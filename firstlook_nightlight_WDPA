@@ -1,0 +1,48 @@
+import rasterio
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Load the GeoTIFF
+with rasterio.open('viirs_pa_south_america_10km_clean.tif') as src:
+    night_lights = src.read(1)  # Band 1
+    pa_mask = src.read(2)       # Band 2
+    
+    # Handle NaN values
+    night_lights_clean = np.where(np.isnan(night_lights), 0, night_lights)
+    
+    # Print data info for debugging
+    print(f"Night lights shape: {night_lights.shape}")
+    print(f"Night lights data type: {night_lights.dtype}")
+    print(f"Original - min: {night_lights.min()}, max: {night_lights.max()}")
+    print(f"Cleaned - min: {night_lights_clean.min()}, max: {night_lights_clean.max()}")
+    print(f"Non-zero values: {np.count_nonzero(night_lights_clean)}")
+
+# Create a single overlaid plot
+plt.figure(figsize=(12, 8))
+
+# Plot night lights as the base layer
+if night_lights_clean.max() > 0:
+    # Use more restrictive percentiles to make high values more exclusive
+    vmin = np.percentile(night_lights_clean[night_lights_clean > 0], 10)
+    vmax = np.percentile(night_lights_clean, 95)  # Only top 2% get the brightest colors
+    plt.imshow(night_lights_clean, cmap='viridis', vmin=vmin, vmax=vmax)
+else:
+    plt.imshow(night_lights_clean, cmap='viridis')
+
+# Overlay protected areas on top with transparency
+plt.imshow(pa_mask, cmap='Greens', alpha=0.6, vmin=0, vmax=1)
+
+# Add colorbar for night lights
+# cbar = plt.colorbar(label='Night Light Intensity')
+# cbar.ax.set_ylabel('Night Light Intensity', rotation=270, labelpad=15)
+
+plt.title('VIIRS Night Lights + Protected Areas - South America', fontsize=14, pad=20)
+plt.axis('off')
+
+# Add legend for protected areas
+from matplotlib.patches import Patch
+legend_elements = [Patch(facecolor='green', alpha=0.6, label='Protected Areas')]
+plt.legend(handles=legend_elements, loc='upper right', framealpha=0.8)
+
+plt.tight_layout()
+plt.show()
