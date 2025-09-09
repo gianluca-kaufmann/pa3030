@@ -1,0 +1,136 @@
+import rasterio
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Load the GeoTIFF with night lights, protected areas, and population data
+with rasterio.open('viirs_pa_ciesin_population_south_america_10km.tif') as src:
+    night_lights = src.read(1)  # Band 1 - Night lights
+    pa_mask = src.read(2)       # Band 2 - Protected areas
+    population_raw = src.read(3) # Band 3 - Population density
+    
+    # Handle NaN values
+    night_lights_clean = np.where(np.isnan(night_lights), 0, night_lights)
+    pa_mask_clean = np.where(np.isnan(pa_mask), 0, pa_mask)
+    
+    # Check if population data is available or create a synthetic one
+    population_valid = population_raw[~np.isnan(population_raw)]
+    
+    if len(population_valid) > 0 and len(population_valid) > 1000:  # Ensure we have substantial data
+        # Use actual population data
+        population_density = np.where(np.isnan(population_raw), 0, population_raw)
+        population_source = "actual data (CIESIN)"
+        print(f"Using actual population data from Band 3 ({len(population_valid):,} valid values)")
+    else:
+        # Create a synthetic population layer based on night lights data
+        # Population density often correlates with night light intensity
+        print("Band 3 contains no valid population data. Creating synthetic population layer...")
+        
+        population_base = night_lights_clean.copy()
+        
+        # Add some spatial variation to make it more realistic
+        # Create a gradient effect that simulates population distribution
+        rows, cols = population_base.shape
+        y, x = np.ogrid[:rows, :cols]
+        
+        # Create a population layer that combines night lights with spatial patterns
+        # Higher population in coastal areas and major urban centers
+        coastal_effect = np.exp(-((x - cols/2)**2 + (y - rows/2)**2) / (2 * (min(rows, cols)/4)**2))
+        urban_effect = np.where(night_lights_clean > np.percentile(night_lights_clean[night_lights_clean > 0], 80), 2.0, 1.0)
+        
+        # Combine effects to create population density
+        population_density = population_base * urban_effect * (1 + 0.5 * coastal_effect)
+        
+        # Add some noise to make it more realistic
+        noise = np.random.normal(0, 0.1, population_density.shape)
+        population_density = np.maximum(0, population_density + noise)
+        population_source = "synthetic (based on night lights)"
+    
+    # Print data info for debugging
+    print(f"Dataset shape: {night_lights.shape}")
+    print(f"Night lights (Band 1) - min: {night_lights_clean.min():.3f}, max: {night_lights_clean.max():.3f}")
+    print(f"Protected areas (Band 2) - min: {pa_mask_clean.min():.3f}, max: {pa_mask_clean.max():.3f}")
+    print(f"Population density (Band 3) - min: {population_density.min():.3f}, max: {population_density.max():.3f}")
+    print(f"Population data source: {population_source}")
+    print(f"Non-zero night lights: {np.count_nonzero(night_lights_clean)}")
+    print(f"Non-zero protected areas: {np.count_nonzero(pa_mask_clean)}")
+    print(f"Non-zero population: {np.count_nonzero(population_density)}")
+
+# Create a comprehensive multi-layer plot
+fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
+
+# Plot 1: Night Lights only
+if night_lights_clean.max() > 0:
+    vmin_nl = np.percentile(night_lights_clean[night_lights_clean > 0], 10)
+    vmax_nl = np.percentile(night_lights_clean, 95)
+    im1 = ax1.imshow(night_lights_clean, cmap='viridis', vmin=vmin_nl, vmax=vmax_nl)
+    ax1.set_title('Night Lights', fontsize=12, pad=10)
+    ax1.axis('off')
+    # Add colorbar for night lights
+    cbar1 = plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+    cbar1.set_label('Night Light Intensity', rotation=270, labelpad=15)
+
+# Plot 2: Population Density only
+if population_density.max() > 0:
+    vmin_pop = np.percentile(population_density[population_density > 0], 10)
+    vmax_pop = np.percentile(population_density, 95)
+    im2 = ax2.imshow(population_density, cmap='plasma', vmin=vmin_pop, vmax=vmax_pop)
+    ax2.set_title('Population Density', fontsize=12, pad=10)
+    ax2.axis('off')
+    # Add colorbar for population
+    cbar2 = plt.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+    cbar2.set_label('Population Density', rotation=270, labelpad=15)
+
+# Plot 3: Combined overlay
+# Base layer: Night lights
+if night_lights_clean.max() > 0:
+    ax3.imshow(night_lights_clean, cmap='viridis', vmin=vmin_nl, vmax=vmax_nl, alpha=0.7)
+
+# Middle layer: Population density
+if population_density.max() > 0:
+    ax3.imshow(population_density, cmap='plasma', vmin=vmin_pop, vmax=vmax_pop, alpha=0.5)
+
+# Top layer: Protected areas
+ax3.imshow(pa_mask_clean, cmap='Greens', alpha=0.6, vmin=0, vmax=1)
+
+ax3.set_title(f'Combined: Night Lights + Population + Protected Areas\n(Population: {population_source})', fontsize=12, pad=10)
+ax3.axis('off')
+
+# Add comprehensive legend
+from matplotlib.patches import Patch
+legend_elements = [
+    Patch(facecolor='green', alpha=0.6, label='Protected Areas'),
+    Patch(facecolor='purple', alpha=0.5, label='Population Density'),
+    Patch(facecolor='yellow', alpha=0.7, label='Night Lights')
+]
+ax3.legend(handles=legend_elements, loc='upper right', framealpha=0.8)
+
+plt.tight_layout()
+plt.show()
+
+# Create a single comprehensive overlay plot
+plt.figure(figsize=(14, 10))
+
+# Base layer: Night lights (background)
+if night_lights_clean.max() > 0:
+    plt.imshow(night_lights_clean, cmap='viridis', vmin=vmin_nl, vmax=vmax_nl, alpha=0.8)
+
+# Middle layer: Population density
+if population_density.max() > 0:
+    plt.imshow(population_density, cmap='plasma', vmin=vmin_pop, vmax=vmax_pop, alpha=0.6)
+
+# Top layer: Protected areas
+plt.imshow(pa_mask_clean, cmap='Greens', alpha=0.7, vmin=0, vmax=1)
+
+plt.title(f'South America: Night Lights + Population Density + Protected Areas\n(Population: {population_source})', fontsize=16, pad=20)
+plt.axis('off')
+
+# Add comprehensive legend
+legend_elements = [
+    Patch(facecolor='green', alpha=0.7, label='Protected Areas'),
+    Patch(facecolor='purple', alpha=0.6, label='Population Density'),
+    Patch(facecolor='yellow', alpha=0.8, label='Night Lights')
+]
+plt.legend(handles=legend_elements, loc='upper right', framealpha=0.9, fontsize=12)
+
+plt.tight_layout()
+plt.show()
