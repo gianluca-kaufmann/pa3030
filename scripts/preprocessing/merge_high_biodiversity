@@ -1,0 +1,191 @@
+# pip install geopandas rasterio shapely numpy
+import numpy as np
+import geopandas as gpd
+import rasterio
+from rasterio.features import rasterize
+from rasterio.enums import Resampling
+
+# ==========
+# Inputs
+# ==========
+TEMPLATE_TIF = "/Users/gianluca/Desktop/Master's Thesis/code/data/south_america_with_ree.tif"  # your 1km stack
+HBA_SHP      = "/Users/gianluca/Desktop/Master's Thesis/code/data/high_biodiversity_areas/High biodiversity areas .shp" # GSN layer
+OUT_MASK_TIF = "/Users/gianluca/Desktop/Master's Thesis/code/data/high_biodiversity_areas_mask_1km.tif"
+OUT_STACK_TIF= "/Users/gianluca/Desktop/Master's Thesis/code/data/south_america_with_ree_plus_hba.tif"  # optional
+
+# ==========
+# 1) Read template (backbone)
+# ==========
+with rasterio.open(TEMPLATE_TIF) as src:
+    template_crs   = src.crs
+    template_tf    = src.transform
+    template_w     = src.width
+    template_h     = src.height
+    template_count = src.count
+    template_profile = src.profile.copy()
+    template_nodata  = src.nodata
+
+# ==========
+# 2) Read & reproject High biodiversity areas to template CRS
+# ==========
+gdf = gpd.read_file(HBA_SHP)
+
+# Drop empty/invalid geometries just in case
+gdf = gdf[~gdf.geometry.is_empty & gdf.geometry.notnull()].copy()
+
+# Reproject to match template
+if gdf.crs != template_crs:
+    gdf = gdf.to_crs(template_crs)
+
+# ==========
+# 3) Rasterize polygons to a 0/1 mask aligned to the template
+#    - all_touched=True is more inclusive for edge pixels; set to False if you prefer strict overlap
+# ==========
+shapes = ((geom, 1) for geom in gdf.geometry)
+mask_arr = rasterize(
+    shapes=shapes,
+    out_shape=(template_h, template_w),
+    transform=template_tf,
+    fill=0,
+    dtype="uint8",
+    all_touched=True
+)
+
+# ==========
+# 3.5) Clip HBA mask to match template's valid data extent
+#      This ensures HBA data only exists where the template has valid data
+# ==========
+with rasterio.open(TEMPLATE_TIF) as src:
+    # Read the first band to get the template's valid data mask
+    template_band = src.read(1)
+    template_valid_mask = ~np.isnan(template_band)
+    
+    # Apply the template's valid data mask to the HBA mask
+    # This ensures HBA data only exists where the template has valid data
+    mask_arr = np.where(template_valid_mask, mask_arr, 0).astype("uint8")
+    
+    print(f"HBA mask clipped to template extent:")
+    print(f"  Original HBA pixels: {np.sum(mask_arr == 1):,}")
+    print(f"  Template valid pixels: {np.sum(template_valid_mask):,}")
+    print(f"  HBA pixels after clipping: {np.sum(mask_arr == 1):,}")
+
+# Optional: if your template has NoData areas you want to preserve as 0 (already the case),
+# you could additionally zero-out pixels where the template is nodata (example using band 1):
+# with rasterio.open(TEMPLATE_TIF) as src:
+#     b1 = src.read(1, masked=True)
+#     mask_arr = np.where(b1.mask, 0, mask_arr).astype("uint8")
+
+# ==========
+# 4) Save the aligned mask as its own GeoTIFF (recommended)
+# ==========
+mask_profile = template_profile.copy()
+mask_profile.update({
+    "count": 1,
+    "dtype": "uint8",
+    "compress": "LZW",
+    "tiled": True,
+    "blockxsize": 512,
+    "blockysize": 512,
+    "nodata": 0  # 0 = not in HBA; 1 = in HBA
+})
+
+with rasterio.open(OUT_MASK_TIF, "w", **mask_profile) as dst:
+    dst.write(mask_arr, 1)
+
+print(f"Saved aligned HBA mask → {OUT_MASK_TIF}")
+
+# ==========
+# 5) (Optional) Write a new stack = original bands + HBA mask as last band
+#    Note: This copies bands; if the template is huge and RAM is tight, do this windowed.
+# ==========
+make_stacked_output = True
+if make_stacked_output:
+    stack_profile = template_profile.copy()
+    stack_profile.update({
+        "count": template_count + 1,
+        "compress": "LZW",
+        "tiled": True,
+        "blockxsize": 512,
+        "blockysize": 512
+    })
+
+    with rasterio.open(TEMPLATE_TIF) as src, \
+         rasterio.open(OUT_STACK_TIF, "w", **stack_profile) as dst:
+
+        # Copy original bands as-is
+        for b in range(1, template_count + 1):
+            dst.write(src.read(b), b)
+
+        # Write HBA mask as the last band
+        dst.write(mask_arr, template_count + 1)
+
+        # (Optional) name the band in metadata
+        tags = dst.tags()
+        band_descriptions = [f"band_{i}" for i in range(1, template_count + 1)] + ["high_biodiversity_areas"]
+        dst.update_tags(**{**tags, "band_names": ",".join(band_descriptions)})
+
+    print(f"Saved stacked raster with HBA band → {OUT_STACK_TIF}")
+
+# ==========
+# 6) (Optional) Create a simple visualization
+# ==========
+create_visualization = True
+if create_visualization:
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        print("Creating visualization...")
+        
+        # Read the merged data for visualization
+        with rasterio.open(OUT_STACK_TIF) as src:
+            # Create a simple overview plot
+            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+            fig.suptitle('South America Dataset with High Biodiversity Areas', fontsize=16)
+            
+            band_names = ['Population', 'Protected Areas', 'Night Lights', 'REE Occurrences', 'High Biodiversity Areas']
+            
+            for i in range(5):
+                row = i // 3
+                col = i % 3
+                ax = axes[row, col]
+                
+                band_data = src.read(i + 1)
+                
+                if i == 4:  # HBA band
+                    colors = ['white', 'darkgreen']
+                    cmap = plt.cm.colors.ListedColormap(colors)
+                    im = ax.imshow(band_data, cmap=cmap, vmin=0, vmax=1)
+                    ax.set_title(f'Band {i+1}: {band_names[i]}')
+                elif i == 3:  # REE band
+                    unique_vals = np.unique(band_data[~np.isnan(band_data)])
+                    im = ax.imshow(band_data, cmap='Set3', vmin=unique_vals.min(), vmax=unique_vals.max())
+                    ax.set_title(f'Band {i+1}: {band_names[i]}')
+                else:  # Continuous data
+                    valid_data = band_data[~np.isnan(band_data)]
+                    if len(valid_data) > 0:
+                        p2, p98 = np.percentile(valid_data, [2, 98])
+                        im = ax.imshow(band_data, cmap='viridis', vmin=p2, vmax=p98)
+                        ax.set_title(f'Band {i+1}: {band_names[i]}')
+                    else:
+                        im = ax.imshow(band_data, cmap='viridis')
+                        ax.set_title(f'Band {i+1}: {band_names[i]}')
+                
+                ax.set_xlabel('Longitude')
+                ax.set_ylabel('Latitude')
+                ax.set_aspect('equal')
+                plt.colorbar(im, ax=ax, shrink=0.6)
+            
+            # Remove empty subplot
+            axes[1, 2].remove()
+            
+            plt.tight_layout()
+            viz_output = "/Users/gianluca/Desktop/Master's Thesis/code/outputs/Figures/hba_merge_quick_viz.png"
+            plt.savefig(viz_output, dpi=300, bbox_inches='tight')
+            plt.close()
+            print(f"Quick visualization saved → {viz_output}")
+            
+    except ImportError:
+        print("Matplotlib not available - skipping visualization")
+    except Exception as e:
+        print(f"Visualization failed: {e}")

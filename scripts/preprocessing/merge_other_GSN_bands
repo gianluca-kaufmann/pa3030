@@ -1,0 +1,195 @@
+# pip install geopandas rasterio shapely numpy
+import os
+import numpy as np
+import geopandas as gpd
+import rasterio
+from rasterio.features import rasterize
+from rasterio.windows import Window
+
+# ---------- CONFIG ----------
+TEMPLATE_TIF = "/Users/gianluca/Desktop/Master's Thesis/code/data/south_america_with_ree_plus_hba.tif"
+
+# Map: shapefile path  -> new band name (no spaces is best for metadata)
+SHAPEFILES = {
+    "/Users/gianluca/Desktop/Master's Thesis/code/data/potential_wildlife_corridors/Potential wildlife corridors .shp": "potential_wildlife_corridors",
+    "/Users/gianluca/Desktop/Master's Thesis/code/data/climate_stabilisation_areas/Climate_Stabilization_Area.shp":  "climate_stabilization_area",
+    "/Users/gianluca/Desktop/Master's Thesis/code/data/intact_wilderness_areas/Intact wilderness areas.shp":     "intact_wilderness_areas",
+    "/Users/gianluca/Desktop/Master's Thesis/code/data/terrestrial_ecoregions/Terrestrial_ecoregions.shp":      "terrestrial_ecoregions",
+}
+
+# Rasterization behavior
+ALL_TOUCHED = True      # set False if you prefer conservative pixel inclusion
+NEW_BAND_DTYPE = "uint8"
+NEW_BAND_NODATA = 0     # 0 = not present; 1 = present
+
+# Optional: also save each mask as its own aligned GeoTIFF (set to None to skip)
+MASKS_DIR = "/Users/gianluca/Desktop/Master's Thesis/code/data/output_masks"  # e.g., "/…/masks"; None to skip saving masks
+# ---------------------------------
+
+
+def load_and_align_gdf(shp_path, target_crs):
+    gdf = gpd.read_file(shp_path)
+    # clean problematic geoms
+    gdf = gdf.loc[gdf.geometry.notnull()].copy()
+    if gdf.empty:
+        return gdf
+    # fix invalid geometries (buffer(0) trick)
+    gdf["geometry"] = gdf.geometry.buffer(0)
+    gdf = gdf.loc[gdf.geometry.notnull()].copy()
+    if gdf.crs != target_crs:
+        gdf = gdf.to_crs(target_crs)
+    return gdf
+
+
+def rasterize_gdf_to_template(gdf, out_shape, transform, all_touched=True, dtype="uint8", value_column=None):
+    if gdf.empty:
+        return np.zeros(out_shape, dtype=dtype)
+    
+    if value_column and value_column in gdf.columns:
+        # Use actual values from the specified column
+        shapes = ((geom, val) for geom, val in zip(gdf.geometry, gdf[value_column]))
+        fill_value = 0
+    else:
+        # Binary rasterization (presence/absence)
+        shapes = ((geom, 1) for geom in gdf.geometry)
+        fill_value = 0
+    
+    arr = rasterize(
+        shapes=shapes,
+        out_shape=out_shape,
+        transform=transform,
+        fill=fill_value,
+        dtype=dtype,
+        all_touched=all_touched,
+    )
+    return arr
+
+
+def write_mask_tif(path, mask_arr, base_profile, dtype="uint8", nodata=0):
+    prof = base_profile.copy()
+    prof.update({
+        "count": 1,
+        "dtype": dtype,
+        "nodata": nodata,
+        "compress": "LZW",
+        "tiled": True,
+        "blockxsize": 512,
+        "blockysize": 512,
+    })
+    with rasterio.open(path, "w", **prof) as dst:
+        dst.write(mask_arr, 1)
+
+
+def main():
+    # --- read template / backbone
+    with rasterio.open(TEMPLATE_TIF) as src:
+        template_crs   = src.crs
+        template_tf    = src.transform
+        template_h     = src.height
+        template_w     = src.width
+        template_count = src.count
+        template_prof  = src.profile.copy()
+
+    # Ensure mask output folder
+    if MASKS_DIR:
+        os.makedirs(MASKS_DIR, exist_ok=True)
+
+    # --- build masks in memory (one by one)
+    new_band_names = []
+    new_band_arrays = []
+
+    for shp_path, band_name in SHAPEFILES.items():
+        print(f"Processing: {os.path.basename(shp_path)} -> {band_name}")
+        gdf = load_and_align_gdf(shp_path, template_crs)
+        
+        # Special handling for terrestrial ecoregions - use actual ecoregion IDs
+        if band_name == "terrestrial_ecoregions":
+            print(f"  Using ECO_ID values for ecoregion classification")
+            # Use a larger data type to accommodate ecoregion IDs
+            mask_arr = rasterize_gdf_to_template(
+                gdf,
+                out_shape=(template_h, template_w),
+                transform=template_tf,
+                all_touched=ALL_TOUCHED,
+                dtype="uint16",  # Larger data type for ecoregion IDs
+                value_column="ECO_ID"
+            )
+        else:
+            # Binary rasterization for other features
+            mask_arr = rasterize_gdf_to_template(
+                gdf,
+                out_shape=(template_h, template_w),
+                transform=template_tf,
+                all_touched=ALL_TOUCHED,
+                dtype=NEW_BAND_DTYPE,
+            )
+        
+        # Clip mask to match template's valid data extent (same as HBA script)
+        with rasterio.open(TEMPLATE_TIF) as src:
+            template_band = src.read(1)
+            template_valid_mask = ~np.isnan(template_band)
+            mask_arr = np.where(template_valid_mask, mask_arr, 0)
+            
+            if band_name == "terrestrial_ecoregions":
+                unique_ecoregions = len(np.unique(mask_arr[mask_arr > 0]))
+                total_ecoregion_pixels = np.sum(mask_arr > 0)
+                print(f"  {band_name}: {total_ecoregion_pixels:,} pixels, {unique_ecoregions} unique ecoregions")
+            else:
+                hba_pixels = np.sum(mask_arr == 1)
+                print(f"  {band_name}: {hba_pixels:,} pixels after clipping")
+        new_band_names.append(band_name)
+        new_band_arrays.append(mask_arr)
+
+        # Optional: save each mask as an aligned single-band GeoTIFF
+        if MASKS_DIR:
+            out_mask_tif = os.path.join(
+                MASKS_DIR,
+                f"{band_name}_mask_1km.tif"
+            )
+            write_mask_tif(out_mask_tif, mask_arr, template_prof, dtype=NEW_BAND_DTYPE, nodata=NEW_BAND_NODATA)
+            print(f"  Saved mask → {out_mask_tif}")
+
+    # --- write stacked result: original bands + new masks
+    out_stack = os.path.splitext(TEMPLATE_TIF)[0] + "_plus_gsn.tif"
+    total_bands = template_count + len(new_band_arrays)
+
+    stack_prof = template_prof.copy()
+    stack_prof.update({
+        "count": total_bands,
+        "compress": "LZW",
+        "tiled": True,
+        "blockxsize": 512,
+        "blockysize": 512,
+    })
+
+    with rasterio.open(TEMPLATE_TIF) as src, rasterio.open(out_stack, "w", **stack_prof) as dst:
+        # 1) Copy original bands as-is
+        for b in range(1, template_count + 1):
+            band_data = src.read(b)
+            dst.write(band_data, b)
+
+        # 2) Write the new bands (convert to float32 to match template)
+        for i, mask_arr in enumerate(new_band_arrays, start=1):
+            band_index = template_count + i
+            # Convert to float32 to match template data type
+            # For ecoregions, preserve the actual values; for binary features, convert 0/1
+            if new_band_names[i-1] == "terrestrial_ecoregions":
+                # Keep ecoregion IDs as integers in float32 format
+                mask_float = mask_arr.astype('float32')
+            else:
+                # Convert binary 0/1 to float32
+                mask_float = mask_arr.astype('float32')
+            dst.write(mask_float, band_index)
+
+        # (Nice to have) band name metadata
+        # Preserve any existing tag, append new names
+        existing_names = [f"band_{i}" for i in range(1, template_count + 1)]
+        band_names = existing_names + new_band_names
+        dst.update_tags(band_names=",".join(band_names))
+
+    print(f"\nSaved stacked raster → {out_stack}")
+    print(f"New bands appended: {', '.join(new_band_names)}")
+
+
+if __name__ == "__main__":
+    main()
