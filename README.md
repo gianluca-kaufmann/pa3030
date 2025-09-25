@@ -90,15 +90,17 @@ Scripts are organized by workflow step:
    python3 scripts/preprocessing/1_clean_viirs
    python3 scripts/preprocessing/1_2012_merge
 
-2.	**Validate**
-python3 scripts/analysis/1_validate_dw.py
-python3 "scripts/consistency checks/alignment check"
+2. **Validate**
+   ```bash 
+	python3 scripts/analysis/1_validate_dw.py
+	python3 "scripts/consistency checks/alignment check"
 
 3. **Visualize**
-python3 scripts/visualisations/1_visualize_dw.py
-python3 scripts/visualisations/1_gwp
-python3 scripts/visualisations/1_viirs
-python3 scripts/visualisations/1_wdpa
+   ```bash 
+	python3 scripts/visualisations/1_visualize_dw.py
+	python3 scripts/visualisations/1_gwp.py
+	python3 scripts/visualisations/1_viirs.py
+	python3 scripts/visualisations/1_wdpa.py
 
 📚 Data Sources
 	•	GPW v4.11 (CIESIN)
