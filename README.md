@@ -1,11 +1,17 @@
-# 📂 Master's Thesis Code Repository  
+# Master's Thesis Code Repository  
 
-This repository contains the code and data for my Master's Thesis on **geospatial analysis in South America**.  
-The project integrates multiple datasets (population, protected areas, night lights, land cover, biodiversity, and rare earth elements) to analyze the interactions between **conservation, human activity, and resource potential**.  
+This repository contains the code, data, and workflows for my Master’s thesis project at ETH Zurich in collaboration with Chiara Colesanti from the University of Zurich and Elena Almeida from the London School of Economics and Political Science (LSE)
+.
+The goal of the project is to predict where new protected areas (PAs) are most likely to be established under the global 30×30 biodiversity target.
+
+Using geospatial data (WDPA, VIIRS night lights, population density, biodiversity and conservation layers, etc.) combined with machine learning models, the project builds a grid-based dataset to identify potential future PA designations.
+
+The repository is organized into directories for raw and processed data, scripts for preprocessing, visualisations and analysis, and outputs such as maps, figures, and tables.
+
 
 ---
 
-## 🚀 Project at a Glance  
+## Project at a Glance  
 
 - **Focus**: Spatial relationships between environment, conservation, and economic activity  
 - **Region**: South America (1 km resolution)  
@@ -16,11 +22,16 @@ The project integrates multiple datasets (population, protected areas, night lig
   - Night lights (VIIRS)  
   - Land cover (DynamicWorld)  
   - Biodiversity and wilderness priority areas (GSN datasets)  
-  - Rare earth element occurrences (USGS)  
+  - Rare earth element occurrences (USGS)
+  - Mineral occurences
+  - Mining locations
+  - Weather data
+  - Climate data
+  - Powerplant locations (Hydro, coal, etc.)
 
 ---
 
-## 📁 Repository Structure  
+## Repository Structure  
 
 ```
 code/
@@ -43,7 +54,7 @@ code/
 
 ---
 
-## 📊 Core Datasets  
+## Core Datasets  
 
 | Dataset            | Files (examples) | Description | Resolution |
 |--------------------|------------------|-------------|------------|
@@ -56,7 +67,7 @@ code/
 
 ---
 
-## 📈 Outputs  
+## Outputs  
 
 - **Figures**: land cover maps, population maps (linear/log), night light maps, PA coverage, integrated analyses  
 - **Results**: statistics, model results  
@@ -64,14 +75,14 @@ code/
 
 ---
 
-## 🛠️ Scripts  
+## Scripts  
 
 Scripts are organized by workflow step:  
 
 1. **Preprocessing**  
    - Convert DynamicWorld → discrete classes  
    - Clean VIIRS data  
-   - Merge datasets (e.g., `*_2012_merge.py`)  
+   - Merge datasets (e.g., `1_2012_merge.py`)  
 
 2. **Analysis**  
    - Validate dataset integrity (e.g., `validate_dw.py`)  
@@ -80,11 +91,11 @@ Scripts are organized by workflow step:
 3. **Visualization**  
    - Generate plots for GPW, VIIRS, WDPA, DynamicWorld  
 
-👉 See [`scripts/README.md`](scripts/README.md) for detailed documentation.  
+See [`scripts/README.md`](scripts/README.md) for detailed documentation.  
 
 ---
 
-## 🔧 Workflow  
+## Workflow  
 
 1. **Prepare Data**  
    ```bash
@@ -104,7 +115,7 @@ Scripts are organized by workflow step:
 	python3 scripts/visualisations/1_viirs.py
 	python3 scripts/visualisations/1_wdpa.py
 
-📚 Data Sources
+Data Sources
 	•	GPW v4.11 (CIESIN)
 	•	WDPA (UNEP-WCMC)
 	•	VIIRS Night Lights (NOAA)
@@ -112,8 +123,11 @@ Scripts are organized by workflow step:
 	•	USGS REE Occurrences
 	•	WWF Terrestrial Ecoregions
 	•	Global Safety Net conservation layers
+	•	Alphaearth foundations (Satellite embeddings V1)
+	•	S&P (Mining and mineral data)
+	•	Global Power Plant Database (Google Earth Engine)
 
-📝 Citation
+Citation
 If you use this repository:
 Kaufmann, G.-L. (2025). "Protected Areas and Transition Risk."  
 Master’s Thesis, ETH Zurich.  
