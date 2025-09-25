@@ -1,7 +1,7 @@
 # Master's Thesis Code Repository  
 
-This repository contains the code, data, and workflows for my Master’s thesis project at ETH Zurich in collaboration with Chiara Colesanti from the University of Zurich and Elena Almeida from the London School of Economics and Political Science (LSE)
-.
+This repository contains the code, data, and workflows for my Master’s thesis project at ETH Zurich at the Chair of Climate and Energy Economics of Professor Lint Barrage, in collaboration with Chiara Colesanti from the University of Zurich and Elena Almeida from the London School of Economics and Political Science (LSE).
+
 The goal of the project is to predict where new protected areas (PAs) are most likely to be established under the global 30×30 biodiversity target.
 
 Using geospatial data (WDPA, VIIRS night lights, population density, biodiversity and conservation layers, etc.) combined with machine learning models, the project builds a grid-based dataset to identify potential future PA designations.
