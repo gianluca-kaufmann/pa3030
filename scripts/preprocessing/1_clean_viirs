@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+"""
+clean_viirs_data.py
+Clean and fix VIIRS night light data by addressing common data quality issues:
+- Set negative values to 0
+- Remove faint background glow: values < 0.2 nW/cm²/sr → 0
+- Cap extreme highs using P99.9 threshold
+- Save cleaned datasets as new files
+
+Usage: python3 clean_viirs_data.py
+"""
+
+import os
+import numpy as np
+import rasterio
+
+def get_eps_for_dtype(dtype):
+    """
+    Get machine epsilon for a given numpy dtype.
+    
+    Parameters
+    ----------
+    dtype : numpy.dtype
+        Data type to get epsilon for
+        
+    Returns
+    -------
+    float
+        Machine epsilon for the data type
+    """
+    if dtype == np.float32:
+        return np.finfo(np.float32).eps
+    elif dtype == np.float64:
+        return np.finfo(np.float64).eps
+    else:
+        return 1e-15  # fallback
+
+def clean_viirs_data(data, eps_threshold=None, p99_9_threshold=None, baseline_threshold=None, verbose=True):
+    """
+    Clean VIIRS data by applying specific fixes for data quality issues.
+    
+    Parameters
+    ----------
+    data : numpy.ndarray
+        Raw VIIRS data array
+    eps_threshold : float, optional
+        Threshold below which to set values to 0. If None, uses machine epsilon.
+    p99_9_threshold : float, optional
+        Threshold above which to cap values. If None, uses P99.9 of data.
+    baseline_threshold : float, optional
+        Threshold below which to set values to 0 to remove baseline noise. If None, uses P10 of non-zero values.
+    verbose : bool
+        Whether to print detailed information about cleaning process
+        
+    Returns
+    -------
+    tuple
+        (cleaned_data, cleaning_stats)
+    """
+    if verbose:
+        print(f"  Input data shape: {data.shape}")
+        print(f"  Input data type: {data.dtype}")
+        print(f"  Input range: {np.nanmin(data):.6f} to {np.nanmax(data):.6f}")
+    
+    # Create a copy to avoid modifying original
+    cleaned = data.copy().astype("float64")
+    original_valid = ~np.isnan(cleaned)
+    
+    # Initialize cleaning statistics
+    stats = {
+        'original_valid_pixels': np.sum(original_valid),
+        'original_negative_count': 0,
+        'original_tiny_positive_count': 0,
+        'original_extreme_count': 0,
+        'final_valid_pixels': 0,
+        'final_zero_pixels': 0,
+        'final_nonzero_pixels': 0
+    }
+    
+    # Step 1: Handle NaN values (set to 0 for night light data)
+    nan_count = np.sum(np.isnan(cleaned))
+    if nan_count > 0 and verbose:
+        print(f"  Found {nan_count:,} NaN values, setting to 0")
+    cleaned = np.where(np.isnan(cleaned), 0.0, cleaned)
+    
+    # Step 2: Clamp tiny negatives to 0
+    negative_mask = cleaned < 0
+    stats['original_negative_count'] = np.sum(negative_mask)
+    
+    if stats['original_negative_count'] > 0:
+        if verbose:
+            print(f"  Found {stats['original_negative_count']:,} negative values")
+            print(f"    Range: {np.min(cleaned[negative_mask]):.6f} to {np.max(cleaned[negative_mask]):.6f}")
+            print(f"    Setting negative values to 0")
+        cleaned = np.where(negative_mask, 0.0, cleaned)
+    
+    # Step 3: Set tiny positives below EPS to 0
+    if eps_threshold is None:
+        eps_threshold = get_eps_for_dtype(data.dtype)
+    
+    tiny_positive_mask = (cleaned > 0) & (cleaned < eps_threshold)
+    stats['original_tiny_positive_count'] = np.sum(tiny_positive_mask)
+    
+    if stats['original_tiny_positive_count'] > 0:
+        if verbose:
+            print(f"  Found {stats['original_tiny_positive_count']:,} tiny positive values (< {eps_threshold:.2e})")
+            print(f"    Setting tiny positive values to 0")
+        cleaned = np.where(tiny_positive_mask, 0.0, cleaned)
+    
+    # Step 4: Remove baseline noise (the main issue!)
+    # This addresses the core problem of suspicious high non-zero coverage
+    if baseline_threshold is None:
+        # Default to fixed threshold to remove faint background glow
+        baseline_threshold = 0.2
+    
+    baseline_noise_mask = (cleaned > 0) & (cleaned < baseline_threshold)
+    stats['baseline_noise_count'] = np.sum(baseline_noise_mask)
+    
+    if stats['baseline_noise_count'] > 0:
+        if verbose:
+            print(f"  Found {stats['baseline_noise_count']:,} baseline noise values (< {baseline_threshold:.6f})")
+            print(f"    Range: {np.min(cleaned[baseline_noise_mask]):.8f} to {np.max(cleaned[baseline_noise_mask]):.8f}")
+            print(f"    Setting baseline noise to 0")
+        cleaned = np.where(baseline_noise_mask, 0.0, cleaned)
+    
+    # Step 5: Cap extreme highs using P99.9 threshold
+    if p99_9_threshold is None:
+        # Only use remaining non-zero values for percentile calculation
+        non_zero_vals = cleaned[cleaned > 0]
+        if len(non_zero_vals) > 0:
+            p99_9_threshold = np.percentile(non_zero_vals, 99.9)
+        else:
+            p99_9_threshold = 1000.0  # fallback
+    
+    extreme_mask = cleaned > p99_9_threshold
+    stats['original_extreme_count'] = np.sum(extreme_mask)
+    
+    if stats['original_extreme_count'] > 0:
+        if verbose:
+            print(f"  Found {stats['original_extreme_count']:,} extreme values (> {p99_9_threshold:.2f})")
+            print(f"    Range: {np.min(cleaned[extreme_mask]):.2f} to {np.max(cleaned[extreme_mask]):.2f}")
+            print(f"    Capping extreme values to {p99_9_threshold:.2f}")
+        cleaned = np.where(extreme_mask, p99_9_threshold, cleaned)
+    
+    # Final statistics
+    stats['final_valid_pixels'] = np.sum(~np.isnan(cleaned))
+    stats['final_zero_pixels'] = np.sum(cleaned == 0)
+    stats['final_nonzero_pixels'] = np.sum(cleaned > 0)
+    stats['final_share_nonzero'] = 100.0 * stats['final_nonzero_pixels'] / stats['final_valid_pixels']
+    
+    if verbose:
+        print(f"  Final data range: {np.min(cleaned):.6f} to {np.max(cleaned):.6f}")
+        print(f"  Final non-zero coverage: {stats['final_share_nonzero']:.2f}%")
+        print(f"  Cleaning summary:")
+        print(f"    - Negative values → 0: {stats['original_negative_count']:,}")
+        print(f"    - Tiny positives → 0: {stats['original_tiny_positive_count']:,}")
+        print(f"    - Baseline noise → 0: {stats.get('baseline_noise_count', 0):,}")
+        print(f"    - Extreme values capped: {stats['original_extreme_count']:,}")
+    
+    return cleaned, stats
+
+def process_viirs_year(year, input_path, output_dir, eps_threshold=None, p99_9_threshold=None, baseline_threshold=None):
+    """
+    Process a single VIIRS year, applying cleaning and saving the result.
+    
+    Parameters
+    ----------
+    year : int
+        Year to process
+    input_path : str
+        Path to input VIIRS file
+    output_dir : str
+        Directory to save cleaned output
+    eps_threshold : float, optional
+        EPS threshold for tiny positive values
+    p99_9_threshold : float, optional
+        P99.9 threshold for extreme values
+    baseline_threshold : float, optional
+        Baseline threshold for removing noise
+        
+    Returns
+    -------
+    dict
+        Processing statistics and output file path
+    """
+    print(f"\n{'='*60}")
+    print(f"Processing VIIRS {year}")
+    print(f"{'='*60}")
+    print(f"Input: {input_path}")
+    
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+    
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Read input data
+    with rasterio.open(input_path) as src:
+        data = src.read(1)
+        profile = src.profile.copy()
+        bounds = src.bounds
+        crs = src.crs
+        
+        print(f"Input metadata:")
+        print(f"  Shape: {data.shape}")
+        print(f"  Data type: {data.dtype}")
+        print(f"  CRS: {crs}")
+        print(f"  Bounds: {bounds}")
+        print(f"  NoData: {src.nodata}")
+    
+    # Clean the data
+    cleaned_data, cleaning_stats = clean_viirs_data(
+        data, 
+        eps_threshold=eps_threshold, 
+        p99_9_threshold=p99_9_threshold,
+        baseline_threshold=baseline_threshold,
+        verbose=True
+    )
+    
+    # Prepare output
+    output_filename = f"viirs_{year}_cleaned.tif"
+    output_path = os.path.join(output_dir, output_filename)
+    
+    # Update profile for output
+    profile.update({
+        'dtype': 'float64',
+        'nodata': None,  # We've handled NaN values
+        'compress': 'lzw'
+    })
+    
+    # Write cleaned data
+    print(f"\nSaving cleaned data to: {output_path}")
+    with rasterio.open(output_path, 'w', **profile) as dst:
+        dst.write(cleaned_data.astype('float64'), 1)
+    
+    # Return processing results
+    result = {
+        'year': year,
+        'input_path': input_path,
+        'output_path': output_path,
+        'cleaning_stats': cleaning_stats,
+        'original_shape': data.shape,
+        'original_dtype': str(data.dtype),
+        'final_dtype': 'float64'
+    }
+    
+    return result
+
+
+def main():
+    """
+    Main function to process all VIIRS years.
+    """
+    print("VIIRS Data Cleaning Script")
+    print("=" * 60)
+    print("This script will clean VIIRS night light data by:")
+    print("1. Setting negative values to 0")
+    print("2. Removing faint background glow: values < 0.2 set to 0")
+    print("3. Capping extreme highs using P99.9 threshold")
+    print("4. Saving cleaned datasets as new files")
+    
+    # Configuration
+    base_dir = "/Users/gianluca/Desktop/Master's Thesis/code"
+    input_dir = os.path.join(base_dir, "data")
+    output_dir = os.path.join(base_dir, "data")  # Save cleaned files directly in data folder
+    
+    # Input files
+    years_data = {
+        2012: os.path.join(input_dir, "viirs_2012.tif"),
+        2017: os.path.join(input_dir, "viirs_2017.tif"),
+        2022: os.path.join(input_dir, "viirs_2022.tif"),
+    }
+    
+    # Processing parameters
+    eps_threshold = 1e-6  # Keep, but main denoising is via baseline_threshold
+    p99_9_threshold = None  # Will be calculated per dataset
+    baseline_threshold = 0.2  # Fixed threshold in nW/cm²/sr to remove faint glow
+    
+    # Process each year
+    results = {}
+    for year, input_path in years_data.items():
+        try:
+            result = process_viirs_year(
+                year=year,
+                input_path=input_path,
+                output_dir=output_dir,
+                eps_threshold=eps_threshold,
+                p99_9_threshold=p99_9_threshold,
+                baseline_threshold=baseline_threshold
+            )
+            results[year] = result
+            
+        except Exception as e:
+            print(f"ERROR processing {year}: {e}")
+            continue
+    
+    # Summary report
+    print(f"\n{'='*60}")
+    print("PROCESSING SUMMARY")
+    print(f"{'='*60}")
+    
+    for year, result in results.items():
+        stats = result['cleaning_stats']
+        print(f"\n{year}:")
+        print(f"  Input: {result['input_path']}")
+        print(f"  Output: {result['output_path']}")
+        print(f"  Original non-zero coverage: {100.0 * stats['original_negative_count'] / stats['original_valid_pixels']:.2f}%")
+        print(f"  Final non-zero coverage: {stats['final_share_nonzero']:.2f}%")
+        print(f"  Values cleaned:")
+        print(f"    - Negatives → 0: {stats['original_negative_count']:,}")
+        print(f"    - Tiny positives → 0: {stats['original_tiny_positive_count']:,}")
+        print(f"    - Baseline noise → 0: {stats.get('baseline_noise_count', 0):,}")
+        print(f"    - Extremes capped: {stats['original_extreme_count']:,}")
+    
+    print(f"\nCleaned datasets saved to: {output_dir}")
+    print("\nYou can now use the cleaned datasets for analysis!")
+    print("Run the 1_viirs script in the visualisations folder to create plots.")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,157 @@
+# analyze_wdpa_all_years.py
+# Minimal analysis + visualization for binary WDPA masks (0/1) GeoTIFFs for multiple years.
+
+import os
+import numpy as np
+import rasterio
+from rasterio.plot import show
+import matplotlib.pyplot as plt
+
+def analyze_wdpa_year(year, tif_path):
+    """
+    Analyze and visualize WDPA data for a specific year.
+    
+    Parameters:
+    year (int): The year for analysis (used in titles and output filenames)
+    tif_path (str): Path to the WDPA GeoTIFF file
+    
+    Returns:
+    dict: Dictionary containing analysis results
+    """
+    
+    assert os.path.exists(tif_path), f"File not found: {tif_path}"
+    
+    # --- Load raster ---
+    with rasterio.open(tif_path) as src:
+        arr = src.read(1)  # first (and only) band
+        meta = src.meta.copy()
+        crs = src.crs
+        transform = src.transform
+        bounds = src.bounds
+        nodata = src.nodata
+        res_x, res_y = src.res  # pixel size in CRS units
+    
+    # Mask out NoData if present
+    if nodata is not None:
+        mask_valid = arr != nodata
+        data = np.where(mask_valid, arr, np.nan)
+    else:
+        data = arr.astype(float)
+        mask_valid = ~np.isnan(data)
+    
+    # --- Basic stats ---
+    valid_values = data[mask_valid]
+    n_pixels = np.count_nonzero(mask_valid)
+    n_protected = np.count_nonzero(valid_values == 1)
+    n_unprotected = np.count_nonzero(valid_values == 0)
+    unique_vals = np.unique(valid_values[~np.isnan(valid_values)])
+    
+    # Area calculation (only if CRS is projected in meters)
+    area_info = ""
+    area_km2 = None
+    if crs and crs.is_projected:
+        # pixel area = |res_x * res_y| in CRS units; assume meters → m²
+        px_area_m2 = abs(res_x * res_y)
+        area_km2 = (n_protected * px_area_m2) / 1e6
+        area_info = f"Approx. protected area: {area_km2:,.0f} km² (assuming projected CRS in meters)."
+    else:
+        area_info = ("CRS appears geographic (degrees). Skipping area calc.\n"
+                     "Tip: export rasters in a metric CRS (e.g., EPSG:3857) to get 1 km pixels.")
+    
+    share_protected = (n_protected / n_pixels) * 100 if n_pixels > 0 else np.nan
+    
+    # Print summary
+    print(f"\n=== WDPA {year} — Quick Summary ===")
+    print(f"Path: {tif_path}")
+    print(f"Shape: {arr.shape} (rows, cols)")
+    print(f"CRS: {crs}")
+    print(f"Resolution: {res_x} x {res_y} (CRS units per pixel)")
+    print(f"Bounds: {bounds}")
+    print(f"NoData: {nodata}")
+    print(f"Unique values (valid): {unique_vals}")
+    print(f"Valid pixels: {n_pixels:,}")
+    print(f"Protected pixels (==1): {n_protected:,}")
+    print(f"Unprotected pixels (==0): {n_unprotected:,}")
+    print(f"Share protected: {share_protected:.2f}%")
+    print(area_info)
+    
+    # --- Visualization: map view ---
+    plt.figure(figsize=(10, 8))
+    # Show with extent so axes reflect CRS coordinates
+    extent = (bounds.left, bounds.right, bounds.bottom, bounds.top)
+    img = plt.imshow(data, extent=extent, origin='upper', cmap='Greens', vmin=0, vmax=1)
+    cbar = plt.colorbar(img, shrink=0.8)
+    cbar.set_label('PA mask (0/1)')
+    plt.title(f"WDPA Protected Areas — As-of {year}")
+    plt.xlabel(f"X ({crs.to_string() if crs else ''})")
+    plt.ylabel(f"Y ({crs.to_string() if crs else ''})")
+    plt.tight_layout()
+    
+    # Create outputs/figures directory if it doesn't exist
+    os.makedirs("outputs/figures", exist_ok=True)
+    
+    output_filename = f"outputs/figures/wdpa_{year}_map.png"
+    plt.savefig(output_filename, dpi=200)
+    plt.close()
+    
+    print(f"\nSaved figures:")
+    print(f" - {output_filename}")
+    
+    # Return results for potential further analysis
+    return {
+        'year': year,
+        'path': tif_path,
+        'shape': arr.shape,
+        'crs': crs,
+        'resolution': (res_x, res_y),
+        'bounds': bounds,
+        'nodata': nodata,
+        'unique_values': unique_vals,
+        'n_pixels': n_pixels,
+        'n_protected': n_protected,
+        'n_unprotected': n_unprotected,
+        'share_protected': share_protected,
+        'area_km2': area_km2,
+        'output_file': output_filename
+    }
+
+def main():
+    """
+    Main function to analyze WDPA data for all years.
+    """
+    
+    # Define the years and their corresponding file paths
+    years_data = {
+        2012: "/Users/gianluca/Desktop/Master's Thesis/code/data/wdpa_2012.tif",
+        2017: "/Users/gianluca/Desktop/Master's Thesis/code/data/wdpa_2017.tif",
+        2022: "/Users/gianluca/Desktop/Master's Thesis/code/data/wdpa_2022.tif"
+    }
+    
+    # Store results for all years
+    all_results = {}
+    
+    # Analyze each year
+    for year, tif_path in years_data.items():
+        try:
+            results = analyze_wdpa_year(year, tif_path)
+            all_results[year] = results
+        except Exception as e:
+            print(f"Error analyzing {year}: {e}")
+            continue
+    
+    # Print summary comparison
+    if len(all_results) > 1:
+        print("\n" + "="*60)
+        print("SUMMARY COMPARISON ACROSS YEARS")
+        print("="*60)
+        
+        for year in sorted(all_results.keys()):
+            results = all_results[year]
+            print(f"\n{year}:")
+            print(f"  Protected pixels: {results['n_protected']:,}")
+            print(f"  Share protected: {results['share_protected']:.2f}%")
+            if results['area_km2']:
+                print(f"  Protected area: {results['area_km2']:,.0f} km²")
+
+if __name__ == "__main__":
+    main()
