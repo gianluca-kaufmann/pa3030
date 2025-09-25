@@ -132,7 +132,5 @@ Data Sources
 Citation
 ```
 If you use this repository:
-Kaufmann, G.-L. (2025). "Protected Areas and Transition Risk."  
-Master’s Thesis, ETH Zurich.  
-Code Repository: [GitHub URL]
+[insert citation later when we publish]
 ```
