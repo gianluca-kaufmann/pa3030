@@ -116,6 +116,7 @@ See [`scripts/README.md`](scripts/README.md) for detailed documentation.
 	python3 scripts/visualisations/1_wdpa.py
 
 Data Sources
+```
 	•	GPW v4.11 (CIESIN)
 	•	WDPA (UNEP-WCMC)
 	•	VIIRS Night Lights (NOAA)
@@ -126,10 +127,12 @@ Data Sources
 	•	Alphaearth foundations (Satellite embeddings V1)
 	•	S&P (Mining and mineral data)
 	•	Global Power Plant Database (Google Earth Engine)
+```
 
 Citation
+```
 If you use this repository:
 Kaufmann, G.-L. (2025). "Protected Areas and Transition Risk."  
 Master’s Thesis, ETH Zurich.  
 Code Repository: [GitHub URL]
-
+```
