@@ -22,6 +22,7 @@ The project integrates multiple datasets (population, protected areas, night lig
 
 ## 📁 Repository Structure  
 
+```
 code/
 ├── data/          # Raw & processed datasets (GeoTIFFs, shapefiles, CSVs)
 │   ├── core datasets (gpw, wdpa, viirs, dynamicworld, ree)
@@ -38,6 +39,7 @@ code/
 │   ├── visualisations/  # Mapping & plots
 │   └── consistency checks/
 └── README.md
+```
 
 ---
 
