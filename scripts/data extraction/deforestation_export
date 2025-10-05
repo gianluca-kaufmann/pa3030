@@ -1,0 +1,182 @@
+"""
+Hansen Global Forest Change → 1 km (South America, 2000-2024)
+Method: downsample to 1 km (EPSG:3857, bilinear), export forest cover and loss for each year.
+
+Dataset: UMD/hansen/global_forest_change_2024_v1_12
+- treecover2000: Tree canopy cover for year 2000 (0-100%)
+- lossyear: Year of forest loss (0 = no loss, 1 = 2001, 2 = 2002, ..., 24 = 2024)
+- gain: Forest gain 2000-2012 (binary)
+
+Outputs: 25 GeoTIFFs (2000-2024), each with bands:
+  - forest_cover: Remaining forest cover (%)
+  - forest_loss: Forest lost in that year (binary)
+  - cumulative_loss: Total forest lost since 2000 (binary)
+"""
+
+import ee
+ee.Authenticate()   # Opens a browser for Google login
+
+# ----------------------------
+# 0) Auth & init
+# ----------------------------
+# First run: ee.Authenticate()
+# If you use a specific EE project, pass project="your-ee-project" to Initialize.
+# Use your project ID
+PROJECT_ID = 'master-thesis-473316'
+
+try:
+    ee.Initialize(project=PROJECT_ID)
+    print("✅ Earth Engine initialized successfully with project:", PROJECT_ID)
+except Exception as e:
+    print(f"❌ Initialization failed: {e}")
+    print("🔐 Attempting authentication...")
+    ee.Authenticate()
+    try:
+        ee.Initialize(project=PROJECT_ID)
+        print("✅ Earth Engine initialized after authentication with project:", PROJECT_ID)
+    except Exception as e2:
+        print(f"❌ Still failed: {e2}")
+        print("💡 You may need to:")
+        print("   1. Enable Earth Engine API in your Google Cloud Project")
+        print("   2. Check if project ID is correct:", PROJECT_ID)
+        print("   3. Verify you have access to the project")
+        exit(1)
+
+# ----------------------------
+# 1) Study area (South America)
+# ----------------------------
+countries = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+region_fc = countries.filter(ee.Filter.inList('wld_rgn', ['South America']))
+region = region_fc.geometry()
+export_region = region.bounds()
+
+# ----------------------------
+# 2) Settings
+# ----------------------------
+CRS = 'EPSG:3857'
+KM = 1000
+
+# Load Hansen Global Forest Change dataset
+hansen = ee.Image('UMD/hansen/global_forest_change_2024_v1_12')
+
+# Extract bands
+treecover2000 = hansen.select('treecover2000')  # Tree cover in 2000 (0-100%)
+lossyear = hansen.select('lossyear')            # Year of loss (0-24)
+gain = hansen.select('gain')                    # Forest gain 2000-2012
+
+# ----------------------------
+# 3) Create annual forest cover images
+# ----------------------------
+def create_annual_forest_image(year: int) -> ee.Image:
+    """
+    Create forest cover image for a specific year.
+    
+    Args:
+        year: Year (2000-2024)
+    
+    Returns:
+        Image with bands:
+        - forest_cover: Remaining forest cover (%)
+        - forest_loss: Forest lost in this specific year (binary)
+        - cumulative_loss: All forest lost from 2000 to this year (binary)
+    """
+    year_code = year - 2000  # Convert to Hansen encoding (0-24)
+    
+    # Forest lost in this specific year
+    loss_this_year = lossyear.eq(year_code)
+    
+    # Cumulative loss up to and including this year
+    cumulative_loss = lossyear.gt(0).And(lossyear.lte(year_code))
+    
+    # Calculate remaining forest cover
+    # Start with 2000 baseline, subtract cumulative loss
+    if year == 2000:
+        # Year 2000: use baseline tree cover
+        forest_cover = treecover2000
+    else:
+        # Later years: tree cover where forest hasn't been lost yet
+        forest_cover = treecover2000.multiply(cumulative_loss.Not())
+    
+    # Apply gain (only relevant for years after 2012)
+    if year > 2012:
+        # Add back areas with forest gain (but not where there was loss)
+        forest_cover = forest_cover.where(
+            gain.And(cumulative_loss.Not()), 
+            treecover2000
+        )
+    
+    # Combine bands
+    result = ee.Image.cat([
+        forest_cover.rename(f'forest_cover_{year}'),
+        loss_this_year.rename(f'forest_loss_{year}'),
+        cumulative_loss.rename(f'cumulative_loss_{year}')
+    ])
+    
+    # Downsample to 1 km and clip to South America
+    result = (result
+        .resample('bilinear')
+        .reproject(crs=CRS, scale=KM)
+        .clip(region)
+        .unmask(0)
+        .toFloat()
+    )
+    
+    return result
+
+# ----------------------------
+# 4) Process data for years 2000-2024
+# ----------------------------
+years = list(range(2000, 2025))  # 2000 to 2024 inclusive
+images = {}
+
+for year in years:
+    print(f'Processing year {year}...')
+    images[year] = create_annual_forest_image(year)
+
+# (Optional) sanity print for first year
+print('Bands for 2000:', images[2000].bandNames().getInfo())
+
+# ----------------------------
+# 5) Export to Google Drive for all years
+# ----------------------------
+tasks = []
+for year in years:
+    task = ee.batch.Export.image.toDrive(
+        image=images[year],
+        description=f'Deforestation_SA_1km_{year}',
+        folder='GEE_exports',                 # change or remove as you like
+        fileNamePrefix=f'Deforestation_SA_1km_{year}',
+        region=export_region,
+        crs=CRS,
+        scale=KM,
+        maxPixels=1e13
+    )
+    task.start()
+    tasks.append(task)
+    print(f'Export started for {year}:', task.id)
+
+print(f'\n✅ All {len(tasks)} export tasks started!')
+print(f'📊 Each GeoTIFF contains 3 bands:')
+print(f'   - forest_cover_YYYY: Remaining forest cover (%)')
+print(f'   - forest_loss_YYYY: Forest lost in that specific year (binary)')
+print(f'   - cumulative_loss_YYYY: All forest lost from 2000 to that year (binary)')
+
+# ----------------------------
+# (Optional) Export to Cloud Storage instead of Drive
+# ----------------------------
+# tasks_gcs = []
+# for year in years:
+#     task_gcs = ee.batch.Export.image.toCloudStorage(
+#         image=images[year],
+#         description=f'Deforestation_SA_1km_{year}_gcs',
+#         bucket='your-gcs-bucket',
+#         fileNamePrefix=f'gee/Deforestation_SA_1km_{year}',
+#         region=export_region,
+#         crs=CRS,
+#         scale=KM,
+#         maxPixels=1e13
+#     )
+#     task_gcs.start()
+#     tasks_gcs.append(task_gcs)
+#     print(f'GCS export started for {year}:', task_gcs.id)
+

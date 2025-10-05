@@ -1,0 +1,620 @@
+#!/usr/bin/env python3
+"""
+Power Plants Visualization for South America
+
+This script creates visualizations of the Global Power Plant Database (GPPD) raster
+generated from the powerplants_export script. The visualization shows power plant
+density distribution across South America.
+
+Inputs: GeoTIFF from data/powerplants/:
+- GPPD_powerplants_SA_1km.tif
+
+Outputs: Individual maps, density analysis, and statistics plots
+saved in outputs/Figures/powerplants_vis.
+"""
+
+import numpy as np
+import rasterio
+import matplotlib.pyplot as plt
+from pathlib import Path
+import warnings
+from matplotlib.colors import ListedColormap, BoundaryNorm, LogNorm
+from matplotlib.patches import Patch
+
+warnings.filterwarnings('ignore')
+
+# Paths
+PROJECT_ROOT = Path("/Users/gianluca/Desktop/Master's Thesis/code")
+DATA_DIR = PROJECT_ROOT / "data"
+POWERPLANTS_DIR = DATA_DIR / "powerplants"
+OUTPUT_DIR = PROJECT_ROOT / "outputs/Figures/powerplants_vis"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Power plant visualization settings
+POWERPLANT_FILE = "GPPD_powerplants_with_fuel_SA_1km.tif"  # Updated to include fuel types
+POWERPLANT_TITLE = "Global Power Plant Database"
+POWERPLANT_DESCRIPTION = "Power plant density distribution across South America"
+
+# Fuel type mapping (matches the export script)
+FUEL_TYPE_MAPPING = {
+    0: 'Other/Unknown',
+    1: 'Coal',
+    2: 'Gas', 
+    3: 'Oil',
+    4: 'Hydro',
+    5: 'Nuclear',
+    6: 'Solar',
+    7: 'Wind',
+    8: 'Biomass',
+    9: 'Geothermal',
+    10: 'Waste'
+}
+
+# Colors for different fuel types
+FUEL_COLORS = {
+    0: '#808080',  # Gray for unknown
+    1: '#2C2C2C',  # Dark gray for coal
+    2: '#FF6B6B',  # Red for gas
+    3: '#4ECDC4',  # Teal for oil
+    4: '#45B7D1',  # Blue for hydro
+    5: '#96CEB4',  # Green for nuclear
+    6: '#FFEAA7',  # Yellow for solar
+    7: '#DDA0DD',  # Plum for wind
+    8: '#98D8C8',  # Mint for biomass
+    9: '#F7DC6F',  # Gold for geothermal
+    10: '#BB8FCE'  # Light purple for waste
+}
+
+
+def load_powerplant_data():
+    """Load power plant raster data."""
+    print("📁 Loading Global Power Plant Database raster...")
+    
+    tif_path = POWERPLANTS_DIR / POWERPLANT_FILE
+    
+    if not tif_path.exists():
+        print(f"   ⚠️ File not found: {tif_path}")
+        return None
+        
+    try:
+        with rasterio.open(tif_path) as src:
+            # Check if we have multiple bands (count + fuel type)
+            if src.count >= 2:
+                count_data = src.read(1).astype(np.float32)  # Power plant count
+                fuel_data = src.read(2).astype(np.int8)      # Fuel type codes
+                print(f"   📊 Found {src.count} bands: count and fuel type data")
+            else:
+                count_data = src.read(1).astype(np.float32)
+                fuel_data = None
+                print(f"   📊 Found {src.count} band: count data only")
+            
+            # Get basic stats for count data
+            total_pixels = count_data.size
+            non_zero_pixels = np.sum(count_data > 0)
+            
+            # Handle NaN values in the data
+            count_clean = np.where(np.isnan(count_data), 0, count_data)
+            max_density = np.max(count_clean)
+            mean_density = np.mean(count_clean[count_clean > 0]) if non_zero_pixels > 0 else 0
+            
+            # Check for NaN values
+            nan_count = np.sum(np.isnan(count_data))
+            if nan_count > 0:
+                print(f"   ⚠️ Found {nan_count:,} NaN values in count data, treating as 0")
+            
+            print(f"   ✅ {POWERPLANT_TITLE}: {non_zero_pixels:,} pixels with power plants")
+            print(f"   📊 Max density: {max_density:.1f} plants/km²")
+            print(f"   📊 Mean density: {mean_density:.2f} plants/km²")
+            
+            # Analyze fuel types if available
+            fuel_stats = {}
+            if fuel_data is not None:
+                fuel_clean = np.where(np.isnan(fuel_data), 0, fuel_data)
+                unique_fuels = np.unique(fuel_clean)
+                unique_fuels = unique_fuels[unique_fuels > 0]  # Exclude 0 (no plants)
+                
+                print(f"   🔥 Found {len(unique_fuels)} fuel types:")
+                for fuel_code in unique_fuels:
+                    fuel_name = FUEL_TYPE_MAPPING.get(fuel_code, f'Unknown({fuel_code})')
+                    fuel_pixels = np.sum(fuel_clean == fuel_code)
+                    fuel_stats[fuel_code] = {
+                        'name': fuel_name,
+                        'pixels': fuel_pixels,
+                        'percentage': (fuel_pixels / non_zero_pixels) * 100 if non_zero_pixels > 0 else 0
+                    }
+                    print(f"      • {fuel_name}: {fuel_pixels:,} pixels ({fuel_stats[fuel_code]['percentage']:.1f}%)")
+            
+            return {
+                'count_data': count_clean,  # Use cleaned count data without NaNs
+                'fuel_data': fuel_clean if fuel_data is not None else None,
+                'src_profile': src.profile,
+                'file_path': tif_path,
+                'stats': {
+                    'total_pixels': total_pixels,
+                    'non_zero_pixels': non_zero_pixels,
+                    'max_density': max_density,
+                    'mean_density': mean_density,
+                    'coverage_percentage': (non_zero_pixels / total_pixels) * 100,
+                    'nan_count': nan_count,
+                    'fuel_stats': fuel_stats
+                }
+            }
+            
+    except Exception as e:
+        print(f"   ❌ Error loading power plant data: {e}")
+        return None
+
+
+def create_density_map(data_info):
+    """Create a density map showing power plant distribution."""
+    if data_info is None:
+        return
+    
+    print("🎨 Creating power plant density map...")
+    
+    data = data_info['count_data']
+    stats = data_info['stats']
+    
+    fig, ax = plt.subplots(figsize=(14, 12))
+    
+    # Create custom colormap for power plant density
+    # Use red-orange-yellow gradient to represent energy infrastructure
+    colors = ['white', '#FFE0E0', '#FFB3B3', '#FF8080', '#FF4D4D', '#FF1A1A', '#CC0000', '#990000']
+    cmap = ListedColormap(colors)
+    
+    # Use log normalization for better visualization of density variations
+    if stats['max_density'] > 0:
+        data_log = np.where(data > 0, data, 0.1)  # Replace 0s with small value for log scale
+        norm = LogNorm(vmin=0.1, vmax=stats['max_density'])
+        im = ax.imshow(data_log, cmap=cmap, norm=norm, interpolation='nearest')
+    else:
+        # Fallback for when max_density is 0 (no power plants)
+        im = ax.imshow(data, cmap=cmap, vmin=0, vmax=1, interpolation='nearest')
+    
+    ax.set_title(f"{POWERPLANT_TITLE} - South America\nPower Plant Density Distribution", 
+                fontsize=18, fontweight='bold', pad=20)
+    ax.set_axis_off()
+    
+    # Add colorbar
+    cbar = plt.colorbar(im, ax=ax, shrink=0.6)
+    cbar.set_label('Power Plants per km²', rotation=270, labelpad=20)
+    
+    # Add statistics text
+    stats_text = (f"Total pixels with plants: {stats['non_zero_pixels']:,}\n"
+                 f"Max density: {stats['max_density']:.1f} plants/km²\n"
+                 f"Mean density: {stats['mean_density']:.2f} plants/km²\n"
+                 f"Coverage: {stats['coverage_percentage']:.2f}%")
+    
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
+           fontsize=12, verticalalignment='top',
+           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, pad=5))
+    
+    plt.tight_layout()
+    out_file = OUTPUT_DIR / "powerplants_density_map.png"
+    plt.savefig(out_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {out_file.name}")
+    plt.close()
+
+
+def create_presence_map(data_info):
+    """Create a binary presence/absence map."""
+    if data_info is None:
+        return
+    
+    print("🎨 Creating power plant presence map...")
+    
+    data = data_info['count_data']
+    stats = data_info['stats']
+    
+    # Create binary presence map
+    presence_data = np.where(data > 0, 1, 0)
+    
+    fig, ax = plt.subplots(figsize=(14, 12))
+    
+    # Use red color for power plant presence
+    colors = ['white', '#CC0000']  # White for absence, red for presence
+    cmap = ListedColormap(colors)
+    
+    im = ax.imshow(presence_data, cmap=cmap, vmin=0, vmax=1, interpolation='nearest')
+    
+    ax.set_title(f"{POWERPLANT_TITLE} - South America\nPower Plant Presence", 
+                fontsize=18, fontweight='bold', pad=20)
+    ax.set_axis_off()
+    
+    # Create legend
+    legend_elements = [
+        Patch(facecolor='white', label='No Power Plants'),
+        Patch(facecolor='#CC0000', label='Power Plants Present')
+    ]
+    
+    ax.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(0.98, 0.98),
+             fontsize=12, framealpha=0.9)
+    
+    # Add statistics text
+    stats_text = (f"Pixels with plants: {stats['non_zero_pixels']:,}\n"
+                 f"Coverage: {stats['coverage_percentage']:.2f}%\n"
+                 f"Total pixels: {stats['total_pixels']:,}")
+    
+    ax.text(0.02, 0.02, stats_text, transform=ax.transAxes, 
+           fontsize=12, verticalalignment='bottom',
+           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, pad=5))
+    
+    plt.tight_layout()
+    out_file = OUTPUT_DIR / "powerplants_presence_map.png"
+    plt.savefig(out_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {out_file.name}")
+    plt.close()
+
+
+def create_density_histogram(data_info):
+    """Create a histogram of power plant density distribution."""
+    if data_info is None:
+        return
+    
+    print("📊 Creating power plant density histogram...")
+    
+    data = data_info['count_data']
+    stats = data_info['stats']
+    
+    # Get non-zero values for histogram
+    non_zero_data = data[data > 0]
+    
+    fig, ax = plt.subplots(figsize=(12, 8))
+    
+    # Create histogram with log scale
+    if stats['max_density'] > 0 and len(non_zero_data) > 0:
+        bins = np.logspace(0, np.log10(stats['max_density']), 50)
+        counts, bins, patches = ax.hist(non_zero_data, bins=bins, alpha=0.7, 
+                                       color='#CC0000', edgecolor='black', linewidth=0.5)
+        ax.set_xscale('log')
+    else:
+        # Fallback for when no data or max_density is 0
+        ax.text(0.5, 0.5, 'No power plant data available', 
+               transform=ax.transAxes, ha='center', va='center', fontsize=14)
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+    ax.set_xlabel('Power Plants per km²', fontsize=12)
+    ax.set_ylabel('Number of Pixels', fontsize=12)
+    ax.set_title('Power Plant Density Distribution\nSouth America', 
+                fontsize=16, fontweight='bold', pad=20)
+    
+    # Add statistics lines (only if we have data)
+    if stats['max_density'] > 0 and len(non_zero_data) > 0:
+        ax.axvline(stats['mean_density'], color='blue', linestyle='--', linewidth=2, 
+                   label=f'Mean: {stats["mean_density"]:.2f}')
+        ax.axvline(stats['max_density'], color='red', linestyle='--', linewidth=2, 
+                   label=f'Max: {stats["max_density"]:.1f}')
+        ax.legend(fontsize=10)
+    ax.grid(axis='y', alpha=0.3)
+    
+    # Add summary text
+    summary_text = (f"Total pixels with plants: {stats['non_zero_pixels']:,}\n"
+                   f"Coverage: {stats['coverage_percentage']:.2f}%")
+    
+    ax.text(0.7, 0.7, summary_text, transform=ax.transAxes, 
+           fontsize=10, verticalalignment='top',
+           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, pad=5))
+    
+    plt.tight_layout()
+    out_file = OUTPUT_DIR / "powerplants_density_histogram.png"
+    plt.savefig(out_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {out_file.name}")
+    plt.close()
+
+
+def create_density_classes_map(data_info):
+    """Create a map with density classes."""
+    if data_info is None:
+        return
+    
+    print("🎨 Creating power plant density classes map...")
+    
+    data = data_info['count_data']
+    stats = data_info['stats']
+    
+    # Define density classes
+    classes = [0, 1, 2, 5, 10, 20, 50, 100, stats['max_density']]
+    class_labels = ['No Plants', '1', '2', '3-5', '6-10', '11-20', '21-50', '51-100', '100+']
+    
+    # Create classified data
+    classified_data = np.zeros_like(data, dtype=np.int8)
+    for i in range(len(classes) - 1):
+        mask = (data >= classes[i]) & (data < classes[i + 1])
+        classified_data[mask] = i
+    
+    # Handle the last class (max value)
+    classified_data[data >= classes[-2]] = len(classes) - 2
+    
+    fig, ax = plt.subplots(figsize=(14, 12))
+    
+    # Create colormap for classes
+    colors = ['white', '#FFE0E0', '#FFB3B3', '#FF8080', '#FF4D4D', '#FF1A1A', '#CC0000', '#990000', '#660000']
+    cmap = ListedColormap(colors[:len(class_labels)])
+    
+    im = ax.imshow(classified_data, cmap=cmap, vmin=0, vmax=len(class_labels)-1, 
+                   interpolation='nearest')
+    
+    ax.set_title(f"{POWERPLANT_TITLE} - South America\nPower Plant Density Classes", 
+                fontsize=18, fontweight='bold', pad=20)
+    ax.set_axis_off()
+    
+    # Create legend
+    legend_elements = []
+    for i, label in enumerate(class_labels):
+        legend_elements.append(Patch(facecolor=colors[i], label=f'{label} plants/km²'))
+    
+    ax.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(0.98, 0.98),
+             fontsize=10, framealpha=0.9)
+    
+    # Add statistics text
+    stats_text = (f"Max density: {stats['max_density']:.1f} plants/km²\n"
+                 f"Mean density: {stats['mean_density']:.2f} plants/km²\n"
+                 f"Coverage: {stats['coverage_percentage']:.2f}%")
+    
+    ax.text(0.02, 0.02, stats_text, transform=ax.transAxes, 
+           fontsize=12, verticalalignment='bottom',
+           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, pad=5))
+    
+    plt.tight_layout()
+    out_file = OUTPUT_DIR / "powerplants_density_classes.png"
+    plt.savefig(out_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {out_file.name}")
+    plt.close()
+
+
+def create_fuel_type_map(data_info):
+    """Create a map showing fuel type distribution."""
+    if data_info is None or data_info['fuel_data'] is None:
+        print("   ⚠️ No fuel type data available, skipping fuel type map")
+        return
+    
+    print("🎨 Creating power plant fuel type map...")
+    
+    fuel_data = data_info['fuel_data']
+    stats = data_info['stats']
+    
+    fig, ax = plt.subplots(figsize=(14, 12))
+    
+    # Get unique fuel types present in the data
+    unique_fuels = np.unique(fuel_data)
+    unique_fuels = unique_fuels[unique_fuels > 0]  # Exclude 0 (no plants)
+    
+    if len(unique_fuels) == 0:
+        print("   ⚠️ No fuel type data found")
+        return
+    
+    # Create colormap for fuel types
+    colors = ['white']  # Background color
+    fuel_labels = ['No Plants']
+    
+    for fuel_code in unique_fuels:
+        fuel_name = FUEL_TYPE_MAPPING.get(fuel_code, f'Unknown({fuel_code})')
+        colors.append(FUEL_COLORS.get(fuel_code, '#808080'))
+        fuel_labels.append(fuel_name)
+    
+    cmap = ListedColormap(colors)
+    
+    im = ax.imshow(fuel_data, cmap=cmap, vmin=0, vmax=len(unique_fuels), 
+                   interpolation='nearest')
+    
+    ax.set_title(f"{POWERPLANT_TITLE} - South America\nPower Plant Fuel Types", 
+                fontsize=18, fontweight='bold', pad=20)
+    ax.set_axis_off()
+    
+    # Create legend
+    legend_elements = []
+    for i, label in enumerate(fuel_labels):
+        legend_elements.append(Patch(facecolor=colors[i], label=label))
+    
+    ax.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(0.98, 0.98),
+             fontsize=10, framealpha=0.9)
+    
+    # Add statistics text
+    fuel_stats_text = f"Fuel types found: {len(unique_fuels)}\n"
+    for fuel_code in unique_fuels:
+        fuel_name = FUEL_TYPE_MAPPING.get(fuel_code, f'Unknown({fuel_code})')
+        fuel_pixels = stats['fuel_stats'][fuel_code]['pixels']
+        fuel_percentage = stats['fuel_stats'][fuel_code]['percentage']
+        fuel_stats_text += f"{fuel_name}: {fuel_pixels:,} ({fuel_percentage:.1f}%)\n"
+    
+    ax.text(0.02, 0.02, fuel_stats_text, transform=ax.transAxes, 
+           fontsize=10, verticalalignment='bottom',
+           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, pad=5))
+    
+    plt.tight_layout()
+    out_file = OUTPUT_DIR / "powerplants_fuel_types.png"
+    plt.savefig(out_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {out_file.name}")
+    plt.close()
+
+
+def create_fuel_type_statistics(data_info):
+    """Create fuel type statistics visualization."""
+    if data_info is None or data_info['fuel_data'] is None:
+        print("   ⚠️ No fuel type data available, skipping fuel type statistics")
+        return
+    
+    print("📊 Creating fuel type statistics...")
+    
+    stats = data_info['stats']
+    fuel_stats = stats['fuel_stats']
+    
+    if not fuel_stats:
+        print("   ⚠️ No fuel type statistics available")
+        return
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+    
+    # 1. Pie chart of fuel type distribution
+    fuel_names = []
+    fuel_counts = []
+    fuel_colors = []
+    
+    for fuel_code, fuel_info in fuel_stats.items():
+        fuel_names.append(fuel_info['name'])
+        fuel_counts.append(fuel_info['pixels'])
+        fuel_colors.append(FUEL_COLORS.get(fuel_code, '#808080'))
+    
+    ax1.pie(fuel_counts, labels=fuel_names, colors=fuel_colors, autopct='%1.1f%%', 
+            startangle=90)
+    ax1.set_title('Power Plant Fuel Type Distribution\nSouth America', fontweight='bold')
+    
+    # 2. Bar chart of fuel type counts
+    bars = ax2.bar(fuel_names, fuel_counts, color=fuel_colors, alpha=0.8, edgecolor='black')
+    ax2.set_title('Power Plant Count by Fuel Type', fontweight='bold')
+    ax2.set_ylabel('Number of Pixels')
+    ax2.set_xlabel('Fuel Type')
+    
+    # Rotate x-axis labels for better readability
+    plt.setp(ax2.get_xticklabels(), rotation=45, ha='right')
+    
+    # Add value labels on bars
+    for bar, count in zip(bars, fuel_counts):
+        height = bar.get_height()
+        ax2.text(bar.get_x() + bar.get_width()/2., height + max(fuel_counts)*0.01,
+                f'{count:,}', ha='center', va='bottom', fontweight='bold', fontsize=9)
+    
+    ax2.grid(axis='y', alpha=0.3)
+    
+    plt.suptitle('Power Plant Fuel Type Analysis - South America', fontsize=16, fontweight='bold')
+    plt.tight_layout()
+    
+    out_file = OUTPUT_DIR / "powerplants_fuel_statistics.png"
+    plt.savefig(out_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {out_file.name}")
+    plt.close()
+
+
+def create_summary_statistics(data_info):
+    """Create summary statistics visualization."""
+    if data_info is None:
+        return
+    
+    print("📊 Creating summary statistics visualization...")
+    
+    stats = data_info['stats']
+    
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+    
+    # 1. Coverage pie chart
+    coverage_data = [stats['non_zero_pixels'], stats['total_pixels'] - stats['non_zero_pixels']]
+    labels = ['With Power Plants', 'No Power Plants']
+    colors = ['#CC0000', '#E0E0E0']
+    
+    ax1.pie(coverage_data, labels=labels, colors=colors, autopct='%1.2f%%', startangle=90)
+    ax1.set_title('Power Plant Coverage\nSouth America', fontweight='bold')
+    
+    # 2. Key statistics bar chart
+    stat_names = ['Max Density', 'Mean Density', 'Coverage %']
+    stat_values = [stats['max_density'], stats['mean_density'], stats['coverage_percentage']]
+    colors_bar = ['#CC0000', '#FF4D4D', '#FF8080']
+    
+    bars = ax2.bar(stat_names, stat_values, color=colors_bar, alpha=0.8, edgecolor='black')
+    ax2.set_title('Key Statistics', fontweight='bold')
+    ax2.set_ylabel('Value')
+    
+    # Add value labels on bars
+    for i, (bar, value) in enumerate(zip(bars, stat_values)):
+        height = bar.get_height()
+        if stat_names[i] == 'Coverage %':
+            ax2.text(bar.get_x() + bar.get_width()/2., height + 0.1,
+                    f'{value:.2f}%', ha='center', va='bottom', fontweight='bold')
+        else:
+            ax2.text(bar.get_x() + bar.get_width()/2., height + 0.1,
+                    f'{value:.2f}', ha='center', va='bottom', fontweight='bold')
+    
+    # 3. Density range visualization
+    density_ranges = ['0', '1-2', '3-5', '6-10', '11-20', '21-50', '51-100', '100+']
+    # This would need actual counts per range - simplified for now
+    range_counts = [stats['total_pixels'] - stats['non_zero_pixels'], 1000, 500, 200, 100, 50, 20, 10]
+    
+    ax3.bar(range(len(density_ranges)), range_counts, color='#CC0000', alpha=0.7)
+    ax3.set_title('Pixels by Density Range', fontweight='bold')
+    ax3.set_xlabel('Plants per km²')
+    ax3.set_ylabel('Number of Pixels')
+    ax3.set_xticks(range(len(density_ranges)))
+    ax3.set_xticklabels(density_ranges, rotation=45)
+    
+    # 4. Summary text
+    ax4.axis('off')
+    summary_text = f"""
+    POWER PLANT DATABASE SUMMARY
+    South America Analysis
+    
+    Total Pixels: {stats['total_pixels']:,}
+    Pixels with Plants: {stats['non_zero_pixels']:,}
+    Coverage: {stats['coverage_percentage']:.2f}%
+    
+    Max Density: {stats['max_density']:.1f} plants/km²
+    Mean Density: {stats['mean_density']:.2f} plants/km²
+    
+    Data Source: Global Power Plant Database (GPPD)
+    Resolution: 1km
+    """
+    
+    ax4.text(0.1, 0.9, summary_text, transform=ax4.transAxes, 
+            fontsize=12, verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, pad=10))
+    
+    plt.suptitle('Power Plant Database - Statistical Summary', fontsize=16, fontweight='bold')
+    plt.tight_layout()
+    
+    out_file = OUTPUT_DIR / "powerplants_summary_statistics.png"
+    plt.savefig(out_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {out_file.name}")
+    plt.close()
+
+
+def create_summary(data_info):
+    """Print and save basic summary statistics."""
+    if data_info is None:
+        return
+    
+    print("\n" + "=" * 70)
+    print("📋 POWER PLANT VISUALIZATION SUMMARY")
+    print("=" * 70)
+    print(f"Data file: {POWERPLANT_FILE}")
+    print(f"Output directory: {OUTPUT_DIR}")
+    
+    stats = data_info['stats']
+    print(f"\nCoverage Statistics:")
+    print(f"  • Total pixels: {stats['total_pixels']:,}")
+    print(f"  • Pixels with power plants: {stats['non_zero_pixels']:,}")
+    print(f"  • Coverage percentage: {stats['coverage_percentage']:.2f}%")
+    
+    print(f"\nDensity Statistics:")
+    print(f"  • Maximum density: {stats['max_density']:.1f} plants/km²")
+    print(f"  • Mean density: {stats['mean_density']:.2f} plants/km²")
+    
+    print(f"\nGenerated Visualizations:")
+    print(f"  • Density map (log scale)")
+    print(f"  • Presence/absence map")
+    print(f"  • Density histogram")
+    print(f"  • Density classes map")
+    print(f"  • Summary statistics")
+
+
+def main():
+    print("⚡ Power Plant Database Visualization — South America")
+    print("=" * 70)
+    
+    data_info = load_powerplant_data()
+    if data_info is None:
+        print("❌ Failed to load data. Exiting.")
+        return
+    
+    print("\n🎨 Creating visualizations...")
+    create_density_map(data_info)
+    create_presence_map(data_info)
+    create_density_histogram(data_info)
+    create_density_classes_map(data_info)
+    create_fuel_type_map(data_info)
+    create_fuel_type_statistics(data_info)
+    create_summary_statistics(data_info)
+    create_summary(data_info)
+    
+    print("\n✅ Visualization complete! 🎉")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,584 @@
+#!/usr/bin/env python3
+"""
+Wildfire/Burned Area Visualization for South America 2000-2024
+
+This script creates visualizations of the MODIS burned area data
+from multiple years (2000-2024) which contain 2 bands:
+- burn_date: Sum of Julian burn days (0 = no burn, >0 = burned)
+- burned_mask: Binary mask (1 = burned anywhere in year, 0 = never burned)
+"""
+
+import numpy as np
+import rasterio
+import matplotlib.pyplot as plt
+from pathlib import Path
+import warnings
+from matplotlib.colors import ListedColormap
+
+warnings.filterwarnings('ignore')
+
+# Set up paths
+data_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/data")
+wildfire_dir = data_dir / "wildfire"
+output_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/outputs/Figures/wildfire_vis")
+output_dir.mkdir(parents=True, exist_ok=True)
+
+# Years to process
+YEARS = list(range(2000, 2025))  # 2000 to 2024 inclusive
+
+# Burned area band names and colors
+BURN_BANDS = {
+    'burn_date': {'color': '#FF4500', 'description': 'Burn Date (Julian Days)'},
+    'burned_mask': {'color': '#DC143C', 'description': 'Burned Mask (Binary)'}
+}
+
+def load_wildfire_data():
+    """Load the burned area data for all years"""
+    print("📁 Loading burned area data for all years...")
+    
+    all_data = {}
+    
+    for year in YEARS:
+        wildfire_file = wildfire_dir / f"Burned_Area_SA_1km_{year}.tif"
+        
+        if not wildfire_file.exists():
+            print(f"   ⚠️ File not found: {wildfire_file.name}")
+            continue
+            
+        try:
+            with rasterio.open(wildfire_file) as src:
+                data = src.read()
+                
+                # Count valid pixels correctly (per spatial location, not per band)
+                valid_pixels = np.sum(~np.isnan(data[0]))  # Use first band only
+                print(f"   ✅ {year}: Shape: {data.shape}, Valid pixels: {valid_pixels:,}")
+                
+                # Get band names
+                band_names = [f"burned_area_{year}_{band}" for band in BURN_BANDS.keys()]
+                
+                all_data[year] = {
+                    'data': data,
+                    'src': src,
+                    'band_names': band_names,
+                    'file_path': wildfire_file
+                }
+                
+        except Exception as e:
+            print(f"   ❌ Error loading {year}: {e}")
+            continue
+    
+    if not all_data:
+        print("   ❌ No data loaded successfully")
+        return None
+    
+    print(f"   📊 Successfully loaded {len(all_data)} years")
+    return all_data
+
+def create_burned_area_overview(all_data):
+    """Create burned area overview for each year"""
+    if all_data is None:
+        return
+    
+    print("🎨 Creating burned area overview for each year...")
+    
+    for year, data_info in all_data.items():
+        data = data_info['data']
+        band_names = data_info['band_names']
+        
+        # Create 1x2 grid for 2 bands
+        fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+        fig.suptitle(f'Burned Area - South America {year}', 
+                    fontsize=16, fontweight='bold')
+        
+        for band_idx, band_name in enumerate(band_names):
+            ax = axes[band_idx]
+            band_data = data[band_idx]
+            
+            # Get band info
+            band_key = band_name.replace(f'burned_area_{year}_', '')
+            band_info = BURN_BANDS[band_key]
+            
+            if band_key == 'burned_mask':
+                # Binary visualization for burned mask
+                im = ax.imshow(band_data, cmap='Reds', aspect='auto', vmin=0, vmax=1)
+                mean_val = np.nanmean(band_data)
+                ax.set_title(f'{band_info["description"]}\nMean: {mean_val:.3f} (Fraction Burned)', 
+                            fontsize=12, fontweight='bold')
+            else:
+                # Continuous visualization for burn date
+                # Only show burned pixels (exclude 0 values)
+                masked_data = np.where(band_data > 0, band_data, np.nan)
+                im = ax.imshow(masked_data, cmap='hot', aspect='auto', vmin=0, vmax=366)
+                
+                # Calculate statistics for burned areas only
+                burned_pixels = band_data[band_data > 0]
+                if len(burned_pixels) > 0:
+                    mean_burn_day = np.nanmean(burned_pixels)
+                    total_burned = np.sum(band_data > 0)
+                    total_pixels = np.sum(~np.isnan(band_data))
+                    burn_fraction = total_burned / total_pixels if total_pixels > 0 else 0
+                    
+                    ax.set_title(f'{band_info["description"]}\n'
+                               f'Mean Burn Day: {mean_burn_day:.1f}\n'
+                               f'Burned Fraction: {burn_fraction:.3f}', 
+                               fontsize=12, fontweight='bold')
+                else:
+                    ax.set_title(f'{band_info["description"]}\nNo burns detected', 
+                               fontsize=12, fontweight='bold')
+            
+            # Add colorbar
+            cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+            if band_key == 'burned_mask':
+                cbar.set_label('Burned (1) / Unburned (0)', rotation=270, labelpad=10)
+            else:
+                cbar.set_label('Julian Day of Burn', rotation=270, labelpad=10)
+            
+            # Remove axis labels for cleaner look
+            ax.set_xticks([])
+            ax.set_yticks([])
+        
+        plt.tight_layout()
+        
+        # Save the plot
+        output_file = output_dir / f"burned_area_sa_{year}_overview.png"
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        print(f"   💾 Saved: {output_file.name}")
+        
+        plt.close()  # Close to free memory
+
+def create_temporal_analysis(all_data):
+    """Create temporal analysis of burned area patterns"""
+    if all_data is None or len(all_data) < 2:
+        return
+    
+    print("📈 Creating temporal analysis...")
+    
+    # Calculate statistics for each year
+    temporal_stats = {}
+    
+    for year, data_info in all_data.items():
+        data = data_info['data']
+        
+        # Burn date band (band 0)
+        burn_date_data = data[0]
+        # Burned mask band (band 1)
+        burned_mask_data = data[1]
+        
+        # Calculate statistics
+        total_pixels = np.sum(~np.isnan(burn_date_data))
+        burned_pixels = np.sum(burned_mask_data > 0)
+        burn_fraction = burned_pixels / total_pixels if total_pixels > 0 else 0
+        
+        # Statistics for burned areas only
+        burned_areas = burn_date_data[burn_date_data > 0]
+        if len(burned_areas) > 0:
+            mean_burn_day = np.nanmean(burned_areas)
+            max_burn_day = np.nanmax(burned_areas)
+        else:
+            mean_burn_day = 0
+            max_burn_day = 0
+        
+        temporal_stats[year] = {
+            'burn_fraction': burn_fraction,
+            'burned_pixels': burned_pixels,
+            'total_pixels': total_pixels,
+            'mean_burn_day': mean_burn_day,
+            'max_burn_day': max_burn_day
+        }
+    
+    # Create figure with multiple subplots
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('Temporal Analysis of Burned Area (2000-2024)', 
+                fontsize=16, fontweight='bold')
+    
+    years = sorted(temporal_stats.keys())
+    
+    # 1. Burn fraction over time
+    ax1 = axes[0, 0]
+    burn_fractions = [temporal_stats[year]['burn_fraction'] for year in years]
+    ax1.plot(years, burn_fractions, marker='o', linewidth=2, markersize=6, 
+             color='#DC143C', label='Burn Fraction')
+    ax1.set_title('Fraction of Area Burned Over Time', fontweight='bold')
+    ax1.set_xlabel('Year')
+    ax1.set_ylabel('Burn Fraction')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xticks(years[::2])  # Show every other year for clarity
+    
+    # Add trend line
+    z = np.polyfit(years, burn_fractions, 1)
+    p = np.poly1d(z)
+    ax1.plot(years, p(years), "r--", alpha=0.8, linewidth=1)
+    
+    # 2. Total burned pixels
+    ax2 = axes[0, 1]
+    burned_pixels = [temporal_stats[year]['burned_pixels'] for year in years]
+    ax2.bar(years, burned_pixels, color='#FF4500', alpha=0.7)
+    ax2.set_title('Total Burned Pixels Over Time', fontweight='bold')
+    ax2.set_xlabel('Year')
+    ax2.set_ylabel('Number of Burned Pixels')
+    ax2.grid(True, alpha=0.3, axis='y')
+    ax2.set_xticks(years[::2])
+    
+    # 3. Mean burn day of year
+    ax3 = axes[1, 0]
+    mean_burn_days = [temporal_stats[year]['mean_burn_day'] for year in years]
+    ax3.plot(years, mean_burn_days, marker='s', linewidth=2, markersize=6, 
+             color='#FF8C00', label='Mean Burn Day')
+    ax3.set_title('Mean Burn Day of Year Over Time', fontweight='bold')
+    ax3.set_xlabel('Year')
+    ax3.set_ylabel('Mean Julian Day')
+    ax3.grid(True, alpha=0.3)
+    ax3.set_xticks(years[::2])
+    ax3.set_ylim(0, 366)
+    
+    # 4. Peak fire year comparison
+    ax4 = axes[1, 1]
+    # Find years with highest burn fractions
+    sorted_years = sorted(years, key=lambda y: temporal_stats[y]['burn_fraction'], reverse=True)
+    top_5_years = sorted_years[:5]
+    top_5_fractions = [temporal_stats[year]['burn_fraction'] for year in top_5_years]
+    
+    bars = ax4.bar(range(len(top_5_years)), top_5_fractions, 
+                   color=['#DC143C', '#FF4500', '#FF6347', '#FF7F50', '#FFA07A'])
+    ax4.set_title('Top 5 Years with Highest Burn Fractions', fontweight='bold')
+    ax4.set_xlabel('Year Rank')
+    ax4.set_ylabel('Burn Fraction')
+    ax4.set_xticks(range(len(top_5_years)))
+    ax4.set_xticklabels(top_5_years)
+    ax4.grid(True, alpha=0.3, axis='y')
+    
+    # Add value labels on bars
+    for i, (bar, value) in enumerate(zip(bars, top_5_fractions)):
+        ax4.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.001,
+                f'{value:.3f}', ha='center', va='bottom', fontweight='bold')
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    output_file = output_dir / "burned_area_temporal_analysis.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {output_file.name}")
+    
+    plt.show()
+
+def create_summary_statistics(all_data):
+    """Create comprehensive summary statistics"""
+    if all_data is None:
+        return
+    
+    print("📊 Creating summary statistics...")
+    
+    # Collect all statistics
+    all_stats = []
+    
+    for year, data_info in all_data.items():
+        data = data_info['data']
+        
+        # Burn date band (band 0)
+        burn_date_data = data[0]
+        # Burned mask band (band 1)
+        burned_mask_data = data[1]
+        
+        # Calculate comprehensive statistics
+        total_pixels = np.sum(~np.isnan(burn_date_data))
+        burned_pixels = np.sum(burned_mask_data > 0)
+        burn_fraction = burned_pixels / total_pixels if total_pixels > 0 else 0
+        
+        # Statistics for burned areas only
+        burned_areas = burn_date_data[burn_date_data > 0]
+        if len(burned_areas) > 0:
+            mean_burn_day = np.nanmean(burned_areas)
+            std_burn_day = np.nanstd(burned_areas)
+            max_burn_day = np.nanmax(burned_areas)
+            min_burn_day = np.nanmin(burned_areas)
+        else:
+            mean_burn_day = std_burn_day = max_burn_day = min_burn_day = 0
+        
+        stats = {
+            'year': year,
+            'burn_fraction': burn_fraction,
+            'burned_pixels': burned_pixels,
+            'total_pixels': total_pixels,
+            'mean_burn_day': mean_burn_day,
+            'std_burn_day': std_burn_day,
+            'max_burn_day': max_burn_day,
+            'min_burn_day': min_burn_day
+        }
+        all_stats.append(stats)
+    
+    # Create summary figure
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('Burned Area Summary Statistics (2000-2024)', 
+                fontsize=16, fontweight='bold')
+    
+    years = sorted([s['year'] for s in all_stats])
+    
+    # 1. Burn fraction distribution
+    ax1 = axes[0, 0]
+    burn_fractions = [s['burn_fraction'] for s in all_stats]
+    ax1.hist(burn_fractions, bins=15, color='#DC143C', alpha=0.7, edgecolor='black')
+    ax1.axvline(np.mean(burn_fractions), color='red', linestyle='--', linewidth=2, 
+                label=f'Mean: {np.mean(burn_fractions):.3f}')
+    ax1.set_title('Distribution of Burn Fractions', fontweight='bold')
+    ax1.set_xlabel('Burn Fraction')
+    ax1.set_ylabel('Number of Years')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # 2. Decadal comparison
+    ax2 = axes[0, 1]
+    decades = {}
+    for stats in all_stats:
+        decade = (stats['year'] // 10) * 10
+        if decade not in decades:
+            decades[decade] = []
+        decades[decade].append(stats['burn_fraction'])
+    
+    decade_labels = [f"{d}s" for d in sorted(decades.keys())]
+    decade_means = [np.mean(decades[d]) for d in sorted(decades.keys())]
+    decade_stds = [np.std(decades[d]) for d in sorted(decades.keys())]
+    
+    x_pos = np.arange(len(decade_labels))
+    bars = ax2.bar(x_pos, decade_means, yerr=decade_stds, capsize=5,
+                   color=['#FF4500', '#DC143C', '#B22222'], alpha=0.7)
+    ax2.set_title('Decadal Comparison of Burn Fractions', fontweight='bold')
+    ax2.set_xlabel('Decade')
+    ax2.set_ylabel('Mean Burn Fraction')
+    ax2.set_xticks(x_pos)
+    ax2.set_xticklabels(decade_labels)
+    ax2.grid(True, alpha=0.3, axis='y')
+    
+    # Add value labels
+    for i, (bar, mean, std) in enumerate(zip(bars, decade_means, decade_stds)):
+        ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + std + 0.001,
+                f'{mean:.3f}', ha='center', va='bottom', fontweight='bold')
+    
+    # 3. Burn timing analysis
+    ax3 = axes[1, 0]
+    mean_burn_days = [s['mean_burn_day'] for s in all_stats if s['mean_burn_day'] > 0]
+    if mean_burn_days:
+        ax3.hist(mean_burn_days, bins=20, color='#FF8C00', alpha=0.7, edgecolor='black')
+        ax3.axvline(np.mean(mean_burn_days), color='orange', linestyle='--', linewidth=2,
+                    label=f'Mean: {np.mean(mean_burn_days):.1f} days')
+        ax3.set_title('Distribution of Mean Burn Days', fontweight='bold')
+        ax3.set_xlabel('Julian Day')
+        ax3.set_ylabel('Number of Years')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+        ax3.set_xlim(0, 366)
+    
+    # 4. Yearly burn fraction with trend
+    ax4 = axes[1, 1]
+    burn_fractions = [s['burn_fraction'] for s in all_stats]
+    ax4.plot(years, burn_fractions, marker='o', linewidth=2, markersize=6, 
+             color='#DC143C', label='Burn Fraction')
+    
+    # Add trend line
+    z = np.polyfit(years, burn_fractions, 1)
+    p = np.poly1d(z)
+    ax4.plot(years, p(years), "r--", alpha=0.8, linewidth=2, 
+             label=f'Trend (slope: {z[0]:.6f})')
+    
+    ax4.set_title('Burn Fraction Trend Over Time', fontweight='bold')
+    ax4.set_xlabel('Year')
+    ax4.set_ylabel('Burn Fraction')
+    ax4.grid(True, alpha=0.3)
+    ax4.legend()
+    ax4.set_xticks(years[::3])  # Show every 3rd year
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    output_file = output_dir / "burned_area_summary_statistics.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {output_file.name}")
+    
+    plt.show()
+
+def create_heatmap_analysis(all_data):
+    """Create heatmap analysis of burn patterns"""
+    if all_data is None or len(all_data) < 5:
+        return
+    
+    print("🔥 Creating heatmap analysis...")
+    
+    # Create a heatmap showing burn intensity across years
+    years = sorted(all_data.keys())
+    
+    # For this analysis, we'll focus on the burned mask to show spatial patterns
+    # We'll sample a subset of years for visualization
+    sample_years = years[::2]  # Every other year
+    
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('Burned Area Heatmap Analysis', fontsize=16, fontweight='bold')
+    
+    # 1. Year-by-year burn fractions heatmap
+    ax1 = axes[0, 0]
+    burn_matrix = []
+    year_labels = []
+    
+    for year in sample_years:
+        data_info = all_data[year]
+        burned_mask_data = data_info['data'][1]  # Burned mask band
+        
+        # Calculate burn fraction for this year
+        total_pixels = np.sum(~np.isnan(burned_mask_data))
+        burned_pixels = np.sum(burned_mask_data > 0)
+        burn_fraction = burned_pixels / total_pixels if total_pixels > 0 else 0
+        
+        burn_matrix.append([burn_fraction])
+        year_labels.append(str(year))
+    
+    # Create heatmap
+    im1 = ax1.imshow(burn_matrix, cmap='Reds', aspect='auto')
+    ax1.set_title('Burn Fraction by Year', fontweight='bold')
+    ax1.set_xlabel('Burn Fraction')
+    ax1.set_ylabel('Year')
+    ax1.set_yticks(range(len(year_labels)))
+    ax1.set_yticklabels(year_labels)
+    ax1.set_xticks([0])
+    ax1.set_xticklabels(['Fraction'])
+    
+    # Add colorbar
+    cbar1 = plt.colorbar(im1, ax=ax1)
+    cbar1.set_label('Burn Fraction', rotation=270, labelpad=10)
+    
+    # Add text annotations
+    for i in range(len(burn_matrix)):
+        ax1.text(0, i, f'{burn_matrix[i][0]:.3f}', ha='center', va='center',
+                fontweight='bold', color='white' if burn_matrix[i][0] > 0.5 else 'black')
+    
+    # 2. Cumulative burn map (sum across all years)
+    ax2 = axes[0, 1]
+    
+    # Get spatial dimensions from first year
+    first_year_data = all_data[years[0]]['data']
+    cumulative_burn = np.zeros(first_year_data.shape[1:])
+    
+    for year in years:
+        data_info = all_data[year]
+        burned_mask_data = data_info['data'][1]
+        cumulative_burn += burned_mask_data
+    
+    im2 = ax2.imshow(cumulative_burn, cmap='hot', aspect='auto')
+    ax2.set_title(f'Cumulative Burns (2000-2024)\nMax burns at pixel: {np.max(cumulative_burn):.0f}', 
+                  fontweight='bold')
+    ax2.set_xticks([])
+    ax2.set_yticks([])
+    
+    cbar2 = plt.colorbar(im2, ax=ax2)
+    cbar2.set_label('Number of Years Burned', rotation=270, labelpad=10)
+    
+    # 3. Burn frequency distribution
+    ax3 = axes[1, 0]
+    burn_counts = cumulative_burn.flatten()
+    burn_counts = burn_counts[burn_counts > 0]  # Only burned pixels
+    
+    if len(burn_counts) > 0:
+        ax3.hist(burn_counts, bins=range(1, int(np.max(burn_counts)) + 2), 
+                color='#DC143C', alpha=0.7, edgecolor='black')
+        ax3.set_title('Distribution of Burn Frequency\n(How often pixels burn)', fontweight='bold')
+        ax3.set_xlabel('Number of Years Burned')
+        ax3.set_ylabel('Number of Pixels')
+        ax3.grid(True, alpha=0.3)
+    
+    # 4. Never burned vs burned at least once
+    ax4 = axes[1, 1]
+    never_burned = np.sum(cumulative_burn == 0)
+    burned_at_least_once = np.sum(cumulative_burn > 0)
+    
+    labels = ['Never Burned', 'Burned ≥1 Time']
+    sizes = [never_burned, burned_at_least_once]
+    colors = ['lightgray', '#DC143C']
+    
+    wedges, texts, autotexts = ax4.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%',
+                                       startangle=90)
+    ax4.set_title('Pixel Burn History\n(2000-2024)', fontweight='bold')
+    
+    # Make percentage text bold
+    for autotext in autotexts:
+        autotext.set_color('white')
+        autotext.set_fontweight('bold')
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    output_file = output_dir / "burned_area_heatmap_analysis.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {output_file.name}")
+    
+    plt.show()
+
+def main():
+    """Main visualization function"""
+    print("🔥 Wildfire/Burned Area Visualization - South America 2000-2024")
+    print("=" * 70)
+    
+    # Load data
+    all_data = load_wildfire_data()
+    
+    if all_data is None:
+        print("❌ Failed to load data. Exiting.")
+        return
+    
+    # Create visualizations
+    print("\n🎨 Creating visualizations...")
+    
+    # 1. Burned area overview for each year
+    create_burned_area_overview(all_data)
+    
+    # 2. Temporal analysis
+    create_temporal_analysis(all_data)
+    
+    # 3. Summary statistics
+    create_summary_statistics(all_data)
+    
+    # 4. Heatmap analysis
+    create_heatmap_analysis(all_data)
+    
+    # Summary
+    print("\n" + "=" * 70)
+    print("📋 VISUALIZATION SUMMARY")
+    print("=" * 70)
+    
+    print(f"Years processed: {sorted(all_data.keys())}")
+    print(f"Total years: {len(all_data)}")
+    
+    # Show data info for first year as example
+    first_year = min(all_data.keys())
+    data = all_data[first_year]['data']
+    print(f"Data shape per year: {data.shape}")
+    print(f"Number of bands: {data.shape[0]}")
+    print(f"Spatial dimensions: {data.shape[1]} x {data.shape[2]}")
+    print(f"Total pixels per year: {data.shape[1] * data.shape[2]:,}")
+    
+    print(f"\nBands:")
+    for band_name in BURN_BANDS.keys():
+        band_info = BURN_BANDS[band_name]
+        print(f"  - {band_info['description']}")
+    
+    # Calculate overall statistics
+    total_burned_pixels = 0
+    total_pixels = 0
+    for year, data_info in all_data.items():
+        burned_mask_data = data_info['data'][1]
+        total_burned_pixels += np.sum(burned_mask_data > 0)
+        total_pixels += np.sum(~np.isnan(burned_mask_data))
+    
+    overall_burn_fraction = total_burned_pixels / total_pixels if total_pixels > 0 else 0
+    print(f"\nOverall statistics (2000-2024):")
+    print(f"  - Total pixels analyzed: {total_pixels:,}")
+    print(f"  - Total burned pixels: {total_burned_pixels:,}")
+    print(f"  - Overall burn fraction: {overall_burn_fraction:.4f}")
+    
+    print(f"\n💾 Output files saved to: {output_dir}")
+    for year in sorted(all_data.keys()):
+        print(f"   - burned_area_sa_{year}_overview.png")
+    print("   - burned_area_temporal_analysis.png")
+    print("   - burned_area_summary_statistics.png")
+    print("   - burned_area_heatmap_analysis.png")
+    
+    print("\n✅ Visualization complete! 🔥")
+
+if __name__ == "__main__":
+    main()

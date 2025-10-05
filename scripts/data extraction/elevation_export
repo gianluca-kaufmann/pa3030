@@ -1,0 +1,200 @@
+"""
+Elevation & Slope Export from COPERNICUS/DEM/GLO30 → 1 km (South America)
+Method: downsample to 1 km (EPSG:3857, bilinear), calculate slope, clip to South America.
+
+Outputs: 2 GeoTIFFs (elevation_SA_1km, slope_SA_1km), float32, clipped to South America.
+"""
+
+import ee
+ee.Authenticate()   # Opens a browser for Google login
+
+# ----------------------------
+# 0) Auth & init
+# ----------------------------
+# First run: ee.Authenticate()
+# If you use a specific EE project, pass project="your-ee-project" to Initialize.
+# Use your project ID
+PROJECT_ID = 'master-thesis-473316'
+
+try:
+    ee.Initialize(project=PROJECT_ID)
+    print("✅ Earth Engine initialized successfully with project:", PROJECT_ID)
+except Exception as e:
+    print(f"❌ Initialization failed: {e}")
+    print("🔐 Attempting authentication...")
+    ee.Authenticate()
+    try:
+        ee.Initialize(project=PROJECT_ID)
+        print("✅ Earth Engine initialized after authentication with project:", PROJECT_ID)
+    except Exception as e2:
+        print(f"❌ Still failed: {e2}")
+        print("💡 You may need to:")
+        print("   1. Enable Earth Engine API in your Google Cloud Project")
+        print("   2. Check if project ID is correct:", PROJECT_ID)
+        print("   3. Verify you have access to the project")
+        exit(1)
+
+# ----------------------------
+# 1) Study area (South America)
+# ----------------------------
+countries = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+region_fc = countries.filter(ee.Filter.inList('wld_rgn', ['South America']))
+region = region_fc.geometry()
+export_region = region.bounds()
+
+# ----------------------------
+# 2) Settings
+# ----------------------------
+CRS = 'EPSG:3857'
+KM = 1000
+# Try using SRTM DEM instead of COPERNICUS (SRTM has better global coverage)
+DEM = ee.Image('USGS/SRTMGL1_003')
+
+# ----------------------------
+# 3) Process elevation and slope data
+# ----------------------------
+def process_elevation_slope() -> tuple[ee.Image, ee.Image]:
+    """
+    Process elevation and slope data:
+    1. Downsample DEM to 1km resolution
+    2. Calculate slope from elevation
+    3. Clip both to South America
+    """
+    print("Processing elevation data...")
+    
+    # Downsample elevation to 1km using bilinear interpolation
+    # SRTM has only one band (elevation), so no need to select
+    elevation_1km = (
+        DEM
+        .resample('bilinear')
+        .reproject(crs=CRS, scale=KM)
+        .clip(region)
+        .toFloat()  # Convert to float before unmasking
+        .unmask(-9999)  # Use -9999 as NoData value instead of 0
+        .rename('elevation')
+    )
+    
+    print("Calculating slope...")
+    
+    # Calculate slope from the original DEM (before downsampling for better accuracy)
+    # Slope is calculated in degrees using the ee.Terrain.slope() function
+    slope_original = ee.Terrain.slope(DEM)
+    
+    # Downsample slope to 1km using bilinear interpolation
+    slope_1km = (
+        slope_original
+        .resample('bilinear')
+        .reproject(crs=CRS, scale=KM)
+        .clip(region)
+        .toFloat()  # Convert to float before unmasking
+        .unmask(-9999)  # Use -9999 as NoData value instead of 0
+        .rename('slope')
+    )
+    
+    return elevation_1km, slope_1km
+
+# ----------------------------
+# 4) Process elevation and slope
+# ----------------------------
+print("Processing elevation and slope data...")
+elevation_img, slope_img = process_elevation_slope()
+
+# Print band information (without forcing computation)
+print('Elevation bands:', elevation_img.bandNames())
+print('Slope bands:', slope_img.bandNames())
+
+# Add some debugging information
+print("Debugging information:")
+print(f"Region bounds: {export_region.getInfo()}")
+print(f"DEM projection: {DEM.projection().getInfo()}")
+
+# Test a small sample to verify data
+print("Testing data access...")
+test_sample = elevation_img.sample(region=export_region, scale=KM, numPixels=5)
+print(f"Sample elevation values: {test_sample.aggregate_array('elevation').getInfo()}")
+
+# ----------------------------
+# 5) Export to Google Drive
+# ----------------------------
+tasks = []
+
+try:
+    print("Starting elevation export...")
+    # Export elevation
+    elevation_task = ee.batch.Export.image.toDrive(
+        image=elevation_img,
+        description='Elevation_SA_1km',
+        folder='GEE_exports',                 # change or remove as you like
+        fileNamePrefix='Elevation_SA_1km',
+        region=export_region,
+        crs=CRS,
+        scale=KM,
+        maxPixels=1e13
+    )
+    elevation_task.start()
+    tasks.append(elevation_task)
+    print('Elevation export started:', elevation_task.id)
+
+    print("Starting slope export...")
+    # Export slope
+    slope_task = ee.batch.Export.image.toDrive(
+        image=slope_img,
+        description='Slope_SA_1km',
+        folder='GEE_exports',                 # change or remove as you like
+        fileNamePrefix='Slope_SA_1km',
+        region=export_region,
+        crs=CRS,
+        scale=KM,
+        maxPixels=1e13
+    )
+    slope_task.start()
+    tasks.append(slope_task)
+    print('Slope export started:', slope_task.id)
+
+except Exception as e:
+    print(f"❌ Export failed: {e}")
+    print("This might be due to:")
+    print("1. Insufficient permissions for Google Drive")
+    print("2. Invalid region or image properties")
+    print("3. Earth Engine quota limits")
+    exit(1)
+
+print(f"\n✅ Export tasks started successfully!")
+print(f"📊 Total tasks: {len(tasks)}")
+print(f"📁 Files will be saved to Google Drive folder: 'GEE_exports'")
+print(f"🔍 Check your Google Drive or Earth Engine Tasks tab for progress")
+
+# ----------------------------
+# (Optional) Export to Cloud Storage instead of Drive
+# ----------------------------
+# tasks_gcs = []
+# 
+# # Export elevation to GCS
+# elevation_task_gcs = ee.batch.Export.image.toCloudStorage(
+#     image=elevation_img,
+#     description='Elevation_SA_1km_gcs',
+#     bucket='your-gcs-bucket',
+#     fileNamePrefix='gee/Elevation_SA_1km',
+#     region=export_region,
+#     crs=CRS,
+#     scale=KM,
+#     maxPixels=1e13
+# )
+# elevation_task_gcs.start()
+# tasks_gcs.append(elevation_task_gcs)
+# print('Elevation GCS export started:', elevation_task_gcs.id)
+# 
+# # Export slope to GCS
+# slope_task_gcs = ee.batch.Export.image.toCloudStorage(
+#     image=slope_img,
+#     description='Slope_SA_1km_gcs',
+#     bucket='your-gcs-bucket',
+#     fileNamePrefix='gee/Slope_SA_1km',
+#     region=export_region,
+#     crs=CRS,
+#     scale=KM,
+#     maxPixels=1e13
+# )
+# slope_task_gcs.start()
+# tasks_gcs.append(slope_task_gcs)
+# print('Slope GCS export started:', slope_task_gcs.id)

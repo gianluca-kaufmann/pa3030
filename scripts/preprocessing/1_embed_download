@@ -1,0 +1,449 @@
+#!/usr/bin/env python3
+"""
+Satellite Embeddings Data Processing Script
+==========================================
+
+This script downloads Google's AlphaEarth satellite embeddings for South America,
+aggregates them to a manageable resolution, and saves them as a machine-learning ready dataset.
+
+Author: AI Assistant
+Date: 2024
+"""
+
+import ee
+import ssl
+import urllib.request
+import numpy as np
+import os
+import sys
+from datetime import datetime
+import time
+
+def setup_ssl_context():
+    """Handle SSL certificate issues on macOS"""
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+    return ssl_context
+
+def patch_urllib():
+    """Monkey patch urllib to use unverified SSL context"""
+    original_urlopen = urllib.request.urlopen
+    def patched_urlopen(*args, **kwargs):
+        if 'context' not in kwargs:
+            kwargs['context'] = setup_ssl_context()
+        return original_urlopen(*args, **kwargs)
+    urllib.request.urlopen = patched_urlopen
+
+def initialize_earth_engine():
+    """Initialize Google Earth Engine with robust error handling"""
+    print("Initializing Google Earth Engine...")
+    
+    try:
+        ee.Initialize(project='master-thesis-473316')
+        print("✅ Successfully initialized with project: master-thesis-473316")
+        return True
+    except Exception as e:
+        print(f"❌ Failed to initialize: {e}")
+        print("Please ensure your project is registered for Earth Engine access.")
+        return False
+
+def load_satellite_embeddings():
+    """Load Google's AlphaEarth satellite embeddings"""
+    print("🛰️ Loading AlphaEarth satellite embeddings...")
+    
+    try:
+        # Load the satellite embeddings collection
+        collection = ee.ImageCollection('GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL')
+        
+        # Filter for 2023 data (most recent available)
+        img = (collection
+               .filterDate('2023-01-01', '2024-01-01')
+               .first())
+        
+        # Get band information
+        band_names = img.bandNames().getInfo()
+        print(f"📊 Available bands: {band_names[:10]}... (showing first 10)")
+        print(f"📊 Total bands: {len(band_names)}")
+        
+        return img, band_names
+        
+    except Exception as e:
+        print(f"❌ Error loading satellite embeddings: {e}")
+        return None, None
+
+def create_south_america_sample(img):
+    """Create a South America sample with proper resolution"""
+    print("🌍 Creating South America sample...")
+    
+    try:
+        # Define South America bounds
+        south_america_bounds = ee.Geometry.Rectangle([
+            -82.0,  # West
+            -56.0,  # South  
+            -34.0,  # East
+            12.0    # North
+        ])
+        
+        print(f"📍 South America bounds: West={-82}, South={-56}, East={-34}, North={12}")
+        
+        # Clip the image to South America
+        sa_img = img.clip(south_america_bounds)
+        
+        # Use staged aggregation to avoid computational overload
+        # First aggregate to 1km, then to 50km
+        intermediate_aggregated = (sa_img
+                                 .reduceResolution(
+                                     reducer=ee.Reducer.mean(),
+                                     maxPixels=65536,  # Standard GEE limit
+                                     bestEffort=True
+                                 )
+                                 .reproject(crs='EPSG:4326', scale=1000))  # 1km intermediate
+        
+        # Then aggregate to final 50km resolution
+        aggregated_sa = (intermediate_aggregated
+                        .reduceResolution(
+                            reducer=ee.Reducer.mean(),
+                            maxPixels=65536,
+                            bestEffort=True
+                        )
+                        .reproject(crs='EPSG:4326', scale=50000)  # 50km resolution
+                        .clip(south_america_bounds))
+        
+        print("✅ South America sample created successfully")
+        return aggregated_sa, south_america_bounds
+        
+    except Exception as e:
+        print(f"❌ Error creating South America sample: {e}")
+        return None, None
+
+def export_to_cloud_storage(img, aoi, output_path):
+    """Export the image to Google Cloud Storage"""
+    print(f"☁️ Exporting to Google Cloud Storage...")
+    
+    try:
+        # Define export parameters
+        export_config = {
+            'image': img,
+            'description': 'satellite_embeddings_south_america_50km',
+            'bucket': 'master-thesis-473316',  # Your GCS bucket
+            'fileNamePrefix': 'satellite_embeddings_south_america_50km',
+            'region': aoi,
+            'scale': 50000,  # 50km resolution
+            'crs': 'EPSG:4326',
+            'maxPixels': 1e9,  # Conservative limit for staged aggregation
+            'fileFormat': 'GeoTIFF'
+        }
+        
+        # Start the export task
+        task = ee.batch.Export.image.toCloudStorage(**export_config)
+        task.start()
+        
+        print(f"🚀 Export task started: {task.id}")
+        print("⏳ This may take several minutes to hours depending on the data size...")
+        print("📁 Check your Google Cloud Storage bucket for the file when complete.")
+        
+        return True
+            
+    except Exception as e:
+        print(f"❌ Error during export: {e}")
+        return False
+
+def create_tiled_exports(img):
+    """Create multiple smaller exports for different regions"""
+    print("🧩 Creating tiled exports for different regions...")
+    
+    # Define much smaller regions for testing staged aggregation
+    regions = {
+        'test_brazil_1': ee.Geometry.Rectangle([-50, -5, -45, 0]),    # Small Brazil region
+        'test_brazil_2': ee.Geometry.Rectangle([-45, -5, -40, 0]),    # Another small Brazil region
+        'test_colombia': ee.Geometry.Rectangle([-75, 5, -70, 10]),    # Small Colombia region
+        'test_peru': ee.Geometry.Rectangle([-75, -10, -70, -5]),      # Small Peru region
+        'test_argentina': ee.Geometry.Rectangle([-60, -35, -55, -30]) # Small Argentina region
+    }
+    
+    tasks = []
+    
+    for region_name, region_bounds in regions.items():
+        try:
+            print(f"📍 Processing {region_name} region...")
+            
+            # Clip image to region
+            region_img = img.clip(region_bounds)
+            
+            # Use staged aggregation to avoid computational overload
+            # First aggregate to 1km, then to 50km
+            intermediate_aggregated = (region_img
+                                     .reduceResolution(
+                                         reducer=ee.Reducer.mean(),
+                                         maxPixels=65536,  # Standard GEE limit
+                                         bestEffort=True
+                                     )
+                                     .reproject(crs='EPSG:4326', scale=1000))  # 1km intermediate
+            
+            # Then aggregate to final 50km resolution
+            aggregated_region = (intermediate_aggregated
+                               .reduceResolution(
+                                   reducer=ee.Reducer.mean(),
+                                   maxPixels=65536,
+                                   bestEffort=True
+                               )
+                               .reproject(crs='EPSG:4326', scale=50000)  # 50km resolution
+                               .clip(region_bounds))
+            
+            # Export configuration
+            export_config = {
+                'image': aggregated_region,
+                'description': f'satellite_embeddings_{region_name}_50km',
+                'bucket': 'master-thesis-473316',
+                'fileNamePrefix': f'satellite_embeddings_{region_name}_50km',
+                'region': region_bounds,
+                'scale': 50000,  # 50km resolution
+                'crs': 'EPSG:4326',
+                'maxPixels': 1e9,  # Conservative limit for staged aggregation
+                'fileFormat': 'GeoTIFF'
+            }
+            
+            # Start export task
+            task = ee.batch.Export.image.toCloudStorage(**export_config)
+            task.start()
+            tasks.append((region_name, task.id))
+            
+            print(f"🚀 Export task started for {region_name}: {task.id}")
+            
+        except Exception as e:
+            print(f"❌ Error processing {region_name}: {e}")
+    
+    return tasks
+
+def create_small_test_sample(img):
+    """Create a very small test sample for validation"""
+    print("🔬 Creating a small test sample...")
+    
+    try:
+        # Create a small region in Brazil (known to have data)
+        test_bounds = ee.Geometry.Rectangle([
+            -45.0,  # West
+            -15.0,  # South  
+            -40.0,  # East
+            -10.0   # North
+        ])
+        
+        print(f"📍 Test bounds: West={-45}, South={-15}, East={-40}, North={-10}")
+        
+        # Clip the image to the test region
+        test_img = img.clip(test_bounds)
+        
+        # Use staged aggregation for test sample too
+        # First aggregate to 100m, then to 20km
+        intermediate_test = (test_img
+                           .reduceResolution(
+                               reducer=ee.Reducer.mean(),
+                               maxPixels=65536,
+                               bestEffort=True
+                           )
+                           .reproject(crs='EPSG:4326', scale=100))  # 100m intermediate
+        
+        # Then aggregate to final 20km resolution
+        aggregated_test = (intermediate_test
+                          .reduceResolution(
+                              reducer=ee.Reducer.mean(),
+                              maxPixels=65536,
+                              bestEffort=True
+                          )
+                          .reproject(crs='EPSG:4326', scale=20000)  # 20km resolution
+                          .clip(test_bounds))
+        
+        print("✅ Test sample created successfully")
+        return aggregated_test, test_bounds
+        
+    except Exception as e:
+        print(f"❌ Error creating test sample: {e}")
+        return None, None
+
+def download_test_data(img, aoi, output_path):
+    """Download the test data"""
+    print(f"💾 Downloading test data to: {output_path}")
+    
+    try:
+        # Download the image using sampleRectangle
+        print("⬇️ Downloading test image data...")
+        image_data = img.sampleRectangle(region=aoi, defaultValue=0)
+        
+        # Get the data as arrays
+        data_dict = image_data.getInfo()
+        
+        # Extract the image data
+        image_arrays = {}
+        for band_name, band_data in data_dict.items():
+            if isinstance(band_data, list) and len(band_data) > 0:
+                image_arrays[band_name] = np.array(band_data)
+                print(f"📊 Band {band_name}: shape {image_arrays[band_name].shape}")
+        
+        if not image_arrays:
+            print("❌ No image data found")
+            return False
+        
+        # Get the first band to determine dimensions
+        first_band = list(image_arrays.values())[0]
+        height, width = first_band.shape
+        
+        print(f"📐 Test dimensions: {width} x {height}")
+        
+        # Create output directory if it doesn't exist
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        
+        # Save as NumPy array (easier for ML)
+        np.savez_compressed(output_path.replace('.tif', '.npz'), **image_arrays)
+        
+        print(f"✅ Successfully saved {len(image_arrays)} bands to {output_path.replace('.tif', '.npz')}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error saving test data: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def create_metadata_file(output_path, band_names, bounds):
+    """Create a metadata file with dataset information"""
+    metadata_path = output_path.replace('.npz', '_metadata.txt')
+    
+    with open(metadata_path, 'w') as f:
+        f.write("Satellite Embeddings Dataset Metadata\n")
+        f.write("=" * 40 + "\n\n")
+        f.write(f"Created: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Source: Google AlphaEarth Satellite Embeddings V1\n")
+        f.write(f"Resolution: 20km (test sample)\n")
+        f.write(f"Region: Brazil area\n")
+        f.write(f"Bounds: {bounds}\n")
+        f.write(f"Number of bands: {len(band_names)}\n")
+        f.write(f"Bands: {', '.join(band_names)}\n")
+        f.write(f"Data type: float32\n")
+        f.write(f"Format: NumPy compressed (.npz)\n")
+        f.write(f"Usage: Load with np.load('filename.npz')\n")
+        f.write(f"Note: This is a test sample. For full dataset, use Google Cloud Storage export.\n")
+    
+    print(f"📄 Metadata saved to: {metadata_path}")
+
+def demonstrate_ml_usage(output_path):
+    """Demonstrate how to use the data for machine learning"""
+    print("\n🤖 Machine Learning Usage Example:")
+    print("=" * 40)
+    
+    example_code = f'''
+# Load the satellite embeddings data
+import numpy as np
+
+# Load the data
+data = np.load('{output_path.replace('.tif', '.npz')}')
+
+# Get band names
+band_names = list(data.keys())
+print(f"Available bands: {{band_names}}")
+
+# Get the data shape
+first_band = data[band_names[0]]
+print(f"Data shape: {{first_band.shape}}")
+
+# Convert to a single array (samples x features)
+# Each pixel becomes a sample, each band becomes a feature
+height, width = first_band.shape
+n_bands = len(band_names)
+
+# Reshape to (height*width, n_bands)
+X = np.zeros((height * width, n_bands))
+for i, band_name in enumerate(band_names):
+    X[:, i] = data[band_name].flatten()
+
+print(f"ML-ready shape: {{X.shape}}")
+print(f"Ready for: clustering, classification, regression, etc.")
+
+# Example: K-means clustering
+from sklearn.cluster import KMeans
+kmeans = KMeans(n_clusters=5, random_state=42)
+clusters = kmeans.fit_predict(X)
+clusters_2d = clusters.reshape(height, width)
+
+# Example: PCA dimensionality reduction
+from sklearn.decomposition import PCA
+pca = PCA(n_components=10)
+X_pca = pca.fit_transform(X)
+'''
+    
+    print(example_code)
+    
+    # Save the example code
+    example_path = output_path.replace('.tif', '_ml_example.py')
+    with open(example_path, 'w') as f:
+        f.write(example_code)
+    
+    print(f"📄 ML example saved to: {example_path}")
+
+def main():
+    """Main processing function"""
+    print("🚀 Starting Satellite Embeddings Processing")
+    print("=" * 50)
+    
+    # Setup SSL handling
+    patch_urllib()
+    
+    # Initialize Earth Engine
+    if not initialize_earth_engine():
+        sys.exit(1)
+    
+    # Load satellite embeddings
+    img, band_names = load_satellite_embeddings()
+    if img is None:
+        sys.exit(1)
+    
+    # Create South America sample
+    sa_img, sa_aoi = create_south_america_sample(img)
+    if sa_img is None:
+        sys.exit(1)
+    
+    # Export full South America dataset to Google Cloud Storage (50km resolution)
+    print("\n🌍 Exporting full South America dataset (50km resolution)...")
+    if export_to_cloud_storage(sa_img, sa_aoi, ""):
+        print("✅ Export task started successfully!")
+    
+    # Create tiled exports for manageable resolution (50km)
+    print("\n🧩 Creating tiled exports for manageable resolution...")
+    tiled_tasks = create_tiled_exports(img)
+    if tiled_tasks:
+        print(f"✅ Started {len(tiled_tasks)} tiled export tasks:")
+        for region_name, task_id in tiled_tasks:
+            print(f"   📍 {region_name}: {task_id}")
+    
+    # Create a small test sample for validation
+    test_img, test_aoi = create_small_test_sample(img)
+    if test_img is None:
+        print("⚠️ Could not create test sample, but export tasks are running")
+        sys.exit(0)
+    
+    # Define output path for test
+    output_dir = "/Users/gianluca/Desktop/Master's Thesis/code/data"
+    test_output_path = os.path.join(output_dir, "satellite_embeddings_test_20km.npz")
+    
+    # Download test data
+    if download_test_data(test_img, test_aoi, test_output_path):
+        # Create metadata file
+        bounds = test_aoi.bounds().getInfo()
+        create_metadata_file(test_output_path, band_names, bounds)
+        
+        # Demonstrate ML usage
+        demonstrate_ml_usage(test_output_path)
+        
+        print("\n🎉 Processing completed successfully!")
+        print(f"📁 Test file: {test_output_path}")
+        print(f"📊 Test dataset ready for machine learning!")
+        print(f"☁️ Export tasks are running in Google Cloud Storage:")
+        print(f"   🌍 Full South America (50km resolution)")
+        print(f"   🧩 Tiled regions (50km resolution)")
+        
+    else:
+        print("\n⚠️ Test download failed, but export tasks are running")
+        print("☁️ Check Google Cloud Storage for the datasets")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""
+Oil & Gas Infrastructure Visualization for South America 2024
+
+This script creates visualizations of the Oil & Gas infrastructure density
+(count per 1km pixel) for 2024.
+
+Inputs: GeoTIFF exported from GEE at 1km resolution, single band named
+"infrastructure_count", stored in data/oil_gas.
+
+Outputs: heatmap and basic statistics, saved in outputs/Figures/oil_gas_vis.
+"""
+
+import numpy as np
+import rasterio
+import matplotlib.pyplot as plt
+from pathlib import Path
+import warnings
+from matplotlib.colors import Normalize
+
+warnings.filterwarnings('ignore')
+
+# Paths
+data_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/data/oil_gas")
+output_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/outputs/Figures/oil_gas_vis")
+output_dir.mkdir(parents=True, exist_ok=True)
+
+# No year suffix in filename
+
+def load_oil_gas_data():
+    """Load oil & gas infrastructure raster."""
+    print("📁 Loading Oil & Gas infrastructure raster...")
+
+    tif_path = data_dir / "Oil_Gas_Infrastructure_SA_1km.tif"
+
+    if not tif_path.exists():
+        print(f"   ❌ File not found: {tif_path.name}")
+        return None
+
+    try:
+        with rasterio.open(tif_path) as src:
+            # Expect single band: infrastructure_count
+            data = src.read(1).astype(float)
+
+            # Convert nodata to NaN for stats/visuals
+            nodata = src.nodata
+            if nodata is not None:
+                data[data == nodata] = np.nan
+
+            valid_pixels = np.sum(~np.isnan(data))
+            print(f"   ✅ Shape: {data.shape}, Valid pixels: {valid_pixels:,}")
+
+            data_info = {
+                'data': data,
+                'src_profile': src.profile,
+                'file_path': tif_path
+            }
+
+        print(f"   📊 Successfully loaded data")
+        return data_info
+
+    except Exception as e:
+        print(f"   ❌ Error loading data: {e}")
+        return None
+
+def compute_vmax(data, percentile: float = 99.0) -> float:
+    """Compute a robust upper bound for color scaling."""
+    arr = data[np.isfinite(data)]
+    if arr.size == 0:
+        return 1.0
+    vmax = float(np.percentile(arr, percentile))
+    return max(vmax, 1.0)
+
+def create_infrastructure_map(data_info):
+    """Create and save a heatmap of infrastructure count."""
+    if data_info is None:
+        return
+
+    print("🎨 Creating infrastructure heatmap...")
+
+    data = data_info['data']
+    vmax = compute_vmax(data, percentile=99.0)
+    norm = Normalize(vmin=0, vmax=vmax)
+
+    fig, ax = plt.subplots(figsize=(12, 10))
+    im = ax.imshow(data, cmap='inferno', aspect='auto', norm=norm)
+    ax.set_title('Oil & Gas Infrastructure Density (count per 1km pixel)',
+                 fontsize=16, fontweight='bold')
+    ax.set_xticks([])
+    ax.set_yticks([])
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+    cbar.set_label('Count per 1km pixel', rotation=270, labelpad=15)
+
+    # Simple text stats
+    mean_val = float(np.nanmean(data)) if np.isfinite(data).any() else 0.0
+    total_count = float(np.nansum(data)) if np.isfinite(data).any() else 0.0
+    max_val = float(np.nanmax(data)) if np.isfinite(data).any() else 0.0
+    
+    ax.text(0.02, 0.02,
+            f"Mean: {mean_val:.3f}  |  Total: {int(total_count):,}  |  Max: {max_val:.0f}",
+            transform=ax.transAxes, fontsize=12,
+            color='white', bbox=dict(facecolor='black', alpha=0.4, pad=6))
+
+    plt.tight_layout()
+    out_file = output_dir / "oil_gas_infrastructure_sa.png"
+    plt.savefig(out_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {out_file.name}")
+    plt.close()
+
+def create_statistics_plot(data_info):
+    """Create a simple statistics summary plot."""
+    if data_info is None:
+        return
+
+    print("📊 Creating statistics summary...")
+
+    data = data_info['data']
+    
+    # Calculate statistics
+    valid_data = data[np.isfinite(data)]
+    mean_val = np.mean(valid_data)
+    std_val = np.std(valid_data)
+    max_val = np.max(valid_data)
+    total_count = np.sum(valid_data)
+    
+    # Create histogram of infrastructure counts
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    
+    # Histogram
+    ax1.hist(valid_data, bins=50, alpha=0.7, color='#2E86AB', edgecolor='black')
+    ax1.set_xlabel('Infrastructure Count per 1km pixel')
+    ax1.set_ylabel('Frequency')
+    ax1.set_title('Distribution of Infrastructure Density')
+    ax1.grid(True, alpha=0.3)
+    
+    # Statistics text
+    stats_text = f"""Statistics Summary
+    
+Total Infrastructure Count: {total_count:,.0f}
+Mean per pixel: {mean_val:.3f}
+Standard Deviation: {std_val:.3f}
+Maximum per pixel: {max_val:.0f}
+Valid pixels: {len(valid_data):,}
+Total pixels: {data.size:,}"""
+
+    ax2.text(0.05, 0.95, stats_text, transform=ax2.transAxes, fontsize=12,
+             verticalalignment='top', fontfamily='monospace',
+             bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+    ax2.set_xlim(0, 1)
+    ax2.set_ylim(0, 1)
+    ax2.axis('off')
+    ax2.set_title('Statistics Summary')
+
+    plt.suptitle('Oil & Gas Infrastructure Analysis', fontsize=16, fontweight='bold')
+    plt.tight_layout()
+    
+    out_file = output_dir / "oil_gas_infrastructure_stats.png"
+    plt.savefig(out_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {out_file.name}")
+    plt.close()
+
+def create_summary(data_info):
+    """Print and save basic summary statistics."""
+    if data_info is None:
+        return
+
+    data = data_info['data']
+    valid_data = data[np.isfinite(data)]
+
+    print("\n" + "=" * 70)
+    print("📋 VISUALIZATION SUMMARY")
+    print("=" * 70)
+    print(f"Data shape: {data.shape}")
+    print(f"Spatial dimensions: {data.shape[0]} x {data.shape[1]}")
+    print(f"Total pixels: {data.size:,}")
+    print(f"Valid pixels: {len(valid_data):,}")
+    print(f"Mean infrastructure count: {np.mean(valid_data):.3f}")
+    print(f"Max infrastructure count: {np.max(valid_data):.0f}")
+    print(f"Total infrastructure count: {np.sum(valid_data):,.0f}")
+    print(f"Output directory: {output_dir}")
+
+def main():
+    print("🌍 Oil & Gas Infrastructure Visualization — South America")
+    print("=" * 70)
+
+    data_info = load_oil_gas_data()
+    if data_info is None:
+        print("❌ Failed to load data. Exiting.")
+        return
+
+    print("\n🎨 Creating visualizations...")
+    create_infrastructure_map(data_info)
+    create_statistics_plot(data_info)
+    create_summary(data_info)
+
+    print("\n✅ Visualization complete! 🎉")
+
+if __name__ == "__main__":
+    main()
+
+

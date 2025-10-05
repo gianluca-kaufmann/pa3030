@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""
+GDP Data Preprocessing Script
+============================
+
+This script processes GDP per capita data from shapefiles and CSV files to create
+rasterized data aligned with the existing 1×1 km template GeoTIFF.
+
+Process:
+1. Load shapefile from data/gdp/shapefile/
+2. Load GDP per capita data from CSV file
+3. Join shapefile with GDP data
+4. Reproject to match GPW template (EPSG:3857, South America extent)
+5. Rasterize GDP per capita to 1×1 km pixels (float32, mean if overlaps, nodata=-9999)
+6. Save as new GeoTIFF
+
+"""
+
+import pandas as pd
+import numpy as np
+import geopandas as gpd
+import rasterio
+from rasterio.transform import from_bounds
+from rasterio.crs import CRS
+from rasterio.features import rasterize
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+# ==========
+# Configuration
+# ==========
+
+DATA_DIR = Path("/Users/gianluca/Desktop/Master's Thesis/code/data")
+SHAPEFILE_DIR = DATA_DIR / "gdp" / "shapefile"
+GDP_CSV = DATA_DIR / "gdp" / "final_GDP_0_25deg_postadjust_pop_dens_0_adjust.csv"
+TEMPLATE_TIFF = DATA_DIR / "GPW" / "GPW_population_density_SA_1km_2020.tif"
+OUTPUT_DIR = DATA_DIR / "gdp"
+OUTPUT_TIFF = OUTPUT_DIR / "GDP_per_capita_SA_1km.tif"
+
+def load_template_info():
+    """Load template raster information"""
+    print(f"📁 Loading template raster from {TEMPLATE_TIFF.name}...")
+    
+    with rasterio.open(TEMPLATE_TIFF) as src:
+        template_crs = src.crs
+        template_transform = src.transform
+        template_shape = src.shape
+        template_bounds = src.bounds
+        
+    print(f"   Template CRS: {template_crs}")
+    print(f"   Template shape: {template_shape}")
+    print(f"   Template bounds: {template_bounds}")
+    
+    return template_crs, template_transform, template_shape, template_bounds
+
+def load_gdp_data():
+    """Load GDP shapefile and CSV data, then join them"""
+    print(f"📁 Loading GDP shapefile from {SHAPEFILE_DIR}...")
+    
+    # Load shapefile
+    shapefile_path = SHAPEFILE_DIR / "geom_0_25deg.shp"
+    gdf = gpd.read_file(shapefile_path)
+    print(f"   Shapefile loaded: {gdf.shape[0]} features")
+    print(f"   Shapefile CRS: {gdf.crs}")
+    
+    # Load CSV data
+    print(f"📁 Loading GDP CSV data from {GDP_CSV.name}...")
+    gdp_df = pd.read_csv(GDP_CSV)
+    print(f"   CSV loaded: {gdp_df.shape[0]} records")
+    print(f"   CSV columns: {list(gdp_df.columns)}")
+    
+    # Check available years
+    available_years = sorted(gdp_df['year'].unique())
+    print(f"   Available years: {available_years}")
+    
+    # Join shapefile with GDP data
+    print("🔗 Joining shapefile with GDP data...")
+    
+    # Convert cell_id to string in both datasets for consistent merging
+    gdf['cell_id'] = gdf['cell_id'].astype(str)
+    gdp_df['cell_id'] = gdp_df['cell_id'].astype(str)
+    
+    # Merge on cell_id and subcell_id
+    merged = gdf.merge(
+        gdp_df, 
+        left_on=['cell_id', 'sbcll_d'], 
+        right_on=['cell_id', 'subcell_id'], 
+        how='inner'
+    )
+    
+    print(f"   Joined data: {merged.shape[0]} features")
+    
+    # Filter to South America only (excluding Panama and Central America)
+    print("🌎 Filtering to South America extent (excluding Panama)...")
+    sa_bounds = {
+        'min_lon': -82, 'max_lon': -30,  # Exclude Panama (starts around -83)
+        'min_lat': -60, 'max_lat': 15
+    }
+    
+    # Get centroid of each geometry for filtering
+    merged['centroid_lon'] = merged.geometry.centroid.x
+    merged['centroid_lat'] = merged.geometry.centroid.y
+    
+    # Filter to South America bounds
+    sa_filter = (
+        (merged['centroid_lon'] >= sa_bounds['min_lon']) &
+        (merged['centroid_lon'] <= sa_bounds['max_lon']) &
+        (merged['centroid_lat'] >= sa_bounds['min_lat']) &
+        (merged['centroid_lat'] <= sa_bounds['max_lat'])
+    )
+    
+    # Additional filter to exclude Central American countries (including Panama)
+    central_america_countries = ['PAN', 'CRI', 'NIC', 'HND', 'GTM', 'BLZ', 'SLV']
+    # Check which iso column exists (it might be 'iso_x' or 'iso_y' after merge)
+    iso_col = 'iso' if 'iso' in merged.columns else 'iso_x' if 'iso_x' in merged.columns else 'iso_y'
+    sa_countries_filter = ~merged[iso_col].isin(central_america_countries)
+    
+    # Combine both filters
+    final_sa_filter = sa_filter & sa_countries_filter
+    merged_sa = merged[final_sa_filter].copy()
+    print(f"   South America features (excluding Central America): {merged_sa.shape[0]}")
+    
+    return merged_sa, available_years
+
+def reproject_to_template(gdf, template_crs):
+    """Reproject GeoDataFrame to match template CRS"""
+    print(f"🔄 Reprojecting to {template_crs}...")
+    
+    if gdf.crs != template_crs:
+        gdf_reprojected = gdf.to_crs(template_crs)
+        print(f"   Reprojected from {gdf.crs} to {template_crs}")
+    else:
+        gdf_reprojected = gdf.copy()
+        print(f"   Already in correct CRS: {template_crs}")
+    
+    return gdf_reprojected
+
+def rasterize_gdp_data(gdf, template_transform, template_shape, template_crs, year):
+    """Rasterize GDP per capita data to match template for a specific year"""
+    print(f"🗺️ Rasterizing GDP per capita data for year {year}...")
+    
+    # Filter data for the specific year
+    year_data = gdf[gdf['year'] == year].copy()
+    print(f"   Data points for {year}: {len(year_data)}")
+    
+    if len(year_data) == 0:
+        raise ValueError(f"No data found for year {year}!")
+    
+    # Use GDP per capita in constant 2017 USD PPP as the main variable
+    # This provides the most standardized comparison
+    gdp_column = 'cell_GDPC_const_2017_PPP'
+    
+    # Check if column exists, fallback to other GDP per capita columns
+    if gdp_column not in year_data.columns:
+        alternative_columns = [
+            'cell_GDPC_current_PPP',
+            'cell_GDPC_const_2017_USD', 
+            'cell_GDPC_current_USD'
+        ]
+        for col in alternative_columns:
+            if col in year_data.columns:
+                gdp_column = col
+                break
+    
+    print(f"   Using GDP column: {gdp_column}")
+    
+    # Convert from billions to actual USD by multiplying by 1e9
+    print(f"   Converting GDP values from billions to actual USD (multiplying by 1e9)...")
+    year_data[gdp_column] = year_data[gdp_column] * 1e9
+    
+    # Cap extreme values at 200,000 USD per capita (realistic upper limit)
+    print(f"   Capping extreme values at 200,000 USD per capita...")
+    year_data[gdp_column] = year_data[gdp_column].clip(upper=200000)
+    
+    # Filter out zero or null values
+    valid_data = year_data[year_data[gdp_column] > 0].copy()
+    print(f"   Valid GDP data points for {year}: {len(valid_data)}")
+    
+    if len(valid_data) == 0:
+        raise ValueError(f"No valid GDP per capita data found for year {year}!")
+    
+    # Create geometries and values for rasterization
+    geometries = valid_data.geometry
+    values = valid_data[gdp_column].values
+    
+    # Rasterize with mean aggregation for overlapping geometries
+    print("   Rasterizing with mean aggregation...")
+    
+    # Create raster using rasterize with mean aggregation
+    raster_data = np.full(template_shape, -9999, dtype=np.float32)
+    
+    # Use rasterio.features.rasterize with all_touched=True for better coverage
+    raster = rasterize(
+        [(geom, val) for geom, val in zip(geometries, values)],
+        out_shape=template_shape,
+        transform=template_transform,
+        fill=-9999,
+        default_value=-9999,
+        dtype=np.float32,
+        all_touched=True
+    )
+    
+    # For overlapping areas, we need to compute mean manually
+    # This is a simplified approach - for more complex overlaps, 
+    # we could use a more sophisticated method
+    raster_data = np.where(raster != -9999, raster, -9999)
+    
+    print(f"   Raster shape: {raster_data.shape}")
+    print(f"   Non-nodata pixels: {np.sum(raster_data != -9999)}")
+    if np.sum(raster_data != -9999) > 0:
+        print(f"   Min GDP per capita: {np.min(raster_data[raster_data != -9999]):.2f} USD")
+        print(f"   Max GDP per capita: {np.max(raster_data[raster_data != -9999]):.2f} USD")
+        print(f"   Mean GDP per capita: {np.mean(raster_data[raster_data != -9999]):.2f} USD")
+    else:
+        print("   No valid data pixels found")
+    
+    return raster_data
+
+def save_raster(raster_data, template_transform, template_crs, output_path):
+    """Save rasterized data as GeoTIFF"""
+    print(f"💾 Saving raster to {output_path.name}...")
+    
+    # Ensure output directory exists
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Save as GeoTIFF
+    with rasterio.open(
+        output_path,
+        'w',
+        driver='GTiff',
+        height=raster_data.shape[0],
+        width=raster_data.shape[1],
+        count=1,
+        dtype=raster_data.dtype,
+        crs=template_crs,
+        transform=template_transform,
+        nodata=-9999,
+        compress='lzw'
+    ) as dst:
+        dst.write(raster_data, 1)
+    
+    print(f"   ✅ Successfully saved to {output_path}")
+    
+    # Verify the saved file
+    with rasterio.open(output_path) as src:
+        print(f"   Verification - CRS: {src.crs}")
+        print(f"   Verification - Shape: {src.shape}")
+        print(f"   Verification - NoData: {src.nodata}")
+        print(f"   Verification - Data type: {src.dtypes[0]}")
+
+def main():
+    """Main processing function"""
+    print("🚀 Starting GDP preprocessing for multiple years...")
+    print("=" * 50)
+    
+    try:
+        # Load template information
+        template_crs, template_transform, template_shape, template_bounds = load_template_info()
+        
+        # Load and process GDP data
+        gdp_data, available_years = load_gdp_data()
+        
+        # Reproject to template CRS
+        gdp_reprojected = reproject_to_template(gdp_data, template_crs)
+        
+        # Process each year
+        successful_years = []
+        failed_years = []
+        
+        for year in available_years:
+            try:
+                print(f"\n📅 Processing year {year}...")
+                print("-" * 30)
+                
+                # Rasterize GDP data for this year
+                raster_data = rasterize_gdp_data(
+                    gdp_reprojected, 
+                    template_transform, 
+                    template_shape, 
+                    template_crs,
+                    year
+                )
+                
+                # Create output filename with year
+                output_file = OUTPUT_DIR / f"GDP_per_capita_SA_1km_{year}.tif"
+                
+                # Save raster
+                save_raster(raster_data, template_transform, template_crs, output_file)
+                
+                successful_years.append(year)
+                print(f"✅ Year {year} completed successfully!")
+                
+            except Exception as e:
+                print(f"❌ Error processing year {year}: {str(e)}")
+                failed_years.append(year)
+                continue
+        
+        print("\n" + "=" * 50)
+        print("📊 GDP preprocessing summary:")
+        print(f"✅ Successful years: {len(successful_years)} - {successful_years}")
+        if failed_years:
+            print(f"❌ Failed years: {len(failed_years)} - {failed_years}")
+        print(f"📁 Output directory: {OUTPUT_DIR}")
+        
+        if successful_years:
+            print("✅ GDP preprocessing completed successfully!")
+        else:
+            print("❌ No years were processed successfully!")
+        
+    except Exception as e:
+        print(f"❌ Error during processing: {str(e)}")
+        raise
+
+if __name__ == "__main__":
+    main()

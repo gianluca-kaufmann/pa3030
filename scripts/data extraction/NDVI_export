@@ -1,0 +1,129 @@
+"""
+MODIS NDVI → 1 km (South America, 2000-2024)
+Method: downsample first (1 km, EPSG:3857, bilinear), then median across the window.
+
+Outputs: 25 GeoTIFFs with NDVI band (ndvi_2000_*, ndvi_2001_*, ..., ndvi_2024_*), float32, clipped to South America.
+"""
+
+import ee
+ee.Authenticate()   # Opens a browser for Google login
+
+# ----------------------------
+# 0) Auth & init
+# ----------------------------
+# First run: ee.Authenticate()
+# If you use a specific EE project, pass project="your-ee-project" to Initialize.
+# Use your project ID
+PROJECT_ID = 'master-thesis-473316'
+
+try:
+    ee.Initialize(project=PROJECT_ID)
+    print("✅ Earth Engine initialized successfully with project:", PROJECT_ID)
+except Exception as e:
+    print(f"❌ Initialization failed: {e}")
+    print("🔐 Attempting authentication...")
+    ee.Authenticate()
+    try:
+        ee.Initialize(project=PROJECT_ID)
+        print("✅ Earth Engine initialized after authentication with project:", PROJECT_ID)
+    except Exception as e2:
+        print(f"❌ Still failed: {e2}")
+        print("💡 You may need to:")
+        print("   1. Enable Earth Engine API in your Google Cloud Project")
+        print("   2. Check if project ID is correct:", PROJECT_ID)
+        print("   3. Verify you have access to the project")
+        exit(1)
+
+# ----------------------------
+# 1) Study area (South America)
+# ----------------------------
+countries = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+region_fc = countries.filter(ee.Filter.inList('wld_rgn', ['South America']))
+region = region_fc.geometry()
+export_region = region.bounds()
+
+# ----------------------------
+# 2) Settings
+# ----------------------------
+CRS = 'EPSG:3857'
+KM = 1000
+NDVI_COLLECTION = ee.ImageCollection('MODIS/061/MOD13Q1')
+NDVI_BAND = 'NDVI'
+
+def rename_ndvi(img: ee.Image, prefix: str) -> ee.Image:
+    """Rename NDVI band with a prefix."""
+    return img.select(NDVI_BAND).rename(f"{prefix}_NDVI")
+
+# ----------------------------
+# 3) Downsample-to-1km per scene, then median over window
+# ----------------------------
+def window_ndvi_1km(start: str, end: str, prefix: str) -> ee.Image:
+    # Filter to window + AOI + NDVI band
+    coll = (
+        NDVI_COLLECTION.filterDate(start, end)
+          .filterBounds(region)
+          .select(NDVI_BAND)
+          .map(lambda img: (
+              img
+                .resample('bilinear')                         # bilinear on NDVI values
+                .reproject(crs=CRS, scale=KM)                 # force 1 km @ EPSG:3857
+          ))
+    )
+    # Median across the year → stable ~1km NDVI
+    img = ee.ImageCollection(coll).median().clip(region).unmask(0).toFloat()
+    return rename_ndvi(img, prefix)
+
+# ----------------------------
+# 4) Process data for years 2000-2024
+# ----------------------------
+years = list(range(2000, 2025))  # 2000 to 2024 inclusive
+images = {}
+
+for year in years:
+    start_date = f'{year}-01-01'
+    end_date = f'{year+1}-01-01'
+    prefix = f'ndvi{year}'
+    
+    print(f'Processing year {year}...')
+    images[year] = window_ndvi_1km(start_date, end_date, prefix)
+
+# (Optional) sanity print for first year
+print('Bands:', images[2000].bandNames().getInfo())
+
+# ----------------------------
+# 5) Export to Google Drive for all years
+# ----------------------------
+tasks = []
+for year in years:
+    task = ee.batch.Export.image.toDrive(
+        image=images[year],
+        description=f'NDVI_SA_1km_{year}',
+        folder='GEE_exports',                 # change or remove as you like
+        fileNamePrefix=f'NDVI_SA_1km_{year}',
+        region=export_region,
+        crs=CRS,
+        scale=KM,
+        maxPixels=1e13
+    )
+    task.start()
+    tasks.append(task)
+    print(f'Export started for {year}:', task.id)
+
+# ----------------------------
+# (Optional) Export to Cloud Storage instead of Drive
+# ----------------------------
+# tasks_gcs = []
+# for year in years:
+#     task_gcs = ee.batch.Export.image.toCloudStorage(
+#         image=images[year],
+#         description=f'NDVI_SA_1km_{year}_gcs',
+#         bucket='your-gcs-bucket',
+#         fileNamePrefix=f'gee/NDVI_SA_1km_{year}',
+#         region=export_region,
+#         crs=CRS,
+#         scale=KM,
+#         maxPixels=1e13
+#     )
+#     task_gcs.start()
+#     tasks_gcs.append(task_gcs)
+#     print(f'GCS export started for {year}:', task_gcs.id)

@@ -1,0 +1,149 @@
+"""
+WorldClim V1 BIO → 1 km bioclimatic variables (South America, 1960-1991 average)
+Method: downsample to 1 km (EPSG:3857, bilinear), clip to South America.
+
+Output: 1 GeoTIFF with 19 bands (bio1, bio2, ..., bio19), float32, clipped to South America.
+Note: WorldClim V1 BIO represents climatological averages from 1960-1991, no temporal variation.
+"""
+
+import ee
+ee.Authenticate()   # Opens a browser for Google login
+
+# ----------------------------
+# 0) Auth & init
+# ----------------------------
+# First run: ee.Authenticate()
+# If you use a specific EE project, pass project="your-ee-project" to Initialize.
+# Use your project ID
+PROJECT_ID = 'master-thesis-473316'
+
+try:
+    ee.Initialize(project=PROJECT_ID)
+    print("✅ Earth Engine initialized successfully with project:", PROJECT_ID)
+except Exception as e:
+    print(f"❌ Initialization failed: {e}")
+    print("🔐 Attempting authentication...")
+    ee.Authenticate()
+    try:
+        ee.Initialize(project=PROJECT_ID)
+        print("✅ Earth Engine initialized after authentication with project:", PROJECT_ID)
+    except Exception as e2:
+        print(f"❌ Still failed: {e2}")
+        print("💡 You may need to:")
+        print("   1. Enable Earth Engine API in your Google Cloud Project")
+        print("   2. Check if project ID is correct:", PROJECT_ID)
+        print("   3. Verify you have access to the project")
+        exit(1)
+
+# ----------------------------
+# 1) Study area (South America)
+# ----------------------------
+countries = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+region_fc = countries.filter(ee.Filter.inList('wld_rgn', ['South America']))
+region = region_fc.geometry()
+export_region = region.bounds()
+
+# ----------------------------
+# 2) Settings
+# ----------------------------
+CRS = 'EPSG:3857'
+KM = 1000
+WORLDCLIM = ee.Image('WORLDCLIM/V1/BIO')
+
+# WorldClim BIO bands (19 bioclimatic variables)
+bands = [
+    'bio01', 'bio02', 'bio03', 'bio04', 'bio05', 'bio06', 'bio07', 'bio08', 'bio09',
+    'bio10', 'bio11', 'bio12', 'bio13', 'bio14', 'bio15', 'bio16', 'bio17', 'bio18', 'bio19'
+]
+
+# ----------------------------
+# 3) Process WorldClim data
+# ----------------------------
+def process_worldclim() -> ee.Image:
+    """Process WorldClim BIO data: downsample to 1km and clip to South America."""
+    # Select all bioclimatic bands
+    img = WORLDCLIM.select(bands)
+    
+    # Downsample to 1km using bilinear resampling
+    img_resampled = (
+        img
+            .resample('bilinear')
+            .reproject(crs=CRS, scale=KM)
+    )
+    
+    # Clip to South America and convert to float
+    img_clipped = img_resampled.clip(region).unmask(0).toFloat()
+    
+    return img_clipped
+
+# ----------------------------
+# 4) Process the data
+# ----------------------------
+print('Processing WorldClim BIO data (1960-1991 climatological average)...')
+worldclim_image = process_worldclim()
+
+# Sanity check: print band names
+print('Bands:', worldclim_image.bandNames().getInfo())
+
+# ----------------------------
+# 5) Export to Google Drive
+# ----------------------------
+task = ee.batch.Export.image.toDrive(
+    image=worldclim_image,
+    description='WorldClim_BIO_SA_1km',
+    folder='GEE_exports',                 # change or remove as you like
+    fileNamePrefix='WorldClim_BIO_SA_1km',
+    region=export_region,
+    crs=CRS,
+    scale=KM,
+    maxPixels=1e13
+)
+task.start()
+print('Export started:', task.id)
+
+# ----------------------------
+# (Optional) Export to Cloud Storage instead of Drive
+# ----------------------------
+# task_gcs = ee.batch.Export.image.toCloudStorage(
+#     image=worldclim_image,
+#     description='WorldClim_BIO_SA_1km_gcs',
+#     bucket='your-gcs-bucket',
+#     fileNamePrefix='gee/WorldClim_BIO_SA_1km',
+#     region=export_region,
+#     crs=CRS,
+#     scale=KM,
+#     maxPixels=1e13
+# )
+# task_gcs.start()
+# print('GCS export started:', task_gcs.id)
+
+print("""
+📋 Export Summary:
+- Dataset: WorldClim V1 BIO (climatological average 1960-1991)
+- Region: South America
+- Resolution: 1 km
+- Bands: 19 bioclimatic variables (bio01-bio19)
+- Output: WorldClim_BIO_SA_1km.tif
+- Destination: Google Drive folder 'GEE_exports'
+
+🔍 Bioclimatic Variables:
+- bio01: Annual Mean Temperature
+- bio02: Mean Diurnal Range
+- bio03: Isothermality
+- bio04: Temperature Seasonality
+- bio05: Max Temperature of Warmest Month
+- bio06: Min Temperature of Coldest Month
+- bio07: Temperature Annual Range
+- bio08: Mean Temperature of Wettest Quarter
+- bio09: Mean Temperature of Driest Quarter
+- bio10: Mean Temperature of Warmest Quarter
+- bio11: Mean Temperature of Coldest Quarter
+- bio12: Annual Precipitation
+- bio13: Precipitation of Wettest Month
+- bio14: Precipitation of Driest Month
+- bio15: Precipitation Seasonality
+- bio16: Precipitation of Wettest Quarter
+- bio17: Precipitation of Driest Quarter
+- bio18: Precipitation of Warmest Quarter
+- bio19: Precipitation of Coldest Quarter
+""")

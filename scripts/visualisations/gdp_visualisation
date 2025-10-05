@@ -1,0 +1,510 @@
+#!/usr/bin/env python3
+"""
+GDP Per Capita Visualization for South America (2012-2021)
+
+This script creates comprehensive visualizations of the GDP per capita data
+for multiple years (2012-2021) at 1km resolution for South America.
+
+Inputs: GeoTIFF files from data/gdp/:
+- GDP_per_capita_SA_1km_2012.tif through GDP_per_capita_SA_1km_2021.tif
+
+Outputs: Multiple visualization types saved in outputs/Figures/gdp_vis/
+"""
+
+import numpy as np
+import rasterio
+import matplotlib.pyplot as plt
+from pathlib import Path
+import warnings
+from matplotlib.colors import LogNorm, LinearSegmentedColormap, BoundaryNorm
+import seaborn as sns
+
+warnings.filterwarnings('ignore')
+
+# Set up paths
+PROJECT_ROOT = Path("/Users/gianluca/Desktop/Master's Thesis/code")
+DATA_DIR = PROJECT_ROOT / "data"
+GDP_DIR = DATA_DIR / "gdp"
+OUTPUT_DIR = PROJECT_ROOT / "outputs/Figures/gdp_vis"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# GDP visualization settings
+YEARS = list(range(2012, 2022))  # 2012-2021
+TITLE_PREFIX = "GDP Per Capita"
+DESCRIPTION = "GDP per capita distribution across South America"
+
+# GDP color scheme (reversed: blue = high, red = low)
+GDP_COLORS = {
+    'very_low': '#b2182b',      # Dark red for very low GDP
+    'low': '#d6604d',           # Red-orange
+    'medium_low': '#f4a582',    # Orange
+    'medium': '#fddbc7',        # Light orange
+    'medium_high': '#f7f7f7',   # Light gray
+    'high': '#d1e5f0',          # Very light blue
+    'very_high': '#92c5de',     # Very light blue
+    'extreme': '#4393c3',       # Light blue
+    'maximum': '#2166ac'        # Blue for highest GDP
+}
+
+def load_gdp_data():
+    """Load GDP per capita data for all years"""
+    print("📁 Loading GDP per capita data for all years...")
+    
+    all_data = {}
+    
+    for year in YEARS:
+        gdp_file = GDP_DIR / f"GDP_per_capita_SA_1km_{year}.tif"
+        
+        if not gdp_file.exists():
+            print(f"   ⚠️ File not found: {gdp_file.name}")
+            continue
+            
+        try:
+            with rasterio.open(gdp_file) as src:
+                data = src.read(1)
+                
+                # Handle nodata values
+                valid_data = data[data != src.nodata] if src.nodata is not None else data
+                
+                print(f"   ✅ {year}: Shape: {data.shape}, Valid pixels: {len(valid_data):,}")
+                if len(valid_data) > 0:
+                    print(f"       GDP range: {np.min(valid_data):,.0f} - {np.max(valid_data):,.0f} USD")
+                    print(f"       Mean GDP: {np.mean(valid_data):,.0f} USD")
+                
+                all_data[year] = {
+                    'data': data,
+                    'src': src,
+                    'file_path': gdp_file
+                }
+                
+        except Exception as e:
+            print(f"   ❌ Error loading {year}: {e}")
+            continue
+    
+    if not all_data:
+        print("   ❌ No data loaded successfully")
+        return None
+    
+    print(f"   📊 Successfully loaded {len(all_data)} years")
+    return all_data
+
+def create_individual_year_maps(all_data):
+    """Create individual maps for each year"""
+    if all_data is None:
+        return
+    
+    print("🎨 Creating individual year maps...")
+    
+    # Create custom colormap for GDP (reversed: blue = high, red = low)
+    colors = ['#b2182b', '#d6604d', '#f4a582', '#fddbc7', '#f7f7f7', '#d1e5f0', '#92c5de', '#4393c3', '#2166ac']
+    cmap = LinearSegmentedColormap.from_list('gdp', colors, N=256)
+    
+    for year, data_info in all_data.items():
+        gdp_data = data_info['data']
+        src = data_info['src']
+        
+        # Handle nodata values
+        if src.nodata is not None:
+            valid_data = gdp_data[gdp_data != src.nodata]
+            display_data = np.where(gdp_data == src.nodata, np.nan, gdp_data)
+        else:
+            valid_data = gdp_data
+            display_data = gdp_data
+        
+        # Create figure
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+        fig.suptitle(f'GDP Per Capita - South America {year}', 
+                    fontsize=16, fontweight='bold')
+        
+        # Plot 1: Linear scale (capped at 200k)
+        vmax = min(200000, np.nanpercentile(display_data, 95)) if len(valid_data) > 0 else 200000
+        im1 = ax1.imshow(display_data, cmap=cmap, aspect='auto', 
+                        vmin=0, vmax=vmax)
+        ax1.set_title('GDP Per Capita (Linear Scale)', fontweight='bold')
+        cbar1 = plt.colorbar(im1, ax=ax1, shrink=0.8)
+        cbar1.set_label('GDP per capita (USD)', rotation=270, labelpad=15)
+        
+        # Plot 2: Log scale for better visualization
+        if len(valid_data) > 0 and np.min(valid_data) > 0:
+            log_data = np.where(display_data > 0, display_data, np.nan)
+            im2 = ax2.imshow(log_data, cmap=cmap, aspect='auto', 
+                            norm=LogNorm(vmin=np.nanpercentile(log_data, 1), 
+                                       vmax=np.nanpercentile(log_data, 99)))
+            ax2.set_title('GDP Per Capita (Log Scale)', fontweight='bold')
+            cbar2 = plt.colorbar(im2, ax=ax2, shrink=0.8)
+            cbar2.set_label('GDP per capita (USD, log scale)', rotation=270, labelpad=15)
+        else:
+            ax2.text(0.5, 0.5, 'No valid data for log scale', 
+                    ha='center', va='center', transform=ax2.transAxes, fontsize=12)
+            ax2.set_title('GDP Per Capita (Log Scale)', fontweight='bold')
+        
+        # Add statistics text
+        if len(valid_data) > 0:
+            stats_text = f"""Statistics for {year}:
+Mean: {np.mean(valid_data):,.0f} USD
+Median: {np.median(valid_data):,.0f} USD
+Max: {np.max(valid_data):,.0f} USD
+Valid pixels: {len(valid_data):,}"""
+        else:
+            stats_text = f"No valid data for {year}"
+        
+        fig.text(0.02, 0.02, stats_text, fontsize=10, 
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray", alpha=0.8))
+        
+        # Remove axis labels for cleaner look
+        for ax in [ax1, ax2]:
+            ax.set_xticks([])
+            ax.set_yticks([])
+        
+        plt.tight_layout()
+        
+        # Save the plot
+        output_file = OUTPUT_DIR / f"gdp_per_capita_sa_{year}_individual.png"
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        print(f"   💾 Saved: {output_file.name}")
+        
+        plt.close()
+
+def create_temporal_comparison(all_data):
+    """Create temporal comparison of GDP changes"""
+    if all_data is None or len(all_data) < 2:
+        return
+    
+    print("📈 Creating temporal comparison...")
+    
+    # Calculate statistics for each year
+    temporal_stats = {}
+    
+    for year, data_info in all_data.items():
+        gdp_data = data_info['data']
+        src = data_info['src']
+        
+        # Handle nodata values
+        if src.nodata is not None:
+            valid_data = gdp_data[gdp_data != src.nodata]
+        else:
+            valid_data = gdp_data
+        
+        if len(valid_data) > 0:
+            temporal_stats[year] = {
+                'mean': np.mean(valid_data),
+                'median': np.median(valid_data),
+                'max': np.max(valid_data),
+                'min': np.min(valid_data),
+                'std': np.std(valid_data),
+                'valid_pixels': len(valid_data)
+            }
+    
+    if not temporal_stats:
+        print("   ⚠️ No valid temporal data found")
+        return
+    
+    # Create temporal plots
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('GDP Per Capita - Temporal Analysis (2012-2021)', 
+                fontsize=16, fontweight='bold')
+    
+    years = sorted(temporal_stats.keys())
+    means = [temporal_stats[year]['mean'] for year in years]
+    medians = [temporal_stats[year]['median'] for year in years]
+    maxs = [temporal_stats[year]['max'] for year in years]
+    mins = [temporal_stats[year]['min'] for year in years]
+    stds = [temporal_stats[year]['std'] for year in years]
+    
+    # Plot 1: Mean and Median over time
+    axes[0,0].plot(years, means, 'o-', label='Mean', linewidth=2, markersize=6)
+    axes[0,0].plot(years, medians, 's-', label='Median', linewidth=2, markersize=6)
+    axes[0,0].set_title('Mean and Median GDP Per Capita Over Time', fontweight='bold')
+    axes[0,0].set_xlabel('Year')
+    axes[0,0].set_ylabel('GDP per capita (USD)')
+    axes[0,0].legend()
+    axes[0,0].grid(True, alpha=0.3)
+    
+    # Plot 2: Range (Min-Max) over time
+    axes[0,1].fill_between(years, mins, maxs, alpha=0.3, label='Range (Min-Max)')
+    axes[0,1].plot(years, means, 'o-', label='Mean', linewidth=2, markersize=6)
+    axes[0,1].set_title('GDP Per Capita Range Over Time', fontweight='bold')
+    axes[0,1].set_xlabel('Year')
+    axes[0,1].set_ylabel('GDP per capita (USD)')
+    axes[0,1].legend()
+    axes[0,1].grid(True, alpha=0.3)
+    
+    # Plot 3: Standard Deviation over time
+    axes[1,0].plot(years, stds, '^-', color='red', linewidth=2, markersize=6)
+    axes[1,0].set_title('Standard Deviation Over Time', fontweight='bold')
+    axes[1,0].set_xlabel('Year')
+    axes[1,0].set_ylabel('Standard deviation (USD)')
+    axes[1,0].grid(True, alpha=0.3)
+    
+    # Plot 4: Year-over-year change in mean
+    if len(years) > 1:
+        mean_changes = [means[i] - means[i-1] for i in range(1, len(means))]
+        change_years = years[1:]
+        colors = ['green' if change > 0 else 'red' for change in mean_changes]
+        bars = axes[1,1].bar(change_years, mean_changes, color=colors, alpha=0.7)
+        axes[1,1].set_title('Year-over-Year Change in Mean GDP', fontweight='bold')
+        axes[1,1].set_xlabel('Year')
+        axes[1,1].set_ylabel('Change in mean GDP (USD)')
+        axes[1,1].axhline(y=0, color='black', linestyle='-', alpha=0.3)
+        axes[1,1].grid(True, alpha=0.3)
+        
+        # Add value labels on bars
+        for bar, value in zip(bars, mean_changes):
+            height = bar.get_height()
+            axes[1,1].text(bar.get_x() + bar.get_width()/2., height + (0.01 * max(mean_changes)),
+                          f'{value:,.0f}', ha='center', va='bottom' if height > 0 else 'top')
+    else:
+        axes[1,1].text(0.5, 0.5, 'Insufficient data for change analysis', 
+                      ha='center', va='center', transform=axes[1,1].transAxes)
+        axes[1,1].set_title('Year-over-Year Change in Mean GDP', fontweight='bold')
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    output_file = OUTPUT_DIR / "gdp_temporal_comparison.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {output_file.name}")
+    
+    plt.close()
+
+def create_multi_year_overview(all_data):
+    """Create a multi-year overview with subplots"""
+    if all_data is None:
+        return
+    
+    print("🗺️ Creating multi-year overview...")
+    
+    # Create custom colormap (reversed: blue = high, red = low)
+    colors = ['#b2182b', '#d6604d', '#f4a582', '#fddbc7', '#f7f7f7', '#d1e5f0', '#92c5de', '#4393c3', '#2166ac']
+    cmap = LinearSegmentedColormap.from_list('gdp', colors, N=256)
+    
+    # Select years to display (every 2-3 years to avoid overcrowding)
+    years_to_show = sorted(list(all_data.keys()))
+    if len(years_to_show) > 6:
+        # Show first, middle, and last years, plus a few in between
+        step = len(years_to_show) // 5
+        years_to_show = years_to_show[::max(1, step)]
+        if years_to_show[-1] != max(all_data.keys()):
+            years_to_show.append(max(all_data.keys()))
+    
+    n_years = len(years_to_show)
+    n_cols = 3
+    n_rows = (n_years + n_cols - 1) // n_cols
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(18, 6 * n_rows))
+    fig.suptitle('GDP Per Capita - Multi-Year Overview', fontsize=18, fontweight='bold')
+    
+    # Flatten axes for easier indexing
+    if n_rows == 1:
+        axes = axes.reshape(1, -1)
+    axes_flat = axes.flatten()
+    
+    # Calculate global min/max for consistent scaling
+    all_valid_data = []
+    for year_data in all_data.values():
+        data = year_data['data']
+        src = year_data['src']
+        if src.nodata is not None:
+            valid_data = data[data != src.nodata]
+        else:
+            valid_data = data
+        all_valid_data.extend(valid_data)
+    
+    if all_valid_data:
+        global_vmax = min(200000, np.percentile(all_valid_data, 95))
+    else:
+        global_vmax = 200000
+    
+    for i, year in enumerate(years_to_show):
+        if i >= len(axes_flat):
+            break
+            
+        data_info = all_data[year]
+        gdp_data = data_info['data']
+        src = data_info['src']
+        
+        # Handle nodata values
+        if src.nodata is not None:
+            display_data = np.where(gdp_data == src.nodata, np.nan, gdp_data)
+        else:
+            display_data = gdp_data
+        
+        im = axes_flat[i].imshow(display_data, cmap=cmap, aspect='auto', 
+                                vmin=0, vmax=global_vmax)
+        axes_flat[i].set_title(f'{year}', fontweight='bold', fontsize=14)
+        
+        # Add colorbar
+        cbar = plt.colorbar(im, ax=axes_flat[i], shrink=0.8)
+        if i == 0:  # Only label the first colorbar
+            cbar.set_label('GDP per capita (USD)', rotation=270, labelpad=15)
+        
+        # Remove axis labels
+        axes_flat[i].set_xticks([])
+        axes_flat[i].set_yticks([])
+    
+    # Hide unused subplots
+    for i in range(len(years_to_show), len(axes_flat)):
+        axes_flat[i].set_visible(False)
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    output_file = OUTPUT_DIR / "gdp_multi_year_overview.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {output_file.name}")
+    
+    plt.close()
+
+def create_statistical_summary(all_data):
+    """Create statistical summary plots"""
+    if all_data is None:
+        return
+    
+    print("📊 Creating statistical summary...")
+    
+    # Calculate statistics for each year
+    stats_data = []
+    
+    for year, data_info in all_data.items():
+        gdp_data = data_info['data']
+        src = data_info['src']
+        
+        # Handle nodata values
+        if src.nodata is not None:
+            valid_data = gdp_data[gdp_data != src.nodata]
+        else:
+            valid_data = gdp_data
+        
+        if len(valid_data) > 0:
+            stats_data.append({
+                'year': year,
+                'mean': np.mean(valid_data),
+                'median': np.median(valid_data),
+                'std': np.std(valid_data),
+                'min': np.min(valid_data),
+                'max': np.max(valid_data),
+                'q25': np.percentile(valid_data, 25),
+                'q75': np.percentile(valid_data, 75),
+                'valid_pixels': len(valid_data)
+            })
+    
+    if not stats_data:
+        print("   ⚠️ No valid statistical data found")
+        return
+    
+    # Create summary plots
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('GDP Per Capita - Statistical Summary', fontsize=16, fontweight='bold')
+    
+    years = [s['year'] for s in stats_data]
+    
+    # Plot 1: Box plot of distributions
+    gdp_values_by_year = []
+    labels = []
+    for s in stats_data:
+        year_data = all_data[s['year']]['data']
+        src = all_data[s['year']]['src']
+        if src.nodata is not None:
+            valid_data = year_data[year_data != src.nodata]
+        else:
+            valid_data = year_data
+        gdp_values_by_year.append(valid_data)
+        labels.append(str(s['year']))
+    
+    axes[0,0].boxplot(gdp_values_by_year, labels=labels)
+    axes[0,0].set_title('GDP Distribution by Year (Box Plot)', fontweight='bold')
+    axes[0,0].set_xlabel('Year')
+    axes[0,0].set_ylabel('GDP per capita (USD)')
+    axes[0,0].tick_params(axis='x', rotation=45)
+    
+    # Plot 2: Coverage over time
+    valid_pixels = [s['valid_pixels'] for s in stats_data]
+    axes[0,1].plot(years, valid_pixels, 'o-', linewidth=2, markersize=6)
+    axes[0,1].set_title('Data Coverage Over Time', fontweight='bold')
+    axes[0,1].set_xlabel('Year')
+    axes[0,1].set_ylabel('Valid pixels')
+    axes[0,1].grid(True, alpha=0.3)
+    
+    # Plot 3: Quartiles over time
+    q25s = [s['q25'] for s in stats_data]
+    medians = [s['median'] for s in stats_data]
+    q75s = [s['q75'] for s in stats_data]
+    
+    axes[1,0].fill_between(years, q25s, q75s, alpha=0.3, label='IQR (25th-75th percentile)')
+    axes[1,0].plot(years, medians, 'o-', label='Median', linewidth=2, markersize=6)
+    axes[1,0].set_title('GDP Quartiles Over Time', fontweight='bold')
+    axes[1,0].set_xlabel('Year')
+    axes[1,0].set_ylabel('GDP per capita (USD)')
+    axes[1,0].legend()
+    axes[1,0].grid(True, alpha=0.3)
+    
+    # Plot 4: Summary table
+    axes[1,1].axis('off')
+    
+    # Create summary table
+    table_data = []
+    for s in stats_data:
+        table_data.append([
+            str(s['year']),
+            f"{s['mean']:,.0f}",
+            f"{s['median']:,.0f}",
+            f"{s['std']:,.0f}",
+            f"{s['valid_pixels']:,}"
+        ])
+    
+    table = axes[1,1].table(cellText=table_data,
+                           colLabels=['Year', 'Mean', 'Median', 'Std Dev', 'Valid Pixels'],
+                           cellLoc='center',
+                           loc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.2, 1.5)
+    
+    axes[1,1].set_title('Summary Statistics by Year', fontweight='bold', pad=20)
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    output_file = OUTPUT_DIR / "gdp_statistical_summary.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {output_file.name}")
+    
+    plt.close()
+
+def main():
+    """Main visualization function"""
+    print("🎨 GDP Per Capita Visualization (2012-2021)")
+    print("=" * 60)
+    
+    # Load data
+    all_data = load_gdp_data()
+    
+    if all_data is None:
+        print("❌ No data available for visualization. Exiting.")
+        return
+    
+    # Create visualizations
+    print("\n🎨 Creating visualizations...")
+    
+    # 1. Individual year maps
+    create_individual_year_maps(all_data)
+    
+    # 2. Temporal comparison
+    create_temporal_comparison(all_data)
+    
+    # 3. Multi-year overview
+    create_multi_year_overview(all_data)
+    
+    # 4. Statistical summary
+    create_statistical_summary(all_data)
+    
+    print(f"\n✅ Visualization complete! 🎉")
+    print(f"📁 Output directory: {OUTPUT_DIR}")
+    print(f"📊 Created visualizations:")
+    print(f"   • Individual year maps ({len(all_data)} years)")
+    print(f"   • Temporal comparison analysis")
+    print(f"   • Multi-year overview")
+    print(f"   • Statistical summary")
+
+if __name__ == "__main__":
+    main()
