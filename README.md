@@ -8,21 +8,24 @@ This repository contains the code for a master's thesis project that aims to pre
 
 ```
 ├── data/                          # Geospatial datasets (GeoTIFF format)
-│   ├── assetlevel/               # Asset-level data (power plants, infrastructure)
-│   ├── deforestation/            # Hansen forest change data (2000-2024)
-│   ├── DynamicWorld/             # Dynamic World land cover fractions (2017-2024)
-│   ├── elevation/                # Elevation and slope data
-│   ├── gdp/                      # GDP per capita data (2012-2021)
-│   ├── GlobalSafetyNet/          # Conservation priority areas
-│   ├── GPW/                      # Population density data (2000-2020)
-│   ├── landcover/                # Land cover classifications
-│   ├── NDVI/                     # Vegetation index data (2000-2024)
-│   ├── oil_gas/                  # Oil and gas infrastructure
-│   ├── powerplants/              # Power plant locations
-│   ├── road_infrastructure/      # Road network data
-│   ├── VIIRS/                    # Nighttime lights data
-│   ├── WDPA/                     # World Database on Protected Areas
-│   └── wildfire/                 # Wildfire occurrence data
+│   ├── ready/                    # Processed and ready-to-use datasets
+│   │   ├── assetlevel/           # Asset-level data (power plants, infrastructure)
+│   │   ├── deforestation/        # Hansen forest change data (2000-2024)
+│   │   ├── DynamicWorld/         # Dynamic World land cover fractions (2017-2024)
+│   │   ├── elevation/            # Elevation and slope data
+│   │   ├── gdp/                  # GDP per capita data (2012-2021)
+│   │   ├── GlobalSafetyNet/      # Conservation priority areas
+│   │   ├── GPW/                  # Population density data (2000-2020)
+│   │   ├── landcover/            # Land cover classifications
+│   │   ├── NDVI/                 # Vegetation index data (2000-2024)
+│   │   ├── oil_gas/              # Oil and gas infrastructure
+│   │   ├── powerplants/          # Power plant locations
+│   │   ├── road_infrastructure/  # Road network data
+│   │   ├── VIIRS/                # Nighttime lights data
+│   │   ├── WDPA/                 # World Database on Protected Areas
+│   │   └── wildfire/             # Wildfire occurrence data
+│   ├── ml/                       # Machine learning datasets and models
+│   └── old data/                 # Archived and legacy datasets
 ├── scripts/
 │   ├── data extraction/          # Google Earth Engine export scripts
 │   ├── preprocessing/            # Data processing and preparation
@@ -124,8 +127,9 @@ python scripts/visualisations/deforestation_visualisation
 ### Data Processing Pipeline
 1. **Extraction**: Raw data exported from Google Earth Engine
 2. **Preprocessing**: Reprojected and resampled to 1km resolution
-3. **Validation**: Quality checks and consistency verification
-4. **Integration**: Combined into unified datasets for modeling
+3. **Organization**: Data organized in `data/ready/` subfolders by dataset type
+4. **Validation**: Quality checks and consistency verification
+5. **Integration**: Combined into unified datasets for modeling
 
 ## Notes
 - All scripts include comprehensive error handling and logging
