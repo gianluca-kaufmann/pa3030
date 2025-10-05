@@ -1,0 +1,168 @@
+"""
+MODIS Land Cover (MCD12Q1) → 1 km (South America, 2000-2024)
+Method: downsample from 500m to 1 km (EPSG:3857, nearest neighbor for categorical data).
+
+Dataset: MODIS/061/MCD12Q1
+Outputs: 25 GeoTIFFs (MODIS_landcover_SA_1km_2000, ..., MODIS_landcover_SA_1km_2024), clipped to South America.
+Each file contains the LC_Type1 band (IGBP classification with 17 classes).
+"""
+
+import ee
+ee.Authenticate()   # Opens a browser for Google login
+
+# ----------------------------
+# 0) Auth & init
+# ----------------------------
+# First run: ee.Authenticate()
+# If you use a specific EE project, pass project="your-ee-project" to Initialize.
+# Use your project ID
+PROJECT_ID = 'master-thesis-473316'
+
+try:
+    ee.Initialize(project=PROJECT_ID)
+    print("✅ Earth Engine initialized successfully with project:", PROJECT_ID)
+except Exception as e:
+    print(f"❌ Initialization failed: {e}")
+    print("🔐 Attempting authentication...")
+    ee.Authenticate()
+    try:
+        ee.Initialize(project=PROJECT_ID)
+        print("✅ Earth Engine initialized after authentication with project:", PROJECT_ID)
+    except Exception as e2:
+        print(f"❌ Still failed: {e2}")
+        print("💡 You may need to:")
+        print("   1. Enable Earth Engine API in your Google Cloud Project")
+        print("   2. Check if project ID is correct:", PROJECT_ID)
+        print("   3. Verify you have access to the project")
+        exit(1)
+
+# ----------------------------
+# 1) Study area (South America)
+# ----------------------------
+countries = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+region_fc = countries.filter(ee.Filter.inList('wld_rgn', ['South America']))
+region = region_fc.geometry()
+export_region = region.bounds()
+
+# ----------------------------
+# 2) Settings
+# ----------------------------
+CRS = 'EPSG:3857'
+KM = 1000
+MODIS_LC = ee.ImageCollection('MODIS/061/MCD12Q1')
+
+# MODIS MCD12Q1 has 5 different land cover classification systems
+# We use LC_Type1: IGBP classification (17 classes)
+# 0: Water, 1: Evergreen Needleleaf Forest, 2: Evergreen Broadleaf Forest,
+# 3: Deciduous Needleleaf Forest, 4: Deciduous Broadleaf Forest,
+# 5: Mixed Forests, 6: Closed Shrublands, 7: Open Shrublands,
+# 8: Woody Savannas, 9: Savannas, 10: Grasslands,
+# 11: Permanent Wetlands, 12: Croplands, 13: Urban and Built-up Lands,
+# 14: Cropland/Natural Vegetation Mosaics, 15: Snow and Ice,
+# 16: Barren, 255: Unclassified
+bands = ['LC_Type1']
+
+# ----------------------------
+# 3) Downsample to 1km per year
+# ----------------------------
+def process_year(year: int) -> ee.Image:
+    """
+    Filter MODIS to a specific year, downsample to 1km, and clip to region.
+    MODIS data is already annual composites, so we just need to filter by year.
+    Using nearest neighbor resampling for categorical land cover data.
+    """
+    # Filter to the specific year
+    start_date = f'{year}-01-01'
+    end_date = f'{year+1}-01-01'
+    
+    # Get the image for this year (MODIS releases one image per year)
+    filtered = (
+        MODIS_LC
+        .filterDate(start_date, end_date)
+        .filterBounds(region)
+    )
+    
+    # Check if data exists for this year
+    count = filtered.size().getInfo()
+    if count == 0:
+        raise ValueError(f"No MODIS data available for year {year}")
+    
+    img = filtered.select(bands).first()
+    
+    # Resample to 1km using nearest neighbor (appropriate for categorical data)
+    # and clip to South America
+    img_1km = (
+        img
+        .reproject(crs=CRS, scale=KM)  # removed resample, just reproject with nearest neighbor (default)
+        .clip(region)
+        .unmask(0)
+        .toInt16()  # Land cover classes are integers
+    )
+    
+    return img_1km
+
+# ----------------------------
+# 4) Process data for years 2000-2024
+# ----------------------------
+years = list(range(2000, 2025))  # 2000 to 2024 inclusive
+images = {}
+
+for year in years:
+    print(f'Processing year {year}...')
+    try:
+        images[year] = process_year(year)
+        print(f'✅ Year {year} processed successfully')
+    except ValueError as e:
+        print(f'⚠️  Skipping year {year}: {e}')
+    except Exception as e:
+        print(f'❌ Error processing year {year}: {e}')
+
+# (Optional) sanity print for first available year
+if images:
+    first_year = min(images.keys())
+    print(f'\nSuccessfully processed {len(images)} years')
+    print(f'Bands for year {first_year}:', images[first_year].bandNames().getInfo())
+else:
+    print('❌ No years were successfully processed')
+    exit(1)
+
+# ----------------------------
+# 5) Export to Google Drive for all successfully processed years
+# ----------------------------
+tasks = []
+for year in sorted(images.keys()):
+    task = ee.batch.Export.image.toDrive(
+        image=images[year],
+        description=f'MODIS_landcover_SA_1km_{year}',
+        folder='GEE_exports',                 # change or remove as you like
+        fileNamePrefix=f'MODIS_landcover_SA_1km_{year}',
+        region=export_region,
+        crs=CRS,
+        scale=KM,
+        maxPixels=1e13
+    )
+    task.start()
+    tasks.append(task)
+    print(f'📤 Export started for {year}:', task.id)
+
+print(f'\n✅ Started {len(tasks)} export tasks')
+
+# ----------------------------
+# (Optional) Export to Cloud Storage instead of Drive
+# ----------------------------
+# tasks_gcs = []
+# for year in sorted(images.keys()):
+#     task_gcs = ee.batch.Export.image.toCloudStorage(
+#         image=images[year],
+#         description=f'MODIS_landcover_SA_1km_{year}_gcs',
+#         bucket='your-gcs-bucket',
+#         fileNamePrefix=f'gee/MODIS_landcover_SA_1km_{year}',
+#         region=export_region,
+#         crs=CRS,
+#         scale=KM,
+#         maxPixels=1e13
+#     )
+#     task_gcs.start()
+#     tasks_gcs.append(task_gcs)
+#     print(f'GCS export started for {year}:', task_gcs.id)
+

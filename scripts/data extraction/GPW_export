@@ -1,0 +1,155 @@
+"""
+GPW Population Density → 1 km (South America, 2000-2020)
+Method: downsample to 1 km (EPSG:3857, bilinear), clip to South America.
+
+Outputs: GeoTIFFs for each available year (gpw_2000_*, gpw_2005_*, ..., gpw_2020_*), 
+float32, clipped to South America.
+"""
+
+import ee
+ee.Authenticate()   # Opens a browser for Google login
+
+# ----------------------------
+# 0) Auth & init
+# ----------------------------
+# First run: ee.Authenticate()
+# If you use a specific EE project, pass project="your-ee-project" to Initialize.
+# Use your project ID
+PROJECT_ID = 'master-thesis-473316'
+
+try:
+    ee.Initialize(project=PROJECT_ID)
+    print("✅ Earth Engine initialized successfully with project:", PROJECT_ID)
+except Exception as e:
+    print(f"❌ Initialization failed: {e}")
+    print("🔐 Attempting authentication...")
+    ee.Authenticate()
+    try:
+        ee.Initialize(project=PROJECT_ID)
+        print("✅ Earth Engine initialized after authentication with project:", PROJECT_ID)
+    except Exception as e2:
+        print(f"❌ Still failed: {e2}")
+        print("💡 You may need to:")
+        print("   1. Enable Earth Engine API in your Google Cloud Project")
+        print("   2. Check if project ID is correct:", PROJECT_ID)
+        print("   3. Verify you have access to the project")
+        exit(1)
+
+# ----------------------------
+# 1) Study area (South America)
+# ----------------------------
+countries = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+region_fc = countries.filter(ee.Filter.inList('wld_rgn', ['South America']))
+region = region_fc.geometry()
+export_region = region.bounds()
+
+# ----------------------------
+# 2) Settings
+# ----------------------------
+CRS = 'EPSG:3857'
+KM = 1000
+GPW_COLLECTION = 'CIESIN/GPWv411/GPW_Population_Density'
+
+# GPW typically has 5-year intervals: 2000, 2005, 2010, 2015, 2020
+years = [2000, 2005, 2010, 2015, 2020]
+
+# ----------------------------
+# 3) Function to downsample GPW to 1km
+# ----------------------------
+def downsample_gpw_1km(year: int) -> ee.Image:
+    """Downsample GPW population density to 1km resolution and clip to South America."""
+    # Get GPW image for the specific year - use proper date filtering
+    gpw_collection = ee.ImageCollection(GPW_COLLECTION)
+    gpw_image = gpw_collection.filterDate(f'{year}-01-01', f'{year+1}-01-01').first()
+    
+    # Select the population density band
+    gpw_image = gpw_image.select('population_density')
+    
+    # Downsample to 1km using bilinear resampling (appropriate for population density)
+    downsampled = gpw_image.resample('bilinear').reproject(crs=CRS, scale=KM)
+    
+    # Clip to South America and convert to float
+    clipped = downsampled.clip(region).unmask(0).toFloat()
+    
+    # Rename band to include year for clarity
+    renamed = clipped.rename(f'population_density_{year}')
+    
+    return renamed
+
+# ----------------------------
+# 4) Process data for available years
+# ----------------------------
+images = {}
+
+for year in years:
+    print(f'Processing GPW year {year}...')
+    try:
+        # Test if the image exists first
+        gpw_collection = ee.ImageCollection(GPW_COLLECTION)
+        test_image = gpw_collection.filterDate(f'{year}-01-01', f'{year+1}-01-01').first()
+        
+        # Check if image exists
+        image_info = test_image.getInfo()
+        if image_info is None:
+            print(f'❌ No data available for year {year}')
+            continue
+            
+        images[year] = downsample_gpw_1km(year)
+        print(f'✅ Successfully processed year {year}')
+    except Exception as e:
+        print(f'❌ Failed to process year {year}: {e}')
+        print(f'   Error type: {type(e).__name__}')
+        # Skip this year and continue
+        continue
+
+# (Optional) sanity check for first available year
+if images:
+    first_year = min(images.keys())
+    print(f'Bands for {first_year}:', images[first_year].bandNames().getInfo())
+
+# ----------------------------
+# 5) Export to Google Drive for all years
+# ----------------------------
+tasks = []
+for year in years:
+    if year in images:  # Only export if we successfully processed the year
+        task = ee.batch.Export.image.toDrive(
+            image=images[year],
+            description=f'GPW_population_density_SA_1km_{year}',
+            folder='GEE_exports',                 # change or remove as you like
+            fileNamePrefix=f'GPW_population_density_SA_1km_{year}',
+            region=export_region,
+            crs=CRS,
+            scale=KM,
+            maxPixels=1e13
+        )
+        task.start()
+        tasks.append(task)
+        print(f'Export started for {year}:', task.id)
+    else:
+        print(f'Skipping export for {year} (processing failed)')
+
+print(f'\n📊 Total export tasks started: {len(tasks)}')
+
+# ----------------------------
+# (Optional) Export to Cloud Storage instead of Drive
+# ----------------------------
+# tasks_gcs = []
+# for year in years:
+#     if year in images:
+#         task_gcs = ee.batch.Export.image.toCloudStorage(
+#             image=images[year],
+#             description=f'GPW_population_density_SA_1km_{year}_gcs',
+#             bucket='your-gcs-bucket',
+#             fileNamePrefix=f'gee/GPW_population_density_SA_1km_{year}',
+#             region=export_region,
+#             crs=CRS,
+#             scale=KM,
+#             maxPixels=1e13
+#         )
+#         task_gcs.start()
+#         tasks_gcs.append(task_gcs)
+#         print(f'GCS export started for {year}:', task_gcs.id)
+
+print('\n🎯 Script completed! Check your Google Drive "GEE_exports" folder for the exported files.')
+print('📝 Note: GPW population density data is typically available in 5-year intervals (2000, 2005, 2010, 2015, 2020)')

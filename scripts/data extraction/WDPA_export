@@ -1,0 +1,148 @@
+"""
+WDPA Protected Areas → 1 km coverage (South America, 2013-2024)
+Method: Filter WDPA polygons by status year, rasterize to 1km resolution, clip to South America.
+
+Outputs: 12 GeoTIFFs (wdpa_2013_*, wdpa_2014_*, ..., wdpa_2024_*), float32, clipped to South America.
+Each pixel represents protected area coverage (1 = protected, 0 = not protected).
+"""
+
+import ee
+ee.Authenticate()   # Opens a browser for Google login
+
+# ----------------------------
+# 0) Auth & init
+# ----------------------------
+# First run: ee.Authenticate()
+# If you use a specific EE project, pass project="your-ee-project" to Initialize.
+# Use your project ID
+PROJECT_ID = 'master-thesis-473316'
+
+try:
+    ee.Initialize(project=PROJECT_ID)
+    print("✅ Earth Engine initialized successfully with project:", PROJECT_ID)
+except Exception as e:
+    print(f"❌ Initialization failed: {e}")
+    print("🔐 Attempting authentication...")
+    ee.Authenticate()
+    try:
+        ee.Initialize(project=PROJECT_ID)
+        print("✅ Earth Engine initialized after authentication with project:", PROJECT_ID)
+    except Exception as e2:
+        print(f"❌ Still failed: {e2}")
+        print("💡 You may need to:")
+        print("   1. Enable Earth Engine API in your Google Cloud Project")
+        print("   2. Check if project ID is correct:", PROJECT_ID)
+        print("   3. Verify you have access to the project")
+        exit(1)
+
+# ----------------------------
+# 1) Study area (South America)
+# ----------------------------
+countries = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+region_fc = countries.filter(ee.Filter.inList('wld_rgn', ['South America']))
+region = region_fc.geometry()
+export_region = region.bounds()
+
+# ----------------------------
+# 2) Settings
+# ----------------------------
+CRS = 'EPSG:3857'
+KM = 1000
+WDPA = ee.FeatureCollection('WCMC/WDPA/current/polygons')
+
+# ----------------------------
+# 3) Function to create protected area coverage for a given year
+# ----------------------------
+def create_protected_area_coverage(year: int) -> ee.Image:
+    """
+    Create protected area coverage raster for a given year.
+    
+    Args:
+        year: The year for which to create the coverage
+        
+    Returns:
+        ee.Image: Rasterized protected area coverage (1 = protected, 0 = not protected)
+    """
+    # Filter WDPA features by status year (only include areas that were designated by this year)
+    wdpa_filtered = WDPA.filter(ee.Filter.lte('STATUS_YR', year))
+    
+    # Rasterize the filtered WDPA features to 1km resolution
+    # Create an empty image and paint the protected area polygons
+    protected_areas = (
+        ee.Image().byte()
+        .paint(featureCollection=wdpa_filtered, color=1)
+        .clip(region)
+        .unmask(0)  # Set unmasked pixels to 0 (not protected)
+        .toFloat()
+    )
+    
+    # Reproject to 1km resolution in EPSG:3857
+    protected_areas_1km = protected_areas.reproject(crs=CRS, scale=KM)
+    
+    return protected_areas_1km.set('year', year)
+
+# ----------------------------
+# 4) Process data for years 2013-2024
+# ----------------------------
+years = [2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024]
+images = {}
+
+for year in years:
+    print(f'Processing year {year}...')
+    images[year] = create_protected_area_coverage(year)
+
+# (Optional) sanity print for first year
+print('Band names:', images[2013].bandNames().getInfo())
+print('Image properties for 2013:', images[2013].propertyNames().getInfo())
+
+# ----------------------------
+# 5) Export to Google Drive for all years
+# ----------------------------
+tasks = []
+for year in years:
+    task = ee.batch.Export.image.toDrive(
+        image=images[year],
+        description=f'WDPA_SA_1km_{year}',
+        folder='GEE_exports',                 # change or remove as you like
+        fileNamePrefix=f'WDPA_SA_1km_{year}',
+        region=export_region,
+        crs=CRS,
+        scale=KM,
+        maxPixels=1e13
+    )
+    task.start()
+    tasks.append(task)
+    print(f'Export started for {year}:', task.id)
+
+# ----------------------------
+# (Optional) Export to Cloud Storage instead of Drive
+# ----------------------------
+# tasks_gcs = []
+# for year in years:
+#     task_gcs = ee.batch.Export.image.toCloudStorage(
+#         image=images[year],
+#         description=f'WDPA_SA_1km_{year}_gcs',
+#         bucket='your-gcs-bucket',
+#         fileNamePrefix=f'gee/WDPA_SA_1km_{year}',
+#         region=export_region,
+#         crs=CRS,
+#         scale=KM,
+#         maxPixels=1e13
+#     )
+#     task_gcs.start()
+#     tasks_gcs.append(task_gcs)
+#     print(f'GCS export started for {year}:', task_gcs.id)
+
+# ----------------------------
+# 6) Monitor export progress
+# ----------------------------
+print("\n📊 Export Status Summary:")
+print("=" * 50)
+for i, (year, task) in enumerate(zip(years, tasks)):
+    status = task.status()
+    print(f"{year}: {status['state']} - {task.id}")
+
+print(f"\n🎯 Total exports started: {len(tasks)}")
+print("💡 Check the Earth Engine console for detailed progress:")
+print("   https://code.earthengine.google.com/")
+print("\n📁 Files will be saved to Google Drive in the 'GEE_exports' folder")

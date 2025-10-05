@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""
+Road Infrastructure Preprocessing for South America
+
+This script:
+- Clips all road shapefiles in `data/road_infrastructure` to South America
+  using a 1 km reference grid (GPW 2020) as the exact spatial mask
+- Rasterizes the clipped roads to a 1 km presence/absence GeoTIFF aligned to
+  the reference grid
+
+Outputs:
+- data/road_infrastructure/roads_sa.gpkg (vector, clipped)
+- data/road_infrastructure/roads_sa_1km.tif (raster, 1 km grid)
+
+Assumptions:
+- Reference grid: `data/GPW/GPW_population_density_SA_1km_2020.tif`
+  (CRS in meters; transform at 1,000 m resolution; covers South America)
+"""
+
+from pathlib import Path
+import warnings
+
+import pandas as pd
+import rasterio
+from rasterio.features import rasterize
+from shapely.geometry import box
+
+try:
+    import geopandas as gpd
+except Exception as _e:  # pragma: no cover
+    raise SystemExit(
+        "geopandas is required. Install with `pip install geopandas`"
+    ) from _e
+
+
+warnings.filterwarnings("ignore")
+
+
+# Paths
+PROJECT_ROOT = Path("/Users/gianluca/Desktop/Master's Thesis/code")
+DATA_DIR = PROJECT_ROOT / "data"
+ROADS_DIR = DATA_DIR / "road_infrastructure"
+REF_RASTER = DATA_DIR / "GPW/GPW_population_density_SA_1km_2020.tif"
+
+OUT_VECTOR = ROADS_DIR / "roads_sa.gpkg"
+OUT_RASTER = ROADS_DIR / "roads_sa_1km.tif"
+
+
+def _find_shapefiles(directory: Path) -> list[Path]:
+    return sorted([p for p in directory.iterdir() if p.suffix.lower() == ".shp"])
+
+
+def load_reference_grid():
+    """Load the 1 km reference raster and return its metadata and bounds polygon."""
+    if not REF_RASTER.exists():
+        raise FileNotFoundError(f"Reference raster not found: {REF_RASTER}")
+    src = rasterio.open(REF_RASTER)
+    bounds = src.bounds
+    transform = src.transform
+    crs = src.crs
+    height, width = src.height, src.width
+    # Polygon of bounds in the same CRS
+    bounds_poly = box(bounds.left, bounds.bottom, bounds.right, bounds.top)
+    return src, bounds_poly, transform, crs, width, height
+
+
+def load_and_clip_roads(bounds_poly, target_crs) -> gpd.GeoDataFrame:
+    """Load all road shapefiles, reproject to target CRS, and clip to bounds_poly."""
+    shp_files = _find_shapefiles(ROADS_DIR)
+    if not shp_files:
+        raise FileNotFoundError(f"No shapefiles found in {ROADS_DIR}")
+
+    frames: list[gpd.GeoDataFrame] = []
+    for shp in shp_files:
+        try:
+            gdf = gpd.read_file(shp)
+            if gdf.empty:
+                continue
+            gdf = gdf[gdf.geometry.notnull()].copy()
+            if gdf.crs is None:
+                # Assume WGS84 if undefined
+                gdf = gdf.set_crs(4326, allow_override=True)
+            gdf = gdf.to_crs(target_crs)
+            frames.append(gdf)
+        except Exception as e:
+            print(f"❌ Failed to read {shp.name}: {e}")
+
+    if not frames:
+        raise RuntimeError("No valid road geometries loaded.")
+
+    roads = gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), crs=target_crs)
+    # Keep only line-like geometries
+    roads = roads[roads.geometry.geom_type.isin(["LineString", "MultiLineString"])].copy()
+    if roads.empty:
+        raise RuntimeError("No line-like road geometries after filtering.")
+
+    # Clip to South America bounds
+    clip_gdf = gpd.GeoDataFrame(geometry=[bounds_poly], crs=target_crs)
+    roads_clipped = gpd.overlay(roads, clip_gdf, how="intersection")
+
+    # Save clipped vector
+    if not roads_clipped.empty:
+        # Dissolve is not required for rasterization, but ensures clean export
+        roads_clipped.to_file(OUT_VECTOR, driver="GPKG")
+        print(f"💾 Saved clipped roads vector: {OUT_VECTOR}")
+    else:
+        print("⚠️ Clipped roads are empty.")
+
+    return roads_clipped
+
+
+def rasterize_roads(roads_gdf: gpd.GeoDataFrame, transform, crs, width: int, height: int):
+    """Rasterize road lines to a 1 km presence/absence raster aligned to reference grid."""
+    if roads_gdf.empty:
+        raise RuntimeError("Cannot rasterize: empty roads GeoDataFrame")
+
+    shapes = ((geom, 1) for geom in roads_gdf.geometry if geom is not None)
+
+    raster = rasterize(
+        shapes=shapes,
+        out_shape=(height, width),
+        transform=transform,
+        fill=0,
+        all_touched=True,  # mark any pixel touched by a road
+        dtype="uint8",
+    )
+
+    profile = {
+        "driver": "GTiff",
+        "height": height,
+        "width": width,
+        "count": 1,
+        "dtype": "uint8",
+        "crs": crs,
+        "transform": transform,
+        "compress": "lzw",
+        "nodata": 0,
+    }
+
+    with rasterio.open(OUT_RASTER, "w", **profile) as dst:
+        dst.write(raster, 1)
+
+    print(f"💾 Saved roads 1 km raster: {OUT_RASTER}")
+
+    # Report pixel and area stats
+    num_pixels = raster.size
+    road_pixels = int((raster == 1).sum())
+    print(f"📏 Grid size: {height} x {width} = {num_pixels:,} pixels (~1 km² each)")
+    print(f"🛣️  Road pixels (presence): {road_pixels:,}")
+
+
+def main():
+    print("🛣️  Road Infrastructure Preprocessing - South America")
+    print("=" * 70)
+    print(f"Input roads directory: {ROADS_DIR}")
+    print(f"Reference grid: {REF_RASTER}")
+
+    # Load reference 1 km grid
+    ref_src, bounds_poly, transform, crs, width, height = load_reference_grid()
+    print(f"✅ Reference CRS: {crs}")
+    print(f"✅ Reference transform: {transform}")
+    print(f"✅ Reference grid: {height} x {width} (~{height*width:,} km²)")
+
+    # Load and clip roads to South America
+    roads_sa = load_and_clip_roads(bounds_poly, crs)
+    print(f"✅ Roads after clip: {len(roads_sa):,} features")
+
+    # Rasterize to 1 km aligned grid
+    rasterize_roads(roads_sa, transform, crs, width, height)
+
+    ref_src.close()
+    print("\n✅ Preprocessing complete!")
+
+
+if __name__ == "__main__":
+    main()
+
+

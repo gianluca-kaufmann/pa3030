@@ -1,0 +1,473 @@
+#!/usr/bin/env python3
+"""
+MODIS Land Cover (MCD12Q1) Visualization for South America 2001-2024
+
+This script creates visualizations of the MODIS land cover classifications
+from multiple years (2001-2024) using the IGBP classification system (LC_Type1)
+at 1km resolution.
+"""
+
+import numpy as np
+import rasterio
+import matplotlib.pyplot as plt
+from pathlib import Path
+import warnings
+from matplotlib.colors import ListedColormap
+import matplotlib.patches as mpatches
+
+warnings.filterwarnings('ignore')
+
+# Set up paths
+data_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/data")
+landcover_dir = data_dir / "landcover"
+output_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/outputs/Figures/landcover_vis")
+output_dir.mkdir(parents=True, exist_ok=True)
+
+# Years to process
+YEARS = list(range(2001, 2025))  # 2001 to 2024
+
+# MODIS IGBP Land Cover Classes (LC_Type1)
+IGBP_CLASSES = {
+    0: {'name': 'Water', 'color': '#1f77b4'},
+    1: {'name': 'Evergreen Needleleaf Forest', 'color': '#0d3d0d'},
+    2: {'name': 'Evergreen Broadleaf Forest', 'color': '#197519'},
+    3: {'name': 'Deciduous Needleleaf Forest', 'color': '#3d753d'},
+    4: {'name': 'Deciduous Broadleaf Forest', 'color': '#62c162'},
+    5: {'name': 'Mixed Forests', 'color': '#4fa74f'},
+    6: {'name': 'Closed Shrublands', 'color': '#c97a3d'},
+    7: {'name': 'Open Shrublands', 'color': '#e6b84f'},
+    8: {'name': 'Woody Savannas', 'color': '#d4d45a'},
+    9: {'name': 'Savannas', 'color': '#e6e64f'},
+    10: {'name': 'Grasslands', 'color': '#c8c83f'},
+    11: {'name': 'Permanent Wetlands', 'color': '#62d1d1'},
+    12: {'name': 'Croplands', 'color': '#e6c14f'},
+    13: {'name': 'Urban and Built-up', 'color': '#d62728'},
+    14: {'name': 'Cropland/Natural Vegetation Mosaics', 'color': '#e69d3d'},
+    15: {'name': 'Snow and Ice', 'color': '#ffffff'},
+    16: {'name': 'Barren', 'color': '#c9c9c9'},
+    255: {'name': 'Unclassified', 'color': '#000000'}
+}
+
+def get_landcover_colormap():
+    """Create a colormap for land cover classes"""
+    # Create list of colors in order of class values
+    colors = []
+    for i in range(17):
+        colors.append(IGBP_CLASSES[i]['color'])
+    # Add black for values 17-254 (these shouldn't exist but just in case)
+    colors.extend(['#000000'] * (255-17))
+    # Add unclassified
+    colors.append(IGBP_CLASSES[255]['color'])
+    
+    return ListedColormap(colors)
+
+def load_landcover_data():
+    """Load the MODIS land cover data for all years"""
+    print("📁 Loading MODIS land cover data for all years...")
+    
+    all_data = {}
+    
+    for year in YEARS:
+        lc_file = landcover_dir / f"MODIS_landcover_SA_1km_{year}.tif"
+        
+        if not lc_file.exists():
+            print(f"   ⚠️ File not found: {lc_file.name}")
+            continue
+            
+        try:
+            with rasterio.open(lc_file) as src:
+                data = src.read(1)  # Read first (and only) band
+                
+                # Get valid pixels (excluding 255 = unclassified)
+                valid_pixels = np.sum((data >= 0) & (data <= 16))
+                
+                print(f"   ✅ {year}: Shape: {data.shape}, Valid pixels: {valid_pixels:,}")
+                
+                all_data[year] = {
+                    'data': data,
+                    'transform': src.transform,
+                    'crs': src.crs,
+                    'file_path': lc_file
+                }
+                
+        except Exception as e:
+            print(f"   ❌ Error loading {year}: {e}")
+            continue
+    
+    if not all_data:
+        print("   ❌ No data loaded successfully")
+        return None
+    
+    print(f"   📊 Successfully loaded {len(all_data)} years")
+    return all_data
+
+def create_landcover_map(all_data):
+    """Create land cover map for each year"""
+    if all_data is None:
+        return
+    
+    print("🎨 Creating land cover maps for each year...")
+    
+    cmap = get_landcover_colormap()
+    
+    for year, data_info in all_data.items():
+        data = data_info['data']
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(14, 10))
+        
+        # Plot land cover
+        im = ax.imshow(data, cmap=cmap, vmin=0, vmax=255, aspect='auto')
+        
+        ax.set_title(f'MODIS Land Cover (IGBP) - South America {year}', 
+                    fontsize=16, fontweight='bold')
+        ax.set_xlabel('Longitude')
+        ax.set_ylabel('Latitude')
+        
+        # Create legend with only classes present in the data
+        unique_classes = np.unique(data)
+        legend_elements = []
+        
+        for class_val in sorted(unique_classes):
+            if class_val in IGBP_CLASSES:
+                class_info = IGBP_CLASSES[class_val]
+                legend_elements.append(
+                    mpatches.Patch(facecolor=class_info['color'], 
+                                 edgecolor='black', 
+                                 label=f"{int(class_val)}: {class_info['name']}")
+                )
+        
+        # Place legend outside the plot
+        ax.legend(handles=legend_elements, loc='center left', 
+                 bbox_to_anchor=(1, 0.5), fontsize=8)
+        
+        plt.tight_layout()
+        
+        # Save the plot
+        output_file = output_dir / f"landcover_sa_{year}_map.png"
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        print(f"   💾 Saved: {output_file.name}")
+        
+        plt.close()  # Close to free memory
+
+def create_class_distribution(all_data):
+    """Create bar chart showing class distribution for each year"""
+    if all_data is None:
+        return
+    
+    print("📊 Creating class distribution charts...")
+    
+    # Calculate class distributions for a few key years
+    key_years = [2001, 2008, 2015, 2022, 2024]
+    key_years = [y for y in key_years if y in all_data.keys()]
+    
+    if not key_years:
+        return
+    
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    fig.suptitle('Land Cover Class Distribution Over Time', 
+                fontsize=16, fontweight='bold')
+    
+    axes_flat = axes.flatten()
+    
+    for idx, year in enumerate(key_years):
+        if idx >= len(axes_flat):
+            break
+            
+        ax = axes_flat[idx]
+        data = all_data[year]['data']
+        
+        # Calculate class frequencies
+        unique, counts = np.unique(data, return_counts=True)
+        
+        # Filter to valid classes (0-16)
+        valid_mask = unique <= 16
+        unique_valid = unique[valid_mask]
+        counts_valid = counts[valid_mask]
+        
+        # Calculate percentages
+        total_valid = counts_valid.sum()
+        percentages = (counts_valid / total_valid) * 100
+        
+        # Get colors for each class
+        colors = [IGBP_CLASSES[int(cls)]['color'] for cls in unique_valid]
+        
+        # Create bar plot
+        bars = ax.bar(range(len(unique_valid)), percentages, color=colors, 
+                     edgecolor='black', linewidth=0.5)
+        
+        ax.set_title(f'{year}', fontweight='bold', fontsize=12)
+        ax.set_xlabel('Land Cover Class')
+        ax.set_ylabel('Coverage (%)')
+        ax.set_xticks(range(len(unique_valid)))
+        ax.set_xticklabels([int(cls) for cls in unique_valid], rotation=45)
+        ax.grid(True, alpha=0.3, axis='y')
+        
+        # Add percentage labels on top of bars
+        for bar, pct in zip(bars, percentages):
+            if pct > 1:  # Only label bars with >1% coverage
+                height = bar.get_height()
+                ax.text(bar.get_x() + bar.get_width()/2., height,
+                       f'{pct:.1f}%', ha='center', va='bottom', fontsize=7)
+    
+    # Hide unused subplots
+    for idx in range(len(key_years), len(axes_flat)):
+        axes_flat[idx].set_visible(False)
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    output_file = output_dir / "landcover_class_distribution.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {output_file.name}")
+    
+    plt.close()
+
+def create_temporal_comparison(all_data):
+    """Create temporal comparison of major land cover classes"""
+    if all_data is None or len(all_data) < 2:
+        return
+    
+    print("📈 Creating temporal comparison...")
+    
+    # Calculate class coverage for each year
+    temporal_data = {}
+    
+    for year, data_info in all_data.items():
+        data = data_info['data']
+        
+        # Calculate class frequencies
+        unique, counts = np.unique(data, return_counts=True)
+        
+        # Filter to valid classes (0-16)
+        valid_mask = unique <= 16
+        unique_valid = unique[valid_mask]
+        counts_valid = counts[valid_mask]
+        
+        total_valid = counts_valid.sum()
+        
+        # Store percentages for each class
+        year_stats = {}
+        for cls, cnt in zip(unique_valid, counts_valid):
+            year_stats[int(cls)] = (cnt / total_valid) * 100
+        
+        temporal_data[year] = year_stats
+    
+    # Create figure with multiple subplots for different class groups
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('Temporal Changes in Major Land Cover Classes (2001-2024)', 
+                fontsize=16, fontweight='bold')
+    
+    # Group 1: Forest types
+    ax = axes[0, 0]
+    forest_classes = [1, 2, 3, 4, 5]  # All forest types
+    years = sorted(temporal_data.keys())
+    
+    for cls in forest_classes:
+        if cls in IGBP_CLASSES:
+            values = [temporal_data[year].get(cls, 0) for year in years]
+            ax.plot(years, values, marker='o', linewidth=2, markersize=6,
+                   color=IGBP_CLASSES[cls]['color'], 
+                   label=IGBP_CLASSES[cls]['name'])
+    
+    ax.set_title('Forest Types', fontweight='bold')
+    ax.set_xlabel('Year')
+    ax.set_ylabel('Coverage (%)')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    
+    # Group 2: Agricultural and grassland
+    ax = axes[0, 1]
+    ag_classes = [10, 12, 14]  # Grasslands, Croplands, Crop/Nat Veg Mosaics
+    
+    for cls in ag_classes:
+        if cls in IGBP_CLASSES:
+            values = [temporal_data[year].get(cls, 0) for year in years]
+            ax.plot(years, values, marker='o', linewidth=2, markersize=6,
+                   color=IGBP_CLASSES[cls]['color'], 
+                   label=IGBP_CLASSES[cls]['name'])
+    
+    ax.set_title('Agricultural and Grasslands', fontweight='bold')
+    ax.set_xlabel('Year')
+    ax.set_ylabel('Coverage (%)')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    
+    # Group 3: Savannas and shrublands
+    ax = axes[1, 0]
+    savanna_classes = [6, 7, 8, 9]  # Shrublands and savannas
+    
+    for cls in savanna_classes:
+        if cls in IGBP_CLASSES:
+            values = [temporal_data[year].get(cls, 0) for year in years]
+            ax.plot(years, values, marker='o', linewidth=2, markersize=6,
+                   color=IGBP_CLASSES[cls]['color'], 
+                   label=IGBP_CLASSES[cls]['name'])
+    
+    ax.set_title('Savannas and Shrublands', fontweight='bold')
+    ax.set_xlabel('Year')
+    ax.set_ylabel('Coverage (%)')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    
+    # Group 4: Other important classes
+    ax = axes[1, 1]
+    other_classes = [0, 11, 13, 16]  # Water, Wetlands, Urban, Barren
+    
+    for cls in other_classes:
+        if cls in IGBP_CLASSES:
+            values = [temporal_data[year].get(cls, 0) for year in years]
+            ax.plot(years, values, marker='o', linewidth=2, markersize=6,
+                   color=IGBP_CLASSES[cls]['color'], 
+                   label=IGBP_CLASSES[cls]['name'])
+    
+    ax.set_title('Water, Wetlands, Urban, and Barren', fontweight='bold')
+    ax.set_xlabel('Year')
+    ax.set_ylabel('Coverage (%)')
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    output_file = output_dir / "landcover_temporal_comparison.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {output_file.name}")
+    
+    plt.close()
+
+def create_change_analysis(all_data):
+    """Analyze changes between first and last year"""
+    if all_data is None or len(all_data) < 2:
+        return
+    
+    print("🔍 Creating change analysis...")
+    
+    years = sorted(all_data.keys())
+    first_year = years[0]
+    last_year = years[-1]
+    
+    data_first = all_data[first_year]['data']
+    data_last = all_data[last_year]['data']
+    
+    # Calculate class frequencies for both years
+    def get_class_percentages(data):
+        unique, counts = np.unique(data, return_counts=True)
+        valid_mask = unique <= 16
+        unique_valid = unique[valid_mask]
+        counts_valid = counts[valid_mask]
+        total_valid = counts_valid.sum()
+        
+        percentages = {}
+        for cls, cnt in zip(unique_valid, counts_valid):
+            percentages[int(cls)] = (cnt / total_valid) * 100
+        return percentages
+    
+    pct_first = get_class_percentages(data_first)
+    pct_last = get_class_percentages(data_last)
+    
+    # Calculate changes
+    all_classes = sorted(set(list(pct_first.keys()) + list(pct_last.keys())))
+    
+    changes = {}
+    for cls in all_classes:
+        val_first = pct_first.get(cls, 0)
+        val_last = pct_last.get(cls, 0)
+        changes[cls] = val_last - val_first
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(14, 8))
+    
+    classes = list(changes.keys())
+    change_values = list(changes.values())
+    colors = [IGBP_CLASSES[cls]['color'] for cls in classes]
+    
+    bars = ax.bar(range(len(classes)), change_values, color=colors, 
+                  edgecolor='black', linewidth=0.5)
+    
+    ax.set_title(f'Land Cover Change: {first_year} to {last_year}', 
+                fontsize=16, fontweight='bold')
+    ax.set_xlabel('Land Cover Class')
+    ax.set_ylabel('Change in Coverage (%)')
+    ax.set_xticks(range(len(classes)))
+    ax.set_xticklabels([f"{cls}\n{IGBP_CLASSES[cls]['name']}" for cls in classes], 
+                       rotation=45, ha='right', fontsize=8)
+    ax.axhline(y=0, color='black', linestyle='-', linewidth=1)
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    # Add value labels on bars
+    for bar, val in zip(bars, change_values):
+        if abs(val) > 0.1:  # Only label significant changes
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2., height,
+                   f'{val:+.2f}%', ha='center', 
+                   va='bottom' if val > 0 else 'top', fontsize=8)
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    output_file = output_dir / f"landcover_change_{first_year}_to_{last_year}.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {output_file.name}")
+    
+    plt.close()
+
+def main():
+    """Main visualization function"""
+    print("🌍 MODIS Land Cover Visualization - South America 2001-2024")
+    print("=" * 70)
+    
+    # Load data
+    all_data = load_landcover_data()
+    
+    if all_data is None:
+        print("❌ Failed to load data. Exiting.")
+        return
+    
+    # Create visualizations
+    print("\n🎨 Creating visualizations...")
+    
+    # 1. Land cover maps for each year
+    create_landcover_map(all_data)
+    
+    # 2. Class distribution comparison
+    create_class_distribution(all_data)
+    
+    # 3. Temporal comparison
+    create_temporal_comparison(all_data)
+    
+    # 4. Change analysis
+    create_change_analysis(all_data)
+    
+    # Summary
+    print("\n" + "=" * 70)
+    print("📋 VISUALIZATION SUMMARY")
+    print("=" * 70)
+    
+    print(f"Years processed: {min(all_data.keys())} - {max(all_data.keys())}")
+    print(f"Total years: {len(all_data)}")
+    
+    # Show data info
+    first_year = min(all_data.keys())
+    data = all_data[first_year]['data']
+    print(f"Data shape per year: {data.shape}")
+    print(f"Spatial dimensions: {data.shape[0]} x {data.shape[1]}")
+    print(f"Total pixels per year: {data.shape[0] * data.shape[1]:,}")
+    
+    print(f"\nLand cover classes (IGBP):")
+    for cls_id in range(17):
+        class_info = IGBP_CLASSES[cls_id]
+        print(f"  {cls_id:2d}: {class_info['name']}")
+    
+    print(f"\n💾 Output files saved to: {output_dir}")
+    for year in sorted(all_data.keys()):
+        print(f"   - landcover_sa_{year}_map.png")
+    print("   - landcover_class_distribution.png")
+    print("   - landcover_temporal_comparison.png")
+    print(f"   - landcover_change_{min(all_data.keys())}_to_{max(all_data.keys())}.png")
+    
+    print("\n✅ Visualization complete! 🎉")
+
+if __name__ == "__main__":
+    main()
+

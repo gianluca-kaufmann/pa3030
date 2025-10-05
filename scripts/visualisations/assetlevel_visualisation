@@ -1,0 +1,633 @@
+#!/usr/bin/env python3
+"""
+Asset-level Data Visualization for South America
+
+This script creates comprehensive visualizations of the asset-level data
+from FA_sample_data.xlsx, showing both asset counts and capacity distributions
+across South America at 1km resolution.
+
+Inputs: GeoTIFF files from data/assetlevel/:
+- FA_assets_count_SA_1km.tif (asset counts per pixel)
+- FA_assets_capacity_SA_1km.tif (capacity sum per pixel)
+
+Outputs: Multiple visualization types saved in outputs/Figures/assetlevel_vis/
+"""
+
+import numpy as np
+import rasterio
+import matplotlib.pyplot as plt
+from pathlib import Path
+import warnings
+from matplotlib.colors import LogNorm, LinearSegmentedColormap, BoundaryNorm, ListedColormap
+from matplotlib.patches import Patch
+import seaborn as sns
+
+warnings.filterwarnings('ignore')
+
+# Set up paths
+PROJECT_ROOT = Path("/Users/gianluca/Desktop/Master's Thesis/code")
+DATA_DIR = PROJECT_ROOT / "data"
+ASSETLEVEL_DIR = DATA_DIR / "assetlevel"
+OUTPUT_DIR = PROJECT_ROOT / "outputs/Figures/assetlevel_vis"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Asset visualization settings
+COUNT_FILE = "FA_assets_count_SA_1km.tif"
+CAPACITY_FILE = "FA_assets_capacity_SA_1km.tif"
+TITLE_PREFIX = "FA Asset-level Data"
+DESCRIPTION = "Asset distribution across South America"
+
+# Color schemes for different visualizations
+ASSET_COLORS = {
+    'count_low': '#2166ac',      # Blue for low counts
+    'count_medium': '#4393c3',   # Light blue
+    'count_high': '#92c5de',     # Very light blue
+    'count_very_high': '#d1e5f0', # Very light blue
+    'count_maximum': '#f7f7f7',  # Light gray
+    'count_peak': '#fddbc7',     # Light orange
+    'count_extreme': '#f4a582',  # Orange
+    'count_critical': '#d6604d', # Red-orange
+    'count_max': '#b2182b'       # Dark red
+}
+
+CAPACITY_COLORS = {
+    'low': '#2E8B57',      # Sea green for low capacity
+    'medium_low': '#3CB371', # Medium sea green
+    'medium': '#20B2AA',   # Light sea green
+    'medium_high': '#00CED1', # Dark turquoise
+    'high': '#48D1CC',     # Medium turquoise
+    'very_high': '#00FFFF', # Cyan
+    'extreme': '#FFD700',  # Gold
+    'maximum': '#FFA500',  # Orange
+    'peak': '#FF6347',     # Tomato
+    'critical': '#DC143C'  # Crimson
+}
+
+def load_asset_data():
+    """Load asset count and capacity raster data"""
+    print("📁 Loading FA asset-level data...")
+    
+    data_info = {}
+    
+    # Load count data
+    count_path = ASSETLEVEL_DIR / COUNT_FILE
+    if count_path.exists():
+        try:
+            with rasterio.open(count_path) as src:
+                count_data = src.read(1).astype(np.float32)
+                print(f"   ✅ Count data: Shape: {count_data.shape}, Valid pixels: {np.sum(count_data > 0):,}")
+                print(f"       Count range: {np.min(count_data):.0f} - {np.max(count_data):.0f} assets/pixel")
+                print(f"       Mean count: {np.mean(count_data[count_data > 0]):.2f} assets/pixel")
+                
+                data_info['count'] = {
+                    'data': count_data,
+                    'src': src,
+                    'file_path': count_path
+                }
+        except Exception as e:
+            print(f"   ❌ Error loading count data: {e}")
+    else:
+        print(f"   ⚠️ Count file not found: {count_path}")
+    
+    # Load capacity data
+    capacity_path = ASSETLEVEL_DIR / CAPACITY_FILE
+    if capacity_path.exists():
+        try:
+            with rasterio.open(capacity_path) as src:
+                capacity_data = src.read(1).astype(np.float32)
+                print(f"   ✅ Capacity data: Shape: {capacity_data.shape}, Valid pixels: {np.sum(capacity_data > 0):,}")
+                print(f"       Capacity range: {np.min(capacity_data):.2f} - {np.max(capacity_data):.2f} MW/pixel")
+                print(f"       Mean capacity: {np.mean(capacity_data[capacity_data > 0]):.2f} MW/pixel")
+                
+                data_info['capacity'] = {
+                    'data': capacity_data,
+                    'src': src,
+                    'file_path': capacity_path
+                }
+        except Exception as e:
+            print(f"   ❌ Error loading capacity data: {e}")
+    else:
+        print(f"   ⚠️ Capacity file not found: {capacity_path}")
+    
+    if not data_info:
+        print("   ❌ No data loaded successfully")
+        return None
+    
+    print(f"   📊 Successfully loaded {len(data_info)} datasets")
+    return data_info
+
+def create_overview_maps(data_info):
+    """Create overview maps for asset count and capacity"""
+    if data_info is None:
+        return
+    
+    print("🎨 Creating overview maps...")
+    
+    # Create custom colormaps
+    count_colors = ['#2166ac', '#4393c3', '#92c5de', '#d1e5f0', '#f7f7f7', '#fddbc7', '#f4a582', '#d6604d', '#b2182b']
+    count_cmap = LinearSegmentedColormap.from_list('asset_count', count_colors, N=256)
+    
+    capacity_colors = ['#2E8B57', '#3CB371', '#20B2AA', '#00CED1', '#48D1CC', '#00FFFF', '#FFD700', '#FFA500', '#FF6347', '#DC143C']
+    capacity_cmap = LinearSegmentedColormap.from_list('asset_capacity', capacity_colors, N=256)
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(2, 2, figsize=(20, 16))
+    fig.suptitle(f'{TITLE_PREFIX} - South America Overview', 
+                fontsize=18, fontweight='bold')
+    
+    # Plot 1: Asset Count (Linear Scale)
+    if 'count' in data_info:
+        count_data = data_info['count']['data']
+        im1 = axes[0,0].imshow(count_data, cmap=count_cmap, aspect='auto', 
+                              vmin=0, vmax=np.percentile(count_data[count_data > 0], 95) if np.sum(count_data > 0) > 0 else 1)
+        axes[0,0].set_title('Asset Count per Pixel (Linear Scale)', fontweight='bold', fontsize=14)
+        cbar1 = plt.colorbar(im1, ax=axes[0,0], shrink=0.8)
+        cbar1.set_label('Assets per pixel', rotation=270, labelpad=15)
+    
+    # Plot 2: Asset Count (Log Scale)
+    if 'count' in data_info:
+        count_data = data_info['count']['data']
+        log_count_data = np.where(count_data > 0, count_data, 0.1)
+        im2 = axes[0,1].imshow(log_count_data, cmap=count_cmap, aspect='auto', 
+                              norm=LogNorm(vmin=0.5, vmax=np.max(log_count_data)))
+        axes[0,1].set_title('Asset Count per Pixel (Log Scale)', fontweight='bold', fontsize=14)
+        cbar2 = plt.colorbar(im2, ax=axes[0,1], shrink=0.8)
+        cbar2.set_label('Assets per pixel (log scale)', rotation=270, labelpad=15)
+    
+    # Plot 3: Capacity (Linear Scale)
+    if 'capacity' in data_info:
+        capacity_data = data_info['capacity']['data']
+        im3 = axes[1,0].imshow(capacity_data, cmap=capacity_cmap, aspect='auto', 
+                              vmin=0, vmax=np.percentile(capacity_data[capacity_data > 0], 95) if np.sum(capacity_data > 0) > 0 else 1)
+        axes[1,0].set_title('Capacity per Pixel (Linear Scale)', fontweight='bold', fontsize=14)
+        cbar3 = plt.colorbar(im3, ax=axes[1,0], shrink=0.8)
+        cbar3.set_label('Capacity (MW)', rotation=270, labelpad=15)
+    
+    # Plot 4: Capacity (Log Scale)
+    if 'capacity' in data_info:
+        capacity_data = data_info['capacity']['data']
+        log_capacity_data = np.where(capacity_data > 0, capacity_data, 0.1)
+        im4 = axes[1,1].imshow(log_capacity_data, cmap=capacity_cmap, aspect='auto', 
+                              norm=LogNorm(vmin=1, vmax=np.max(log_capacity_data)))
+        axes[1,1].set_title('Capacity per Pixel (Log Scale)', fontweight='bold', fontsize=14)
+        cbar4 = plt.colorbar(im4, ax=axes[1,1], shrink=0.8)
+        cbar4.set_label('Capacity (MW, log scale)', rotation=270, labelpad=15)
+    
+    # Remove axis labels for cleaner look
+    for ax in axes.flat:
+        ax.set_xticks([])
+        ax.set_yticks([])
+    
+    # Add statistics text
+    stats_text = ""
+    if 'count' in data_info:
+        count_data = data_info['count']['data']
+        stats_text += f"""Asset Count Statistics:
+Total pixels with assets: {np.sum(count_data > 0):,}
+Max assets per pixel: {np.max(count_data):.0f}
+Mean assets per pixel: {np.mean(count_data[count_data > 0]):.2f}
+Total assets: {np.sum(count_data):.0f}
+
+"""
+    
+    if 'capacity' in data_info:
+        capacity_data = data_info['capacity']['data']
+        stats_text += f"""Capacity Statistics:
+Total capacity: {np.sum(capacity_data):,.2f} MW
+Max capacity per pixel: {np.max(capacity_data):.2f} MW
+Mean capacity per pixel: {np.mean(capacity_data[capacity_data > 0]):.2f} MW
+Pixels with capacity: {np.sum(capacity_data > 0):,}"""
+    
+    fig.text(0.02, 0.02, stats_text, fontsize=11, 
+            bbox=dict(boxstyle="round,pad=0.5", facecolor="lightgray", alpha=0.9))
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    output_file = OUTPUT_DIR / "assetlevel_overview_sa.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {output_file.name}")
+    
+    plt.close()
+
+def create_density_analysis(data_info):
+    """Create density analysis plots"""
+    if data_info is None:
+        return
+    
+    print("📊 Creating density analysis...")
+    
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('Asset Density Analysis', fontsize=16, fontweight='bold')
+    
+    # Plot 1: Asset Count Distribution
+    if 'count' in data_info:
+        count_data = data_info['count']['data']
+        non_zero_counts = count_data[count_data > 0]
+        
+        axes[0,0].hist(non_zero_counts, bins=50, alpha=0.7, color='steelblue', edgecolor='black')
+        axes[0,0].set_title('Distribution of Asset Counts per Pixel', fontweight='bold')
+        axes[0,0].set_xlabel('Assets per pixel')
+        axes[0,0].set_ylabel('Number of pixels')
+        axes[0,0].grid(True, alpha=0.3)
+        
+        # Add statistics
+        mean_count = np.mean(non_zero_counts)
+        median_count = np.median(non_zero_counts)
+        axes[0,0].axvline(mean_count, color='red', linestyle='--', label=f'Mean: {mean_count:.2f}')
+        axes[0,0].axvline(median_count, color='green', linestyle='--', label=f'Median: {median_count:.2f}')
+        axes[0,0].legend()
+    
+    # Plot 2: Capacity Distribution
+    if 'capacity' in data_info:
+        capacity_data = data_info['capacity']['data']
+        non_zero_capacity = capacity_data[capacity_data > 0]
+        
+        axes[0,1].hist(non_zero_capacity, bins=50, alpha=0.7, color='forestgreen', edgecolor='black')
+        axes[0,1].set_title('Distribution of Capacity per Pixel', fontweight='bold')
+        axes[0,1].set_xlabel('Capacity (MW)')
+        axes[0,1].set_ylabel('Number of pixels')
+        axes[0,1].grid(True, alpha=0.3)
+        
+        # Add statistics
+        mean_capacity = np.mean(non_zero_capacity)
+        median_capacity = np.median(non_zero_capacity)
+        axes[0,1].axvline(mean_capacity, color='red', linestyle='--', label=f'Mean: {mean_capacity:.2f}')
+        axes[0,1].axvline(median_capacity, color='green', linestyle='--', label=f'Median: {median_capacity:.2f}')
+        axes[0,1].legend()
+    
+    # Plot 3: Log-scale Asset Count Distribution
+    if 'count' in data_info:
+        count_data = data_info['count']['data']
+        non_zero_counts = count_data[count_data > 0]
+        
+        axes[1,0].hist(np.log10(non_zero_counts), bins=50, alpha=0.7, color='darkblue', edgecolor='black')
+        axes[1,0].set_title('Distribution of Asset Counts (Log Scale)', fontweight='bold')
+        axes[1,0].set_xlabel('Log10(Assets per pixel)')
+        axes[1,0].set_ylabel('Number of pixels')
+        axes[1,0].grid(True, alpha=0.3)
+    
+    # Plot 4: Log-scale Capacity Distribution
+    if 'capacity' in data_info:
+        capacity_data = data_info['capacity']['data']
+        non_zero_capacity = capacity_data[capacity_data > 0]
+        
+        axes[1,1].hist(np.log10(non_zero_capacity), bins=50, alpha=0.7, color='darkgreen', edgecolor='black')
+        axes[1,1].set_title('Distribution of Capacity (Log Scale)', fontweight='bold')
+        axes[1,1].set_xlabel('Log10(Capacity in MW)')
+        axes[1,1].set_ylabel('Number of pixels')
+        axes[1,1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    output_file = OUTPUT_DIR / "assetlevel_density_analysis.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {output_file.name}")
+    
+    plt.close()
+
+def create_categorical_maps(data_info):
+    """Create categorical maps with discrete bins"""
+    if data_info is None:
+        return
+    
+    print("🗺️ Creating categorical maps...")
+    
+    fig, axes = plt.subplots(1, 2, figsize=(20, 8))
+    fig.suptitle('Asset Distribution - Categorical View', fontsize=16, fontweight='bold')
+    
+    # Define categories and colors
+    count_categories = {
+        'No Assets': (0, '#f7f7f7'),
+        'Low (1)': (1, '#d1e5f0'),
+        'Medium (2-3)': (3, '#92c5de'),
+        'High (4-5)': (5, '#4393c3'),
+        'Very High (6+)': (10, '#2166ac')
+    }
+    
+    capacity_categories = {
+        'No Capacity': (0, '#f7f7f7'),
+        'Low (<100 MW)': (100, '#d9f0a3'),
+        'Medium (100-500 MW)': (500, '#addd8e'),
+        'High (500-1000 MW)': (1000, '#78c679'),
+        'Very High (1000-2000 MW)': (2000, '#41ab5d'),
+        'Extreme (2000+ MW)': (5000, '#238443')
+    }
+    
+    # Plot 1: Asset Count Categories
+    if 'count' in data_info:
+        count_data = data_info['count']['data']
+        
+        # Create categorical data
+        count_cat = np.zeros_like(count_data, dtype=int)
+        count_cat[count_data == 0] = 0  # No assets
+        count_cat[(count_data >= 1) & (count_data <= 1)] = 1  # Low
+        count_cat[(count_data >= 2) & (count_data <= 3)] = 2  # Medium
+        count_cat[(count_data >= 4) & (count_data <= 5)] = 3  # High
+        count_cat[count_data >= 6] = 4  # Very high
+        
+        # Create colormap
+        count_colors = ['#f7f7f7', '#d1e5f0', '#92c5de', '#4393c3', '#2166ac']
+        count_cmap = ListedColormap(count_colors)
+        
+        im1 = axes[0].imshow(count_cat, cmap=count_cmap, aspect='auto', vmin=0, vmax=4)
+        axes[0].set_title('Asset Count Categories', fontweight='bold', fontsize=14)
+        
+        # Create legend
+        legend_elements = [Patch(facecolor=color, label=label) 
+                          for label, (_, color) in count_categories.items()]
+        axes[0].legend(handles=legend_elements, loc='center left', bbox_to_anchor=(1, 0.5))
+    
+    # Plot 2: Capacity Categories
+    if 'capacity' in data_info:
+        capacity_data = data_info['capacity']['data']
+        
+        # Create categorical data
+        capacity_cat = np.zeros_like(capacity_data, dtype=int)
+        capacity_cat[capacity_data == 0] = 0  # No capacity
+        capacity_cat[(capacity_data > 0) & (capacity_data < 100)] = 1  # Low
+        capacity_cat[(capacity_data >= 100) & (capacity_data < 500)] = 2  # Medium
+        capacity_cat[(capacity_data >= 500) & (capacity_data < 1000)] = 3  # High
+        capacity_cat[(capacity_data >= 1000) & (capacity_data < 2000)] = 4  # Very high
+        capacity_cat[capacity_data >= 2000] = 5  # Extreme
+        
+        # Create colormap
+        capacity_colors = ['#f7f7f7', '#d9f0a3', '#addd8e', '#78c679', '#41ab5d', '#238443']
+        capacity_cmap = ListedColormap(capacity_colors)
+        
+        im2 = axes[1].imshow(capacity_cat, cmap=capacity_cmap, aspect='auto', vmin=0, vmax=5)
+        axes[1].set_title('Capacity Categories', fontweight='bold', fontsize=14)
+        
+        # Create legend
+        legend_elements = [Patch(facecolor=color, label=label) 
+                          for label, (_, color) in capacity_categories.items()]
+        axes[1].legend(handles=legend_elements, loc='center left', bbox_to_anchor=(1, 0.5))
+    
+    # Remove axis labels
+    for ax in axes:
+        ax.set_xticks([])
+        ax.set_yticks([])
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    output_file = OUTPUT_DIR / "assetlevel_categorical_maps.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {output_file.name}")
+    
+    plt.close()
+
+def create_statistical_summary(data_info):
+    """Create statistical summary plots"""
+    if data_info is None:
+        return
+    
+    print("📈 Creating statistical summary...")
+    
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('Asset Data Statistical Summary', fontsize=16, fontweight='bold')
+    
+    # Calculate statistics
+    stats_data = {}
+    
+    if 'count' in data_info:
+        count_data = data_info['count']['data']
+        non_zero_counts = count_data[count_data > 0]
+        
+        stats_data['count'] = {
+            'total_assets': np.sum(count_data),
+            'pixels_with_assets': np.sum(count_data > 0),
+            'max_per_pixel': np.max(count_data),
+            'mean_per_pixel': np.mean(non_zero_counts),
+            'median_per_pixel': np.median(non_zero_counts),
+            'std_per_pixel': np.std(non_zero_counts),
+            'coverage_percent': (np.sum(count_data > 0) / count_data.size) * 100
+        }
+    
+    if 'capacity' in data_info:
+        capacity_data = data_info['capacity']['data']
+        non_zero_capacity = capacity_data[capacity_data > 0]
+        
+        stats_data['capacity'] = {
+            'total_capacity': np.sum(capacity_data),
+            'pixels_with_capacity': np.sum(capacity_data > 0),
+            'max_per_pixel': np.max(capacity_data),
+            'mean_per_pixel': np.mean(non_zero_capacity),
+            'median_per_pixel': np.median(non_zero_capacity),
+            'std_per_pixel': np.std(non_zero_capacity),
+            'coverage_percent': (np.sum(capacity_data > 0) / capacity_data.size) * 100
+        }
+    
+    # Plot 1: Coverage Statistics
+    categories = []
+    coverage_values = []
+    colors = []
+    
+    if 'count' in stats_data:
+        categories.append('Asset Count')
+        coverage_values.append(stats_data['count']['coverage_percent'])
+        colors.append('steelblue')
+    
+    if 'capacity' in stats_data:
+        categories.append('Capacity')
+        coverage_values.append(stats_data['capacity']['coverage_percent'])
+        colors.append('forestgreen')
+    
+    bars1 = axes[0,0].bar(categories, coverage_values, color=colors, alpha=0.7, edgecolor='black')
+    axes[0,0].set_title('Coverage Statistics', fontweight='bold')
+    axes[0,0].set_ylabel('Coverage (%)')
+    axes[0,0].set_ylim(0, max(coverage_values) * 1.1)
+    
+    # Add value labels on bars
+    for bar, value in zip(bars1, coverage_values):
+        height = bar.get_height()
+        axes[0,0].text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                      f'{value:.4f}%', ha='center', va='bottom')
+    
+    # Plot 2: Total Values
+    categories = []
+    total_values = []
+    colors = []
+    
+    if 'count' in stats_data:
+        categories.append('Total Assets')
+        total_values.append(stats_data['count']['total_assets'])
+        colors.append('steelblue')
+    
+    if 'capacity' in stats_data:
+        categories.append('Total Capacity (MW)')
+        total_values.append(stats_data['capacity']['total_capacity'])
+        colors.append('forestgreen')
+    
+    bars2 = axes[0,1].bar(categories, total_values, color=colors, alpha=0.7, edgecolor='black')
+    axes[0,1].set_title('Total Values', fontweight='bold')
+    axes[0,1].set_ylabel('Value')
+    
+    # Add value labels on bars
+    for bar, value in zip(bars2, total_values):
+        height = bar.get_height()
+        axes[0,1].text(bar.get_x() + bar.get_width()/2., height + height*0.01,
+                      f'{value:,.0f}', ha='center', va='bottom')
+    
+    # Plot 3: Mean vs Median Comparison
+    if 'count' in stats_data and 'capacity' in stats_data:
+        metrics = ['Mean', 'Median']
+        count_values = [stats_data['count']['mean_per_pixel'], stats_data['count']['median_per_pixel']]
+        capacity_values = [stats_data['capacity']['mean_per_pixel'], stats_data['capacity']['median_per_pixel']]
+        
+        x = np.arange(len(metrics))
+        width = 0.35
+        
+        bars3a = axes[1,0].bar(x - width/2, count_values, width, label='Asset Count', color='steelblue', alpha=0.7)
+        bars3b = axes[1,0].bar(x + width/2, capacity_values, width, label='Capacity (MW)', color='forestgreen', alpha=0.7)
+        
+        axes[1,0].set_title('Mean vs Median per Pixel', fontweight='bold')
+        axes[1,0].set_ylabel('Value per Pixel')
+        axes[1,0].set_xticks(x)
+        axes[1,0].set_xticklabels(metrics)
+        axes[1,0].legend()
+        axes[1,0].set_yscale('log')
+    
+    # Plot 4: Text summary
+    axes[1,1].axis('off')
+    
+    summary_text = "Statistical Summary:\n\n"
+    
+    if 'count' in stats_data:
+        summary_text += f"Asset Count Data:\n"
+        summary_text += f"• Total assets: {stats_data['count']['total_assets']:,.0f}\n"
+        summary_text += f"• Pixels with assets: {stats_data['count']['pixels_with_assets']:,}\n"
+        summary_text += f"• Coverage: {stats_data['count']['coverage_percent']:.4f}%\n"
+        summary_text += f"• Max per pixel: {stats_data['count']['max_per_pixel']:.0f}\n"
+        summary_text += f"• Mean per pixel: {stats_data['count']['mean_per_pixel']:.2f}\n"
+        summary_text += f"• Median per pixel: {stats_data['count']['median_per_pixel']:.2f}\n"
+        summary_text += f"• Std per pixel: {stats_data['count']['std_per_pixel']:.2f}\n\n"
+    
+    if 'capacity' in stats_data:
+        summary_text += f"Capacity Data:\n"
+        summary_text += f"• Total capacity: {stats_data['capacity']['total_capacity']:,.2f} MW\n"
+        summary_text += f"• Pixels with capacity: {stats_data['capacity']['pixels_with_capacity']:,}\n"
+        summary_text += f"• Coverage: {stats_data['capacity']['coverage_percent']:.4f}%\n"
+        summary_text += f"• Max per pixel: {stats_data['capacity']['max_per_pixel']:.2f} MW\n"
+        summary_text += f"• Mean per pixel: {stats_data['capacity']['mean_per_pixel']:.2f} MW\n"
+        summary_text += f"• Median per pixel: {stats_data['capacity']['median_per_pixel']:.2f} MW\n"
+        summary_text += f"• Std per pixel: {stats_data['capacity']['std_per_pixel']:.2f} MW"
+    
+    axes[1,1].text(0.05, 0.95, summary_text, transform=axes[1,1].transAxes, 
+                  fontsize=11, verticalalignment='top', fontfamily='monospace',
+                  bbox=dict(boxstyle="round,pad=0.5", facecolor="lightgray", alpha=0.8))
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    output_file = OUTPUT_DIR / "assetlevel_statistical_summary.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {output_file.name}")
+    
+    plt.close()
+
+def create_zoom_insets(data_info):
+    """Create zoomed-in views of high-density areas"""
+    if data_info is None:
+        return
+    
+    print("🔍 Creating zoomed-in views...")
+    
+    # Find high-density areas
+    if 'count' in data_info:
+        count_data = data_info['count']['data']
+        
+        # Find pixels with maximum asset count
+        max_count = np.max(count_data)
+        high_density_pixels = np.where(count_data == max_count)
+        
+        if len(high_density_pixels[0]) > 0:
+            # Take the first high-density pixel
+            center_row = high_density_pixels[0][0]
+            center_col = high_density_pixels[1][0]
+            
+            # Define zoom window (50x50 pixels around center)
+            zoom_size = 50
+            row_start = max(0, center_row - zoom_size//2)
+            row_end = min(count_data.shape[0], center_row + zoom_size//2)
+            col_start = max(0, center_col - zoom_size//2)
+            col_end = min(count_data.shape[1], center_col + zoom_size//2)
+            
+            # Extract zoomed data
+            count_zoom = count_data[row_start:row_end, col_start:col_end]
+            capacity_zoom = data_info['capacity']['data'][row_start:row_end, col_start:col_end] if 'capacity' in data_info else None
+            
+            # Create zoomed view
+            fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+            fig.suptitle(f'Zoomed View - High Density Area (Max {max_count} assets/pixel)', 
+                        fontsize=14, fontweight='bold')
+            
+            # Plot count zoom
+            im1 = axes[0].imshow(count_zoom, cmap='Reds', aspect='auto')
+            axes[0].set_title('Asset Count (Zoomed)', fontweight='bold')
+            cbar1 = plt.colorbar(im1, ax=axes[0], shrink=0.8)
+            cbar1.set_label('Assets per pixel')
+            
+            # Plot capacity zoom
+            if capacity_zoom is not None:
+                im2 = axes[1].imshow(capacity_zoom, cmap='Oranges', aspect='auto')
+                axes[1].set_title('Capacity (Zoomed)', fontweight='bold')
+                cbar2 = plt.colorbar(im2, ax=axes[1], shrink=0.8)
+                cbar2.set_label('Capacity (MW)')
+            
+            # Remove axis labels
+            for ax in axes:
+                ax.set_xticks([])
+                ax.set_yticks([])
+            
+            plt.tight_layout()
+            
+            # Save the plot
+            output_file = OUTPUT_DIR / "assetlevel_zoom_high_density.png"
+            plt.savefig(output_file, dpi=300, bbox_inches='tight')
+            print(f"   💾 Saved: {output_file.name}")
+            
+            plt.close()
+
+def main():
+    """Main visualization function"""
+    print("🎨 FA Asset-level Data Visualization")
+    print("=" * 60)
+    
+    # Load data
+    data_info = load_asset_data()
+    
+    if data_info is None:
+        print("❌ No data available for visualization. Exiting.")
+        return
+    
+    # Create visualizations
+    print("\n🎨 Creating visualizations...")
+    
+    # 1. Overview maps
+    create_overview_maps(data_info)
+    
+    # 2. Density analysis
+    create_density_analysis(data_info)
+    
+    # 3. Categorical maps
+    create_categorical_maps(data_info)
+    
+    # 4. Statistical summary
+    create_statistical_summary(data_info)
+    
+    # 5. Zoomed views
+    create_zoom_insets(data_info)
+    
+    print(f"\n✅ Visualization complete! 🎉")
+    print(f"📁 Output directory: {OUTPUT_DIR}")
+    print(f"📊 Created visualizations:")
+    print(f"   • Overview maps (linear and log scales)")
+    print(f"   • Density analysis plots")
+    print(f"   • Categorical distribution maps")
+    print(f"   • Statistical summary")
+    print(f"   • Zoomed views of high-density areas")
+
+if __name__ == "__main__":
+    main()

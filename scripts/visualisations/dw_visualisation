@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""
+Dynamic World Fractions Visualization for South America 2017-2024
+
+This script creates visualizations of the Dynamic World land cover fractions
+from multiple years (2017-2024) which contain 9 bands representing
+different land cover types at 1km resolution.
+"""
+
+import numpy as np
+import rasterio
+import matplotlib.pyplot as plt
+from pathlib import Path
+import warnings
+from matplotlib.colors import ListedColormap
+
+warnings.filterwarnings('ignore')
+
+# Set up paths
+data_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/data")
+dw_dir = data_dir / "DynamicWorld"
+output_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/outputs/Figures/DW_vis")
+output_dir.mkdir(parents=True, exist_ok=True)
+
+# Years to process
+YEARS = [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024]
+
+# Dynamic World band names and colors
+DW_BANDS = {
+    'water': {'color': '#419BDF', 'description': 'Water'},
+    'trees': {'color': '#397D49', 'description': 'Trees'},
+    'grass': {'color': '#88B053', 'description': 'Grass'},
+    'flooded_vegetation': {'color': '#7A87C6', 'description': 'Flooded Vegetation'},
+    'crops': {'color': '#E49635', 'description': 'Crops'},
+    'shrub_and_scrub': {'color': '#C4281B', 'description': 'Shrub and Scrub'},
+    'built': {'color': '#A59B8F', 'description': 'Built'},
+    'bare': {'color': '#B39FE1', 'description': 'Bare Ground'},
+    'snow_and_ice': {'color': '#D1DDF9', 'description': 'Snow and Ice'}
+}
+
+def load_dw_data():
+    """Load the Dynamic World fractions data for all years"""
+    print("📁 Loading Dynamic World fractions data for all years...")
+    
+    all_data = {}
+    
+    for year in YEARS:
+        dw_file = dw_dir / f"DW_fractions_SA_1km_{year}.tif"
+        
+        if not dw_file.exists():
+            print(f"   ⚠️ File not found: {dw_file.name}")
+            continue
+            
+        try:
+            with rasterio.open(dw_file) as src:
+                data = src.read()
+                
+                print(f"   ✅ {year}: Shape: {data.shape}, Valid pixels: {np.sum(~np.isnan(data)):,}")
+                
+                # Get band names
+                band_names = [f"dw{year}_{band}" for band in DW_BANDS.keys()]
+                
+                all_data[year] = {
+                    'data': data,
+                    'src': src,
+                    'band_names': band_names,
+                    'file_path': dw_file
+                }
+                
+        except Exception as e:
+            print(f"   ❌ Error loading {year}: {e}")
+            continue
+    
+    if not all_data:
+        print("   ❌ No data loaded successfully")
+        return None
+    
+    print(f"   📊 Successfully loaded {len(all_data)} years")
+    return all_data
+
+def create_simple_overview(all_data):
+    """Create simple overview for each year"""
+    if all_data is None:
+        return
+    
+    print("🎨 Creating simple overview for each year...")
+    
+    for year, data_info in all_data.items():
+        data = data_info['data']
+        band_names = data_info['band_names']
+        
+        # Create 3x3 grid for 9 bands
+        fig, axes = plt.subplots(3, 3, figsize=(15, 15))
+        fig.suptitle(f'Dynamic World Land Cover Fractions - South America {year}', 
+                    fontsize=16, fontweight='bold')
+        
+        axes_flat = axes.flatten()
+        
+        for band_idx, band_name in enumerate(band_names):
+            ax = axes_flat[band_idx]
+            band_data = data[band_idx]
+            
+            # Get band info
+            band_key = band_name.replace(f'dw{year}_', '')
+            band_info = DW_BANDS[band_key]
+            
+            # Create visualization
+            im = ax.imshow(band_data, cmap='viridis', aspect='auto', vmin=0, vmax=1)
+            
+            # Set title with mean value
+            mean_val = np.nanmean(band_data)
+            ax.set_title(f'{band_info["description"]}\nMean: {mean_val:.3f}', 
+                        fontsize=10, fontweight='bold')
+            
+            # Add colorbar
+            cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+            cbar.set_label('Fraction', rotation=270, labelpad=10)
+            
+            # Remove axis labels for cleaner look
+            ax.set_xticks([])
+            ax.set_yticks([])
+        
+        plt.tight_layout()
+        
+        # Save the plot
+        output_file = output_dir / f"dw_fractions_sa_{year}_overview.png"
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        print(f"   💾 Saved: {output_file.name}")
+        
+        plt.close()  # Close to free memory
+
+def create_temporal_comparison(all_data):
+    """Create temporal comparison of land cover changes"""
+    if all_data is None or len(all_data) < 2:
+        return
+    
+    print("📈 Creating temporal comparison...")
+    
+    # Calculate mean fractions for each year and band
+    temporal_data = {}
+    
+    for year, data_info in all_data.items():
+        data = data_info['data']
+        band_names = data_info['band_names']
+        
+        year_stats = {}
+        for band_idx, band_name in enumerate(band_names):
+            band_data = data[band_idx]
+            band_key = band_name.replace(f'dw{year}_', '')
+            year_stats[band_key] = np.nanmean(band_data)
+        
+        temporal_data[year] = year_stats
+    
+    # Create figure
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('Temporal Comparison of Land Cover Fractions (2017-2024)', 
+                fontsize=16, fontweight='bold')
+    
+    # Select key bands for comparison
+    key_bands = ['trees', 'grass', 'crops', 'built']
+    band_titles = ['Trees', 'Grass', 'Crops', 'Built']
+    
+    for idx, (band, title) in enumerate(zip(key_bands, band_titles)):
+        ax = axes[idx//2, idx%2]
+        
+        years = sorted(temporal_data.keys())
+        values = [temporal_data[year][band] for year in years]
+        
+        # Plot line with markers
+        ax.plot(years, values, marker='o', linewidth=2, markersize=8,
+                color=DW_BANDS[band]['color'], label=title)
+        
+        ax.set_title(f'{title} Fraction Over Time', fontweight='bold')
+        ax.set_xlabel('Year')
+        ax.set_ylabel('Mean Fraction')
+        ax.grid(True, alpha=0.3)
+        ax.set_xticks(years)
+        
+        # Add value labels on points
+        for year, value in zip(years, values):
+            ax.annotate(f'{value:.3f}', (year, value), 
+                       textcoords="offset points", xytext=(0,10), ha='center')
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    output_file = output_dir / "dw_fractions_temporal_comparison.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {output_file.name}")
+    
+    plt.show()
+
+def create_summary_statistics(all_data):
+    """Create summary statistics across all years"""
+    if all_data is None:
+        return
+    
+    print("📊 Creating summary statistics...")
+    
+    # Collect statistics for all years
+    all_stats = []
+    
+    for year, data_info in all_data.items():
+        data = data_info['data']
+        band_names = data_info['band_names']
+        
+        for band_idx, band_name in enumerate(band_names):
+            band_data = data[band_idx]
+            band_key = band_name.replace(f'dw{year}_', '')
+            
+            stats = {
+                'year': year,
+                'band': band_key,
+                'mean': np.nanmean(band_data),
+                'std': np.nanstd(band_data),
+                'max': np.nanmax(band_data)
+            }
+            all_stats.append(stats)
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(14, 8))
+    
+    # Group by band and plot mean values over time
+    bands = list(DW_BANDS.keys())
+    years = sorted(all_data.keys())
+    
+    x = np.arange(len(years))
+    width = 0.1
+    
+    for i, band in enumerate(bands):
+        band_stats = [s for s in all_stats if s['band'] == band]
+        means = [s['mean'] for s in band_stats]
+        
+        ax.bar(x + i * width, means, width, 
+               label=DW_BANDS[band]['description'], 
+               color=DW_BANDS[band]['color'], alpha=0.8)
+    
+    ax.set_title('Mean Land Cover Fractions by Year', fontweight='bold')
+    ax.set_xlabel('Year')
+    ax.set_ylabel('Mean Fraction')
+    ax.set_xticks(x + width * 4)
+    ax.set_xticklabels(years)
+    ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    output_file = output_dir / "dw_fractions_summary_statistics.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {output_file.name}")
+    
+    plt.show()
+
+def main():
+    """Main visualization function"""
+    print("🌍 Dynamic World Fractions Visualization - South America 2017-2024")
+    print("=" * 70)
+    
+    # Load data
+    all_data = load_dw_data()
+    
+    if all_data is None:
+        print("❌ Failed to load data. Exiting.")
+        return
+    
+    # Create visualizations
+    print("\n🎨 Creating visualizations...")
+    
+    # 1. Simple overview for each year
+    create_simple_overview(all_data)
+    
+    # 2. Temporal comparison
+    create_temporal_comparison(all_data)
+    
+    # 3. Summary statistics
+    create_summary_statistics(all_data)
+    
+    # Summary
+    print("\n" + "=" * 70)
+    print("📋 VISUALIZATION SUMMARY")
+    print("=" * 70)
+    
+    print(f"Years processed: {sorted(all_data.keys())}")
+    print(f"Total years: {len(all_data)}")
+    
+    # Show data info for first year as example
+    first_year = min(all_data.keys())
+    data = all_data[first_year]['data']
+    print(f"Data shape per year: {data.shape}")
+    print(f"Number of bands: {data.shape[0]}")
+    print(f"Spatial dimensions: {data.shape[1]} x {data.shape[2]}")
+    print(f"Total pixels per year: {data.shape[1] * data.shape[2]:,}")
+    
+    print(f"\nLand cover types:")
+    for band_name in DW_BANDS.keys():
+        band_info = DW_BANDS[band_name]
+        print(f"  - {band_info['description']}")
+    
+    print(f"\n💾 Output files saved to: {output_dir}")
+    for year in sorted(all_data.keys()):
+        print(f"   - dw_fractions_sa_{year}_overview.png")
+    print("   - dw_fractions_temporal_comparison.png")
+    print("   - dw_fractions_summary_statistics.png")
+    
+    print("\n✅ Visualization complete! 🎉")
+
+if __name__ == "__main__":
+    main()

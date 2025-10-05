@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""
+GPW Population Density Visualization for South America 2000-2020
+
+This script creates visualizations of the GPW (Gridded Population of the World)
+population density data from multiple years (2000, 2005, 2010, 2015, 2020)
+at 1km resolution for South America.
+"""
+
+import numpy as np
+import rasterio
+import matplotlib.pyplot as plt
+from pathlib import Path
+import warnings
+from matplotlib.colors import LogNorm, LinearSegmentedColormap
+
+warnings.filterwarnings('ignore')
+
+# Set up paths
+data_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/data")
+gpw_dir = data_dir / "GPW"
+output_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/outputs/Figures/GPW_vis")
+output_dir.mkdir(parents=True, exist_ok=True)
+
+# Years to process (GPW data available in 5-year intervals)
+YEARS = [2000, 2005, 2010, 2015, 2020]
+
+# Population density color scheme
+POPULATION_COLORS = {
+    'low': '#2166ac',      # Blue for low density
+    'medium_low': '#4393c3', # Light blue
+    'medium': '#92c5de',   # Very light blue
+    'medium_high': '#d1e5f0', # Very light blue
+    'high': '#f7f7f7',     # Light gray
+    'very_high': '#fddbc7', # Light orange
+    'extreme': '#f4a582',  # Orange
+    'maximum': '#d6604d',  # Red-orange
+    'peak': '#b2182b'      # Dark red
+}
+
+def load_gpw_data():
+    """Load the GPW population density data for all years"""
+    print("📁 Loading GPW population density data for all years...")
+    
+    all_data = {}
+    
+    for year in YEARS:
+        gpw_file = gpw_dir / f"GPW_population_density_SA_1km_{year}.tif"
+        
+        if not gpw_file.exists():
+            print(f"   ⚠️ File not found: {gpw_file.name}")
+            continue
+            
+        try:
+            with rasterio.open(gpw_file) as src:
+                data = src.read()
+                
+                # GPW data is single band, so we take the first (and only) band
+                population_data = data[0]
+                
+                print(f"   ✅ {year}: Shape: {population_data.shape}, Valid pixels: {np.sum(~np.isnan(population_data)):,}")
+                print(f"       Population range: {np.nanmin(population_data):.2f} - {np.nanmax(population_data):.2f} people/km²")
+                print(f"       Mean density: {np.nanmean(population_data):.2f} people/km²")
+                
+                all_data[year] = {
+                    'data': population_data,
+                    'src': src,
+                    'file_path': gpw_file
+                }
+                
+        except Exception as e:
+            print(f"   ❌ Error loading {year}: {e}")
+            continue
+    
+    if not all_data:
+        print("   ❌ No data loaded successfully")
+        return None
+    
+    print(f"   📊 Successfully loaded {len(all_data)} years")
+    return all_data
+
+def create_population_overview(all_data):
+    """Create overview maps for each year"""
+    if all_data is None:
+        return
+    
+    print("🎨 Creating population density overview for each year...")
+    
+    # Create custom colormap for population density
+    colors = ['#2166ac', '#4393c3', '#92c5de', '#d1e5f0', '#f7f7f7', '#fddbc7', '#f4a582', '#d6604d', '#b2182b']
+    n_bins = 256
+    cmap = LinearSegmentedColormap.from_list('population', colors, N=n_bins)
+    
+    for year, data_info in all_data.items():
+        population_data = data_info['data']
+        
+        # Create figure
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+        fig.suptitle(f'Population Density - South America {year}', 
+                    fontsize=16, fontweight='bold')
+        
+        # Plot 1: Linear scale
+        im1 = ax1.imshow(population_data, cmap=cmap, aspect='auto', 
+                        vmin=0, vmax=np.nanpercentile(population_data, 95))
+        ax1.set_title('Population Density (Linear Scale)', fontweight='bold')
+        cbar1 = plt.colorbar(im1, ax=ax1, shrink=0.8)
+        cbar1.set_label('People/km²', rotation=270, labelpad=15)
+        
+        # Plot 2: Log scale for better visualization of low densities
+        # Add small value to avoid log(0)
+        log_data = np.where(population_data > 0, population_data, 0.01)
+        im2 = ax2.imshow(log_data, cmap=cmap, aspect='auto', norm=LogNorm(vmin=0.1, vmax=1000))
+        ax2.set_title('Population Density (Log Scale)', fontweight='bold')
+        cbar2 = plt.colorbar(im2, ax=ax2, shrink=0.8)
+        cbar2.set_label('People/km² (log scale)', rotation=270, labelpad=15)
+        
+        # Add statistics text
+        stats_text = f"""Statistics for {year}:
+Mean: {np.nanmean(population_data):.2f} people/km²
+Median: {np.nanmedian(population_data):.2f} people/km²
+Max: {np.nanmax(population_data):.2f} people/km²
+Valid pixels: {np.sum(~np.isnan(population_data)):,}"""
+        
+        fig.text(0.02, 0.02, stats_text, fontsize=10, 
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray", alpha=0.8))
+        
+        # Remove axis labels for cleaner look
+        for ax in [ax1, ax2]:
+            ax.set_xticks([])
+            ax.set_yticks([])
+        
+        plt.tight_layout()
+        
+        # Save the plot
+        output_file = output_dir / f"gpw_population_density_sa_{year}_overview.png"
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        print(f"   💾 Saved: {output_file.name}")
+        
+        plt.close()  # Close to free memory
+
+def create_temporal_comparison(all_data):
+    """Create temporal comparison of population changes"""
+    if all_data is None or len(all_data) < 2:
+        return
+    
+    print("📈 Creating temporal comparison...")
+    
+    # Calculate statistics for each year
+    temporal_stats = {}
+    
+    for year, data_info in all_data.items():
+        data = data_info['data']
+        
+        # Calculate various statistics
+        stats = {
+            'mean': np.nanmean(data),
+            'median': np.nanmedian(data),
+            'std': np.nanstd(data),
+            'max': np.nanmax(data),
+            'total_population': np.nansum(data),  # Approximate total population
+            'populated_pixels': np.sum(data > 0),
+            'urban_threshold': np.sum(data > 1500),  # Pixels with >1500 people/km² (urban)
+        }
+        temporal_stats[year] = stats
+    
+    # Create figure with multiple subplots
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('Population Density Trends in South America (2000-2020)', 
+                fontsize=16, fontweight='bold')
+    
+    years = sorted(temporal_stats.keys())
+    
+    # Plot 1: Mean population density
+    ax1 = axes[0, 0]
+    means = [temporal_stats[year]['mean'] for year in years]
+    ax1.plot(years, means, marker='o', linewidth=2, markersize=8, color='#2166ac')
+    ax1.set_title('Mean Population Density Over Time', fontweight='bold')
+    ax1.set_xlabel('Year')
+    ax1.set_ylabel('Mean Density (people/km²)')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xticks(years)
+    
+    # Add value labels
+    for year, value in zip(years, means):
+        ax1.annotate(f'{value:.1f}', (year, value), 
+                   textcoords="offset points", xytext=(0,10), ha='center')
+    
+    # Plot 2: Total population (approximate)
+    ax2 = axes[0, 1]
+    totals = [temporal_stats[year]['total_population']/1e6 for year in years]  # Convert to millions
+    ax2.plot(years, totals, marker='s', linewidth=2, markersize=8, color='#d6604d')
+    ax2.set_title('Total Population (Approximate)', fontweight='bold')
+    ax2.set_xlabel('Year')
+    ax2.set_ylabel('Population (Millions)')
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xticks(years)
+    
+    # Add value labels
+    for year, value in zip(years, totals):
+        ax2.annotate(f'{value:.0f}M', (year, value), 
+                   textcoords="offset points", xytext=(0,10), ha='center')
+    
+    # Plot 3: Populated pixels
+    ax3 = axes[1, 0]
+    populated = [temporal_stats[year]['populated_pixels']/1e6 for year in years]  # Convert to millions
+    ax3.plot(years, populated, marker='^', linewidth=2, markersize=8, color='#4393c3')
+    ax3.set_title('Populated Pixels Over Time', fontweight='bold')
+    ax3.set_xlabel('Year')
+    ax3.set_ylabel('Populated Pixels (Millions)')
+    ax3.grid(True, alpha=0.3)
+    ax3.set_xticks(years)
+    
+    # Add value labels
+    for year, value in zip(years, populated):
+        ax3.annotate(f'{value:.1f}M', (year, value), 
+                   textcoords="offset points", xytext=(0,10), ha='center')
+    
+    # Plot 4: Urban areas (>1500 people/km²)
+    ax4 = axes[1, 1]
+    urban = [temporal_stats[year]['urban_threshold']/1e3 for year in years]  # Convert to thousands
+    ax4.plot(years, urban, marker='d', linewidth=2, markersize=8, color='#b2182b')
+    ax4.set_title('Urban Areas (>1500 people/km²)', fontweight='bold')
+    ax4.set_xlabel('Year')
+    ax4.set_ylabel('Urban Pixels (Thousands)')
+    ax4.grid(True, alpha=0.3)
+    ax4.set_xticks(years)
+    
+    # Add value labels
+    for year, value in zip(years, urban):
+        ax4.annotate(f'{value:.0f}K', (year, value), 
+                   textcoords="offset points", xytext=(0,10), ha='center')
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    output_file = output_dir / "gpw_population_temporal_comparison.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {output_file.name}")
+    
+    plt.show()
+
+def create_population_change_maps(all_data):
+    """Create maps showing population change between periods"""
+    if all_data is None or len(all_data) < 2:
+        return
+    
+    print("🗺️ Creating population change maps...")
+    
+    years = sorted(all_data.keys())
+    
+    # Calculate changes between consecutive periods
+    for i in range(len(years) - 1):
+        year1, year2 = years[i], years[i + 1]
+        
+        data1 = all_data[year1]['data']
+        data2 = all_data[year2]['data']
+        
+        # Calculate absolute and percentage change
+        abs_change = data2 - data1
+        pct_change = np.where(data1 > 0, (abs_change / data1) * 100, 0)
+        
+        # Create figure
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+        fig.suptitle(f'Population Change: {year1} to {year2}', 
+                    fontsize=16, fontweight='bold')
+        
+        # Plot 1: Absolute change
+        im1 = ax1.imshow(abs_change, cmap='RdBu_r', aspect='auto', 
+                        vmin=-np.nanpercentile(np.abs(abs_change), 95),
+                        vmax=np.nanpercentile(np.abs(abs_change), 95))
+        ax1.set_title('Absolute Change (people/km²)', fontweight='bold')
+        cbar1 = plt.colorbar(im1, ax=ax1, shrink=0.8)
+        cbar1.set_label('Change (people/km²)', rotation=270, labelpad=15)
+        
+        # Plot 2: Percentage change (capped at ±100% for visualization)
+        pct_change_capped = np.clip(pct_change, -100, 100)
+        im2 = ax2.imshow(pct_change_capped, cmap='RdBu_r', aspect='auto', 
+                        vmin=-100, vmax=100)
+        ax2.set_title('Percentage Change (%)', fontweight='bold')
+        cbar2 = plt.colorbar(im2, ax=ax2, shrink=0.8)
+        cbar2.set_label('Change (%)', rotation=270, labelpad=15)
+        
+        # Add statistics
+        stats_text = f"""Change Statistics ({year1} → {year2}):
+Mean absolute change: {np.nanmean(abs_change):.2f} people/km²
+Mean percentage change: {np.nanmean(pct_change):.2f}%
+Areas with increase: {np.sum(abs_change > 0):,} pixels
+Areas with decrease: {np.sum(abs_change < 0):,} pixels"""
+        
+        fig.text(0.02, 0.02, stats_text, fontsize=10, 
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray", alpha=0.8))
+        
+        # Remove axis labels
+        for ax in [ax1, ax2]:
+            ax.set_xticks([])
+            ax.set_yticks([])
+        
+        plt.tight_layout()
+        
+        # Save the plot
+        output_file = output_dir / f"gpw_population_change_{year1}_to_{year2}.png"
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        print(f"   💾 Saved: {output_file.name}")
+        
+        plt.close()
+
+def create_summary_statistics(all_data):
+    """Create summary statistics across all years"""
+    if all_data is None:
+        return
+    
+    print("📊 Creating summary statistics...")
+    
+    # Collect all statistics
+    all_stats = []
+    
+    for year, data_info in all_data.items():
+        data = data_info['data']
+        
+        # Calculate comprehensive statistics
+        stats = {
+            'year': year,
+            'mean': np.nanmean(data),
+            'median': np.nanmedian(data),
+            'std': np.nanstd(data),
+            'min': np.nanmin(data),
+            'max': np.nanmax(data),
+            'total_population': np.nansum(data),
+            'populated_pixels': np.sum(data > 0),
+            'urban_pixels': np.sum(data > 1500),
+            'rural_pixels': np.sum((data > 0) & (data <= 1500))
+        }
+        all_stats.append(stats)
+    
+    # Create figure with summary table
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+    fig.suptitle('GPW Population Density Summary Statistics (2000-2020)', 
+                fontsize=16, fontweight='bold')
+    
+    years = [s['year'] for s in all_stats]
+    
+    # Plot 1: Key metrics over time
+    ax1_twin = ax1.twinx()
+    
+    means = [s['mean'] for s in all_stats]
+    totals = [s['total_population']/1e6 for s in all_stats]  # Convert to millions
+    
+    line1 = ax1.plot(years, means, marker='o', linewidth=2, markersize=8, 
+                    color='#2166ac', label='Mean Density')
+    line2 = ax1_twin.plot(years, totals, marker='s', linewidth=2, markersize=8, 
+                         color='#d6604d', label='Total Population')
+    
+    ax1.set_xlabel('Year')
+    ax1.set_ylabel('Mean Density (people/km²)', color='#2166ac')
+    ax1_twin.set_ylabel('Total Population (Millions)', color='#d6604d')
+    ax1.set_title('Population Trends', fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xticks(years)
+    
+    # Combine legends
+    lines = line1 + line2
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc='upper left')
+    
+    # Plot 2: Population distribution categories
+    urban_counts = [s['urban_pixels']/1e3 for s in all_stats]
+    rural_counts = [s['rural_pixels']/1e3 for s in all_stats]
+    
+    width = 0.35
+    x = np.arange(len(years))
+    
+    ax2.bar(x - width/2, rural_counts, width, label='Rural (≤1500 people/km²)', 
+           color='#92c5de', alpha=0.8)
+    ax2.bar(x + width/2, urban_counts, width, label='Urban (>1500 people/km²)', 
+           color='#d6604d', alpha=0.8)
+    
+    ax2.set_xlabel('Year')
+    ax2.set_ylabel('Number of Pixels (Thousands)')
+    ax2.set_title('Population Distribution by Type', fontweight='bold')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(years)
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    output_file = output_dir / "gpw_population_summary_statistics.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {output_file.name}")
+    
+    plt.show()
+
+def main():
+    """Main visualization function"""
+    print("🌍 GPW Population Density Visualization - South America 2000-2020")
+    print("=" * 70)
+    
+    # Load data
+    all_data = load_gpw_data()
+    
+    if all_data is None:
+        print("❌ Failed to load data. Exiting.")
+        return
+    
+    # Create visualizations
+    print("\n🎨 Creating visualizations...")
+    
+    # 1. Population density overview for each year
+    create_population_overview(all_data)
+    
+    # 2. Temporal comparison
+    create_temporal_comparison(all_data)
+    
+    # 3. Population change maps
+    create_population_change_maps(all_data)
+    
+    # 4. Summary statistics
+    create_summary_statistics(all_data)
+    
+    # Summary
+    print("\n" + "=" * 70)
+    print("📋 VISUALIZATION SUMMARY")
+    print("=" * 70)
+    
+    print(f"Years processed: {sorted(all_data.keys())}")
+    print(f"Total years: {len(all_data)}")
+    
+    # Show data info for first year as example
+    first_year = min(all_data.keys())
+    data = all_data[first_year]['data']
+    print(f"Data shape per year: {data.shape}")
+    print(f"Spatial dimensions: {data.shape[0]} x {data.shape[1]}")
+    print(f"Total pixels per year: {data.shape[0] * data.shape[1]:,}")
+    
+    print(f"\nPopulation density ranges:")
+    for year in sorted(all_data.keys()):
+        data = all_data[year]['data']
+        print(f"  {year}: {np.nanmin(data):.2f} - {np.nanmax(data):.2f} people/km²")
+    
+    print(f"\n💾 Output files saved to: {output_dir}")
+    for year in sorted(all_data.keys()):
+        print(f"   - gpw_population_density_sa_{year}_overview.png")
+    
+    # List change maps
+    years = sorted(all_data.keys())
+    for i in range(len(years) - 1):
+        year1, year2 = years[i], years[i + 1]
+        print(f"   - gpw_population_change_{year1}_to_{year2}.png")
+    
+    print("   - gpw_population_temporal_comparison.png")
+    print("   - gpw_population_summary_statistics.png")
+    
+    print("\n✅ Visualization complete! 🎉")
+
+if __name__ == "__main__":
+    main()

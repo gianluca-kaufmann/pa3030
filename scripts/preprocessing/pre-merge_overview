@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""
+Pre-merge Overview Script
+Scans all GeoTIFF files in the data folder and creates a comprehensive summary.
+"""
+
+import os
+import sys
+import pandas as pd
+import numpy as np
+import rasterio
+from rasterio.crs import CRS
+from rasterio.warp import transform_bounds
+from pathlib import Path
+import warnings
+from datetime import datetime
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import re
+from typing import Dict, List, Tuple, Optional
+import logging
+
+# Suppress warnings for cleaner output
+warnings.filterwarnings('ignore')
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class GeoTIFFScanner:
+    """Class to scan and analyze GeoTIFF files."""
+    
+    def __init__(self, data_folder: str, output_folder: str):
+        self.data_folder = Path(data_folder)
+        self.output_folder = Path(output_folder)
+        self.output_folder.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize results storage
+        self.results = []
+        
+    def extract_year_from_filename(self, filename: str) -> Optional[int]:
+        """Extract year from filename if present."""
+        # Look for 4-digit years in filename
+        year_pattern = r'\b(19|20)\d{2}\b'
+        matches = re.findall(year_pattern, filename)
+        if matches:
+            return int(matches[0])
+        return None
+    
+    def extract_dataset_name(self, filepath: Path) -> str:
+        """Extract dataset name from filepath."""
+        # Get the parent folder name as dataset
+        parent_folder = filepath.parent.name
+        filename = filepath.stem
+        
+        # If parent folder is 'data', use grandparent or filename
+        if parent_folder == 'data':
+            grandparent = filepath.parent.parent.name
+            if grandparent:
+                return f"{grandparent}_{filename}"
+            else:
+                return filename
+        else:
+            return f"{parent_folder}_{filename}"
+    
+    def analyze_geotiff(self, filepath: Path) -> Dict:
+        """Analyze a single GeoTIFF file and extract metadata."""
+        try:
+            with rasterio.open(filepath) as src:
+                # Basic file info
+                dataset_name = self.extract_dataset_name(filepath)
+                file_path = str(filepath)
+                
+                # CRS information
+                crs = src.crs
+                crs_string = str(crs) if crs else "Unknown"
+                
+                # Resolution
+                transform = src.transform
+                if transform:
+                    resolution_x = abs(transform[0])
+                    resolution_y = abs(transform[3])
+                    resolution = f"{resolution_x:.2f}x{resolution_y:.2f}"
+                else:
+                    resolution = "Unknown"
+                
+                # Extent (bounding box)
+                bounds = src.bounds
+                extent = f"({bounds.left:.4f}, {bounds.bottom:.4f}, {bounds.right:.4f}, {bounds.top:.4f})"
+                
+                # Dimensions and bands
+                height, width = src.shape
+                total_pixels = height * width
+                num_bands = src.count
+                
+                # Band names
+                band_names = []
+                if hasattr(src, 'descriptions') and src.descriptions:
+                    band_names = [desc for desc in src.descriptions if desc]
+                else:
+                    band_names = [f"Band_{i+1}" for i in range(num_bands)]
+                
+                # Data type
+                dtype = str(src.dtypes[0]) if src.dtypes else "Unknown"
+                
+                # Valid pixels calculation (for first band)
+                valid_pixels = 0
+                coverage_percentage = 0.0
+                
+                try:
+                    # Read first band to count valid pixels
+                    band_data = src.read(1)
+                    valid_pixels = np.sum(~np.isnan(band_data))
+                    coverage_percentage = (valid_pixels / total_pixels) * 100
+                except Exception as e:
+                    logger.warning(f"Could not read band data for {filepath}: {e}")
+                
+                # Extract year from filename
+                year = self.extract_year_from_filename(filepath.name)
+                years_covered = str(year) if year else "N/A"
+                
+                return {
+                    'dataset_name': dataset_name,
+                    'file_path': file_path,
+                    'crs': crs_string,
+                    'resolution_meters': resolution,
+                    'extent': extent,
+                    'total_pixels': total_pixels,
+                    'valid_pixels': valid_pixels,
+                    'coverage_percentage': round(coverage_percentage, 2),
+                    'num_bands': num_bands,
+                    'band_names': '; '.join(band_names),
+                    'data_type': dtype,
+                    'years_covered': years_covered,
+                    'file_size_mb': round(filepath.stat().st_size / (1024 * 1024), 2)
+                }
+                
+        except Exception as e:
+            logger.error(f"Error analyzing {filepath}: {e}")
+            return {
+                'dataset_name': self.extract_dataset_name(filepath),
+                'file_path': str(filepath),
+                'crs': "Error",
+                'resolution_meters': "Error",
+                'extent': "Error",
+                'total_pixels': 0,
+                'valid_pixels': 0,
+                'coverage_percentage': 0.0,
+                'num_bands': 0,
+                'band_names': "Error",
+                'data_type': "Error",
+                'years_covered': "Error",
+                'file_size_mb': 0
+            }
+    
+    def find_geotiff_files(self) -> List[Path]:
+        """Find all GeoTIFF files in the data folder."""
+        geotiff_files = []
+        
+        for root, dirs, files in os.walk(self.data_folder):
+            for file in files:
+                if file.lower().endswith(('.tif', '.tiff')):
+                    geotiff_files.append(Path(root) / file)
+        
+        return geotiff_files
+    
+    def scan_files_parallel(self, geotiff_files: List[Path], max_workers: int = None) -> List[Dict]:
+        """Scan GeoTIFF files in parallel."""
+        if max_workers is None:
+            max_workers = min(mp.cpu_count(), len(geotiff_files))
+        
+        logger.info(f"Scanning {len(geotiff_files)} GeoTIFF files using {max_workers} workers...")
+        
+        results = []
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_file = {
+                executor.submit(self.analyze_geotiff, filepath): filepath 
+                for filepath in geotiff_files
+            }
+            
+            # Process completed tasks
+            completed = 0
+            for future in as_completed(future_to_file):
+                filepath = future_to_file[future]
+                try:
+                    result = future.result()
+                    results.append(result)
+                    completed += 1
+                    
+                    if completed % 10 == 0 or completed == len(geotiff_files):
+                        logger.info(f"Processed {completed}/{len(geotiff_files)} files...")
+                        
+                except Exception as e:
+                    logger.error(f"Error processing {filepath}: {e}")
+        
+        return results
+    
+    def create_summary_table(self, results: List[Dict]) -> pd.DataFrame:
+        """Create a summary table from the results."""
+        df = pd.DataFrame(results)
+        
+        # Sort by dataset name
+        df = df.sort_values('dataset_name').reset_index(drop=True)
+        
+        return df
+    
+    def save_csv(self, df: pd.DataFrame) -> str:
+        """Save the summary table as CSV."""
+        csv_path = self.output_folder / "pre-merge_overview.csv"
+        df.to_csv(csv_path, index=False)
+        logger.info(f"CSV summary saved to: {csv_path}")
+        return str(csv_path)
+    
+    def create_html_report(self, df: pd.DataFrame) -> str:
+        """Create an HTML report for external presentation."""
+        html_path = self.output_folder / "pre-merge_overview.html"
+        
+        # Calculate summary statistics
+        total_files = len(df)
+        total_size_gb = df['file_size_mb'].sum() / 1024
+        avg_coverage = df['coverage_percentage'].mean()
+        
+        # Group by dataset type
+        dataset_groups = df['dataset_name'].str.split('_', n=1, expand=True)[0].value_counts()
+        
+        html_content = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GeoTIFF Dataset Overview</title>
+    <style>
+        body {{
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+            color: #333;
+        }}
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }}
+        h1 {{
+            color: #2c3e50;
+            text-align: center;
+            margin-bottom: 30px;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+        }}
+        .summary-stats {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }}
+        .stat-card {{
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+        }}
+        .stat-number {{
+            font-size: 2em;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }}
+        .stat-label {{
+            font-size: 0.9em;
+            opacity: 0.9;
+        }}
+        .dataset-groups {{
+            margin-bottom: 30px;
+        }}
+        .group-item {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 15px;
+            margin: 5px 0;
+            background: #ecf0f1;
+            border-radius: 5px;
+            border-left: 4px solid #3498db;
+        }}
+        .group-name {{
+            font-weight: bold;
+        }}
+        .group-count {{
+            background: #3498db;
+            color: white;
+            padding: 5px 10px;
+            border-radius: 15px;
+            font-size: 0.9em;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+            font-size: 0.9em;
+        }}
+        th, td {{
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }}
+        th {{
+            background-color: #34495e;
+            color: white;
+            font-weight: bold;
+        }}
+        tr:nth-child(even) {{
+            background-color: #f8f9fa;
+        }}
+        tr:hover {{
+            background-color: #e8f4f8;
+        }}
+        .footer {{
+            margin-top: 30px;
+            text-align: center;
+            color: #7f8c8d;
+            font-size: 0.9em;
+        }}
+        .error-row {{
+            background-color: #ffebee !important;
+            color: #c62828;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🌍 GeoTIFF Dataset Overview</h1>
+        
+        <div class="summary-stats">
+            <div class="stat-card">
+                <div class="stat-number">{total_files}</div>
+                <div class="stat-label">Total Files</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number">{total_size_gb:.1f} GB</div>
+                <div class="stat-label">Total Size</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number">{avg_coverage:.1f}%</div>
+                <div class="stat-label">Avg Coverage</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number">{len(dataset_groups)}</div>
+                <div class="stat-label">Dataset Types</div>
+            </div>
+        </div>
+        
+        <h2>📊 Dataset Groups</h2>
+        <div class="dataset-groups">
+"""
+        
+        for group_name, count in dataset_groups.items():
+            html_content += f"""
+            <div class="group-item">
+                <span class="group-name">{group_name}</span>
+                <span class="group-count">{count} files</span>
+            </div>
+"""
+        
+        html_content += f"""
+        </div>
+        
+        <h2>📋 Detailed File Information</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Dataset Name</th>
+                    <th>File Path</th>
+                    <th>CRS</th>
+                    <th>Resolution (m)</th>
+                    <th>Total Pixels</th>
+                    <th>Valid Pixels</th>
+                    <th>Coverage %</th>
+                    <th>Bands</th>
+                    <th>Data Type</th>
+                    <th>Year</th>
+                    <th>Size (MB)</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+        
+        for _, row in df.iterrows():
+            error_class = "error-row" if row['crs'] == "Error" else ""
+            html_content += f"""
+                <tr class="{error_class}">
+                    <td>{row['dataset_name']}</td>
+                    <td>{row['file_path']}</td>
+                    <td>{row['crs']}</td>
+                    <td>{row['resolution_meters']}</td>
+                    <td>{row['total_pixels']:,}</td>
+                    <td>{row['valid_pixels']:,}</td>
+                    <td>{row['coverage_percentage']:.2f}%</td>
+                    <td>{row['num_bands']}</td>
+                    <td>{row['data_type']}</td>
+                    <td>{row['years_covered']}</td>
+                    <td>{row['file_size_mb']:.1f}</td>
+                </tr>
+"""
+        
+        html_content += f"""
+            </tbody>
+        </table>
+        
+        <div class="footer">
+            <p>Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+            <p>Total processing time: {datetime.now().strftime('%H:%M:%S')}</p>
+        </div>
+    </div>
+</body>
+</html>
+"""
+        
+        with open(html_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        
+        logger.info(f"HTML report saved to: {html_path}")
+        return str(html_path)
+    
+    def run(self):
+        """Main execution method."""
+        logger.info("Starting GeoTIFF dataset overview generation...")
+        start_time = datetime.now()
+        
+        # Find all GeoTIFF files
+        logger.info("Scanning for GeoTIFF files...")
+        geotiff_files = self.find_geotiff_files()
+        logger.info(f"Found {len(geotiff_files)} GeoTIFF files")
+        
+        if not geotiff_files:
+            logger.warning("No GeoTIFF files found!")
+            return
+        
+        # Analyze files in parallel
+        results = self.scan_files_parallel(geotiff_files)
+        
+        # Create summary table
+        logger.info("Creating summary table...")
+        df = self.create_summary_table(results)
+        
+        # Save CSV
+        csv_path = self.save_csv(df)
+        
+        # Create HTML report
+        html_path = self.create_html_report(df)
+        
+        # Final summary
+        end_time = datetime.now()
+        duration = end_time - start_time
+        
+        logger.info("=" * 60)
+        logger.info("SUMMARY COMPLETE")
+        logger.info("=" * 60)
+        logger.info(f"Total files processed: {len(results)}")
+        logger.info(f"Total processing time: {duration}")
+        logger.info(f"CSV output: {csv_path}")
+        logger.info(f"HTML report: {html_path}")
+        logger.info("=" * 60)
+
+def main():
+    """Main function."""
+    # Define paths
+    data_folder = "/Users/gianluca/Desktop/Master's Thesis/code/data"
+    output_folder = "/Users/gianluca/Desktop/Master's Thesis/code/outputs/Tables"
+    
+    # Create scanner and run
+    scanner = GeoTIFFScanner(data_folder, output_folder)
+    scanner.run()
+
+if __name__ == "__main__":
+    main()

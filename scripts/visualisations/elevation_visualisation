@@ -1,0 +1,478 @@
+#!/usr/bin/env python3
+"""
+Elevation & Slope Visualization for South America
+
+This script creates visualizations of the elevation and slope datasets
+from COPERNICUS/DEM/GLO30 at 1km resolution for South America.
+"""
+
+import numpy as np
+import rasterio
+import matplotlib.pyplot as plt
+from pathlib import Path
+import warnings
+from matplotlib.colors import LinearSegmentedColormap, ListedColormap
+
+warnings.filterwarnings('ignore')
+
+# Set up paths
+data_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/data")
+elevation_dir = data_dir / "elevation"
+output_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/outputs/Figures/elevation_vis")
+output_dir.mkdir(parents=True, exist_ok=True)
+
+# Color schemes for elevation and slope
+ELEVATION_COLORS = ['#0066CC', '#00CCFF', '#00FF00', '#FFFF00', '#FF6600', '#CC0000', '#660066']
+SLOPE_COLORS = ['#F7F7F7', '#D9D9D9', '#BDBDBD', '#969696', '#737373', '#525252', '#252525']
+
+def load_elevation_data():
+    """Load the elevation and slope data"""
+    print("📁 Loading elevation and slope data...")
+    
+    elevation_file = elevation_dir / "Elevation_SA_1km.tif"
+    slope_file = elevation_dir / "Slope_SA_1km.tif"
+    
+    data = {}
+    
+    # Load elevation data
+    if elevation_file.exists():
+        try:
+            with rasterio.open(elevation_file) as src:
+                elevation_data = src.read(1)  # Read first band
+                valid_pixels = np.sum(~np.isnan(elevation_data))
+                print(f"   ✅ Elevation: Shape: {elevation_data.shape}, Valid pixels: {valid_pixels:,}")
+                
+                if valid_pixels == 0:
+                    print(f"   ⚠️ Elevation file contains only NaN values - export may not be complete")
+                    print(f"   💡 Check Google Earth Engine Tasks tab for export status")
+                else:
+                    print(f"   📊 Elevation range: {np.nanmin(elevation_data):.1f} - {np.nanmax(elevation_data):.1f} m")
+                
+                data['elevation'] = {
+                    'data': elevation_data,
+                    'src': src,
+                    'file_path': elevation_file
+                }
+        except Exception as e:
+            print(f"   ❌ Error loading elevation: {e}")
+    else:
+        print(f"   ⚠️ Elevation file not found: {elevation_file}")
+    
+    # Load slope data
+    if slope_file.exists():
+        try:
+            with rasterio.open(slope_file) as src:
+                slope_data = src.read(1)  # Read first band
+                valid_pixels = np.sum(~np.isnan(slope_data))
+                print(f"   ✅ Slope: Shape: {slope_data.shape}, Valid pixels: {valid_pixels:,}")
+                
+                if valid_pixels == 0:
+                    print(f"   ⚠️ Slope file contains only NaN values - export may not be complete")
+                    print(f"   💡 Check Google Earth Engine Tasks tab for export status")
+                else:
+                    print(f"   📊 Slope range: {np.nanmin(slope_data):.1f} - {np.nanmax(slope_data):.1f} degrees")
+                
+                data['slope'] = {
+                    'data': slope_data,
+                    'src': src,
+                    'file_path': slope_file
+                }
+        except Exception as e:
+            print(f"   ❌ Error loading slope: {e}")
+    else:
+        print(f"   ⚠️ Slope file not found: {slope_file}")
+    
+    if not data:
+        print("   ❌ No data loaded successfully")
+        return None
+    
+    # Check if any dataset has valid data
+    has_valid_data = False
+    for dataset_name, dataset_info in data.items():
+        valid_pixels = np.sum(~np.isnan(dataset_info['data']))
+        if valid_pixels > 0:
+            has_valid_data = True
+            break
+    
+    if not has_valid_data:
+        print("   ⚠️ All datasets contain only NaN values")
+        print("   💡 The Google Earth Engine export may not be complete yet")
+        print("   🔍 Check the Earth Engine Tasks tab for export status")
+        return None
+    
+    print(f"   📊 Successfully loaded {len(data)} datasets")
+    return data
+
+def create_elevation_map(data):
+    """Create elevation map visualization"""
+    if 'elevation' not in data:
+        return
+    
+    print("🗻 Creating elevation map...")
+    
+    elevation_data = data['elevation']['data']
+    
+    # Mask NoData values (-9999) for proper visualization
+    elevation_masked = np.where(elevation_data == -9999, np.nan, elevation_data)
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(12, 10))
+    
+    # Create custom colormap for elevation
+    elevation_cmap = LinearSegmentedColormap.from_list('elevation', ELEVATION_COLORS, N=256)
+    
+    # Create visualization with proper vmin/vmax
+    vmin = np.nanmin(elevation_masked)
+    vmax = np.nanmax(elevation_masked)
+    im = ax.imshow(elevation_masked, cmap=elevation_cmap, aspect='auto', vmin=vmin, vmax=vmax)
+    
+    # Add colorbar
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+    cbar.set_label('Elevation (meters)', rotation=270, labelpad=20, fontsize=12)
+    
+    # Set title and labels
+    ax.set_title('Elevation Map - South America\n(SRTM DEM, 1km resolution)', 
+                fontsize=14, fontweight='bold', pad=20)
+    ax.set_xlabel('Longitude', fontsize=12)
+    ax.set_ylabel('Latitude', fontsize=12)
+    
+    # Add statistics text (excluding NoData values)
+    stats_text = f"""Statistics (excluding NoData):
+Mean: {np.nanmean(elevation_masked):.1f} m
+Std: {np.nanstd(elevation_masked):.1f} m
+Min: {np.nanmin(elevation_masked):.1f} m
+Max: {np.nanmax(elevation_masked):.1f} m"""
+    
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
+            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+            fontsize=10)
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    output_file = output_dir / "elevation_map_sa.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {output_file.name}")
+    
+    plt.close()
+
+def create_slope_map(data):
+    """Create slope map visualization"""
+    if 'slope' not in data:
+        return
+    
+    print("📐 Creating slope map...")
+    
+    slope_data = data['slope']['data']
+    
+    # Mask NoData values (-9999) for proper visualization
+    slope_masked = np.where(slope_data == -9999, np.nan, slope_data)
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(12, 10))
+    
+    # Create custom colormap for slope
+    slope_cmap = LinearSegmentedColormap.from_list('slope', SLOPE_COLORS, N=256)
+    
+    # Create visualization with proper vmin/vmax
+    vmin = np.nanmin(slope_masked)
+    vmax = np.nanmax(slope_masked)
+    im = ax.imshow(slope_masked, cmap=slope_cmap, aspect='auto', vmin=vmin, vmax=vmax)
+    
+    # Add colorbar
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+    cbar.set_label('Slope (degrees)', rotation=270, labelpad=20, fontsize=12)
+    
+    # Set title and labels
+    ax.set_title('Slope Map - South America\n(SRTM DEM, 1km resolution)', 
+                fontsize=14, fontweight='bold', pad=20)
+    ax.set_xlabel('Longitude', fontsize=12)
+    ax.set_ylabel('Latitude', fontsize=12)
+    
+    # Add statistics text (excluding NoData values)
+    stats_text = f"""Statistics (excluding NoData):
+Mean: {np.nanmean(slope_masked):.1f}°
+Std: {np.nanstd(slope_masked):.1f}°
+Min: {np.nanmin(slope_masked):.1f}°
+Max: {np.nanmax(slope_masked):.1f}°"""
+    
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
+            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+            fontsize=10)
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    output_file = output_dir / "slope_map_sa.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {output_file.name}")
+    
+    plt.close()
+
+def create_histograms(data):
+    """Create histograms for elevation and slope distributions"""
+    if not data:
+        return
+    
+    print("📊 Creating distribution histograms...")
+    
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    fig.suptitle('Distribution of Elevation and Slope Values - South America', 
+                fontsize=16, fontweight='bold')
+    
+    # Elevation histogram
+    if 'elevation' in data:
+        elevation_data = data['elevation']['data']
+        # Mask NoData values (-9999) and NaN values
+        elevation_masked = np.where(elevation_data == -9999, np.nan, elevation_data)
+        valid_elevation = elevation_masked[~np.isnan(elevation_masked)]
+        
+        axes[0].hist(valid_elevation, bins=100, alpha=0.7, color='#0066CC', edgecolor='black')
+        axes[0].set_title('Elevation Distribution', fontweight='bold')
+        axes[0].set_xlabel('Elevation (meters)')
+        axes[0].set_ylabel('Frequency')
+        axes[0].grid(True, alpha=0.3)
+        
+        # Add statistics
+        mean_elev = np.mean(valid_elevation)
+        std_elev = np.std(valid_elevation)
+        axes[0].axvline(mean_elev, color='red', linestyle='--', linewidth=2, 
+                       label=f'Mean: {mean_elev:.1f}m')
+        axes[0].legend()
+    
+    # Slope histogram
+    if 'slope' in data:
+        slope_data = data['slope']['data']
+        # Mask NoData values (-9999) and NaN values
+        slope_masked = np.where(slope_data == -9999, np.nan, slope_data)
+        valid_slope = slope_masked[~np.isnan(slope_masked)]
+        
+        axes[1].hist(valid_slope, bins=100, alpha=0.7, color='#525252', edgecolor='black')
+        axes[1].set_title('Slope Distribution', fontweight='bold')
+        axes[1].set_xlabel('Slope (degrees)')
+        axes[1].set_ylabel('Frequency')
+        axes[1].grid(True, alpha=0.3)
+        
+        # Add statistics
+        mean_slope = np.mean(valid_slope)
+        std_slope = np.std(valid_slope)
+        axes[1].axvline(mean_slope, color='red', linestyle='--', linewidth=2, 
+                       label=f'Mean: {mean_slope:.1f}°')
+        axes[1].legend()
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    output_file = output_dir / "elevation_slope_histograms.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {output_file.name}")
+    
+    plt.close()
+
+def create_elevation_slope_scatter(data):
+    """Create scatter plot of elevation vs slope"""
+    if 'elevation' not in data or 'slope' not in data:
+        return
+    
+    print("🔗 Creating elevation-slope relationship plot...")
+    
+    elevation_data = data['elevation']['data']
+    slope_data = data['slope']['data']
+    
+    # Mask NoData values (-9999) for both datasets
+    elevation_masked = np.where(elevation_data == -9999, np.nan, elevation_data)
+    slope_masked = np.where(slope_data == -9999, np.nan, slope_data)
+    
+    # Create valid mask (both datasets have valid values)
+    valid_mask = ~np.isnan(elevation_masked) & ~np.isnan(slope_masked)
+    
+    if np.sum(valid_mask) == 0:
+        print("   ⚠️ No valid data points for scatter plot")
+        return
+    
+    # Sample data for visualization (too many points for scatter plot)
+    valid_elevation = elevation_masked[valid_mask]
+    valid_slope = slope_masked[valid_mask]
+    
+    # Sample 100,000 points for visualization
+    n_samples = min(100000, len(valid_elevation))
+    indices = np.random.choice(len(valid_elevation), n_samples, replace=False)
+    
+    sample_elevation = valid_elevation[indices]
+    sample_slope = valid_slope[indices]
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(12, 8))
+    
+    # Create scatter plot with density coloring
+    scatter = ax.scatter(sample_elevation, sample_slope, alpha=0.5, s=1, c='blue')
+    
+    # Set labels and title
+    ax.set_xlabel('Elevation (meters)', fontsize=12)
+    ax.set_ylabel('Slope (degrees)', fontsize=12)
+    ax.set_title('Elevation vs Slope Relationship - South America\n(Sample of 100,000 points)', 
+                fontsize=14, fontweight='bold')
+    
+    # Add correlation coefficient
+    correlation = np.corrcoef(sample_elevation, sample_slope)[0, 1]
+    ax.text(0.05, 0.95, f'Correlation: {correlation:.3f}', 
+            transform=ax.transAxes, fontsize=12, fontweight='bold',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    # Add grid
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    output_file = output_dir / "elevation_slope_scatter.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {output_file.name}")
+    
+    plt.close()
+
+def create_terrain_classification(data):
+    """Create terrain classification based on elevation and slope"""
+    if 'elevation' not in data or 'slope' not in data:
+        return
+    
+    print("🏔️ Creating terrain classification...")
+    
+    elevation_data = data['elevation']['data']
+    slope_data = data['slope']['data']
+    
+    # Mask NoData values (-9999) for both datasets
+    elevation_masked = np.where(elevation_data == -9999, np.nan, elevation_data)
+    slope_masked = np.where(slope_data == -9999, np.nan, slope_data)
+    
+    # Create valid mask
+    valid_mask = ~np.isnan(elevation_masked) & ~np.isnan(slope_masked)
+    
+    # Create terrain classification
+    terrain_class = np.full_like(elevation_data, np.nan)
+    
+    # Classification rules (using masked data)
+    # Low elevation, low slope: Plains
+    plains_mask = (elevation_masked < 500) & (slope_masked < 5) & valid_mask
+    terrain_class[plains_mask] = 1
+    
+    # Low elevation, high slope: Hills
+    hills_mask = (elevation_masked < 500) & (slope_masked >= 5) & valid_mask
+    terrain_class[hills_mask] = 2
+    
+    # Medium elevation, low slope: Plateaus
+    plateaus_mask = (elevation_masked >= 500) & (elevation_masked < 2000) & (slope_masked < 10) & valid_mask
+    terrain_class[plateaus_mask] = 3
+    
+    # Medium elevation, high slope: Mountains
+    mountains_mask = (elevation_masked >= 500) & (elevation_masked < 2000) & (slope_masked >= 10) & valid_mask
+    terrain_class[mountains_mask] = 4
+    
+    # High elevation: High Mountains
+    high_mountains_mask = (elevation_masked >= 2000) & valid_mask
+    terrain_class[high_mountains_mask] = 5
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(12, 10))
+    
+    # Define colors for terrain classes
+    terrain_colors = ['#2E8B57', '#8FBC8F', '#D2B48C', '#CD853F', '#8B4513']
+    terrain_labels = ['Plains', 'Hills', 'Plateaus', 'Mountains', 'High Mountains']
+    
+    # Create visualization
+    im = ax.imshow(terrain_class, cmap=ListedColormap(terrain_colors), aspect='auto')
+    
+    # Add colorbar
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8, ticks=[1, 2, 3, 4, 5])
+    cbar.set_ticklabels(terrain_labels)
+    cbar.set_label('Terrain Type', rotation=270, labelpad=20, fontsize=12)
+    
+    # Set title
+    ax.set_title('Terrain Classification - South America\n(Based on Elevation and Slope)', 
+                fontsize=14, fontweight='bold', pad=20)
+    ax.set_xlabel('Longitude', fontsize=12)
+    ax.set_ylabel('Latitude', fontsize=12)
+    
+    # Add statistics
+    terrain_stats = []
+    for i, label in enumerate(terrain_labels, 1):
+        count = np.sum(terrain_class == i)
+        percentage = count / np.sum(valid_mask) * 100
+        terrain_stats.append(f"{label}: {percentage:.1f}%")
+    
+    stats_text = "Terrain Distribution:\n" + "\n".join(terrain_stats)
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, 
+            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+            fontsize=10)
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    output_file = output_dir / "terrain_classification_sa.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   💾 Saved: {output_file.name}")
+    
+    plt.close()
+
+def main():
+    """Main visualization function"""
+    print("🏔️ Elevation & Slope Visualization - South America")
+    print("=" * 60)
+    
+    # Load data
+    data = load_elevation_data()
+    
+    if data is None:
+        print("❌ Failed to load data. Exiting.")
+        return
+    
+    # Create visualizations
+    print("\n🎨 Creating visualizations...")
+    
+    # 1. Individual maps
+    create_elevation_map(data)
+    create_slope_map(data)
+    
+    # 2. Distribution analysis
+    create_histograms(data)
+    
+    # 3. Relationship analysis
+    create_elevation_slope_scatter(data)
+    
+    # 4. Terrain classification
+    create_terrain_classification(data)
+    
+    # Summary
+    print("\n" + "=" * 60)
+    print("📋 VISUALIZATION SUMMARY")
+    print("=" * 60)
+    
+    if 'elevation' in data:
+        elevation_data = data['elevation']['data']
+        elevation_masked = np.where(elevation_data == -9999, np.nan, elevation_data)
+        print(f"Elevation data:")
+        print(f"  Shape: {elevation_data.shape}")
+        print(f"  Range: {np.nanmin(elevation_masked):.1f} - {np.nanmax(elevation_masked):.1f} m")
+        print(f"  Mean: {np.nanmean(elevation_masked):.1f} m")
+        print(f"  Std: {np.nanstd(elevation_masked):.1f} m")
+    
+    if 'slope' in data:
+        slope_data = data['slope']['data']
+        slope_masked = np.where(slope_data == -9999, np.nan, slope_data)
+        print(f"Slope data:")
+        print(f"  Shape: {slope_data.shape}")
+        print(f"  Range: {np.nanmin(slope_masked):.1f} - {np.nanmax(slope_masked):.1f}°")
+        print(f"  Mean: {np.nanmean(slope_masked):.1f}°")
+        print(f"  Std: {np.nanstd(slope_masked):.1f}°")
+    
+    print(f"\n💾 Output files saved to: {output_dir}")
+    print("   - elevation_map_sa.png")
+    print("   - slope_map_sa.png")
+    print("   - elevation_slope_histograms.png")
+    print("   - elevation_slope_scatter.png")
+    print("   - terrain_classification_sa.png")
+    
+    print("\n✅ Visualization complete! 🎉")
+
+if __name__ == "__main__":
+    main()

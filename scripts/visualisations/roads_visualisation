@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""
+Road Infrastructure Visualization for South America
+
+This script loads the preprocessed road infrastructure for South America and
+creates simple visualizations saved to the figures directory. It falls back to
+raw shapefiles if preprocessed outputs are missing.
+
+Inputs (preferred):
+- data/road_infrastructure/roads_sa.gpkg (vector, clipped)
+- data/road_infrastructure/roads_sa_1km.tif (raster, 1 km presence)
+
+Fallback inputs:
+- data/road_infrastructure/*.shp
+
+Outputs:
+- outputs/Figures/road_infrastructure_vis/roads_overview.png
+- outputs/Figures/road_infrastructure_vis/roads_by_attribute_<attr>.png (if available)
+- outputs/Figures/road_infrastructure_vis/roads_raster_presence.png (if available)
+"""
+
+import warnings
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import rasterio
+import pandas as pd
+
+try:
+    import geopandas as gpd
+except Exception as _e:  # pragma: no cover
+    raise SystemExit(
+        "geopandas is required to run this script. Install with `pip install geopandas`"
+    ) from _e
+
+
+warnings.filterwarnings("ignore")
+
+
+# Paths
+PROJECT_ROOT = Path("/Users/gianluca/Desktop/Master's Thesis/code")
+DATA_DIR = PROJECT_ROOT / "data"
+ROADS_DIR = DATA_DIR / "road_infrastructure"
+VECTOR_PREPROCESSED = ROADS_DIR / "roads_sa.gpkg"
+RASTER_PREPROCESSED = ROADS_DIR / "roads_sa_1km.tif"
+OUTPUT_DIR = PROJECT_ROOT / "outputs/Figures/road_infrastructure_vis"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _find_shapefiles(directory: Path) -> list[Path]:
+    """Return list of .shp files in directory (non-recursive)."""
+    return sorted([p for p in directory.iterdir() if p.suffix.lower() == ".shp"])
+
+
+def load_roads() -> gpd.GeoDataFrame:
+    """Load and concatenate all road shapefiles as a single GeoDataFrame.
+
+    Reprojects to EPSG:3857 for consistent plotting.
+    """
+    # Prefer preprocessed vector if available
+    if VECTOR_PREPROCESSED.exists():
+        try:
+            gdf = gpd.read_file(VECTOR_PREPROCESSED)
+            if gdf.crs is None:
+                gdf = gdf.set_crs(4326, allow_override=True)
+            gdf = gdf.to_crs(3857)
+            # Keep only line-like geometries
+            gdf = gdf[gdf.geometry.notnull()]
+            gdf = gdf[gdf.geometry.geom_type.isin(["LineString", "MultiLineString"])].copy()
+            if not gdf.empty:
+                return gdf
+        except Exception as e:
+            print(f"⚠️  Failed to load preprocessed vector: {e}. Falling back to raw shapefiles.")
+
+    shp_files = _find_shapefiles(ROADS_DIR)
+    if not shp_files:
+        raise FileNotFoundError(f"No shapefiles found in {ROADS_DIR}")
+
+    frames: list[gpd.GeoDataFrame] = []
+    for shp in shp_files:
+        try:
+            gdf = gpd.read_file(shp)
+            if gdf.empty:
+                continue
+            # Ensure valid geometries and line-types only
+            gdf = gdf[gdf.geometry.notnull()].copy()
+            if gdf.empty:
+                continue
+            # Reproject to Web Mercator for plotting
+            if gdf.crs is None:
+                # Fallback: assume EPSG:4326 if undefined
+                gdf = gdf.set_crs(4326, allow_override=True)
+            gdf = gdf.to_crs(3857)
+            frames.append(gdf)
+        except Exception as e:
+            print(f"❌ Failed to read {shp.name}: {e}")
+
+    if not frames:
+        raise RuntimeError("No valid road geometries loaded.")
+
+    combined = gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), crs=frames[0].crs)
+    # Filter to LineString/MultiLineString only for clarity
+    line_like = combined.geometry.geom_type.isin(["LineString", "MultiLineString"])
+    combined = combined[line_like].copy()
+    if combined.empty:
+        raise RuntimeError("No line-like road geometries after filtering.")
+
+    return combined
+
+
+def _best_attribute_for_coloring(gdf: gpd.GeoDataFrame) -> str | None:
+    """Pick a reasonable attribute column to color by if present."""
+    candidates = [
+        "fclass",  # frequently used in OSM-derived datasets
+        "highway",
+        "type",
+        "roadtype",
+        "class",
+        "status",
+        "surface",
+    ]
+    cols_lower = {c.lower(): c for c in gdf.columns}
+    for cand in candidates:
+        if cand in cols_lower:
+            col = cols_lower[cand]
+            # Require more than 1 unique category to be meaningful
+            try:
+                nunique = gdf[col].dropna().astype(str).nunique()
+                if nunique > 1 and nunique <= 20:
+                    return col
+            except Exception:
+                continue
+    return None
+
+
+def plot_overview(gdf: gpd.GeoDataFrame) -> None:
+    """Plot a simple overview of all roads."""
+    fig, ax = plt.subplots(figsize=(12, 12))
+    # Thinner linewidth for dense networks
+    gdf.plot(ax=ax, color="#2c3e50", linewidth=0.25)
+
+    ax.set_title("Road Network - South America (Overview)", fontsize=16, fontweight="bold")
+    ax.set_axis_off()
+    plt.tight_layout()
+    outfile = OUTPUT_DIR / "roads_overview.png"
+    plt.savefig(outfile, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"💾 Saved: {outfile}")
+
+
+def plot_by_attribute(gdf: gpd.GeoDataFrame, attr: str) -> None:
+    """Plot roads colored by a chosen attribute column."""
+    # Limit categories for legibility
+    series = gdf[attr].astype(str).fillna("Unknown")
+    value_counts = series.value_counts()
+    top_values = value_counts.head(12).index.tolist()
+    filtered = gdf.copy()
+    filtered[attr] = series.where(series.isin(top_values), other="Other")
+
+    fig, ax = plt.subplots(figsize=(12, 12))
+    filtered.plot(ax=ax, column=attr, linewidth=0.35, legend=True, cmap="tab20")
+    ax.set_title(f"Road Network by {attr}", fontsize=16, fontweight="bold")
+    ax.set_axis_off()
+    plt.tight_layout()
+    outfile = OUTPUT_DIR / f"roads_by_attribute_{attr}.png"
+    plt.savefig(outfile, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"💾 Saved: {outfile}")
+
+
+def plot_raster_presence() -> None:
+    """Plot the 1 km raster presence/absence if available."""
+    if not RASTER_PREPROCESSED.exists():
+        print("ℹ️  No preprocessed raster found; skipping raster presence plot.")
+        return
+
+    try:
+        with rasterio.open(RASTER_PREPROCESSED) as src:
+            data = src.read(1)
+    except Exception as e:
+        print(f"⚠️  Failed to read raster: {e}")
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 12))
+    # Simple binary colormap: presence in dark line color
+    ax.imshow(data, cmap="Greys", vmin=0, vmax=1, interpolation="nearest")
+    ax.set_title("Road Presence (1 km) - South America", fontsize=16, fontweight="bold")
+    ax.set_axis_off()
+    plt.tight_layout()
+    outfile = OUTPUT_DIR / "roads_raster_presence.png"
+    plt.savefig(outfile, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"💾 Saved: {outfile}")
+
+
+def main() -> None:
+    print("🛣️  Road Infrastructure Visualization - South America")
+    print("=" * 70)
+    print(f"Input directory: {ROADS_DIR}")
+    print(f"Output directory: {OUTPUT_DIR}")
+
+    # Load
+    roads = load_roads()
+    print(f"✅ Loaded {len(roads):,} road features. CRS: {roads.crs}")
+
+    # Overview
+    plot_overview(roads)
+
+    # Attribute-colored map (if applicable)
+    attr = _best_attribute_for_coloring(roads)
+    if attr:
+        print(f"🎨 Using attribute for coloring: {attr}")
+        plot_by_attribute(roads, attr)
+    else:
+        print("ℹ️  No suitable attribute found for categorical coloring; skipping.")
+
+    # Raster presence (1 km) if available
+    plot_raster_presence()
+
+    print("\n✅ Visualization complete!")
+
+
+if __name__ == "__main__":
+    main()
+
+
