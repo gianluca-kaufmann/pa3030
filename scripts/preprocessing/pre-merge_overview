@@ -44,14 +44,48 @@ class GeoTIFFScanner:
         # Initialize results storage
         self.results = []
         
-    def extract_year_from_filename(self, filename: str) -> Optional[int]:
-        """Extract year from filename if present."""
-        # Look for 4-digit years in filename
-        year_pattern = r'\b(19|20)\d{2}\b'
-        matches = re.findall(year_pattern, filename)
-        if matches:
-            return int(matches[0])
-        return None
+    def extract_years_from_text(self, text: str) -> List[int]:
+        """Extract all standalone 4-digit years from arbitrary text.
+        Matches years not embedded in longer numbers and supports ranges.
+        """
+        # Normalize dashes to hyphen
+        normalized = re.sub(r'[\u2010-\u2015\u2212]', '-', text)
+        # Find standalone 4-digit years (not part of longer digit sequences)
+        year_hits = re.findall(r'(?<!\d)((?:19|20)\d{2})(?!\d)', normalized)
+        # Also expand ranges like 2019-2021
+        range_hits = re.findall(r'(?<!\d)((?:19|20)\d{2})\s*-\s*((?:19|20)\d{2})(?!\d)', normalized)
+        years: List[int] = []
+        for y in year_hits:
+            years.append(int(y))
+        for a, b in range_hits:
+            ya, yb = int(a), int(b)
+            if ya <= yb:
+                years.extend(list(range(ya, yb + 1)))
+            else:
+                years.extend(list(range(yb, ya + 1)))
+        return sorted(set(years))
+
+    def extract_years_from_path(self, filepath: Path) -> List[int]:
+        """Extract years from both filename and its relative directory path under data."""
+        parts_text = str(filepath.name)
+        try:
+            rel = filepath.relative_to(self.data_folder)
+            parts_text = str(rel)
+        except Exception:
+            parts_text = str(filepath)
+        return self.extract_years_from_text(parts_text)
+
+    def get_category_from_path(self, filepath: Path) -> str:
+        """Return the top-level subfolder under the data root as the category."""
+        try:
+            rel = filepath.relative_to(self.data_folder)
+            parts = rel.parts
+            if len(parts) > 1:
+                return parts[0]
+            # Files directly under data go in category 'data'
+            return 'data'
+        except Exception:
+            return filepath.parent.name
     
     def extract_dataset_name(self, filepath: Path) -> str:
         """Extract dataset name from filepath."""
@@ -76,6 +110,7 @@ class GeoTIFFScanner:
                 # Basic file info
                 dataset_name = self.extract_dataset_name(filepath)
                 file_path = str(filepath)
+                category = self.get_category_from_path(filepath)
                 
                 # CRS information
                 crs = src.crs
@@ -121,9 +156,9 @@ class GeoTIFFScanner:
                 except Exception as e:
                     logger.warning(f"Could not read band data for {filepath}: {e}")
                 
-                # Extract year from filename
-                year = self.extract_year_from_filename(filepath.name)
-                years_covered = str(year) if year else "N/A"
+                # Extract years from filename and folder path
+                years = self.extract_years_from_path(filepath)
+                years_covered = ", ".join(str(y) for y in years) if years else "N/A"
                 
                 return {
                     'dataset_name': dataset_name,
@@ -138,6 +173,7 @@ class GeoTIFFScanner:
                     'band_names': '; '.join(band_names),
                     'data_type': dtype,
                     'years_covered': years_covered,
+                    'category': category,
                     'file_size_mb': round(filepath.stat().st_size / (1024 * 1024), 2)
                 }
                 
@@ -156,6 +192,7 @@ class GeoTIFFScanner:
                 'band_names': "Error",
                 'data_type': "Error",
                 'years_covered': "Error",
+                'category': self.get_category_from_path(filepath),
                 'file_size_mb': 0
             }
     
@@ -210,6 +247,56 @@ class GeoTIFFScanner:
         df = df.sort_values('dataset_name').reset_index(drop=True)
         
         return df
+
+    def create_category_summary(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Aggregate per top-level category (folder under data)."""
+        # Normalize years into list per row
+        def parse_years(cell: str) -> List[int]:
+            if not isinstance(cell, str) or cell in ("N/A", "Error", ""):
+                return []
+            candidates = [c.strip() for c in cell.split(',') if c.strip()]
+            years: List[int] = []
+            for c in candidates:
+                if c.isdigit():
+                    try:
+                        years.append(int(c))
+                    except Exception:
+                        continue
+            return years
+
+        df = df.copy()
+        df['__years_list'] = df['years_covered'].apply(parse_years)
+
+        def agg_years(series: pd.Series) -> Tuple[int, Optional[int], Optional[int], str]:
+            all_years: List[int] = []
+            for lst in series:
+                all_years.extend(lst)
+            if not all_years:
+                return 0, None, None, ""
+            uniq = sorted(set(all_years))
+            return len(uniq), min(uniq), max(uniq), ", ".join(str(y) for y in uniq)
+
+        grouped = []
+        for category, sub in df.groupby('category', dropna=False):
+            years_count, year_min, year_max, years_list = agg_years(sub['__years_list'])
+            grouped.append({
+                'category': category,
+                'num_files': int(len(sub)),
+                'total_size_gb': round(sub['file_size_mb'].sum() / 1024.0, 3),
+                'avg_coverage_pct': round(sub['coverage_percentage'].replace([np.inf, -np.inf], np.nan).fillna(0).mean(), 2),
+                'data_types': ", ".join(sorted({dt for dt in sub['data_type'].dropna().astype(str) if dt and dt != 'Error'})) or "",
+                'crs_set': ", ".join(sorted({c for c in sub['crs'].dropna().astype(str) if c and c != 'Error'})) or "",
+                'resolutions': ", ".join(sorted({r for r in sub['resolution_meters'].dropna().astype(str) if r and r != 'Error'})) or "",
+                'bands_min': int(sub['num_bands'].min()) if len(sub) else 0,
+                'bands_max': int(sub['num_bands'].max()) if len(sub) else 0,
+                'years_covered_count': years_count,
+                'years_min': year_min if year_min is not None else "",
+                'years_max': year_max if year_max is not None else "",
+                'years_list': years_list,
+            })
+
+        cat_df = pd.DataFrame(grouped).sort_values('category').reset_index(drop=True)
+        return cat_df
     
     def save_csv(self, df: pd.DataFrame) -> str:
         """Save the summary table as CSV."""
@@ -217,8 +304,15 @@ class GeoTIFFScanner:
         df.to_csv(csv_path, index=False)
         logger.info(f"CSV summary saved to: {csv_path}")
         return str(csv_path)
+
+    def save_category_csv(self, cat_df: pd.DataFrame) -> str:
+        """Save the category-level summary as CSV."""
+        csv_path = self.output_folder / "pre-merge_overview_by_category.csv"
+        cat_df.to_csv(csv_path, index=False)
+        logger.info(f"Category CSV saved to: {csv_path}")
+        return str(csv_path)
     
-    def create_html_report(self, df: pd.DataFrame) -> str:
+    def create_html_report(self, df: pd.DataFrame, cat_df: Optional[pd.DataFrame] = None) -> str:
         """Create an HTML report for external presentation."""
         html_path = self.output_folder / "pre-merge_overview.html"
         
@@ -284,6 +378,9 @@ class GeoTIFFScanner:
         }}
         .dataset-groups {{
             margin-bottom: 30px;
+        }}
+        .category-table {{
+            margin-top: 20px;
         }}
         .group-item {{
             display: flex;
@@ -377,6 +474,50 @@ class GeoTIFFScanner:
         html_content += f"""
         </div>
         
+        <h2>📁 Folder-level Overview</h2>
+        <table class="category-table">
+            <thead>
+                <tr>
+                    <th>Category</th>
+                    <th>Files</th>
+                    <th>Total Size (GB)</th>
+                    <th>Avg Coverage %</th>
+                    <th>Years Covered</th>
+                    <th>Year Min</th>
+                    <th>Year Max</th>
+                    <th>Data Types</th>
+                    <th>CRS</th>
+                    <th>Resolutions</th>
+                    <th>Bands Min</th>
+                    <th>Bands Max</th>
+                </tr>
+            </thead>
+            <tbody>
+"""
+
+        if cat_df is not None and len(cat_df):
+            for _, r in cat_df.iterrows():
+                html_content += f"""
+                <tr>
+                    <td>{r['category']}</td>
+                    <td>{r['num_files']}</td>
+                    <td>{r['total_size_gb']}</td>
+                    <td>{r['avg_coverage_pct']}</td>
+                    <td>{r['years_list']}</td>
+                    <td>{r['years_min']}</td>
+                    <td>{r['years_max']}</td>
+                    <td>{r['data_types']}</td>
+                    <td>{r['crs_set']}</td>
+                    <td>{r['resolutions']}</td>
+                    <td>{r['bands_min']}</td>
+                    <td>{r['bands_max']}</td>
+                </tr>
+"""
+
+        html_content += f"""
+            </tbody>
+        </table>
+
         <h2>📋 Detailed File Information</h2>
         <table>
             <thead>
@@ -458,8 +599,13 @@ class GeoTIFFScanner:
         # Save CSV
         csv_path = self.save_csv(df)
         
+        # Create and save category summary
+        logger.info("Creating category-level summary...")
+        cat_df = self.create_category_summary(df)
+        cat_csv_path = self.save_category_csv(cat_df)
+
         # Create HTML report
-        html_path = self.create_html_report(df)
+        html_path = self.create_html_report(df, cat_df)
         
         # Final summary
         end_time = datetime.now()
@@ -472,6 +618,7 @@ class GeoTIFFScanner:
         logger.info(f"Total processing time: {duration}")
         logger.info(f"CSV output: {csv_path}")
         logger.info(f"HTML report: {html_path}")
+        logger.info(f"Category CSV: {cat_csv_path}")
         logger.info("=" * 60)
 
 def main():
