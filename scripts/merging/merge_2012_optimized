@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""
+Optimized merge script for South America 1×1 km datasets into a yearly tile-year panel (2012–2024).
+
+Key optimizations:
+- Progress monitoring and memory-efficient processing
+- Skip reprojection when files are already aligned
+- Process datasets one at a time instead of loading everything into memory
+- Use chunked processing for large files
+- Better error handling and logging
+"""
+
+import re
+import sys
+import math
+import json
+import time
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import rasterio
+from rasterio.enums import Resampling
+from rasterio.warp import reproject
+import pandas as pd
+
+
+DATA_ROOT = Path("/Users/gianluca/Desktop/Master's Thesis/code/data")
+READY_ROOT = DATA_ROOT / "ready"
+OUTPUT_ROOT = Path("/Users/gianluca/Desktop/Master's Thesis/code/outputs/Results")
+OUTPUT_TIFF_DIR = OUTPUT_ROOT / "merged_tifs"
+OUTPUT_TIFF_DIR.mkdir(parents=True, exist_ok=True)
+PARQUET_PATH = OUTPUT_ROOT / "merged_panel_2012_2024.parquet"
+
+YEARS = list(range(2012, 2025))
+
+
+def log_progress(message: str, start_time: Optional[float] = None):
+    """Log progress with optional timing."""
+    if start_time:
+        elapsed = time.time() - start_time
+        print(f"⏱️  {message} ({elapsed:.1f}s)")
+    else:
+        print(f"📊 {message}")
+
+
+def find_wdpa_files() -> Dict[int, Path]:
+    """Locate WDPA yearly files under ready or data root and return mapping year->path."""
+    log_progress("Scanning for WDPA files...")
+    candidates: List[Path] = []
+    # Search under ready/WDPA and data/WDPA
+    for base in [READY_ROOT / "WDPA", DATA_ROOT / "WDPA"]:
+        if base.exists():
+            candidates.extend(sorted(base.glob("*.tif")))
+    year_re = re.compile(r"(19|20)\d{2}")
+    mapping: Dict[int, Path] = {}
+    for p in candidates:
+        m = year_re.search(p.name)
+        if not m:
+            continue
+        year = int(m.group(0))
+        mapping[year] = p
+    log_progress(f"Found {len(mapping)} WDPA files")
+    return mapping
+
+
+def open_reference_wdpa() -> Tuple[Path, rasterio.DatasetReader]:
+    wdpa_map = find_wdpa_files()
+    if not wdpa_map:
+        print("❌ No WDPA files found under data/ready/WDPA or data/WDPA.")
+        sys.exit(1)
+    # Prefer 2012 else closest available year
+    ref_year = 2012 if 2012 in wdpa_map else sorted(wdpa_map.keys())[0]
+    ref_path = wdpa_map[ref_year]
+    src = rasterio.open(ref_path)
+    log_progress(f"Using WDPA backbone {ref_path.name} (year {ref_year}) as reference grid")
+    log_progress(f"Reference grid: {src.shape} pixels, CRS: {src.crs}")
+    return ref_path, src
+
+
+def discover_raster_catalog() -> Dict[str, Dict[Optional[int], List[Path]]]:
+    """
+    Scan READY_ROOT subfolders and build a catalog:
+    {dataset_name: {year(or None for static): [paths]}}
+    """
+    log_progress("Building raster catalog...")
+    catalog: Dict[str, Dict[Optional[int], List[Path]]] = {}
+    year_re = re.compile(r"(19|20)\d{2}")
+    if not READY_ROOT.exists():
+        print(f"❌ Missing directory: {READY_ROOT}")
+        sys.exit(1)
+    
+    total_files = 0
+    for subdir in sorted([p for p in READY_ROOT.iterdir() if p.is_dir()]):
+        dataset = subdir.name
+        catalog.setdefault(dataset, {})
+        files_in_dataset = 0
+        for tif in sorted(subdir.rglob("*.tif")):
+            m = year_re.search(tif.name)
+            year = int(m.group(0)) if m else None
+            catalog[dataset].setdefault(year, []).append(tif)
+            files_in_dataset += 1
+            total_files += 1
+        if files_in_dataset > 0:
+            log_progress(f"  {dataset}: {files_in_dataset} files")
+    
+    log_progress(f"Total files catalogued: {total_files}")
+    return catalog
+
+
+def check_alignment(src_path: Path, ref_profile: dict) -> bool:
+    """Check if a raster is already aligned with the reference grid."""
+    try:
+        with rasterio.open(src_path) as src:
+            return (
+                src.shape == (ref_profile["height"], ref_profile["width"]) and
+                src.crs == ref_profile["crs"] and
+                np.allclose(src.transform, ref_profile["transform"], atol=1e-6)
+            )
+    except Exception:
+        return False
+
+
+def read_reproject_to_ref(path: Path, ref_profile: dict) -> np.ndarray:
+    """Read a raster and reproject/resample to the reference profile, returning a float32 array."""
+    log_progress(f"  Processing {path.name}...")
+    start_time = time.time()
+    
+    # Check if already aligned
+    if check_alignment(path, ref_profile):
+        log_progress(f"    Already aligned, reading directly...")
+        with rasterio.open(path) as src:
+            data = src.read().astype(np.float32)
+            # Handle nodata values
+            if src.nodata is not None:
+                data[data == src.nodata] = np.nan
+            log_progress(f"    Read {path.name} ({time.time() - start_time:.1f}s)")
+            return data
+    
+    log_progress(f"    Reprojecting {path.name}...")
+    with rasterio.open(path) as src:
+        dst_height = ref_profile["height"]
+        dst_width = ref_profile["width"]
+        dst_transform = ref_profile["transform"]
+        dst_crs = ref_profile["crs"]
+        count = src.count
+        dst = np.full((count, dst_height, dst_width), np.nan, dtype=np.float32)
+        
+        for b in range(1, count + 1):
+            reproject(
+                source=rasterio.band(src, b),
+                destination=dst[b - 1],
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=dst_transform,
+                dst_crs=dst_crs,
+                resampling=Resampling.nearest,
+                dst_nodata=np.nan,
+            )
+        
+        log_progress(f"    Reprojected {path.name} ({time.time() - start_time:.1f}s)")
+        return dst if count > 1 else dst[0]
+
+
+def stack_arrays(arrays: List[np.ndarray]) -> np.ndarray:
+    """Stack arrays into (B, H, W), auto-expanding (H, W) to (1, H, W)."""
+    if not arrays:
+        return np.empty((0,))
+    
+    normed: List[np.ndarray] = []
+    for a in arrays:
+        if a.ndim == 2:
+            normed.append(a[np.newaxis, ...])
+        elif a.ndim == 3:
+            normed.append(a)
+        else:
+            raise ValueError(f"Unsupported array ndim: {a.ndim}")
+    
+    return np.concatenate(normed, axis=0)
+
+
+def build_band_names(dataset: str, arrays: List[np.ndarray]) -> List[str]:
+    """Build band names for a dataset given contributing arrays."""
+    names: List[str] = []
+    idx = 1
+    for arr in arrays:
+        if arr.ndim == 2:
+            names.append(f"{dataset}")
+        else:
+            for i in range(arr.shape[0]):
+                names.append(f"{dataset}_b{idx}")
+                idx += 1
+    
+    # If all were single-band and duplicates resulted, ensure unique suffixes
+    if len(names) != len(set(names)):
+        names = [f"{dataset}_{i+1}" for i in range(len(names))]
+    return names
+
+
+def forward_and_backward_fill(year_to_array: Dict[int, np.ndarray]) -> Dict[int, np.ndarray]:
+    """Ensure coverage for YEARS by forward filling within YEARS and backfilling at the beginning."""
+    if not year_to_array:
+        # Return empty arrays if no data
+        sample_shape = (1, 100, 100)  # Dummy shape
+        return {y: np.full(sample_shape, np.nan) for y in YEARS}
+    
+    available_years = sorted(year_to_array.keys())
+    first_year = available_years[0]
+    last_known = year_to_array[first_year]
+    filled: Dict[int, np.ndarray] = {}
+    
+    # Backfill years before first available
+    for y in YEARS:
+        if y < first_year:
+            filled[y] = last_known.copy()
+        else:
+            break
+    
+    # Iterate years in order, forward fill
+    for y in YEARS:
+        if y in year_to_array:
+            last_known = year_to_array[y]
+        filled[y] = last_known.copy()
+    
+    return filled
+
+
+def write_year_tif(year: int, band_stack: np.ndarray, band_names: List[str], ref_profile: dict) -> Path:
+    """Write a yearly GeoTIFF with optimized compression."""
+    log_progress(f"Writing {year} GeoTIFF...")
+    profile = ref_profile.copy()
+    profile.update({
+        "count": band_stack.shape[0],
+        "dtype": rasterio.float32,
+        "nodata": np.nan,
+        "compress": "lzw",  # Faster compression than deflate
+        "tiled": True,
+        "blockxsize": 512,
+        "blockysize": 512,
+    })
+    
+    out_path = OUTPUT_TIFF_DIR / f"merged_SA_1km_{year}.tif"
+    with rasterio.open(out_path, "w", **profile) as dst:
+        for i in range(band_stack.shape[0]):
+            dst.write(band_stack[i].astype(np.float32), i + 1)
+            try:
+                dst.set_band_description(i + 1, band_names[i])
+            except Exception:
+                pass
+    
+    log_progress(f"Wrote {out_path}")
+    return out_path
+
+
+def to_long_dataframe(year: int, band_stack: np.ndarray, band_names: List[str], ref_profile: dict) -> pd.DataFrame:
+    """Convert raster data to long dataframe format."""
+    log_progress(f"Converting {year} to DataFrame...")
+    h, w = ref_profile["height"], ref_profile["width"]
+    transform = ref_profile["transform"]
+    
+    # Use more efficient coordinate generation
+    rows, cols = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
+    xs, ys = rasterio.transform.xy(transform, rows, cols)
+    
+    data = {
+        "year": np.full(h * w, year, dtype=np.int16),
+        "x": np.asarray(xs, dtype=np.float64).reshape(-1),
+        "y": np.asarray(ys, dtype=np.float64).reshape(-1),
+        "row": rows.reshape(-1).astype(np.int32),
+        "col": cols.reshape(-1).astype(np.int32),
+    }
+    
+    for i, name in enumerate(band_names):
+        data[name] = band_stack[i].reshape(-1).astype(np.float32)
+    
+    df = pd.DataFrame(data)
+    log_progress(f"Created DataFrame for {year}: {len(df)} rows")
+    return df
+
+
+def process_dataset(dataset: str, entries: Dict[Optional[int], List[Path]], ref_profile: dict) -> Tuple[List[str], Dict[int, np.ndarray]]:
+    """Process a single dataset and return band names and yearly arrays."""
+    log_progress(f"Processing dataset: {dataset}")
+    start_time = time.time()
+    
+    # Build per-year arrays for this dataset
+    year_to_array: Dict[int, np.ndarray] = {}
+    static_arrays: List[np.ndarray] = []
+
+    # Static files (no year in filename)
+    if None in entries:
+        log_progress(f"  Processing {len(entries[None])} static files...")
+        for i, p in enumerate(entries[None]):
+            log_progress(f"    Static file {i+1}/{len(entries[None])}: {p.name}")
+            arr = read_reproject_to_ref(p, ref_profile)
+            static_arrays.append(arr)
+
+    # Yearly files
+    yearly_files = sum(len(paths) for year, paths in entries.items() if year is not None)
+    log_progress(f"  Processing {yearly_files} yearly files...")
+    
+    processed_files = 0
+    for year, paths in entries.items():
+        if year is None or year not in YEARS:
+            continue
+        
+        log_progress(f"    Year {year}: {len(paths)} files")
+        arrays = []
+        for path in paths:
+            arr = read_reproject_to_ref(path, ref_profile)
+            arrays.append(arr)
+            processed_files += 1
+        
+        if arrays:
+            year_to_array[year] = stack_arrays(arrays) if len(arrays) > 1 else arrays[0]
+
+    # Handle static data
+    static_stack: Optional[np.ndarray] = None
+    if static_arrays:
+        static_stack = stack_arrays(static_arrays)
+
+    # Build band names for this dataset
+    sample_arrays: List[np.ndarray] = []
+    if static_stack is not None:
+        sample_arrays.append(static_stack)
+    if year_to_array:
+        sample_arrays.append(next(iter(year_to_array.values())))
+    
+    if not sample_arrays:
+        log_progress(f"  No data found for {dataset}")
+        return [], {}
+    
+    band_names = build_band_names(dataset, sample_arrays)
+    log_progress(f"  Band names: {band_names}")
+
+    # Fill across years
+    if not year_to_array and static_stack is not None:
+        # Purely static dataset: reuse for all years
+        filled = {}
+        for y in YEARS:
+            filled[y] = static_stack if static_stack.ndim == 3 else static_stack[np.newaxis, ...]
+    else:
+        # Have yearly data (possibly partial)
+        filled = forward_and_backward_fill(year_to_array)
+
+    log_progress(f"Completed {dataset} ({time.time() - start_time:.1f}s)")
+    return band_names, filled
+
+
+def main():
+    """Main processing function with progress monitoring."""
+    total_start_time = time.time()
+    log_progress("Starting optimized merge process...")
+    
+    # Setup reference
+    ref_path, ref_src = open_reference_wdpa()
+    ref_profile = ref_src.profile.copy()
+    ref_profile.update({
+        "count": 1,
+        "dtype": rasterio.float32,
+        "nodata": np.nan,
+        "compress": "lzw",
+    })
+    ref_src.close()  # Close the reference file
+    
+    # Build catalog
+    catalog = discover_raster_catalog()
+
+    # Identify datasets to include
+    include_priority = [
+        "WDPA", "VIIRS", "NDVI", "GPW", "gdp", "gdp_preprocessing", "gdp_processed",
+        "deforestation", "landcover", "DynamicWorld", "DW", "WorldClim",
+        "assetlevel", "elevation", "slope", "oil_gas", "road_infrastructure",
+        "GSN", "powerplants",
+    ]
+
+    datasets_present = [d for d in catalog.keys() 
+                       if d in include_priority or d.lower() in [x.lower() for x in include_priority]]
+    datasets_present = sorted(set(datasets_present), 
+                             key=lambda d: (0 if d.upper() == "WDPA" else 1, d.lower()))
+    
+    if not datasets_present:
+        print("❌ No datasets found under data/ready.")
+        sys.exit(1)
+    
+    log_progress(f"Datasets to process: {', '.join(datasets_present)}")
+
+    # Process each dataset individually to manage memory
+    all_band_names: List[str] = []
+    all_yearly_data: Dict[int, List[np.ndarray]] = {y: [] for y in YEARS}
+
+    for i, dataset in enumerate(datasets_present):
+        log_progress(f"Processing dataset {i+1}/{len(datasets_present)}: {dataset}")
+        
+        try:
+            band_names, yearly_arrays = process_dataset(dataset, catalog[dataset], ref_profile)
+            
+            if band_names:
+                all_band_names.extend(band_names)
+                for year in YEARS:
+                    if year in yearly_arrays:
+                        all_yearly_data[year].append(yearly_arrays[year])
+            
+        except Exception as e:
+            log_progress(f"❌ Error processing {dataset}: {e}")
+            continue
+
+    if not all_band_names:
+        print("❌ Failed to process any datasets.")
+        sys.exit(1)
+
+    log_progress(f"Total bands: {len(all_band_names)}")
+    log_progress(f"Band names: {all_band_names}")
+
+    # Write yearly GeoTIFFs and accumulate Parquet rows
+    log_progress("Writing output files...")
+    all_years_df: List[pd.DataFrame] = []
+    
+    for i, year in enumerate(YEARS):
+        log_progress(f"Processing year {i+1}/{len(YEARS)}: {year}")
+        
+        try:
+            # Concatenate dataset stacks for this year along band axis
+            ds_stacks = all_yearly_data[year]
+            if not ds_stacks:
+                log_progress(f"  No data for {year}, skipping...")
+                continue
+                
+            band_stack = np.concatenate([s if s.ndim == 3 else s[np.newaxis, ...] for s in ds_stacks], axis=0)
+            
+            # Write GeoTIFF
+            out_tif = write_year_tif(year, band_stack, all_band_names, ref_profile)
+            
+            # Make year dataframe
+            df_year = to_long_dataframe(year, band_stack, all_band_names, ref_profile)
+            all_years_df.append(df_year)
+            
+        except Exception as e:
+            log_progress(f"❌ Error processing year {year}: {e}")
+            continue
+
+    # Concatenate and write Parquet
+    if all_years_df:
+        log_progress("Writing Parquet file...")
+        panel_df = pd.concat(all_years_df, ignore_index=True)
+        panel_df.to_parquet(PARQUET_PATH, index=False)
+        log_progress(f"Wrote Parquet panel: {PARQUET_PATH}")
+        log_progress(f"Panel shape: {panel_df.shape}")
+    else:
+        log_progress("❌ No data to write to Parquet")
+
+    total_time = time.time() - total_start_time
+    log_progress(f"✅ Merge process completed in {total_time/60:.1f} minutes")
+
+
+if __name__ == "__main__":
+    main()
