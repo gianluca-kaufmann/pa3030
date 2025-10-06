@@ -16,6 +16,7 @@ This repository contains the code for a master's thesis project that aims to pre
 │   │   ├── gdp/                  # GDP per capita data (2012-2021)
 │   │   ├── GlobalSafetyNet/      # Conservation priority areas
 │   │   ├── GPW/                  # Population density data (2000-2020)
+│   │   ├── GSN/                  # Global Safety Net shapefiles (High biodiversity areas, Potential wildlife corrdidors, Terrestrial ecosystems, Intact wilderness areas, Climate stabilisation areas
 │   │   ├── landcover/            # Land cover classifications
 │   │   ├── NDVI/                 # Vegetation index data (2000-2024)
 │   │   ├── oil_gas/              # Oil and gas infrastructure
@@ -24,6 +25,7 @@ This repository contains the code for a master's thesis project that aims to pre
 │   │   ├── VIIRS/                # Nighttime lights data
 │   │   ├── WDPA/                 # World Database on Protected Areas
 │   │   └── wildfire/             # Wildfire occurrence data
+│   │   └── WorldClim/            # Climate data (precipitation, temperature, etc.)
 │   ├── ml/                       # Machine learning datasets and models
 │   └── old data/                 # Archived and legacy datasets
 ├── scripts/
@@ -126,7 +128,7 @@ python scripts/visualisations/deforestation_visualisation
 
 ### Data Processing Pipeline
 1. **Extraction**: Raw data exported from Google Earth Engine
-2. **Preprocessing**: Reprojected and resampled to 1km resolution
+2. **Preprocessing**: Reprojected and resampled external datasets to 1km SA resolution
 3. **Organization**: Data organized in `data/ready/` subfolders by dataset type
 4. **Validation**: Quality checks and consistency verification
 5. **Integration**: Combined into unified datasets for modeling
