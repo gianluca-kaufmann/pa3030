@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""
+Satellite Embeddings (1 km) - Quick Visualization
+
+Loads a multi-band embedding GeoTIFF from data/ready/embeddings, computes a
+3-component PCA (via NumPy SVD) to create an RGB composite, and saves a PNG.
+
+Inputs: the first .tif file found in data/ready/embeddings
+Output: outputs/Figures/alphaearth_vis/embeddings_2020_tile_rgb.png
+"""
+
+import numpy as np
+import rasterio
+from pathlib import Path
+import matplotlib.pyplot as plt
+
+
+# Paths
+PROJECT_ROOT = Path("/Users/gianluca/Desktop/Master's Thesis/code")
+EMBED_DIR = PROJECT_ROOT / "data" / "ready" / "embeddings"
+OUT_DIR = PROJECT_ROOT / "outputs" / "Figures" / "alphaearth_vis"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def find_all_tifs(directory: Path) -> list[Path]:
+    tifs = sorted(directory.glob("*.tif"))
+    if not tifs:
+        raise FileNotFoundError(f"No .tif found in {directory}")
+    return tifs
+
+def get_tile_stats(tif_path: Path) -> dict:
+    """Get basic stats about a tile file."""
+    with rasterio.open(tif_path) as src:
+        bounds = src.bounds
+        shape = src.shape
+        bands = src.count
+        crs = src.crs
+        
+        # Convert Web Mercator bounds to lat/lon for geographic info
+        from rasterio.warp import transform_bounds
+        if crs.to_string() == 'EPSG:3857':
+            # Transform from Web Mercator to WGS84
+            min_lon, min_lat, max_lon, max_lat = transform_bounds(crs, 'EPSG:4326', 
+                                                                bounds.left, bounds.bottom, 
+                                                                bounds.right, bounds.top)
+            
+            # Calculate approximate area in km² using lat/lon
+            # More accurate calculation considering Earth's curvature
+            import math
+            R = 6371  # Earth radius in km
+            
+            # Convert to radians
+            lat1_rad = math.radians(min_lat)
+            lat2_rad = math.radians(max_lat)
+            delta_lat = math.radians(max_lat - min_lat)
+            delta_lon = math.radians(max_lon - min_lon)
+            
+            # Haversine formula for width (at average latitude)
+            avg_lat = (min_lat + max_lat) / 2
+            width_km = R * delta_lon * math.cos(math.radians(avg_lat))
+            height_km = R * delta_lat
+            
+            area_km2 = width_km * height_km
+        else:
+            # Fallback for other CRS
+            width_km = (bounds.right - bounds.left) / 1000
+            height_km = (bounds.top - bounds.bottom) / 1000
+            area_km2 = width_km * height_km
+            min_lat, min_lon = 0, 0
+            max_lat, max_lon = 0, 0
+        
+        return {
+            'file': tif_path.name,
+            'bounds': bounds,
+            'shape': shape,
+            'bands': bands,
+            'crs': str(crs),
+            'width_km': width_km,
+            'height_km': height_km,
+            'area_km2': area_km2,
+            'center_lat': (min_lat + max_lat) / 2,
+            'center_lon': (min_lon + max_lon) / 2,
+            'min_lat': min_lat,
+            'max_lat': max_lat,
+            'min_lon': min_lon,
+            'max_lon': max_lon
+        }
+
+
+def _replace_nans_with_band_means(X: np.ndarray) -> np.ndarray:
+    band_means = np.nanmean(X, axis=1, keepdims=True)
+    nan_mask = np.isnan(X)
+    if np.any(nan_mask):
+        # Broadcast band means to nan positions
+        rows, cols = np.where(nan_mask)
+        X[rows, cols] = band_means[rows, 0]
+    return X
+
+
+def _percentile_stretch(img: np.ndarray, pmin: float = 2.0, pmax: float = 98.0) -> np.ndarray:
+    vmin = np.percentile(img, pmin)
+    vmax = np.percentile(img, pmax)
+    if vmax <= vmin:
+        vmax = vmin + 1e-6
+    out = np.clip((img - vmin) / (vmax - vmin), 0, 1)
+    return out
+
+
+def _gray_world_balance(rgb: np.ndarray) -> np.ndarray:
+    # Simple gray-world color balance to avoid color casts
+    # rgb in [0,1], shape (H, W, 3)
+    means = rgb.reshape(-1, 3).mean(axis=0) + 1e-6
+    scale = means.mean() / means
+    balanced = np.clip(rgb * scale, 0, 1)
+    return balanced
+
+
+def compute_pca_rgb_zscore(data: np.ndarray) -> np.ndarray:
+    """PCA RGB after band-wise z-score standardization and gray-world balance.
+
+    Args:
+        data: (bands, height, width)
+    Returns:
+        (height, width, 3) uint8 RGB
+    """
+    bands, height, width = data.shape
+    X = data.reshape(bands, height * width).astype(np.float32)
+    X = _replace_nans_with_band_means(X)
+
+    # Band-wise z-score
+    mean = X.mean(axis=1, keepdims=True)
+    std = X.std(axis=1, keepdims=True) + 1e-6
+    Xz = (X - mean) / std
+
+    # PCA (SVD) and take first 3 components across pixels
+    U, S, Vt = np.linalg.svd(Xz, full_matrices=False)
+    pcs = Vt[:3, :].reshape(3, height, width)
+
+    # Percentile stretch per channel, then gray-world balance
+    channels = [_percentile_stretch(pcs[i]) for i in range(3)]
+    rgb = np.stack(channels, axis=-1)
+    rgb = _gray_world_balance(rgb)
+    return (rgb * 255).astype(np.uint8)
+
+
+def compute_pca_rgb_unitvec(data: np.ndarray) -> np.ndarray:
+    """PCA RGB after per-pixel L2 normalization (emphasizes angular structure).
+
+    Args:
+        data: (bands, height, width)
+    Returns:
+        (height, width, 3) uint8 RGB
+    """
+    bands, height, width = data.shape
+    X = data.reshape(bands, height * width).astype(np.float32)
+    X = _replace_nans_with_band_means(X)
+
+    # Per-pixel L2 normalization
+    norms = np.linalg.norm(X, axis=0, keepdims=True) + 1e-6
+    Xu = X / norms
+
+    U, S, Vt = np.linalg.svd(Xu, full_matrices=False)
+    pcs = Vt[:3, :].reshape(3, height, width)
+
+    channels = [_percentile_stretch(pcs[i]) for i in range(3)]
+    rgb = np.stack(channels, axis=-1)
+    rgb = _gray_world_balance(rgb)
+    return (rgb * 255).astype(np.uint8)
+
+
+def compute_magnitude_heatmap(data: np.ndarray) -> np.ndarray:
+    """Embedding magnitude (L2 norm across bands) as a grayscale heatmap uint8."""
+    bands, height, width = data.shape
+    X = data.reshape(bands, height * width).astype(np.float32)
+    X = _replace_nans_with_band_means(X)
+    mags = np.linalg.norm(X, axis=0).reshape(height, width)
+    heat = _percentile_stretch(mags)
+    return (heat * 255).astype(np.uint8)
+
+
+def print_tile_statistics(tif_paths: list[Path]) -> None:
+    """Print statistics about all tiles."""
+    print(f"📊 TILE STATISTICS ({len(tif_paths)} tiles)")
+    print("=" * 80)
+    
+    all_stats = []
+    total_area = 0
+    
+    for tif_path in tif_paths:
+        stats = get_tile_stats(tif_path)
+        all_stats.append(stats)
+        total_area += stats['area_km2']
+    
+    # Sort by center coordinates for better overview
+    all_stats.sort(key=lambda x: (x['center_lat'], x['center_lon']))
+    
+    print(f"{'Tile':<35} {'Center (lat,lon)':<20} {'Size (km)':<15} {'Area (km²)':<12} {'Bands':<6}")
+    print("-" * 80)
+    
+    for stats in all_stats:
+        print(f"{stats['file']:<35} "
+              f"({stats['center_lat']:6.2f}, {stats['center_lon']:7.2f}) "
+              f"{stats['width_km']:6.1f}x{stats['height_km']:5.1f} "
+              f"{stats['area_km2']:10.0f} "
+              f"{stats['bands']:6}")
+    
+    print("-" * 80)
+    print(f"Total coverage: {total_area:,.0f} km²")
+    print(f"Average tile size: {total_area/len(all_stats):,.0f} km²")
+    print(f"Geographic bounds:")
+    
+    # Calculate overall bounds using proper lat/lon coordinates
+    min_lat = min(s['min_lat'] for s in all_stats)
+    max_lat = max(s['max_lat'] for s in all_stats)
+    min_lon = min(s['min_lon'] for s in all_stats)
+    max_lon = max(s['max_lon'] for s in all_stats)
+    
+    print(f"  Latitude: {min_lat:7.2f} to {max_lat:7.2f} ({max_lat-min_lat:6.2f}°)")
+    print(f"  Longitude: {min_lon:7.2f} to {max_lon:7.2f} ({max_lon-min_lon:6.2f}°)")
+    
+    # Show spatial resolution info
+    if all_stats:
+        first_stats = all_stats[0]
+        print(f"  Spatial resolution: ~{first_stats['width_km']/first_stats['shape'][1]:.1f} km/pixel")
+        print(f"  Tile dimensions: {first_stats['shape'][1]} x {first_stats['shape'][0]} pixels")
+    print()
+
+def visualize_all_tiles(tif_paths: list[Path]) -> None:
+    """Create visualizations for all tiles."""
+    print(f"🎨 Creating visualizations for {len(tif_paths)} tiles...")
+    
+    for i, tif_path in enumerate(tif_paths):
+        print(f"   Processing tile {i+1}/{len(tif_paths)}: {tif_path.name}")
+        
+        with rasterio.open(tif_path) as src:
+            data = src.read()  # (bands, height, width)
+        
+        # Create unique filenames based on tile name
+        tile_name = tif_path.stem  # filename without extension
+        
+        # Visual 1: PCA on z-scored bands (balanced)
+        rgb_z = compute_pca_rgb_zscore(data)
+        out_file_z = OUT_DIR / f"{tile_name}_pca_zscore_rgb.png"
+        plt.imsave(out_file_z.as_posix(), rgb_z)
+        
+        # Visual 2: PCA on unit-vector (angular) embeddings (balanced)
+        rgb_u = compute_pca_rgb_unitvec(data)
+        out_file_u = OUT_DIR / f"{tile_name}_pca_unitvec_rgb.png"
+        plt.imsave(out_file_u.as_posix(), rgb_u)
+        
+        # Visual 3: Magnitude heatmap
+        mag = compute_magnitude_heatmap(data)
+        out_file_m = OUT_DIR / f"{tile_name}_magnitude.png"
+        plt.imsave(out_file_m.as_posix(), mag, cmap='magma')
+    
+    print(f"✅ Created {len(tif_paths) * 3} visualizations in {OUT_DIR}")
+
+def main():
+    # Find all tile files (exclude the test tile)
+    all_tifs = find_all_tifs(EMBED_DIR)
+    tile_tifs = [tif for tif in all_tifs if 'tile_test' not in tif.name]
+    
+    if not tile_tifs:
+        print("❌ No tile files found (excluding test tile)")
+        return
+    
+    print(f"📁 Found {len(tile_tifs)} embedding tiles")
+    print()
+    
+    # Print statistics
+    print_tile_statistics(tile_tifs)
+    
+    # Create visualizations for all tiles
+    visualize_all_tiles(tile_tifs)
+
+
+if __name__ == "__main__":
+    main()
+
+

@@ -1,0 +1,146 @@
+"""
+Satellite Embedding V1 (Annual) → 1 km (South America, tiled export for 2020)
+
+Dataset: GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL
+
+This script authenticates to Earth Engine, builds a 1 km export for 2020 and
+exports multiple tiles over South America to Google Drive. Tile size is
+configured in degrees (lon/lat) to keep each file manageable.
+
+Notes:
+- Reprojection to EPSG:3857 at 1,000 m to match other 1 km layers.
+- Adjust TILE_DX_DEG/TILE_DY_DEG and MAX_TILES to control coverage & task count.
+"""
+
+import ee
+ee.Authenticate()   # Opens a browser for Google login
+
+# ----------------------------
+# 0) Auth & init
+# ----------------------------
+# Use your project ID
+PROJECT_ID = 'master-thesis-473316'
+
+try:
+    ee.Initialize(project=PROJECT_ID)
+    print("✅ Earth Engine initialized successfully with project:", PROJECT_ID)
+except Exception as e:
+    print(f"❌ Initialization failed: {e}")
+    print("🔐 Attempting authentication...")
+    ee.Authenticate()
+    try:
+        ee.Initialize(project=PROJECT_ID)
+        print("✅ Earth Engine initialized after authentication with project:", PROJECT_ID)
+    except Exception as e2:
+        print(f"❌ Still failed: {e2}")
+        print("💡 You may need to:")
+        print("   1. Enable Earth Engine API in your Google Cloud Project")
+        print("   2. Check if project ID is correct:", PROJECT_ID)
+        print("   3. Verify you have access to the project")
+        exit(1)
+
+# ----------------------------
+# 1) Study area (South America)
+# ----------------------------
+# Region-of-interest bounds for South America
+countries = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+region_fc = countries.filter(ee.Filter.inList('wld_rgn', ['South America']))
+region = region_fc.geometry()
+
+# ----------------------------
+# 2) Settings
+# ----------------------------
+CRS = 'EPSG:3857'
+KM = 1000
+COLL_ID = 'GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL'
+
+# Tile configuration (lon/lat degrees)
+TILE_DX_DEG = 4.0
+TILE_DY_DEG = 4.0
+MAX_TILES = 12  # safety limit for concurrent tasks; increase once validated
+
+# ----------------------------
+# 3) Build 2020 embedding image at 1 km (mosaic once, export per-tile)
+# ----------------------------
+coll_2020 = (
+    ee.ImageCollection(COLL_ID)
+      .filterDate('2020-01-01', '2021-01-01')
+      .filterBounds(region)
+)
+
+if coll_2020.size().getInfo() == 0:
+    print('❌ No images found for 2020 over South America. Check dataset/dates.')
+    exit(1)
+
+img_2020 = ee.ImageCollection(coll_2020).mosaic()
+img_2020_1km = (
+    img_2020
+      .resample('bilinear')
+      .reproject(crs=CRS, scale=KM)
+      .toFloat()
+)
+
+print('Bands (first 10):', img_2020_1km.bandNames().slice(0, 10).getInfo())
+print('Band count:', img_2020_1km.bandNames().size().getInfo())
+
+# ----------------------------
+# 4) Generate tiles over South America bounds
+# ----------------------------
+# We generate a lon/lat grid over the bounding box, then keep tiles that
+# intersect the South America polygon.
+bounds = region.bounds().coordinates().getInfo()[0]
+# bounds is list of [lon, lat] forming a ring; extract lon/lat min/max
+lons = [pt[0] for pt in bounds]
+lats = [pt[1] for pt in bounds]
+min_lon, max_lon = min(lons), max(lons)
+min_lat, max_lat = min(lats), max(lats)
+
+tiles = []
+i = 0
+lat = min_lat
+while lat < max_lat:
+    lon = min_lon
+    j = 0
+    while lon < max_lon:
+        rect = ee.Geometry.Rectangle([lon, lat, min(lon + TILE_DX_DEG, max_lon), min(lat + TILE_DY_DEG, max_lat)])
+        try:
+            intersects = region.intersects(rect, ee.ErrorMargin(1)).getInfo()
+        except Exception:
+            intersects = False
+        if intersects:
+            tiles.append((i, j, rect))
+        lon += TILE_DX_DEG
+        j += 1
+    lat += TILE_DY_DEG
+    i += 1
+
+print(f"🧩 Generated {len(tiles)} tiles intersecting South America (grid {TILE_DX_DEG}x{TILE_DY_DEG} deg)")
+
+# ----------------------------
+# 5) Export tiles to Google Drive
+# ----------------------------
+tasks = []
+tiles_to_export = tiles[:MAX_TILES] if MAX_TILES else tiles
+print(f"🚀 Starting exports for {len(tiles_to_export)} tiles (limit={MAX_TILES})...")
+
+for idx, (i, j, geom) in enumerate(tiles_to_export):
+    description = f'SatelliteEmbeddings_SA_1km_2020_tile_{i}_{j}'
+    prefix = description
+
+    task = ee.batch.Export.image.toDrive(
+        image=img_2020_1km.clip(geom),
+        description=description,
+        folder='GEE_exports',
+        fileNamePrefix=prefix,
+        region=geom,
+        crs=CRS,
+        scale=KM,
+        maxPixels=1e13
+    )
+    task.start()
+    tasks.append(task)
+    print(f"   ▶️ Tile {idx+1}/{len(tiles_to_export)} started: {description} (task {task.id})")
+
+print(f"\n✅ Started {len(tasks)} export tasks. You can monitor progress in the EE Task Manager.")
+
+
