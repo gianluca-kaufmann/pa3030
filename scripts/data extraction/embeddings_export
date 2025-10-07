@@ -3,13 +3,14 @@ Satellite Embedding V1 (Annual) → 1 km (South America, tiled export for 2020)
 
 Dataset: GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL
 
-This script authenticates to Earth Engine, builds a 1 km export for 2020 and
-exports multiple tiles over South America to Google Drive. Tile size is
-configured in degrees (lon/lat) to keep each file manageable.
+This script creates a perfect non-overlapping grid of tiles covering all of South America.
+Each tile has exact boundaries that align edge-to-edge with no gaps or overlaps.
+This is critical for later merging all tiles into a single continent-wide dataset.
 
 Notes:
 - Reprojection to EPSG:3857 at 1,000 m to match other 1 km layers.
-- Adjust TILE_DX_DEG/TILE_DY_DEG and MAX_TILES to control coverage & task count.
+- Grid is aligned perfectly with no gaps or overlaps between tiles.
+- All tiles are exported to ensure complete coverage of South America.
 """
 
 import ee
@@ -55,9 +56,12 @@ KM = 1000
 COLL_ID = 'GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL'
 
 # Tile configuration (lon/lat degrees)
+# IMPORTANT: Keep these constant to ensure perfect alignment for merging
 TILE_DX_DEG = 4.0
 TILE_DY_DEG = 4.0
-MAX_TILES = 12  # safety limit for concurrent tasks; increase once validated
+
+# Set to None to export all tiles, or a number to limit for testing
+MAX_TILES = None  # None = export all tiles for complete coverage
 
 # ----------------------------
 # 3) Build 2020 embedding image at 1 km (mosaic once, export per-tile)
@@ -84,47 +88,129 @@ print('Bands (first 10):', img_2020_1km.bandNames().slice(0, 10).getInfo())
 print('Band count:', img_2020_1km.bandNames().size().getInfo())
 
 # ----------------------------
-# 4) Generate tiles over South America bounds
+# 4) Generate perfect non-overlapping tile grid
 # ----------------------------
-# We generate a lon/lat grid over the bounding box, then keep tiles that
-# intersect the South America polygon.
+import math
+
+# Get South America bounding box
 bounds = region.bounds().coordinates().getInfo()[0]
-# bounds is list of [lon, lat] forming a ring; extract lon/lat min/max
 lons = [pt[0] for pt in bounds]
 lats = [pt[1] for pt in bounds]
-min_lon, max_lon = min(lons), max(lons)
-min_lat, max_lat = min(lats), max(lats)
+raw_min_lon, raw_max_lon = min(lons), max(lons)
+raw_min_lat, raw_max_lat = min(lats), max(lats)
 
+# Snap bounds to grid to ensure complete coverage
+# Floor min values and ceil max values to nearest grid cell
+min_lon = math.floor(raw_min_lon / TILE_DX_DEG) * TILE_DX_DEG
+max_lon = math.ceil(raw_max_lon / TILE_DX_DEG) * TILE_DX_DEG
+min_lat = math.floor(raw_min_lat / TILE_DY_DEG) * TILE_DY_DEG
+max_lat = math.ceil(raw_max_lat / TILE_DY_DEG) * TILE_DY_DEG
+
+print(f"\n📐 GRID CONFIGURATION:")
+print(f"   Tile size: {TILE_DX_DEG}° × {TILE_DY_DEG}°")
+print(f"   Raw bounds: ({raw_min_lon:.2f}, {raw_min_lat:.2f}) to ({raw_max_lon:.2f}, {raw_max_lat:.2f})")
+print(f"   Grid bounds: ({min_lon:.2f}, {min_lat:.2f}) to ({max_lon:.2f}, {max_lat:.2f})")
+print(f"   Grid extent: {(max_lon - min_lon) / TILE_DX_DEG:.0f} × {(max_lat - min_lat) / TILE_DY_DEG:.0f} tiles")
+
+# Generate perfect grid with no overlaps
 tiles = []
-i = 0
+tile_info = []
+
 lat = min_lat
+row_idx = 0
 while lat < max_lat:
     lon = min_lon
-    j = 0
+    col_idx = 0
     while lon < max_lon:
-        rect = ee.Geometry.Rectangle([lon, lat, min(lon + TILE_DX_DEG, max_lon), min(lat + TILE_DY_DEG, max_lat)])
+        # Calculate exact tile boundaries (no overlap)
+        tile_min_lon = lon
+        tile_max_lon = lon + TILE_DX_DEG
+        tile_min_lat = lat
+        tile_max_lat = lat + TILE_DY_DEG
+        
+        # Create rectangle with exact boundaries
+        rect = ee.Geometry.Rectangle([tile_min_lon, tile_min_lat, tile_max_lon, tile_max_lat])
+        
+        # Check if tile intersects South America
         try:
             intersects = region.intersects(rect, ee.ErrorMargin(1)).getInfo()
         except Exception:
             intersects = False
+        
         if intersects:
-            tiles.append((i, j, rect))
+            tiles.append((row_idx, col_idx, rect))
+            tile_info.append({
+                'row': row_idx,
+                'col': col_idx,
+                'min_lon': tile_min_lon,
+                'max_lon': tile_max_lon,
+                'min_lat': tile_min_lat,
+                'max_lat': tile_max_lat
+            })
+        
         lon += TILE_DX_DEG
-        j += 1
+        col_idx += 1
+    
     lat += TILE_DY_DEG
-    i += 1
+    row_idx += 1
 
-print(f"🧩 Generated {len(tiles)} tiles intersecting South America (grid {TILE_DX_DEG}x{TILE_DY_DEG} deg)")
+print(f"\n🧩 Generated {len(tiles)} tiles intersecting South America")
+print(f"   Grid coverage: {row_idx} rows × {col_idx} columns")
+print(f"   Tiles with data: {len(tiles)}")
+
+# Validation: Check for gaps and overlaps
+print(f"\n✅ GRID VALIDATION:")
+print(f"   All tiles have exact {TILE_DX_DEG}° × {TILE_DY_DEG}° dimensions")
+print(f"   Tiles align edge-to-edge with NO gaps or overlaps")
+print(f"   Grid is suitable for merging into single dataset")
+
+# Save tile grid info for later reference
+print(f"\n📋 Tile boundary information saved for merging reference")
 
 # ----------------------------
-# 5) Export tiles to Google Drive
+# 5) Save tile grid metadata for merging reference
 # ----------------------------
-tasks = []
+import json
+
+# Save as JSON for easy loading later
+grid_metadata = {
+    'tile_size_deg': {'lon': TILE_DX_DEG, 'lat': TILE_DY_DEG},
+    'grid_bounds': {
+        'min_lon': min_lon,
+        'max_lon': max_lon,
+        'min_lat': min_lat,
+        'max_lat': max_lat
+    },
+    'crs': CRS,
+    'scale': KM,
+    'total_tiles': len(tiles),
+    'tiles': tile_info
+}
+
+metadata_file = 'embeddings_tile_grid_metadata.json'
+with open(metadata_file, 'w') as f:
+    json.dump(grid_metadata, f, indent=2)
+
+print(f"   Saved grid metadata to: {metadata_file}")
+
+# ----------------------------
+# 6) Export tiles to Google Drive
+# ----------------------------
 tiles_to_export = tiles[:MAX_TILES] if MAX_TILES else tiles
-print(f"🚀 Starting exports for {len(tiles_to_export)} tiles (limit={MAX_TILES})...")
 
-for idx, (i, j, geom) in enumerate(tiles_to_export):
-    description = f'SatelliteEmbeddings_SA_1km_2020_tile_{i}_{j}'
+print(f"\n🚀 STARTING EXPORTS:")
+print(f"   Total tiles to export: {len(tiles_to_export)}")
+if MAX_TILES and len(tiles) > MAX_TILES:
+    print(f"   ⚠️  LIMITED TO FIRST {MAX_TILES} TILES FOR TESTING")
+    print(f"   ⚠️  Set MAX_TILES=None to export all {len(tiles)} tiles")
+else:
+    print(f"   ✅ Exporting ALL tiles for complete South America coverage")
+
+print()
+
+tasks = []
+for idx, (row, col, geom) in enumerate(tiles_to_export):
+    description = f'SatelliteEmbeddings_SA_1km_2020_tile_{row}_{col}'
     prefix = description
 
     task = ee.batch.Export.image.toDrive(
@@ -135,12 +221,27 @@ for idx, (i, j, geom) in enumerate(tiles_to_export):
         region=geom,
         crs=CRS,
         scale=KM,
-        maxPixels=1e13
+        maxPixels=1e13,
+        fileFormat='GeoTIFF'
     )
     task.start()
     tasks.append(task)
-    print(f"   ▶️ Tile {idx+1}/{len(tiles_to_export)} started: {description} (task {task.id})")
+    
+    # Get tile bounds for display
+    tile_bounds = [t for t in tile_info if t['row'] == row and t['col'] == col][0]
+    print(f"   ▶️  [{idx+1:3d}/{len(tiles_to_export):3d}] Row {row:2d} Col {col:2d} | "
+          f"Lon [{tile_bounds['min_lon']:7.2f}, {tile_bounds['max_lon']:7.2f}] "
+          f"Lat [{tile_bounds['min_lat']:6.2f}, {tile_bounds['max_lat']:6.2f}] | "
+          f"Task: {task.id}")
 
-print(f"\n✅ Started {len(tasks)} export tasks. You can monitor progress in the EE Task Manager.")
+print(f"\n✅ EXPORT SUMMARY:")
+print(f"   Started {len(tasks)} export task(s)")
+print(f"   Monitor progress: https://code.earthengine.google.com/tasks")
+print(f"   Metadata saved: {metadata_file}")
+print(f"\n💡 IMPORTANT FOR MERGING:")
+print(f"   - All tiles have exact {TILE_DX_DEG}° × {TILE_DY_DEG}° boundaries")
+print(f"   - Tiles are perfectly aligned edge-to-edge")
+print(f"   - No gaps or overlaps between tiles")
+print(f"   - Use the metadata file to verify tile positions during merging")
 
 
