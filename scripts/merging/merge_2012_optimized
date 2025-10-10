@@ -15,6 +15,7 @@ import sys
 import math
 import json
 import time
+import os
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -23,6 +24,7 @@ import rasterio
 from rasterio.enums import Resampling
 from rasterio.warp import reproject
 import pandas as pd
+import wandb
 
 
 DATA_ROOT = Path("/Users/gianluca/Desktop/Master's Thesis/code/data")
@@ -352,6 +354,17 @@ def main():
     total_start_time = time.time()
     log_progress("Starting optimized merge process...")
     
+    # Initialize wandb
+    wandb.init(
+        project="merging",
+        entity=os.environ.get("WANDB_ENTITY"),
+        config={
+            "years": YEARS,
+            "data_root": str(DATA_ROOT),
+            "output_root": str(OUTPUT_ROOT),
+        }
+    )
+    
     # Setup reference
     ref_path, ref_src = open_reference_wdpa()
     ref_profile = ref_src.profile.copy()
@@ -384,6 +397,7 @@ def main():
         sys.exit(1)
     
     log_progress(f"Datasets to process: {', '.join(datasets_present)}")
+    wandb.config.update({"datasets": datasets_present, "num_datasets": len(datasets_present)})
 
     # Process each dataset individually to manage memory
     all_band_names: List[str] = []
@@ -400,9 +414,11 @@ def main():
                 for year in YEARS:
                     if year in yearly_arrays:
                         all_yearly_data[year].append(yearly_arrays[year])
+                wandb.log({f"dataset_{dataset}_bands": len(band_names)})
             
         except Exception as e:
             log_progress(f"❌ Error processing {dataset}: {e}")
+            wandb.log({f"dataset_{dataset}_error": 1})
             continue
 
     if not all_band_names:
@@ -411,6 +427,7 @@ def main():
 
     log_progress(f"Total bands: {len(all_band_names)}")
     log_progress(f"Band names: {all_band_names}")
+    wandb.log({"total_bands": len(all_band_names)})
 
     # Write yearly GeoTIFFs and accumulate Parquet rows
     log_progress("Writing output files...")
@@ -434,9 +451,11 @@ def main():
             # Make year dataframe
             df_year = to_long_dataframe(year, band_stack, all_band_names, ref_profile)
             all_years_df.append(df_year)
+            wandb.log({f"year_{year}_rows": len(df_year), f"year_{year}_bands": band_stack.shape[0]})
             
         except Exception as e:
             log_progress(f"❌ Error processing year {year}: {e}")
+            wandb.log({f"year_{year}_error": 1})
             continue
 
     # Concatenate and write Parquet
@@ -446,11 +465,18 @@ def main():
         panel_df.to_parquet(PARQUET_PATH, index=False)
         log_progress(f"Wrote Parquet panel: {PARQUET_PATH}")
         log_progress(f"Panel shape: {panel_df.shape}")
+        wandb.log({
+            "panel_rows": panel_df.shape[0],
+            "panel_columns": panel_df.shape[1],
+            "parquet_file_size_mb": PARQUET_PATH.stat().st_size / (1024 * 1024)
+        })
     else:
         log_progress("❌ No data to write to Parquet")
 
     total_time = time.time() - total_start_time
     log_progress(f"✅ Merge process completed in {total_time/60:.1f} minutes")
+    wandb.log({"total_time_minutes": total_time / 60})
+    wandb.finish()
 
 
 if __name__ == "__main__":

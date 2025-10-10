@@ -1,32 +1,36 @@
 #!/usr/bin/env python3
 """
-Satellite Embeddings (1 km) - Quick Visualization
+Satellite Embeddings (1 km) - Clipped File Visualization
 
-Loads a multi-band embedding GeoTIFF from data/ready/embeddings, computes a
-3-component PCA (via NumPy SVD) to create an RGB composite, and saves a PNG.
+Loads the clipped multi-band embedding GeoTIFF from data/ready/embeddings,
+computes a 3-component PCA (via NumPy SVD) to create an RGB composite, and saves PNGs.
 
-Inputs: the first .tif file found in data/ready/embeddings
-Output: outputs/Figures/alphaearth_vis/embeddings_2020_tile_rgb.png
+Inputs: SatelliteEmbeddings_SA_1km_2020_clipped.tif
+Output: outputs/Figures/alphaearth_vis/embeddings_clipped_*.png
 """
 
 import numpy as np
 import rasterio
 from pathlib import Path
 import matplotlib.pyplot as plt
+from typing import Tuple
 
 
 # Paths
 PROJECT_ROOT = Path("/Users/gianluca/Desktop/Master's Thesis/code")
 EMBED_DIR = PROJECT_ROOT / "data" / "ready" / "embeddings"
+EMBEDDINGS_FILE = EMBED_DIR / "SatelliteEmbeddings_SA_1km_2020_clipped.tif"
 OUT_DIR = PROJECT_ROOT / "outputs" / "Figures" / "alphaearth_vis"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def find_all_tifs(directory: Path) -> list[Path]:
+    """Find all .tif files in directory."""
     tifs = sorted(directory.glob("*.tif"))
     if not tifs:
         raise FileNotFoundError(f"No .tif found in {directory}")
     return tifs
+
 
 def get_tile_stats(tif_path: Path) -> dict:
     """Get basic stats about a tile file."""
@@ -475,34 +479,392 @@ def print_data_quality(tif_paths: list[Path]) -> None:
     
     print()
 
-def main():
-    # Find all tile files (exclude the test tile)
-    all_tifs = find_all_tifs(EMBED_DIR)
-    tile_tifs = [tif for tif in all_tifs if 'tile_test' not in tif.name]
+def downsample_data(data: np.ndarray, target_size: Tuple[int, int] = (2000, 2000)) -> np.ndarray:
+    """
+    Downsample large data array for visualization.
     
-    if not tile_tifs:
-        print("❌ No tile files found (excluding test tile)")
+    Args:
+        data: (bands, height, width) array
+        target_size: Target (height, width) for output
+    Returns:
+        Downsampled (bands, target_height, target_width) array
+    """
+    bands, height, width = data.shape
+    target_height, target_width = target_size
+    
+    # Calculate stride for downsampling
+    stride_h = max(1, height // target_height)
+    stride_w = max(1, width // target_width)
+    
+    print(f"   Downsampling from {height}x{width} to ~{height//stride_h}x{width//stride_w} "
+          f"(stride: {stride_h}x{stride_w})")
+    
+    # Simple strided downsampling
+    downsampled = data[:, ::stride_h, ::stride_w]
+    
+    return downsampled
+
+
+def print_embeddings_stats() -> dict:
+    """Print comprehensive statistics about the clipped embeddings file."""
+    print("📊 CLIPPED EMBEDDINGS STATISTICS")
+    print("=" * 80)
+    
+    with rasterio.open(EMBEDDINGS_FILE) as src:
+        bounds = src.bounds
+        shape = src.shape
+        bands = src.count
+        crs = src.crs
+        transform = src.transform
+        
+        # Convert Web Mercator bounds to lat/lon
+        from rasterio.warp import transform_bounds
+        min_lon, min_lat, max_lon, max_lat = transform_bounds(
+            crs, 'EPSG:4326', 
+            bounds.left, bounds.bottom, 
+            bounds.right, bounds.top
+        )
+        
+        # File information
+        print(f"\n📁 FILE INFORMATION:")
+        print(f"   File name: {EMBEDDINGS_FILE.name}")
+        file_size_gb = EMBEDDINGS_FILE.stat().st_size / (1024**3)
+        print(f"   File size: {file_size_gb:.2f} GB")
+        print(f"   Format: GeoTIFF (BigTIFF)")
+        
+        # Dimensions
+        print(f"\n📐 DIMENSIONS:")
+        print(f"   Width:  {shape[1]:,} pixels")
+        print(f"   Height: {shape[0]:,} pixels")
+        print(f"   Bands:  {bands}")
+        total_pixels = shape[0] * shape[1]
+        total_values = total_pixels * bands
+        print(f"   Total pixels: {total_pixels:,}")
+        print(f"   Total values: {total_values:,} ({bands} bands × {total_pixels:,} pixels)")
+        
+        # Coordinate system
+        print(f"\n🌍 COORDINATE SYSTEM:")
+        print(f"   CRS: {crs}")
+        print(f"   Pixel resolution: {abs(transform.a)/1000:.1f} km × {abs(transform.e)/1000:.1f} km")
+        
+        # Geographic extent
+        print(f"\n🗺️  GEOGRAPHIC EXTENT:")
+        print(f"   Latitude:  {min_lat:7.2f}° to {max_lat:7.2f}° (span: {max_lat-min_lat:6.2f}°)")
+        print(f"   Longitude: {min_lon:7.2f}° to {max_lon:7.2f}° (span: {max_lon-min_lon:6.2f}°)")
+        width_km = (bounds.right - bounds.left) / 1000
+        height_km = (bounds.top - bounds.bottom) / 1000
+        area_km2 = width_km * height_km
+        print(f"   Physical extent: {width_km:,.0f} km × {height_km:,.0f} km")
+        print(f"   Bounding box area: {area_km2:,.0f} km²")
+        
+        # Data quality analysis
+        print(f"\n🔬 DATA QUALITY ANALYSIS:")
+        print(f"   Analyzing all {bands} bands...")
+        
+        # Read all bands to analyze
+        data = src.read()
+        
+        # Overall statistics
+        valid_mask = ~np.isnan(data)
+        valid_per_band = valid_mask.sum(axis=(1, 2))
+        total_valid = valid_mask.sum()
+        
+        print(f"\n   Overall Statistics:")
+        print(f"   • Total values:        {total_values:,}")
+        print(f"   • Valid values:        {total_valid:,} ({total_valid/total_values*100:.2f}%)")
+        print(f"   • NaN values:          {total_values - total_valid:,} ({(total_values - total_valid)/total_values*100:.2f}%)")
+        
+        # Per-pixel coverage
+        valid_any_band = valid_mask.any(axis=0)
+        pixels_with_data = valid_any_band.sum()
+        print(f"\n   Pixel Coverage:")
+        print(f"   • Pixels with any data:  {pixels_with_data:,} ({pixels_with_data/total_pixels*100:.2f}%)")
+        print(f"   • Pixels all NaN:        {total_pixels - pixels_with_data:,} ({(total_pixels - pixels_with_data)/total_pixels*100:.2f}%)")
+        
+        # Valid pixels per band
+        min_valid = valid_per_band.min()
+        max_valid = valid_per_band.max()
+        mean_valid = valid_per_band.mean()
+        print(f"\n   Per-Band Coverage:")
+        print(f"   • Min valid pixels:  {min_valid:,} ({min_valid/total_pixels*100:.2f}%)")
+        print(f"   • Max valid pixels:  {max_valid:,} ({max_valid/total_pixels*100:.2f}%)")
+        print(f"   • Mean valid pixels: {mean_valid:,.0f} ({mean_valid/total_pixels*100:.2f}%)")
+        
+        # Value statistics
+        print(f"\n   📈 VALUE STATISTICS (across all bands):")
+        valid_data = data[valid_mask]
+        print(f"   • Min:        {np.min(valid_data):10.6f}")
+        print(f"   • Max:        {np.max(valid_data):10.6f}")
+        print(f"   • Mean:       {np.mean(valid_data):10.6f}")
+        print(f"   • Median:     {np.median(valid_data):10.6f}")
+        print(f"   • Std:        {np.std(valid_data):10.6f}")
+        print(f"   • 5th %ile:   {np.percentile(valid_data, 5):10.6f}")
+        print(f"   • 95th %ile:  {np.percentile(valid_data, 95):10.6f}")
+        
+        # Per-band statistics summary
+        print(f"\n   📊 PER-BAND STATISTICS:")
+        band_stats = []
+        for b in range(bands):
+            band_data = data[b]
+            band_valid = band_data[~np.isnan(band_data)]
+            if len(band_valid) > 0:
+                band_stats.append({
+                    'band': b + 1,
+                    'valid_pixels': len(band_valid),
+                    'valid_pct': (len(band_valid) / total_pixels) * 100,
+                    'min': np.min(band_valid),
+                    'max': np.max(band_valid),
+                    'mean': np.mean(band_valid),
+                    'std': np.std(band_valid)
+                })
+        
+        # Show summary table for first 10 and last 5 bands
+        print(f"\n   {'Band':<6} {'Valid %':<10} {'Mean':<12} {'Std':<12} {'Min':<12} {'Max':<12}")
+        print(f"   {'-'*70}")
+        
+        # First 10 bands
+        for stat in band_stats[:10]:
+            print(f"   {stat['band']:<6} {stat['valid_pct']:>8.2f}% {stat['mean']:>10.4f}  {stat['std']:>10.4f}  {stat['min']:>10.4f}  {stat['max']:>10.4f}")
+        
+        if len(band_stats) > 15:
+            print(f"   {'...':<6} {'...':<10} {'...':<12} {'...':<12} {'...':<12} {'...':<12}")
+        
+        # Last 5 bands
+        for stat in band_stats[-5:]:
+            print(f"   {stat['band']:<6} {stat['valid_pct']:>8.2f}% {stat['mean']:>10.4f}  {stat['std']:>10.4f}  {stat['min']:>10.4f}  {stat['max']:>10.4f}")
+        
+        print()
+        
+        return {
+            'shape': shape,
+            'bands': bands,
+            'total_pixels': total_pixels,
+            'total_values': total_values,
+            'valid_pixels': pixels_with_data,
+            'valid_values': total_valid,
+            'band_stats': band_stats,
+            'bounds': bounds,
+            'crs': crs,
+            'data': data  # Return data for visualizations
+        }
+
+
+def visualize_individual_bands(data: np.ndarray, band_indices: list, 
+                                stats: dict, downsampled: bool = True) -> None:
+    """
+    Visualize selected individual bands.
+    
+    Args:
+        data: (bands, height, width) array
+        band_indices: List of band indices to visualize (1-indexed)
+        stats: Statistics dictionary from print_merged_file_stats
+        downsampled: Whether data is already downsampled
+    """
+    print(f"\n🎨 Creating individual band visualizations...")
+    print(f"   Visualizing {len(band_indices)} bands: {band_indices}")
+    
+    num_bands = len(band_indices)
+    
+    # Create a multi-panel figure
+    fig, axes = plt.subplots(2, (num_bands + 1) // 2, figsize=(5 * ((num_bands + 1) // 2), 10))
+    if num_bands == 1:
+        axes = np.array([axes])
+    axes = axes.flatten()
+    
+    for idx, band_num in enumerate(band_indices):
+        band_idx = band_num - 1  # Convert to 0-indexed
+        if band_idx >= data.shape[0]:
+            print(f"   ⚠️  Band {band_num} not found (only {data.shape[0]} bands available)")
+            continue
+        
+        band_data = data[band_idx]
+        
+        # Get statistics for this band
+        band_stat = next((s for s in stats['band_stats'] if s['band'] == band_num), None)
+        
+        # Create visualization
+        ax = axes[idx]
+        
+        # Use percentile stretch for better visualization
+        stretched = _percentile_stretch(band_data, pmin=2, pmax=98)
+        
+        im = ax.imshow(stretched, cmap='viridis', aspect='auto')
+        
+        if band_stat:
+            title = f"Band {band_num}\n"
+            title += f"Valid: {band_stat['valid_pct']:.1f}% | "
+            title += f"μ={band_stat['mean']:.4f}, σ={band_stat['std']:.4f}"
+            ax.set_title(title, fontsize=10)
+        else:
+            ax.set_title(f"Band {band_num}", fontsize=10)
+        
+        ax.axis('off')
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    
+    # Hide extra subplots if odd number of bands
+    for idx in range(len(band_indices), len(axes)):
+        axes[idx].axis('off')
+    
+    plt.tight_layout()
+    
+    out_file = OUT_DIR / "embeddings_clipped_selected_bands.png"
+    plt.savefig(out_file, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    print(f"   ✅ Saved: {out_file.name}")
+    
+    # Also save individual band images with better handling
+    print(f"\n   Creating individual band images...")
+    for band_num in band_indices:
+        band_idx = band_num - 1
+        if band_idx >= data.shape[0]:
+            continue
+        
+        band_data = data[band_idx].copy()
+        
+        # Create a masked version where zero/NaN is black
+        valid_mask = (band_data != 0) & ~np.isnan(band_data)
+        
+        if valid_mask.sum() > 0:
+            # Stretch only valid data
+            valid_data = band_data[valid_mask]
+            p2, p98 = np.percentile(valid_data, [2, 98])
+            stretched = np.clip((band_data - p2) / (p98 - p2 + 1e-8), 0, 1)
+            stretched[~valid_mask] = 0  # Set invalid to black
+        else:
+            stretched = np.zeros_like(band_data)
+        
+        out_file_single = OUT_DIR / f"embeddings_clipped_band_{band_num:02d}.png"
+        
+        # Use matplotlib to save with proper colormap
+        fig, ax = plt.subplots(figsize=(10, 10))
+        im = ax.imshow(stretched, cmap='viridis', interpolation='nearest')
+        ax.axis('off')
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label=f'Band {band_num}')
+        plt.tight_layout()
+        plt.savefig(out_file_single, dpi=150, bbox_inches='tight', facecolor='white')
+        plt.close()
+        
+        print(f"      Band {band_num:2d}: {out_file_single.name}")
+
+
+def visualize_embeddings_file(downsample: bool = True, target_size: Tuple[int, int] = (2000, 2000),
+                              visualize_bands: list = None) -> None:
+    """
+    Create visualizations for the clipped embeddings file.
+    
+    Args:
+        downsample: Whether to downsample for faster visualization
+        target_size: Target size if downsampling
+        visualize_bands: List of band numbers (1-indexed) to visualize individually, or None
+    """
+    if not EMBEDDINGS_FILE.exists():
+        print(f"❌ Clipped embeddings file not found: {EMBEDDINGS_FILE}")
+        print("   Please run the clipping script first.")
         return
     
-    print(f"📁 Found {len(tile_tifs)} embedding tiles")
+    print("🎨 Creating visualizations for clipped embeddings file...")
     print()
     
-    # Print quick overview statistics
-    print_tile_statistics(tile_tifs)
+    # Print file statistics and get data
+    stats = print_embeddings_stats()
+    data = stats['data']
     
-    # Print detailed report for each tile
-    print_detailed_tile_report(tile_tifs)
-    
-    # Ask user if they want to proceed with visualizations
-    print("\n💭 Do you want to create visualizations?")
-    print("   (This will create 36 PNG files)")
-    response = input("   Continue? [y/N]: ").strip().lower()
-    
-    if response in ['y', 'yes']:
-        # Create visualizations for all tiles
-        visualize_all_tiles(tile_tifs)
+    # Downsample if requested
+    if downsample:
+        print("Downsampling for visualization...")
+        data = downsample_data(data, target_size)
+        print(f"   Working with shape: {data.shape}")
     else:
-        print("   Skipping visualizations.")
+        print(f"   Working with full resolution: {data.shape}")
+    
+    print()
+    
+    # PCA composite visualizations
+    print("=" * 80)
+    print("CREATING PCA COMPOSITE VISUALIZATIONS")
+    print("=" * 80)
+    
+    # Visual 1: PCA on z-scored bands (balanced)
+    print("\n1. PCA z-score RGB visualization...")
+    rgb_z = compute_pca_rgb_zscore(data)
+    out_file_z = OUT_DIR / "embeddings_clipped_pca_zscore_rgb.png"
+    plt.imsave(out_file_z.as_posix(), rgb_z)
+    print(f"   ✅ Saved: {out_file_z.name}")
+    
+    # Visual 2: PCA on unit-vector (angular) embeddings (balanced)
+    print("\n2. PCA unit-vector RGB visualization...")
+    rgb_u = compute_pca_rgb_unitvec(data)
+    out_file_u = OUT_DIR / "embeddings_clipped_pca_unitvec_rgb.png"
+    plt.imsave(out_file_u.as_posix(), rgb_u)
+    print(f"   ✅ Saved: {out_file_u.name}")
+    
+    # Visual 3: Magnitude heatmap
+    print("\n3. Magnitude heatmap...")
+    mag = compute_magnitude_heatmap(data)
+    out_file_m = OUT_DIR / "embeddings_clipped_magnitude.png"
+    plt.imsave(out_file_m.as_posix(), mag, cmap='magma')
+    print(f"   ✅ Saved: {out_file_m.name}")
+    
+    # Individual band visualizations
+    if visualize_bands:
+        print("\n" + "=" * 80)
+        print("CREATING INDIVIDUAL BAND VISUALIZATIONS")
+        print("=" * 80)
+        visualize_individual_bands(data, visualize_bands, stats, downsampled=downsample)
+    
+    # Summary
+    print("\n" + "=" * 80)
+    print("✅ VISUALIZATION COMPLETE")
+    print("=" * 80)
+    total_vis = 3 + (len(visualize_bands) + 1 if visualize_bands else 0)
+    print(f"\nCreated {total_vis} visualization files in {OUT_DIR}")
+    print("\nPCA Composite Visualizations:")
+    print(f"   • {out_file_z.name} - PCA RGB (z-score normalized)")
+    print(f"   • {out_file_u.name} - PCA RGB (unit vector normalized)")
+    print(f"   • {out_file_m.name} - Embedding magnitude heatmap")
+    
+    if visualize_bands:
+        print(f"\nIndividual Band Visualizations:")
+        print(f"   • embeddings_clipped_selected_bands.png - Multi-panel view")
+        print(f"   • embeddings_clipped_band_XX.png - Individual band images (×{len(visualize_bands)})")
+
+
+def main():
+    print("=" * 80)
+    print("SATELLITE EMBEDDINGS VISUALIZATION")
+    print("Clipped South America 1km Dataset (Clean Coastline)")
+    print("=" * 80)
+    print()
+    
+    if not EMBEDDINGS_FILE.exists():
+        print(f"❌ Clipped embeddings file not found: {EMBEDDINGS_FILE}")
+        print()
+        print("Please run the clipping script first:")
+        print("   python3 scripts/merging/clip_embeddings")
+        return
+    
+    # Create visualizations with downsampling by default
+    print("📝 Note: Visualizations will be created at reduced resolution for performance.")
+    print("   The full image will be downsampled to ~2000x2000 for faster processing.")
+    print()
+    
+    # Select interesting bands to visualize individually
+    # Visualize bands evenly distributed across the 64 bands, plus first and last
+    selected_bands = [1, 8, 16, 24, 32, 40, 48, 56, 64]
+    
+    visualize_embeddings_file(
+        downsample=True, 
+        target_size=(2000, 2000),
+        visualize_bands=selected_bands
+    )
+    
+    print()
+    print("💡 TIPS:")
+    print("   • PCA visualizations show overall spatial patterns in embedding space")
+    print("   • Different colors represent different embedding patterns")
+    print("   • Magnitude heatmap shows embedding strength/intensity")
+    print("   • Individual bands show what each embedding dimension captures")
 
 
 if __name__ == "__main__":
