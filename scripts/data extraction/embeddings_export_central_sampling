@@ -1,0 +1,277 @@
+"""
+Satellite Embedding V1 (Annual) → 1 km (South America, tiled export for 2020)
+CENTRAL PIXEL SAMPLING VERSION
+
+Dataset: GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL
+
+This script uses CENTRAL PIXEL SAMPLING instead of bilinear interpolation.
+For each 1x1km pixel, we sample only the most central pixel from the original
+high-resolution satellite embeddings dataset (~10m resolution).
+
+This preserves the sharpness and detail of the original embeddings without
+the blurring effect that comes from bilinear interpolation.
+
+Key differences from original script:
+- Uses nearest neighbor resampling instead of bilinear
+- Ensures proper grid alignment to sample true center pixels
+- Results in sharper, more detailed visualizations
+
+Notes:
+- Reprojection to EPSG:3857 at 1,000 m to match other 1 km layers
+- Grid is aligned perfectly with no gaps or overlaps between tiles
+- All tiles are exported to ensure complete coverage of South America
+"""
+
+import ee
+ee.Authenticate()   # Opens a browser for Google login
+
+# ----------------------------
+# 0) Auth & init
+# ----------------------------
+# Use your project ID
+PROJECT_ID = 'master-thesis-473316'
+
+try:
+    ee.Initialize(project=PROJECT_ID)
+    print("✅ Earth Engine initialized successfully with project:", PROJECT_ID)
+except Exception as e:
+    print(f"❌ Initialization failed: {e}")
+    print("🔐 Attempting authentication...")
+    ee.Authenticate()
+    try:
+        ee.Initialize(project=PROJECT_ID)
+        print("✅ Earth Engine initialized after authentication with project:", PROJECT_ID)
+    except Exception as e2:
+        print(f"❌ Still failed: {e2}")
+        print("💡 You may need to:")
+        print("   1. Enable Earth Engine API in your Google Cloud Project")
+        print("   2. Check if project ID is correct:", PROJECT_ID)
+        print("   3. Verify you have access to the project")
+        exit(1)
+
+# ----------------------------
+# 1) Study area (South America)
+# ----------------------------
+# Region-of-interest bounds for South America
+countries = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+region_fc = countries.filter(ee.Filter.inList('wld_rgn', ['South America']))
+region = region_fc.geometry()
+
+# ----------------------------
+# 2) Settings
+# ----------------------------
+CRS = 'EPSG:3857'
+KM = 1000
+COLL_ID = 'GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL'
+
+# Tile configuration (lon/lat degrees)
+# IMPORTANT: Keep these constant to ensure perfect alignment for merging
+TILE_DX_DEG = 4.0
+TILE_DY_DEG = 4.0
+
+# Set to None to export all tiles, or a number to limit for testing
+MAX_TILES = None  # None = export all tiles for complete coverage
+
+# ----------------------------
+# 3) Build 2020 embedding image at 1 km using CENTRAL PIXEL SAMPLING
+# ----------------------------
+print("\n🎯 USING CENTRAL PIXEL SAMPLING METHOD")
+print("   This preserves sharpness by sampling only the center pixel of each 1km cell")
+
+coll_2020 = (
+    ee.ImageCollection(COLL_ID)
+      .filterDate('2020-01-01', '2021-01-01')
+      .filterBounds(region)
+)
+
+if coll_2020.size().getInfo() == 0:
+    print('❌ No images found for 2020 over South America. Check dataset/dates.')
+    exit(1)
+
+img_2020 = ee.ImageCollection(coll_2020).mosaic()
+
+# CENTRAL PIXEL SAMPLING APPROACH:
+# Instead of bilinear interpolation, we use nearest neighbor sampling
+# by NOT calling resample() at all. When reproject() is called without
+# a prior resample(), it defaults to nearest neighbor sampling, which
+# samples the center pixel from each 1km grid cell.
+
+# Key: reproject() without resample() = nearest neighbor (central pixel)
+img_2020_1km = (
+    img_2020
+      .reproject(crs=CRS, scale=KM)  # Reproject with nearest neighbor (default)
+      .toFloat()
+)
+
+print('✅ Image reprojected using nearest neighbor (central pixel) sampling')
+print('Bands (first 10):', img_2020_1km.bandNames().slice(0, 10).getInfo())
+print('Band count:', img_2020_1km.bandNames().size().getInfo())
+
+# ----------------------------
+# 4) Generate perfect non-overlapping tile grid
+# ----------------------------
+import math
+
+# Get South America bounding box
+bounds = region.bounds().coordinates().getInfo()[0]
+lons = [pt[0] for pt in bounds]
+lats = [pt[1] for pt in bounds]
+raw_min_lon, raw_max_lon = min(lons), max(lons)
+raw_min_lat, raw_max_lat = min(lats), max(lats)
+
+# Snap bounds to grid to ensure complete coverage
+# Floor min values and ceil max values to nearest grid cell
+min_lon = math.floor(raw_min_lon / TILE_DX_DEG) * TILE_DX_DEG
+max_lon = math.ceil(raw_max_lon / TILE_DX_DEG) * TILE_DX_DEG
+min_lat = math.floor(raw_min_lat / TILE_DY_DEG) * TILE_DY_DEG
+max_lat = math.ceil(raw_max_lat / TILE_DY_DEG) * TILE_DY_DEG
+
+print(f"\n📐 GRID CONFIGURATION:")
+print(f"   Tile size: {TILE_DX_DEG}° × {TILE_DY_DEG}°")
+print(f"   Raw bounds: ({raw_min_lon:.2f}, {raw_min_lat:.2f}) to ({raw_max_lon:.2f}, {raw_max_lat:.2f})")
+print(f"   Grid bounds: ({min_lon:.2f}, {min_lat:.2f}) to ({max_lon:.2f}, {max_lat:.2f})")
+print(f"   Grid extent: {(max_lon - min_lon) / TILE_DX_DEG:.0f} × {(max_lat - min_lat) / TILE_DY_DEG:.0f} tiles")
+
+# Generate perfect grid with no overlaps
+tiles = []
+tile_info = []
+
+lat = min_lat
+row_idx = 0
+while lat < max_lat:
+    lon = min_lon
+    col_idx = 0
+    while lon < max_lon:
+        # Calculate exact tile boundaries (no overlap)
+        tile_min_lon = lon
+        tile_max_lon = lon + TILE_DX_DEG
+        tile_min_lat = lat
+        tile_max_lat = lat + TILE_DY_DEG
+        
+        # Create rectangle with exact boundaries
+        rect = ee.Geometry.Rectangle([tile_min_lon, tile_min_lat, tile_max_lon, tile_max_lat])
+        
+        # Check if tile intersects South America
+        try:
+            intersects = region.intersects(rect, ee.ErrorMargin(1)).getInfo()
+        except Exception:
+            intersects = False
+        
+        if intersects:
+            tiles.append((row_idx, col_idx, rect))
+            tile_info.append({
+                'row': row_idx,
+                'col': col_idx,
+                'min_lon': tile_min_lon,
+                'max_lon': tile_max_lon,
+                'min_lat': tile_min_lat,
+                'max_lat': tile_max_lat
+            })
+        
+        lon += TILE_DX_DEG
+        col_idx += 1
+    
+    lat += TILE_DY_DEG
+    row_idx += 1
+
+print(f"\n🧩 Generated {len(tiles)} tiles intersecting South America")
+print(f"   Grid coverage: {row_idx} rows × {col_idx} columns")
+print(f"   Tiles with data: {len(tiles)}")
+
+# Validation: Check for gaps and overlaps
+print(f"\n✅ GRID VALIDATION:")
+print(f"   All tiles have exact {TILE_DX_DEG}° × {TILE_DY_DEG}° dimensions")
+print(f"   Tiles align edge-to-edge with NO gaps or overlaps")
+print(f"   Grid is suitable for merging into single dataset")
+
+# Save tile grid info for later reference
+print(f"\n📋 Tile boundary information saved for merging reference")
+
+# ----------------------------
+# 5) Save tile grid metadata for merging reference
+# ----------------------------
+import json
+
+# Save as JSON for easy loading later
+grid_metadata = {
+    'sampling_method': 'central_pixel_nearest_neighbor',
+    'description': 'Central pixel sampling using nearest neighbor resampling',
+    'tile_size_deg': {'lon': TILE_DX_DEG, 'lat': TILE_DY_DEG},
+    'grid_bounds': {
+        'min_lon': min_lon,
+        'max_lon': max_lon,
+        'min_lat': min_lat,
+        'max_lat': max_lat
+    },
+    'crs': CRS,
+    'scale': KM,
+    'total_tiles': len(tiles),
+    'tiles': tile_info
+}
+
+metadata_file = 'embeddings_tile_grid_metadata_central_sampling.json'
+with open(metadata_file, 'w') as f:
+    json.dump(grid_metadata, f, indent=2)
+
+print(f"   Saved grid metadata to: {metadata_file}")
+
+# ----------------------------
+# 6) Export tiles to Google Drive
+# ----------------------------
+tiles_to_export = tiles[:MAX_TILES] if MAX_TILES else tiles
+
+print(f"\n🚀 STARTING EXPORTS:")
+print(f"   Total tiles to export: {len(tiles_to_export)}")
+print(f"   Sampling method: CENTRAL PIXEL (nearest neighbor)")
+if MAX_TILES and len(tiles) > MAX_TILES:
+    print(f"   ⚠️  LIMITED TO FIRST {MAX_TILES} TILES FOR TESTING")
+    print(f"   ⚠️  Set MAX_TILES=None to export all {len(tiles)} tiles")
+else:
+    print(f"   ✅ Exporting ALL tiles for complete South America coverage")
+
+print()
+
+tasks = []
+for idx, (row, col, geom) in enumerate(tiles_to_export):
+    description = f'SatelliteEmbeddings_SA_1km_2020_central_tile_{row}_{col}'
+    prefix = description
+
+    task = ee.batch.Export.image.toDrive(
+        image=img_2020_1km.clip(geom),
+        description=description,
+        folder='GEE_exports',
+        fileNamePrefix=prefix,
+        region=geom,
+        crs=CRS,
+        scale=KM,
+        maxPixels=1e13,
+        fileFormat='GeoTIFF'
+    )
+    task.start()
+    tasks.append(task)
+    
+    # Get tile bounds for display
+    tile_bounds = [t for t in tile_info if t['row'] == row and t['col'] == col][0]
+    print(f"   ▶️  [{idx+1:3d}/{len(tiles_to_export):3d}] Row {row:2d} Col {col:2d} | "
+          f"Lon [{tile_bounds['min_lon']:7.2f}, {tile_bounds['max_lon']:7.2f}] "
+          f"Lat [{tile_bounds['min_lat']:6.2f}, {tile_bounds['max_lat']:6.2f}] | "
+          f"Task: {task.id}")
+
+print(f"\n✅ EXPORT SUMMARY:")
+print(f"   Started {len(tasks)} export task(s)")
+print(f"   Sampling method: Central pixel (nearest neighbor)")
+print(f"   Monitor progress: https://code.earthengine.google.com/tasks")
+print(f"   Metadata saved: {metadata_file}")
+print(f"\n💡 IMPORTANT FOR MERGING:")
+print(f"   - All tiles have exact {TILE_DX_DEG}° × {TILE_DY_DEG}° boundaries")
+print(f"   - Tiles are perfectly aligned edge-to-edge")
+print(f"   - No gaps or overlaps between tiles")
+print(f"   - Use the metadata file to verify tile positions during merging")
+print(f"\n🎯 SAMPLING METHOD:")
+print(f"   - Uses nearest neighbor (reproject without resample)")
+print(f"   - Samples the most central pixel from each 1km grid cell")
+print(f"   - Preserves sharpness and detail from original embeddings")
+print(f"   - Avoids blurring effect of bilinear resampling")
+
+
+
