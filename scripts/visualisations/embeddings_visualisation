@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Satellite Embeddings (1 km) - Clipped File Visualization
+Satellite Embeddings (1 km) - File Visualization
 
-Loads the clipped multi-band embedding GeoTIFF from data/ready/embeddings,
+Loads the merged multi-band embedding GeoTIFF from data/ready/embeddings,
 computes a 3-component PCA (via NumPy SVD) to create an RGB composite, and saves PNGs.
 
-Inputs: SatelliteEmbeddings_SA_1km_2020_clipped.tif
-Output: outputs/Figures/alphaearth_vis/embeddings_clipped_*.png
+Inputs: SatelliteEmbeddings_SA_1km_2020_merged.tif
+Output: outputs/Figures/embeddings_vis/embeddings_*.png
 """
 
 import numpy as np
@@ -19,8 +19,8 @@ from typing import Tuple
 # Paths
 PROJECT_ROOT = Path("/Users/gianluca/Desktop/Master's Thesis/code")
 EMBED_DIR = PROJECT_ROOT / "data" / "ready" / "embeddings"
-EMBEDDINGS_FILE = EMBED_DIR / "SatelliteEmbeddings_SA_1km_2020_clipped.tif"
-OUT_DIR = PROJECT_ROOT / "outputs" / "Figures" / "alphaearth_vis"
+EMBEDDINGS_FILE = EMBED_DIR / "SatelliteEmbeddings_SA_1km_2020_merged.tif"
+OUT_DIR = PROJECT_ROOT / "outputs" / "Figures" / "embeddings_vis"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -506,8 +506,8 @@ def downsample_data(data: np.ndarray, target_size: Tuple[int, int] = (2000, 2000
 
 
 def print_embeddings_stats() -> dict:
-    """Print comprehensive statistics about the clipped embeddings file."""
-    print("📊 CLIPPED EMBEDDINGS STATISTICS")
+    """Print comprehensive statistics about the embeddings file."""
+    print("📊 EMBEDDINGS STATISTICS")
     print("=" * 80)
     
     with rasterio.open(EMBEDDINGS_FILE) as src:
@@ -707,7 +707,7 @@ def visualize_individual_bands(data: np.ndarray, band_indices: list,
     
     plt.tight_layout()
     
-    out_file = OUT_DIR / "embeddings_clipped_selected_bands.png"
+    out_file = OUT_DIR / "embeddings_selected_bands.png"
     plt.savefig(out_file, dpi=150, bbox_inches='tight')
     plt.close()
     
@@ -734,7 +734,7 @@ def visualize_individual_bands(data: np.ndarray, band_indices: list,
         else:
             stretched = np.zeros_like(band_data)
         
-        out_file_single = OUT_DIR / f"embeddings_clipped_band_{band_num:02d}.png"
+        out_file_single = OUT_DIR / f"embeddings_band_{band_num:02d}.png"
         
         # Use matplotlib to save with proper colormap
         fig, ax = plt.subplots(figsize=(10, 10))
@@ -751,7 +751,7 @@ def visualize_individual_bands(data: np.ndarray, band_indices: list,
 def visualize_embeddings_file(downsample: bool = True, target_size: Tuple[int, int] = (2000, 2000),
                               visualize_bands: list = None) -> None:
     """
-    Create visualizations for the clipped embeddings file.
+    Create visualizations for the embeddings file.
     
     Args:
         downsample: Whether to downsample for faster visualization
@@ -759,11 +759,11 @@ def visualize_embeddings_file(downsample: bool = True, target_size: Tuple[int, i
         visualize_bands: List of band numbers (1-indexed) to visualize individually, or None
     """
     if not EMBEDDINGS_FILE.exists():
-        print(f"❌ Clipped embeddings file not found: {EMBEDDINGS_FILE}")
-        print("   Please run the clipping script first.")
+        print(f"❌ Embeddings file not found: {EMBEDDINGS_FILE}")
+        print("   Please run the merge script first.")
         return
     
-    print("🎨 Creating visualizations for clipped embeddings file...")
+    print("🎨 Creating visualizations for embeddings file...")
     print()
     
     # Print file statistics and get data
@@ -788,21 +788,21 @@ def visualize_embeddings_file(downsample: bool = True, target_size: Tuple[int, i
     # Visual 1: PCA on z-scored bands (balanced)
     print("\n1. PCA z-score RGB visualization...")
     rgb_z = compute_pca_rgb_zscore(data)
-    out_file_z = OUT_DIR / "embeddings_clipped_pca_zscore_rgb.png"
+    out_file_z = OUT_DIR / "embeddings_pca_zscore_rgb.png"
     plt.imsave(out_file_z.as_posix(), rgb_z)
     print(f"   ✅ Saved: {out_file_z.name}")
     
     # Visual 2: PCA on unit-vector (angular) embeddings (balanced)
     print("\n2. PCA unit-vector RGB visualization...")
     rgb_u = compute_pca_rgb_unitvec(data)
-    out_file_u = OUT_DIR / "embeddings_clipped_pca_unitvec_rgb.png"
+    out_file_u = OUT_DIR / "embeddings_pca_unitvec_rgb.png"
     plt.imsave(out_file_u.as_posix(), rgb_u)
     print(f"   ✅ Saved: {out_file_u.name}")
     
     # Visual 3: Magnitude heatmap
     print("\n3. Magnitude heatmap...")
     mag = compute_magnitude_heatmap(data)
-    out_file_m = OUT_DIR / "embeddings_clipped_magnitude.png"
+    out_file_m = OUT_DIR / "embeddings_magnitude.png"
     plt.imsave(out_file_m.as_posix(), mag, cmap='magma')
     print(f"   ✅ Saved: {out_file_m.name}")
     
@@ -826,22 +826,22 @@ def visualize_embeddings_file(downsample: bool = True, target_size: Tuple[int, i
     
     if visualize_bands:
         print(f"\nIndividual Band Visualizations:")
-        print(f"   • embeddings_clipped_selected_bands.png - Multi-panel view")
-        print(f"   • embeddings_clipped_band_XX.png - Individual band images (×{len(visualize_bands)})")
+        print(f"   • embeddings_selected_bands.png - Multi-panel view")
+        print(f"   • embeddings_band_XX.png - Individual band images (×{len(visualize_bands)})")
 
 
 def main():
     print("=" * 80)
     print("SATELLITE EMBEDDINGS VISUALIZATION")
-    print("Clipped South America 1km Dataset (Clean Coastline)")
+    print("South America 1km Dataset")
     print("=" * 80)
     print()
     
     if not EMBEDDINGS_FILE.exists():
-        print(f"❌ Clipped embeddings file not found: {EMBEDDINGS_FILE}")
+        print(f"❌ Embeddings file not found: {EMBEDDINGS_FILE}")
         print()
-        print("Please run the clipping script first:")
-        print("   python3 scripts/merging/clip_embeddings")
+        print("Please run the merge script first:")
+        print("   python3 scripts/merging/merge_embeddings")
         return
     
     # Create visualizations with downsampling by default
@@ -869,5 +869,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
