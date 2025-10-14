@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""
+Merge satellite embedding tiles into a single South America 1×1 km mosaic (2024).
+
+This script:
+- Reads tiles of satellite embeddings (64-band, float32)
+- Merges them into a seamless mosaic covering South America
+- Ensures no gaps or overlaps between tiles
+- Outputs a single GeoTIFF at 1km resolution in EPSG:3857
+"""
+
+import json
+import sys
+import time
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import rasterio
+from rasterio.transform import Affine
+from rasterio.crs import CRS
+
+# Paths
+DATA_ROOT = Path("/Users/gianluca/Desktop/Master's Thesis/code/data")
+EMBEDDINGS_DIR = DATA_ROOT / "ready" / "embeddings" / "embeddings_2024"
+METADATA_FILE = EMBEDDINGS_DIR / "embeddings_tile_grid_metadata_2024.json"
+OUTPUT_FILE = EMBEDDINGS_DIR / "SatelliteEmbeddings_SA_1km_2024_merged.tif"
+
+
+def log_progress(message: str, start_time: Optional[float] = None):
+    """Log progress with optional timing."""
+    if start_time:
+        elapsed = time.time() - start_time
+        print(f"⏱️  {message} ({elapsed:.1f}s)")
+    else:
+        print(f"📊 {message}")
+
+
+def load_metadata() -> dict:
+    """Load tile grid metadata."""
+    log_progress(f"Loading metadata from {METADATA_FILE.name}")
+    with open(METADATA_FILE, 'r') as f:
+        return json.load(f)
+
+
+def calculate_output_dimensions(tile_files: List[Path], scale: int) -> Tuple[Affine, int, int, dict]:
+    """
+    Calculate output raster dimensions and transform from actual tile files.
+    This ensures perfect alignment with the tiles.
+    
+    Returns:
+        transform: Affine transform for the output raster
+        width: Width in pixels
+        height: Height in pixels
+        bounds: Dictionary with min/max x/y
+    """
+    log_progress("Calculating output dimensions from tile files...")
+    
+    # Find the actual extent by scanning all tiles
+    min_x = float('inf')
+    max_x = float('-inf')
+    min_y = float('inf')
+    max_y = float('-inf')
+    
+    log_progress(f"  Scanning {len(tile_files)} tiles to find extent...")
+    for tile_path in tile_files:
+        with rasterio.open(tile_path) as src:
+            bounds = src.bounds
+            min_x = min(min_x, bounds.left)
+            max_x = max(max_x, bounds.right)
+            min_y = min(min_y, bounds.bottom)
+            max_y = max(max_y, bounds.top)
+    
+    log_progress(f"Extent: x [{min_x:.0f}, {max_x:.0f}], y [{min_y:.0f}, {max_y:.0f}]")
+    
+    # Calculate dimensions (round to ensure integer pixels, aligned to scale)
+    # Snap to pixel grid
+    min_x = np.floor(min_x / scale) * scale
+    max_x = np.ceil(max_x / scale) * scale
+    min_y = np.floor(min_y / scale) * scale
+    max_y = np.ceil(max_y / scale) * scale
+    
+    width = int(np.round((max_x - min_x) / scale))
+    height = int(np.round((max_y - min_y) / scale))
+    
+    # Create affine transform
+    # Top-left corner with pixel size
+    transform = Affine.translation(min_x, max_y) * Affine.scale(scale, -scale)
+    
+    log_progress(f"Output dimensions: {width} x {height} pixels ({width * height / 1e6:.1f}M pixels)")
+    log_progress(f"Output transform: {transform}")
+    
+    return transform, width, height, {'min_x': min_x, 'max_x': max_x, 'min_y': min_y, 'max_y': max_y}
+
+
+def find_tile_files() -> List[Path]:
+    """Find all tile files in the embeddings directory."""
+    log_progress("Scanning for tile files...")
+    tiles = sorted(EMBEDDINGS_DIR.glob("SatelliteEmbeddings_SA_1km_2024_tile_*.tif"))
+    log_progress(f"Found {len(tiles)} tile files")
+    return tiles
+
+
+def get_tile_row_col(tile_path: Path) -> Tuple[int, int]:
+    """Extract row and column from tile filename."""
+    # Filename format: SatelliteEmbeddings_SA_1km_2024_tile_{row}_{col}.tif
+    name = tile_path.stem
+    parts = name.split('_')
+    row = int(parts[-2])
+    col = int(parts[-1])
+    return row, col
+
+
+def create_tile_index(metadata: dict) -> Dict[Tuple[int, int], dict]:
+    """Create an index mapping (row, col) to tile metadata."""
+    tile_index = {}
+    for tile_info in metadata['tiles']:
+        key = (tile_info['row'], tile_info['col'])
+        tile_index[key] = tile_info
+    return tile_index
+
+
+def merge_tiles(tile_files: List[Path], metadata: dict, output_transform: Affine, 
+                output_width: int, output_height: int) -> np.ndarray:
+    """
+    Merge all tiles into a single array.
+    
+    Returns:
+        merged: Array of shape (bands, height, width)
+    """
+    log_progress("Starting tile merge...")
+    start_time = time.time()
+    
+    # Get number of bands from first tile
+    with rasterio.open(tile_files[0]) as src:
+        num_bands = src.count
+        log_progress(f"Each tile has {num_bands} bands")
+    
+    # Initialize output array with NaN
+    log_progress(f"Allocating output array: ({num_bands}, {output_height}, {output_width})")
+    merged = np.full((num_bands, output_height, output_width), np.nan, dtype=np.float32)
+    
+    # Create tile index for quick lookup
+    tile_index = create_tile_index(metadata)
+    
+    # Process each tile
+    tiles_processed = 0
+    tiles_total = len(tile_files)
+    
+    for tile_path in tile_files:
+        row, col = get_tile_row_col(tile_path)
+        
+        # Get tile metadata
+        if (row, col) not in tile_index:
+            log_progress(f"⚠️  Warning: No metadata for tile ({row}, {col}), skipping...")
+            continue
+        
+        tile_meta = tile_index[(row, col)]
+        
+        # Read tile data
+        with rasterio.open(tile_path) as src:
+            tile_data = src.read()  # Shape: (bands, height, width)
+            tile_transform = src.transform
+            tile_height, tile_width = src.shape
+            
+            # Calculate pixel offset in output array
+            # Using the tile's actual transform to determine position
+            tile_left = tile_transform.c
+            tile_top = tile_transform.f
+            
+            # Calculate pixel position in output
+            col_offset = int(np.round((tile_left - output_transform.c) / output_transform.a))
+            row_offset = int(np.round((tile_top - output_transform.f) / output_transform.e))
+            
+            # Ensure we don't go out of bounds
+            if col_offset < 0 or row_offset < 0:
+                log_progress(f"⚠️  Warning: Tile ({row}, {col}) has negative offset, skipping...")
+                continue
+            
+            if col_offset + tile_width > output_width or row_offset + tile_height > output_height:
+                # Clip the tile to fit
+                clip_width = min(tile_width, output_width - col_offset)
+                clip_height = min(tile_height, output_height - row_offset)
+                log_progress(f"⚠️  Clipping tile ({row}, {col}) to fit output bounds")
+                tile_data = tile_data[:, :clip_height, :clip_width]
+                tile_height, tile_width = clip_height, clip_width
+            
+            # Place tile in output array
+            merged[:, row_offset:row_offset + tile_height, col_offset:col_offset + tile_width] = tile_data
+        
+        tiles_processed += 1
+        if tiles_processed % 10 == 0 or tiles_processed == tiles_total:
+            progress_pct = (tiles_processed / tiles_total) * 100
+            elapsed = time.time() - start_time
+            est_total = elapsed / tiles_processed * tiles_total
+            est_remaining = est_total - elapsed
+            log_progress(f"Progress: {tiles_processed}/{tiles_total} tiles ({progress_pct:.1f}%) "
+                        f"- Est. remaining: {est_remaining:.0f}s")
+    
+    log_progress(f"Merge completed: {tiles_processed} tiles processed", start_time)
+    
+    # Check for gaps
+    nan_pixels = np.sum(np.isnan(merged[0]))
+    total_pixels = merged.shape[1] * merged.shape[2]
+    coverage_pct = (1 - nan_pixels / total_pixels) * 100
+    log_progress(f"Coverage: {coverage_pct:.2f}% ({total_pixels - nan_pixels}/{total_pixels} pixels)")
+    
+    if nan_pixels > 0:
+        log_progress(f"⚠️  Warning: {nan_pixels} pixels have no data (gaps in coverage)")
+    
+    return merged
+
+
+def write_merged_geotiff(merged: np.ndarray, transform: Affine, crs: str, output_path: Path):
+    """Write merged array to GeoTIFF."""
+    log_progress(f"Writing merged GeoTIFF to {output_path.name}...")
+    start_time = time.time()
+    
+    num_bands, height, width = merged.shape
+    
+    # Configure output profile
+    profile = {
+        'driver': 'GTiff',
+        'dtype': rasterio.float32,
+        'nodata': np.nan,
+        'width': width,
+        'height': height,
+        'count': num_bands,
+        'crs': crs,
+        'transform': transform,
+        'compress': 'lzw',
+        'tiled': True,
+        'blockxsize': 512,
+        'blockysize': 512,
+        'interleave': 'band',
+        'BIGTIFF': 'YES',  # Enable BigTIFF for large files
+    }
+    
+    with rasterio.open(output_path, 'w', **profile) as dst:
+        # Write bands
+        for band_idx in range(num_bands):
+            dst.write(merged[band_idx], band_idx + 1)
+            dst.set_band_description(band_idx + 1, f'embedding_{band_idx + 1}')
+            
+            # Log progress for large files
+            if (band_idx + 1) % 10 == 0 or band_idx + 1 == num_bands:
+                log_progress(f"  Written band {band_idx + 1}/{num_bands}")
+    
+    # Get file size
+    file_size_mb = output_path.stat().st_size / (1024 * 1024)
+    log_progress(f"Written {output_path.name} ({file_size_mb:.1f} MB)", start_time)
+
+
+def validate_merge(output_path: Path, expected_bounds: dict, expected_scale: int):
+    """Validate the merged output."""
+    log_progress("Validating merged output...")
+    
+    with rasterio.open(output_path) as src:
+        log_progress(f"  Shape: {src.shape} (height x width)")
+        log_progress(f"  Bands: {src.count}")
+        log_progress(f"  CRS: {src.crs}")
+        log_progress(f"  Transform: {src.transform}")
+        log_progress(f"  Bounds: {src.bounds}")
+        log_progress(f"  Pixel size: {src.res}")
+        
+        # Check CRS
+        if src.crs != CRS.from_string('EPSG:3857'):
+            log_progress("  ⚠️  Warning: CRS is not EPSG:3857")
+        
+        # Check resolution
+        if not np.isclose(abs(src.res[0]), expected_scale, rtol=0.01):
+            log_progress(f"  ⚠️  Warning: Resolution {src.res[0]} != expected {expected_scale}")
+        
+        # Sample data to check validity
+        sample_band = src.read(1)
+        valid_pixels = np.sum(~np.isnan(sample_band))
+        total_pixels = sample_band.size
+        log_progress(f"  Valid pixels: {valid_pixels}/{total_pixels} ({valid_pixels/total_pixels*100:.2f}%)")
+        
+        if valid_pixels > 0:
+            log_progress(f"  Data range (band 1): [{np.nanmin(sample_band):.4f}, {np.nanmax(sample_band):.4f}]")
+            log_progress(f"  Data mean (band 1): {np.nanmean(sample_band):.4f}")
+
+
+def main():
+    """Main merge function."""
+    total_start = time.time()
+    
+    log_progress("=" * 80)
+    log_progress("Satellite Embeddings Tile Merge Script (2024)")
+    log_progress("=" * 80)
+    
+    # Check inputs
+    if not EMBEDDINGS_DIR.exists():
+        print(f"❌ Embeddings directory not found: {EMBEDDINGS_DIR}")
+        sys.exit(1)
+    
+    if not METADATA_FILE.exists():
+        print(f"❌ Metadata file not found: {METADATA_FILE}")
+        sys.exit(1)
+    
+    # Load metadata
+    metadata = load_metadata()
+    log_progress(f"Grid: {metadata['tile_size_deg']} degree tiles")
+    log_progress(f"Total tiles in metadata: {metadata['total_tiles']}")
+    
+    # Find tile files
+    tile_files = find_tile_files()
+    if not tile_files:
+        print(f"❌ No tile files found in {EMBEDDINGS_DIR}")
+        sys.exit(1)
+    
+    if len(tile_files) != metadata['total_tiles']:
+        log_progress(f"⚠️  Warning: Found {len(tile_files)} files but metadata specifies {metadata['total_tiles']} tiles")
+    
+    # Calculate output dimensions from actual tile files
+    output_transform, output_width, output_height, bounds = calculate_output_dimensions(
+        tile_files, metadata['scale']
+    )
+    
+    # Merge tiles
+    merged = merge_tiles(tile_files, metadata, output_transform, output_width, output_height)
+    
+    # Write output
+    write_merged_geotiff(merged, output_transform, metadata['crs'], OUTPUT_FILE)
+    
+    # Validate
+    validate_merge(OUTPUT_FILE, bounds, metadata['scale'])
+    
+    # Summary
+    total_time = time.time() - total_start
+    log_progress("=" * 80)
+    log_progress(f"✅ Merge completed successfully in {total_time/60:.1f} minutes")
+    log_progress(f"Output file: {OUTPUT_FILE}")
+    log_progress("=" * 80)
+
+
+if __name__ == "__main__":
+    main()
+

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Satellite Embeddings (1 km) - File Visualization
+Multi-Temporal Satellite Embeddings (2018-2024) - Visualization
 
-Loads the merged multi-band embedding GeoTIFF from data/ready/embeddings,
-computes a 3-component PCA (via NumPy SVD) to create an RGB composite, and saves PNGs.
+Creates visualizations for the merged multi-temporal embedding file (448 bands = 64 bands × 7 years).
+Generates PCA composites and heatmaps for each year to show temporal changes.
 
-Inputs: SatelliteEmbeddings_SA_1km_2020_merged.tif
+Input: SatelliteEmbeddings_SA_1km_2018-2024_multitemporal.tif
 Output: outputs/Figures/embeddings_vis/embeddings_*.png
 """
 
@@ -13,860 +13,363 @@ import numpy as np
 import rasterio
 from pathlib import Path
 import matplotlib.pyplot as plt
-from typing import Tuple
-
+from typing import Tuple, List
+import matplotlib.gridspec as gridspec
 
 # Paths
 PROJECT_ROOT = Path("/Users/gianluca/Desktop/Master's Thesis/code")
 EMBED_DIR = PROJECT_ROOT / "data" / "ready" / "embeddings"
-EMBEDDINGS_FILE = EMBED_DIR / "SatelliteEmbeddings_SA_1km_2020_merged.tif"
+EMBEDDINGS_FILE = EMBED_DIR / "SatelliteEmbeddings_SA_1km_2018-2024_multitemporal.tif"
 OUT_DIR = PROJECT_ROOT / "outputs" / "Figures" / "embeddings_vis"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-
-def find_all_tifs(directory: Path) -> list[Path]:
-    """Find all .tif files in directory."""
-    tifs = sorted(directory.glob("*.tif"))
-    if not tifs:
-        raise FileNotFoundError(f"No .tif found in {directory}")
-    return tifs
+# Years in the dataset
+YEARS = [2018, 2019, 2020, 2021, 2022, 2023, 2024]
+BANDS_PER_YEAR = 64
 
 
-def get_tile_stats(tif_path: Path) -> dict:
-    """Get basic stats about a tile file."""
-    with rasterio.open(tif_path) as src:
-        bounds = src.bounds
-        shape = src.shape
-        bands = src.count
-        crs = src.crs
-        
-        # Convert Web Mercator bounds to lat/lon for geographic info
-        from rasterio.warp import transform_bounds
-        if crs.to_string() == 'EPSG:3857':
-            # Transform from Web Mercator to WGS84
-            min_lon, min_lat, max_lon, max_lat = transform_bounds(crs, 'EPSG:4326', 
-                                                                bounds.left, bounds.bottom, 
-                                                                bounds.right, bounds.top)
-            
-            # Calculate approximate area in km² using lat/lon
-            # More accurate calculation considering Earth's curvature
-            import math
-            R = 6371  # Earth radius in km
-            
-            # Convert to radians
-            lat1_rad = math.radians(min_lat)
-            lat2_rad = math.radians(max_lat)
-            delta_lat = math.radians(max_lat - min_lat)
-            delta_lon = math.radians(max_lon - min_lon)
-            
-            # Haversine formula for width (at average latitude)
-            avg_lat = (min_lat + max_lat) / 2
-            width_km = R * delta_lon * math.cos(math.radians(avg_lat))
-            height_km = R * delta_lat
-            
-            area_km2 = width_km * height_km
-        else:
-            # Fallback for other CRS
-            width_km = (bounds.right - bounds.left) / 1000
-            height_km = (bounds.top - bounds.bottom) / 1000
-            area_km2 = width_km * height_km
-            min_lat, min_lon = 0, 0
-            max_lat, max_lon = 0, 0
-        
-        return {
-            'file': tif_path.name,
-            'bounds': bounds,
-            'shape': shape,
-            'bands': bands,
-            'crs': str(crs),
-            'width_km': width_km,
-            'height_km': height_km,
-            'area_km2': area_km2,
-            'center_lat': (min_lat + max_lat) / 2,
-            'center_lon': (min_lon + max_lon) / 2,
-            'min_lat': min_lat,
-            'max_lat': max_lat,
-            'min_lon': min_lon,
-            'max_lon': max_lon
-        }
+def log_progress(message: str):
+    """Simple logging function."""
+    print(f"📊 {message}")
 
 
-def _replace_nans_with_band_means(X: np.ndarray) -> np.ndarray:
-    band_means = np.nanmean(X, axis=1, keepdims=True)
-    nan_mask = np.isnan(X)
-    if np.any(nan_mask):
-        # Broadcast band means to nan positions
-        rows, cols = np.where(nan_mask)
-        X[rows, cols] = band_means[rows, 0]
-    return X
-
-
-def _percentile_stretch(img: np.ndarray, pmin: float = 2.0, pmax: float = 98.0) -> np.ndarray:
-    vmin = np.percentile(img, pmin)
-    vmax = np.percentile(img, pmax)
-    if vmax <= vmin:
-        vmax = vmin + 1e-6
-    out = np.clip((img - vmin) / (vmax - vmin), 0, 1)
-    return out
-
-
-def _gray_world_balance(rgb: np.ndarray) -> np.ndarray:
-    # Simple gray-world color balance to avoid color casts
-    # rgb in [0,1], shape (H, W, 3)
-    means = rgb.reshape(-1, 3).mean(axis=0) + 1e-6
-    scale = means.mean() / means
-    balanced = np.clip(rgb * scale, 0, 1)
-    return balanced
-
-
-def compute_pca_rgb_zscore(data: np.ndarray) -> np.ndarray:
-    """PCA RGB after band-wise z-score standardization and gray-world balance.
-
-    Args:
-        data: (bands, height, width)
+def load_multitemporal_data(downsample: bool = True, 
+                            target_size: Tuple[int, int] = (2000, 2000)) -> Tuple[np.ndarray, dict]:
+    """
+    Load the multi-temporal embeddings file.
+    
     Returns:
-        (height, width, 3) uint8 RGB
+        data: Array of shape (bands, height, width) = (448, H, W)
+        metadata: Dictionary with file information
     """
-    bands, height, width = data.shape
-    X = data.reshape(bands, height * width).astype(np.float32)
-    X = _replace_nans_with_band_means(X)
-
-    # Band-wise z-score
-    mean = X.mean(axis=1, keepdims=True)
-    std = X.std(axis=1, keepdims=True) + 1e-6
-    Xz = (X - mean) / std
-
-    # PCA (SVD) and take first 3 components across pixels
-    U, S, Vt = np.linalg.svd(Xz, full_matrices=False)
-    pcs = Vt[:3, :].reshape(3, height, width)
-
-    # Percentile stretch per channel, then gray-world balance
-    channels = [_percentile_stretch(pcs[i]) for i in range(3)]
-    rgb = np.stack(channels, axis=-1)
-    rgb = _gray_world_balance(rgb)
-    return (rgb * 255).astype(np.uint8)
-
-
-def compute_pca_rgb_unitvec(data: np.ndarray) -> np.ndarray:
-    """PCA RGB after per-pixel L2 normalization (emphasizes angular structure).
-
-    Args:
-        data: (bands, height, width)
-    Returns:
-        (height, width, 3) uint8 RGB
-    """
-    bands, height, width = data.shape
-    X = data.reshape(bands, height * width).astype(np.float32)
-    X = _replace_nans_with_band_means(X)
-
-    # Per-pixel L2 normalization
-    norms = np.linalg.norm(X, axis=0, keepdims=True) + 1e-6
-    Xu = X / norms
-
-    U, S, Vt = np.linalg.svd(Xu, full_matrices=False)
-    pcs = Vt[:3, :].reshape(3, height, width)
-
-    channels = [_percentile_stretch(pcs[i]) for i in range(3)]
-    rgb = np.stack(channels, axis=-1)
-    rgb = _gray_world_balance(rgb)
-    return (rgb * 255).astype(np.uint8)
-
-
-def compute_magnitude_heatmap(data: np.ndarray) -> np.ndarray:
-    """Embedding magnitude (L2 norm across bands) as a grayscale heatmap uint8."""
-    bands, height, width = data.shape
-    X = data.reshape(bands, height * width).astype(np.float32)
-    X = _replace_nans_with_band_means(X)
-    mags = np.linalg.norm(X, axis=0).reshape(height, width)
-    heat = _percentile_stretch(mags)
-    return (heat * 255).astype(np.uint8)
-
-
-def check_data_quality(tif_path: Path) -> dict:
-    """Check data quality for a tile."""
-    with rasterio.open(tif_path) as src:
-        data = src.read()  # (bands, height, width)
-        
-        bands, height, width = data.shape
-        total_pixels = height * width
-        
-        # Check per-band statistics
-        band_nan_counts = []
-        band_zero_counts = []
-        band_valid_counts = []
-        band_means = []
-        band_stds = []
-        
-        for b in range(bands):
-            band_data = data[b]
-            nan_count = np.isnan(band_data).sum()
-            zero_count = (band_data == 0).sum()
-            valid_count = (~np.isnan(band_data) & (band_data != 0)).sum()
-            
-            band_nan_counts.append(nan_count)
-            band_zero_counts.append(zero_count)
-            band_valid_counts.append(valid_count)
-            
-            valid_data = band_data[~np.isnan(band_data) & (band_data != 0)]
-            if len(valid_data) > 0:
-                band_means.append(np.mean(valid_data))
-                band_stds.append(np.std(valid_data))
-            else:
-                band_means.append(0)
-                band_stds.append(0)
-        
-        # Overall statistics
-        total_nans = sum(band_nan_counts)
-        total_zeros = sum(band_zero_counts)
-        total_valid = sum(band_valid_counts)
-        total_values = bands * total_pixels
-        
-        return {
-            'file': tif_path.name,
-            'bands': bands,
-            'pixels': total_pixels,
-            'total_values': total_values,
-            'total_nans': total_nans,
-            'total_zeros': total_zeros,
-            'total_valid': total_valid,
-            'nan_percentage': (total_nans / total_values) * 100,
-            'zero_percentage': (total_zeros / total_values) * 100,
-            'valid_percentage': (total_valid / total_values) * 100,
-            'band_nan_counts': band_nan_counts,
-            'band_valid_counts': band_valid_counts,
-            'band_means': band_means,
-            'band_stds': band_stds,
-            'avg_band_mean': np.mean([m for m in band_means if m != 0]) if any(m != 0 for m in band_means) else 0,
-            'avg_band_std': np.mean([s for s in band_stds if s != 0]) if any(s != 0 for s in band_stds) else 0
-        }
-
-def print_tile_statistics(tif_paths: list[Path]) -> None:
-    """Print statistics about all tiles."""
-    print(f"📊 TILE STATISTICS ({len(tif_paths)} tiles)")
-    print("=" * 80)
-    
-    all_stats = []
-    total_area = 0
-    
-    for tif_path in tif_paths:
-        stats = get_tile_stats(tif_path)
-        all_stats.append(stats)
-        total_area += stats['area_km2']
-    
-    # Sort by center coordinates for better overview
-    all_stats.sort(key=lambda x: (x['center_lat'], x['center_lon']))
-    
-    print(f"{'Tile':<35} {'Center (lat,lon)':<20} {'Size (km)':<15} {'Area (km²)':<12} {'Bands':<6}")
-    print("-" * 80)
-    
-    for stats in all_stats:
-        print(f"{stats['file']:<35} "
-              f"({stats['center_lat']:6.2f}, {stats['center_lon']:7.2f}) "
-              f"{stats['width_km']:6.1f}x{stats['height_km']:5.1f} "
-              f"{stats['area_km2']:10.0f} "
-              f"{stats['bands']:6}")
-    
-    print("-" * 80)
-    print(f"Total coverage: {total_area:,.0f} km²")
-    print(f"Average tile size: {total_area/len(all_stats):,.0f} km²")
-    print(f"Geographic bounds:")
-    
-    # Calculate overall bounds using proper lat/lon coordinates
-    min_lat = min(s['min_lat'] for s in all_stats)
-    max_lat = max(s['max_lat'] for s in all_stats)
-    min_lon = min(s['min_lon'] for s in all_stats)
-    max_lon = max(s['max_lon'] for s in all_stats)
-    
-    print(f"  Latitude: {min_lat:7.2f} to {max_lat:7.2f} ({max_lat-min_lat:6.2f}°)")
-    print(f"  Longitude: {min_lon:7.2f} to {max_lon:7.2f} ({max_lon-min_lon:6.2f}°)")
-    
-    # Show spatial resolution info
-    if all_stats:
-        first_stats = all_stats[0]
-        print(f"  Spatial resolution: ~{first_stats['width_km']/first_stats['shape'][1]:.1f} km/pixel")
-        print(f"  Tile dimensions: {first_stats['shape'][1]} x {first_stats['shape'][0]} pixels")
-    print()
-
-def visualize_all_tiles(tif_paths: list[Path]) -> None:
-    """Create visualizations for all tiles."""
-    print(f"🎨 Creating visualizations for {len(tif_paths)} tiles...")
-    
-    for i, tif_path in enumerate(tif_paths):
-        print(f"   Processing tile {i+1}/{len(tif_paths)}: {tif_path.name}")
-        
-        with rasterio.open(tif_path) as src:
-            data = src.read()  # (bands, height, width)
-        
-        # Create unique filenames based on tile name
-        tile_name = tif_path.stem  # filename without extension
-        
-        # Visual 1: PCA on z-scored bands (balanced)
-        rgb_z = compute_pca_rgb_zscore(data)
-        out_file_z = OUT_DIR / f"{tile_name}_pca_zscore_rgb.png"
-        plt.imsave(out_file_z.as_posix(), rgb_z)
-        
-        # Visual 2: PCA on unit-vector (angular) embeddings (balanced)
-        rgb_u = compute_pca_rgb_unitvec(data)
-        out_file_u = OUT_DIR / f"{tile_name}_pca_unitvec_rgb.png"
-        plt.imsave(out_file_u.as_posix(), rgb_u)
-        
-        # Visual 3: Magnitude heatmap
-        mag = compute_magnitude_heatmap(data)
-        out_file_m = OUT_DIR / f"{tile_name}_magnitude.png"
-        plt.imsave(out_file_m.as_posix(), mag, cmap='magma')
-    
-    print(f"✅ Created {len(tif_paths) * 3} visualizations in {OUT_DIR}")
-
-def print_detailed_tile_report(tif_paths: list[Path]) -> None:
-    """Print detailed statistics report for each tile."""
-    print(f"\n📋 DETAILED TILE REPORT")
-    print("=" * 100)
-    
-    all_tile_info = []
-    
-    for idx, tif_path in enumerate(tif_paths, 1):
-        print(f"\n{'='*100}")
-        print(f"TILE {idx}/{len(tif_paths)}: {tif_path.name}")
-        print(f"{'='*100}")
-        
-        # Get geographic stats
-        geo_stats = get_tile_stats(tif_path)
-        
-        # Get quality stats
-        quality_stats = check_data_quality(tif_path)
-        
-        # Combine info
-        tile_info = {**geo_stats, **quality_stats}
-        all_tile_info.append(tile_info)
-        
-        # Print location information
-        print(f"\n📍 LOCATION:")
-        print(f"   Center coordinates:  {tile_info['center_lat']:8.4f}°, {tile_info['center_lon']:8.4f}°")
-        print(f"   Latitude range:      {tile_info['min_lat']:8.4f}° to {tile_info['max_lat']:8.4f}°  ({tile_info['max_lat']-tile_info['min_lat']:6.2f}° span)")
-        print(f"   Longitude range:     {tile_info['min_lon']:8.4f}° to {tile_info['max_lon']:8.4f}°  ({tile_info['max_lon']-tile_info['min_lon']:6.2f}° span)")
-        
-        # Print size information
-        print(f"\n📐 SIZE:")
-        print(f"   Physical dimensions: {tile_info['width_km']:7.1f} km × {tile_info['height_km']:7.1f} km")
-        print(f"   Area coverage:       {tile_info['area_km2']:10,.0f} km²")
-        print(f"   Pixel dimensions:    {tile_info['shape'][1]:,} × {tile_info['shape'][0]:,} pixels")
-        print(f"   Total pixels:        {tile_info['pixels']:,}")
-        print(f"   Pixel resolution:    ~{tile_info['width_km']/tile_info['shape'][1]:.2f} km/pixel")
-        
-        # Print data quality information
-        print(f"\n🔬 DATA QUALITY:")
-        print(f"   Number of bands:     {tile_info['bands']}")
-        print(f"   Total data points:   {tile_info['total_values']:,} ({tile_info['bands']} bands × {tile_info['pixels']:,} pixels)")
-        print(f"   Valid data points:   {tile_info['total_valid']:,} ({tile_info['valid_percentage']:.2f}%)")
-        print(f"   NaN data points:     {tile_info['total_nans']:,} ({tile_info['nan_percentage']:.2f}%)")
-        print(f"   Zero data points:    {tile_info['total_zeros']:,} ({tile_info['zero_percentage']:.2f}%)")
-        
-        # Calculate valid pixels (pixels where at least one band has valid data)
-        valid_pixels = tile_info['total_valid'] // tile_info['bands'] if tile_info['bands'] > 0 else 0
-        valid_pixel_pct = (valid_pixels / tile_info['pixels']) * 100 if tile_info['pixels'] > 0 else 0
-        print(f"   Valid pixels:        ~{valid_pixels:,} (~{valid_pixel_pct:.1f}% of pixels have some valid data)")
-        
-        # Print embedding statistics
-        print(f"\n📊 EMBEDDING STATISTICS:")
-        print(f"   Mean (across bands): {tile_info['avg_band_mean']:9.6f}")
-        print(f"   Std (across bands):  {tile_info['avg_band_std']:9.6f}")
-        
-        # Quality assessment
-        if tile_info['valid_percentage'] > 75:
-            status = "✅ EXCELLENT - High data coverage"
-        elif tile_info['valid_percentage'] > 50:
-            status = "✅ GOOD - Adequate data coverage"
-        elif tile_info['valid_percentage'] > 25:
-            status = "⚠️  FAIR - Moderate data coverage"
-        else:
-            status = "⚠️  POOR - Low data coverage"
-        
-        print(f"\n🎯 QUALITY ASSESSMENT: {status}")
-    
-    # Summary table
-    print(f"\n{'='*100}")
-    print(f"SUMMARY TABLE - ALL TILES")
-    print(f"{'='*100}\n")
-    
-    print(f"{'Tile':<40} {'Center (Lat,Lon)':<22} {'Area (km²)':<14} {'Pixels':<12} {'Valid %':<10}")
-    print("-" * 100)
-    
-    for info in all_tile_info:
-        print(f"{info['file']:<40} "
-              f"({info['center_lat']:7.3f}, {info['center_lon']:8.3f}) "
-              f"{info['area_km2']:>12,.0f}  "
-              f"{info['pixels']:>10,}  "
-              f"{info['valid_percentage']:>8.1f}%")
-    
-    print("-" * 100)
-    
-    # Overall statistics
-    total_area = sum(info['area_km2'] for info in all_tile_info)
-    total_pixels = sum(info['pixels'] for info in all_tile_info)
-    total_valid = sum(info['total_valid'] for info in all_tile_info)
-    total_values = sum(info['total_values'] for info in all_tile_info)
-    overall_valid_pct = (total_valid / total_values) * 100 if total_values > 0 else 0
-    
-    print(f"\nOVERALL STATISTICS:")
-    print(f"   Total tiles:         {len(all_tile_info)}")
-    print(f"   Total area:          {total_area:,.0f} km²")
-    print(f"   Total pixels:        {total_pixels:,}")
-    print(f"   Overall valid data:  {overall_valid_pct:.2f}%")
-    print(f"   Geographic extent:   {max(info['max_lat'] for info in all_tile_info) - min(info['min_lat'] for info in all_tile_info):.2f}° lat × "
-          f"{max(info['max_lon'] for info in all_tile_info) - min(info['min_lon'] for info in all_tile_info):.2f}° lon")
-    
-    print()
-
-def print_data_quality(tif_paths: list[Path]) -> None:
-    """Print data quality statistics for all tiles."""
-    print(f"🔍 DATA QUALITY CHECK ({len(tif_paths)} tiles)")
-    print("=" * 100)
-    
-    quality_stats = []
-    for tif_path in tif_paths:
-        print(f"   Analyzing {tif_path.name}...", end=' ')
-        stats = check_data_quality(tif_path)
-        quality_stats.append(stats)
-        print("✓")
-    
-    print()
-    print(f"{'Tile':<35} {'Valid %':<10} {'NaN %':<10} {'Zero %':<10} {'Avg Mean':<12} {'Avg Std':<12}")
-    print("-" * 100)
-    
-    for stats in quality_stats:
-        status = "✅" if stats['valid_percentage'] > 50 else "⚠️" if stats['valid_percentage'] > 10 else "❌"
-        print(f"{stats['file']:<35} "
-              f"{stats['valid_percentage']:>8.2f}% "
-              f"{stats['nan_percentage']:>8.2f}% "
-              f"{stats['zero_percentage']:>8.2f}% "
-              f"{stats['avg_band_mean']:>10.4f}  "
-              f"{stats['avg_band_std']:>10.4f}  "
-              f"{status}")
-    
-    print("-" * 100)
-    
-    # Overall summary
-    total_valid = sum(s['total_valid'] for s in quality_stats)
-    total_values = sum(s['total_values'] for s in quality_stats)
-    overall_valid_pct = (total_valid / total_values) * 100
-    
-    print(f"Overall valid data: {overall_valid_pct:.2f}%")
-    print(f"Total pixels across all tiles: {sum(s['pixels'] for s in quality_stats):,}")
-    print(f"Total bands: {quality_stats[0]['bands'] if quality_stats else 0}")
-    
-    # Check for problem bands (bands with mostly NaN/zero across all tiles)
-    if quality_stats:
-        num_bands = quality_stats[0]['bands']
-        print(f"\n🔬 Per-band quality (averaged across all tiles):")
-        
-        problem_bands = []
-        for b in range(num_bands):
-            band_valid_counts = [s['band_valid_counts'][b] for s in quality_stats]
-            band_pixels = quality_stats[0]['pixels'] * len(quality_stats)
-            band_valid_pct = (sum(band_valid_counts) / band_pixels) * 100
-            
-            if band_valid_pct < 50:
-                problem_bands.append((b, band_valid_pct))
-        
-        if problem_bands:
-            print(f"   ⚠️ Found {len(problem_bands)} bands with <50% valid data:")
-            for band_idx, valid_pct in problem_bands[:10]:  # Show first 10
-                print(f"      Band {band_idx}: {valid_pct:.1f}% valid")
-            if len(problem_bands) > 10:
-                print(f"      ... and {len(problem_bands) - 10} more")
-        else:
-            print(f"   ✅ All bands have >50% valid data across tiles")
-    
-    print()
-
-def downsample_data(data: np.ndarray, target_size: Tuple[int, int] = (2000, 2000)) -> np.ndarray:
-    """
-    Downsample large data array for visualization.
-    
-    Args:
-        data: (bands, height, width) array
-        target_size: Target (height, width) for output
-    Returns:
-        Downsampled (bands, target_height, target_width) array
-    """
-    bands, height, width = data.shape
-    target_height, target_width = target_size
-    
-    # Calculate stride for downsampling
-    stride_h = max(1, height // target_height)
-    stride_w = max(1, width // target_width)
-    
-    print(f"   Downsampling from {height}x{width} to ~{height//stride_h}x{width//stride_w} "
-          f"(stride: {stride_h}x{stride_w})")
-    
-    # Simple strided downsampling
-    downsampled = data[:, ::stride_h, ::stride_w]
-    
-    return downsampled
-
-
-def print_embeddings_stats() -> dict:
-    """Print comprehensive statistics about the embeddings file."""
-    print("📊 EMBEDDINGS STATISTICS")
-    print("=" * 80)
+    log_progress(f"Loading: {EMBEDDINGS_FILE.name}")
     
     with rasterio.open(EMBEDDINGS_FILE) as src:
-        bounds = src.bounds
-        shape = src.shape
-        bands = src.count
-        crs = src.crs
-        transform = src.transform
-        
-        # Convert Web Mercator bounds to lat/lon
-        from rasterio.warp import transform_bounds
-        min_lon, min_lat, max_lon, max_lat = transform_bounds(
-            crs, 'EPSG:4326', 
-            bounds.left, bounds.bottom, 
-            bounds.right, bounds.top
-        )
-        
-        # File information
-        print(f"\n📁 FILE INFORMATION:")
-        print(f"   File name: {EMBEDDINGS_FILE.name}")
-        file_size_gb = EMBEDDINGS_FILE.stat().st_size / (1024**3)
-        print(f"   File size: {file_size_gb:.2f} GB")
-        print(f"   Format: GeoTIFF (BigTIFF)")
-        
-        # Dimensions
-        print(f"\n📐 DIMENSIONS:")
-        print(f"   Width:  {shape[1]:,} pixels")
-        print(f"   Height: {shape[0]:,} pixels")
-        print(f"   Bands:  {bands}")
-        total_pixels = shape[0] * shape[1]
-        total_values = total_pixels * bands
-        print(f"   Total pixels: {total_pixels:,}")
-        print(f"   Total values: {total_values:,} ({bands} bands × {total_pixels:,} pixels)")
-        
-        # Coordinate system
-        print(f"\n🌍 COORDINATE SYSTEM:")
-        print(f"   CRS: {crs}")
-        print(f"   Pixel resolution: {abs(transform.a)/1000:.1f} km × {abs(transform.e)/1000:.1f} km")
-        
-        # Geographic extent
-        print(f"\n🗺️  GEOGRAPHIC EXTENT:")
-        print(f"   Latitude:  {min_lat:7.2f}° to {max_lat:7.2f}° (span: {max_lat-min_lat:6.2f}°)")
-        print(f"   Longitude: {min_lon:7.2f}° to {max_lon:7.2f}° (span: {max_lon-min_lon:6.2f}°)")
-        width_km = (bounds.right - bounds.left) / 1000
-        height_km = (bounds.top - bounds.bottom) / 1000
-        area_km2 = width_km * height_km
-        print(f"   Physical extent: {width_km:,.0f} km × {height_km:,.0f} km")
-        print(f"   Bounding box area: {area_km2:,.0f} km²")
-        
-        # Data quality analysis
-        print(f"\n🔬 DATA QUALITY ANALYSIS:")
-        print(f"   Analyzing all {bands} bands...")
-        
-        # Read all bands to analyze
-        data = src.read()
-        
-        # Overall statistics
-        valid_mask = ~np.isnan(data)
-        valid_per_band = valid_mask.sum(axis=(1, 2))
-        total_valid = valid_mask.sum()
-        
-        print(f"\n   Overall Statistics:")
-        print(f"   • Total values:        {total_values:,}")
-        print(f"   • Valid values:        {total_valid:,} ({total_valid/total_values*100:.2f}%)")
-        print(f"   • NaN values:          {total_values - total_valid:,} ({(total_values - total_valid)/total_values*100:.2f}%)")
-        
-        # Per-pixel coverage
-        valid_any_band = valid_mask.any(axis=0)
-        pixels_with_data = valid_any_band.sum()
-        print(f"\n   Pixel Coverage:")
-        print(f"   • Pixels with any data:  {pixels_with_data:,} ({pixels_with_data/total_pixels*100:.2f}%)")
-        print(f"   • Pixels all NaN:        {total_pixels - pixels_with_data:,} ({(total_pixels - pixels_with_data)/total_pixels*100:.2f}%)")
-        
-        # Valid pixels per band
-        min_valid = valid_per_band.min()
-        max_valid = valid_per_band.max()
-        mean_valid = valid_per_band.mean()
-        print(f"\n   Per-Band Coverage:")
-        print(f"   • Min valid pixels:  {min_valid:,} ({min_valid/total_pixels*100:.2f}%)")
-        print(f"   • Max valid pixels:  {max_valid:,} ({max_valid/total_pixels*100:.2f}%)")
-        print(f"   • Mean valid pixels: {mean_valid:,.0f} ({mean_valid/total_pixels*100:.2f}%)")
-        
-        # Value statistics
-        print(f"\n   📈 VALUE STATISTICS (across all bands):")
-        valid_data = data[valid_mask]
-        print(f"   • Min:        {np.min(valid_data):10.6f}")
-        print(f"   • Max:        {np.max(valid_data):10.6f}")
-        print(f"   • Mean:       {np.mean(valid_data):10.6f}")
-        print(f"   • Median:     {np.median(valid_data):10.6f}")
-        print(f"   • Std:        {np.std(valid_data):10.6f}")
-        print(f"   • 5th %ile:   {np.percentile(valid_data, 5):10.6f}")
-        print(f"   • 95th %ile:  {np.percentile(valid_data, 95):10.6f}")
-        
-        # Per-band statistics summary
-        print(f"\n   📊 PER-BAND STATISTICS:")
-        band_stats = []
-        for b in range(bands):
-            band_data = data[b]
-            band_valid = band_data[~np.isnan(band_data)]
-            if len(band_valid) > 0:
-                band_stats.append({
-                    'band': b + 1,
-                    'valid_pixels': len(band_valid),
-                    'valid_pct': (len(band_valid) / total_pixels) * 100,
-                    'min': np.min(band_valid),
-                    'max': np.max(band_valid),
-                    'mean': np.mean(band_valid),
-                    'std': np.std(band_valid)
-                })
-        
-        # Show summary table for first 10 and last 5 bands
-        print(f"\n   {'Band':<6} {'Valid %':<10} {'Mean':<12} {'Std':<12} {'Min':<12} {'Max':<12}")
-        print(f"   {'-'*70}")
-        
-        # First 10 bands
-        for stat in band_stats[:10]:
-            print(f"   {stat['band']:<6} {stat['valid_pct']:>8.2f}% {stat['mean']:>10.4f}  {stat['std']:>10.4f}  {stat['min']:>10.4f}  {stat['max']:>10.4f}")
-        
-        if len(band_stats) > 15:
-            print(f"   {'...':<6} {'...':<10} {'...':<12} {'...':<12} {'...':<12} {'...':<12}")
-        
-        # Last 5 bands
-        for stat in band_stats[-5:]:
-            print(f"   {stat['band']:<6} {stat['valid_pct']:>8.2f}% {stat['mean']:>10.4f}  {stat['std']:>10.4f}  {stat['min']:>10.4f}  {stat['max']:>10.4f}")
-        
-        print()
-        
-        return {
-            'shape': shape,
-            'bands': bands,
-            'total_pixels': total_pixels,
-            'total_values': total_values,
-            'valid_pixels': pixels_with_data,
-            'valid_values': total_valid,
-            'band_stats': band_stats,
-            'bounds': bounds,
-            'crs': crs,
-            'data': data  # Return data for visualizations
+        # Get metadata
+        metadata = {
+            'bands': src.count,
+            'shape': src.shape,
+            'crs': src.crs,
+            'bounds': src.bounds,
+            'transform': src.transform,
+            'width': src.width,
+            'height': src.height
         }
+        
+        log_progress(f"  Dimensions: {src.width} × {src.height}")
+        log_progress(f"  Bands: {src.count}")
+        log_progress(f"  CRS: {src.crs}")
+        
+        # Load data
+        if downsample and (src.width > target_size[0] or src.height > target_size[1]):
+            # Calculate downsample factors
+            scale_x = src.width / target_size[0]
+            scale_y = src.height / target_size[1]
+            scale = max(scale_x, scale_y)
+            
+            new_width = int(src.width / scale)
+            new_height = int(src.height / scale)
+            
+            log_progress(f"  Downsampling to ~{new_width} × {new_height} for visualization...")
+            
+            # Read downsampled data
+            data = src.read(
+                out_shape=(src.count, new_height, new_width),
+                resampling=rasterio.enums.Resampling.average
+            )
+            
+            log_progress(f"  Loaded downsampled data: {data.shape}")
+        else:
+            log_progress(f"  Loading full resolution...")
+            data = src.read()
+            log_progress(f"  Loaded data: {data.shape}")
+    
+    return data, metadata
 
 
-def visualize_individual_bands(data: np.ndarray, band_indices: list, 
-                                stats: dict, downsampled: bool = True) -> None:
+def get_year_data(data: np.ndarray, year: int) -> np.ndarray:
     """
-    Visualize selected individual bands.
+    Extract data for a specific year from multi-temporal array.
     
     Args:
-        data: (bands, height, width) array
-        band_indices: List of band indices to visualize (1-indexed)
-        stats: Statistics dictionary from print_merged_file_stats
-        downsampled: Whether data is already downsampled
+        data: Full array (448, H, W)
+        year: Year to extract (2018-2024)
+    
+    Returns:
+        year_data: Array (64, H, W) for that year
     """
-    print(f"\n🎨 Creating individual band visualizations...")
-    print(f"   Visualizing {len(band_indices)} bands: {band_indices}")
+    year_idx = YEARS.index(year)
+    band_start = year_idx * BANDS_PER_YEAR
+    band_end = band_start + BANDS_PER_YEAR
+    return data[band_start:band_end, :, :]
+
+
+def compute_pca_rgb(data: np.ndarray, normalize: str = 'zscore') -> np.ndarray:
+    """
+    Compute PCA and create RGB composite from first 3 components.
     
-    num_bands = len(band_indices)
+    Args:
+        data: (bands, height, width)
+        normalize: 'zscore' or 'unitvec'
     
-    # Create a multi-panel figure
-    fig, axes = plt.subplots(2, (num_bands + 1) // 2, figsize=(5 * ((num_bands + 1) // 2), 10))
-    if num_bands == 1:
-        axes = np.array([axes])
-    axes = axes.flatten()
+    Returns:
+        rgb: (height, width, 3) RGB image in [0, 1]
+    """
+    bands, height, width = data.shape
     
-    for idx, band_num in enumerate(band_indices):
-        band_idx = band_num - 1  # Convert to 0-indexed
-        if band_idx >= data.shape[0]:
-            print(f"   ⚠️  Band {band_num} not found (only {data.shape[0]} bands available)")
-            continue
+    # Reshape: (bands, pixels)
+    X = data.reshape(bands, -1)
+    
+    # Handle NaNs by replacing with band means
+    nan_mask = np.isnan(X)
+    if np.any(nan_mask):
+        band_means = np.nanmean(X, axis=1, keepdims=True)
+        rows, cols = np.where(nan_mask)
+        X[rows, cols] = band_means[rows, 0]
+    
+    # Normalize
+    if normalize == 'zscore':
+        # Z-score normalization
+        means = np.mean(X, axis=1, keepdims=True)
+        stds = np.std(X, axis=1, keepdims=True)
+        stds = np.where(stds == 0, 1, stds)  # Avoid division by zero
+        X = (X - means) / stds
+    elif normalize == 'unitvec':
+        # Unit vector normalization
+        norms = np.linalg.norm(X, axis=0, keepdims=True)
+        norms = np.where(norms == 0, 1, norms)
+        X = X / norms
+    
+    # Transpose for PCA: (pixels, bands)
+    X = X.T
+    
+    # Center the data
+    X_mean = np.mean(X, axis=0)
+    X_centered = X - X_mean
+    
+    # Compute SVD
+    U, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
+    
+    # First 3 principal components: U[:, :3]
+    pc = U[:, :3]  # (pixels, 3)
+    
+    # Reshape to image: (height, width, 3)
+    rgb = pc.reshape(height, width, 3)
+    
+    # Normalize to [0, 1] for each channel
+    for c in range(3):
+        channel = rgb[:, :, c]
+        vmin, vmax = np.percentile(channel[~np.isnan(channel)], [2, 98])
+        rgb[:, :, c] = np.clip((channel - vmin) / (vmax - vmin), 0, 1)
+    
+    return rgb
+
+
+def compute_magnitude(data: np.ndarray) -> np.ndarray:
+    """
+    Compute L2 norm (magnitude) across all bands.
+    
+    Args:
+        data: (bands, height, width)
+    
+    Returns:
+        magnitude: (height, width)
+    """
+    # Compute L2 norm across band dimension
+    mag = np.linalg.norm(data, axis=0)
+    
+    # Normalize to [0, 1]
+    mag_clean = mag[~np.isnan(mag)]
+    if len(mag_clean) > 0:
+        vmin, vmax = np.percentile(mag_clean, [2, 98])
+        mag = np.clip((mag - vmin) / (vmax - vmin), 0, 1)
+    
+    return mag
+
+
+def create_year_visualizations(data: np.ndarray) -> None:
+    """
+    Create visualizations for each year.
+    
+    For each year, creates:
+    - PCA RGB composite (z-score)
+    - Magnitude heatmap
+    """
+    log_progress("\n" + "=" * 80)
+    log_progress("CREATING PER-YEAR VISUALIZATIONS")
+    log_progress("=" * 80)
+    
+    for year in YEARS:
+        log_progress(f"\nProcessing {year}...")
         
-        band_data = data[band_idx]
+        # Extract year data
+        year_data = get_year_data(data, year)
         
-        # Get statistics for this band
-        band_stat = next((s for s in stats['band_stats'] if s['band'] == band_num), None)
+        # 1. PCA RGB
+        log_progress(f"  Computing PCA RGB...")
+        rgb = compute_pca_rgb(year_data, normalize='zscore')
+        out_file = OUT_DIR / f"embeddings_{year}_pca_rgb.png"
+        plt.imsave(out_file, rgb)
+        log_progress(f"  ✅ Saved: {out_file.name}")
         
-        # Create visualization
-        ax = axes[idx]
+        # 2. Magnitude heatmap
+        log_progress(f"  Computing magnitude...")
+        mag = compute_magnitude(year_data)
+        out_file = OUT_DIR / f"embeddings_{year}_magnitude.png"
+        plt.imsave(out_file, mag, cmap='magma')
+        log_progress(f"  ✅ Saved: {out_file.name}")
+
+
+def create_temporal_comparison_grid(data: np.ndarray) -> None:
+    """
+    Create a grid showing PCA RGB for all years side-by-side.
+    """
+    log_progress("\n" + "=" * 80)
+    log_progress("CREATING TEMPORAL COMPARISON GRID")
+    log_progress("=" * 80)
+    
+    # Create figure with subplots
+    fig = plt.figure(figsize=(20, 6))
+    gs = gridspec.GridSpec(1, 7, figure=fig, wspace=0.05, hspace=0.05)
+    
+    for idx, year in enumerate(YEARS):
+        log_progress(f"  Adding {year} to grid...")
         
-        # Use percentile stretch for better visualization
-        stretched = _percentile_stretch(band_data, pmin=2, pmax=98)
+        # Get year data and compute PCA
+        year_data = get_year_data(data, year)
+        rgb = compute_pca_rgb(year_data, normalize='zscore')
         
-        im = ax.imshow(stretched, cmap='viridis', aspect='auto')
-        
-        if band_stat:
-            title = f"Band {band_num}\n"
-            title += f"Valid: {band_stat['valid_pct']:.1f}% | "
-            title += f"μ={band_stat['mean']:.4f}, σ={band_stat['std']:.4f}"
-            ax.set_title(title, fontsize=10)
-        else:
-            ax.set_title(f"Band {band_num}", fontsize=10)
-        
+        # Add to subplot
+        ax = fig.add_subplot(gs[0, idx])
+        ax.imshow(rgb)
+        ax.set_title(str(year), fontsize=14, fontweight='bold')
         ax.axis('off')
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     
-    # Hide extra subplots if odd number of bands
-    for idx in range(len(band_indices), len(axes)):
-        axes[idx].axis('off')
-    
-    plt.tight_layout()
-    
-    out_file = OUT_DIR / "embeddings_selected_bands.png"
-    plt.savefig(out_file, dpi=150, bbox_inches='tight')
+    # Save
+    out_file = OUT_DIR / "embeddings_temporal_comparison_grid.png"
+    plt.savefig(out_file, dpi=300, bbox_inches='tight')
     plt.close()
     
-    print(f"   ✅ Saved: {out_file.name}")
+    log_progress(f"✅ Saved: {out_file.name}")
+
+
+def create_magnitude_temporal_grid(data: np.ndarray) -> None:
+    """
+    Create a grid showing magnitude for all years side-by-side.
+    """
+    log_progress("\n" + "=" * 80)
+    log_progress("CREATING MAGNITUDE TEMPORAL COMPARISON")
+    log_progress("=" * 80)
     
-    # Also save individual band images with better handling
-    print(f"\n   Creating individual band images...")
-    for band_num in band_indices:
-        band_idx = band_num - 1
-        if band_idx >= data.shape[0]:
-            continue
+    # Create figure with subplots
+    fig = plt.figure(figsize=(20, 6))
+    gs = gridspec.GridSpec(1, 7, figure=fig, wspace=0.05, hspace=0.05)
+    
+    for idx, year in enumerate(YEARS):
+        log_progress(f"  Adding {year} magnitude to grid...")
         
-        band_data = data[band_idx].copy()
+        # Get year data and compute magnitude
+        year_data = get_year_data(data, year)
+        mag = compute_magnitude(year_data)
         
-        # Create a masked version where zero/NaN is black
-        valid_mask = (band_data != 0) & ~np.isnan(band_data)
-        
-        if valid_mask.sum() > 0:
-            # Stretch only valid data
-            valid_data = band_data[valid_mask]
-            p2, p98 = np.percentile(valid_data, [2, 98])
-            stretched = np.clip((band_data - p2) / (p98 - p2 + 1e-8), 0, 1)
-            stretched[~valid_mask] = 0  # Set invalid to black
-        else:
-            stretched = np.zeros_like(band_data)
-        
-        out_file_single = OUT_DIR / f"embeddings_band_{band_num:02d}.png"
-        
-        # Use matplotlib to save with proper colormap
-        fig, ax = plt.subplots(figsize=(10, 10))
-        im = ax.imshow(stretched, cmap='viridis', interpolation='nearest')
+        # Add to subplot
+        ax = fig.add_subplot(gs[0, idx])
+        im = ax.imshow(mag, cmap='magma')
+        ax.set_title(str(year), fontsize=14, fontweight='bold')
         ax.axis('off')
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label=f'Band {band_num}')
-        plt.tight_layout()
-        plt.savefig(out_file_single, dpi=150, bbox_inches='tight', facecolor='white')
-        plt.close()
-        
-        print(f"      Band {band_num:2d}: {out_file_single.name}")
-
-
-def visualize_embeddings_file(downsample: bool = True, target_size: Tuple[int, int] = (2000, 2000),
-                              visualize_bands: list = None) -> None:
-    """
-    Create visualizations for the embeddings file.
     
-    Args:
-        downsample: Whether to downsample for faster visualization
-        target_size: Target size if downsampling
-        visualize_bands: List of band numbers (1-indexed) to visualize individually, or None
-    """
+    # Add colorbar
+    fig.colorbar(im, ax=fig.get_axes(), orientation='horizontal', 
+                 fraction=0.046, pad=0.04, label='Embedding Magnitude')
+    
+    # Save
+    out_file = OUT_DIR / "embeddings_magnitude_temporal_grid.png"
+    plt.savefig(out_file, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    log_progress(f"✅ Saved: {out_file.name}")
+
+
+def print_data_statistics(data: np.ndarray, metadata: dict) -> None:
+    """Print statistics about the loaded data."""
+    log_progress("\n" + "=" * 80)
+    log_progress("DATA STATISTICS")
+    log_progress("=" * 80)
+    
+    total_bands = data.shape[0]
+    height = data.shape[1]
+    width = data.shape[2]
+    
+    log_progress(f"Shape: ({total_bands}, {height}, {width})")
+    log_progress(f"Years: {len(YEARS)} ({min(YEARS)}-{max(YEARS)})")
+    log_progress(f"Bands per year: {BANDS_PER_YEAR}")
+    
+    # Count valid pixels
+    total_pixels = height * width
+    valid_pixels_per_band = np.sum(~np.isnan(data), axis=(1, 2))
+    
+    # Average coverage across all bands
+    avg_coverage = np.mean(valid_pixels_per_band) / total_pixels * 100
+    
+    log_progress(f"Average coverage: {avg_coverage:.2f}%")
+    
+    # Per-year coverage
+    log_progress("\nCoverage by year:")
+    for year in YEARS:
+        year_data = get_year_data(data, year)
+        year_coverage = np.mean(np.sum(~np.isnan(year_data), axis=(1, 2))) / total_pixels * 100
+        log_progress(f"  {year}: {year_coverage:.2f}%")
+
+
+def main():
+    print("\n" + "=" * 80)
+    print("MULTI-TEMPORAL SATELLITE EMBEDDINGS VISUALIZATION")
+    print("South America 1km Dataset (2018-2024)")
+    print("=" * 80)
+    print()
+    
+    # Check file exists
     if not EMBEDDINGS_FILE.exists():
         print(f"❌ Embeddings file not found: {EMBEDDINGS_FILE}")
-        print("   Please run the merge script first.")
+        print()
+        print("Please run the merge script first:")
+        print("   python scripts/merging/merge_embeddings_total")
         return
     
-    print("🎨 Creating visualizations for embeddings file...")
-    print()
+    # Load data
+    data, metadata = load_multitemporal_data(downsample=True, target_size=(2000, 2000))
     
-    # Print file statistics and get data
-    stats = print_embeddings_stats()
-    data = stats['data']
+    # Print statistics
+    print_data_statistics(data, metadata)
     
-    # Downsample if requested
-    if downsample:
-        print("Downsampling for visualization...")
-        data = downsample_data(data, target_size)
-        print(f"   Working with shape: {data.shape}")
-    else:
-        print(f"   Working with full resolution: {data.shape}")
-    
-    print()
-    
-    # PCA composite visualizations
-    print("=" * 80)
-    print("CREATING PCA COMPOSITE VISUALIZATIONS")
-    print("=" * 80)
-    
-    # Visual 1: PCA on z-scored bands (balanced)
-    print("\n1. PCA z-score RGB visualization...")
-    rgb_z = compute_pca_rgb_zscore(data)
-    out_file_z = OUT_DIR / "embeddings_pca_zscore_rgb.png"
-    plt.imsave(out_file_z.as_posix(), rgb_z)
-    print(f"   ✅ Saved: {out_file_z.name}")
-    
-    # Visual 2: PCA on unit-vector (angular) embeddings (balanced)
-    print("\n2. PCA unit-vector RGB visualization...")
-    rgb_u = compute_pca_rgb_unitvec(data)
-    out_file_u = OUT_DIR / "embeddings_pca_unitvec_rgb.png"
-    plt.imsave(out_file_u.as_posix(), rgb_u)
-    print(f"   ✅ Saved: {out_file_u.name}")
-    
-    # Visual 3: Magnitude heatmap
-    print("\n3. Magnitude heatmap...")
-    mag = compute_magnitude_heatmap(data)
-    out_file_m = OUT_DIR / "embeddings_magnitude.png"
-    plt.imsave(out_file_m.as_posix(), mag, cmap='magma')
-    print(f"   ✅ Saved: {out_file_m.name}")
-    
-    # Individual band visualizations
-    if visualize_bands:
-        print("\n" + "=" * 80)
-        print("CREATING INDIVIDUAL BAND VISUALIZATIONS")
-        print("=" * 80)
-        visualize_individual_bands(data, visualize_bands, stats, downsampled=downsample)
+    # Create visualizations
+    create_year_visualizations(data)
+    create_temporal_comparison_grid(data)
+    create_magnitude_temporal_grid(data)
     
     # Summary
     print("\n" + "=" * 80)
     print("✅ VISUALIZATION COMPLETE")
     print("=" * 80)
-    total_vis = 3 + (len(visualize_bands) + 1 if visualize_bands else 0)
-    print(f"\nCreated {total_vis} visualization files in {OUT_DIR}")
-    print("\nPCA Composite Visualizations:")
-    print(f"   • {out_file_z.name} - PCA RGB (z-score normalized)")
-    print(f"   • {out_file_u.name} - PCA RGB (unit vector normalized)")
-    print(f"   • {out_file_m.name} - Embedding magnitude heatmap")
     
-    if visualize_bands:
-        print(f"\nIndividual Band Visualizations:")
-        print(f"   • embeddings_selected_bands.png - Multi-panel view")
-        print(f"   • embeddings_band_XX.png - Individual band images (×{len(visualize_bands)})")
-
-
-def main():
-    print("=" * 80)
-    print("SATELLITE EMBEDDINGS VISUALIZATION")
-    print("South America 1km Dataset")
-    print("=" * 80)
-    print()
+    total_files = len(YEARS) * 2 + 2  # 2 per year + 2 grids
+    print(f"\nCreated {total_files} visualization files in {OUT_DIR}")
     
-    if not EMBEDDINGS_FILE.exists():
-        print(f"❌ Embeddings file not found: {EMBEDDINGS_FILE}")
-        print()
-        print("Please run the merge script first:")
-        print("   python3 scripts/merging/merge_embeddings")
-        return
+    print("\nPer-Year Visualizations:")
+    for year in YEARS:
+        print(f"   • embeddings_{year}_pca_rgb.png - PCA RGB composite")
+        print(f"   • embeddings_{year}_magnitude.png - Magnitude heatmap")
     
-    # Create visualizations with downsampling by default
-    print("📝 Note: Visualizations will be created at reduced resolution for performance.")
-    print("   The full image will be downsampled to ~2000x2000 for faster processing.")
-    print()
+    print("\nTemporal Comparison Visualizations:")
+    print(f"   • embeddings_temporal_comparison_grid.png - All years PCA RGB")
+    print(f"   • embeddings_magnitude_temporal_grid.png - All years magnitude")
     
-    # Select interesting bands to visualize individually
-    # Visualize bands evenly distributed across the 64 bands, plus first and last
-    selected_bands = [1, 8, 16, 24, 32, 40, 48, 56, 64]
-    
-    visualize_embeddings_file(
-        downsample=True, 
-        target_size=(2000, 2000),
-        visualize_bands=selected_bands
-    )
-    
-    print()
-    print("💡 TIPS:")
-    print("   • PCA visualizations show overall spatial patterns in embedding space")
-    print("   • Different colors represent different embedding patterns")
-    print("   • Magnitude heatmap shows embedding strength/intensity")
-    print("   • Individual bands show what each embedding dimension captures")
+    print("\n💡 TIPS:")
+    print("   • PCA visualizations show spatial patterns in embedding space")
+    print("   • Temporal grids allow visual comparison of changes over time")
+    print("   • Magnitude shows overall embedding strength/intensity")
+    print("   • Compare years to identify temporal changes in land use/cover")
 
 
 if __name__ == "__main__":
     main()
-

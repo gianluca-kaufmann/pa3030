@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""
+Merge all yearly satellite embedding mosaics into a single multi-temporal file.
+
+This script:
+- Reads merged embedding files from 2018-2024 (7 years)
+- Verifies perfect spatial alignment across all years
+- Stacks them temporally into a single file
+- Each pixel contains 64 bands × 7 years = 448 bands total
+- Band naming: YYYY_embedding_XX (e.g., 2018_embedding_01, 2018_embedding_02, ...)
+
+Output structure:
+- Bands 1-64: 2018 embeddings
+- Bands 65-128: 2019 embeddings
+- Bands 129-192: 2020 embeddings
+- Bands 193-256: 2021 embeddings
+- Bands 257-320: 2022 embeddings
+- Bands 321-384: 2023 embeddings
+- Bands 385-448: 2024 embeddings
+"""
+
+import sys
+import time
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import numpy as np
+import rasterio
+from rasterio.transform import Affine
+from rasterio.crs import CRS
+
+# Paths
+DATA_ROOT = Path("/Users/gianluca/Desktop/Master's Thesis/code/data")
+EMBEDDINGS_DIR = DATA_ROOT / "ready" / "embeddings"
+
+# Years to merge
+YEARS = [2018, 2019, 2020, 2021, 2022, 2023, 2024]
+
+# Output file
+OUTPUT_FILE = EMBEDDINGS_DIR / "SatelliteEmbeddings_SA_1km_2018-2024_multitemporal.tif"
+
+
+def log_progress(message: str, start_time: float = None):
+    """Log progress with optional timing."""
+    if start_time:
+        elapsed = time.time() - start_time
+        print(f"⏱️  {message} ({elapsed:.1f}s)")
+    else:
+        print(f"📊 {message}")
+
+
+def find_yearly_files() -> Dict[int, Path]:
+    """Find all yearly merged embedding files."""
+    log_progress("Scanning for yearly merged files...")
+    
+    yearly_files = {}
+    missing_years = []
+    
+    for year in YEARS:
+        year_dir = EMBEDDINGS_DIR / f"embeddings_{year}"
+        merged_file = year_dir / f"SatelliteEmbeddings_SA_1km_{year}_merged.tif"
+        
+        if merged_file.exists():
+            yearly_files[year] = merged_file
+            log_progress(f"  ✓ Found {year}: {merged_file.name}")
+        else:
+            missing_years.append(year)
+            log_progress(f"  ✗ Missing {year}: {merged_file}")
+    
+    if missing_years:
+        print(f"\n❌ Missing files for years: {missing_years}")
+        print("Please ensure all yearly merge scripts have been run first.")
+        sys.exit(1)
+    
+    log_progress(f"Found all {len(yearly_files)} yearly files")
+    return yearly_files
+
+
+def verify_spatial_alignment(yearly_files: Dict[int, Path]) -> Tuple[Affine, int, int, str, int]:
+    """
+    Verify that all yearly files have identical spatial properties.
+    
+    Returns:
+        transform: Common transform
+        width: Common width
+        height: Common height
+        crs: Common CRS
+        bands_per_year: Number of bands per year
+    """
+    log_progress("Verifying spatial alignment across all years...")
+    
+    reference_year = min(YEARS)
+    reference_file = yearly_files[reference_year]
+    
+    # Read reference properties
+    with rasterio.open(reference_file) as ref:
+        ref_transform = ref.transform
+        ref_width = ref.width
+        ref_height = ref.height
+        ref_crs = ref.crs
+        ref_bounds = ref.bounds
+        ref_bands = ref.count
+        
+        log_progress(f"Reference ({reference_year}):")
+        log_progress(f"  Dimensions: {ref_width} × {ref_height}")
+        log_progress(f"  Bands: {ref_bands}")
+        log_progress(f"  CRS: {ref_crs}")
+        log_progress(f"  Transform: {ref_transform}")
+        log_progress(f"  Bounds: {ref_bounds}")
+    
+    # Verify all other years match
+    all_aligned = True
+    misaligned_years = []
+    
+    for year in YEARS:
+        if year == reference_year:
+            continue
+            
+        file_path = yearly_files[year]
+        with rasterio.open(file_path) as src:
+            # Check dimensions
+            if src.width != ref_width or src.height != ref_height:
+                log_progress(f"  ✗ {year}: Dimension mismatch ({src.width}×{src.height} vs {ref_width}×{ref_height})")
+                all_aligned = False
+                misaligned_years.append(year)
+                continue
+            
+            # Check CRS
+            if src.crs != ref_crs:
+                log_progress(f"  ✗ {year}: CRS mismatch ({src.crs} vs {ref_crs})")
+                all_aligned = False
+                misaligned_years.append(year)
+                continue
+            
+            # Check transform
+            if src.transform != ref_transform:
+                log_progress(f"  ✗ {year}: Transform mismatch")
+                log_progress(f"      Got: {src.transform}")
+                log_progress(f"      Expected: {ref_transform}")
+                all_aligned = False
+                misaligned_years.append(year)
+                continue
+            
+            # Check bounds (allowing small floating point differences)
+            bounds_match = all(
+                abs(a - b) < 1.0  # 1 meter tolerance
+                for a, b in zip(src.bounds, ref_bounds)
+            )
+            if not bounds_match:
+                log_progress(f"  ✗ {year}: Bounds mismatch")
+                log_progress(f"      Got: {src.bounds}")
+                log_progress(f"      Expected: {ref_bounds}")
+                all_aligned = False
+                misaligned_years.append(year)
+                continue
+            
+            # Check number of bands
+            if src.count != ref_bands:
+                log_progress(f"  ⚠️  {year}: Band count differs ({src.count} vs {ref_bands})")
+                # This is a warning, not a failure
+            
+            log_progress(f"  ✓ {year}: Perfectly aligned")
+    
+    if not all_aligned:
+        print(f"\n❌ Spatial alignment verification failed for years: {misaligned_years}")
+        print("All yearly files must have identical dimensions, CRS, transform, and bounds.")
+        sys.exit(1)
+    
+    log_progress("✅ All years are perfectly aligned spatially!")
+    return ref_transform, ref_width, ref_height, ref_crs, ref_bands
+
+
+def create_band_descriptions(bands_per_year: int) -> List[str]:
+    """Create descriptive names for all bands."""
+    descriptions = []
+    for year in YEARS:
+        for band_num in range(1, bands_per_year + 1):
+            descriptions.append(f"{year}_embedding_{band_num:02d}")
+    return descriptions
+
+
+def write_multitemporal_geotiff_streaming(yearly_files: Dict[int, Path], bands_per_year: int,
+                                          width: int, height: int, transform: Affine, crs: str,
+                                          band_descriptions: List[str], output_path: Path):
+    """
+    Write multi-temporal GeoTIFF by streaming data band-by-band (memory efficient).
+    
+    Processes one band at a time to minimize memory usage (~350 MB per band).
+    This avoids loading all 7 years (146 GB) into memory at once.
+    """
+    log_progress(f"Creating multi-temporal GeoTIFF (streaming mode)...")
+    start_time = time.time()
+    
+    num_years = len(YEARS)
+    total_bands = bands_per_year * num_years
+    
+    # Memory estimate for reference
+    total_memory_gb = (total_bands * height * width * 4) / (1024**3)
+    memory_per_band_mb = (height * width * 4) / (1024**2)
+    
+    log_progress(f"  Total bands: {total_bands}")
+    log_progress(f"  Would require: ~{total_memory_gb:.2f} GB if loaded all at once")
+    log_progress(f"  Using streaming: ~{memory_per_band_mb:.0f} MB per band")
+    
+    # Configure output profile
+    profile = {
+        'driver': 'GTiff',
+        'dtype': rasterio.float32,
+        'nodata': np.nan,
+        'width': width,
+        'height': height,
+        'count': total_bands,
+        'crs': crs,
+        'transform': transform,
+        'compress': 'lzw',
+        'tiled': True,
+        'blockxsize': 512,
+        'blockysize': 512,
+        'interleave': 'band',
+        'BIGTIFF': 'YES',
+    }
+    
+    log_progress(f"  Creating output file: {output_path.name}")
+    
+    # Open output file for writing
+    with rasterio.open(output_path, 'w', **profile) as dst:
+        # Process each year
+        bands_written = 0
+        
+        for year_idx, year in enumerate(YEARS):
+            log_progress(f"  Processing {year}...")
+            year_start = time.time()
+            
+            file_path = yearly_files[year]
+            band_start = year_idx * bands_per_year
+            
+            # Open source file and copy bands one at a time
+            with rasterio.open(file_path) as src:
+                # Read and write band-by-band to minimize memory usage
+                for band_num in range(1, bands_per_year + 1):
+                    # Read one band at a time
+                    band_data = src.read(band_num)
+                    
+                    # Write to output
+                    output_band_num = band_start + band_num
+                    dst.write(band_data, output_band_num)
+                    dst.set_band_description(output_band_num, band_descriptions[output_band_num - 1])
+                    
+                    bands_written += 1
+                    
+                    # Progress update every 16 bands (roughly every quarter year)
+                    if band_num % 16 == 0 or band_num == bands_per_year:
+                        progress_pct = (bands_written / total_bands) * 100
+                        log_progress(f"    Band {output_band_num}/{total_bands} ({progress_pct:.1f}%)")
+                
+                # Statistics for this year
+                first_band = src.read(1)
+                valid_pixels = np.sum(~np.isnan(first_band))
+                total_pixels = first_band.size
+                coverage = (valid_pixels / total_pixels) * 100
+                
+                log_progress(f"    {year}: Coverage {coverage:.2f}%, Time: {time.time() - year_start:.1f}s")
+    
+    # Get file size
+    file_size_gb = output_path.stat().st_size / (1024 ** 3)
+    log_progress(f"Streaming write completed: {output_path.name} ({file_size_gb:.2f} GB)", start_time)
+
+
+def validate_output(output_path: Path, expected_bands: int):
+    """Validate the output file."""
+    log_progress("Validating output file...")
+    
+    with rasterio.open(output_path) as src:
+        log_progress(f"  Shape: {src.shape} (height × width)")
+        log_progress(f"  Bands: {src.count} (expected: {expected_bands})")
+        log_progress(f"  CRS: {src.crs}")
+        log_progress(f"  Transform: {src.transform}")
+        log_progress(f"  Bounds: {src.bounds}")
+        log_progress(f"  Pixel size: {src.res}")
+        
+        # Verify band count
+        if src.count != expected_bands:
+            log_progress(f"  ⚠️  Warning: Expected {expected_bands} bands, got {src.count}")
+        else:
+            log_progress(f"  ✓ Band count correct")
+        
+        # Sample first and last band
+        log_progress("  Sampling data quality...")
+        first_band = src.read(1)
+        last_band = src.read(src.count)
+        
+        for band_data, band_name in [(first_band, "First"), (last_band, "Last")]:
+            valid_pixels = np.sum(~np.isnan(band_data))
+            total_pixels = band_data.size
+            coverage = (valid_pixels / total_pixels) * 100
+            
+            if valid_pixels > 0:
+                log_progress(f"  {band_name} band: {coverage:.2f}% coverage, "
+                           f"range [{np.nanmin(band_data):.4f}, {np.nanmax(band_data):.4f}]")
+            else:
+                log_progress(f"  {band_name} band: No valid data!")
+        
+        # Check a few band descriptions
+        log_progress("  Band descriptions (sample):")
+        sample_bands = [1, 64, 65, 128, src.count]
+        for band_num in sample_bands:
+            if band_num <= src.count:
+                desc = src.descriptions[band_num - 1]
+                log_progress(f"    Band {band_num}: {desc}")
+
+
+def main():
+    """Main merge function."""
+    total_start = time.time()
+    
+    log_progress("=" * 80)
+    log_progress("Multi-Temporal Satellite Embeddings Merge Script (2018-2024)")
+    log_progress("=" * 80)
+    
+    # Check embeddings directory
+    if not EMBEDDINGS_DIR.exists():
+        print(f"❌ Embeddings directory not found: {EMBEDDINGS_DIR}")
+        sys.exit(1)
+    
+    # Find all yearly files
+    yearly_files = find_yearly_files()
+    
+    # Verify spatial alignment
+    transform, width, height, crs, bands_per_year = verify_spatial_alignment(yearly_files)
+    
+    # Create band descriptions
+    band_descriptions = create_band_descriptions(bands_per_year)
+    expected_total_bands = bands_per_year * len(YEARS)
+    
+    log_progress(f"\nOutput configuration:")
+    log_progress(f"  Years: {len(YEARS)} ({min(YEARS)}-{max(YEARS)})")
+    log_progress(f"  Bands per year: {bands_per_year}")
+    log_progress(f"  Total bands: {expected_total_bands}")
+    log_progress(f"  Spatial dimensions: {width} × {height}")
+    
+    # Write output using streaming (memory-efficient, band-by-band approach)
+    write_multitemporal_geotiff_streaming(yearly_files, bands_per_year, width, height,
+                                         transform, crs, band_descriptions, OUTPUT_FILE)
+    
+    # Validate
+    validate_output(OUTPUT_FILE, expected_total_bands)
+    
+    # Summary
+    total_time = time.time() - total_start
+    log_progress("=" * 80)
+    log_progress(f"✅ Multi-temporal merge completed successfully in {total_time/60:.1f} minutes")
+    log_progress(f"Output file: {OUTPUT_FILE}")
+    log_progress(f"Total bands: {expected_total_bands} ({bands_per_year} bands × {len(YEARS)} years)")
+    log_progress("=" * 80)
+    
+    # Usage notes
+    print("\n💡 Usage notes:")
+    print(f"   - Band 1-{bands_per_year}: {YEARS[0]} embeddings")
+    for i, year in enumerate(YEARS[1:], 1):
+        start_band = i * bands_per_year + 1
+        end_band = (i + 1) * bands_per_year
+        print(f"   - Band {start_band}-{end_band}: {year} embeddings")
+    print(f"   - Each pixel contains {expected_total_bands} values (64 embeddings × 7 years)")
+    print(f"   - Perfect spatial alignment verified across all years")
+
+
+if __name__ == "__main__":
+    main()
