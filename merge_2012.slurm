@@ -33,7 +33,7 @@ source "$VENV_DIR/bin/activate"
 #------------------------------------------------------------------------------
 # Set your W&B API key here (paste it in on the cluster)
 export WANDB_API_KEY="PASTE_YOUR_API_KEY_HERE"
-export WANDB_ENTITY="gikaufmann"
+export WANDB_ENTITY="gikaufmann-eth-z-rich"
 
 if [ "$WANDB_API_KEY" = "PASTE_YOUR_API_KEY_HERE" ]; then
     echo "⚠️  WARNING: WANDB_API_KEY not configured yet!"
