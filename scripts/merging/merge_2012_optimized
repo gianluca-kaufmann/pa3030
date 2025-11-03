@@ -26,13 +26,19 @@ from rasterio.warp import reproject
 import pandas as pd
 import wandb
 
+# Determine base path - use current script location for portability
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent
 
-# Set W&B API key
-os.environ["WANDB_API_KEY"] = "3e5c388d45c1632fa75a63cb0840fbccb1470412"
-
-DATA_ROOT = Path("/Users/gianluca/Desktop/Master's Thesis/code/data")
+DATA_ROOT = PROJECT_ROOT / "data"
 READY_ROOT = DATA_ROOT / "ready"
-OUTPUT_ROOT = Path("/Users/gianluca/Desktop/Master's Thesis/code/outputs/Results")
+
+# Use $SCRATCH if on cluster, otherwise use local outputs
+if "SCRATCH" in os.environ:
+    OUTPUT_ROOT = Path(os.environ["SCRATCH"]) / "outputs" / "Results"
+else:
+    OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "Results"
+
 OUTPUT_TIFF_DIR = OUTPUT_ROOT / "merged_tifs"
 OUTPUT_TIFF_DIR.mkdir(parents=True, exist_ok=True)
 PARQUET_PATH = OUTPUT_ROOT / "merged_panel_2012_2024.parquet"
@@ -356,20 +362,36 @@ def main():
     """Main processing function with progress monitoring."""
     # Initialize wandb FIRST before any processing
     print("🔄 Initializing Weights & Biases connection...")
+    
+    # Get credentials from environment variables
+    wandb_api_key = os.environ.get("WANDB_API_KEY")
+    wandb_entity = os.environ.get("WANDB_ENTITY")
+    
+    if not wandb_api_key:
+        print("⚠️  WANDB_API_KEY not found in environment variables")
+        print("   Set it with: export WANDB_API_KEY='your-key-here'")
+    
+    if not wandb_entity:
+        print("⚠️  WANDB_ENTITY not found in environment variables")
+        print("   Set it with: export WANDB_ENTITY='your-entity-here'")
+    
     wandb.init(
-        project="merging",
-        entity="gikaufmann-eth-z-rich",
+        project="merge",
+        entity=wandb_entity,
         save_code=True,
         config={
             "years": YEARS,
+            "year_range": f"{min(YEARS)}-{max(YEARS)}",
             "data_root": str(DATA_ROOT),
             "output_root": str(OUTPUT_ROOT),
+            "scratch_mode": "SCRATCH" in os.environ,
         }
     )
     print("✅ Weights & Biases connected successfully!")
     
     total_start_time = time.time()
     log_progress("Starting optimized merge process...")
+    wandb.log({"status": "started", "start_time": total_start_time})
     
     # Setup reference
     ref_path, ref_src = open_reference_wdpa()
@@ -380,6 +402,15 @@ def main():
         "nodata": np.nan,
         "compress": "lzw",
     })
+    
+    # Log reference grid info
+    wandb.log({
+        "reference_grid/height": ref_profile["height"],
+        "reference_grid/width": ref_profile["width"],
+        "reference_grid/total_pixels": ref_profile["height"] * ref_profile["width"],
+        "reference_grid/crs": str(ref_profile["crs"]),
+    })
+    
     ref_src.close()  # Close the reference file
     
     # Build catalog
@@ -420,11 +451,17 @@ def main():
                 for year in YEARS:
                     if year in yearly_arrays:
                         all_yearly_data[year].append(yearly_arrays[year])
-                wandb.log({f"dataset_{dataset}_bands": len(band_names)})
+                wandb.log({
+                    f"dataset/{dataset}/bands": len(band_names),
+                    f"dataset/{dataset}/status": "success"
+                })
             
         except Exception as e:
             log_progress(f"❌ Error processing {dataset}: {e}")
-            wandb.log({f"dataset_{dataset}_error": 1})
+            wandb.log({
+                f"dataset/{dataset}/status": "error",
+                f"dataset/{dataset}/error_message": str(e)
+            })
             continue
 
     if not all_band_names:
@@ -433,7 +470,7 @@ def main():
 
     log_progress(f"Total bands: {len(all_band_names)}")
     log_progress(f"Band names: {all_band_names}")
-    wandb.log({"total_bands": len(all_band_names)})
+    wandb.log({"processing/total_bands": len(all_band_names)})
 
     # Write yearly GeoTIFFs and accumulate Parquet rows
     log_progress("Writing output files...")
@@ -453,15 +490,25 @@ def main():
             
             # Write GeoTIFF
             out_tif = write_year_tif(year, band_stack, all_band_names, ref_profile)
+            file_size_mb = out_tif.stat().st_size / (1024 * 1024)
             
             # Make year dataframe
             df_year = to_long_dataframe(year, band_stack, all_band_names, ref_profile)
             all_years_df.append(df_year)
-            wandb.log({f"year_{year}_rows": len(df_year), f"year_{year}_bands": band_stack.shape[0]})
+            
+            wandb.log({
+                f"year/{year}/rows": len(df_year),
+                f"year/{year}/bands": band_stack.shape[0],
+                f"year/{year}/tiff_size_mb": file_size_mb,
+                f"year/{year}/status": "success"
+            })
             
         except Exception as e:
             log_progress(f"❌ Error processing year {year}: {e}")
-            wandb.log({f"year_{year}_error": 1})
+            wandb.log({
+                f"year/{year}/status": "error",
+                f"year/{year}/error_message": str(e)
+            })
             continue
 
     # Concatenate and write Parquet
@@ -471,17 +518,34 @@ def main():
         panel_df.to_parquet(PARQUET_PATH, index=False)
         log_progress(f"Wrote Parquet panel: {PARQUET_PATH}")
         log_progress(f"Panel shape: {panel_df.shape}")
+        
+        parquet_size_mb = PARQUET_PATH.stat().st_size / (1024 * 1024)
         wandb.log({
-            "panel_rows": panel_df.shape[0],
-            "panel_columns": panel_df.shape[1],
-            "parquet_file_size_mb": PARQUET_PATH.stat().st_size / (1024 * 1024)
+            "output/parquet_rows": panel_df.shape[0],
+            "output/parquet_columns": panel_df.shape[1],
+            "output/parquet_size_mb": parquet_size_mb,
+            "output/years_processed": len(all_years_df)
+        })
+        
+        # Log summary statistics
+        memory_per_row_bytes = panel_df.memory_usage(deep=True).sum() / len(panel_df)
+        wandb.log({
+            "summary/memory_per_row_bytes": memory_per_row_bytes,
+            "summary/avg_filesize_per_year_mb": parquet_size_mb / len(all_years_df) if all_years_df else 0
         })
     else:
         log_progress("❌ No data to write to Parquet")
+        wandb.log({"output/status": "failed", "output/error": "no_data"})
 
     total_time = time.time() - total_start_time
     log_progress(f"✅ Merge process completed in {total_time/60:.1f} minutes")
-    wandb.log({"total_time_minutes": total_time / 60})
+    
+    wandb.log({
+        "summary/total_time_minutes": total_time / 60,
+        "summary/total_time_hours": total_time / 3600,
+        "summary/status": "completed"
+    })
+    
     wandb.finish()
 
 
