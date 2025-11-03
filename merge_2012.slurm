@@ -31,20 +31,13 @@ source "$VENV_DIR/bin/activate"
 #------------------------------------------------------------------------------
 # Set up Weights & Biases credentials
 #------------------------------------------------------------------------------
-# Export W&B credentials from environment variables
-# Make sure to set these in your ~/.bashrc or before running sbatch:
-#   export WANDB_API_KEY="your-api-key-here"
-#   export WANDB_ENTITY="your-wandb-entity"
-# Or set them here directly (less secure):
-# export WANDB_API_KEY="your-api-key-here"
-# export WANDB_ENTITY="your-wandb-entity"
+# Set your W&B API key here (paste it in on the cluster)
+export WANDB_API_KEY="PASTE_YOUR_API_KEY_HERE"
+export WANDB_ENTITY="gikaufmann"
 
-if [ -z "$WANDB_API_KEY" ]; then
-    echo "WANDB_API_KEY not set. Set it with: export WANDB_API_KEY='your-key'"
-fi
-
-if [ -z "$WANDB_ENTITY" ]; then
-    echo "WANDB_ENTITY not set. Set it with: export WANDB_ENTITY='your-entity'"
+if [ "$WANDB_API_KEY" = "PASTE_YOUR_API_KEY_HERE" ]; then
+    echo "⚠️  WARNING: WANDB_API_KEY not configured yet!"
+    echo "   Edit merge_2012.slurm and replace PASTE_YOUR_API_KEY_HERE with your actual API key"
 fi
 
 #------------------------------------------------------------------------------
