@@ -2,12 +2,17 @@
 """
 Optimized merge script for South America 1×1 km datasets into a yearly tile-year panel (2012–2024).
 
-Key optimizations:
-- Progress monitoring and memory-efficient processing
+Key memory optimizations to prevent OOM:
+- Year-by-year processing: Process and write each year completely before moving to next
+- Incremental Parquet writing: Write each year immediately using pyarrow.ParquetWriter
+- Memory cleanup: Explicit del and gc.collect() after each year
+- Vectorized coordinate generation: Use affine transform matrix instead of loops
+- Process datasets per-year only: Don't load all years for all datasets simultaneously
+
+Performance optimizations:
 - Skip reprojection when files are already aligned
-- Process datasets one at a time instead of loading everything into memory
-- Use chunked processing for large files
-- Better error handling and logging
+- Progress monitoring and logging
+- Better error handling
 """
 
 import re
@@ -16,6 +21,7 @@ import math
 import json
 import time
 import os
+import gc
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -24,6 +30,8 @@ import rasterio
 from rasterio.enums import Resampling
 from rasterio.warp import reproject
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import wandb
 
 # Determine base path - use current script location for portability
@@ -296,30 +304,159 @@ def write_year_tif(year: int, band_stack: np.ndarray, band_names: List[str], ref
     return out_path
 
 
-def to_long_dataframe(year: int, band_stack: np.ndarray, band_names: List[str], ref_profile: dict) -> pd.DataFrame:
-    """Convert raster data to long dataframe format."""
+def to_long_dataframe_chunked(year: int, band_stack: np.ndarray, band_names: List[str], 
+                               ref_profile: dict, chunk_size: int = 10000) -> pd.DataFrame:
+    """
+    Convert raster data to long dataframe format using chunked processing to save memory.
+    Generates coordinates in chunks instead of all at once.
+    """
+    log_progress(f"Converting {year} to DataFrame (chunked)...")
+    h, w = ref_profile["height"], ref_profile["width"]
+    transform = ref_profile["transform"]
+    total_pixels = h * w
+    
+    # Process in chunks to avoid creating full coordinate arrays at once
+    chunks = []
+    for start_idx in range(0, total_pixels, chunk_size):
+        end_idx = min(start_idx + chunk_size, total_pixels)
+        chunk_size_actual = end_idx - start_idx
+        
+        # Calculate row/col indices for this chunk
+        rows_chunk = (start_idx // w) + np.arange(chunk_size_actual) // w
+        cols_chunk = (start_idx % w) + np.arange(chunk_size_actual) % w
+        
+        # Handle wrapping for rows
+        rows_chunk = rows_chunk[:chunk_size_actual]
+        cols_chunk = cols_chunk[:chunk_size_actual]
+        if len(rows_chunk) < chunk_size_actual:
+            rows_extra = np.full(chunk_size_actual - len(rows_chunk), rows_chunk[-1] + 1)
+            cols_extra = np.arange(len(rows_chunk), chunk_size_actual) % w
+            rows_chunk = np.concatenate([rows_chunk, rows_extra])
+            cols_chunk = np.concatenate([cols_chunk, cols_extra])
+        
+        # Generate coordinates for chunk
+        xs_chunk = []
+        ys_chunk = []
+        for i in range(len(rows_chunk)):
+            x, y = rasterio.transform.xy(transform, int(rows_chunk[i]), int(cols_chunk[i]))
+            xs_chunk.append(x)
+            ys_chunk.append(y)
+        
+        chunk_data = {
+            "year": np.full(chunk_size_actual, year, dtype=np.int16),
+            "x": np.array(xs_chunk, dtype=np.float64),
+            "y": np.array(ys_chunk, dtype=np.float64),
+            "row": rows_chunk.astype(np.int32),
+            "col": cols_chunk.astype(np.int32),
+        }
+        
+        # Add band data for this chunk
+        pixel_indices = np.arange(start_idx, end_idx)
+        for i, name in enumerate(band_names):
+            flat_band = band_stack[i].reshape(-1)
+            chunk_data[name] = flat_band[pixel_indices].astype(np.float32)
+        
+        chunks.append(pd.DataFrame(chunk_data))
+    
+    df = pd.concat(chunks, ignore_index=True)
+    log_progress(f"Created DataFrame for {year}: {len(df)} rows")
+    return df
+
+
+def to_long_dataframe_optimized(year: int, band_stack: np.ndarray, band_names: List[str], 
+                                 ref_profile: dict) -> pd.DataFrame:
+    """
+    Optimized version using vectorized coordinate generation via affine transform.
+    Much faster and more memory efficient than calling transform.xy in a loop.
+    """
     log_progress(f"Converting {year} to DataFrame...")
     h, w = ref_profile["height"], ref_profile["width"]
     transform = ref_profile["transform"]
+    total_pixels = h * w
     
-    # Use more efficient coordinate generation
-    rows, cols = np.meshgrid(np.arange(h), np.arange(w), indexing='ij')
-    xs, ys = rasterio.transform.xy(transform, rows, cols)
+    # Generate row/col indices efficiently
+    rows = np.arange(h).repeat(w).astype(np.int32)
+    cols = np.tile(np.arange(w), h).astype(np.int32)
+    
+    # Use affine transform formula to compute coordinates vectorized
+    # Affine transform: x = a*col + b*row + c, y = d*col + e*row + f
+    # This is much faster than calling transform.xy in a loop
+    xs = (transform.a * cols + transform.b * rows + transform.c).astype(np.float64)
+    ys = (transform.d * cols + transform.e * rows + transform.f).astype(np.float64)
     
     data = {
-        "year": np.full(h * w, year, dtype=np.int16),
-        "x": np.asarray(xs, dtype=np.float64).reshape(-1),
-        "y": np.asarray(ys, dtype=np.float64).reshape(-1),
-        "row": rows.reshape(-1).astype(np.int32),
-        "col": cols.reshape(-1).astype(np.int32),
+        "year": np.full(total_pixels, year, dtype=np.int16),
+        "x": xs,
+        "y": ys,
+        "row": rows,
+        "col": cols,
     }
     
+    # Add band data
     for i, name in enumerate(band_names):
         data[name] = band_stack[i].reshape(-1).astype(np.float32)
     
     df = pd.DataFrame(data)
     log_progress(f"Created DataFrame for {year}: {len(df)} rows")
     return df
+
+
+def process_dataset_for_year(dataset: str, entries: Dict[Optional[int], List[Path]], 
+                             ref_profile: dict, target_year: int) -> Tuple[List[str], Optional[np.ndarray]]:
+    """
+    Process a single dataset for a specific year only.
+    Returns band names and array for that year (or None if no data).
+    More memory efficient than processing all years at once.
+    """
+    log_progress(f"  Processing dataset: {dataset} for year {target_year}")
+    start_time = time.time()
+    
+    static_arrays: List[np.ndarray] = []
+    year_arrays: List[np.ndarray] = []
+
+    # Static files (no year in filename) - apply to all years
+    if None in entries:
+        for p in entries[None]:
+            arr = read_reproject_to_ref(p, ref_profile)
+            static_arrays.append(arr)
+
+    # Yearly files for target year
+    if target_year in entries:
+        for path in entries[target_year]:
+            arr = read_reproject_to_ref(path, ref_profile)
+            year_arrays.append(arr)
+
+    # Forward fill: if no data for this year, check earlier years
+    if not year_arrays and target_year > min(YEARS):
+        # Try to find data from previous years
+        for prev_year in reversed(range(min(YEARS), target_year)):
+            if prev_year in entries:
+                log_progress(f"    Forward-filling from year {prev_year}")
+                for path in entries[prev_year]:
+                    arr = read_reproject_to_ref(path, ref_profile)
+                    year_arrays.append(arr)
+                break
+
+    # Combine static and yearly arrays
+    all_arrays = static_arrays + year_arrays
+    
+    if not all_arrays:
+        log_progress(f"    No data found for {dataset} in year {target_year}")
+        return [], None
+
+    # Stack arrays
+    if len(all_arrays) > 1:
+        stacked = stack_arrays(all_arrays)
+    else:
+        stacked = all_arrays[0]
+        if stacked.ndim == 2:
+            stacked = stacked[np.newaxis, ...]
+    
+    # Build band names
+    band_names = build_band_names(dataset, all_arrays)
+    
+    log_progress(f"    Completed {dataset} for year {target_year}: {len(band_names)} bands ({time.time() - start_time:.1f}s)")
+    return band_names, stacked
 
 
 def process_dataset(dataset: str, entries: Dict[Optional[int], List[Path]], ref_profile: dict) -> Tuple[List[str], Dict[int, np.ndarray]]:
@@ -469,103 +606,140 @@ def main():
     log_progress(f"Datasets to process: {', '.join(datasets_present)}")
     wandb.config.update({"datasets": datasets_present, "num_datasets": len(datasets_present)})
 
-    # Process each dataset individually to manage memory
+    # Determine all band names first (by processing one year to get structure)
+    log_progress("Determining band structure...")
     all_band_names: List[str] = []
-    all_yearly_data: Dict[int, List[np.ndarray]] = {y: [] for y in YEARS}
-
-    for i, dataset in enumerate(datasets_present):
-        log_progress(f"Processing dataset {i+1}/{len(datasets_present)}: {dataset}")
-        
+    sample_year = YEARS[0]
+    for dataset in datasets_present:
         try:
-            band_names, yearly_arrays = process_dataset(dataset, catalog[dataset], ref_profile)
-            
+            band_names, _ = process_dataset_for_year(dataset, catalog[dataset], ref_profile, sample_year)
             if band_names:
                 all_band_names.extend(band_names)
-                for year in YEARS:
-                    if year in yearly_arrays:
-                        all_yearly_data[year].append(yearly_arrays[year])
-                wandb.log({
-                    f"dataset/{dataset}/bands": len(band_names),
-                    f"dataset/{dataset}/status": "success"
-                })
-            
         except Exception as e:
-            log_progress(f"❌ Error processing {dataset}: {e}")
-            wandb.log({
-                f"dataset/{dataset}/status": "error",
-                f"dataset/{dataset}/error_message": str(e)
-            })
+            log_progress(f"  Warning: Could not determine bands for {dataset}: {e}")
             continue
-
+    
     if not all_band_names:
-        print("❌ Failed to process any datasets.")
+        print("❌ Failed to determine band structure.")
         sys.exit(1)
 
     log_progress(f"Total bands: {len(all_band_names)}")
     log_progress(f"Band names: {all_band_names}")
     wandb.log({"processing/total_bands": len(all_band_names)})
 
-    # Write yearly GeoTIFFs and accumulate Parquet rows
-    log_progress("Writing output files...")
-    all_years_df: List[pd.DataFrame] = []
+    # Setup incremental Parquet writer
+    log_progress("Setting up incremental Parquet writer...")
+    parquet_writer = None
+    total_rows = 0
+    
+    # Process year-by-year: load datasets, merge, write, clear memory
+    log_progress("Processing years sequentially (year-by-year)...")
     
     for i, year in enumerate(YEARS):
+        log_progress(f"\n{'='*60}")
         log_progress(f"Processing year {i+1}/{len(YEARS)}: {year}")
+        log_progress(f"{'='*60}")
         
         try:
-            # Concatenate dataset stacks for this year along band axis
-            ds_stacks = all_yearly_data[year]
-            if not ds_stacks:
+            # Process all datasets for this year only
+            year_band_names: List[str] = []
+            year_arrays: List[np.ndarray] = []
+            
+            for dataset in datasets_present:
+                try:
+                    band_names, array = process_dataset_for_year(
+                        dataset, catalog[dataset], ref_profile, year
+                    )
+                    if array is not None and band_names:
+                        year_band_names.extend(band_names)
+                        year_arrays.append(array)
+                except Exception as e:
+                    log_progress(f"  ❌ Error processing {dataset} for {year}: {e}")
+                    continue
+            
+            if not year_arrays:
                 log_progress(f"  No data for {year}, skipping...")
                 continue
-                
-            band_stack = np.concatenate([s if s.ndim == 3 else s[np.newaxis, ...] for s in ds_stacks], axis=0)
+            
+            # Concatenate dataset stacks for this year along band axis
+            log_progress(f"  Merging {len(year_arrays)} dataset stacks...")
+            band_stack = np.concatenate([s if s.ndim == 3 else s[np.newaxis, ...] 
+                                       for s in year_arrays], axis=0)
+            
+            # Verify band count matches
+            if band_stack.shape[0] != len(all_band_names):
+                log_progress(f"  ⚠️  Band count mismatch: {band_stack.shape[0]} vs {len(all_band_names)}")
+                log_progress(f"  Using detected bands for this year: {len(year_band_names)}")
+                current_band_names = year_band_names
+            else:
+                current_band_names = all_band_names
             
             # Write GeoTIFF
-            out_tif = write_year_tif(year, band_stack, all_band_names, ref_profile)
+            out_tif = write_year_tif(year, band_stack, current_band_names, ref_profile)
             file_size_mb = out_tif.stat().st_size / (1024 * 1024)
             
-            # Make year dataframe
-            df_year = to_long_dataframe(year, band_stack, all_band_names, ref_profile)
-            all_years_df.append(df_year)
+            # Convert to DataFrame and write to Parquet incrementally
+            log_progress(f"  Converting to DataFrame...")
+            df_year = to_long_dataframe_optimized(year, band_stack, current_band_names, ref_profile)
             
+            # Initialize Parquet writer on first year
+            if parquet_writer is None:
+                log_progress(f"  Initializing Parquet writer...")
+                table = pa.Table.from_pandas(df_year)
+                schema = table.schema
+                parquet_writer = pq.ParquetWriter(PARQUET_PATH, schema, compression='snappy')
+            
+            # Write year data incrementally
+            log_progress(f"  Writing year {year} to Parquet...")
+            table = pa.Table.from_pandas(df_year)
+            parquet_writer.write_table(table)
+            year_rows = len(df_year)
+            total_rows += year_rows
+            
+            # Log before clearing memory
             wandb.log({
-                f"year/{year}/rows": len(df_year),
+                f"year/{year}/rows": year_rows,
                 f"year/{year}/bands": band_stack.shape[0],
                 f"year/{year}/tiff_size_mb": file_size_mb,
                 f"year/{year}/status": "success"
             })
             
+            # Clear memory immediately
+            del df_year, band_stack, year_arrays, table
+            gc.collect()
+            
+            log_progress(f"  ✅ Completed year {year}")
+            
         except Exception as e:
             log_progress(f"❌ Error processing year {year}: {e}")
+            import traceback
+            traceback.print_exc()
             wandb.log({
                 f"year/{year}/status": "error",
                 f"year/{year}/error_message": str(e)
             })
             continue
 
-    # Concatenate and write Parquet
-    if all_years_df:
-        log_progress("Writing Parquet file...")
-        panel_df = pd.concat(all_years_df, ignore_index=True)
-        panel_df.to_parquet(PARQUET_PATH, index=False)
-        log_progress(f"Wrote Parquet panel: {PARQUET_PATH}")
-        log_progress(f"Panel shape: {panel_df.shape}")
+    # Close Parquet writer
+    if parquet_writer is not None:
+        log_progress("Closing Parquet writer...")
+        parquet_writer.close()
         
-        parquet_size_mb = PARQUET_PATH.stat().st_size / (1024 * 1024)
-        wandb.log({
-            "output/parquet_rows": panel_df.shape[0],
-            "output/parquet_columns": panel_df.shape[1],
-            "output/parquet_size_mb": parquet_size_mb,
-            "output/years_processed": len(all_years_df)
-        })
-        
-        # Log summary statistics
-        memory_per_row_bytes = panel_df.memory_usage(deep=True).sum() / len(panel_df)
-        wandb.log({
-            "summary/memory_per_row_bytes": memory_per_row_bytes,
-            "summary/avg_filesize_per_year_mb": parquet_size_mb / len(all_years_df) if all_years_df else 0
-        })
+        if PARQUET_PATH.exists():
+            parquet_size_mb = PARQUET_PATH.stat().st_size / (1024 * 1024)
+            log_progress(f"Wrote Parquet panel: {PARQUET_PATH}")
+            log_progress(f"Panel size: {parquet_size_mb:.1f} MB")
+            log_progress(f"Total rows: {total_rows:,}")
+            
+            wandb.log({
+                "output/parquet_rows": total_rows,
+                "output/parquet_columns": len(all_band_names) + 5,  # bands + year + x + y + row + col
+                "output/parquet_size_mb": parquet_size_mb,
+                "output/years_processed": len(YEARS)
+            })
+        else:
+            log_progress("❌ Parquet file was not created")
+            wandb.log({"output/status": "failed", "output/error": "file_not_created"})
     else:
         log_progress("❌ No data to write to Parquet")
         wandb.log({"output/status": "failed", "output/error": "no_data"})
