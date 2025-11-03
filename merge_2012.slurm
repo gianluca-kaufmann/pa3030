@@ -8,6 +8,10 @@
 #SBATCH --output=/cluster/scratch/%u/logs/merge_2012_%j.out
 #SBATCH --error=/cluster/scratch/%u/logs/merge_2012_%j.err
 
+# Set data and output paths for clarity
+export DATA_ROOT="$SCRATCH/data"
+export OUTPUT_ROOT="$SCRATCH/outputs"
+
 # Create necessary folders on $SCRATCH if they don't exist
 mkdir -p "$SCRATCH/logs"
 mkdir -p "$SCRATCH/datasets"
