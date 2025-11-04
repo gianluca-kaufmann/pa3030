@@ -623,25 +623,31 @@ def main():
     wandb.config.update({"datasets": datasets_present, "num_datasets": len(datasets_present)})
 
     # Determine band names using a small probe window to avoid full reads
+    # Check ALL years to ensure we capture datasets that appear in any year
     log_progress("Determining band structure with probe window...")
     probe_window = Window(col_off=0, row_off=0, width=min(8, ref_profile["width"]), height=min(8, ref_profile["height"]))
     all_band_names: List[str] = []
-    sample_year = YEARS[0]
+    dataset_band_counts: Dict[str, int] = {}  # Track how many bands each dataset contributes
     for dataset in datasets_present:
         try:
             entries = catalog[dataset]
             candidate_paths: List[Path] = []
-            if sample_year in entries:
-                candidate_paths = entries[sample_year]
-            elif None in entries:
+            
+            # First check for static files (None = no year in filename)
+            if None in entries:
                 candidate_paths = entries[None]
             else:
-                # find nearest previous year
-                prevs = sorted([y for y in entries.keys() if y is not None and y <= sample_year])
-                if prevs:
-                    candidate_paths = entries[prevs[-1]]
+                # Find ANY available year for this dataset (not just <= first year)
+                # This ensures we capture datasets that start later (e.g., WDPA starting at 2013)
+                available_years = sorted([y for y in entries.keys() if y is not None])
+                if available_years:
+                    # Use the first available year to determine band structure
+                    candidate_paths = entries[available_years[0]]
+            
             if not candidate_paths:
+                log_progress(f"  Skipping {dataset}: no data files found")
                 continue
+                
             arrays = []
             for p in candidate_paths:
                 arr = read_reproject_window(p, ref_profile, probe_window)
@@ -649,6 +655,9 @@ def main():
             band_names = build_band_names(dataset, arrays)
             if band_names:
                 all_band_names.extend(band_names)
+                # Store the number of bands this dataset contributes (matches band_names length)
+                dataset_band_counts[dataset] = len(band_names)
+                log_progress(f"  {dataset}: {len(band_names)} bands")
         except Exception as e:
             log_progress(f"  Warning: Could not probe {dataset}: {e}")
             continue
@@ -682,6 +691,9 @@ def main():
             # Iterate windows and stream
             for w in iter_reference_windows(ref_profile, TILE_SIZE):
                 window_arrays: List[np.ndarray] = []
+                window_height = int(w.height)
+                window_width = int(w.width)
+                
                 for dataset in datasets_present:
                     entries = catalog[dataset]
                     paths: List[Path] = []
@@ -693,12 +705,33 @@ def main():
                         prevs = [y for y in entries.keys() if y is not None and y < year]
                         if prevs:
                             paths = entries[max(prevs)]
+                    
+                    # Collect arrays for this dataset
+                    dataset_arrays: List[np.ndarray] = []
                     for p in paths:
                         arr = read_reproject_window(p, ref_profile, w)
-                        window_arrays.append(arr)
+                        dataset_arrays.append(arr)
+                    
+                    # If no data found, create NaN placeholder arrays
+                    if not dataset_arrays and dataset in dataset_band_counts:
+                        expected_bands = dataset_band_counts[dataset]
+                        # Create a single placeholder array with all expected bands
+                        placeholder = np.full((expected_bands, window_height, window_width), np.nan, dtype=np.float32)
+                        dataset_arrays.append(placeholder)
+                    
+                    window_arrays.extend(dataset_arrays)
+                
                 if not window_arrays:
                     continue
                 band_stack = np.concatenate([a if a.ndim == 3 else a[np.newaxis, ...] for a in window_arrays], axis=0)
+                
+                # Safety check: ensure band count matches expected
+                if band_stack.shape[0] != len(current_band_names):
+                    error_msg = (f"Band count mismatch for year {year}, window {w}: "
+                               f"expected {len(current_band_names)} bands, got {band_stack.shape[0]}")
+                    log_progress(f"❌ {error_msg}")
+                    raise ValueError(error_msg)
+                
                 # Write window to GeoTIFF
                 for i in range(band_stack.shape[0]):
                     tif_ds.write(band_stack[i].astype(np.float32), i + 1, window=w)
