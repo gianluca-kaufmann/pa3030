@@ -3,8 +3,8 @@
 #SBATCH --job-name=merge-2012
 #SBATCH --time=24:00:00                    # 24 hours for data merging
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8               # Use 8 CPUs for parallel processing
-#SBATCH --mem-per-cpu=16G                  # 128GB total memory
+#SBATCH --cpus-per-task=8              # Use 8 CPUs for parallel processing
+#SBATCH --mem-per-cpu=16G                 # 128GB total memory
 #SBATCH --output=/cluster/scratch/%u/logs/merge_2012_%j.out
 #SBATCH --error=/cluster/scratch/%u/logs/merge_2012_%j.err
 
@@ -18,7 +18,7 @@ mkdir -p "$SCRATCH/datasets"
 mkdir -p "$SCRATCH/outputs/Results/merged_tifs"
 
 #------------------------------------------------------------------------------
-# Load modules
+# Load modules and activate virtual environment
 #------------------------------------------------------------------------------
 module purge
 module load stack/2024-06
