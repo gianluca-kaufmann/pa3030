@@ -1,4 +1,4 @@
-#!/bin/bash
+##!/bin/bash
 #SBATCH --job-name=merge-2012
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
@@ -7,6 +7,7 @@
 #SBATCH --mem-per-cpu=15G
 #SBATCH --output=/cluster/scratch/%u/logs/merge_2012_%j.out
 #SBATCH --error=/cluster/scratch/%u/logs/merge_2012_%j.err
+#SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
 mkdir -p "$SCRATCH/logs"
@@ -34,14 +35,23 @@ source "$VENV_DIR/bin/activate"
 #------------------------------------------------------------------------------
 # Navigate to training script directory
 #------------------------------------------------------------------------------
-cd "$HOME/master-thesis" || { echo "ERROR: Could not cd into directory"; exit 1; }
 
 #------------------------------------------------------------------------------
 # Run the training
 #------------------------------------------------------------------------------
 echo "Starting merge script..."
 
-# Run the HPO script
+# --- Preflight checks ---
+ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1;>
+echo "PWD = $(pwd)"
+
+[ -f scripts/merging/merge_2012_optimized ] || {
+  echo "ERROR: merge_2012_optimized not found under scripts/merging"; find scri>
+
+[ -d data/ready/WDPA ] || {
+  echo "ERROR: data/ready/WDPA missing (symlink to $SCRATCH/data expected)"; ls>
+
+# Run the script
 python scripts/merging/merge_2012_optimized
 
-echo "merge script finished."
+echo "Merge script finished."
