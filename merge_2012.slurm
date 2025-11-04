@@ -33,17 +33,25 @@ VENV_DIR="$HOME/venv/master-thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Set up Weights & Biases credentials
+# Weights & Biases (log online; no key in the slurm file)
 #------------------------------------------------------------------------------
-# Set your W&B API key here (paste it in on the cluster)
-export WANDB_API_KEY="PASTE_YOUR_API_KEY_HERE"
 export WANDB_ENTITY=gikaufmann
 export WANDB_PROJECT=master_thesis
+export WANDB_MODE=online
 
-if [ "$WANDB_API_KEY" = "PASTE_YOUR_API_KEY_HERE" ]; then
-    echo "⚠️  WARNING: WANDB_API_KEY not configured yet!"
-    echo "   Edit merge_2012.slurm and replace PASTE_YOUR_API_KEY_HERE with your actual API key"
+# If a key is present in the environment (e.g., from ~/.bashrc), refresh login silently.
+if [ -n "${WANDB_API_KEY:-}" ]; then
+  wandb login --relogin "$WANDB_API_KEY" >/dev/null 2>&1 || true
 fi
+
+# Fail early if this venv isn't logged in yet
+wandb login --status >/dev/null 2>&1 || {
+  echo "W&B not logged in for this venv. Run once on Euler:"
+  echo "  module purge; module load stack/2024-06 gcc/12.2.0 python_cuda/3.11.6 eth_proxy"
+  echo "  source ~/venv/master-thesis/bin/activate"
+  echo "  wandb login <YOUR_API_KEY>"
+  exit 4
+}
 
 #------------------------------------------------------------------------------
 # Navigate to project directory
