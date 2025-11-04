@@ -1,39 +1,53 @@
 #!/bin/bash
 
 #SBATCH --job-name=merge-2012
+#SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
-#SBATCH --ntasks=1
-# keep ONLY this CPU/mem pair (128 GiB total)
+#SBATCH --ntasks=1 
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
 #SBATCH --output=/cluster/scratch/%u/logs/merge_2012_%j.out
 #SBATCH --error=/cluster/scratch/%u/logs/merge_2012_%j.err
 
-# paths
+set -euo pipefail
+
+# --- Paths (mirror the "worked before" behavior) ---
+PROJECT_DIR="$HOME/master_thesis"
 export DATA_ROOT="$SCRATCH/data"
 export OUTPUT_ROOT="$SCRATCH/outputs"
-mkdir -p "$SCRATCH/logs" "$SCRATCH/datasets" "$SCRATCH/outputs/Results/merged_tifs"
+mkdir -p "$SCRATCH/logs" "$SCRATCH/outputs" "$SCRATCH/outputs/Results/merged_tifs"
 
-# modules
+# Make HOME->SCRATCH symlinks so scripts that ignore env vars still see the data/outputs
+rm -rf "$PROJECT_DIR/data" 2>/dev/null || true
+ln -sfn "$DATA_ROOT" "$PROJECT_DIR/data"
+rm -rf "$PROJECT_DIR/outputs" 2>/dev/null || true
+ln -sfn "$OUTPUT_ROOT" "$PROJECT_DIR/outputs"
+
+# --- Modules & venv (same stack that worked) ---
 module purge
 module load stack/2024-06
 module load gcc/12.2.0
 module load python_cuda/3.11.6
 module load eth_proxy
-
-# venv
 source "$HOME/venv/master-thesis/bin/activate"
 
-# W&B (no key in file; you already did `wandb login` once in this venv)
-export WANDB_ENTITY=gikaufmann
-export WANDB_PROJECT=master_thesis
+# --- Weights & Biases (online; no key in file) ---
+export WANDB_ENTITY="${WANDB_ENTITY:-gikaufmann}"
+export WANDB_PROJECT="${WANDB_PROJECT:-merge}"   # this matches your earlier working URLs
+export WANDB_MODE=online
+# If the venv is already logged in (stored in ~/.netrc), this is enough.
 
-# run
-cd "$HOME/master_thesis" || { echo "ERROR: cd failed"; exit 1; }
-echo "Working directory: $(pwd)"
-echo "Python version: $(python --version)"
-echo "Starting merge script at $(date)"
+# --- Tame hidden memory spikes (minimal) ---
+export GDAL_CACHEMAX=512
+export RASTERIO_MAX_DATASET_OPEN=32
+export MALLOC_ARENA_MAX=1
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
+export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
 
-python scripts/merging/merge_2012_optimized
-
-echo "Merge script finished at $(date)"
+# --- Run ---
+cd "$PROJECT_DIR"
+echo "GIT COMMIT: $(git rev-parse --short HEAD || true)"
+echo "DATA link -> $(readlink -f "$PROJECT_DIR/data" || true)"
+echo "OUTPUT link -> $(readlink -f "$PROJECT_DIR/outputs" || true)"
+echo "Python: $(python --version)"
+python scripts/merging/merge_2012_optimized 
