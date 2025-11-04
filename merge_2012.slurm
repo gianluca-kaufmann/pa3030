@@ -1,19 +1,14 @@
 #!/bin/bash
-
 #SBATCH --job-name=merge-2012
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
-#SBATCH --ntasks=1 
+#SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem-per-cpu=16G
+#SBATCH --mem-per-cpu=15G
 #SBATCH --output=/cluster/scratch/%u/logs/merge_2012_%j.out
 #SBATCH --error=/cluster/scratch/%u/logs/merge_2012_%j.err
 
-set -euo pipefail
-
-#------------------------------------------------------------------------------
-# Create necessary folders on $SCRATCH
-#------------------------------------------------------------------------------
+# Create necessary folders on $SCRATCH if they don't exist
 mkdir -p "$SCRATCH/logs"
 mkdir -p "$SCRATCH/data"
 mkdir -p "$SCRATCH/outputs"
@@ -27,96 +22,26 @@ module purge
 module load stack/2024-06
 module load gcc/12.2.0
 module load python_cuda/3.11.6
+module load cuda/12.4.1
 module load eth_proxy
 
 #------------------------------------------------------------------------------
-# Activate virtual environment
+# Activate the Python virtual environment (uav-genAI-opti)
 #------------------------------------------------------------------------------
 VENV_DIR="$HOME/venv/master-thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Setup project directory
+# Navigate to training script directory
 #------------------------------------------------------------------------------
-PROJECT_DIR="$HOME/master_thesis"
-cd "$PROJECT_DIR" || { echo "ERROR: Could not cd into $PROJECT_DIR"; exit 1; }
+cd "$HOME/master-thesis" || { echo "ERROR: Could not cd into directory"; exit 1; }
 
 #------------------------------------------------------------------------------
-# Link project data/outputs -> $SCRATCH to be robust if SCRATCH isn't detected
+# Run the training
 #------------------------------------------------------------------------------
-rm -rf "$PROJECT_DIR/data" 2>/dev/null || true
-ln -sfn "$SCRATCH/data" "$PROJECT_DIR/data"
-rm -rf "$PROJECT_DIR/outputs" 2>/dev/null || true
-ln -sfn "$SCRATCH/outputs" "$PROJECT_DIR/outputs"
+echo "Starting merge script..."
 
-#------------------------------------------------------------------------------
-# Weights & Biases Authentication
-#------------------------------------------------------------------------------
-export WANDB_ENTITY="gikaufmann"
-export WANDB_PROJECT="merge"
-export WANDB_DIR="$SCRATCH/wandb/merge"
-export WANDB_MODE=online
-
-# W&B authentication: Check for API key in ~/.netrc (created by 'wandb login')
-# If ~/.netrc doesn't work in batch jobs, uncomment and set WANDB_API_KEY:
-# export WANDB_API_KEY="your-api-key-here"  # Get from: https://wandb.ai/authorize
-
-echo "🔍 W&B Authentication Check:"
-if [ -f "$HOME/.netrc" ]; then
-    echo "  ✓ Found ~/.netrc (credentials from 'wandb login')"
-else
-    echo "  ✗ No ~/.netrc found"
-    if [ -z "${WANDB_API_KEY:-}" ]; then
-        echo "  ✗ WANDB_API_KEY not set either"
-        echo "  ⚠️  To fix: Either run 'wandb login' or set WANDB_API_KEY in this script"
-    fi
-fi
-
-#------------------------------------------------------------------------------
-# Environment variables for performance tuning
-#------------------------------------------------------------------------------
-export GDAL_CACHEMAX=512
-export RASTERIO_MAX_DATASET_OPEN=32
-export MALLOC_ARENA_MAX=1
-export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
-export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
-
-#------------------------------------------------------------------------------
-# Critical: Ensure SCRATCH environment variable is set for Python script
-#------------------------------------------------------------------------------
-# The Python script checks for SCRATCH to determine data paths
-export SCRATCH="${SCRATCH}"
-
-echo ""
-echo "🔍 Data Path Diagnostics:"
-echo "  SCRATCH = $SCRATCH"
-echo "  SCRATCH/data exists: $([ -d "$SCRATCH/data" ] && echo "✓ YES" || echo "✗ NO")"
-echo "  SCRATCH/data/ready exists: $([ -d "$SCRATCH/data/ready" ] && echo "✓ YES" || echo "✗ NO")"
-echo "  SCRATCH/data/ready/WDPA exists: $([ -d "$SCRATCH/data/ready/WDPA" ] && echo "✓ YES" || echo "✗ NO")"
-echo "  PROJECT_DIR/data -> $(readlink -f "$PROJECT_DIR/data" 2>/dev/null || echo 'missing')"
-echo "  PROJECT_DIR/outputs -> $(readlink -f "$PROJECT_DIR/outputs" 2>/dev/null || echo 'missing')"
-
-echo ""
-echo "🔍 Relevant environment variables:"
-env | sort | grep -E '^(SCRATCH|SLURM_|WANDB_|HOME|PWD)=' || true
-
-# List WDPA files if directory exists
-if [ -d "$SCRATCH/data/ready/WDPA" ]; then
-    echo "  WDPA files found:"
-    ls -lh "$SCRATCH/data/ready/WDPA/"*.tif 2>/dev/null | head -5 || echo "    (no .tif files)"
-fi
-
-#------------------------------------------------------------------------------
-# Run the merge script
-#------------------------------------------------------------------------------
-echo ""
-echo "🚀 Starting merge script..."
-echo "  Git commit: $(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
-echo "  Python: $(python --version)"
-echo "  Working directory: $(pwd)"
-echo ""
-
+# Run the HPO script
 python scripts/merging/merge_2012_optimized
 
-echo ""
-echo "Script completed!"
+echo "merge script finished."
