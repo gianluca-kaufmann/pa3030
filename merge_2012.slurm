@@ -42,6 +42,14 @@ PROJECT_DIR="$HOME/master_thesis"
 cd "$PROJECT_DIR" || { echo "ERROR: Could not cd into $PROJECT_DIR"; exit 1; }
 
 #------------------------------------------------------------------------------
+# Link project data/outputs -> $SCRATCH to be robust if SCRATCH isn't detected
+#------------------------------------------------------------------------------
+rm -rf "$PROJECT_DIR/data" 2>/dev/null || true
+ln -sfn "$SCRATCH/data" "$PROJECT_DIR/data"
+rm -rf "$PROJECT_DIR/outputs" 2>/dev/null || true
+ln -sfn "$SCRATCH/outputs" "$PROJECT_DIR/outputs"
+
+#------------------------------------------------------------------------------
 # Weights & Biases Authentication
 #------------------------------------------------------------------------------
 export WANDB_ENTITY="gikaufmann"
@@ -85,6 +93,12 @@ echo "  SCRATCH = $SCRATCH"
 echo "  SCRATCH/data exists: $([ -d "$SCRATCH/data" ] && echo "✓ YES" || echo "✗ NO")"
 echo "  SCRATCH/data/ready exists: $([ -d "$SCRATCH/data/ready" ] && echo "✓ YES" || echo "✗ NO")"
 echo "  SCRATCH/data/ready/WDPA exists: $([ -d "$SCRATCH/data/ready/WDPA" ] && echo "✓ YES" || echo "✗ NO")"
+echo "  PROJECT_DIR/data -> $(readlink -f "$PROJECT_DIR/data" 2>/dev/null || echo 'missing')"
+echo "  PROJECT_DIR/outputs -> $(readlink -f "$PROJECT_DIR/outputs" 2>/dev/null || echo 'missing')"
+
+echo ""
+echo "🔍 Relevant environment variables:"
+env | sort | grep -E '^(SCRATCH|SLURM_|WANDB_|HOME|PWD)=' || true
 
 # List WDPA files if directory exists
 if [ -d "$SCRATCH/data/ready/WDPA" ]; then
@@ -105,4 +119,4 @@ echo ""
 python scripts/merging/merge_2012_optimized
 
 echo ""
-echo "Script completed!" 
+echo "Script completed!"
