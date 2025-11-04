@@ -11,43 +11,98 @@
 
 set -euo pipefail
 
-# --- Paths (mirror the "worked before" behavior) ---
-PROJECT_DIR="$HOME/master_thesis"
-export DATA_ROOT="$SCRATCH/data"
-export OUTPUT_ROOT="$SCRATCH/outputs"
-mkdir -p "$SCRATCH/logs" "$SCRATCH/outputs" "$SCRATCH/outputs/Results/merged_tifs"
+#------------------------------------------------------------------------------
+# Create necessary folders on $SCRATCH
+#------------------------------------------------------------------------------
+mkdir -p "$SCRATCH/logs"
+mkdir -p "$SCRATCH/data"
+mkdir -p "$SCRATCH/outputs"
+mkdir -p "$SCRATCH/outputs/Results/merged_tifs"
+mkdir -p "$SCRATCH/wandb/merge"
 
-# Make HOME->SCRATCH symlinks so scripts that ignore env vars still see the data/outputs
-rm -rf "$PROJECT_DIR/data" 2>/dev/null || true
-ln -sfn "$DATA_ROOT" "$PROJECT_DIR/data"
-rm -rf "$PROJECT_DIR/outputs" 2>/dev/null || true
-ln -sfn "$OUTPUT_ROOT" "$PROJECT_DIR/outputs"
-
-# --- Modules & venv (same stack that worked) ---
+#------------------------------------------------------------------------------
+# Load modules
+#------------------------------------------------------------------------------
 module purge
 module load stack/2024-06
 module load gcc/12.2.0
 module load python_cuda/3.11.6
 module load eth_proxy
-source "$HOME/venv/master-thesis/bin/activate"
 
-# --- Weights & Biases (online; no key in file) ---
-export WANDB_ENTITY="${WANDB_ENTITY:-gikaufmann}"
-export WANDB_PROJECT="${WANDB_PROJECT:-merge}"   # this matches your earlier working URLs
+#------------------------------------------------------------------------------
+# Activate virtual environment
+#------------------------------------------------------------------------------
+VENV_DIR="$HOME/venv/master-thesis"
+source "$VENV_DIR/bin/activate"
+
+#------------------------------------------------------------------------------
+# Setup project directory
+#------------------------------------------------------------------------------
+PROJECT_DIR="$HOME/master_thesis"
+cd "$PROJECT_DIR" || { echo "ERROR: Could not cd into $PROJECT_DIR"; exit 1; }
+
+#------------------------------------------------------------------------------
+# Weights & Biases Authentication
+#------------------------------------------------------------------------------
+export WANDB_ENTITY="gikaufmann"
+export WANDB_PROJECT="merge"
+export WANDB_DIR="$SCRATCH/wandb/merge"
 export WANDB_MODE=online
-# If the venv is already logged in (stored in ~/.netrc), this is enough.
 
-# --- Tame hidden memory spikes (minimal) ---
+# W&B authentication: Check for API key in ~/.netrc (created by 'wandb login')
+# If ~/.netrc doesn't work in batch jobs, uncomment and set WANDB_API_KEY:
+# export WANDB_API_KEY="your-api-key-here"  # Get from: https://wandb.ai/authorize
+
+echo "🔍 W&B Authentication Check:"
+if [ -f "$HOME/.netrc" ]; then
+    echo "  ✓ Found ~/.netrc (credentials from 'wandb login')"
+else
+    echo "  ✗ No ~/.netrc found"
+    if [ -z "${WANDB_API_KEY:-}" ]; then
+        echo "  ✗ WANDB_API_KEY not set either"
+        echo "  ⚠️  To fix: Either run 'wandb login' or set WANDB_API_KEY in this script"
+    fi
+fi
+
+#------------------------------------------------------------------------------
+# Environment variables for performance tuning
+#------------------------------------------------------------------------------
 export GDAL_CACHEMAX=512
 export RASTERIO_MAX_DATASET_OPEN=32
 export MALLOC_ARENA_MAX=1
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
 export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
 
-# --- Run ---
-cd "$PROJECT_DIR"
-echo "GIT COMMIT: $(git rev-parse --short HEAD || true)"
-echo "DATA link -> $(readlink -f "$PROJECT_DIR/data" || true)"
-echo "OUTPUT link -> $(readlink -f "$PROJECT_DIR/outputs" || true)"
-echo "Python: $(python --version)"
-python scripts/merging/merge_2012_optimized 
+#------------------------------------------------------------------------------
+# Critical: Ensure SCRATCH environment variable is set for Python script
+#------------------------------------------------------------------------------
+# The Python script checks for SCRATCH to determine data paths
+export SCRATCH="${SCRATCH}"
+
+echo ""
+echo "🔍 Data Path Diagnostics:"
+echo "  SCRATCH = $SCRATCH"
+echo "  SCRATCH/data exists: $([ -d "$SCRATCH/data" ] && echo "✓ YES" || echo "✗ NO")"
+echo "  SCRATCH/data/ready exists: $([ -d "$SCRATCH/data/ready" ] && echo "✓ YES" || echo "✗ NO")"
+echo "  SCRATCH/data/ready/WDPA exists: $([ -d "$SCRATCH/data/ready/WDPA" ] && echo "✓ YES" || echo "✗ NO")"
+
+# List WDPA files if directory exists
+if [ -d "$SCRATCH/data/ready/WDPA" ]; then
+    echo "  WDPA files found:"
+    ls -lh "$SCRATCH/data/ready/WDPA/"*.tif 2>/dev/null | head -5 || echo "    (no .tif files)"
+fi
+
+#------------------------------------------------------------------------------
+# Run the merge script
+#------------------------------------------------------------------------------
+echo ""
+echo "🚀 Starting merge script..."
+echo "  Git commit: $(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+echo "  Python: $(python --version)"
+echo "  Working directory: $(pwd)"
+echo ""
+
+python scripts/merging/merge_2012_optimized
+
+echo ""
+echo "Script completed!" 
