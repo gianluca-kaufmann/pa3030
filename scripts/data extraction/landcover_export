@@ -1,40 +1,39 @@
 """
-MODIS Land Cover (MCD12Q1) → 1 km (South America, 2000-2024) 
-Method: downsample from 500m to 1 km (EPSG:3857, nearest neighbor for categorical data).
-
-Dataset: MODIS/061/MCD12Q1
-Outputs: 25 GeoTIFFs (MODIS_landcover_SA_1km_2000, ..., MODIS_landcover_SA_1km_2024), clipped to South America.
-Each file contains the LC_Type1 band (IGBP classification with 17 classes).
+Dataset: MODIS/061/MCD12Q1 Land Cover Type 1 (IGBP classification).
+Temporal coverage: Annual composites for South America from 2000 through 2024.
+Overview: Authenticates with Google Earth Engine, retrieves the LC_Type1 band for each year, and exports annual land-cover rasters to Google Drive.
+Resampling & reprojection: Images are reprojected to EPSG:3857 at 1,000 m using nearest-neighbour sampling suited for categorical data.
+Outputs: One int16 GeoTIFF per year (2000-2024) containing the LC_Type1 class values clipped to the South America boundary.
+Usage: export EE_PROJECT_ID=<your-project-id> && python "scripts/data extraction/landcover_export".
 """
 
+import os
+
 import ee
-ee.Authenticate()   # Opens a browser for Google login
 
-# ----------------------------
-# 0) Auth & init
-# ----------------------------
-# First run: ee.Authenticate()
-# If you use a specific EE project, pass project="your-ee-project" to Initialize.
-# Use your project ID
-PROJECT_ID = 'master-thesis-473316'
+PROJECT_ID = os.environ.get("EE_PROJECT_ID")
 
-try:
-    ee.Initialize(project=PROJECT_ID)
-    print("✅ Earth Engine initialized successfully with project:", PROJECT_ID)
-except Exception as e:
-    print(f"❌ Initialization failed: {e}")
-    print("🔐 Attempting authentication...")
-    ee.Authenticate()
+
+def initialize_earth_engine(project_id=None) -> None:
+    """Authenticate and initialize Earth Engine with an optional project."""
     try:
-        ee.Initialize(project=PROJECT_ID)
-        print("✅ Earth Engine initialized after authentication with project:", PROJECT_ID)
-    except Exception as e2:
-        print(f"❌ Still failed: {e2}")
-        print("💡 You may need to:")
-        print("   1. Enable Earth Engine API in your Google Cloud Project")
-        print("   2. Check if project ID is correct:", PROJECT_ID)
-        print("   3. Verify you have access to the project")
-        exit(1)
+        if project_id:
+            ee.Initialize(project=project_id)
+        else:
+            ee.Initialize()
+        print("Earth Engine initialized.")
+    except Exception as exc:
+        print(f"Initialization failed: {exc}")
+        print("Attempting interactive authentication...")
+        ee.Authenticate()
+        if project_id:
+            ee.Initialize(project=project_id)
+        else:
+            ee.Initialize()
+        print("Earth Engine initialized after authentication.")
+
+
+initialize_earth_engine(PROJECT_ID)
 
 # ----------------------------
 # 1) Study area (South America)
@@ -111,11 +110,11 @@ for year in years:
     print(f'Processing year {year}...')
     try:
         images[year] = process_year(year)
-        print(f'✅ Year {year} processed successfully')
+        print(f'Year {year} processed successfully.')
     except ValueError as e:
-        print(f'⚠️  Skipping year {year}: {e}')
+        print(f'Skipping year {year}: {e}')
     except Exception as e:
-        print(f'❌ Error processing year {year}: {e}')
+        print(f'Error processing year {year}: {e}')
 
 # (Optional) sanity print for first available year
 if images:
@@ -123,7 +122,7 @@ if images:
     print(f'\nSuccessfully processed {len(images)} years')
     print(f'Bands for year {first_year}:', images[first_year].bandNames().getInfo())
 else:
-    print('❌ No years were successfully processed')
+    print('No years were successfully processed.')
     exit(1)
 
 # ----------------------------
@@ -143,9 +142,9 @@ for year in sorted(images.keys()):
     )
     task.start()
     tasks.append(task)
-    print(f'📤 Export started for {year}:', task.id)
+    print(f'Export started for {year}:', task.id)
 
-print(f'\n✅ Started {len(tasks)} export tasks')
+print(f'\nStarted {len(tasks)} export tasks.')
 
 # ----------------------------
 # (Optional) Export to Cloud Storage instead of Drive

@@ -1,38 +1,39 @@
 """
-VIIRS Nighttime Lights → 1 km (South America, 2013-2022) 
-Method: downsample first (1 km, EPSG:3857, bilinear), then median across the window.
-
-Outputs: 10 GeoTIFFs (viirs_2013_*, viirs_2014_*, ..., viirs_2022_*), float32, clipped to South America.
-Uses NOAA/VIIRS/DNB/ANNUAL_V21 for 2013-2021 and NOAA/VIIRS/DNB/ANNUAL_V22 for 2022.
+Dataset: NOAA/VIIRS/DNB/ANNUAL_V21 (2013-2021) and NOAA/VIIRS/DNB/ANNUAL_V22 (2022) nighttime lights.
+Temporal coverage: Annual composites for South America from 2013 through 2022.
+Overview: Authenticates with Google Earth Engine, merges annual VIIRS nighttime lights collections, and exports 1 km median radiance rasters to Google Drive.
+Resampling & reprojection: Each scene is bilinearly resampled and reprojected to EPSG:3857 at 1,000 m before the annual median reduction.
+Outputs: One float32 GeoTIFF per year (2013-2022) containing the average radiance band clipped to South America.
+Usage: export EE_PROJECT_ID=<your-project-id> && python "scripts/data extraction/VIIRS_export".
 """
+
+import os
 
 import ee
 
-# ----------------------------
-# 0) Auth & init
-# ----------------------------
-# First run: ee.Authenticate()
-# If you use a specific EE project, pass project="your-ee-project" to Initialize.
-# Use your project ID
-PROJECT_ID = 'master-thesis-473316'
+PROJECT_ID = os.environ.get("EE_PROJECT_ID")
 
-try:
-    ee.Initialize(project=PROJECT_ID)
-    print("✅ Earth Engine initialized successfully with project:", PROJECT_ID)
-except Exception as e:
-    print(f"❌ Initialization failed: {e}")
-    print("🔐 Attempting authentication...")
-    ee.Authenticate()
+
+def initialize_earth_engine(project_id=None) -> None:
+    """Authenticate and initialize Earth Engine with an optional project."""
     try:
-        ee.Initialize(project=PROJECT_ID)
-        print("✅ Earth Engine initialized after authentication with project:", PROJECT_ID)
-    except Exception as e2:
-        print(f"❌ Still failed: {e2}")
-        print("💡 You may need to:")
-        print("   1. Enable Earth Engine API in your Google Cloud Project")
-        print("   2. Check if project ID is correct:", PROJECT_ID)
-        print("   3. Verify you have access to the project")
-        exit(1)
+        if project_id:
+            ee.Initialize(project=project_id)
+        else:
+            ee.Initialize()
+        print("Earth Engine initialized.")
+    except Exception as exc:
+        print(f"Initialization failed: {exc}")
+        print("Attempting interactive authentication...")
+        ee.Authenticate()
+        if project_id:
+            ee.Initialize(project=project_id)
+        else:
+            ee.Initialize()
+        print("Earth Engine initialized after authentication.")
+
+
+initialize_earth_engine(PROJECT_ID)
 
 # ----------------------------
 # 1) Study area (South America)

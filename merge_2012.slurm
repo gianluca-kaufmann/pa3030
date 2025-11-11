@@ -45,13 +45,13 @@ echo "Starting merge script..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1;>
 echo "PWD = $(pwd)"
 
-[ -f scripts/merging/merge_2012_optimized ] || {
-  echo "ERROR: merge_2012_optimized not found under scripts/merging"; find scri>
+[ -f scripts/merging/merge_total_optimized ] || {
+  echo "ERROR: merge_total_optimized not found under scripts/merging"; find scri>
 
 [ -d data/ready/WDPA ] || {
   echo "ERROR: data/ready/WDPA missing (symlink to $SCRATCH/data expected)"; ls>
 
 # Run the script
-python scripts/merging/merge_2012_optimized
+python scripts/merging/merge_total_optimized
 
 echo "Merge script finished."

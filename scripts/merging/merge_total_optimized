@@ -1,18 +1,25 @@
 #!/usr/bin/python3
 """
-Optimized merge script for South America 1×1 km datasets into a yearly tile-year panel (2012–2024).
+Merge South America 1 km rasters into a yearly panel (2012–2024) with streaming I/O and low memory use.
 
-Key memory optimizations to prevent OOM:
-- Year-by-year processing: Process and write each year completely before moving to next
-- Incremental Parquet writing: Write each year immediately using pyarrow.ParquetWriter
-- Memory cleanup: Explicit del and gc.collect() after each year
-- Vectorized coordinate generation: Use affine transform matrix instead of loops
-- Process datasets per-year only: Don't load all years for all datasets simultaneously
+Summary:
+- Reads per-dataset rasters from ``data/ready`` (or ``$SCRATCH/data``) and aligns them to the WDPA grid.
+- Processes one year at a time, reusing earlier data when a dataset is missing for a given year.
+- Streams window batches to yearly GeoTIFFs and a single Parquet panel while cleaning up memory eagerly.
 
-Performance optimizations:
-- Skip reprojection when files are already aligned
-- Progress monitoring and logging
-- Better error handling
+Inputs:
+- Year-specific raster folders under ``data/ready/<dataset>`` with filenames containing the year.
+- Optional static rasters (no year in filename) applied to every year.
+- WDPA raster (2012 preferred) that defines the reference grid.
+
+Outputs:
+- GeoTIFF per year: ``outputs/Results/merged_tifs/merged_SA_1km_<year>.tif`` (or ``$SCRATCH/outputs/...``).
+- Parquet panel: ``outputs/Results/merged_panel_2012_2024.parquet`` storing coordinates plus all bands.
+
+Key choices:
+- Portable path resolution from ``Path(__file__)`` with automatic ``$SCRATCH`` override for HPC runs.
+- Vectorized coordinate generation and Arrow streaming to avoid pandas and large in-memory tables.
+- Explicit cleanup (`del`, `gc.collect`) after each window and year to keep RAM usage bounded.
 
 Short overview of what the script does:
 1) Initialize Weights & Biases and resolve paths for data and outputs.
@@ -78,9 +85,9 @@ def log_progress(message: str, start_time: Optional[float] = None):
     """Log progress with optional timing."""
     if start_time:
         elapsed = time.time() - start_time
-        print(f"⏱️  {message} ({elapsed:.1f}s)")
+        print(f"[time] {message} ({elapsed:.1f}s)")
     else:
-        print(f"📊 {message}")
+        print(f"[info] {message}")
 
 
 def find_wdpa_files() -> Dict[int, Path]:
@@ -96,7 +103,7 @@ def find_wdpa_files() -> Dict[int, Path]:
     for base in [READY_ROOT / "WDPA", DATA_ROOT / "WDPA"]:
         log_progress(f"  Checking if {base} exists...")
         if base.exists():
-            log_progress(f"    ✓ {base} exists")
+            log_progress(f"    OK {base} exists")
             tifs = sorted(base.glob("*.tif"))
             log_progress(f"    Found {len(tifs)} .tif files")
             if tifs:
@@ -106,7 +113,7 @@ def find_wdpa_files() -> Dict[int, Path]:
                     log_progress(f"      ... and {len(tifs) - 5} more")
             candidates.extend(tifs)
         else:
-            log_progress(f"    ✗ {base} does NOT exist")
+            log_progress(f"    MISSING {base} does NOT exist")
     
     year_re = re.compile(r"(19|20)\d{2}")
     mapping: Dict[int, Path] = {}
@@ -117,7 +124,7 @@ def find_wdpa_files() -> Dict[int, Path]:
             continue
         year = int(m.group(0))
         mapping[year] = p
-        log_progress(f"  ✓ Matched: {p.name} → year {year}")
+        log_progress(f"  Matched: {p.name} → year {year}")
     
     log_progress(f"Found {len(mapping)} WDPA files with years")
     return mapping
@@ -126,15 +133,15 @@ def find_wdpa_files() -> Dict[int, Path]:
 def open_reference_wdpa() -> Tuple[Path, rasterio.DatasetReader]:
     wdpa_map = find_wdpa_files()
     if not wdpa_map:
-        print("❌ No WDPA files found under data/ready/WDPA or data/WDPA.")
-        print(f"\n📁 Debug Info:")
+        print("ERROR: No WDPA files found under data/ready/WDPA or data/WDPA.")
+        print("\nDebug Info:")
         print(f"   PROJECT_ROOT = {PROJECT_ROOT}")
         print(f"   DATA_ROOT = {DATA_ROOT}")
         print(f"   READY_ROOT = {READY_ROOT}")
-        print(f"\n🔍 Checked locations:")
+        print("\nChecked locations:")
         print(f"   - {READY_ROOT / 'WDPA'} (exists: {(READY_ROOT / 'WDPA').exists()})")
         print(f"   - {DATA_ROOT / 'WDPA'} (exists: {(DATA_ROOT / 'WDPA').exists()})")
-        print(f"\n💡 Please ensure WDPA .tif files with years in their names exist in one of these locations")
+        print("\nPlease ensure WDPA .tif files with years in their names exist in one of these locations")
         sys.exit(1)
     # Prefer 2012 else closest available year
     ref_year = 2012 if 2012 in wdpa_map else sorted(wdpa_map.keys())[0]
@@ -154,7 +161,7 @@ def discover_raster_catalog() -> Dict[str, Dict[Optional[int], List[Path]]]:
     catalog: Dict[str, Dict[Optional[int], List[Path]]] = {}
     year_re = re.compile(r"(19|20)\d{2}")
     if not READY_ROOT.exists():
-        print(f"❌ Missing directory: {READY_ROOT}")
+        print(f"ERROR: Missing directory: {READY_ROOT}")
         sys.exit(1)
     
     total_files = 0
@@ -554,11 +561,11 @@ def main():
     wandb_entity = os.environ.get("WANDB_ENTITY")
     
     if not wandb_api_key:
-        print("⚠️  WANDB_API_KEY not found in environment variables")
+        print("Warning: WANDB_API_KEY not found in environment variables")
         print("   Set it with: export WANDB_API_KEY='your-key-here'")
     
     if not wandb_entity:
-        print("⚠️  WANDB_ENTITY not found in environment variables")
+        print("Warning: WANDB_ENTITY not found in environment variables")
         print("   Set it with: export WANDB_ENTITY='your-entity-here'")
     
     wandb.init(
@@ -573,7 +580,7 @@ def main():
             "scratch_mode": "SCRATCH" in os.environ,
         }
     )
-    print("✅ Weights & Biases connected successfully!")
+    print("Weights & Biases connected successfully!")
     
     total_start_time = time.time()
     log_progress("Starting optimized merge process...")
@@ -616,7 +623,7 @@ def main():
                              key=lambda d: (0 if d.upper() == "WDPA" else 1, d.lower()))
     
     if not datasets_present:
-        print("❌ No datasets found under data/ready.")
+        print("ERROR: No datasets found under data/ready.")
         sys.exit(1)
     
     log_progress(f"Datasets to process: {', '.join(datasets_present)}")
@@ -663,7 +670,7 @@ def main():
             continue
 
     if not all_band_names:
-        print("❌ Failed to determine band structure.")
+        print("ERROR: Failed to determine band structure.")
         sys.exit(1)
 
     log_progress(f"Total bands: {len(all_band_names)}")
@@ -729,7 +736,7 @@ def main():
                 if band_stack.shape[0] != len(current_band_names):
                     error_msg = (f"Band count mismatch for year {year}, window {w}: "
                                f"expected {len(current_band_names)} bands, got {band_stack.shape[0]}")
-                    log_progress(f"❌ {error_msg}")
+                    log_progress(f"ERROR: {error_msg}")
                     raise ValueError(error_msg)
                 
                 # Write window to GeoTIFF
@@ -754,10 +761,10 @@ def main():
                 f"year/{year}/status": "success"
             })
             total_rows += year_rows
-            log_progress(f"  ✅ Completed year {year}")
+            log_progress(f"  Completed year {year}")
             
         except Exception as e:
-            log_progress(f"❌ Error processing year {year}: {e}")
+            log_progress(f"ERROR processing year {year}: {e}")
             import traceback
             traceback.print_exc()
             wandb.log({
@@ -784,14 +791,14 @@ def main():
                 "output/years_processed": len(YEARS)
             })
         else:
-            log_progress("❌ Parquet file was not created")
+            log_progress("ERROR: Parquet file was not created")
             wandb.log({"output/status": "failed", "output/error": "file_not_created"})
     else:
-        log_progress("❌ No data to write to Parquet")
+        log_progress("ERROR: No data to write to Parquet")
         wandb.log({"output/status": "failed", "output/error": "no_data"})
 
     total_time = time.time() - total_start_time
-    log_progress(f"✅ Merge process completed in {total_time/60:.1f} minutes")
+    log_progress(f"Merge process completed in {total_time/60:.1f} minutes")
     
     wandb.log({
         "summary/total_time_minutes": total_time / 60,

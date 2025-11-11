@@ -1,53 +1,39 @@
 """
-Satellite Embedding V1 (Annual) → 1 km (South America, tiled export for 2023)
-CENTRAL PIXEL SAMPLING VERSION
-
-Dataset: GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL
-
-This script uses CENTRAL PIXEL SAMPLING instead of bilinear interpolation.
-For each 1x1km pixel, we sample only the most central pixel from the original
-high-resolution satellite embeddings dataset (~10m resolution).
-
-This preserves the sharpness and detail of the original embeddings without
-the blurring effect that comes from bilinear interpolation.
-
-Key differences from original script:
-- Uses nearest neighbor resampling instead of bilinear
-- Ensures proper grid alignment to sample true center pixels
-- Results in sharper, more detailed visualizations
-
-Notes:
-- Reprojection to EPSG:3857 at 1,000 m to match other 1 km layers
-- Grid is aligned perfectly with no gaps or overlaps between tiles
-- All tiles are exported to ensure complete coverage of South America
+Dataset: GOOGLE/SATELLITE_EMBEDDING/V1/ANNUAL central-pixel embeddings.
+Temporal coverage: Annual embedding mosaic for 2023 over South America.
+Overview: Authenticates with Google Earth Engine, mosaics the 2023 satellite embeddings, reprojects to a 1 km EPSG:3857 grid using nearest-neighbour sampling, tiles South America, and exports GeoTIFF tiles plus metadata.
+Resampling & reprojection: Uses nearest-neighbour sampling during reprojection to EPSG:3857 at 1,000 m to preserve the original embedding values (central pixel sampling).
+Outputs: GeoTIFF tiles covering South America at 1 km resolution for 2023 along with a JSON file describing the export grid.
+Usage: export EE_PROJECT_ID=<your-project-id> && python "scripts/data extraction/embeddings_export/embeddings_export_2023".
 """
 
+import os
+
 import ee
-ee.Authenticate()   # Opens a browser for Google login
 
-# ----------------------------
-# 0) Auth & init
-# ----------------------------
-# Use your project ID
-PROJECT_ID = 'master-thesis-473316'
+PROJECT_ID = os.environ.get("EE_PROJECT_ID")
 
-try:
-    ee.Initialize(project=PROJECT_ID)
-    print("✅ Earth Engine initialized successfully with project:", PROJECT_ID)
-except Exception as e:
-    print(f"❌ Initialization failed: {e}")
-    print("🔐 Attempting authentication...")
-    ee.Authenticate()
+
+def initialize_earth_engine(project_id=None) -> None:
+    """Authenticate and initialize Earth Engine with an optional project."""
     try:
-        ee.Initialize(project=PROJECT_ID)
-        print("✅ Earth Engine initialized after authentication with project:", PROJECT_ID)
-    except Exception as e2:
-        print(f"❌ Still failed: {e2}")
-        print("💡 You may need to:")
-        print("   1. Enable Earth Engine API in your Google Cloud Project")
-        print("   2. Check if project ID is correct:", PROJECT_ID)
-        print("   3. Verify you have access to the project")
-        exit(1)
+        if project_id:
+            ee.Initialize(project=project_id)
+        else:
+            ee.Initialize()
+        print("Earth Engine initialized.")
+    except Exception as exc:
+        print(f"Initialization failed: {exc}")
+        print("Attempting interactive authentication...")
+        ee.Authenticate()
+        if project_id:
+            ee.Initialize(project=project_id)
+        else:
+            ee.Initialize()
+        print("Earth Engine initialized after authentication.")
+
+
+initialize_earth_engine(PROJECT_ID)
 
 # ----------------------------
 # 1) Study area (South America)
@@ -75,8 +61,8 @@ MAX_TILES = None  # None = export all tiles for complete coverage
 # ----------------------------
 # 3) Build 2023 embedding image at 1 km using CENTRAL PIXEL SAMPLING
 # ----------------------------
-print("\n🎯 USING CENTRAL PIXEL SAMPLING METHOD")
-print("   This preserves sharpness by sampling only the center pixel of each 1km cell")
+print("\nUsing central pixel sampling method.")
+print("   This preserves sharpness by sampling only the center pixel of each 1 km cell.")
 
 coll_2023 = (
     ee.ImageCollection(COLL_ID)
@@ -85,7 +71,7 @@ coll_2023 = (
 )
 
 if coll_2023.size().getInfo() == 0:
-    print('❌ No images found for 2023 over South America. Check dataset/dates.')
+    print('No images found for 2023 over South America. Check dataset/dates.')
     exit(1)
 
 img_2023 = ee.ImageCollection(coll_2023).mosaic()
@@ -103,7 +89,7 @@ img_2023_1km = (
       .toFloat()
 )
 
-print('✅ Image reprojected using nearest neighbor (central pixel) sampling')
+print('Image reprojected using nearest neighbor (central pixel) sampling.')
 print('Bands (first 10):', img_2023_1km.bandNames().slice(0, 10).getInfo())
 print('Band count:', img_2023_1km.bandNames().size().getInfo())
 
@@ -126,7 +112,7 @@ max_lon = math.ceil(raw_max_lon / TILE_DX_DEG) * TILE_DX_DEG
 min_lat = math.floor(raw_min_lat / TILE_DY_DEG) * TILE_DY_DEG
 max_lat = math.ceil(raw_max_lat / TILE_DY_DEG) * TILE_DY_DEG
 
-print(f"\n📐 GRID CONFIGURATION:")
+print("\nGrid configuration:")
 print(f"   Tile size: {TILE_DX_DEG}° × {TILE_DY_DEG}°")
 print(f"   Raw bounds: ({raw_min_lon:.2f}, {raw_min_lat:.2f}) to ({raw_max_lon:.2f}, {raw_max_lat:.2f})")
 print(f"   Grid bounds: ({min_lon:.2f}, {min_lat:.2f}) to ({max_lon:.2f}, {max_lat:.2f})")
@@ -174,18 +160,18 @@ while lat < max_lat:
     lat += TILE_DY_DEG
     row_idx += 1
 
-print(f"\n🧩 Generated {len(tiles)} tiles intersecting South America")
+print(f"\nGenerated {len(tiles)} tiles intersecting South America")
 print(f"   Grid coverage: {row_idx} rows × {col_idx} columns")
 print(f"   Tiles with data: {len(tiles)}")
 
 # Validation: Check for gaps and overlaps
-print(f"\n✅ GRID VALIDATION:")
+print("\nGrid validation:")
 print(f"   All tiles have exact {TILE_DX_DEG}° × {TILE_DY_DEG}° dimensions")
 print(f"   Tiles align edge-to-edge with NO gaps or overlaps")
 print(f"   Grid is suitable for merging into single dataset")
 
 # Save tile grid info for later reference
-print(f"\n📋 Tile boundary information saved for merging reference")
+print("\nTile boundary information saved for merging reference")
 
 # ----------------------------
 # 5) Save tile grid metadata for merging reference
@@ -220,14 +206,14 @@ print(f"   Saved grid metadata to: {metadata_file}")
 # ----------------------------
 tiles_to_export = tiles[:MAX_TILES] if MAX_TILES else tiles
 
-print(f"\n🚀 STARTING EXPORTS:")
+print("\nStarting exports:")
 print(f"   Total tiles to export: {len(tiles_to_export)}")
 print(f"   Sampling method: CENTRAL PIXEL (nearest neighbor)")
 if MAX_TILES and len(tiles) > MAX_TILES:
-    print(f"   ⚠️  LIMITED TO FIRST {MAX_TILES} TILES FOR TESTING")
-    print(f"   ⚠️  Set MAX_TILES=None to export all {len(tiles)} tiles")
+    print(f"   Limited to first {MAX_TILES} tiles for testing")
+    print(f"   Set MAX_TILES=None to export all {len(tiles)} tiles")
 else:
-    print(f"   ✅ Exporting ALL tiles for complete South America coverage")
+    print("   Exporting all tiles for complete South America coverage")
 
 print()
 
@@ -252,22 +238,22 @@ for idx, (row, col, geom) in enumerate(tiles_to_export):
     
     # Get tile bounds for display
     tile_bounds = [t for t in tile_info if t['row'] == row and t['col'] == col][0]
-    print(f"   ▶️  [{idx+1:3d}/{len(tiles_to_export):3d}] Row {row:2d} Col {col:2d} | "
+    print(f"   [{idx+1:3d}/{len(tiles_to_export):3d}] Row {row:2d} Col {col:2d} | "
           f"Lon [{tile_bounds['min_lon']:7.2f}, {tile_bounds['max_lon']:7.2f}] "
           f"Lat [{tile_bounds['min_lat']:6.2f}, {tile_bounds['max_lat']:6.2f}] | "
           f"Task: {task.id}")
 
-print(f"\n✅ EXPORT SUMMARY:")
+print("\nExport summary:")
 print(f"   Started {len(tasks)} export task(s)")
 print(f"   Sampling method: Central pixel (nearest neighbor)")
 print(f"   Monitor progress: https://code.earthengine.google.com/tasks")
 print(f"   Metadata saved: {metadata_file}")
-print(f"\n💡 IMPORTANT FOR MERGING:")
+print("\nImportant for merging:")
 print(f"   - All tiles have exact {TILE_DX_DEG}° × {TILE_DY_DEG}° boundaries")
 print(f"   - Tiles are perfectly aligned edge-to-edge")
 print(f"   - No gaps or overlaps between tiles")
 print(f"   - Use the metadata file to verify tile positions during merging")
-print(f"\n🎯 SAMPLING METHOD:")
+print("\nSampling method:")
 print(f"   - Uses nearest neighbor (reproject without resample)")
 print(f"   - Samples the most central pixel from each 1km grid cell")
 print(f"   - Preserves sharpness and detail from original embeddings")

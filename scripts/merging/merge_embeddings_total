@@ -2,23 +2,29 @@
 """
 Merge all yearly satellite embedding mosaics into a single multi-temporal file.
 
-This script:
-- Reads merged embedding files from 2018-2024 (7 years)
-- Verifies perfect spatial alignment across all years
-- Stacks them temporally into a single file
-- Each pixel contains 64 bands × 7 years = 448 bands total
-- Band naming: YYYY_embedding_XX (e.g., 2018_embedding_01, 2018_embedding_02, ...)
+Data sources:
+- Consumes yearly merged GeoTIFF mosaics produced by the per-year embedding pipeline. The files are
+  expected under ``data/ready/embeddings/embeddings_<year>/SatelliteEmbeddings_SA_1km_<year>_merged.tif``.
 
-Output structure:
-- Bands 1-64: 2018 embeddings
-- Bands 65-128: 2019 embeddings
-- Bands 129-192: 2020 embeddings
-- Bands 193-256: 2021 embeddings
-- Bands 257-320: 2022 embeddings
-- Bands 321-384: 2023 embeddings
-- Bands 385-448: 2024 embeddings
+Data location strategy:
+- Resolves the repository root from the script's location so paths remain portable. When the
+  ``SCRATCH`` environment variable is available (e.g., on the Euler cluster) the script transparently
+  switches to ``$SCRATCH/data`` for inputs and writes outputs to ``$SCRATCH/data/ready/embeddings``.
+
+Temporal scope:
+- Processes seven yearly mosaics for 2018–2024. The order is chronological, and band names encode the
+  year and embedding index (``YYYY_embedding_XX``).
+
+Processing mechanism:
+- Validates that all yearly mosaics share the same grid definition and streams each band sequentially
+  into a single multi-band GeoTIFF to minimise memory pressure (only one band loaded at a time).
+
+Output artefact:
+- Writes ``SatelliteEmbeddings_SA_1km_2018-2024_multitemporal.tif`` next to the source mosaics. The
+  stacked file contains 448 bands (64 embeddings × 7 years) and preserves the original spatial grid.
 """
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -27,10 +33,16 @@ from typing import Dict, List, Tuple
 import numpy as np
 import rasterio
 from rasterio.transform import Affine
-from rasterio.crs import CRS
 
 # Paths
-DATA_ROOT = Path("/Users/gianluca/Desktop/Master's Thesis/code/data")
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent
+
+if "SCRATCH" in os.environ:
+    DATA_ROOT = Path(os.environ["SCRATCH"]) / "data"
+else:
+    DATA_ROOT = PROJECT_ROOT / "data"
+
 EMBEDDINGS_DIR = DATA_ROOT / "ready" / "embeddings"
 
 # Years to merge
@@ -44,9 +56,9 @@ def log_progress(message: str, start_time: float = None):
     """Log progress with optional timing."""
     if start_time:
         elapsed = time.time() - start_time
-        print(f"⏱️  {message} ({elapsed:.1f}s)")
+        print(f"[time] {message} ({elapsed:.1f}s)")
     else:
-        print(f"📊 {message}")
+        print(f"[info] {message}")
 
 
 def find_yearly_files() -> Dict[int, Path]:
@@ -62,13 +74,13 @@ def find_yearly_files() -> Dict[int, Path]:
         
         if merged_file.exists():
             yearly_files[year] = merged_file
-            log_progress(f"  ✓ Found {year}: {merged_file.name}")
+            log_progress(f"  Found {year}: {merged_file.name}")
         else:
             missing_years.append(year)
-            log_progress(f"  ✗ Missing {year}: {merged_file}")
+            log_progress(f"  Missing {year}: {merged_file}")
     
     if missing_years:
-        print(f"\n❌ Missing files for years: {missing_years}")
+        print(f"\nERROR: Missing files for years: {missing_years}")
         print("Please ensure all yearly merge scripts have been run first.")
         sys.exit(1)
     
@@ -120,21 +132,21 @@ def verify_spatial_alignment(yearly_files: Dict[int, Path]) -> Tuple[Affine, int
         with rasterio.open(file_path) as src:
             # Check dimensions
             if src.width != ref_width or src.height != ref_height:
-                log_progress(f"  ✗ {year}: Dimension mismatch ({src.width}×{src.height} vs {ref_width}×{ref_height})")
+                log_progress(f"  Mismatch for {year}: dimensions {src.width}×{src.height} vs {ref_width}×{ref_height}")
                 all_aligned = False
                 misaligned_years.append(year)
                 continue
             
             # Check CRS
             if src.crs != ref_crs:
-                log_progress(f"  ✗ {year}: CRS mismatch ({src.crs} vs {ref_crs})")
+                log_progress(f"  Mismatch for {year}: CRS {src.crs} vs {ref_crs}")
                 all_aligned = False
                 misaligned_years.append(year)
                 continue
             
             # Check transform
             if src.transform != ref_transform:
-                log_progress(f"  ✗ {year}: Transform mismatch")
+                log_progress(f"  Mismatch for {year}: transform differs")
                 log_progress(f"      Got: {src.transform}")
                 log_progress(f"      Expected: {ref_transform}")
                 all_aligned = False
@@ -147,7 +159,7 @@ def verify_spatial_alignment(yearly_files: Dict[int, Path]) -> Tuple[Affine, int
                 for a, b in zip(src.bounds, ref_bounds)
             )
             if not bounds_match:
-                log_progress(f"  ✗ {year}: Bounds mismatch")
+                log_progress(f"  Mismatch for {year}: bounds differ")
                 log_progress(f"      Got: {src.bounds}")
                 log_progress(f"      Expected: {ref_bounds}")
                 all_aligned = False
@@ -156,17 +168,17 @@ def verify_spatial_alignment(yearly_files: Dict[int, Path]) -> Tuple[Affine, int
             
             # Check number of bands
             if src.count != ref_bands:
-                log_progress(f"  ⚠️  {year}: Band count differs ({src.count} vs {ref_bands})")
+                log_progress(f"  Warning for {year}: band count {src.count} vs {ref_bands}")
                 # This is a warning, not a failure
             
-            log_progress(f"  ✓ {year}: Perfectly aligned")
+            log_progress(f"  {year}: perfectly aligned")
     
     if not all_aligned:
-        print(f"\n❌ Spatial alignment verification failed for years: {misaligned_years}")
+        print(f"\nERROR: Spatial alignment verification failed for years: {misaligned_years}")
         print("All yearly files must have identical dimensions, CRS, transform, and bounds.")
         sys.exit(1)
     
-    log_progress("✅ All years are perfectly aligned spatially!")
+    log_progress("All years are perfectly aligned spatially.")
     return ref_transform, ref_width, ref_height, ref_crs, ref_bands
 
 
@@ -280,9 +292,9 @@ def validate_output(output_path: Path, expected_bands: int):
         
         # Verify band count
         if src.count != expected_bands:
-            log_progress(f"  ⚠️  Warning: Expected {expected_bands} bands, got {src.count}")
+            log_progress(f"  Warning: expected {expected_bands} bands, got {src.count}")
         else:
-            log_progress(f"  ✓ Band count correct")
+            log_progress("  Band count correct")
         
         # Sample first and last band
         log_progress("  Sampling data quality...")
@@ -319,7 +331,7 @@ def main():
     
     # Check embeddings directory
     if not EMBEDDINGS_DIR.exists():
-        print(f"❌ Embeddings directory not found: {EMBEDDINGS_DIR}")
+        print(f"ERROR: Embeddings directory not found: {EMBEDDINGS_DIR}")
         sys.exit(1)
     
     # Find all yearly files
@@ -348,13 +360,13 @@ def main():
     # Summary
     total_time = time.time() - total_start
     log_progress("=" * 80)
-    log_progress(f"✅ Multi-temporal merge completed successfully in {total_time/60:.1f} minutes")
+    log_progress(f"Multi-temporal merge completed successfully in {total_time/60:.1f} minutes")
     log_progress(f"Output file: {OUTPUT_FILE}")
     log_progress(f"Total bands: {expected_total_bands} ({bands_per_year} bands × {len(YEARS)} years)")
     log_progress("=" * 80)
     
     # Usage notes
-    print("\n💡 Usage notes:")
+    print("\nUsage notes:")
     print(f"   - Band 1-{bands_per_year}: {YEARS[0]} embeddings")
     for i, year in enumerate(YEARS[1:], 1):
         start_band = i * bands_per_year + 1

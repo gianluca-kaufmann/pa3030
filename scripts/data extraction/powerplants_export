@@ -1,39 +1,39 @@
 """
-Power Plants → 1 km raster (South America, 2024) 
-Dataset: WRI/GPPD/power_plants (Global Power Plant Database)
-Method: rasterize features, downsample to 1 km (EPSG:3857), clip to South America.
-
-Outputs: 1 GeoTIFF (powerplants_*), float32, clipped to South America.
+Dataset: WRI/GPPD/power_plants (Global Power Plant Database).
+Temporal coverage: Latest available compilation (accessed 2024) for South America.
+Overview: Authenticates with Google Earth Engine, rasterises power plant counts and dominant fuel types at 1 km resolution, and exports to Google Drive.
+Resampling & reprojection: Vector features are rasterised, unmasked to zero, and reprojected to EPSG:3857 at 1,000 m before clipping to South America.
+Outputs: A single float32 GeoTIFF with `powerplant_count` and `fuel_type` bands covering South America.
+Usage: export EE_PROJECT_ID=<your-project-id> && python "scripts/data extraction/powerplants_export".
 """
 
+import os
+
 import ee
-ee.Authenticate()   # Opens a browser for Google login
 
-# ----------------------------
-# 0) Auth & init
-# ----------------------------
-# First run: ee.Authenticate()
-# If you use a specific EE project, pass project="your-ee-project" to Initialize.
-# Use your project ID
-PROJECT_ID = 'master-thesis-473316'
+PROJECT_ID = os.environ.get("EE_PROJECT_ID")
 
-try:
-    ee.Initialize(project=PROJECT_ID)
-    print("✅ Earth Engine initialized successfully with project:", PROJECT_ID)
-except Exception as e:
-    print(f"❌ Initialization failed: {e}")
-    print("🔐 Attempting authentication...")
-    ee.Authenticate()
+
+def initialize_earth_engine(project_id=None) -> None:
+    """Authenticate and initialize Earth Engine with an optional project."""
     try:
-        ee.Initialize(project=PROJECT_ID)
-        print("✅ Earth Engine initialized after authentication with project:", PROJECT_ID)
-    except Exception as e2:
-        print(f"❌ Still failed: {e2}")
-        print("💡 You may need to:")
-        print("   1. Enable Earth Engine API in your Google Cloud Project")
-        print("   2. Check if project ID is correct:", PROJECT_ID)
-        print("   3. Verify you have access to the project")
-        exit(1)
+        if project_id:
+            ee.Initialize(project=project_id)
+        else:
+            ee.Initialize()
+        print("Earth Engine initialized.")
+    except Exception as exc:
+        print(f"Initialization failed: {exc}")
+        print("Attempting interactive authentication...")
+        ee.Authenticate()
+        if project_id:
+            ee.Initialize(project=project_id)
+        else:
+            ee.Initialize()
+        print("Earth Engine initialized after authentication.")
+
+
+initialize_earth_engine(PROJECT_ID)
 
 # ----------------------------
 # 1) Study area (South America)
@@ -153,8 +153,8 @@ task = ee.batch.Export.image.toDrive(
 task.start()
 print('Export started:', task.id)
 
-print(f'\n✅ Export task has been started!')
-print('📊 Check progress at: https://code.earthengine.google.com/tasks')
+print('\nExport task started.')
+print('Check progress at: https://code.earthengine.google.com/tasks')
 
 # ----------------------------
 # (Optional) Export to Cloud Storage instead of Drive

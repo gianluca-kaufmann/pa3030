@@ -1,39 +1,39 @@
 """
-GPW Population Density → 1 km (South America, 2000-2020) 
-Method: downsample to 1 km (EPSG:3857, bilinear), clip to South America.
-
-Outputs: GeoTIFFs for each available year (gpw_2000_*, gpw_2005_*, ..., gpw_2020_*), 
-float32, clipped to South America.
+Dataset: CIESIN/GPWv411/GPW_Population_Density.
+Temporal coverage: South America snapshots for 2000, 2005, 2010, 2015, and 2020.
+Overview: Authenticates with Google Earth Engine, retrieves each five-year GPW population density layer, and exports 1 km rasters to Google Drive.
+Resampling & reprojection: Images are bilinearly resampled and reprojected to EPSG:3857 at 1,000 m before clipping to South America.
+Outputs: One float32 population-density GeoTIFF per available year, clipped to the South America boundary.
+Usage: export EE_PROJECT_ID=<your-project-id> && python "scripts/data extraction/GPW_export".
 """
 
+import os
+
 import ee
-ee.Authenticate()   # Opens a browser for Google login
 
-# ----------------------------
-# 0) Auth & init
-# ----------------------------
-# First run: ee.Authenticate()
-# If you use a specific EE project, pass project="your-ee-project" to Initialize.
-# Use your project ID
-PROJECT_ID = 'master-thesis-473316'
+PROJECT_ID = os.environ.get("EE_PROJECT_ID")
 
-try:
-    ee.Initialize(project=PROJECT_ID)
-    print("✅ Earth Engine initialized successfully with project:", PROJECT_ID)
-except Exception as e:
-    print(f"❌ Initialization failed: {e}")
-    print("🔐 Attempting authentication...")
-    ee.Authenticate()
+
+def initialize_earth_engine(project_id=None) -> None:
+    """Authenticate and initialize Earth Engine with an optional project."""
     try:
-        ee.Initialize(project=PROJECT_ID)
-        print("✅ Earth Engine initialized after authentication with project:", PROJECT_ID)
-    except Exception as e2:
-        print(f"❌ Still failed: {e2}")
-        print("💡 You may need to:")
-        print("   1. Enable Earth Engine API in your Google Cloud Project")
-        print("   2. Check if project ID is correct:", PROJECT_ID)
-        print("   3. Verify you have access to the project")
-        exit(1)
+        if project_id:
+            ee.Initialize(project=project_id)
+        else:
+            ee.Initialize()
+        print("Earth Engine initialized.")
+    except Exception as exc:
+        print(f"Initialization failed: {exc}")
+        print("Attempting interactive authentication...")
+        ee.Authenticate()
+        if project_id:
+            ee.Initialize(project=project_id)
+        else:
+            ee.Initialize()
+        print("Earth Engine initialized after authentication.")
+
+
+initialize_earth_engine(PROJECT_ID)
 
 # ----------------------------
 # 1) Study area (South America)
@@ -91,13 +91,13 @@ for year in years:
         # Check if image exists
         image_info = test_image.getInfo()
         if image_info is None:
-            print(f'❌ No data available for year {year}')
+            print(f'No data available for year {year}.')
             continue
             
         images[year] = downsample_gpw_1km(year)
-        print(f'✅ Successfully processed year {year}')
+        print(f'Successfully processed year {year}.')
     except Exception as e:
-        print(f'❌ Failed to process year {year}: {e}')
+        print(f'Failed to process year {year}: {e}')
         print(f'   Error type: {type(e).__name__}')
         # Skip this year and continue
         continue
@@ -129,7 +129,7 @@ for year in years:
     else:
         print(f'Skipping export for {year} (processing failed)')
 
-print(f'\n📊 Total export tasks started: {len(tasks)}')
+print(f'\nTotal export tasks started: {len(tasks)}')
 
 # ----------------------------
 # (Optional) Export to Cloud Storage instead of Drive
@@ -151,5 +151,5 @@ print(f'\n📊 Total export tasks started: {len(tasks)}')
 #         tasks_gcs.append(task_gcs)
 #         print(f'GCS export started for {year}:', task_gcs.id)
 
-print('\n🎯 Script completed! Check your Google Drive "GEE_exports" folder for the exported files.')
-print('📝 Note: GPW population density data is typically available in 5-year intervals (2000, 2005, 2010, 2015, 2020)')
+print('\nScript completed. Check your Google Drive "GEE_exports" folder for the exported files.')
+print('Note: GPW population density data is typically available in 5-year intervals (2000, 2005, 2010, 2015, 2020).')
