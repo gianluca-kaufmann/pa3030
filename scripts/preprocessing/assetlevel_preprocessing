@@ -1,19 +1,34 @@
 #!/usr/bin/env python3
 """
-Asset-level Data Preprocessing Script
-====================================
+Asset-level data preprocessing
+==============================
 
-This script processes asset-level data from FA_sample_data.xlsx to create
-rasterized data aligned with the existing 1×1 km template GeoTIFF.
+Description:
+    Prepare asset-level facility information for spatial analysis by aligning
+    the data with the 1 km reference grid used across the project.
 
-Process:
-1. Read "Asset-level data" from FA_sample_data.xlsx
-2. Filter to only active plants (status column)
-3. Use Latitude, Longitude, Capacity columns
-4. Align to existing 1×1 km template GeoTIFF (GPW format)
-5. Aggregate per pixel: count of assets and sum of capacity (MW)
-6. Save as new GeoTIFF
+Source data:
+    Input file `data/ready/assetlevel/FA_sample_data.xlsx` located in the
+    project `data/ready` directory.
 
+Objective:
+    Filter the asset records to active facilities, align them to the reference
+    raster grid, and calculate the count of assets and their total capacity per
+    grid cell.
+
+Process overview:
+    1. Load the asset-level Excel file and identify the relevant sheet.
+    2. Filter the dataset to facilities marked as active.
+    3. Load spatial metadata from the population density GeoTIFF template.
+    4. Rasterize the latitude and longitude information onto the template grid.
+    5. Aggregate counts and capacities for each grid cell.
+    6. Export GeoTIFF rasters with asset counts and total capacity.
+
+Outputs:
+    - `data/assetlevel/FA_assets_count_SA_1km.tif` containing counts of active
+      assets per pixel.
+    - `data/assetlevel/FA_assets_capacity_SA_1km.tif` containing total active
+      capacity per pixel.
 """
 
 import pandas as pd
@@ -29,16 +44,20 @@ warnings.filterwarnings('ignore')
 # Configuration
 # ==========
 
-DATA_DIR = Path("/Users/gianluca/Desktop/Master's Thesis/code/data")
-INPUT_EXCEL = DATA_DIR / "assetlevel" / "FA_sample_data.xlsx"
-TEMPLATE_TIFF = DATA_DIR / "GPW" / "GPW_population_density_SA_1km_2020.tif"
-OUTPUT_DIR = DATA_DIR / "assetlevel"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DATA_DIR = PROJECT_ROOT / "data"
+READY_DIR = DATA_DIR / "ready"
+
+ASSETLEVEL_DIR = READY_DIR / "assetlevel"
+INPUT_EXCEL = ASSETLEVEL_DIR / "FA_sample_data.xlsx"
+TEMPLATE_TIFF = READY_DIR / "GPW" / "GPW_population_density_SA_1km_2020.tif"
+OUTPUT_DIR = ASSETLEVEL_DIR
 OUTPUT_COUNT = OUTPUT_DIR / "FA_assets_count_SA_1km.tif"
 OUTPUT_CAPACITY = OUTPUT_DIR / "FA_assets_capacity_SA_1km.tif"
 
 def load_excel_data():
     """Load and examine the Excel data structure"""
-    print(f"📁 Loading Excel data from {INPUT_EXCEL.name}...")
+    print(f"Loading Excel data from {INPUT_EXCEL.name}...")
     
     try:
         # Read the Excel file
@@ -75,7 +94,7 @@ def load_excel_data():
         missing_cols = [col for col in required_cols if col not in df.columns]
         
         if missing_cols:
-            print(f"   ⚠️ Missing required columns: {missing_cols}")
+            print(f"   Missing required columns: {missing_cols}")
             print(f"   Available columns: {list(df.columns)}")
             
             # Try case-insensitive matching
@@ -95,7 +114,7 @@ def load_excel_data():
         return df
         
     except Exception as e:
-        print(f"   ❌ Error loading Excel file: {e}")
+        print(f"   Error loading Excel file: {e}")
         return None
 
 def filter_active_plants(df):
@@ -103,11 +122,11 @@ def filter_active_plants(df):
     if df is None:
         return None
     
-    print("🔍 Filtering to active plants...")
+    print("Filtering to active plants...")
     
     # Check status column values
     if 'status' not in df.columns:
-        print("   ❌ No 'status' column found")
+        print("   No 'status' column found")
         return None
     
     print(f"   Status values: {df['status'].value_counts()}")
@@ -130,20 +149,20 @@ def filter_active_plants(df):
                 break
     
     if active_count == 0:
-        print("   ⚠️ No active plants found with standard status values")
+        print("   No active plants found with standard status values")
         print("   Available status values:", df['status'].unique())
         # For now, let's use all plants and let user decide
         active_df = df.copy()
         print("   Using all plants (no filtering applied)")
     else:
         active_df = df[active_mask].copy()
-        print(f"   ✅ Found {active_count} active plants out of {len(df)} total")
+        print(f"   Found {active_count} active plants out of {len(df)} total")
     
     return active_df
 
 def load_template_info():
     """Load template GeoTIFF information"""
-    print(f"📐 Loading template GeoTIFF: {TEMPLATE_TIFF.name}...")
+    print(f"Loading template GeoTIFF: {TEMPLATE_TIFF.name}...")
     
     try:
         with rasterio.open(TEMPLATE_TIFF) as src:
@@ -164,7 +183,7 @@ def load_template_info():
             return template_info
             
     except Exception as e:
-        print(f"   ❌ Error loading template: {e}")
+        print(f"   Error loading template: {e}")
         return None
 
 def rasterize_asset_data(df, template_info):
@@ -172,7 +191,7 @@ def rasterize_asset_data(df, template_info):
     if df is None or template_info is None:
         return None, None
     
-    print("🗺️ Rasterizing asset data...")
+    print("Rasterizing asset data...")
     
     # Clean and prepare coordinate data
     print("   Cleaning coordinate data...")
@@ -215,7 +234,7 @@ def rasterize_asset_data(df, template_info):
         transformer = Transformer.from_crs("EPSG:4326", template_info['crs'], always_xy=True)
         print(f"   Using coordinate transformation: WGS84 -> {template_info['crs']}")
     except ImportError:
-        print("   ⚠️ pyproj not available, assuming coordinates are already in template CRS")
+        print("   pyproj not available, assuming coordinates are already in template CRS")
         transformer = None
     
     for i, (lon, lat) in enumerate(zip(lons, lats)):
@@ -225,7 +244,7 @@ def rasterize_asset_data(df, template_info):
                 # Transform from WGS84 to template CRS
                 x, y = transformer.transform(lon, lat)
             except Exception as e:
-                print(f"   ⚠️ Coordinate transformation failed for point {i}: {e}")
+                print(f"   Coordinate transformation failed for point {i}: {e}")
                 continue
         else:
             # Assume coordinates are already in template CRS
@@ -276,7 +295,7 @@ def save_raster_data(count_array, capacity_array, template_info):
     if count_array is None or capacity_array is None or template_info is None:
         return False
     
-    print("💾 Saving raster data...")
+    print("Saving raster data...")
     
     # Create output directory
     OUTPUT_DIR.mkdir(exist_ok=True)
@@ -302,9 +321,9 @@ def save_raster_data(count_array, capacity_array, template_info):
                 processing="Rasterized from Excel coordinates",
                 units="count"
             )
-        print(f"   ✅ Count raster saved: {OUTPUT_COUNT}")
+        print(f"   Count raster saved: {OUTPUT_COUNT}")
     except Exception as e:
-        print(f"   ❌ Error saving count raster: {e}")
+        print(f"   Error saving count raster: {e}")
         return False
     
     # Save capacity raster
@@ -320,9 +339,9 @@ def save_raster_data(count_array, capacity_array, template_info):
                 processing="Rasterized from Excel coordinates",
                 units="MW"
             )
-        print(f"   ✅ Capacity raster saved: {OUTPUT_CAPACITY}")
+        print(f"   Capacity raster saved: {OUTPUT_CAPACITY}")
     except Exception as e:
-        print(f"   ❌ Error saving capacity raster: {e}")
+        print(f"   Error saving capacity raster: {e}")
         return False
     
     return True
@@ -333,7 +352,7 @@ def create_summary_report(df, clean_df, count_array, capacity_array, template_in
         return
     
     print("\n" + "=" * 60)
-    print("📋 PROCESSING SUMMARY")
+    print("Processing summary")
     print("=" * 60)
     
     print(f"Input Excel file: {INPUT_EXCEL.name}")
@@ -369,54 +388,54 @@ def create_summary_report(df, clean_df, count_array, capacity_array, template_in
 
 def main():
     """Main processing function"""
-    print("⚡ FA Asset-level Data Preprocessing")
+    print("FA Asset-level Data Preprocessing")
     print("=" * 60)
     
     # Step 1: Load Excel data
-    print("\n📁 Step 1: Loading Excel data...")
+    print("\nStep 1: Loading Excel data...")
     df = load_excel_data()
     
     if df is None:
-        print("❌ Failed to load Excel data. Exiting.")
+        print("Failed to load Excel data. Exiting.")
         return
     
     # Step 2: Filter active plants
-    print("\n🔍 Step 2: Filtering active plants...")
+    print("\nStep 2: Filtering active plants...")
     active_df = filter_active_plants(df)
     
     if active_df is None:
-        print("❌ Failed to filter active plants. Exiting.")
+        print("Failed to filter active plants. Exiting.")
         return
     
     # Step 3: Load template information
-    print("\n📐 Step 3: Loading template GeoTIFF...")
+    print("\nStep 3: Loading template GeoTIFF...")
     template_info = load_template_info()
     
     if template_info is None:
-        print("❌ Failed to load template. Exiting.")
+        print("Failed to load template. Exiting.")
         return
     
     # Step 4: Rasterize asset data
-    print("\n🗺️ Step 4: Rasterizing asset data...")
+    print("\nStep 4: Rasterizing asset data...")
     count_array, capacity_array = rasterize_asset_data(active_df, template_info)
     
     if count_array is None:
-        print("❌ Failed to rasterize data. Exiting.")
+        print("Failed to rasterize data. Exiting.")
         return
     
     # Step 5: Save raster data
-    print("\n💾 Step 5: Saving raster data...")
+    print("\nStep 5: Saving raster data...")
     success = save_raster_data(count_array, capacity_array, template_info)
     
     if not success:
-        print("❌ Failed to save raster data. Exiting.")
+        print("Failed to save raster data. Exiting.")
         return
     
     # Step 6: Create summary report
     create_summary_report(df, active_df, count_array, capacity_array, template_info)
     
-    print("\n✅ Processing complete! 🎉")
-    print(f"📁 Output files:")
+    print("\nProcessing complete.")
+    print("Output files:")
     print(f"   Count raster: {OUTPUT_COUNT}")
     print(f"   Capacity raster: {OUTPUT_CAPACITY}")
 

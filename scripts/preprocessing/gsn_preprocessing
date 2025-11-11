@@ -1,16 +1,36 @@
 #!/usr/bin/env python3
 """
-GSN Data Preprocessing Script
-============================
+Global Safety Net preprocessing
+==============================
 
-This script processes GSN shapefiles to create rasterized data 
-aligned with the existing 1×1 km template GeoTIFF.
+Description:
+    Convert the Global Safety Net vector layers into 1 km rasters that align
+    with the common template grid used across the project.
 
+Source data:
+    - Vector files located under `data/ready/GSN/GlobalSafetyNet/<layer_name>/`
+      as shapefiles or GeoPackages.
+    - Reference raster template in `data/ready/GPW/`, typically
+      `GPW_population_density_SA_1km_2020.tif`.
+
+Objective:
+    Prepare binary or categorical raster masks for each Global Safety Net
+    layer so they can be merged with other datasets in later stages.
+
+Process overview:
+    1. Locate the GPW template raster and read its spatial metadata.
+    2. Discover the Global Safety Net layers expected in the data directory.
+    3. Load, reproject, and clip each layer to the template extent.
+    4. Rasterize geometries onto the 1 km grid (categorical for ecoregions,
+       binary for other layers).
+    5. Save the resulting rasters for downstream processing.
+
+Outputs:
+    - GeoTIFF masks stored in `data/ready/GSN/gsn_<layer_name>_mask_1km.tif`.
 """
 
 import sys
 import os
-import glob
 from typing import Optional, Tuple, List
 
 import numpy as np
@@ -20,30 +40,29 @@ from rasterio.features import rasterize
 from rasterio.transform import Affine
 import geopandas as gpd
 from shapely.geometry import box
+from pathlib import Path
 
 
-def find_template_raster(base_dir: str) -> str:
+def find_template_raster(base_dir: Path) -> Path:
     """
     Locate the GPW 1 km template raster. Prefer year 2020, fall back to any GPW 1 km SA.
     """
-    candidates_preferred = [
-        os.path.join(base_dir, "data", "GPW", "GPW_population_density_SA_1km_2020.tif"),
-    ]
-    for c in candidates_preferred:
-        if os.path.isfile(c):
-            return c
+    template_path = base_dir / "data" / "ready" / "GPW" / "GPW_population_density_SA_1km_2020.tif"
+    if template_path.is_file():
+        return template_path
 
-    # Fallback: any GPW_population_density_SA_1km_*.tif
-    fallback_glob = os.path.join(base_dir, "data", "GPW", "GPW_population_density_SA_1km_*.tif")
-    matches = sorted(glob.glob(fallback_glob))
-    if not matches:
-        raise FileNotFoundError(
-            f"No GPW 1 km template raster found. Expected at {candidates_preferred[0]} or matching {fallback_glob}"
-        )
-    return matches[-1]
+    matches = sorted((base_dir / "data" / "ready" / "GPW").glob("GPW_population_density_SA_1km_*.tif"))
+    if matches:
+        return matches[-1]
+
+    raise FileNotFoundError(
+        "No GPW 1 km template raster found in data/ready/GPW. Expected "
+        "GPW_population_density_SA_1km_2020.tif or a matching pattern "
+        "'GPW_population_density_SA_1km_*.tif'."
+    )
 
 
-def read_template_info(template_path: str) -> Tuple[Affine, int, int, str, Tuple[float, float, float, float]]:
+def read_template_info(template_path: Path) -> Tuple[Affine, int, int, str, Tuple[float, float, float, float]]:
     with rasterio.open(template_path) as ds:
         transform: Affine = ds.transform
         width: int = ds.width
@@ -55,24 +74,26 @@ def read_template_info(template_path: str) -> Tuple[Affine, int, int, str, Tuple
     return transform, width, height, crs_wkt_or_epsg, (bounds.left, bounds.bottom, bounds.right, bounds.top)
 
 
-def find_shapefile_in_dir(dir_path: str) -> Optional[str]:
+def find_shapefile_in_dir(dir_path: Path) -> Optional[Path]:
     """Return the first .shp file found within dir_path (non-recursive)."""
-    shp_matches = sorted(glob.glob(os.path.join(dir_path, "*.shp")))
+    shp_matches = sorted(dir_path.glob("*.shp"))
     if shp_matches:
         return shp_matches[0]
     # Also support GeoPackage if present
-    gpkg_matches = sorted(glob.glob(os.path.join(dir_path, "*.gpkg")))
+    gpkg_matches = sorted(dir_path.glob("*.gpkg"))
     if gpkg_matches:
         return gpkg_matches[0]
     return None
 
 
-def get_gsn_layers(base_dir: str) -> List[Tuple[str, str]]:
+def get_gsn_layers(base_dir: Path) -> List[Tuple[str, Path]]:
     """
     Find the five GlobalSafetyNet layers and return list of tuples (name_key, vector_path).
     name_key will be used for output filenames.
     """
-    gsn_base = os.path.join(base_dir, "data", "GlobalSafetyNet")
+    gsn_base = base_dir / "data" / "ready" / "GSN" / "GlobalSafetyNet"
+    if not gsn_base.is_dir():
+        raise FileNotFoundError(f"Could not locate GlobalSafetyNet directory at {gsn_base}")
     layer_dirs = [
         "climate_stabilisation_areas",
         "high_biodiversity_areas",
@@ -83,8 +104,8 @@ def get_gsn_layers(base_dir: str) -> List[Tuple[str, str]]:
 
     layers: List[Tuple[str, str]] = []
     for d in layer_dirs:
-        dir_path = os.path.join(gsn_base, d)
-        if not os.path.isdir(dir_path):
+        dir_path = gsn_base / d
+        if not dir_path.is_dir():
             raise FileNotFoundError(f"Expected directory not found: {dir_path}")
         shp = find_shapefile_in_dir(dir_path)
         if shp is None:
@@ -157,7 +178,7 @@ def rasterize_gdf(
 
 
 def save_geotiff(
-    out_path: str,
+    out_path: Path,
     array: np.ndarray,
     transform: Affine,
     crs: str,
@@ -178,26 +199,26 @@ def save_geotiff(
         "blockysize": 256,
         "nodata": 0,
     }
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     with rasterio.open(out_path, "w", **profile) as dst:
         dst.write(array, 1)
 
 
 def main() -> int:
-    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    project_root = Path(__file__).resolve().parents[2]
 
     # 1) Template raster
-    template_path = find_template_raster(base_dir)
+    template_path = find_template_raster(project_root)
     transform, width, height, template_crs, t_bounds = read_template_info(template_path)
 
     # 2) Target bbox polygon in template CRS
     t_bbox_poly = gpd.GeoSeries([bbox_polygon(t_bounds)], crs=template_crs)
 
     # 3) GSN vector layers
-    layers = get_gsn_layers(base_dir)
+    layers = get_gsn_layers(project_root)
 
     # 4) Output dir
-    out_dir = os.path.join(base_dir, "data", "output_masks")
+    out_dir = project_root / "data" / "ready" / "GSN"
 
     # 5) Process each layer
     for key, vec_path in layers:
@@ -229,7 +250,7 @@ def main() -> int:
                 mask = rasterize_gdf(gdf, transform, width, height, burn_value=1, all_touched=False)
 
         out_name = f"gsn_{key}_mask_1km.tif"
-        out_path = os.path.join(out_dir, out_name)
+        out_path = out_dir / out_name
         save_geotiff(out_path, mask, transform, template_crs)
         print(f"Saved {out_path}")
 

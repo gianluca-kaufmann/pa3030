@@ -1,20 +1,32 @@
 #!/usr/bin/env python3
 """
-Road Infrastructure Preprocessing for South America
+Road infrastructure preprocessing
+=================================
 
-This script:
-- Clips all road shapefiles in `data/ready/road_infrastructure` to South America
-  using a 1 km reference grid (GPW 2020) as the exact spatial mask
-- Rasterizes the clipped roads to a 1 km presence/absence GeoTIFF aligned to
-  the reference grid
+Description:
+    Prepare vector road datasets for the South America study area and produce
+    a 1 km grid that records the presence of road infrastructure.
+
+Source data:
+    - Input shapefiles located in `data/ready/road_infrastructure/`.
+    - Reference template raster `data/ready/GPW/GPW_population_density_SA_1km_2020.tif`.
+
+Objective:
+    Clip available road vectors to the template extent and generate a 1 km
+    presence/absence raster aligned with the common project grid.
+
+Process overview:
+    1. Load the 1 km reference raster and extract its bounds, CRS, and grid
+       properties.
+    2. Read all road shapefiles, reproject them to the template CRS, and filter
+       to valid line geometries.
+    3. Clip the roads to the template bounds and export the clipped vector data.
+    4. Rasterize the clipped roads to a 1 km binary presence grid.
+    5. Summarize the resulting raster statistics.
 
 Outputs:
-- data/ready/road_infrastructure/roads_sa.gpkg (vector, clipped)
-- data/ready/road_infrastructure/roads_sa_1km.tif (raster, 1 km grid)
-
-Assumptions:
-- Reference grid: `data/ready/GPW/GPW_population_density_SA_1km_2020.tif`
-  (CRS in meters; transform at 1,000 m resolution; covers South America)
+    - `data/ready/road_infrastructure/roads_sa.gpkg` (clipped vector roads).
+    - `data/ready/road_infrastructure/roads_sa_1km.tif` (1 km binary raster).
 """
 
 from pathlib import Path
@@ -37,7 +49,7 @@ warnings.filterwarnings("ignore")
 
 
 # Paths
-PROJECT_ROOT = Path("/Users/gianluca/Desktop/Master's Thesis/code")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_ROOT / "data"
 ROADS_DIR = DATA_DIR / "ready" / "road_infrastructure"
 REF_RASTER = DATA_DIR / "ready" / "GPW" / "GPW_population_density_SA_1km_2020.tif"
@@ -83,7 +95,7 @@ def load_and_clip_roads(bounds_poly, target_crs) -> gpd.GeoDataFrame:
             gdf = gdf.to_crs(target_crs)
             frames.append(gdf)
         except Exception as e:
-            print(f"❌ Failed to read {shp.name}: {e}")
+            print(f"Failed to read {shp.name}: {e}")
 
     if not frames:
         raise RuntimeError("No valid road geometries loaded.")
@@ -102,9 +114,9 @@ def load_and_clip_roads(bounds_poly, target_crs) -> gpd.GeoDataFrame:
     if not roads_clipped.empty:
         # Dissolve is not required for rasterization, but ensures clean export
         roads_clipped.to_file(OUT_VECTOR, driver="GPKG")
-        print(f"💾 Saved clipped roads vector: {OUT_VECTOR}")
+        print(f"Saved clipped roads vector: {OUT_VECTOR}")
     else:
-        print("⚠️ Clipped roads are empty.")
+        print("Clipped roads are empty.")
 
     return roads_clipped
 
@@ -140,36 +152,36 @@ def rasterize_roads(roads_gdf: gpd.GeoDataFrame, transform, crs, width: int, hei
     with rasterio.open(OUT_RASTER, "w", **profile) as dst:
         dst.write(raster, 1)
 
-    print(f"💾 Saved roads 1 km raster: {OUT_RASTER}")
+    print(f"Saved roads 1 km raster: {OUT_RASTER}")
 
     # Report pixel and area stats
     num_pixels = raster.size
     road_pixels = int((raster == 1).sum())
-    print(f"📏 Grid size: {height} x {width} = {num_pixels:,} pixels (~1 km² each)")
-    print(f"🛣️  Road pixels (presence): {road_pixels:,}")
+    print(f"Grid size: {height} x {width} = {num_pixels:,} pixels (~1 km² each)")
+    print(f"Road pixels (presence): {road_pixels:,}")
 
 
 def main():
-    print("🛣️  Road Infrastructure Preprocessing - South America")
+    print("Road Infrastructure Preprocessing - South America")
     print("=" * 70)
     print(f"Input roads directory: {ROADS_DIR}")
     print(f"Reference grid: {REF_RASTER}")
 
     # Load reference 1 km grid
     ref_src, bounds_poly, transform, crs, width, height = load_reference_grid()
-    print(f"✅ Reference CRS: {crs}")
-    print(f"✅ Reference transform: {transform}")
-    print(f"✅ Reference grid: {height} x {width} (~{height*width:,} km²)")
+    print(f"Reference CRS: {crs}")
+    print(f"Reference transform: {transform}")
+    print(f"Reference grid: {height} x {width} (~{height*width:,} km²)")
 
     # Load and clip roads to South America
     roads_sa = load_and_clip_roads(bounds_poly, crs)
-    print(f"✅ Roads after clip: {len(roads_sa):,} features")
+    print(f"Roads after clip: {len(roads_sa):,} features")
 
     # Rasterize to 1 km aligned grid
     rasterize_roads(roads_sa, transform, crs, width, height)
 
     ref_src.close()
-    print("\n✅ Preprocessing complete!")
+    print("\nPreprocessing complete.")
 
 
 if __name__ == "__main__":

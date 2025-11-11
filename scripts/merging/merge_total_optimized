@@ -9,7 +9,7 @@ Summary:
 
 Inputs:
 - Year-specific raster folders under ``data/ready/<dataset>`` with filenames containing the year.
-- Optional static rasters (no year in filename) applied to every year.
+- Static rasters (no year in filename) read once and injected into every year (e.g., elevation, slope).
 - WDPA raster (2012 preferred) that defines the reference grid.
 
 Outputs:
@@ -18,6 +18,9 @@ Outputs:
 
 Key choices:
 - Portable path resolution from ``Path(__file__)`` with automatic ``$SCRATCH`` override for HPC runs.
+- Forward-fill for yearly datasets (e.g., VIIRS, NDVI, GDP, GSN) whenever a target year has no source file,
+  reusing the most recent prior year to maintain a complete panel and avoid gaps in derived indicators.
+- Static datasets are cached once and broadcast to every processed year without further reads or transforms.
 - Vectorized coordinate generation and Arrow streaming to avoid pandas and large in-memory tables.
 - Explicit cleanup (`del`, `gc.collect`) after each window and year to keep RAM usage bounded.
 
@@ -30,9 +33,9 @@ Short overview of what the script does:
    - Load only that year's rasters per dataset (with forward-fill fallback and static layers).
    - Reproject on-the-fly to match the reference grid if needed.
    - Concatenate dataset arrays into a single band stack for the year.
-   - Write a per-year GeoTIFF and convert the stack to a long DataFrame (vectorized coords).
+   - Write a per-year GeoTIFF and convert the stack to a long Arrow table (vectorized coords).
    - Append the year's rows to a single Parquet file using a persistent writer.
-   - Immediately free memory for arrays and DataFrame chunks.
+   - Immediately free memory for arrays and Arrow tables.
 """
 
 import re
