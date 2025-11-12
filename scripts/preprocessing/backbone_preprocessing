@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""
+Backbone Mask Preprocessing
+===========================
+
+Objective:
+    Convert the existing South America backbone raster into an explicit binary
+    mask with no masked pixels: pixels inside South America are set to 1,
+    outside pixels to 0.
+
+Inputs:
+    - `data/ready/backbone/backbone_GEE.tif` (float raster, 1 km resolution,
+      EPSG:3857).
+
+Outputs:
+    - `data/ready/backbone/backbone.tif` (uint8 raster, same grid,
+      1 indicates South America, 0 otherwise).
+"""
+
+from pathlib import Path
+import warnings
+
+import numpy as np
+import rasterio
+
+
+warnings.filterwarnings("ignore")
+
+
+# Paths
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+BACKBONE_DIR = PROJECT_ROOT / "data" / "ready" / "backbone"
+INPUT_RASTER = BACKBONE_DIR / "backbone_GEE.tif"
+OUTPUT_RASTER = BACKBONE_DIR / "backbone.tif"
+
+
+def load_backbone() -> tuple[np.ma.MaskedArray, dict]:
+    """Read the backbone raster as a masked array and return data with metadata."""
+    if not INPUT_RASTER.exists():
+        raise FileNotFoundError(
+            f"Missing backbone raster at {INPUT_RASTER}. Run the export step first."
+        )
+
+    src = rasterio.open(INPUT_RASTER)
+    data = src.read(1, masked=True)
+    profile = src.profile.copy()
+    src.close()
+
+    print(
+        f"Loaded backbone raster: shape={data.shape}, "
+        f"masked pixels={(np.ma.getmaskarray(data)).sum():,}"
+    )
+    return data, profile
+
+
+def create_binary_mask(data: np.ma.MaskedArray) -> np.ndarray:
+    """Convert the masked backbone data to a uint8 binary array with no nodata."""
+    filled = np.ma.filled(data, 0)
+    binary = np.where(filled > 0, 1, 0).astype("uint8")
+    return binary
+
+
+def save_binary_raster(binary: np.ndarray, profile: dict) -> None:
+    """Write the binary raster to disk with updated metadata."""
+    profile.update(dtype="uint8", nodata=None, compress="lzw")
+    # Remove any lingering nodata definition to avoid masked pixels.
+    profile.pop("nodata", None)
+
+    with rasterio.open(OUTPUT_RASTER, "w", **profile) as dst:
+        dst.write(binary, 1)
+
+    total_pixels = binary.size
+    continent_pixels = int((binary == 1).sum())
+    print(f"Saved backbone raster: {OUTPUT_RASTER}")
+    print(f"Total pixels: {total_pixels:,}")
+    print(f"South America pixels (value=1): {continent_pixels:,}")
+    print(f"Outside pixels (value=0): {total_pixels - continent_pixels:,}")
+
+
+def main() -> None:
+    print("Backbone Mask Preprocessing")
+    print("=" * 60)
+    print(f"Input raster: {INPUT_RASTER}")
+    print(f"Output raster: {OUTPUT_RASTER}")
+
+    data, profile = load_backbone()
+    binary = create_binary_mask(data)
+    save_binary_raster(binary, profile)
+
+    print("Processing complete.")
+
+
+if __name__ == "__main__":
+    main()
+
+

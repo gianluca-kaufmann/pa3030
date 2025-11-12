@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""
+South America Backbone Mask Visualisation.
+
+Inputs:
+- Binary GeoTIFF `backbone.tif` stored in `data/ready/backbone`.
+  South America pixels are 1, outside pixels are 0 (no masked/nodata values).
+
+Process:
+- Load the backbone raster, display the continental extent, and
+  create basic diagnostics for the mask.
+
+Outputs:
+- PNG figures in `outputs/Figures/backbone_vis`.
+"""
+
+import warnings
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import rasterio
+from rasterio.plot import show
+
+warnings.filterwarnings("ignore")
+
+# Paths
+ROOT_DIR = Path(__file__).resolve().parents[2]
+DATA_DIR = ROOT_DIR / "data" / "ready" / "backbone"
+OUTPUT_DIR = ROOT_DIR / "outputs" / "Figures" / "backbone_vis"
+BACKBONE_PATH = DATA_DIR / "backbone.tif"
+
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_backbone():
+    """Load backbone raster and return array plus metadata."""
+    if not BACKBONE_PATH.exists():
+        raise FileNotFoundError(
+            f"Missing backbone raster at {BACKBONE_PATH}. "
+            "Run the preprocessing script before visualising."
+        )
+
+    with rasterio.open(BACKBONE_PATH) as src:
+        data = src.read(1)
+        transform = src.transform
+        crs = src.crs
+
+    land_pixels = int((data == 1).sum())
+    outside_pixels = int((data == 0).sum())
+    print(
+        f"Loaded backbone mask: shape={data.shape}, "
+        f"South America pixels (value=1): {land_pixels:,}, "
+        f"Outside pixels (value=0): {outside_pixels:,}"
+    )
+    return data, transform, crs
+
+
+def plot_backbone_map(data, transform, crs):
+    """Generate an overview map of the backbone mask."""
+    fig, ax = plt.subplots(figsize=(10, 12))
+    show(
+        data,
+        transform=transform,
+        cmap="viridis",
+        ax=ax,
+        title="South America Backbone Mask (1 = Land)",
+    )
+    ax.set_xlabel("Easting (m)")
+    ax.set_ylabel("Northing (m)")
+
+    output_file = OUTPUT_DIR / "backbone_mask_map.png"
+    fig.tight_layout()
+    fig.savefig(output_file, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved map: {output_file}")
+
+
+def plot_backbone_histogram(data):
+    """Plot a simple histogram/count of South America vs outside pixels."""
+    land_count = int((data == 1).sum())
+    outside_count = int((data == 0).sum())
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    bars = ax.bar(["South America (1)", "Outside (0)"], [land_count, outside_count], color=["#2ca02c", "#1f77b4"])
+    ax.bar_label(bars, fmt="{:,}")
+    ax.set_title("Backbone Pixel Counts")
+    ax.set_ylabel("Number of pixels")
+
+    output_file = OUTPUT_DIR / "backbone_pixel_counts.png"
+    fig.tight_layout()
+    fig.savefig(output_file, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved histogram: {output_file}")
+
+
+def main():
+    data, transform, crs = load_backbone()
+    plot_backbone_map(data, transform, crs)
+    plot_backbone_histogram(data)
+    print("Backbone visualisations complete.")
+
+
+if __name__ == "__main__":
+    main()
+

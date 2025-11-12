@@ -3,8 +3,8 @@ Dataset: FAO GAUL 2015 level-0 (ee.FeatureCollection("FAO/GAUL_SIMPLIFIED_500m/2
 Purpose: Create a 1 km binary land mask (South America) as a backbone GeoTIFF.
 Overview: Authenticates with Google Earth Engine, dissolves all South American
           countries into a single polygon, burns it into a 1 km raster in EPSG:3857,
-          and exports a float GeoTIFF with on-continent pixels set to 1 and everything
-          else set to NaN.
+          and exports a float GeoTIFF with on-continent pixels set to 1 and off-continent
+          pixels set to 0.
 Usage: export EE_PROJECT_ID=<your-project-id> && python "scripts/data extraction/backbone_export"
 """
 
@@ -24,7 +24,7 @@ GAUL_COLLECTION = "FAO/GAUL_SIMPLIFIED_500m/2015/level0"
 
 SOUTH_AMERICA_COUNTRIES = [
     "Argentina",
-    "Bolivia (Plurinational State of)",
+    "Bolivia",
     "Brazil",
     "Chile",
     "Colombia",
@@ -35,7 +35,7 @@ SOUTH_AMERICA_COUNTRIES = [
     "Peru",
     "Suriname",
     "Uruguay",
-    "Venezuela (Bolivarian Republic of)",
+    "Venezuela",
 ]
 
 
@@ -68,16 +68,16 @@ def get_south_america_geometry() -> ee.Geometry:
 
 
 def build_backbone_image(region: ee.Geometry) -> ee.Image:
-    """Create a float image with South America pixels set to 1 and others masked."""
-    land_constant = ee.Image.constant(1).clip(region)
-    masked_land = land_constant.updateMask(land_constant)
-
+    """Create a float image with South America pixels set to 1 and others to 0."""
     backbone = (
-        masked_land.toFloat()
+        ee.Image.constant(1)
+        .toFloat()
+        .clip(region)
+        .unmask(0)
         .rename("backbone")
     )
 
-    print("Backbone image prepared (1 for land, masked outside).")
+    print("Backbone image prepared (1 for land, 0 outside).")
     return backbone
 
 
