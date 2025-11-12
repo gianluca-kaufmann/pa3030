@@ -42,14 +42,14 @@ source "$VENV_DIR/bin/activate"
 echo "Starting merge script..."
 
 # --- Preflight checks ---
-ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1;>
+ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
 [ -f scripts/merging/merge_total_optimized ] || {
-  echo "ERROR: merge_total_optimized not found under scripts/merging"; find scri>
-
-[ -d data/ready/WDPA ] || {
-  echo "ERROR: data/ready/WDPA missing (symlink to $SCRATCH/data expected)"; ls>
+  echo "ERROR: merge_total_optimized not found under scripts/merging"
+  find scripts -maxdepth 2 -type f -name "merge_total_optimized"
+  exit 1
+}
 
 # Run the script
 python scripts/merging/merge_total_optimized
