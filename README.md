@@ -70,11 +70,8 @@ earthengine authenticate
 
 The sections below detail each stage, expected inputs/outputs, and common command sequences.
 
-<<<<<<< HEAD
+
 ## Typical run sequence
-=======
-# Typical run sequence
->>>>>>> 0ac21f5877325f8c1a442e2ced20b58c2f5a80fb
 
 ## 1. Data Extraction
 
