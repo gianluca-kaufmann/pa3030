@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Multi-Temporal Satellite Embeddings (2018-2024) - Visualization
+Multi-temporal satellite embedding visualization (2018-2024).
 
-Creates visualizations for the merged multi-temporal embedding file (448 bands = 64 bands × 7 years).
-Generates PCA composites and heatmaps for each year to show temporal changes.
+Inputs:
+- GeoTIFF `SatelliteEmbeddings_SA_1km_2018-2024_multitemporal.tif` located in `data/ready/embeddings`.
 
-Input: SatelliteEmbeddings_SA_1km_2018-2024_multitemporal.tif
-Output: outputs/Figures/embeddings_vis/embeddings_*.png
+Process:
+- Loads the 448-band embedding raster, optionally downsamples for visual clarity, computes PCA composites, and generates annual heatmaps and summaries.
+
+Outputs:
+- PNG figures saved to `outputs/Figures/embeddings_vis`.
 """
 
 import numpy as np
@@ -17,10 +20,10 @@ from typing import Tuple, List
 import matplotlib.gridspec as gridspec
 
 # Paths
-PROJECT_ROOT = Path("/Users/gianluca/Desktop/Master's Thesis/code")
-EMBED_DIR = PROJECT_ROOT / "data" / "ready" / "embeddings"
+ROOT_DIR = Path(__file__).resolve().parents[2]
+EMBED_DIR = ROOT_DIR / "data" / "ready" / "embeddings"
 EMBEDDINGS_FILE = EMBED_DIR / "SatelliteEmbeddings_SA_1km_2018-2024_multitemporal.tif"
-OUT_DIR = PROJECT_ROOT / "outputs" / "Figures" / "embeddings_vis"
+OUT_DIR = ROOT_DIR / "outputs" / "Figures" / "embeddings_vis"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Years in the dataset
@@ -30,7 +33,7 @@ BANDS_PER_YEAR = 64
 
 def log_progress(message: str):
     """Simple logging function."""
-    print(f"📊 {message}")
+    print(message)
 
 
 def load_multitemporal_data(downsample: bool = True, 
@@ -210,14 +213,14 @@ def create_year_visualizations(data: np.ndarray) -> None:
         rgb = compute_pca_rgb(year_data, normalize='zscore')
         out_file = OUT_DIR / f"embeddings_{year}_pca_rgb.png"
         plt.imsave(out_file, rgb)
-        log_progress(f"  ✅ Saved: {out_file.name}")
+        log_progress(f"  Saved: {out_file.name}")
         
         # 2. Magnitude heatmap
         log_progress(f"  Computing magnitude...")
         mag = compute_magnitude(year_data)
         out_file = OUT_DIR / f"embeddings_{year}_magnitude.png"
         plt.imsave(out_file, mag, cmap='magma')
-        log_progress(f"  ✅ Saved: {out_file.name}")
+        log_progress(f"  Saved: {out_file.name}")
 
 
 def create_temporal_comparison_grid(data: np.ndarray) -> None:
@@ -250,7 +253,7 @@ def create_temporal_comparison_grid(data: np.ndarray) -> None:
     plt.savefig(out_file, dpi=300, bbox_inches='tight')
     plt.close()
     
-    log_progress(f"✅ Saved: {out_file.name}")
+    log_progress(f"Saved: {out_file.name}")
 
 
 def create_magnitude_temporal_grid(data: np.ndarray) -> None:
@@ -287,7 +290,7 @@ def create_magnitude_temporal_grid(data: np.ndarray) -> None:
     plt.savefig(out_file, dpi=300, bbox_inches='tight')
     plt.close()
     
-    log_progress(f"✅ Saved: {out_file.name}")
+    log_progress(f"Saved: {out_file.name}")
 
 
 def print_data_statistics(data: np.ndarray, metadata: dict) -> None:
@@ -330,7 +333,7 @@ def main():
     
     # Check file exists
     if not EMBEDDINGS_FILE.exists():
-        print(f"❌ Embeddings file not found: {EMBEDDINGS_FILE}")
+        print(f"Error: Embeddings file not found: {EMBEDDINGS_FILE}")
         print()
         print("Please run the merge script first:")
         print("   python scripts/merging/merge_embeddings_total")
@@ -349,7 +352,7 @@ def main():
     
     # Summary
     print("\n" + "=" * 80)
-    print("✅ VISUALIZATION COMPLETE")
+    print("VISUALIZATION COMPLETE")
     print("=" * 80)
     
     total_files = len(YEARS) * 2 + 2  # 2 per year + 2 grids
@@ -364,7 +367,7 @@ def main():
     print(f"   • embeddings_temporal_comparison_grid.png - All years PCA RGB")
     print(f"   • embeddings_magnitude_temporal_grid.png - All years magnitude")
     
-    print("\n💡 TIPS:")
+    print("\nHint: TIPS:")
     print("   • PCA visualizations show spatial patterns in embedding space")
     print("   • Temporal grids allow visual comparison of changes over time")
     print("   • Magnitude shows overall embedding strength/intensity")

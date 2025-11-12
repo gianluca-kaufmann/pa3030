@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Oil & Gas Infrastructure Visualization for South America 2024 
+Oil and gas infrastructure visualization for South America (2024).
 
-This script creates visualizations of the Oil & Gas infrastructure density
-(count per 1km pixel) for 2024.
+Inputs:
+- GeoTIFF `Oil_Gas_Infrastructure_SA_1km.tif` located in `data/ready/oil_gas`.
 
-Inputs: GeoTIFF exported from GEE at 1km resolution, single band named
-"infrastructure_count", stored in data/oil_gas.
+Process:
+- Loads the infrastructure count raster, converts nodata values, calculates descriptive statistics, and generates heatmap and summary figures.
 
-Outputs: heatmap and basic statistics, saved in outputs/Figures/oil_gas_vis.
+Outputs:
+- PNG figures saved to `outputs/Figures/oil_gas_vis`.
 """
 
 import numpy as np
@@ -21,20 +22,21 @@ from matplotlib.colors import Normalize
 warnings.filterwarnings('ignore')
 
 # Paths
-data_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/data/ready/oil_gas")
-output_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/outputs/Figures/oil_gas_vis")
+ROOT_DIR = Path(__file__).resolve().parents[2]
+data_dir = ROOT_DIR / "data" / "ready" / "oil_gas"
+output_dir = ROOT_DIR / "outputs" / "Figures" / "oil_gas_vis"
 output_dir.mkdir(parents=True, exist_ok=True)
 
 # No year suffix in filename
 
 def load_oil_gas_data():
     """Load oil & gas infrastructure raster."""
-    print("📁 Loading Oil & Gas infrastructure raster...")
+    print("Loading Oil & Gas infrastructure raster...")
 
     tif_path = data_dir / "Oil_Gas_Infrastructure_SA_1km.tif"
 
     if not tif_path.exists():
-        print(f"   ❌ File not found: {tif_path.name}")
+        print(f"   Error: File not found: {tif_path.name}")
         return None
 
     try:
@@ -48,7 +50,7 @@ def load_oil_gas_data():
                 data[data == nodata] = np.nan
 
             valid_pixels = np.sum(~np.isnan(data))
-            print(f"   ✅ Shape: {data.shape}, Valid pixels: {valid_pixels:,}")
+            print(f"   Shape: {data.shape}, Valid pixels: {valid_pixels:,}")
 
             data_info = {
                 'data': data,
@@ -56,11 +58,11 @@ def load_oil_gas_data():
                 'file_path': tif_path
             }
 
-        print(f"   📊 Successfully loaded data")
+        print(f"   Successfully loaded data")
         return data_info
 
     except Exception as e:
-        print(f"   ❌ Error loading data: {e}")
+        print(f"   Error loading data: {e}")
         return None
 
 def compute_vmax(data, percentile: float = 99.0) -> float:
@@ -76,7 +78,7 @@ def create_infrastructure_map(data_info):
     if data_info is None:
         return
 
-    print("🎨 Creating infrastructure heatmap...")
+    print("Creating infrastructure heatmap...")
 
     data = data_info['data']
     vmax = compute_vmax(data, percentile=99.0)
@@ -104,7 +106,7 @@ def create_infrastructure_map(data_info):
     plt.tight_layout()
     out_file = output_dir / "oil_gas_infrastructure_sa.png"
     plt.savefig(out_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {out_file.name}")
+    print(f"   Saved: {out_file.name}")
     plt.close()
 
 def create_statistics_plot(data_info):
@@ -112,7 +114,7 @@ def create_statistics_plot(data_info):
     if data_info is None:
         return
 
-    print("📊 Creating statistics summary...")
+    print("Creating statistics summary...")
 
     data = data_info['data']
     
@@ -156,7 +158,7 @@ Total pixels: {data.size:,}"""
     
     out_file = output_dir / "oil_gas_infrastructure_stats.png"
     plt.savefig(out_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {out_file.name}")
+    print(f"   Saved: {out_file.name}")
     plt.close()
 
 def create_summary(data_info):
@@ -168,7 +170,7 @@ def create_summary(data_info):
     valid_data = data[np.isfinite(data)]
 
     print("\n" + "=" * 70)
-    print("📋 VISUALIZATION SUMMARY")
+    print("VISUALIZATION SUMMARY")
     print("=" * 70)
     print(f"Data shape: {data.shape}")
     print(f"Spatial dimensions: {data.shape[0]} x {data.shape[1]}")
@@ -180,20 +182,20 @@ def create_summary(data_info):
     print(f"Output directory: {output_dir}")
 
 def main():
-    print("🌍 Oil & Gas Infrastructure Visualization — South America")
+    print("Oil & Gas Infrastructure Visualization — South America")
     print("=" * 70)
 
     data_info = load_oil_gas_data()
     if data_info is None:
-        print("❌ Failed to load data. Exiting.")
+        print("Failed to load data. Exiting.")
         return
 
-    print("\n🎨 Creating visualizations...")
+    print("\nCreating visualizations...")
     create_infrastructure_map(data_info)
     create_statistics_plot(data_info)
     create_summary(data_info)
 
-    print("\n✅ Visualization complete! 🎉")
+    print("\nVisualization complete! ")
 
 if __name__ == "__main__":
     main()

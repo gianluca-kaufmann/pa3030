@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-WDPA Protected Areas Visualization for South America 2013-2024 
+WDPA protected areas visualization for South America (2013-2024).
 
-This script creates visualizations of the WDPA protected area coverage
-from multiple years (2013-2024) which contain binary coverage data
-(1 = protected, 0 = not protected) at 1km resolution.
+Inputs:
+- GeoTIFF rasters in `data/ready/WDPA`, named `WDPA_SA_1km_<year>.tif` with binary protection masks.
+
+Process:
+- Loads annual protected area rasters, computes coverage statistics, and generates yearly maps, temporal comparisons, and summary plots.
+
+Outputs:
+- PNG figures saved to `outputs/Figures/WDPA_vis`.
 """
 
 import numpy as np
@@ -17,9 +22,10 @@ from matplotlib.colors import ListedColormap
 warnings.filterwarnings('ignore')
 
 # Set up paths
-data_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/data")
+ROOT_DIR = Path(__file__).resolve().parents[2]
+data_dir = ROOT_DIR / "data"
 wdpa_dir = data_dir / "ready" / "WDPA"
-output_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/outputs/Figures/WDPA_vis")
+output_dir = ROOT_DIR / "outputs" / "Figures" / "WDPA_vis"
 output_dir.mkdir(parents=True, exist_ok=True)
 
 # Years to process
@@ -32,7 +38,7 @@ BOUNDARY_COLOR = '#000000'  # Black
 
 def load_wdpa_data():
     """Load the WDPA protected area coverage data for all years"""
-    print("📁 Loading WDPA protected area coverage data for all years...")
+    print("Loading WDPA protected area coverage data for all years...")
     
     all_data = {}
     
@@ -40,7 +46,7 @@ def load_wdpa_data():
         wdpa_file = wdpa_dir / f"WDPA_SA_1km_{year}.tif"
         
         if not wdpa_file.exists():
-            print(f"   ⚠️ File not found: {wdpa_file.name}")
+            print(f"   Warning: File not found: {wdpa_file.name}")
             continue
             
         try:
@@ -52,7 +58,7 @@ def load_wdpa_data():
                 total_pixels = np.sum(~np.isnan(data))
                 protected_percentage = (protected_pixels / total_pixels * 100) if total_pixels > 0 else 0
                 
-                print(f"   ✅ {year}: Shape: {data.shape}, Protected pixels: {protected_pixels:,} ({protected_percentage:.2f}%)")
+                print(f"   {year}: Shape: {data.shape}, Protected pixels: {protected_pixels:,} ({protected_percentage:.2f}%)")
                 
                 all_data[year] = {
                     'data': data[0],  # Single band data
@@ -63,14 +69,14 @@ def load_wdpa_data():
                 }
                 
         except Exception as e:
-            print(f"   ❌ Error loading {year}: {e}")
+            print(f"   Error loading {year}: {e}")
             continue
     
     if not all_data:
-        print("   ❌ No data loaded successfully")
+        print("   No data loaded successfully")
         return None
     
-    print(f"   📊 Successfully loaded {len(all_data)} years")
+    print(f"   Successfully loaded {len(all_data)} years")
     return all_data
 
 def create_protected_area_maps(all_data):
@@ -78,7 +84,7 @@ def create_protected_area_maps(all_data):
     if all_data is None:
         return
     
-    print("🗺️ Creating protected area maps for each year...")
+    print("Creating protected area maps for each year...")
     
     # Create custom colormap for protected areas
     colors = [UNPROTECTED_COLOR, PROTECTED_COLOR]
@@ -122,7 +128,7 @@ def create_protected_area_maps(all_data):
         # Save the plot
         output_file = output_dir / f"wdpa_coverage_sa_{year}.png"
         plt.savefig(output_file, dpi=300, bbox_inches='tight')
-        print(f"   💾 Saved: {output_file.name}")
+        print(f"   Saved: {output_file.name}")
         
         plt.close()  # Close to free memory
 
@@ -131,7 +137,7 @@ def create_temporal_comparison(all_data):
     if all_data is None or len(all_data) < 2:
         return
     
-    print("📈 Creating temporal comparison...")
+    print("Creating temporal comparison...")
     
     # Extract protected area percentages over time
     years = sorted(all_data.keys())
@@ -179,7 +185,7 @@ def create_temporal_comparison(all_data):
     # Save the plot
     output_file = output_dir / "wdpa_temporal_comparison.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.show()
 
@@ -188,7 +194,7 @@ def create_change_analysis(all_data):
     if all_data is None or len(all_data) < 2:
         return
     
-    print("📊 Creating change analysis...")
+    print("Creating change analysis...")
     
     years = sorted(all_data.keys())
     
@@ -257,7 +263,7 @@ def create_change_analysis(all_data):
     # Save the plot
     output_file = output_dir / "wdpa_change_analysis.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.show()
 
@@ -266,7 +272,7 @@ def create_summary_statistics(all_data):
     if all_data is None:
         return
     
-    print("📊 Creating summary statistics...")
+    print("Creating summary statistics...")
     
     # Extract statistics
     years = sorted(all_data.keys())
@@ -347,24 +353,24 @@ def create_summary_statistics(all_data):
     # Save the plot
     output_file = output_dir / "wdpa_summary_statistics.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.show()
 
 def main():
     """Main visualization function"""
-    print("🌍 WDPA Protected Areas Visualization - South America 2013-2024")
+    print("WDPA Protected Areas Visualization - South America 2013-2024")
     print("=" * 70)
     
     # Load data
     all_data = load_wdpa_data()
     
     if all_data is None:
-        print("❌ Failed to load data. Exiting.")
+        print("Failed to load data. Exiting.")
         return
     
     # Create visualizations
-    print("\n🎨 Creating visualizations...")
+    print("\nCreating visualizations...")
     
     # 1. Protected area maps for each year
     create_protected_area_maps(all_data)
@@ -380,7 +386,7 @@ def main():
     
     # Summary
     print("\n" + "=" * 70)
-    print("📋 VISUALIZATION SUMMARY")
+    print("VISUALIZATION SUMMARY")
     print("=" * 70)
     
     print(f"Years processed: {sorted(all_data.keys())}")
@@ -399,14 +405,14 @@ def main():
     print(f"  Range: {np.min(percentages):.2f}% - {np.max(percentages):.2f}%")
     print(f"  Total change (2013-2024): {percentages[-1] - percentages[0]:+.2f}%")
     
-    print(f"\n💾 Output files saved to: {output_dir}")
+    print(f"\nOutput files saved to: {output_dir}")
     for year in sorted(all_data.keys()):
         print(f"   - wdpa_coverage_sa_{year}.png")
     print("   - wdpa_temporal_comparison.png")
     print("   - wdpa_change_analysis.png")
     print("   - wdpa_summary_statistics.png")
     
-    print("\n✅ Visualization complete! 🎉")
+    print("\nVisualization complete! ")
 
 if __name__ == "__main__":
     main()

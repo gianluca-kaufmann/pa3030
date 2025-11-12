@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-Asset-level Data Visualization for South America 
+Asset-level infrastructure visualization for South America.
 
-This script creates comprehensive visualizations of the asset-level data
-from FA_sample_data.xlsx, showing both asset counts and capacity distributions
-across South America at 1km resolution.
+Inputs:
+- GeoTIFF rasters in `data/ready/assetlevel`, including `FA_assets_count_SA_1km.tif` and `FA_assets_capacity_SA_1km.tif`.
 
-Inputs: GeoTIFF files from data/assetlevel/:
-- FA_assets_count_SA_1km.tif (asset counts per pixel)
-- FA_assets_capacity_SA_1km.tif (capacity sum per pixel)
+Process:
+- Loads asset counts and capacity rasters, calculates descriptive statistics, and creates overview, density, categorical, statistical, and zoomed visualisations.
 
-Outputs: Multiple visualization types saved in outputs/Figures/assetlevel_vis/
+Outputs:
+- PNG figures written to `outputs/Figures/assetlevel_vis`.
 """
 
 import numpy as np
@@ -25,10 +24,10 @@ import seaborn as sns
 warnings.filterwarnings('ignore')
 
 # Set up paths
-PROJECT_ROOT = Path("/Users/gianluca/Desktop/Master's Thesis/code")
-DATA_DIR = PROJECT_ROOT / "data"
+ROOT_DIR = Path(__file__).resolve().parents[2]
+DATA_DIR = ROOT_DIR / "data"
 ASSETLEVEL_DIR = DATA_DIR / "ready" / "assetlevel"
-OUTPUT_DIR = PROJECT_ROOT / "outputs/Figures/assetlevel_vis"
+OUTPUT_DIR = ROOT_DIR / "outputs" / "Figures" / "assetlevel_vis"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Asset visualization settings
@@ -65,7 +64,7 @@ CAPACITY_COLORS = {
 
 def load_asset_data():
     """Load asset count and capacity raster data"""
-    print("📁 Loading FA asset-level data...")
+    print("Loading FA asset-level data...")
     
     data_info = {}
     
@@ -75,7 +74,7 @@ def load_asset_data():
         try:
             with rasterio.open(count_path) as src:
                 count_data = src.read(1).astype(np.float32)
-                print(f"   ✅ Count data: Shape: {count_data.shape}, Valid pixels: {np.sum(count_data > 0):,}")
+                print(f"   Count data loaded: shape {count_data.shape}, valid pixels {np.sum(count_data > 0):,}")
                 print(f"       Count range: {np.min(count_data):.0f} - {np.max(count_data):.0f} assets/pixel")
                 print(f"       Mean count: {np.mean(count_data[count_data > 0]):.2f} assets/pixel")
                 
@@ -85,9 +84,9 @@ def load_asset_data():
                     'file_path': count_path
                 }
         except Exception as e:
-            print(f"   ❌ Error loading count data: {e}")
+            print(f"   Error loading count data: {e}")
     else:
-        print(f"   ⚠️ Count file not found: {count_path}")
+        print(f"   Warning: count file not found: {count_path}")
     
     # Load capacity data
     capacity_path = ASSETLEVEL_DIR / CAPACITY_FILE
@@ -95,7 +94,7 @@ def load_asset_data():
         try:
             with rasterio.open(capacity_path) as src:
                 capacity_data = src.read(1).astype(np.float32)
-                print(f"   ✅ Capacity data: Shape: {capacity_data.shape}, Valid pixels: {np.sum(capacity_data > 0):,}")
+                print(f"   Capacity data loaded: shape {capacity_data.shape}, valid pixels {np.sum(capacity_data > 0):,}")
                 print(f"       Capacity range: {np.min(capacity_data):.2f} - {np.max(capacity_data):.2f} MW/pixel")
                 print(f"       Mean capacity: {np.mean(capacity_data[capacity_data > 0]):.2f} MW/pixel")
                 
@@ -105,15 +104,15 @@ def load_asset_data():
                     'file_path': capacity_path
                 }
         except Exception as e:
-            print(f"   ❌ Error loading capacity data: {e}")
+            print(f"   Error loading capacity data: {e}")
     else:
-        print(f"   ⚠️ Capacity file not found: {capacity_path}")
+        print(f"   Warning: capacity file not found: {capacity_path}")
     
     if not data_info:
-        print("   ❌ No data loaded successfully")
+        print("   No data loaded successfully")
         return None
     
-    print(f"   📊 Successfully loaded {len(data_info)} datasets")
+    print(f"   Successfully loaded {len(data_info)} datasets")
     return data_info
 
 def create_overview_maps(data_info):
@@ -121,7 +120,7 @@ def create_overview_maps(data_info):
     if data_info is None:
         return
     
-    print("🎨 Creating overview maps...")
+    print("Creating overview maps...")
     
     # Create custom colormaps
     count_colors = ['#2166ac', '#4393c3', '#92c5de', '#d1e5f0', '#f7f7f7', '#fddbc7', '#f4a582', '#d6604d', '#b2182b']
@@ -206,7 +205,7 @@ Pixels with capacity: {np.sum(capacity_data > 0):,}"""
     # Save the plot
     output_file = OUTPUT_DIR / "assetlevel_overview_sa.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.close()
 
@@ -215,7 +214,7 @@ def create_density_analysis(data_info):
     if data_info is None:
         return
     
-    print("📊 Creating density analysis...")
+    print("Creating density analysis...")
     
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     fig.suptitle('Asset Density Analysis', fontsize=16, fontweight='bold')
@@ -283,7 +282,7 @@ def create_density_analysis(data_info):
     # Save the plot
     output_file = OUTPUT_DIR / "assetlevel_density_analysis.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.close()
 
@@ -292,7 +291,7 @@ def create_categorical_maps(data_info):
     if data_info is None:
         return
     
-    print("🗺️ Creating categorical maps...")
+    print("Creating categorical maps...")
     
     fig, axes = plt.subplots(1, 2, figsize=(20, 8))
     fig.suptitle('Asset Distribution - Categorical View', fontsize=16, fontweight='bold')
@@ -374,7 +373,7 @@ def create_categorical_maps(data_info):
     # Save the plot
     output_file = OUTPUT_DIR / "assetlevel_categorical_maps.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.close()
 
@@ -383,7 +382,7 @@ def create_statistical_summary(data_info):
     if data_info is None:
         return
     
-    print("📈 Creating statistical summary...")
+    print("Creating statistical summary...")
     
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
     fig.suptitle('Asset Data Statistical Summary', fontsize=16, fontweight='bold')
@@ -523,7 +522,7 @@ def create_statistical_summary(data_info):
     # Save the plot
     output_file = OUTPUT_DIR / "assetlevel_statistical_summary.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.close()
 
@@ -532,7 +531,7 @@ def create_zoom_insets(data_info):
     if data_info is None:
         return
     
-    print("🔍 Creating zoomed-in views...")
+    print("Creating zoomed-in views...")
     
     # Find high-density areas
     if 'count' in data_info:
@@ -586,24 +585,24 @@ def create_zoom_insets(data_info):
             # Save the plot
             output_file = OUTPUT_DIR / "assetlevel_zoom_high_density.png"
             plt.savefig(output_file, dpi=300, bbox_inches='tight')
-            print(f"   💾 Saved: {output_file.name}")
+            print(f"   Saved: {output_file.name}")
             
             plt.close()
 
 def main():
     """Main visualization function"""
-    print("🎨 FA Asset-level Data Visualization")
+    print("FA Asset-level Data Visualization")
     print("=" * 60)
     
     # Load data
     data_info = load_asset_data()
     
     if data_info is None:
-        print("❌ No data available for visualization. Exiting.")
+        print("No data available for visualization. Exiting.")
         return
     
     # Create visualizations
-    print("\n🎨 Creating visualizations...")
+    print("\nCreating visualizations...")
     
     # 1. Overview maps
     create_overview_maps(data_info)
@@ -620,14 +619,14 @@ def main():
     # 5. Zoomed views
     create_zoom_insets(data_info)
     
-    print(f"\n✅ Visualization complete! 🎉")
-    print(f"📁 Output directory: {OUTPUT_DIR}")
-    print(f"📊 Created visualizations:")
-    print(f"   • Overview maps (linear and log scales)")
-    print(f"   • Density analysis plots")
-    print(f"   • Categorical distribution maps")
-    print(f"   • Statistical summary")
-    print(f"   • Zoomed views of high-density areas")
+    print("\nVisualization complete.")
+    print(f"Output directory: {OUTPUT_DIR}")
+    print("Created visualizations:")
+    print("   - Overview maps (linear and log scales)")
+    print("   - Density analysis plots")
+    print("   - Categorical distribution maps")
+    print("   - Statistical summary")
+    print("   - Zoomed views of high-density areas")
 
 if __name__ == "__main__":
     main()

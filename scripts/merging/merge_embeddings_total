@@ -20,8 +20,9 @@ Processing mechanism:
   into a single multi-band GeoTIFF to minimise memory pressure (only one band loaded at a time).
 
 Output artefact:
-- Writes ``SatelliteEmbeddings_SA_1km_2018-2024_multitemporal.tif`` next to the source mosaics. The
-  stacked file contains 448 bands (64 embeddings × 7 years) and preserves the original spatial grid.
+- Writes ``SatelliteEmbeddings_SA_1km_2018-2024_multitemporal.tif`` to ``data/ml`` in the repository
+  root (``/code/data/ml``). The stacked file contains 448 bands (64 embeddings × 7 years) and
+  preserves the original spatial grid.
 """
 
 import os
@@ -44,12 +45,13 @@ else:
     DATA_ROOT = PROJECT_ROOT / "data"
 
 EMBEDDINGS_DIR = DATA_ROOT / "ready" / "embeddings"
+ML_OUTPUT_DIR = PROJECT_ROOT / "data" / "ml"
 
 # Years to merge
 YEARS = [2018, 2019, 2020, 2021, 2022, 2023, 2024]
 
 # Output file
-OUTPUT_FILE = EMBEDDINGS_DIR / "SatelliteEmbeddings_SA_1km_2018-2024_multitemporal.tif"
+OUTPUT_FILE = ML_OUTPUT_DIR / "SatelliteEmbeddings_SA_1km_2018-2024_multitemporal.tif"
 
 
 def log_progress(message: str, start_time: float = None):
@@ -350,6 +352,9 @@ def main():
     log_progress(f"  Total bands: {expected_total_bands}")
     log_progress(f"  Spatial dimensions: {width} × {height}")
     
+    # Ensure output directory exists
+    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+
     # Write output using streaming (memory-efficient, band-by-band approach)
     write_multitemporal_geotiff_streaming(yearly_files, bands_per_year, width, height,
                                          transform, crs, band_descriptions, OUTPUT_FILE)

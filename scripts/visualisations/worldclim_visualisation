@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-WorldClim BIO Visualization for South America 
+WorldClim bioclimatic visualization for South America.
 
-This script creates visualizations of the WorldClim bioclimatic variables
-which contain 19 bands representing different climate indicators at 1km resolution.
-The data represents climatological averages from 1960-1991.
+Inputs:
+- GeoTIFF tiles in `data/ready/WorldClim`, containing the 19 bioclimatic variables at 1 km resolution.
+
+Process:
+- Loads all tiles, mosaics the rasters, applies scale factors, and generates maps, summary statistics, and comparative analyses for each bioclimatic band.
+
+Outputs:
+- PNG figures saved to `outputs/Figures/WorldClim_vis`.
 """
 
 import numpy as np
@@ -18,9 +23,10 @@ import glob
 warnings.filterwarnings('ignore')
 
 # Set up paths
-data_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/data")
+ROOT_DIR = Path(__file__).resolve().parents[2]
+data_dir = ROOT_DIR / "data"
 worldclim_dir = data_dir / "ready" / "WorldClim"
-output_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/outputs/Figures/WorldClim_vis")
+output_dir = ROOT_DIR / "outputs" / "Figures" / "WorldClim_vis"
 output_dir.mkdir(parents=True, exist_ok=True)
 
 # WorldClim BIO band names and descriptions
@@ -48,16 +54,16 @@ WORLDCLIM_BANDS = {
 
 def load_worldclim_data():
     """Load the WorldClim BIO data from all tile files and mosaic them"""
-    print("📁 Loading WorldClim BIO data from tile files...")
+    print("Loading WorldClim BIO data from tile files...")
     
     # Find all WorldClim tile files
     tile_files = list(worldclim_dir.glob("WorldClim_BIO_SA_1km-*.tif"))
     
     if not tile_files:
-        print("   ❌ No WorldClim files found")
+        print("   No WorldClim files found")
         return None
     
-    print(f"   📊 Found {len(tile_files)} tile files")
+    print(f"   Found {len(tile_files)} tile files")
     
     # Read all tiles and combine them
     all_tiles = []
@@ -70,7 +76,7 @@ def load_worldclim_data():
                 data = src.read()
                 bounds = src.bounds
                 
-                print(f"   ✅ {tile_file.name}: Shape: {data.shape}, Bounds: {bounds}")
+                print(f"   {tile_file.name}: Shape: {data.shape}, Bounds: {bounds}")
                 
                 all_tiles.append({
                     'data': data,
@@ -94,21 +100,21 @@ def load_worldclim_data():
                     )
                 
         except Exception as e:
-            print(f"   ❌ Error loading {tile_file.name}: {e}")
+            print(f"   Error loading {tile_file.name}: {e}")
             continue
     
     if not all_tiles:
-        print("   ❌ No tiles loaded successfully")
+        print("   No tiles loaded successfully")
         return None
     
     # Mosaic all tiles to get complete South America coverage
-    print("   🔧 Mosaicking tiles for complete coverage...")
+    print("   Mosaicking tiles for complete coverage...")
     
     # Calculate the mosaic dimensions
     mosaic_width = int((combined_bounds.right - combined_bounds.left) / 1000)  # 1km resolution
     mosaic_height = int((combined_bounds.top - combined_bounds.bottom) / 1000)
     
-    print(f"   📊 Mosaic dimensions: {mosaic_width} x {mosaic_height}")
+    print(f"   Mosaic dimensions: {mosaic_width} x {mosaic_height}")
     
     # Create mosaic array
     mosaic_data = np.full((19, mosaic_height, mosaic_width), np.nan, dtype=np.float32)
@@ -126,8 +132,8 @@ def load_worldclim_data():
         tile_height, tile_width = data.shape[1], data.shape[2]
         mosaic_data[:, top_offset:top_offset+tile_height, left_offset:left_offset+tile_width] = data
     
-    print(f"   📊 Mosaic data shape: {mosaic_data.shape}")
-    print(f"   📊 Valid pixels: {np.sum(~np.isnan(mosaic_data)):,}")
+    print(f"   Mosaic data shape: {mosaic_data.shape}")
+    print(f"   Valid pixels: {np.sum(~np.isnan(mosaic_data)):,}")
     
     return {
         'data': mosaic_data,
@@ -142,7 +148,7 @@ def create_overview_visualization(data_info):
     if data_info is None:
         return
     
-    print("🎨 Creating overview visualization for all bioclimatic variables...")
+    print("Creating overview visualization for all bioclimatic variables...")
     
     data = data_info['data']
     band_names = data_info['band_names']
@@ -189,7 +195,7 @@ def create_overview_visualization(data_info):
     # Save the plot
     output_file = output_dir / "worldclim_bio_overview.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.close()  # Close to free memory
 
@@ -198,7 +204,7 @@ def create_temperature_precipitation_comparison(data_info):
     if data_info is None:
         return
     
-    print("🌡️ Creating temperature and precipitation comparison...")
+    print("Creating temperature and precipitation comparison...")
     
     data = data_info['data']
     band_names = data_info['band_names']
@@ -255,7 +261,7 @@ def create_temperature_precipitation_comparison(data_info):
     # Save the plot
     output_file = output_dir / "worldclim_temp_precip_comparison.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.close()
 
@@ -264,7 +270,7 @@ def create_statistics_summary(data_info):
     if data_info is None:
         return
     
-    print("📊 Creating statistics summary...")
+    print("Creating statistics summary...")
     
     data = data_info['data']
     band_names = data_info['band_names']
@@ -350,24 +356,24 @@ def create_statistics_summary(data_info):
     # Save the plot
     output_file = output_dir / "worldclim_statistics_summary.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.close()
 
 def main():
     """Main visualization function"""
-    print("🌍 WorldClim BIO Visualization - South America (1960-1991)")
+    print("WorldClim BIO Visualization - South America (1960-1991)")
     print("=" * 70)
     
     # Load data
     data_info = load_worldclim_data()
     
     if data_info is None:
-        print("❌ Failed to load data. Exiting.")
+        print("Failed to load data. Exiting.")
         return
     
     # Create visualizations
-    print("\n🎨 Creating visualizations...")
+    print("\nCreating visualizations...")
     
     # 1. Overview of all variables
     create_overview_visualization(data_info)
@@ -380,7 +386,7 @@ def main():
     
     # Summary
     print("\n" + "=" * 70)
-    print("📋 VISUALIZATION SUMMARY")
+    print("VISUALIZATION SUMMARY")
     print("=" * 70)
     
     data = data_info['data']
@@ -394,12 +400,12 @@ def main():
     for band_name, band_info in WORLDCLIM_BANDS.items():
         print(f"  - {band_name}: {band_info['description']} ({band_info['unit']})")
     
-    print(f"\n💾 Output files saved to: {output_dir}")
+    print(f"\nOutput files saved to: {output_dir}")
     print("   - worldclim_bio_overview.png")
     print("   - worldclim_temp_precip_comparison.png")
     print("   - worldclim_statistics_summary.png")
     
-    print("\n✅ Visualization complete! 🎉")
+    print("\nVisualization complete! ")
 
 if __name__ == "__main__":
     main()

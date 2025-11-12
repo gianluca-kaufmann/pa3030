@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """
-Elevation & Slope Visualization for South America 
+Elevation and slope visualization for South America.
 
-This script creates visualizations of the elevation and slope datasets
-from COPERNICUS/DEM/GLO30 at 1km resolution for South America.
+Inputs:
+- GeoTIFF rasters in `data/ready/elevation`, including `Elevation_SA_1km.tif` and `Slope_SA_1km.tif`.
+
+Process:
+- Loads elevation and slope rasters, evaluates data quality, and produces maps, histograms, and summary statistics.
+
+Outputs:
+- PNG figures saved to `outputs/Figures/elevation_vis`.
 """
 
 import numpy as np
@@ -16,9 +22,10 @@ from matplotlib.colors import LinearSegmentedColormap, ListedColormap
 warnings.filterwarnings('ignore')
 
 # Set up paths
-data_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/data")
+ROOT_DIR = Path(__file__).resolve().parents[2]
+data_dir = ROOT_DIR / "data"
 elevation_dir = data_dir / "ready" / "elevation"
-output_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/outputs/Figures/elevation_vis")
+output_dir = ROOT_DIR / "outputs" / "Figures" / "elevation_vis"
 output_dir.mkdir(parents=True, exist_ok=True)
 
 # Color schemes for elevation and slope
@@ -27,7 +34,7 @@ SLOPE_COLORS = ['#F7F7F7', '#D9D9D9', '#BDBDBD', '#969696', '#737373', '#525252'
 
 def load_elevation_data():
     """Load the elevation and slope data"""
-    print("📁 Loading elevation and slope data...")
+    print("Loading elevation and slope data...")
     
     elevation_file = elevation_dir / "Elevation_SA_1km.tif"
     slope_file = elevation_dir / "Slope_SA_1km.tif"
@@ -40,13 +47,13 @@ def load_elevation_data():
             with rasterio.open(elevation_file) as src:
                 elevation_data = src.read(1)  # Read first band
                 valid_pixels = np.sum(~np.isnan(elevation_data))
-                print(f"   ✅ Elevation: Shape: {elevation_data.shape}, Valid pixels: {valid_pixels:,}")
+                print(f"   Elevation: Shape: {elevation_data.shape}, Valid pixels: {valid_pixels:,}")
                 
                 if valid_pixels == 0:
-                    print(f"   ⚠️ Elevation file contains only NaN values - export may not be complete")
-                    print(f"   💡 Check Google Earth Engine Tasks tab for export status")
+                    print(f"   Warning: Elevation file contains only NaN values - export may not be complete")
+                    print(f"   Hint: Check Google Earth Engine Tasks tab for export status")
                 else:
-                    print(f"   📊 Elevation range: {np.nanmin(elevation_data):.1f} - {np.nanmax(elevation_data):.1f} m")
+                    print(f"   Elevation range: {np.nanmin(elevation_data):.1f} - {np.nanmax(elevation_data):.1f} m")
                 
                 data['elevation'] = {
                     'data': elevation_data,
@@ -54,9 +61,9 @@ def load_elevation_data():
                     'file_path': elevation_file
                 }
         except Exception as e:
-            print(f"   ❌ Error loading elevation: {e}")
+            print(f"   Error loading elevation: {e}")
     else:
-        print(f"   ⚠️ Elevation file not found: {elevation_file}")
+        print(f"   Warning: Elevation file not found: {elevation_file}")
     
     # Load slope data
     if slope_file.exists():
@@ -64,13 +71,13 @@ def load_elevation_data():
             with rasterio.open(slope_file) as src:
                 slope_data = src.read(1)  # Read first band
                 valid_pixels = np.sum(~np.isnan(slope_data))
-                print(f"   ✅ Slope: Shape: {slope_data.shape}, Valid pixels: {valid_pixels:,}")
+                print(f"   Slope: Shape: {slope_data.shape}, Valid pixels: {valid_pixels:,}")
                 
                 if valid_pixels == 0:
-                    print(f"   ⚠️ Slope file contains only NaN values - export may not be complete")
-                    print(f"   💡 Check Google Earth Engine Tasks tab for export status")
+                    print(f"   Warning: Slope file contains only NaN values - export may not be complete")
+                    print(f"   Hint: Check Google Earth Engine Tasks tab for export status")
                 else:
-                    print(f"   📊 Slope range: {np.nanmin(slope_data):.1f} - {np.nanmax(slope_data):.1f} degrees")
+                    print(f"   Slope range: {np.nanmin(slope_data):.1f} - {np.nanmax(slope_data):.1f} degrees")
                 
                 data['slope'] = {
                     'data': slope_data,
@@ -78,12 +85,12 @@ def load_elevation_data():
                     'file_path': slope_file
                 }
         except Exception as e:
-            print(f"   ❌ Error loading slope: {e}")
+            print(f"   Error loading slope: {e}")
     else:
-        print(f"   ⚠️ Slope file not found: {slope_file}")
+        print(f"   Warning: Slope file not found: {slope_file}")
     
     if not data:
-        print("   ❌ No data loaded successfully")
+        print("   No data loaded successfully")
         return None
     
     # Check if any dataset has valid data
@@ -95,12 +102,12 @@ def load_elevation_data():
             break
     
     if not has_valid_data:
-        print("   ⚠️ All datasets contain only NaN values")
-        print("   💡 The Google Earth Engine export may not be complete yet")
-        print("   🔍 Check the Earth Engine Tasks tab for export status")
+        print("   Warning: All datasets contain only NaN values")
+        print("   Hint: The Google Earth Engine export may not be complete yet")
+        print("   Check the Earth Engine Tasks tab for export status")
         return None
     
-    print(f"   📊 Successfully loaded {len(data)} datasets")
+    print(f"   Successfully loaded {len(data)} datasets")
     return data
 
 def create_elevation_map(data):
@@ -108,7 +115,7 @@ def create_elevation_map(data):
     if 'elevation' not in data:
         return
     
-    print("🗻 Creating elevation map...")
+    print("Creating elevation map...")
     
     elevation_data = data['elevation']['data']
     
@@ -152,7 +159,7 @@ Max: {np.nanmax(elevation_masked):.1f} m"""
     # Save the plot
     output_file = output_dir / "elevation_map_sa.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.close()
 
@@ -161,7 +168,7 @@ def create_slope_map(data):
     if 'slope' not in data:
         return
     
-    print("📐 Creating slope map...")
+    print("Creating slope map...")
     
     slope_data = data['slope']['data']
     
@@ -205,7 +212,7 @@ Max: {np.nanmax(slope_masked):.1f}°"""
     # Save the plot
     output_file = output_dir / "slope_map_sa.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.close()
 
@@ -214,7 +221,7 @@ def create_histograms(data):
     if not data:
         return
     
-    print("📊 Creating distribution histograms...")
+    print("Creating distribution histograms...")
     
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
     fig.suptitle('Distribution of Elevation and Slope Values - South America', 
@@ -265,7 +272,7 @@ def create_histograms(data):
     # Save the plot
     output_file = output_dir / "elevation_slope_histograms.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.close()
 
@@ -274,7 +281,7 @@ def create_elevation_slope_scatter(data):
     if 'elevation' not in data or 'slope' not in data:
         return
     
-    print("🔗 Creating elevation-slope relationship plot...")
+    print("Creating elevation-slope relationship plot...")
     
     elevation_data = data['elevation']['data']
     slope_data = data['slope']['data']
@@ -287,7 +294,7 @@ def create_elevation_slope_scatter(data):
     valid_mask = ~np.isnan(elevation_masked) & ~np.isnan(slope_masked)
     
     if np.sum(valid_mask) == 0:
-        print("   ⚠️ No valid data points for scatter plot")
+        print("   Warning: No valid data points for scatter plot")
         return
     
     # Sample data for visualization (too many points for scatter plot)
@@ -327,7 +334,7 @@ def create_elevation_slope_scatter(data):
     # Save the plot
     output_file = output_dir / "elevation_slope_scatter.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.close()
 
@@ -336,7 +343,7 @@ def create_terrain_classification(data):
     if 'elevation' not in data or 'slope' not in data:
         return
     
-    print("🏔️ Creating terrain classification...")
+    print("Creating terrain classification...")
     
     elevation_data = data['elevation']['data']
     slope_data = data['slope']['data']
@@ -410,24 +417,24 @@ def create_terrain_classification(data):
     # Save the plot
     output_file = output_dir / "terrain_classification_sa.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.close()
 
 def main():
     """Main visualization function"""
-    print("🏔️ Elevation & Slope Visualization - South America")
+    print("Elevation & Slope Visualization - South America")
     print("=" * 60)
     
     # Load data
     data = load_elevation_data()
     
     if data is None:
-        print("❌ Failed to load data. Exiting.")
+        print("Failed to load data. Exiting.")
         return
     
     # Create visualizations
-    print("\n🎨 Creating visualizations...")
+    print("\nCreating visualizations...")
     
     # 1. Individual maps
     create_elevation_map(data)
@@ -444,7 +451,7 @@ def main():
     
     # Summary
     print("\n" + "=" * 60)
-    print("📋 VISUALIZATION SUMMARY")
+    print("VISUALIZATION SUMMARY")
     print("=" * 60)
     
     if 'elevation' in data:
@@ -465,14 +472,14 @@ def main():
         print(f"  Mean: {np.nanmean(slope_masked):.1f}°")
         print(f"  Std: {np.nanstd(slope_masked):.1f}°")
     
-    print(f"\n💾 Output files saved to: {output_dir}")
+    print(f"\nOutput files saved to: {output_dir}")
     print("   - elevation_map_sa.png")
     print("   - slope_map_sa.png")
     print("   - elevation_slope_histograms.png")
     print("   - elevation_slope_scatter.png")
     print("   - terrain_classification_sa.png")
     
-    print("\n✅ Visualization complete! 🎉")
+    print("\nVisualization complete! ")
 
 if __name__ == "__main__":
     main()

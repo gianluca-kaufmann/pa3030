@@ -1,18 +1,20 @@
 #!/bin/bash
-#SBATCH --job-name=INSERTNAME
-#SBATCH --time=01:00:00                    # Adjust time as needed
+#SBATCH --job-name=merge-run
+#SBATCH --partition=normal.24h
+#SBATCH --time=24:00:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem-per-cpu=7G                  # Total ~28G memory
-#SBATCH --array=1-1                       # Run 5 jobs (adjust number as needed)
-
-#SBATCH --output=/cluster/scratch/%u/logs/INSERTNAME_%A_%a.out
-#SBATCH --error=/cluster/scratch/%u/logs/INSERTNAME_%A_%a.err
+#SBATCH --cpus-per-task=8
+#SBATCH --mem-per-cpu=15G
+#SBATCH --output=/cluster/scratch/%u/logs/merge_run_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/merge_run_%j.err
+#SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
 mkdir -p "$SCRATCH/logs"
-mkdir -p "$SCRATCH/datasets"
-mkdir -p "$SCRATCH/models"
+mkdir -p "$SCRATCH/data"
+mkdir -p "$SCRATCH/outputs"
+mkdir -p "$SCRATCH/outputs/Results/merged_tifs"
+mkdir -p "$SCRATCH/wandb/merge"
 
 #------------------------------------------------------------------------------
 # Load modules
@@ -27,23 +29,29 @@ module load eth_proxy
 #------------------------------------------------------------------------------
 # Activate the Python virtual environment (uav-genAI-opti)
 #------------------------------------------------------------------------------
-VENV_DIR="$HOME/venv/ENVDIR"
+VENV_DIR="$HOME/venv/master-thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Set WANDB environment variables
-#------------------------------------------------------------------------------
-# make sure to set wandb api key and entity in the cluster environment variables
-export WANDB_PROJECT="INSERT WANDB PROJECT"
-export WANDB_API_KEY="remember to put your api key here"
-
-#-----------------------------------------------------------------------------
 # Navigate to training script directory
 #------------------------------------------------------------------------------
-cd "$HOME/projects/uav-genAI-opti/UAV/8_train_joint_model" || { echo "ERROR: Could not cd into training directory"; exit 1; }
 
 #------------------------------------------------------------------------------
 # Run the training
 #------------------------------------------------------------------------------
-echo "Starting joint model training..."
-srun python train_aircraft_joint_model.py
+echo "Starting merge script..."
+
+# --- Preflight checks ---
+ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1;>
+echo "PWD = $(pwd)"
+
+[ -f scripts/merging/merge_total_optimized ] || {
+  echo "ERROR: merge_total_optimized not found under scripts/merging"; find scri>
+
+[ -d data/ready/WDPA ] || {
+  echo "ERROR: data/ready/WDPA missing (symlink to $SCRATCH/data expected)"; ls>
+
+# Run the script
+python scripts/merging/merge_total_optimized
+
+echo "Merge script finished."

@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-Wildfire/Burned Area Visualization for South America 2000-2024 
+Wildfire burned area visualization for South America (2000-2024).
 
-This script creates visualizations of the MODIS burned area data
-from multiple years (2000-2024) which contain 2 bands:
-- burn_date: Sum of Julian burn days (0 = no burn, >0 = burned)
-- burned_mask: Binary mask (1 = burned anywhere in year, 0 = never burned)
+Inputs:
+- GeoTIFF rasters in `data/ready/wildfire`, named `Burned_Area_SA_1km_<year>.tif` with burn date and burned mask bands.
+
+Process:
+- Loads yearly burned area rasters, interprets burn timing and extent, and generates overview, change, and statistical visualisations.
+
+Outputs:
+- PNG figures saved to `outputs/Figures/wildfire_vis`.
 """
 
 import numpy as np
@@ -18,9 +22,10 @@ from matplotlib.colors import ListedColormap
 warnings.filterwarnings('ignore')
 
 # Set up paths
-data_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/data")
+ROOT_DIR = Path(__file__).resolve().parents[2]
+data_dir = ROOT_DIR / "data"
 wildfire_dir = data_dir / "ready" / "wildfire"
-output_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/outputs/Figures/wildfire_vis")
+output_dir = ROOT_DIR / "outputs" / "Figures" / "wildfire_vis"
 output_dir.mkdir(parents=True, exist_ok=True)
 
 # Years to process
@@ -34,7 +39,7 @@ BURN_BANDS = {
 
 def load_wildfire_data():
     """Load the burned area data for all years"""
-    print("📁 Loading burned area data for all years...")
+    print("Loading burned area data for all years...")
     
     all_data = {}
     
@@ -42,7 +47,7 @@ def load_wildfire_data():
         wildfire_file = wildfire_dir / f"Burned_Area_SA_1km_{year}.tif"
         
         if not wildfire_file.exists():
-            print(f"   ⚠️ File not found: {wildfire_file.name}")
+            print(f"   Warning: File not found: {wildfire_file.name}")
             continue
             
         try:
@@ -51,7 +56,7 @@ def load_wildfire_data():
                 
                 # Count valid pixels correctly (per spatial location, not per band)
                 valid_pixels = np.sum(~np.isnan(data[0]))  # Use first band only
-                print(f"   ✅ {year}: Shape: {data.shape}, Valid pixels: {valid_pixels:,}")
+                print(f"   {year}: Shape: {data.shape}, Valid pixels: {valid_pixels:,}")
                 
                 # Get band names
                 band_names = [f"burned_area_{year}_{band}" for band in BURN_BANDS.keys()]
@@ -64,14 +69,14 @@ def load_wildfire_data():
                 }
                 
         except Exception as e:
-            print(f"   ❌ Error loading {year}: {e}")
+            print(f"   Error loading {year}: {e}")
             continue
     
     if not all_data:
-        print("   ❌ No data loaded successfully")
+        print("   No data loaded successfully")
         return None
     
-    print(f"   📊 Successfully loaded {len(all_data)} years")
+    print(f"   Successfully loaded {len(all_data)} years")
     return all_data
 
 def create_burned_area_overview(all_data):
@@ -79,7 +84,7 @@ def create_burned_area_overview(all_data):
     if all_data is None:
         return
     
-    print("🎨 Creating burned area overview for each year...")
+    print("Creating burned area overview for each year...")
     
     for year, data_info in all_data.items():
         data = data_info['data']
@@ -142,7 +147,7 @@ def create_burned_area_overview(all_data):
         # Save the plot
         output_file = output_dir / f"burned_area_sa_{year}_overview.png"
         plt.savefig(output_file, dpi=300, bbox_inches='tight')
-        print(f"   💾 Saved: {output_file.name}")
+        print(f"   Saved: {output_file.name}")
         
         plt.close()  # Close to free memory
 
@@ -151,7 +156,7 @@ def create_temporal_analysis(all_data):
     if all_data is None or len(all_data) < 2:
         return
     
-    print("📈 Creating temporal analysis...")
+    print("Creating temporal analysis...")
     
     # Calculate statistics for each year
     temporal_stats = {}
@@ -257,7 +262,7 @@ def create_temporal_analysis(all_data):
     # Save the plot
     output_file = output_dir / "burned_area_temporal_analysis.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.show()
 
@@ -266,7 +271,7 @@ def create_summary_statistics(all_data):
     if all_data is None:
         return
     
-    print("📊 Creating summary statistics...")
+    print("Creating summary statistics...")
     
     # Collect all statistics
     all_stats = []
@@ -391,7 +396,7 @@ def create_summary_statistics(all_data):
     # Save the plot
     output_file = output_dir / "burned_area_summary_statistics.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.show()
 
@@ -400,7 +405,7 @@ def create_heatmap_analysis(all_data):
     if all_data is None or len(all_data) < 5:
         return
     
-    print("🔥 Creating heatmap analysis...")
+    print("Creating heatmap analysis...")
     
     # Create a heatmap showing burn intensity across years
     years = sorted(all_data.keys())
@@ -505,24 +510,24 @@ def create_heatmap_analysis(all_data):
     # Save the plot
     output_file = output_dir / "burned_area_heatmap_analysis.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.show()
 
 def main():
     """Main visualization function"""
-    print("🔥 Wildfire/Burned Area Visualization - South America 2000-2024")
+    print("Wildfire/Burned Area Visualization - South America 2000-2024")
     print("=" * 70)
     
     # Load data
     all_data = load_wildfire_data()
     
     if all_data is None:
-        print("❌ Failed to load data. Exiting.")
+        print("Failed to load data. Exiting.")
         return
     
     # Create visualizations
-    print("\n🎨 Creating visualizations...")
+    print("\nCreating visualizations...")
     
     # 1. Burned area overview for each year
     create_burned_area_overview(all_data)
@@ -538,7 +543,7 @@ def main():
     
     # Summary
     print("\n" + "=" * 70)
-    print("📋 VISUALIZATION SUMMARY")
+    print("VISUALIZATION SUMMARY")
     print("=" * 70)
     
     print(f"Years processed: {sorted(all_data.keys())}")
@@ -571,14 +576,14 @@ def main():
     print(f"  - Total burned pixels: {total_burned_pixels:,}")
     print(f"  - Overall burn fraction: {overall_burn_fraction:.4f}")
     
-    print(f"\n💾 Output files saved to: {output_dir}")
+    print(f"\nOutput files saved to: {output_dir}")
     for year in sorted(all_data.keys()):
         print(f"   - burned_area_sa_{year}_overview.png")
     print("   - burned_area_temporal_analysis.png")
     print("   - burned_area_summary_statistics.png")
     print("   - burned_area_heatmap_analysis.png")
     
-    print("\n✅ Visualization complete! 🔥")
+    print("\nVisualization complete! ")
 
 if __name__ == "__main__":
     main()

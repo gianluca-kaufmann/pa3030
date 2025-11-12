@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """
-MODIS NDVI Visualization for South America 2000-2024 
+MODIS NDVI visualization for South America (2000-2024).
 
-This script creates visualizations of the MODIS NDVI data
-from multiple years (2000-2024) at 1km resolution.
+Inputs:
+- GeoTIFF rasters stored in `data/ready/NDVI`, named `NDVI_SA_1km_<year>.tif` for years 2000-2024.
+
+Process:
+- Loads each raster, scales MODIS NDVI values, computes summary statistics, and produces annual, temporal, and comparative visualisations.
+
+Outputs:
+- PNG figures written to `outputs/Figures/NDVI_vis`.
 """
 
 import numpy as np
@@ -16,10 +22,11 @@ from matplotlib.colors import LinearSegmentedColormap
 warnings.filterwarnings('ignore')
 
 # Set up paths
-data_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/data")
-ndvi_dir = data_dir / "ready" / "NDVI"
-output_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/outputs/Figures/NDVI_vis")
-output_dir.mkdir(parents=True, exist_ok=True)
+ROOT_DIR = Path(__file__).resolve().parents[2]
+DATA_DIR = ROOT_DIR / "data"
+NDVI_DIR = DATA_DIR / "ready" / "NDVI"
+OUTPUT_DIR = ROOT_DIR / "outputs" / "Figures" / "NDVI_vis"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Years to process
 YEARS = list(range(2000, 2025))  # 2000 to 2024 inclusive
@@ -35,15 +42,15 @@ NDVI_CMAP = create_ndvi_colormap()
 
 def load_ndvi_data():
     """Load the NDVI data for all years"""
-    print("📁 Loading NDVI data for all years...")
+    print("Loading NDVI data for all years...")
     
     all_data = {}
     
     for year in YEARS:
-        ndvi_file = ndvi_dir / f"NDVI_SA_1km_{year}.tif"
+        ndvi_file = NDVI_DIR / f"NDVI_SA_1km_{year}.tif"
         
         if not ndvi_file.exists():
-            print(f"   ⚠️ File not found: {ndvi_file.name}")
+            print(f"   Warning: file not found: {ndvi_file.name}")
             continue
             
         try:
@@ -58,7 +65,7 @@ def load_ndvi_data():
                 # Mask invalid values
                 data = np.where((data < -1) | (data > 1), np.nan, data)
                 
-                print(f"   ✅ {year}: Shape: {data.shape}, Valid pixels: {np.sum(~np.isnan(data)):,}, "
+                print(f"   {year}: shape: {data.shape}, valid pixels: {np.sum(~np.isnan(data)):,}, "
                       f"NDVI range: [{np.nanmin(data):.3f}, {np.nanmax(data):.3f}]")
                 
                 all_data[year] = {
@@ -68,14 +75,14 @@ def load_ndvi_data():
                 }
                 
         except Exception as e:
-            print(f"   ❌ Error loading {year}: {e}")
+            print(f"   Error loading {year}: {e}")
             continue
     
     if not all_data:
-        print("   ❌ No data loaded successfully")
+        print("   No data loaded successfully")
         return None
     
-    print(f"   📊 Successfully loaded {len(all_data)} years")
+    print(f"   Successfully loaded {len(all_data)} years")
     return all_data
 
 def create_simple_overview(all_data):
@@ -83,7 +90,7 @@ def create_simple_overview(all_data):
     if all_data is None:
         return
     
-    print("🎨 Creating simple overview for each year...")
+    print("Creating simple overview for each year...")
     
     for year, data_info in all_data.items():
         data = data_info['data']
@@ -123,9 +130,9 @@ def create_simple_overview(all_data):
         plt.tight_layout()
         
         # Save the plot
-        output_file = output_dir / f"ndvi_sa_{year}_overview.png"
+        output_file = OUTPUT_DIR / f"ndvi_sa_{year}_overview.png"
         plt.savefig(output_file, dpi=300, bbox_inches='tight')
-        print(f"   💾 Saved: {output_file.name}")
+        print(f"   Saved: {output_file.name}")
         
         plt.close()  # Close to free memory
 
@@ -134,7 +141,7 @@ def create_temporal_comparison(all_data):
     if all_data is None or len(all_data) < 2:
         return
     
-    print("📈 Creating temporal comparison...")
+    print("Creating temporal comparison...")
     
     # Calculate statistics for each year
     years = sorted(all_data.keys())
@@ -194,9 +201,9 @@ def create_temporal_comparison(all_data):
     plt.tight_layout()
     
     # Save the plot
-    output_file = output_dir / "ndvi_temporal_comparison.png"
+    output_file = OUTPUT_DIR / "ndvi_temporal_comparison.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.close()
 
@@ -205,7 +212,7 @@ def create_multi_year_comparison(all_data):
     if all_data is None or len(all_data) < 4:
         return
     
-    print("🗺️ Creating multi-year comparison grid...")
+    print("Creating multi-year comparison grid...")
     
     # Select a subset of years to display (every 5 years + last year)
     years = sorted(all_data.keys())
@@ -244,9 +251,9 @@ def create_multi_year_comparison(all_data):
     plt.tight_layout()
     
     # Save the plot
-    output_file = output_dir / "ndvi_multi_year_comparison.png"
+    output_file = OUTPUT_DIR / "ndvi_multi_year_comparison.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.close()
 
@@ -255,7 +262,7 @@ def create_change_analysis(all_data):
     if all_data is None or len(all_data) < 2:
         return
     
-    print("🔄 Creating change analysis...")
+    print("Creating change analysis...")
     
     years = sorted(all_data.keys())
     first_year = years[0]
@@ -303,9 +310,9 @@ def create_change_analysis(all_data):
     plt.tight_layout()
     
     # Save the plot
-    output_file = output_dir / f"ndvi_change_analysis_{first_year}_{last_year}.png"
+    output_file = OUTPUT_DIR / f"ndvi_change_analysis_{first_year}_{last_year}.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.close()
 
@@ -314,7 +321,7 @@ def create_summary_statistics(all_data):
     if all_data is None:
         return
     
-    print("📊 Creating summary statistics...")
+    print("Creating summary statistics...")
     
     years = sorted(all_data.keys())
     
@@ -392,26 +399,26 @@ def create_summary_statistics(all_data):
     plt.tight_layout()
     
     # Save the plot
-    output_file = output_dir / "ndvi_summary_statistics.png"
+    output_file = OUTPUT_DIR / "ndvi_summary_statistics.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.close()
 
 def main():
     """Main visualization function"""
-    print("🌍 MODIS NDVI Visualization - South America 2000-2024")
+    print("MODIS NDVI Visualization - South America 2000-2024")
     print("=" * 70)
     
     # Load data
     all_data = load_ndvi_data()
     
     if all_data is None:
-        print("❌ Failed to load data. Exiting.")
+        print("Failed to load data. Exiting.")
         return
     
     # Create visualizations
-    print("\n🎨 Creating visualizations...")
+    print("\nCreating visualizations...")
     
     # 1. Simple overview for each year
     create_simple_overview(all_data)
@@ -430,7 +437,7 @@ def main():
     
     # Summary
     print("\n" + "=" * 70)
-    print("📋 VISUALIZATION SUMMARY")
+    print("VISUALIZATION SUMMARY")
     print("=" * 70)
     
     print(f"Years processed: {sorted(all_data.keys())}")
@@ -450,14 +457,14 @@ def main():
     print(f"  - Min mean: {np.min(all_means):.3f}")
     print(f"  - Max mean: {np.max(all_means):.3f}")
     
-    print(f"\n💾 Output files saved to: {output_dir}")
+    print(f"\nOutput files saved to: {OUTPUT_DIR}")
     print(f"   - {len(all_data)} individual year overview files")
     print("   - ndvi_temporal_comparison.png")
     print("   - ndvi_multi_year_comparison.png")
     print(f"   - ndvi_change_analysis_{min(all_data.keys())}_{max(all_data.keys())}.png")
     print("   - ndvi_summary_statistics.png")
-    
-    print("\n✅ Visualization complete! 🎉")
+
+    print("\nVisualization complete.")
 
 if __name__ == "__main__":
     main()

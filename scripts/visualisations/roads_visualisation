@@ -1,22 +1,15 @@
 #!/usr/bin/env python3
 """
-Road Infrastructure Visualization for South America 
+Road infrastructure visualization for South America.
 
-This script loads the preprocessed road infrastructure for South America and
-creates simple visualizations saved to the figures directory. It falls back to
-raw shapefiles if preprocessed outputs are missing.
+Inputs:
+- Preferred: `data/ready/road_infrastructure/roads_sa.gpkg` and `roads_sa_1km.tif`; falls back to shapefiles in `data/ready/road_infrastructure`.
 
-Inputs (preferred):
-- data/road_infrastructure/roads_sa.gpkg (vector, clipped)
-- data/road_infrastructure/roads_sa_1km.tif (raster, 1 km presence)
-
-Fallback inputs:
-- data/road_infrastructure/*.shp
+Process:
+- Loads vector and raster road datasets, combines attributes when available, and produces overview, attribute, and raster presence figures.
 
 Outputs:
-- outputs/Figures/road_infrastructure_vis/roads_overview.png
-- outputs/Figures/road_infrastructure_vis/roads_by_attribute_<attr>.png (if available)
-- outputs/Figures/road_infrastructure_vis/roads_raster_presence.png (if available)
+- PNG figures saved to `outputs/Figures/road_infrastructure_vis`.
 """
 
 import warnings
@@ -38,12 +31,12 @@ warnings.filterwarnings("ignore")
 
 
 # Paths
-PROJECT_ROOT = Path("/Users/gianluca/Desktop/Master's Thesis/code")
-DATA_DIR = PROJECT_ROOT / "data"
+ROOT_DIR = Path(__file__).resolve().parents[2]
+DATA_DIR = ROOT_DIR / "data"
 ROADS_DIR = DATA_DIR / "ready" / "road_infrastructure"
 VECTOR_PREPROCESSED = ROADS_DIR / "roads_sa.gpkg"
 RASTER_PREPROCESSED = ROADS_DIR / "roads_sa_1km.tif"
-OUTPUT_DIR = PROJECT_ROOT / "outputs/Figures/road_infrastructure_vis"
+OUTPUT_DIR = ROOT_DIR / "outputs" / "Figures" / "road_infrastructure_vis"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -70,7 +63,7 @@ def load_roads() -> gpd.GeoDataFrame:
             if not gdf.empty:
                 return gdf
         except Exception as e:
-            print(f"⚠️  Failed to load preprocessed vector: {e}. Falling back to raw shapefiles.")
+            print(f"Warning: Failed to load preprocessed vector: {e}. Falling back to raw shapefiles.")
 
     shp_files = _find_shapefiles(ROADS_DIR)
     if not shp_files:
@@ -93,7 +86,7 @@ def load_roads() -> gpd.GeoDataFrame:
             gdf = gdf.to_crs(3857)
             frames.append(gdf)
         except Exception as e:
-            print(f"❌ Failed to read {shp.name}: {e}")
+            print(f"Error: Failed to read {shp.name}: {e}")
 
     if not frames:
         raise RuntimeError("No valid road geometries loaded.")
@@ -145,7 +138,7 @@ def plot_overview(gdf: gpd.GeoDataFrame) -> None:
     outfile = OUTPUT_DIR / "roads_overview.png"
     plt.savefig(outfile, dpi=300, bbox_inches="tight")
     plt.close(fig)
-    print(f"💾 Saved: {outfile}")
+    print(f"Saved: {outfile}")
 
 
 def plot_by_attribute(gdf: gpd.GeoDataFrame, attr: str) -> None:
@@ -165,20 +158,20 @@ def plot_by_attribute(gdf: gpd.GeoDataFrame, attr: str) -> None:
     outfile = OUTPUT_DIR / f"roads_by_attribute_{attr}.png"
     plt.savefig(outfile, dpi=300, bbox_inches="tight")
     plt.close(fig)
-    print(f"💾 Saved: {outfile}")
+    print(f"Saved: {outfile}")
 
 
 def plot_raster_presence() -> None:
     """Plot the 1 km raster presence/absence if available."""
     if not RASTER_PREPROCESSED.exists():
-        print("ℹ️  No preprocessed raster found; skipping raster presence plot.")
+        print("ℹ  No preprocessed raster found; skipping raster presence plot.")
         return
 
     try:
         with rasterio.open(RASTER_PREPROCESSED) as src:
             data = src.read(1)
     except Exception as e:
-        print(f"⚠️  Failed to read raster: {e}")
+        print(f"Warning: Failed to read raster: {e}")
         return
 
     fig, ax = plt.subplots(figsize=(12, 12))
@@ -190,18 +183,18 @@ def plot_raster_presence() -> None:
     outfile = OUTPUT_DIR / "roads_raster_presence.png"
     plt.savefig(outfile, dpi=300, bbox_inches="tight")
     plt.close(fig)
-    print(f"💾 Saved: {outfile}")
+    print(f"Saved: {outfile}")
 
 
 def main() -> None:
-    print("🛣️  Road Infrastructure Visualization - South America")
+    print("Road Infrastructure Visualization - South America")
     print("=" * 70)
     print(f"Input directory: {ROADS_DIR}")
     print(f"Output directory: {OUTPUT_DIR}")
 
     # Load
     roads = load_roads()
-    print(f"✅ Loaded {len(roads):,} road features. CRS: {roads.crs}")
+    print(f"Loaded {len(roads):,} road features. CRS: {roads.crs}")
 
     # Overview
     plot_overview(roads)
@@ -209,15 +202,15 @@ def main() -> None:
     # Attribute-colored map (if applicable)
     attr = _best_attribute_for_coloring(roads)
     if attr:
-        print(f"🎨 Using attribute for coloring: {attr}")
+        print(f"Using attribute for coloring: {attr}")
         plot_by_attribute(roads, attr)
     else:
-        print("ℹ️  No suitable attribute found for categorical coloring; skipping.")
+        print("ℹ  No suitable attribute found for categorical coloring; skipping.")
 
     # Raster presence (1 km) if available
     plot_raster_presence()
 
-    print("\n✅ Visualization complete!")
+    print("\nVisualization complete!")
 
 
 if __name__ == "__main__":

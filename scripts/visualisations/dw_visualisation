@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-Dynamic World Fractions Visualization for South America 2017-2024 
+Dynamic World land cover fraction visualization for South America (2017-2024).
 
-This script creates visualizations of the Dynamic World land cover fractions
-from multiple years (2017-2024) which contain 9 bands representing
-different land cover types at 1km resolution.
+Inputs:
+- GeoTIFF rasters in `data/ready/DynamicWorld`, named `DW_fractions_SA_1km_<year>.tif` with class-specific fractions.
+
+Process:
+- Loads yearly fraction rasters, maps Dynamic World classes, and creates overview, change, and statistical visualisations.
+
+Outputs:
+- PNG figures saved to `outputs/Figures/DW_vis`.
 """
 
 import numpy as np
@@ -17,9 +22,10 @@ from matplotlib.colors import ListedColormap
 warnings.filterwarnings('ignore')
 
 # Set up paths
-data_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/data")
+ROOT_DIR = Path(__file__).resolve().parents[2]
+data_dir = ROOT_DIR / "data"
 dw_dir = data_dir / "ready" / "DynamicWorld"
-output_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/outputs/Figures/DW_vis")
+output_dir = ROOT_DIR / "outputs" / "Figures" / "DW_vis"
 output_dir.mkdir(parents=True, exist_ok=True)
 
 # Years to process
@@ -40,7 +46,7 @@ DW_BANDS = {
 
 def load_dw_data():
     """Load the Dynamic World fractions data for all years"""
-    print("📁 Loading Dynamic World fractions data for all years...")
+    print("Loading Dynamic World fractions data for all years...")
     
     all_data = {}
     
@@ -48,14 +54,14 @@ def load_dw_data():
         dw_file = dw_dir / f"DW_fractions_SA_1km_{year}.tif"
         
         if not dw_file.exists():
-            print(f"   ⚠️ File not found: {dw_file.name}")
+            print(f"   Warning: File not found: {dw_file.name}")
             continue
             
         try:
             with rasterio.open(dw_file) as src:
                 data = src.read()
                 
-                print(f"   ✅ {year}: Shape: {data.shape}, Valid pixels: {np.sum(~np.isnan(data)):,}")
+                print(f"   {year}: Shape: {data.shape}, Valid pixels: {np.sum(~np.isnan(data)):,}")
                 
                 # Get band names
                 band_names = [f"dw{year}_{band}" for band in DW_BANDS.keys()]
@@ -68,14 +74,14 @@ def load_dw_data():
                 }
                 
         except Exception as e:
-            print(f"   ❌ Error loading {year}: {e}")
+            print(f"   Error loading {year}: {e}")
             continue
     
     if not all_data:
-        print("   ❌ No data loaded successfully")
+        print("   No data loaded successfully")
         return None
     
-    print(f"   📊 Successfully loaded {len(all_data)} years")
+    print(f"   Successfully loaded {len(all_data)} years")
     return all_data
 
 def create_simple_overview(all_data):
@@ -83,7 +89,7 @@ def create_simple_overview(all_data):
     if all_data is None:
         return
     
-    print("🎨 Creating simple overview for each year...")
+    print("Creating simple overview for each year...")
     
     for year, data_info in all_data.items():
         data = data_info['data']
@@ -125,7 +131,7 @@ def create_simple_overview(all_data):
         # Save the plot
         output_file = output_dir / f"dw_fractions_sa_{year}_overview.png"
         plt.savefig(output_file, dpi=300, bbox_inches='tight')
-        print(f"   💾 Saved: {output_file.name}")
+        print(f"   Saved: {output_file.name}")
         
         plt.close()  # Close to free memory
 
@@ -134,7 +140,7 @@ def create_temporal_comparison(all_data):
     if all_data is None or len(all_data) < 2:
         return
     
-    print("📈 Creating temporal comparison...")
+    print("Creating temporal comparison...")
     
     # Calculate mean fractions for each year and band
     temporal_data = {}
@@ -186,7 +192,7 @@ def create_temporal_comparison(all_data):
     # Save the plot
     output_file = output_dir / "dw_fractions_temporal_comparison.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.show()
 
@@ -195,7 +201,7 @@ def create_summary_statistics(all_data):
     if all_data is None:
         return
     
-    print("📊 Creating summary statistics...")
+    print("Creating summary statistics...")
     
     # Collect statistics for all years
     all_stats = []
@@ -248,24 +254,24 @@ def create_summary_statistics(all_data):
     # Save the plot
     output_file = output_dir / "dw_fractions_summary_statistics.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.show()
 
 def main():
     """Main visualization function"""
-    print("🌍 Dynamic World Fractions Visualization - South America 2017-2024")
+    print("Dynamic World Fractions Visualization - South America 2017-2024")
     print("=" * 70)
     
     # Load data
     all_data = load_dw_data()
     
     if all_data is None:
-        print("❌ Failed to load data. Exiting.")
+        print("Failed to load data. Exiting.")
         return
     
     # Create visualizations
-    print("\n🎨 Creating visualizations...")
+    print("\nCreating visualizations...")
     
     # 1. Simple overview for each year
     create_simple_overview(all_data)
@@ -278,7 +284,7 @@ def main():
     
     # Summary
     print("\n" + "=" * 70)
-    print("📋 VISUALIZATION SUMMARY")
+    print("VISUALIZATION SUMMARY")
     print("=" * 70)
     
     print(f"Years processed: {sorted(all_data.keys())}")
@@ -297,13 +303,13 @@ def main():
         band_info = DW_BANDS[band_name]
         print(f"  - {band_info['description']}")
     
-    print(f"\n💾 Output files saved to: {output_dir}")
+    print(f"\nOutput files saved to: {output_dir}")
     for year in sorted(all_data.keys()):
         print(f"   - dw_fractions_sa_{year}_overview.png")
     print("   - dw_fractions_temporal_comparison.png")
     print("   - dw_fractions_summary_statistics.png")
     
-    print("\n✅ Visualization complete! 🎉")
+    print("\nVisualization complete! ")
 
 if __name__ == "__main__":
     main()

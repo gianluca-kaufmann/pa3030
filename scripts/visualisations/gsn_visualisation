@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
 """
-Global Safety Net (GSN) Visualization for South America 
+Global Safety Net visualization for South America.
 
-This script creates visualizations of the Global Safety Net raster masks
-generated from the preprocessing script. Each GSN layer is visualized
-individually and in combination.
+Inputs:
+- GeoTIFF masks in `data/ready/GSN`, including climate stabilisation areas, high biodiversity areas, intact wilderness areas, potential wildlife corridors, and terrestrial ecoregions.
 
-Inputs: GeoTIFF masks from data/output_masks/:
-- gsn_climate_stabilisation_areas_mask_1km.tif
-- gsn_high_biodiversity_areas_mask_1km.tif
-- gsn_intact_wilderness_areas_mask_1km.tif
-- gsn_potential_wildlife_corridors_mask_1km.tif
-- gsn_terrestrial_ecoregions_mask_1km.tif
+Process:
+- Loads each mask, computes coverage statistics, and produces individual and combined visualisations of the Global Safety Net layers.
 
-Outputs: Individual maps, combined overview, and statistics plots
-saved in outputs/Figures/gsn_vis.
+Outputs:
+- PNG figures saved to `outputs/Figures/gsn_vis`.
 """
 
 import numpy as np
@@ -28,10 +23,10 @@ from matplotlib.patches import Patch
 warnings.filterwarnings('ignore')
 
 # Paths
-PROJECT_ROOT = Path("/Users/gianluca/Desktop/Master's Thesis/code")
-DATA_DIR = PROJECT_ROOT / "data"
+ROOT_DIR = Path(__file__).resolve().parents[2]
+DATA_DIR = ROOT_DIR / "data"
 MASKS_DIR = DATA_DIR / "ready" / "GSN"
-OUTPUT_DIR = PROJECT_ROOT / "outputs/Figures/gsn_vis"
+OUTPUT_DIR = ROOT_DIR / "outputs" / "Figures" / "gsn_vis"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # GSN layer definitions
@@ -72,7 +67,7 @@ GSN_LAYERS = {
 
 def load_gsn_data():
     """Load all GSN raster masks."""
-    print("📁 Loading Global Safety Net raster masks...")
+    print("Loading Global Safety Net raster masks...")
     
     all_data = {}
     
@@ -80,7 +75,7 @@ def load_gsn_data():
         tif_path = MASKS_DIR / layer_info['file']
         
         if not tif_path.exists():
-            print(f"   ⚠️ File not found: {tif_path.name}")
+            print(f"   Warning: File not found: {tif_path.name}")
             continue
             
         try:
@@ -97,14 +92,14 @@ def load_gsn_data():
                     protected_pixels = np.sum(data > 0)
                     protected_percentage = (protected_pixels / total_pixels) * 100
                     
-                    print(f"   ✅ {layer_info['title']}: {len(unique_values)} unique ecoregions, "
+                    print(f"   {layer_info['title']}: {len(unique_values)} unique ecoregions, "
                           f"{protected_pixels:,} pixels ({protected_percentage:.2f}%)")
                 else:
                     # For binary data, count 1s
                     protected_pixels = np.sum(data == 1)
                     protected_percentage = (protected_pixels / total_pixels) * 100
                     
-                    print(f"   ✅ {layer_info['title']}: {protected_pixels:,} protected pixels ({protected_percentage:.2f}%)")
+                    print(f"   {layer_info['title']}: {protected_pixels:,} protected pixels ({protected_percentage:.2f}%)")
                 
                 all_data[layer_key] = {
                     'data': data,
@@ -119,14 +114,14 @@ def load_gsn_data():
                 }
                 
         except Exception as e:
-            print(f"   ❌ Error loading {layer_key}: {e}")
+            print(f"   Error loading {layer_key}: {e}")
             continue
     
     if not all_data:
-        print("   ❌ No data loaded successfully")
+        print("   No data loaded successfully")
         return None
     
-    print(f"   📊 Successfully loaded {len(all_data)} GSN layers")
+    print(f"   Successfully loaded {len(all_data)} GSN layers")
     return all_data
 
 
@@ -135,7 +130,7 @@ def create_individual_maps(all_data):
     if all_data is None:
         return
     
-    print("🎨 Creating individual GSN layer maps...")
+    print("Creating individual GSN layer maps...")
     
     for layer_key, layer_info in GSN_LAYERS.items():
         if layer_key not in all_data:
@@ -199,7 +194,7 @@ def create_individual_maps(all_data):
         plt.tight_layout()
         out_file = OUTPUT_DIR / f"gsn_{layer_key}_individual.png"
         plt.savefig(out_file, dpi=300, bbox_inches='tight')
-        print(f"   💾 Saved: {out_file.name}")
+        print(f"   Saved: {out_file.name}")
         plt.close()
 
 
@@ -208,7 +203,7 @@ def create_combined_overview(all_data):
     if all_data is None or len(all_data) < 2:
         return
     
-    print("🎨 Creating combined GSN overview...")
+    print("Creating combined GSN overview...")
     
     # Create a combined raster where each pixel value represents which layers overlap
     combined_data = np.zeros_like(list(all_data.values())[0]['data'], dtype=np.uint8)
@@ -275,7 +270,7 @@ def create_combined_overview(all_data):
     plt.tight_layout()
     out_file = OUTPUT_DIR / "gsn_combined_overview.png"
     plt.savefig(out_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {out_file.name}")
+    print(f"   Saved: {out_file.name}")
     plt.close()
 
 
@@ -284,7 +279,7 @@ def create_statistics_plot(all_data):
     if all_data is None:
         return
     
-    print("📊 Creating protection statistics plot...")
+    print("Creating protection statistics plot...")
     
     layers = []
     percentages = []
@@ -320,7 +315,7 @@ def create_statistics_plot(all_data):
     plt.tight_layout()
     out_file = OUTPUT_DIR / "gsn_protection_statistics.png"
     plt.savefig(out_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {out_file.name}")
+    print(f"   Saved: {out_file.name}")
     plt.close()
 
 
@@ -330,7 +325,7 @@ def create_summary(all_data):
         return
     
     print("\n" + "=" * 70)
-    print("📋 GSN VISUALIZATION SUMMARY")
+    print("GSN VISUALIZATION SUMMARY")
     print("=" * 70)
     print(f"Layers processed: {len(all_data)}")
     print(f"Output directory: {OUTPUT_DIR}")
@@ -355,21 +350,21 @@ def create_summary(all_data):
 
 
 def main():
-    print("🌍 Global Safety Net Visualization — South America")
+    print("Global Safety Net Visualization — South America")
     print("=" * 70)
     
     all_data = load_gsn_data()
     if all_data is None:
-        print("❌ Failed to load data. Exiting.")
+        print("Failed to load data. Exiting.")
         return
     
-    print("\n🎨 Creating visualizations...")
+    print("\nCreating visualizations...")
     create_individual_maps(all_data)
     create_combined_overview(all_data)
     create_statistics_plot(all_data)
     create_summary(all_data)
     
-    print("\n✅ Visualization complete! 🎉")
+    print("\nVisualization complete! ")
 
 
 if __name__ == "__main__":

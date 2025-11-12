@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-GPW Population Density Visualization for South America 2000-2020 
+GPW population density visualization for South America (2000-2020).
 
-This script creates visualizations of the GPW (Gridded Population of the World)
-population density data from multiple years (2000, 2005, 2010, 2015, 2020)
-at 1km resolution for South America.
+Inputs:
+- GeoTIFF rasters in `data/ready/GPW`, named `GPW_population_density_SA_1km_<year>.tif` for years 2000, 2005, 2010, 2015, and 2020.
+
+Process:
+- Loads five-year population density rasters, applies linear and logarithmic representations, and generates overview and comparative visualisations.
+
+Outputs:
+- PNG figures saved to `outputs/Figures/GPW_vis`.
 """
 
 import numpy as np
@@ -17,9 +22,10 @@ from matplotlib.colors import LogNorm, LinearSegmentedColormap
 warnings.filterwarnings('ignore')
 
 # Set up paths
-data_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/data")
+ROOT_DIR = Path(__file__).resolve().parents[2]
+data_dir = ROOT_DIR / "data"
 gpw_dir = data_dir / "ready" / "GPW"
-output_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/outputs/Figures/GPW_vis")
+output_dir = ROOT_DIR / "outputs" / "Figures" / "GPW_vis"
 output_dir.mkdir(parents=True, exist_ok=True)
 
 # Years to process (GPW data available in 5-year intervals)
@@ -40,7 +46,7 @@ POPULATION_COLORS = {
 
 def load_gpw_data():
     """Load the GPW population density data for all years"""
-    print("📁 Loading GPW population density data for all years...")
+    print("Loading GPW population density data for all years...")
     
     all_data = {}
     
@@ -48,7 +54,7 @@ def load_gpw_data():
         gpw_file = gpw_dir / f"GPW_population_density_SA_1km_{year}.tif"
         
         if not gpw_file.exists():
-            print(f"   ⚠️ File not found: {gpw_file.name}")
+            print(f"   Warning: File not found: {gpw_file.name}")
             continue
             
         try:
@@ -58,7 +64,7 @@ def load_gpw_data():
                 # GPW data is single band, so we take the first (and only) band
                 population_data = data[0]
                 
-                print(f"   ✅ {year}: Shape: {population_data.shape}, Valid pixels: {np.sum(~np.isnan(population_data)):,}")
+                print(f"   {year}: Shape: {population_data.shape}, Valid pixels: {np.sum(~np.isnan(population_data)):,}")
                 print(f"       Population range: {np.nanmin(population_data):.2f} - {np.nanmax(population_data):.2f} people/km²")
                 print(f"       Mean density: {np.nanmean(population_data):.2f} people/km²")
                 
@@ -69,14 +75,14 @@ def load_gpw_data():
                 }
                 
         except Exception as e:
-            print(f"   ❌ Error loading {year}: {e}")
+            print(f"   Error loading {year}: {e}")
             continue
     
     if not all_data:
-        print("   ❌ No data loaded successfully")
+        print("   No data loaded successfully")
         return None
     
-    print(f"   📊 Successfully loaded {len(all_data)} years")
+    print(f"   Successfully loaded {len(all_data)} years")
     return all_data
 
 def create_population_overview(all_data):
@@ -84,7 +90,7 @@ def create_population_overview(all_data):
     if all_data is None:
         return
     
-    print("🎨 Creating population density overview for each year...")
+    print("Creating population density overview for each year...")
     
     # Create custom colormap for population density
     colors = ['#2166ac', '#4393c3', '#92c5de', '#d1e5f0', '#f7f7f7', '#fddbc7', '#f4a582', '#d6604d', '#b2182b']
@@ -134,7 +140,7 @@ Valid pixels: {np.sum(~np.isnan(population_data)):,}"""
         # Save the plot
         output_file = output_dir / f"gpw_population_density_sa_{year}_overview.png"
         plt.savefig(output_file, dpi=300, bbox_inches='tight')
-        print(f"   💾 Saved: {output_file.name}")
+        print(f"   Saved: {output_file.name}")
         
         plt.close()  # Close to free memory
 
@@ -143,7 +149,7 @@ def create_temporal_comparison(all_data):
     if all_data is None or len(all_data) < 2:
         return
     
-    print("📈 Creating temporal comparison...")
+    print("Creating temporal comparison...")
     
     # Calculate statistics for each year
     temporal_stats = {}
@@ -235,7 +241,7 @@ def create_temporal_comparison(all_data):
     # Save the plot
     output_file = output_dir / "gpw_population_temporal_comparison.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.show()
 
@@ -244,7 +250,7 @@ def create_population_change_maps(all_data):
     if all_data is None or len(all_data) < 2:
         return
     
-    print("🗺️ Creating population change maps...")
+    print("Creating population change maps...")
     
     years = sorted(all_data.keys())
     
@@ -300,7 +306,7 @@ Areas with decrease: {np.sum(abs_change < 0):,} pixels"""
         # Save the plot
         output_file = output_dir / f"gpw_population_change_{year1}_to_{year2}.png"
         plt.savefig(output_file, dpi=300, bbox_inches='tight')
-        print(f"   💾 Saved: {output_file.name}")
+        print(f"   Saved: {output_file.name}")
         
         plt.close()
 
@@ -309,7 +315,7 @@ def create_summary_statistics(all_data):
     if all_data is None:
         return
     
-    print("📊 Creating summary statistics...")
+    print("Creating summary statistics...")
     
     # Collect all statistics
     all_stats = []
@@ -387,24 +393,24 @@ def create_summary_statistics(all_data):
     # Save the plot
     output_file = output_dir / "gpw_population_summary_statistics.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.show()
 
 def main():
     """Main visualization function"""
-    print("🌍 GPW Population Density Visualization - South America 2000-2020")
+    print("GPW Population Density Visualization - South America 2000-2020")
     print("=" * 70)
     
     # Load data
     all_data = load_gpw_data()
     
     if all_data is None:
-        print("❌ Failed to load data. Exiting.")
+        print("Failed to load data. Exiting.")
         return
     
     # Create visualizations
-    print("\n🎨 Creating visualizations...")
+    print("\nCreating visualizations...")
     
     # 1. Population density overview for each year
     create_population_overview(all_data)
@@ -420,7 +426,7 @@ def main():
     
     # Summary
     print("\n" + "=" * 70)
-    print("📋 VISUALIZATION SUMMARY")
+    print("VISUALIZATION SUMMARY")
     print("=" * 70)
     
     print(f"Years processed: {sorted(all_data.keys())}")
@@ -438,7 +444,7 @@ def main():
         data = all_data[year]['data']
         print(f"  {year}: {np.nanmin(data):.2f} - {np.nanmax(data):.2f} people/km²")
     
-    print(f"\n💾 Output files saved to: {output_dir}")
+    print(f"\nOutput files saved to: {output_dir}")
     for year in sorted(all_data.keys()):
         print(f"   - gpw_population_density_sa_{year}_overview.png")
     
@@ -451,7 +457,7 @@ def main():
     print("   - gpw_population_temporal_comparison.png")
     print("   - gpw_population_summary_statistics.png")
     
-    print("\n✅ Visualization complete! 🎉")
+    print("\nVisualization complete! ")
 
 if __name__ == "__main__":
     main()

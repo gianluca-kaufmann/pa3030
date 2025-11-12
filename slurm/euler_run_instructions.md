@@ -32,11 +32,11 @@ wandb settings set entity gikaufmann
 wandb settings set project master_thesis
 
 # 7️⃣ Submit SLURM job
-sbatch merge_2012.slurm
+sbatch slurm/RUN.slurm
 
 # 8️⃣ Monitor queue and logs
 squeue -u $USER
-tail -f $SCRATCH/logs/merge_2012_*.out
+tail -f $SCRATCH/logs/merge_run_*.out
 
 # 9️⃣ Inspect finished jobs and outputs
 sacct -j <JOBID> --format=JobID,State,ExitCode,Elapsed,MaxRSS
@@ -46,11 +46,11 @@ ls -lh $SCRATCH/outputs/Results/
 scp gikaufmann@login.euler.ethz.ch:/cluster/scratch/gikaufmann/outputs/Results/merged_panel_2012_2024.parquet ~/Desktop/
 
 # 1️⃣1️⃣ Quick debugging commands
-nano merge_2012.slurm          # edit SLURM script
-bash -n merge_2012.slurm       # check syntax
+nano slurm/RUN.slurm           # edit SLURM script
+bash -n slurm/RUN.slurm        # check syntax
 module load tmux               # safe monitoring
 tmux new -s merge
-tail -f $SCRATCH/logs/merge_2012_*.out
+tail -f $SCRATCH/logs/merge_run_*.out
 # (reconnect later with: tmux attach -t merge)
 
 # ============================================================

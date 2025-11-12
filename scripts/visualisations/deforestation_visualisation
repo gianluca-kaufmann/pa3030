@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-Hansen Global Forest Change Visualization for South America 2000-2024 
+Hansen Global Forest Change visualization for South America (2000-2024).
 
-This script creates visualizations of the Hansen Global Forest Change dataset
-from multiple years (2000-2024) which contain 3 bands per year:
-- forest_cover: Remaining forest cover (%)
-- forest_loss: Forest lost in that specific year (binary)
-- cumulative_loss: Total forest lost since 2000 (binary)
+Inputs:
+- GeoTIFF rasters in `data/ready/deforestation`, named `Deforestation_SA_1km_<year>.tif` with forest cover, annual loss, and cumulative loss bands.
+
+Process:
+- Loads yearly forest change rasters, extracts cover and loss metrics, and generates multi-band overviews, change analyses, and temporal summaries.
+
+Outputs:
+- PNG figures saved to `outputs/Figures/deforestation_vis`.
 """
 
 import numpy as np
@@ -19,9 +22,10 @@ from matplotlib.colors import ListedColormap, LinearSegmentedColormap
 warnings.filterwarnings('ignore')
 
 # Set up paths
-data_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/data")
+ROOT_DIR = Path(__file__).resolve().parents[2]
+data_dir = ROOT_DIR / "data"
 defor_dir = data_dir / "ready" / "deforestation"
-output_dir = Path("/Users/gianluca/Desktop/Master's Thesis/code/outputs/Figures/deforestation_vis")
+output_dir = ROOT_DIR / "outputs" / "Figures" / "deforestation_vis"
 output_dir.mkdir(parents=True, exist_ok=True)
 
 # Years to process
@@ -35,7 +39,7 @@ LOSS_CMAP = LinearSegmentedColormap.from_list('loss',
 
 def load_deforestation_data():
     """Load the deforestation data for all years"""
-    print("📁 Loading deforestation data for all years...")
+    print("Loading deforestation data for all years...")
     
     all_data = {}
     
@@ -43,14 +47,14 @@ def load_deforestation_data():
         defor_file = defor_dir / f"Deforestation_SA_1km_{year}.tif"
         
         if not defor_file.exists():
-            print(f"   ⚠️ File not found: {defor_file.name}")
+            print(f"   Warning: File not found: {defor_file.name}")
             continue
             
         try:
             with rasterio.open(defor_file) as src:
                 data = src.read()
                 
-                print(f"   ✅ {year}: Shape: {data.shape}, Valid pixels: {np.sum(~np.isnan(data)):,}")
+                print(f"   {year}: Shape: {data.shape}, Valid pixels: {np.sum(~np.isnan(data)):,}")
                 
                 # Expected band names
                 band_names = [
@@ -70,14 +74,14 @@ def load_deforestation_data():
                 }
                 
         except Exception as e:
-            print(f"   ❌ Error loading {year}: {e}")
+            print(f"   Error loading {year}: {e}")
             continue
     
     if not all_data:
-        print("   ❌ No data loaded successfully")
+        print("   No data loaded successfully")
         return None
     
-    print(f"   📊 Successfully loaded {len(all_data)} years")
+    print(f"   Successfully loaded {len(all_data)} years")
     return all_data
 
 def create_three_band_overview(all_data):
@@ -85,7 +89,7 @@ def create_three_band_overview(all_data):
     if all_data is None:
         return
     
-    print("🎨 Creating three-band overview for each year...")
+    print("Creating three-band overview for each year...")
     
     for year, data_info in all_data.items():
         forest_cover = data_info['forest_cover']
@@ -138,7 +142,7 @@ def create_three_band_overview(all_data):
         # Save the plot
         output_file = output_dir / f"deforestation_sa_{year}_overview.png"
         plt.savefig(output_file, dpi=300, bbox_inches='tight')
-        print(f"   💾 Saved: {output_file.name}")
+        print(f"   Saved: {output_file.name}")
         
         plt.close()  # Close to free memory
 
@@ -147,7 +151,7 @@ def create_forest_cover_timeline(all_data):
     if all_data is None or len(all_data) < 2:
         return
     
-    print("📈 Creating forest cover timeline...")
+    print("Creating forest cover timeline...")
     
     years = sorted(all_data.keys())
     
@@ -195,7 +199,7 @@ def create_forest_cover_timeline(all_data):
     # Save the plot
     output_file = output_dir / "deforestation_forest_cover_timeline.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.close()
 
@@ -204,7 +208,7 @@ def create_temporal_statistics(all_data):
     if all_data is None or len(all_data) < 2:
         return
     
-    print("📊 Creating temporal statistics...")
+    print("Creating temporal statistics...")
     
     years = sorted(all_data.keys())
     
@@ -283,7 +287,7 @@ def create_temporal_statistics(all_data):
     # Save the plot
     output_file = output_dir / "deforestation_temporal_trends.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.close()
 
@@ -292,7 +296,7 @@ def create_change_comparison(all_data):
     if all_data is None or len(all_data) < 10:
         return
     
-    print("🔍 Creating early vs late period comparison...")
+    print("Check Creating early vs late period comparison...")
     
     # Define periods
     early_years = [2000, 2001, 2002, 2003, 2004]
@@ -311,7 +315,7 @@ def create_change_comparison(all_data):
             late_covers.append(all_data[year]['forest_cover'])
     
     if not early_covers or not late_covers:
-        print("   ⚠️ Insufficient data for comparison")
+        print("   Warning: Insufficient data for comparison")
         return
     
     early_avg = np.nanmean(np.stack(early_covers), axis=0)
@@ -351,24 +355,24 @@ def create_change_comparison(all_data):
     # Save the plot
     output_file = output_dir / "deforestation_period_comparison.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
-    print(f"   💾 Saved: {output_file.name}")
+    print(f"   Saved: {output_file.name}")
     
     plt.close()
 
 def main():
     """Main visualization function"""
-    print("🌲 Hansen Global Forest Change Visualization - South America 2000-2024")
+    print("Hansen Global Forest Change Visualization - South America 2000-2024")
     print("=" * 70)
     
     # Load data
     all_data = load_deforestation_data()
     
     if all_data is None:
-        print("❌ Failed to load data. Exiting.")
+        print("Failed to load data. Exiting.")
         return
     
     # Create visualizations
-    print("\n🎨 Creating visualizations...")
+    print("\nCreating visualizations...")
     
     # 1. Three-band overview for each year
     create_three_band_overview(all_data)
@@ -384,7 +388,7 @@ def main():
     
     # Summary
     print("\n" + "=" * 70)
-    print("📋 VISUALIZATION SUMMARY")
+    print("VISUALIZATION SUMMARY")
     print("=" * 70)
     
     print(f"Years processed: {sorted(all_data.keys())}")
@@ -403,13 +407,13 @@ def main():
     print(f"  - forest_loss_YYYY: Forest lost in that specific year (binary)")
     print(f"  - cumulative_loss_YYYY: Total forest lost since 2000 (binary)")
     
-    print(f"\n💾 Output files saved to: {output_dir}")
+    print(f"\nOutput files saved to: {output_dir}")
     print(f"   - {len(all_data)} individual year overviews (deforestation_sa_YYYY_overview.png)")
     print("   - deforestation_forest_cover_timeline.png")
     print("   - deforestation_temporal_trends.png")
     print("   - deforestation_period_comparison.png")
     
-    print("\n✅ Visualization complete! 🎉")
+    print("\nVisualization complete! ")
 
 if __name__ == "__main__":
     main()
