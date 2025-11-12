@@ -50,7 +50,6 @@ echo "PWD = $(pwd)"
   find scripts -maxdepth 2 -type f -name "merge_total_optimized"
   exit 1
 }
-
 # Run the script
 python scripts/merging/merge_total_optimized
 
