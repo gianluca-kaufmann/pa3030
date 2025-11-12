@@ -70,11 +70,13 @@ earthengine authenticate
 
 The sections below detail each stage, expected inputs/outputs, and common command sequences.
 
+# Typical run sequence
+
 ## 1. Data Extraction
 
 Scripts under `scripts/data extraction/` pull data from Google Earth Engine and assorted APIs. Each script targets a specific theme (deforestation, land cover, NDVI, VIIRS night lights, infrastructure layers, etc.) and writes aligned GeoTIFF rasters into `data/ready/<dataset>/`.
 
-### Typical run sequence
+### Recommended order
 
 1. Confirm the Earth Engine project, spatial bounds, and export resolution in the script constants (top of each exporter).
 2. Launch exports dataset by dataset. Use `python` directly; each script handles its own directories and logging.
