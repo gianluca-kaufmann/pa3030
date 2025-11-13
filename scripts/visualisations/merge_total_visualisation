@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""
+Full dataset analysis for merged panel (2000-2024).
+
+Inputs:
+- Parquet panel file `merged_panel_2000_2024.parquet` stored in `data/ml`.
+
+Process:
+- Processes all row groups incrementally using memory-efficient streaming.
+- Computes comprehensive statistics, sanity checks, and year coverage.
+- Avoids OOM crashes by processing data in batches.
+
+Outputs:
+- JSON file with full analysis results saved to `outputs/Figures/merge_total_vis/full_dataset_analysis.json`.
+"""
+
+import warnings
+import gc
+import json
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
+from pathlib import Path
+from typing import Dict
+
+warnings.filterwarnings("ignore")
+
+# Set up paths
+ROOT_DIR = Path(__file__).resolve().parents[2]
+DATA_DIR = ROOT_DIR / "data" / "ml"
+OUTPUT_DIR = ROOT_DIR / "outputs" / "Figures" / "merge_total_vis"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Panel file
+PANEL_FILE = DATA_DIR / "merged_panel_2000_2024.parquet"
+
+
+def log_progress(message: str):
+    """Simple logging function with immediate flush."""
+    print(message, flush=True)
+
+
+def get_parquet_metadata() -> Dict:
+    """Get metadata from parquet file without loading all data."""
+    log_progress("    Opening parquet file (this may take a minute for large files)...")
+    try:
+        parquet_file = pq.ParquetFile(PANEL_FILE)
+        log_progress("    Reading metadata...")
+        metadata = parquet_file.metadata
+        log_progress("    Reading schema...")
+        schema = parquet_file.schema
+        
+        log_progress("    Extracting metadata fields...")
+        result = {
+            'row_count': metadata.num_rows,
+            'columns': [schema[i].name for i in range(len(schema))],
+            'num_row_groups': metadata.num_row_groups
+        }
+        log_progress("    Metadata extraction complete")
+        return result
+    except Exception as e:
+        log_progress(f"    Error reading metadata: {e}")
+        raise
+
+
+def convert_to_native(obj):
+    """Recursively convert numpy types to native Python types for JSON serialization."""
+    if isinstance(obj, (np.integer, np.int32, np.int64)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: convert_to_native(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_to_native(item) for item in obj]
+    elif isinstance(obj, set):
+        return sorted([convert_to_native(item) for item in obj])
+    else:
+        return obj
+
+
+def analyze_full_dataset_streaming():
+    """
+    Analyze the full dataset by processing row groups incrementally.
+    This avoids loading all data into memory at once.
+    
+    Returns:
+        Dictionary with aggregated statistics and checks
+    """
+    log_progress("\n" + "=" * 80)
+    log_progress("STREAMING ANALYSIS OF FULL DATASET")
+    log_progress("=" * 80)
+    
+    parquet_file = pq.ParquetFile(PANEL_FILE)
+    num_row_groups = parquet_file.metadata.num_row_groups
+    total_rows = parquet_file.metadata.num_rows
+    
+    log_progress(f"Processing all {num_row_groups:,} row groups ({total_rows:,} total rows)...")
+    log_progress("This will process data incrementally to avoid memory issues.")
+    
+    # Initialize aggregators
+    year_counts = {}
+    year_stats = {}  # Will store running statistics per year
+    all_years = set()
+    coord_ranges = {'x': [float('inf'), float('-inf')], 
+                    'y': [float('inf'), float('-inf')],
+                    'row': [float('inf'), float('-inf')],
+                    'col': [float('inf'), float('-inf')]}
+    missing_counts = {}
+    total_processed = 0
+    
+    # Process row groups in batches
+    batch_size = 50  # Process 50 row groups at a time
+    feature_cols = None
+    
+    for batch_start in range(0, num_row_groups, batch_size):
+        batch_end = min(batch_start + batch_size, num_row_groups)
+        log_progress(f"  Processing row groups {batch_start+1}-{batch_end} ({batch_end}/{num_row_groups})...")
+        
+        # Read batch of row groups
+        chunks = []
+        for i in range(batch_start, batch_end):
+            try:
+                table = parquet_file.read_row_group(i)
+                chunks.append(table.to_pandas())
+            except Exception as e:
+                log_progress(f"    Warning: Could not read row group {i}: {e}")
+                continue
+        
+        if not chunks:
+            continue
+            
+        # Combine batch
+        df_batch = pd.concat(chunks, ignore_index=True)
+        del chunks
+        gc.collect()
+        
+        total_processed += len(df_batch)
+        
+        # Identify feature columns (first time only)
+        if feature_cols is None:
+            metadata_cols = ['year', 'x', 'y', 'row', 'col']
+            feature_cols = [c for c in df_batch.columns if c not in metadata_cols]
+            log_progress(f"  Identified {len(feature_cols)} feature columns")
+        
+        # Update year counts
+        if 'year' in df_batch.columns:
+            batch_year_counts = df_batch['year'].value_counts().to_dict()
+            for year, count in batch_year_counts.items():
+                year_counts[year] = year_counts.get(year, 0) + count
+                all_years.add(year)
+        
+        # Update coordinate ranges
+        for col in ['x', 'y', 'row', 'col']:
+            if col in df_batch.columns:
+                coord_ranges[col][0] = min(coord_ranges[col][0], df_batch[col].min())
+                coord_ranges[col][1] = max(coord_ranges[col][1], df_batch[col].max())
+        
+        # Update missing value counts
+        for col in df_batch.columns:
+            missing = df_batch[col].isnull().sum()
+            missing_counts[col] = missing_counts.get(col, 0) + missing
+        
+        # Update yearly statistics using incremental computation (Welford's algorithm)
+        # This avoids storing all values in memory
+        if 'year' in df_batch.columns:
+            for year in df_batch['year'].unique():
+                year_data = df_batch[df_batch['year'] == year]
+                if year not in year_stats:
+                    year_stats[year] = {}
+                    for feat in feature_cols[:10]:  # Track top 10 features
+                        year_stats[year][feat] = {
+                            'count': 0,
+                            'mean': 0.0,
+                            'M2': 0.0,  # Sum of squares of differences from mean
+                            'min': float('inf'),
+                            'max': float('-inf')
+                        }
+                
+                for feat in feature_cols[:10]:
+                    valid_data = year_data[feat].dropna()
+                    if len(valid_data) > 0:
+                        stats = year_stats[year][feat]
+                        for val in valid_data:
+                            stats['count'] += 1
+                            delta = val - stats['mean']
+                            stats['mean'] += delta / stats['count']
+                            delta2 = val - stats['mean']
+                            stats['M2'] += delta * delta2
+                            stats['min'] = min(stats['min'], val)
+                            stats['max'] = max(stats['max'], val)
+        
+        # Clean up
+        del df_batch
+        gc.collect()
+        
+        # Progress update
+        if (batch_end % 500 == 0) or (batch_end == num_row_groups):
+            log_progress(f"  Progress: {batch_end}/{num_row_groups} row groups ({total_processed:,} rows processed)")
+    
+    log_progress(f"\n  Completed! Processed {total_processed:,} rows from {num_row_groups} row groups")
+    
+    # Compute final statistics from incremental stats
+    final_stats = {}
+    for year in sorted(all_years):
+        final_stats[year] = {}
+        for feat in feature_cols[:10]:
+            if year in year_stats and feat in year_stats[year]:
+                stats = year_stats[year][feat]
+                if stats['count'] > 0:
+                    variance = stats['M2'] / stats['count'] if stats['count'] > 1 else 0.0
+                    std = np.sqrt(variance)
+                    final_stats[year][feat] = {
+                        'mean': stats['mean'],
+                        'std': std,
+                        'count': stats['count'],
+                        'min': stats['min'] if stats['min'] != float('inf') else None,
+                        'max': stats['max'] if stats['max'] != float('-inf') else None
+                    }
+    
+    return {
+        'year_counts': year_counts,
+        'year_stats': final_stats,
+        'coord_ranges': coord_ranges,
+        'missing_counts': missing_counts,
+        'total_rows': total_processed,
+        'years': sorted(all_years),
+        'feature_cols': feature_cols
+    }
+
+
+def main():
+    """Main analysis function."""
+    print("\n" + "=" * 80)
+    print("FULL DATASET ANALYSIS")
+    print("South America 1km Dataset (2000-2024)")
+    print("=" * 80)
+    print()
+    
+    if not PANEL_FILE.exists():
+        print(f"ERROR: Panel file not found: {PANEL_FILE}")
+        print("Please run the merge script first: python scripts/merging/merge_total_optimized")
+        return
+    
+    try:
+        log_progress("Mode: FULL DATASET STREAMING ANALYSIS")
+        log_progress("This will process all row groups incrementally.")
+        log_progress("Estimated time: 30-60 minutes")
+        log_progress("Memory usage: Low (processes in batches)\n")
+        
+        # Full dataset streaming analysis
+        streaming_results = analyze_full_dataset_streaming()
+        
+        # Print summary of streaming results
+        log_progress("\n" + "=" * 80)
+        log_progress("STREAMING ANALYSIS RESULTS")
+        log_progress("=" * 80)
+        log_progress(f"Total rows processed: {streaming_results['total_rows']:,}")
+        log_progress(f"Years found: {streaming_results['years']}")
+        log_progress(f"Year counts: {dict(sorted(streaming_results['year_counts'].items()))}")
+        
+        # Save streaming results
+        results_file = OUTPUT_DIR / "full_dataset_analysis.json"
+        with open(results_file, 'w') as f:
+            json.dump({
+                'year_counts': convert_to_native(streaming_results['year_counts']),
+                'coord_ranges': convert_to_native({k: list(v) for k, v in streaming_results['coord_ranges'].items()}),
+                'missing_counts': convert_to_native(streaming_results['missing_counts']),
+                'total_rows': int(streaming_results['total_rows']),
+                'years': convert_to_native(streaming_results['years']),
+                'year_stats': convert_to_native(streaming_results['year_stats'])
+            }, f, indent=2)
+        log_progress(f"\nSaved full analysis results to: {results_file}")
+        
+        print("\n" + "=" * 80)
+        print("ANALYSIS COMPLETE")
+        print("=" * 80)
+        print(f"\nResults saved to: {results_file}")
+        
+    except FileNotFoundError as e:
+        print(f"\nERROR: {e}")
+        return
+    except Exception as e:
+        print(f"\nERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+
+
+if __name__ == "__main__":
+    main()
