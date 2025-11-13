@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""
+Goal:
+    Compute comprehensive statistics for the merged panel dataset using streaming.
+    This script handles large datasets (35GB+) efficiently without loading all data into RAM.
+
+Input:
+    - Parquet file: data/ml/merged_panel_2000_2024.parquet (processed incrementally).
+
+Process:
+    - Streams through row groups to avoid memory issues
+    - Computes: dimensions, column types, unique counts, missing values,
+      numeric statistics, uniqueness checks, static variable detection
+    - Uses incremental algorithms (Welford's method for means/variance)
+
+Output:
+    - JSON file: outputs/Tables/merged_panel_statistics.json
+    - Contains all computed statistics for later formatting
+"""
+
+import warnings
+import gc
+import json
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, Set
+
+warnings.filterwarnings("ignore")
+
+# Set up paths
+ROOT_DIR = Path(__file__).resolve().parents[2]
+DATA_DIR = ROOT_DIR / "data" / "ml"
+OUTPUT_DIR = ROOT_DIR / "outputs" / "Tables"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Panel file
+PANEL_FILE = DATA_DIR / "merged_panel_2000_2024.parquet"
+OUTPUT_JSON = OUTPUT_DIR / "merged_panel_statistics.json"
+
+# Configuration
+BATCH_SIZE = 50  # Process 50 row groups at a time (same as visualization script)
+CHECK_STATIC_VARS = True  # Set to False to skip (saves time but less complete)
+
+
+def log_progress(message: str):
+    """Simple logging function with immediate flush."""
+    print(message, flush=True)
+
+
+def convert_to_native(obj):
+    """Recursively convert numpy types to native Python types for JSON serialization."""
+    if isinstance(obj, (np.integer, np.int32, np.int64)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float32, np.float64)):
+        if np.isnan(obj) or np.isinf(obj):
+            return None
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: convert_to_native(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_to_native(item) for item in obj]
+    elif isinstance(obj, set):
+        return sorted([convert_to_native(item) for item in obj])
+    else:
+        return obj
+
+
+def analyze_dataset_streaming():
+    """
+    Analyze the full dataset by processing row groups incrementally.
+    Computes all required statistics without loading entire dataset into memory.
+    
+    Returns:
+        Dictionary with all computed statistics
+    """
+    log_progress("\n" + "=" * 80)
+    log_progress("STREAMING ANALYSIS OF MERGED PANEL DATASET")
+    log_progress("=" * 80)
+    
+    # Open parquet file
+    log_progress("Opening parquet file (this may take a minute for large files)...")
+    parquet_file = pq.ParquetFile(PANEL_FILE)
+    log_progress("Reading metadata...")
+    metadata = parquet_file.metadata
+    log_progress("Reading schema...")
+    schema = parquet_file.schema
+    
+    num_row_groups = metadata.num_row_groups
+    total_rows = metadata.num_rows
+    
+    log_progress(f"Processing all {num_row_groups:,} row groups ({total_rows:,} total rows)...")
+    log_progress("This will process data incrementally to avoid memory issues.")
+    
+    # Get column names and types from schema
+    columns = [schema[i].name for i in range(len(schema))]
+    column_types = {schema[i].name: str(schema[i].physical_type) for i in range(len(schema))}
+    
+    log_progress(f"Schema: {len(columns)} columns")
+    
+    # Initialize aggregators
+    year_counts = {}
+    all_years = set()
+    pixel_ids = set()  # For (row, col) pairs
+    missing_counts = {col: 0 for col in columns}
+    total_processed = 0
+    
+    # For numeric statistics (incremental computation using Welford's algorithm)
+    numeric_cols = []
+    numeric_stats = {}  # Will track: count, mean, M2, min, max
+    
+    # For static variable detection
+    # We'll track which columns have variation (True) vs are static (False)
+    pixel_col_uniqueness = {}  # {col: bool} - True if column varies, False if static
+    feature_cols = [c for c in columns if c not in ['year', 'x', 'y', 'row', 'col']]
+    
+    # Initialize all feature columns as potentially static (False)
+    if CHECK_STATIC_VARS:
+        for col in feature_cols:
+            pixel_col_uniqueness[col] = False
+    
+    # Identify metadata columns
+    metadata_cols = ['year', 'x', 'y', 'row', 'col']
+    
+    log_progress("\nStarting streaming computation...")
+    
+    # Process row groups in batches
+    for batch_start in range(0, num_row_groups, BATCH_SIZE):
+        batch_end = min(batch_start + BATCH_SIZE, num_row_groups)
+        log_progress(f"  Processing row groups {batch_start+1}-{batch_end} ({batch_end}/{num_row_groups})...")
+        
+        # Read batch of row groups
+        chunks = []
+        for i in range(batch_start, batch_end):
+            try:
+                table = parquet_file.read_row_group(i)
+                chunks.append(table.to_pandas())
+            except Exception as e:
+                log_progress(f"    Warning: Could not read row group {i}: {e}")
+                continue
+        
+        if not chunks:
+            continue
+        
+        # Combine batch
+        df_batch = pd.concat(chunks, ignore_index=True)
+        del chunks
+        gc.collect()
+        
+        batch_size = len(df_batch)
+        total_processed += batch_size
+        
+        # Identify numeric columns (first batch only)
+        if not numeric_cols:
+            for col in columns:
+                if col in df_batch.columns and pd.api.types.is_numeric_dtype(df_batch[col]):
+                    numeric_cols.append(col)
+                    numeric_stats[col] = {
+                        'count': 0,
+                        'mean': 0.0,
+                        'M2': 0.0,
+                        'min': float('inf'),
+                        'max': float('-inf')
+                    }
+            log_progress(f"  Identified {len(numeric_cols)} numeric columns")
+        
+        # Update year counts
+        if 'year' in df_batch.columns:
+            batch_year_counts = df_batch['year'].value_counts().to_dict()
+            for year, count in batch_year_counts.items():
+                year_counts[int(year)] = year_counts.get(int(year), 0) + count
+                all_years.add(int(year))
+        
+        # Update pixel IDs (row, col pairs)
+        if 'row' in df_batch.columns and 'col' in df_batch.columns:
+            pixel_pairs = set(zip(df_batch['row'].values, df_batch['col'].values))
+            pixel_ids.update(pixel_pairs)
+        
+        # Update missing value counts
+        for col in columns:
+            if col in df_batch.columns:
+                missing = df_batch[col].isnull().sum()
+                missing_counts[col] += int(missing)
+        
+        # Update numeric statistics using Welford's algorithm (incremental mean/variance)
+        for col in numeric_cols:
+            if col in df_batch.columns:
+                valid_data = df_batch[col].dropna()
+                stats = numeric_stats[col]
+                
+                for val in valid_data:
+                    stats['count'] += 1
+                    delta = val - stats['mean']
+                    stats['mean'] += delta / stats['count']
+                    delta2 = val - stats['mean']
+                    stats['M2'] += delta * delta2
+                    stats['min'] = min(stats['min'], val)
+                    stats['max'] = max(stats['max'], val)
+        
+        # Track static variables (check if columns vary within pixels across years)
+        if CHECK_STATIC_VARS and 'row' in df_batch.columns and 'col' in df_batch.columns and 'year' in df_batch.columns:
+            for col in feature_cols:
+                if col in df_batch.columns and col in pixel_col_uniqueness:
+                    # If we haven't found variation yet, check if this column has variation within any pixel
+                    if not pixel_col_uniqueness[col]:
+                        # Group by (row, col) and count unique values
+                        # If any pixel has >1 unique value, the column is not static
+                        try:
+                            grouped = df_batch.groupby(['row', 'col'])[col].n_unique()
+                            if (grouped > 1).any():
+                                # This column has variation, mark it as varying
+                                pixel_col_uniqueness[col] = True
+                        except Exception:
+                            # If grouping fails, assume it varies (safer)
+                            pixel_col_uniqueness[col] = True
+        
+        # Clean up
+        del df_batch
+        gc.collect()
+        
+        # Progress update
+        if (batch_end % 500 == 0) or (batch_end == num_row_groups):
+            log_progress(f"  Progress: {batch_end}/{num_row_groups} row groups ({total_processed:,} rows processed)")
+    
+    log_progress(f"\n  Completed! Processed {total_processed:,} rows from {num_row_groups} row groups")
+    
+    # Compute final numeric statistics
+    log_progress("\nComputing final numeric statistics...")
+    final_numeric_stats = {}
+    for col, stats in numeric_stats.items():
+        if stats['count'] > 0:
+            variance = stats['M2'] / stats['count'] if stats['count'] > 1 else 0.0
+            std = np.sqrt(variance)
+            final_numeric_stats[col] = {
+                'min': stats['min'] if stats['min'] != float('inf') else None,
+                'max': stats['max'] if stats['max'] != float('-inf') else None,
+                'mean': stats['mean'],
+                'std': std,
+                'count': stats['count']
+            }
+    
+    # Check uniqueness
+    log_progress("\nChecking uniqueness...")
+    n_unique_pixels = len(pixel_ids)
+    n_unique_years = len(all_years)
+    expected_rows = n_unique_pixels * n_unique_years
+    
+    log_progress(f"  Unique pixels (row, col): {n_unique_pixels:,}")
+    log_progress(f"  Unique years: {n_unique_years}")
+    log_progress(f"  Expected rows (pixels × years): {expected_rows:,}")
+    log_progress(f"  Actual rows: {total_processed:,}")
+    
+    is_unique = (expected_rows == total_processed)
+    uniqueness_check = {
+        'unique_pixels': n_unique_pixels,
+        'unique_years': n_unique_years,
+        'expected_rows': expected_rows,
+        'actual_rows': total_processed,
+        'is_unique': is_unique,
+        'difference': abs(expected_rows - total_processed)
+    }
+    
+    if is_unique:
+        log_progress("  ✓ All (row, col, year) combinations appear to be unique")
+    else:
+        log_progress(f"  ⚠ Row count mismatch! Difference: {abs(expected_rows - total_processed):,}")
+    
+    # Static variable detection
+    static_vars = []
+    if CHECK_STATIC_VARS:
+        log_progress("\nDetecting static variables...")
+        # Columns that remain False (never found variation) are static
+        static_vars = [col for col, has_variation in pixel_col_uniqueness.items() if not has_variation]
+        log_progress(f"  Found {len(static_vars)} static variables (constant across years)")
+        if len(static_vars) > 0:
+            log_progress(f"  First 10 static variables: {static_vars[:10]}")
+    else:
+        log_progress("\nStatic variable detection SKIPPED (set CHECK_STATIC_VARS=True to enable)")
+    
+    # Compile results
+    results = {
+        'metadata': {
+            'file': str(PANEL_FILE.name),
+            'generated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'total_rows': total_processed,
+            'total_columns': len(columns),
+            'num_row_groups': num_row_groups
+        },
+        'columns': {
+            'names': columns,
+            'types': column_types,
+            'numeric_columns': numeric_cols,
+            'num_numeric': len(numeric_cols)
+        },
+        'years': {
+            'unique_years': sorted(all_years),
+            'num_unique_years': len(all_years),
+            'year_counts': {str(k): int(v) for k, v in year_counts.items()}
+        },
+        'pixels': {
+            'unique_pixels': n_unique_pixels,
+            'pixel_identifier': '(row, col)'
+        },
+        'uniqueness': uniqueness_check,
+        'missing_values': {col: int(missing_counts[col]) for col in columns},
+        'numeric_statistics': final_numeric_stats,
+        'static_variables': {
+            'enabled': CHECK_STATIC_VARS,
+            'count': len(static_vars),
+            'variables': static_vars
+        }
+    }
+    
+    return results
+
+
+def main():
+    """Main analysis function."""
+    print("\n" + "=" * 80)
+    print("MERGED PANEL DATASET - COMPREHENSIVE STATISTICS COMPUTATION")
+    print("South America 1km Dataset (2000-2024)")
+    print("=" * 80)
+    print()
+    
+    if not PANEL_FILE.exists():
+        print(f"ERROR: Panel file not found: {PANEL_FILE}")
+        print("Please check that the file exists in data/ml/")
+        return
+    
+    try:
+        log_progress("Mode: FULL DATASET STREAMING ANALYSIS")
+        log_progress("This will process all row groups incrementally.")
+        log_progress("Estimated time: 30-60 minutes")
+        log_progress("Memory usage: Low (processes in batches)")
+        log_progress(f"Static variable check: {'Enabled' if CHECK_STATIC_VARS else 'Disabled'}")
+        log_progress(f"Input file: {PANEL_FILE}")
+        log_progress(f"Output file: {OUTPUT_JSON}\n")
+        
+        # Run streaming analysis
+        results = analyze_dataset_streaming()
+        
+        # Save to JSON
+        log_progress("\n" + "=" * 80)
+        log_progress("Saving results to JSON...")
+        log_progress("=" * 80)
+        
+        with open(OUTPUT_JSON, 'w') as f:
+            json.dump(convert_to_native(results), f, indent=2)
+        
+        log_progress(f"✓ Results saved to: {OUTPUT_JSON}")
+        
+        # Print summary
+        log_progress("\n" + "=" * 80)
+        log_progress("COMPUTATION SUMMARY")
+        log_progress("=" * 80)
+        log_progress(f"Total rows: {results['metadata']['total_rows']:,}")
+        log_progress(f"Total columns: {results['metadata']['total_columns']}")
+        log_progress(f"Numeric columns: {results['columns']['num_numeric']}")
+        log_progress(f"Unique years: {results['years']['num_unique_years']}")
+        log_progress(f"Unique pixels: {results['pixels']['unique_pixels']:,}")
+        log_progress(f"Columns with missing values: {sum(1 for v in results['missing_values'].values() if v > 0)}")
+        log_progress(f"Static variables: {results['static_variables']['count']}")
+        
+        # Show rows per year
+        log_progress("\nRows per year:")
+        for year in sorted(results['years']['unique_years']):
+            count = results['years']['year_counts'].get(str(year), 0)
+            log_progress(f"  Year {year}: {count:,} rows")
+        
+        log_progress("\n" + "=" * 80)
+        log_progress("COMPUTATION COMPLETE")
+        log_progress("=" * 80)
+        log_progress(f"\nNext step: Run 'inspect_merged_total' to generate human-readable report")
+        
+    except FileNotFoundError as e:
+        print(f"\nERROR: {e}")
+        return
+    except Exception as e:
+        print(f"\nERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+
+
+if __name__ == "__main__":
+    main()

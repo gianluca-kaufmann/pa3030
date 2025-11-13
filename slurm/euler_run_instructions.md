@@ -31,6 +31,9 @@ wandb login <YOUR_API_KEY>
 wandb settings set entity gikaufmann
 wandb settings set project master_thesis
 
+# 1) Create the scratch log directory once
+mkdir -p /cluster/scratch/$USER/logs
+
 # 7️⃣ Submit SLURM job
 sbatch slurm/RUN.slurm
 

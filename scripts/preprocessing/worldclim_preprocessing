@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""
+WorldClim BIO preprocessing
+===========================
+
+Description:
+    Merges multiple GeoTIFF tiles exported from Google Earth Engine into a single
+    merged raster file for use in the merge pipeline.
+
+Source data:
+    - Multiple tile files in `data/ready/WorldClim/` matching pattern
+      `WorldClim_BIO_SA_1km-*.tif` (typically 4 tiles from GEE export).
+
+Objective:
+    Mosaic all tiles into a single GeoTIFF file containing all 19 bioclimatic
+    variables (bio01-bio19) at 1 km resolution for South America.
+
+Process overview:
+    1. Find all WorldClim tile files in the data directory.
+    2. Read each tile and determine the combined bounding box.
+    3. Create a mosaic array covering the full extent.
+    4. Place each tile's data into the correct position in the mosaic.
+    5. Write the merged raster to a single GeoTIFF file.
+
+Outputs:
+    - Single merged GeoTIFF: `data/ready/WorldClim/WorldClim_BIO_SA_1km.tif`
+      containing all 19 bioclimatic variables.
+
+Note:
+    Google Earth Engine automatically splits large exports into multiple tiles
+    when the export exceeds size limits. This script merges those tiles back
+    into a single file for easier processing in downstream pipelines.
+"""
+
+import numpy as np
+import rasterio
+from rasterio.merge import merge
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+# ==========
+# Configuration
+# ==========
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DATA_DIR = PROJECT_ROOT / "data"
+WORLDCLIM_DIR = DATA_DIR / "ready" / "WorldClim"
+OUTPUT_FILE = WORLDCLIM_DIR / "WorldClim_BIO_SA_1km.tif"
+
+# WorldClim BIO band names (19 bioclimatic variables)
+WORLDCLIM_BANDS = [
+    'bio01', 'bio02', 'bio03', 'bio04', 'bio05', 'bio06', 'bio07', 'bio08', 'bio09',
+    'bio10', 'bio11', 'bio12', 'bio13', 'bio14', 'bio15', 'bio16', 'bio17', 'bio18', 'bio19'
+]
+
+
+def find_tile_files():
+    """Find all WorldClim tile files in the data directory."""
+    print(f"Searching for WorldClim tile files in {WORLDCLIM_DIR}...")
+    
+    if not WORLDCLIM_DIR.exists():
+        print(f"ERROR: Directory does not exist: {WORLDCLIM_DIR}")
+        return []
+    
+    # Find all files matching the tile pattern
+    tile_files = sorted(WORLDCLIM_DIR.glob("WorldClim_BIO_SA_1km-*.tif"))
+    
+    if not tile_files:
+        print(f"   No tile files found matching pattern 'WorldClim_BIO_SA_1km-*.tif'")
+        print(f"   Checked directory: {WORLDCLIM_DIR}")
+        return []
+    
+    print(f"   Found {len(tile_files)} tile file(s):")
+    for tile_file in tile_files:
+        print(f"      - {tile_file.name}")
+    
+    return tile_files
+
+
+def merge_tiles(tile_files):
+    """
+    Merge multiple WorldClim tile files into a single raster.
+    
+    Uses rasterio's merge function which handles overlapping tiles correctly
+    and creates a proper mosaic.
+    """
+    if not tile_files:
+        print("ERROR: No tile files to merge")
+        return None
+    
+    print(f"\nMerging {len(tile_files)} tile file(s)...")
+    
+    # Open all tile files
+    tile_sources = []
+    for tile_file in tile_files:
+        try:
+            src = rasterio.open(tile_file)
+            tile_sources.append(src)
+            print(f"   Opened: {tile_file.name}")
+            print(f"      Shape: {src.shape}, Bands: {src.count}, CRS: {src.crs}")
+            print(f"      Bounds: {src.bounds}")
+        except Exception as e:
+            print(f"   ERROR: Could not open {tile_file.name}: {e}")
+            continue
+    
+    if not tile_sources:
+        print("ERROR: No valid tile files could be opened")
+        return None
+    
+    # Use rasterio's merge function to create mosaic
+    print("\n   Creating mosaic...")
+    mosaic, out_transform = merge(tile_sources, method='first')
+    
+    # Get metadata from first source
+    out_meta = tile_sources[0].meta.copy()
+    out_meta.update({
+        "driver": "GTiff",
+        "height": mosaic.shape[1],
+        "width": mosaic.shape[2],
+        "transform": out_transform,
+        "count": mosaic.shape[0],
+        "dtype": mosaic.dtype,
+        "compress": "lzw",
+        "tiled": True,
+        "blockxsize": 512,
+        "blockysize": 512,
+    })
+    
+    # Close all source files
+    for src in tile_sources:
+        src.close()
+    
+    print(f"   Mosaic created:")
+    print(f"      Shape: {mosaic.shape}")
+    print(f"      Bands: {mosaic.shape[0]}")
+    print(f"      Data type: {mosaic.dtype}")
+    print(f"      Valid pixels: {np.sum(~np.isnan(mosaic)):,}")
+    
+    return mosaic, out_meta, out_transform
+
+
+def write_merged_raster(mosaic, out_meta, out_transform):
+    """Write the merged mosaic to a single GeoTIFF file."""
+    print(f"\nWriting merged raster to {OUTPUT_FILE.name}...")
+    
+    # Ensure output directory exists
+    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Write the merged raster
+    with rasterio.open(OUTPUT_FILE, "w", **out_meta) as dst:
+        dst.write(mosaic)
+        
+        # Set band descriptions
+        for i, band_name in enumerate(WORLDCLIM_BANDS, start=1):
+            try:
+                dst.set_band_description(i, band_name)
+            except Exception:
+                pass
+        
+        print(f"   Successfully wrote {OUTPUT_FILE.name}")
+        print(f"   File size: {OUTPUT_FILE.stat().st_size / (1024**2):.1f} MB")
+        print(f"   Bounds: {dst.bounds}")
+        print(f"   CRS: {dst.crs}")
+        print(f"   Resolution: {dst.res[0]:.0f} m × {dst.res[1]:.0f} m")
+
+
+def main():
+    """Main preprocessing function."""
+    print("="*60)
+    print("WorldClim BIO Preprocessing")
+    print("="*60)
+    
+    # Find tile files
+    tile_files = find_tile_files()
+    if not tile_files:
+        print("\nERROR: No tile files found. Please ensure WorldClim tiles are in:")
+        print(f"   {WORLDCLIM_DIR}")
+        return
+    
+    # Check if merged file already exists
+    if OUTPUT_FILE.exists():
+        print(f"\nWARNING: Output file already exists: {OUTPUT_FILE.name}")
+        response = input("   Overwrite? (y/n): ").strip().lower()
+        if response != 'y':
+            print("   Skipping merge (file already exists)")
+            return
+    
+    # Merge tiles
+    result = merge_tiles(tile_files)
+    if result is None:
+        print("\nERROR: Failed to merge tiles")
+        return
+    
+    mosaic, out_meta, out_transform = result
+    
+    # Write merged raster
+    write_merged_raster(mosaic, out_meta, out_transform)
+    
+    print("\n" + "="*60)
+    print("Preprocessing completed successfully!")
+    print("="*60)
+    print(f"\nOutput file: {OUTPUT_FILE}")
+    print("\nYou can now use this merged file in the merge pipeline.")
+    print("The individual tile files can be deleted if desired, but keeping them")
+    print("as backup is recommended.")
+
+
+if __name__ == "__main__":
+    main()
+

@@ -3,10 +3,13 @@
 WorldClim bioclimatic visualization for South America.
 
 Inputs:
-- GeoTIFF tiles in `data/ready/WorldClim`, containing the 19 bioclimatic variables at 1 km resolution.
+- Merged GeoTIFF file `WorldClim_BIO_SA_1km.tif` in `data/ready/WorldClim` (preferred), or
+- GeoTIFF tiles matching pattern `WorldClim_BIO_SA_1km-*.tif` in `data/ready/WorldClim` (fallback).
+  Contains the 19 bioclimatic variables at 1 km resolution.
 
 Process:
-- Loads all tiles, mosaics the rasters, applies scale factors, and generates maps, summary statistics, and comparative analyses for each bioclimatic band.
+- Loads the merged file if available, otherwise loads and mosaics tile files.
+- Applies scale factors and generates maps, summary statistics, and comparative analyses for each bioclimatic band.
 
 Outputs:
 - PNG figures saved to `outputs/Figures/WorldClim_vis`.
@@ -53,8 +56,55 @@ WORLDCLIM_BANDS = {
 }
 
 def load_worldclim_data():
-    """Load the WorldClim BIO data from all tile files and mosaic them"""
-    print("Loading WorldClim BIO data from tile files...")
+    """Load the WorldClim BIO data from merged file or tile files"""
+    print("Loading WorldClim BIO data...")
+    
+    # First, check for the merged file (preferred)
+    merged_file = worldclim_dir / "WorldClim_BIO_SA_1km.tif"
+    
+    if merged_file.exists():
+        print(f"   Found merged file: {merged_file.name}")
+        try:
+            with rasterio.open(merged_file) as src:
+                data = src.read()
+                bounds = src.bounds
+                crs = src.crs
+                transform = src.transform
+                profile = src.profile.copy()
+                
+                print(f"   File: {merged_file.name}")
+                print(f"   Shape: {data.shape}, Bands: {src.count}")
+                print(f"   Bounds: {bounds}")
+                print(f"   CRS: {crs}")
+                print(f"   Valid pixels: {np.sum(~np.isnan(data)):,}")
+            
+            # Create a simple object to hold metadata for compatibility
+            # (The actual src is closed, but we keep the essential info)
+            class SimpleRasterInfo:
+                def __init__(self, profile, bounds, crs, transform):
+                    self.profile = profile
+                    self.bounds = bounds
+                    self.crs = crs
+                    self.transform = transform
+                    self.count = profile['count']
+                    self.width = profile['width']
+                    self.height = profile['height']
+            
+            raster_info = SimpleRasterInfo(profile, bounds, crs, transform)
+            
+            return {
+                'data': data,
+                'src': raster_info,
+                'bounds': bounds,
+                'band_names': list(WORLDCLIM_BANDS.keys()),
+                'file_path': merged_file
+            }
+        except Exception as e:
+            print(f"   Error loading merged file: {e}")
+            print("   Falling back to tile files...")
+    
+    # Fallback: Load from tile files (backward compatibility)
+    print("   Loading from tile files...")
     
     # Find all WorldClim tile files
     tile_files = list(worldclim_dir.glob("WorldClim_BIO_SA_1km-*.tif"))
