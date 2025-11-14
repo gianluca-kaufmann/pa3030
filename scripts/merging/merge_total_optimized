@@ -19,9 +19,14 @@ Static datasets (no year in filename, constant across all years):
   - slope: Terrain slope derived from elevation
   - oil_gas: Oil and gas infrastructure locations (fixed reference year)
   - road_infrastructure: Road network (fixed reference year)
+  - GSN: Grid system network (fixed reference dataset)
+  - powerplants: Power plant locations and capacity (fixed reference year)
+  - WorldClim: Climate variables (static bioclimatic averages)
   
-  Handling: Static files are read ONCE at the start and reused for ALL years without 
-  forward-filling. They appear as identical bands in every output year.
+  Handling: Static files are read ONCE per window and reused for ALL years without 
+  forward-filling. They appear as identical values in every output year, ensuring
+  no artificial NA inflation. Static datasets are loaded first in each window,
+  then combined with yearly data.
 
 Yearly datasets (year in filename, time-varying):
   - WDPA: Protected areas (yearly updates)
@@ -31,9 +36,7 @@ Yearly datasets (year in filename, time-varying):
   - gdp: GDP estimates (yearly or periodic)
   - deforestation: Forest loss (yearly)
   - landcover: Land cover classification (yearly)
-  - WorldClim: Climate variables (yearly or periodic)
-  - GSN: Grid system network (yearly or periodic)
-  - powerplants: Power plant locations and capacity (periodic updates)
+  - wildfire: Wildfire occurrence and burned area (yearly)
   
   Handling: If a dataset has no file for a target year, the script performs FORWARD-FILL,
   reusing the most recent prior year to maintain panel completeness. If a year precedes
@@ -47,8 +50,9 @@ Key choices:
 - Portable path resolution from ``Path(__file__)`` with automatic ``$SCRATCH`` override for HPC runs.
 - Backbone-based masking: only pixels with backbone=1 are included in the Parquet output (GeoTIFFs remain full extent).
 - Dynamic year detection: automatically discovers all available years from the data (no hardcoded range).
+- Automatic dataset classification: separates static (time-invariant) from yearly (time-varying) datasets.
+- Static datasets are loaded once per window and reused across all years, eliminating artificial NA inflation.
 - Forward-fill for yearly datasets to maintain complete panel and avoid gaps in derived indicators.
-- Static datasets are cached once and broadcast to every processed year without further reads or transforms.
 - Vectorized coordinate generation and Arrow streaming to avoid pandas and large in-memory tables.
 - Explicit cleanup (`del`, `gc.collect`) after each window and year to keep RAM usage bounded.
 
@@ -57,9 +61,13 @@ Short overview of what the script does:
 2) Open backbone.tif to define the reference grid (shape, CRS, transform) and load the binary mask.
 3) Discover all candidate rasters in data/ready and group them by dataset and year.
 4) Automatically determine the year range from available data (all years with at least one dataset).
-5) Determine the final band list by probing datasets for a sample year.
-6) For each year in the detected range:
-   - Load only that year's rasters per dataset (with forward-fill fallback and static layers).
+5) Classify datasets into static (time-invariant) and yearly (time-varying) categories.
+6) Determine the final band list by probing static and yearly datasets separately.
+7) For each year in the detected range:
+   - For each window:
+     a) Load static datasets ONCE (these remain constant across all years).
+     b) Load yearly datasets for the current year (with forward/backward-fill fallback).
+     c) Combine static + yearly arrays in consistent order.
    - Reproject on-the-fly to match the reference grid if needed.
    - Concatenate dataset arrays into a single band stack for the year.
    - Write a per-year GeoTIFF and convert the stack to a long Arrow table (vectorized coords).
@@ -70,8 +78,6 @@ Short overview of what the script does:
 
 import re
 import sys
-import math
-import json
 import time
 import os
 import gc
@@ -82,7 +88,6 @@ import numpy as np
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.warp import reproject
-import pandas as pd
 from rasterio.windows import Window
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -365,23 +370,6 @@ def window_to_arrow(year: int, window: Window, band_stack: np.ndarray, band_name
     return pa.table(cols_dict)
 
 
-def stack_arrays(arrays: List[np.ndarray]) -> np.ndarray:
-    """Stack arrays into (B, H, W), auto-expanding (H, W) to (1, H, W)."""
-    if not arrays:
-        return np.empty((0,))
-    
-    normed: List[np.ndarray] = []
-    for a in arrays:
-        if a.ndim == 2:
-            normed.append(a[np.newaxis, ...])
-        elif a.ndim == 3:
-            normed.append(a)
-        else:
-            raise ValueError(f"Unsupported array ndim: {a.ndim}")
-    
-    return np.concatenate(normed, axis=0)
-
-
 def build_band_names(dataset: str, arrays: List[np.ndarray]) -> List[str]:
     """Build band names for a dataset given contributing arrays."""
     names: List[str] = []
@@ -400,59 +388,61 @@ def build_band_names(dataset: str, arrays: List[np.ndarray]) -> List[str]:
     return names
 
 
-def forward_and_backward_fill(year_to_array: Dict[int, np.ndarray], years: List[int]) -> Dict[int, np.ndarray]:
-    """Ensure coverage for years by forward filling within years and backfilling at the beginning."""
-    if not year_to_array:
-        # Return empty arrays if no data
-        sample_shape = (1, 100, 100)  # Dummy shape
-        return {y: np.full(sample_shape, np.nan) for y in years}
+def classify_datasets(catalog: Dict[str, Dict[Optional[int], List[Path]]]) -> Tuple[List[str], List[str]]:
+    """
+    Classify datasets as static (time-invariant) or yearly (time-varying).
     
-    available_years = sorted(year_to_array.keys())
-    first_year = available_years[0]
-    last_known = year_to_array[first_year]
-    filled: Dict[int, np.ndarray] = {}
+    Static datasets have no year in filename (key = None in catalog).
+    Yearly datasets have years in filenames (key = int in catalog).
     
-    # Backfill years before first available
-    for y in years:
-        if y < first_year:
-            filled[y] = last_known.copy()
-        else:
-            break
+    Returns: (static_datasets, yearly_datasets)
+    """
+    static = []
+    yearly = []
     
-    # Iterate years in order, forward fill
-    for y in years:
-        if y in year_to_array:
-            last_known = year_to_array[y]
-        filled[y] = last_known.copy()
+    for dataset, entries in catalog.items():
+        has_static = None in entries
+        has_yearly = any(y is not None for y in entries.keys())
+        
+        if has_static and not has_yearly:
+            # Only static files, no yearly variation
+            static.append(dataset)
+        elif has_yearly:
+            # Has yearly files (may also have some static files, but treat as yearly)
+            yearly.append(dataset)
+        # Skip datasets with neither (shouldn't happen)
     
-    return filled
+    return sorted(static), sorted(yearly)
 
 
-def write_year_tif(year: int, band_stack: np.ndarray, band_names: List[str], ref_profile: dict) -> Path:
-    """Write a yearly GeoTIFF with optimized compression."""
-    log_progress(f"Writing {year} GeoTIFF...")
-    profile = ref_profile.copy()
-    profile.update({
-        "count": band_stack.shape[0],
-        "dtype": rasterio.float32,
-        "nodata": np.nan,
-        "compress": "lzw",  # Faster compression than deflate
-        "tiled": True,
-        "blockxsize": 512,
-        "blockysize": 512,
-    })
+def load_dataset_window(
+    paths: List[Path],
+    ref_profile: dict,
+    window: Window,
+    expected_bands: int,
+    window_height: int,
+    window_width: int
+) -> List[np.ndarray]:
+    """
+    Load and reproject dataset files for a given window.
+    Returns NaN placeholder if no paths provided.
+    """
+    if not paths:
+        # No data available - create NaN placeholder
+        placeholder = np.full((expected_bands, window_height, window_width), np.nan, dtype=np.float32)
+        return [placeholder]
     
-    out_path = OUTPUT_TIFF_DIR / f"merged_SA_1km_{year}.tif"
-    with rasterio.open(out_path, "w", **profile) as dst:
-        for i in range(band_stack.shape[0]):
-            dst.write(band_stack[i].astype(np.float32), i + 1)
-            try:
-                dst.set_band_description(i + 1, band_names[i])
-            except Exception:
-                pass
+    arrays = []
+    for p in paths:
+        arr = read_reproject_window(p, ref_profile, window)
+        arrays.append(arr)
     
-    log_progress(f"Wrote {out_path}")
-    return out_path
+    # If loading failed, create placeholder
+    if not arrays:
+        placeholder = np.full((expected_bands, window_height, window_width), np.nan, dtype=np.float32)
+        return [placeholder]
+    
+    return arrays
 
 
 # Removed pandas DataFrame conversions in favor of direct Arrow streaming per window
@@ -550,55 +540,110 @@ def main():
         sys.exit(1)
     
     log_progress(f"Datasets to process: {', '.join(datasets_present)}")
-    wandb.config.update({"datasets": datasets_present, "num_datasets": len(datasets_present)})
+    
+    # Classify datasets into static (time-invariant) and yearly (time-varying)
+    all_static, all_yearly = classify_datasets(catalog)
+    
+    # Filter to only include datasets in our priority list
+    static_datasets = [d for d in all_static if d in datasets_present]
+    yearly_datasets = [d for d in all_yearly if d in datasets_present]
+    
+    log_progress(f"\nDataset classification:")
+    log_progress(f"  Static datasets (constant across years): {', '.join(static_datasets) if static_datasets else 'none'}")
+    log_progress(f"  Yearly datasets (time-varying): {', '.join(yearly_datasets) if yearly_datasets else 'none'}")
+    
+    wandb.config.update({
+        "datasets": datasets_present, 
+        "num_datasets": len(datasets_present),
+        "static_datasets": static_datasets,
+        "yearly_datasets": yearly_datasets,
+        "num_static": len(static_datasets),
+        "num_yearly": len(yearly_datasets)
+    })
 
     # Determine band names using a small probe window to avoid full reads
-    # Check ALL years to ensure we capture datasets that appear in any year
-    log_progress("Determining band structure with probe window...")
+    log_progress("\nDetermining band structure with probe window...")
     probe_window = Window(col_off=0, row_off=0, width=min(8, ref_profile["width"]), height=min(8, ref_profile["height"]))
-    all_band_names: List[str] = []
-    dataset_band_counts: Dict[str, int] = {}  # Track how many bands each dataset contributes
-    for dataset in datasets_present:
+    
+    # Probe static datasets first
+    static_band_names: List[str] = []
+    static_band_counts: Dict[str, int] = {}
+    
+    log_progress("  Probing static datasets...")
+    for dataset in static_datasets:
         try:
             entries = catalog[dataset]
-            candidate_paths: List[Path] = []
-            
-            # First check for static files (None = no year in filename)
-            if None in entries:
-                candidate_paths = entries[None]
-            else:
-                # Find ANY available year for this dataset (not just <= first year)
-                # This ensures we capture datasets that start later
-                available_years = sorted([y for y in entries.keys() if y is not None])
-                if available_years:
-                    # Use the first available year to determine band structure
-                    candidate_paths = entries[available_years[0]]
-            
-            if not candidate_paths:
-                log_progress(f"  Skipping {dataset}: no data files found")
+            if None not in entries:
+                log_progress(f"    Warning: {dataset} classified as static but has no static files")
                 continue
-                
+            
+            candidate_paths = entries[None]
             arrays = []
             for p in candidate_paths:
                 arr = read_reproject_window(p, ref_profile, probe_window)
                 arrays.append(arr)
+            
             band_names = build_band_names(dataset, arrays)
             if band_names:
-                all_band_names.extend(band_names)
-                # Store the number of bands this dataset contributes (matches band_names length)
-                dataset_band_counts[dataset] = len(band_names)
-                log_progress(f"  {dataset}: {len(band_names)} bands")
+                static_band_names.extend(band_names)
+                static_band_counts[dataset] = len(band_names)
+                log_progress(f"    {dataset}: {len(band_names)} bands (static)")
         except Exception as e:
-            log_progress(f"  Warning: Could not probe {dataset}: {e}")
+            log_progress(f"    Warning: Could not probe static dataset {dataset}: {e}")
             continue
-
+    
+    # Probe yearly datasets
+    yearly_band_names: List[str] = []
+    yearly_band_counts: Dict[str, int] = {}
+    
+    log_progress("  Probing yearly datasets...")
+    for dataset in yearly_datasets:
+        try:
+            entries = catalog[dataset]
+            candidate_paths: List[Path] = []
+            
+            # Find ANY available year for this dataset
+            available_years = sorted([y for y in entries.keys() if y is not None])
+            if available_years:
+                candidate_paths = entries[available_years[0]]
+            
+            if not candidate_paths:
+                log_progress(f"    Skipping {dataset}: no data files found")
+                continue
+            
+            arrays = []
+            for p in candidate_paths:
+                arr = read_reproject_window(p, ref_profile, probe_window)
+                arrays.append(arr)
+            
+            band_names = build_band_names(dataset, arrays)
+            if band_names:
+                yearly_band_names.extend(band_names)
+                yearly_band_counts[dataset] = len(band_names)
+                log_progress(f"    {dataset}: {len(band_names)} bands (yearly)")
+        except Exception as e:
+            log_progress(f"    Warning: Could not probe yearly dataset {dataset}: {e}")
+            continue
+    
+    # Combine band names: static first, then yearly (ensures consistent column order)
+    all_band_names = static_band_names + yearly_band_names
+    dataset_band_counts = {**static_band_counts, **yearly_band_counts}
+    
     if not all_band_names:
         print("ERROR: Failed to determine band structure.")
         sys.exit(1)
-
-    log_progress(f"Total bands: {len(all_band_names)}")
-    log_progress(f"Band names: {all_band_names}")
-    wandb.log({"processing/total_bands": len(all_band_names)})
+    
+    log_progress(f"\nBand structure summary:")
+    log_progress(f"  Static bands: {len(static_band_names)}")
+    log_progress(f"  Yearly bands: {len(yearly_band_names)}")
+    log_progress(f"  Total bands: {len(all_band_names)}")
+    log_progress(f"  All band names: {all_band_names}")
+    
+    wandb.log({
+        "processing/total_bands": len(all_band_names),
+        "processing/static_bands": len(static_band_names),
+        "processing/yearly_bands": len(yearly_band_names)
+    })
 
     # Setup incremental Parquet writer
     log_progress("Setting up incremental Parquet writer...")
@@ -606,11 +651,12 @@ def main():
     total_rows = 0
     
     # Process year-by-year using windowed streaming
-    log_progress("Processing years sequentially (windowed streaming)...")
+    # Key change: Load static datasets ONCE per window and reuse across all years
+    log_progress("\nProcessing years sequentially (windowed streaming with static data caching)...")
     
-    for i, year in enumerate(YEARS):
+    for year_idx, year in enumerate(YEARS):
         log_progress(f"\n{'='*60}")
-        log_progress(f"Processing year {i+1}/{len(YEARS)}: {year}")
+        log_progress(f"Processing year {year_idx+1}/{len(YEARS)}: {year}")
         log_progress(f"{'='*60}")
         
         try:
@@ -618,9 +664,9 @@ def main():
             current_band_names = all_band_names
             tif_ds, out_tif = open_year_tif_writer(year, len(current_band_names), current_band_names, ref_profile)
             year_rows = 0
+            
             # Iterate windows and stream
             for w in iter_reference_windows(ref_profile, TILE_SIZE):
-                window_arrays: List[np.ndarray] = []
                 window_height = int(w.height)
                 window_width = int(w.width)
                 
@@ -630,36 +676,45 @@ def main():
                     int(w.col_off):int(w.col_off + w.width)
                 ]
                 
-                for dataset in datasets_present:
+                # LOAD STATIC DATA FIRST (these are identical across all years)
+                static_window_arrays: List[np.ndarray] = []
+                for dataset in static_datasets:
                     entries = catalog[dataset]
-                    paths: List[Path] = []
+                    paths = entries.get(None, [])
+                    expected_bands = static_band_counts.get(dataset, 1)
+                    arrays = load_dataset_window(paths, ref_profile, w, expected_bands, window_height, window_width)
+                    static_window_arrays.extend(arrays)
+                
+                # LOAD YEARLY DATA (varies by year, with forward-fill)
+                yearly_window_arrays: List[np.ndarray] = []
+                for dataset in yearly_datasets:
+                    entries = catalog[dataset]
+                    
+                    # Find paths: current year, forward-fill, or backward-fill
                     if year in entries:
                         paths = entries[year]
-                    elif None in entries:
-                        paths = entries[None]
                     else:
+                        # Forward-fill: use most recent prior year
                         prevs = [y for y in entries.keys() if y is not None and y < year]
                         if prevs:
                             paths = entries[max(prevs)]
+                        else:
+                            # Backward-fill: use earliest available year
+                            nexts = [y for y in entries.keys() if y is not None and y > year]
+                            paths = entries[min(nexts)] if nexts else []
                     
-                    # Collect arrays for this dataset
-                    dataset_arrays: List[np.ndarray] = []
-                    for p in paths:
-                        arr = read_reproject_window(p, ref_profile, w)
-                        dataset_arrays.append(arr)
-                    
-                    # If no data found, create NaN placeholder arrays
-                    if not dataset_arrays and dataset in dataset_band_counts:
-                        expected_bands = dataset_band_counts[dataset]
-                        # Create a single placeholder array with all expected bands
-                        placeholder = np.full((expected_bands, window_height, window_width), np.nan, dtype=np.float32)
-                        dataset_arrays.append(placeholder)
-                    
-                    window_arrays.extend(dataset_arrays)
+                    expected_bands = yearly_band_counts.get(dataset, 1)
+                    arrays = load_dataset_window(paths, ref_profile, w, expected_bands, window_height, window_width)
+                    yearly_window_arrays.extend(arrays)
                 
-                if not window_arrays:
+                # COMBINE: Static arrays first, then yearly arrays
+                all_window_arrays = static_window_arrays + yearly_window_arrays
+                
+                if not all_window_arrays:
                     continue
-                band_stack = np.concatenate([a if a.ndim == 3 else a[np.newaxis, ...] for a in window_arrays], axis=0)
+                
+                # Stack into single band array
+                band_stack = np.concatenate([a if a.ndim == 3 else a[np.newaxis, ...] for a in all_window_arrays], axis=0)
                 
                 # Safety check: ensure band count matches expected
                 if band_stack.shape[0] != len(current_band_names):
@@ -669,8 +724,9 @@ def main():
                     raise ValueError(error_msg)
                 
                 # Write window to GeoTIFF
-                for i in range(band_stack.shape[0]):
-                    tif_ds.write(band_stack[i].astype(np.float32), i + 1, window=w)
+                for band_idx in range(band_stack.shape[0]):
+                    tif_ds.write(band_stack[band_idx].astype(np.float32), band_idx + 1, window=w)
+                
                 # Parquet streaming with backbone mask
                 table = window_to_arrow(year, w, band_stack, current_band_names, ref_profile, backbone_window)
                 if parquet_writer is None:
@@ -679,8 +735,11 @@ def main():
                 if table.num_rows > 0:
                     parquet_writer.write_table(table)
                     year_rows += table.num_rows
-                del band_stack, window_arrays, table, backbone_window
+                
+                # Clean up memory
+                del band_stack, static_window_arrays, yearly_window_arrays, all_window_arrays, table, backbone_window
                 gc.collect()
+            
             tif_ds.close()
             file_size_mb = out_tif.stat().st_size / (1024 * 1024)
             wandb.log({
