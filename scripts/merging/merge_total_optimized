@@ -542,11 +542,15 @@ def main():
     log_progress(f"Datasets to process: {', '.join(datasets_present)}")
     
     # Classify datasets into static (time-invariant) and yearly (time-varying)
-    all_static, all_yearly = classify_datasets(catalog)
-    
-    # Filter to only include datasets in our priority list
-    static_datasets = [d for d in all_static if d in datasets_present]
-    yearly_datasets = [d for d in all_yearly if d in datasets_present]
+    # Hard override: these datasets are ALWAYS treated as static, even if year-stamped files exist
+    STATIC_OVERRIDE = {
+        "elevation", "slope", "oil_gas", "road_infrastructure",
+        "GSN", "powerplants", "WorldClim"
+    }
+    # Normalize for robust matching
+    static_override_norm = {s.lower() for s in STATIC_OVERRIDE}
+    static_datasets = [d for d in datasets_present if d.lower() in static_override_norm]
+    yearly_datasets = [d for d in datasets_present if d.lower() not in static_override_norm]
     
     log_progress(f"\nDataset classification:")
     log_progress(f"  Static datasets (constant across years): {', '.join(static_datasets) if static_datasets else 'none'}")
@@ -573,11 +577,15 @@ def main():
     for dataset in static_datasets:
         try:
             entries = catalog[dataset]
-            if None not in entries:
-                log_progress(f"    Warning: {dataset} classified as static but has no static files")
-                continue
-            
-            candidate_paths = entries[None]
+            # Prefer truly static files (no year in filename); otherwise fall back to earliest available year
+            if None in entries:
+                candidate_paths = entries[None]
+            else:
+                available_years = sorted([y for y in entries.keys() if y is not None])
+                candidate_paths = entries[available_years[0]] if available_years else []
+                if not candidate_paths:
+                    log_progress(f"    Warning: {dataset} static override but no files found at all")
+                    continue
             arrays = []
             for p in candidate_paths:
                 arr = read_reproject_window(p, ref_profile, probe_window)
@@ -680,7 +688,12 @@ def main():
                 static_window_arrays: List[np.ndarray] = []
                 for dataset in static_datasets:
                     entries = catalog[dataset]
-                    paths = entries.get(None, [])
+                    # Prefer truly static files; fallback to earliest available year
+                    if None in entries:
+                        paths = entries[None]
+                    else:
+                        years_avail = sorted([y for y in entries.keys() if y is not None])
+                        paths = entries[years_avail[0]] if years_avail else []
                     expected_bands = static_band_counts.get(dataset, 1)
                     arrays = load_dataset_window(paths, ref_profile, w, expected_bands, window_height, window_width)
                     static_window_arrays.extend(arrays)
