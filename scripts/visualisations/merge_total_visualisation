@@ -1,293 +1,542 @@
 #!/usr/bin/env python3
 """
-Full dataset analysis for merged panel (2000-2024).
+Generate 2D maps from the merged panel Parquet file without loading everything into memory.
 
-Inputs:
-- Parquet panel file `merged_panel_2000_2024.parquet` stored in `data/ml`.
+This script:
+1. Reads the parquet file in chunks (row groups) to avoid loading everything
+2. Filters by a hardcoded 500x500 pixel tile (random sample check)
+3. Filters by a hardcoded year
+4. Reshapes the data into a 2D grid based on row/col coordinates
+5. Creates visualizations for selected bands (NDVI, landcover, elevation, VIIRS, GSN_1, WDPA)
 
-Process:
-- Processes all row groups incrementally using memory-efficient streaming.
-- Computes comprehensive statistics, sanity checks, and year coverage.
-- Avoids OOM crashes by processing data in batches.
-
-Outputs:
-- JSON file with full analysis results saved to `outputs/Figures/merge_total_vis/full_dataset_analysis.json`.
+Usage:
+    python scripts/visualisations/merge_total_visualisation
 """
 
-import warnings
-import gc
-import json
 import numpy as np
-import pandas as pd
 import pyarrow.parquet as pq
+import matplotlib.pyplot as plt
 from pathlib import Path
-from typing import Dict
+import warnings
+from typing import Optional, List, Dict, Tuple
+import pandas as pd
 
-warnings.filterwarnings("ignore")
+warnings.filterwarnings('ignore')
 
-# Set up paths
+# Paths
 ROOT_DIR = Path(__file__).resolve().parents[2]
-DATA_DIR = ROOT_DIR / "data" / "ml"
+DATA_ML = ROOT_DIR / "data" / "ml"
+OUTPUT_RESULTS = ROOT_DIR / "outputs" / "Results"
 OUTPUT_DIR = ROOT_DIR / "outputs" / "Figures" / "merge_total_vis"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Panel file
-PANEL_FILE = DATA_DIR / "merged_panel_2000_2024.parquet"
+# Hardcoded parameters for random sample check
+TILE_SIZE = 10000
+YEAR = None  # Will be auto-detected if None
+ROW_START = None  # Will be auto-detected if None
+COL_START = None  # Will be auto-detected if None
+
+# Bands to visualize
+REQUESTED_BANDS = ['NDVI', 'landcover', 'elevation', 'night_lights', 'GSN_1', 'WDPA']
+
+# Mapping from requested band names to possible column name patterns
+BAND_ALIASES = {
+    'night_lights': ['VIIRS', 'viirs'],
+    'GSN_1': ['GSN_b1', 'GSN', 'gsn_b1', 'gsn'],  # Try numbered version first
+}
 
 
-def log_progress(message: str):
-    """Simple logging function with immediate flush."""
-    print(message, flush=True)
+def find_parquet_file() -> Path:
+    """Find the merged panel parquet file."""
+    for location in [DATA_ML, OUTPUT_RESULTS]:
+        if location.exists():
+            files = list(location.glob("merged_panel_*.parquet"))
+            if files:
+                return files[0]
+    raise FileNotFoundError("No merged panel parquet file found")
 
 
-def get_parquet_metadata() -> Dict:
-    """Get metadata from parquet file without loading all data."""
-    log_progress("    Opening parquet file (this may take a minute for large files)...")
-    try:
-        parquet_file = pq.ParquetFile(PANEL_FILE)
-        log_progress("    Reading metadata...")
-        metadata = parquet_file.metadata
-        log_progress("    Reading schema...")
-        schema = parquet_file.schema
-        
-        log_progress("    Extracting metadata fields...")
-        result = {
-            'row_count': metadata.num_rows,
-            'columns': [schema[i].name for i in range(len(schema))],
-            'num_row_groups': metadata.num_row_groups
-        }
-        log_progress("    Metadata extraction complete")
-        return result
-    except Exception as e:
-        log_progress(f"    Error reading metadata: {e}")
-        raise
+def discover_available_years(pfile: pq.ParquetFile) -> List[int]:
+    """Discover which years are available in the parquet file."""
+    print("Discovering available years...")
+    years_set = set()
+    num_row_groups = pfile.metadata.num_row_groups
+    
+    # Sample row groups to find years (don't need to read all)
+    sample_indices = list(range(0, num_row_groups, max(1, num_row_groups // 20)))  # Sample ~20 row groups
+    sample_indices.append(num_row_groups - 1)  # Always check last one
+    
+    for rg_idx in sample_indices:
+        try:
+            table = pfile.read_row_group(rg_idx, columns=['year'])
+            df = table.to_pandas()
+            years_set.update(df['year'].unique())
+        except Exception:
+            continue
+    
+    years = sorted([int(y) for y in years_set if pd.notna(y)])
+    print(f"  Found years: {years}")
+    return years
 
 
-def convert_to_native(obj):
-    """Recursively convert numpy types to native Python types for JSON serialization."""
-    if isinstance(obj, (np.integer, np.int32, np.int64)):
-        return int(obj)
-    elif isinstance(obj, (np.floating, np.float32, np.float64)):
-        return float(obj)
-    elif isinstance(obj, np.ndarray):
-        return obj.tolist()
-    elif isinstance(obj, dict):
-        return {k: convert_to_native(v) for k, v in obj.items()}
-    elif isinstance(obj, (list, tuple)):
-        return [convert_to_native(item) for item in obj]
-    elif isinstance(obj, set):
-        return sorted([convert_to_native(item) for item in obj])
-    else:
-        return obj
-
-
-def analyze_full_dataset_streaming():
+def find_valid_tile_location(
+    pfile: pq.ParquetFile,
+    year: int,
+    tile_size: int,
+    max_samples: int = 50
+) -> Tuple[int, int]:
     """
-    Analyze the full dataset by processing row groups incrementally.
-    This avoids loading all data into memory at once.
+    Find a valid tile location (row_start, col_start) that has data for the given year.
     
     Returns:
-        Dictionary with aggregated statistics and checks
+        (row_start, col_start) tuple
     """
-    log_progress("\n" + "=" * 80)
-    log_progress("STREAMING ANALYSIS OF FULL DATASET")
-    log_progress("=" * 80)
+    print(f"Finding valid tile location for year {year}...")
+    columns_to_read = ['year', 'row', 'col']
+    num_row_groups = pfile.metadata.num_row_groups
     
-    parquet_file = pq.ParquetFile(PANEL_FILE)
-    num_row_groups = parquet_file.metadata.num_row_groups
-    total_rows = parquet_file.metadata.num_rows
+    # Sample row groups to find data
+    sample_indices = list(range(0, num_row_groups, max(1, num_row_groups // max_samples)))
     
-    log_progress(f"Processing all {num_row_groups:,} row groups ({total_rows:,} total rows)...")
-    log_progress("This will process data incrementally to avoid memory issues.")
+    all_rows = []
+    all_cols = []
     
-    # Initialize aggregators
-    year_counts = {}
-    year_stats = {}  # Will store running statistics per year
-    all_years = set()
-    coord_ranges = {'x': [float('inf'), float('-inf')], 
-                    'y': [float('inf'), float('-inf')],
-                    'row': [float('inf'), float('-inf')],
-                    'col': [float('inf'), float('-inf')]}
-    missing_counts = {}
-    total_processed = 0
-    
-    # Process row groups in batches
-    batch_size = 50  # Process 50 row groups at a time
-    feature_cols = None
-    
-    for batch_start in range(0, num_row_groups, batch_size):
-        batch_end = min(batch_start + batch_size, num_row_groups)
-        log_progress(f"  Processing row groups {batch_start+1}-{batch_end} ({batch_end}/{num_row_groups})...")
-        
-        # Read batch of row groups
-        chunks = []
-        for i in range(batch_start, batch_end):
-            try:
-                table = parquet_file.read_row_group(i)
-                chunks.append(table.to_pandas())
-            except Exception as e:
-                log_progress(f"    Warning: Could not read row group {i}: {e}")
-                continue
-        
-        if not chunks:
-            continue
+    for rg_idx in sample_indices:
+        try:
+            table = pfile.read_row_group(rg_idx, columns=columns_to_read)
+            df = table.to_pandas()
             
-        # Combine batch
-        df_batch = pd.concat(chunks, ignore_index=True)
-        del chunks
-        gc.collect()
-        
-        total_processed += len(df_batch)
-        
-        # Identify feature columns (first time only)
-        if feature_cols is None:
-            metadata_cols = ['year', 'x', 'y', 'row', 'col']
-            feature_cols = [c for c in df_batch.columns if c not in metadata_cols]
-            log_progress(f"  Identified {len(feature_cols)} feature columns")
-        
-        # Update year counts
-        if 'year' in df_batch.columns:
-            batch_year_counts = df_batch['year'].value_counts().to_dict()
-            for year, count in batch_year_counts.items():
-                year_counts[year] = year_counts.get(year, 0) + count
-                all_years.add(year)
-        
-        # Update coordinate ranges
-        for col in ['x', 'y', 'row', 'col']:
-            if col in df_batch.columns:
-                coord_ranges[col][0] = min(coord_ranges[col][0], df_batch[col].min())
-                coord_ranges[col][1] = max(coord_ranges[col][1], df_batch[col].max())
-        
-        # Update missing value counts
-        for col in df_batch.columns:
-            missing = df_batch[col].isnull().sum()
-            missing_counts[col] = missing_counts.get(col, 0) + missing
-        
-        # Update yearly statistics using incremental computation (Welford's algorithm)
-        # This avoids storing all values in memory
-        if 'year' in df_batch.columns:
-            for year in df_batch['year'].unique():
-                year_data = df_batch[df_batch['year'] == year]
-                if year not in year_stats:
-                    year_stats[year] = {}
-                    for feat in feature_cols[:10]:  # Track top 10 features
-                        year_stats[year][feat] = {
-                            'count': 0,
-                            'mean': 0.0,
-                            'M2': 0.0,  # Sum of squares of differences from mean
-                            'min': float('inf'),
-                            'max': float('-inf')
-                        }
-                
-                for feat in feature_cols[:10]:
-                    valid_data = year_data[feat].dropna()
-                    if len(valid_data) > 0:
-                        stats = year_stats[year][feat]
-                        for val in valid_data:
-                            stats['count'] += 1
-                            delta = val - stats['mean']
-                            stats['mean'] += delta / stats['count']
-                            delta2 = val - stats['mean']
-                            stats['M2'] += delta * delta2
-                            stats['min'] = min(stats['min'], val)
-                            stats['max'] = max(stats['max'], val)
-        
-        # Clean up
-        del df_batch
-        gc.collect()
-        
-        # Progress update
-        if (batch_end % 500 == 0) or (batch_end == num_row_groups):
-            log_progress(f"  Progress: {batch_end}/{num_row_groups} row groups ({total_processed:,} rows processed)")
+            # Filter by year
+            year_data = df[df['year'] == year]
+            
+            if len(year_data) > 0:
+                all_rows.extend(year_data['row'].tolist())
+                all_cols.extend(year_data['col'].tolist())
+        except Exception:
+            continue
     
-    log_progress(f"\n  Completed! Processed {total_processed:,} rows from {num_row_groups} row groups")
+    if not all_rows:
+        raise ValueError(f"No data found for year {year} in sampled row groups")
     
-    # Compute final statistics from incremental stats
-    final_stats = {}
-    for year in sorted(all_years):
-        final_stats[year] = {}
-        for feat in feature_cols[:10]:
-            if year in year_stats and feat in year_stats[year]:
-                stats = year_stats[year][feat]
-                if stats['count'] > 0:
-                    variance = stats['M2'] / stats['count'] if stats['count'] > 1 else 0.0
-                    std = np.sqrt(variance)
-                    final_stats[year][feat] = {
-                        'mean': stats['mean'],
-                        'std': std,
-                        'count': stats['count'],
-                        'min': stats['min'] if stats['min'] != float('inf') else None,
-                        'max': stats['max'] if stats['max'] != float('-inf') else None
-                    }
+    # Find a good starting point (use median to get a central location)
+    row_start = int(np.median(all_rows)) - tile_size // 2
+    col_start = int(np.median(all_cols)) - tile_size // 2
     
-    return {
-        'year_counts': year_counts,
-        'year_stats': final_stats,
-        'coord_ranges': coord_ranges,
-        'missing_counts': missing_counts,
-        'total_rows': total_processed,
-        'years': sorted(all_years),
-        'feature_cols': feature_cols
+    # Ensure non-negative
+    row_start = max(0, row_start)
+    col_start = max(0, col_start)
+    
+    print(f"  Found data at rows [{min(all_rows)}:{max(all_rows)}], cols [{min(all_cols)}:{max(all_cols)}]")
+    print(f"  Selected tile location: row_start={row_start}, col_start={col_start}")
+    
+    return row_start, col_start
+
+
+def get_available_bands(pfile: pq.ParquetFile) -> List[str]:
+    """Get list of available band columns from the parquet file."""
+    schema = pfile.schema
+    columns = [schema[i].name for i in range(len(schema))]
+    # Filter out metadata columns
+    metadata_cols = {'year', 'x', 'y', 'row', 'col'}
+    band_cols = [c for c in columns if c not in metadata_cols]
+    return band_cols
+
+
+def find_band_column(band_name: str, available_bands: List[str]) -> Optional[str]:
+    """Find the actual column name for a requested band."""
+    # First, try direct matching (exact, case-insensitive, partial)
+    if band_name in available_bands:
+        return band_name
+    
+    for col in available_bands:
+        if col.lower() == band_name.lower():
+            return col
+    
+    # Try partial match - band name at start of column name
+    # (e.g., 'NDVI' matches 'NDVI_b1', 'landcover' matches 'landcover_b1')
+    for col in available_bands:
+        col_lower = col.lower()
+        name_lower = band_name.lower()
+        if col_lower.startswith(name_lower) or name_lower in col_lower:
+            return col
+    
+    # Check aliases (e.g., 'night_lights' -> 'VIIRS', 'GSN_1' -> 'GSN')
+    if band_name in BAND_ALIASES:
+        for alias_pattern in BAND_ALIASES[band_name]:
+            # Try exact match with alias
+            if alias_pattern in available_bands:
+                return alias_pattern
+            # Try case-insensitive exact match
+            for col in available_bands:
+                if col.lower() == alias_pattern.lower():
+                    return col
+            # Try partial match - alias pattern at start of column name
+            # (e.g., 'VIIRS' matches 'VIIRS_b1', 'VIIRS_b2', etc.)
+            for col in available_bands:
+                col_lower = col.lower()
+                pattern_lower = alias_pattern.lower()
+                if col_lower.startswith(pattern_lower) or pattern_lower in col_lower:
+                    return col
+    
+    return None
+
+
+def read_tile_from_parquet(
+    pfile: pq.ParquetFile,
+    row_start: int,
+    col_start: int,
+    tile_size: int,
+    year: int,
+    band_columns: List[str]
+) -> Tuple[np.ndarray, Dict[str, np.ndarray], Dict[str, int]]:
+    """
+    Read a tile from the parquet file without loading everything into memory.
+    
+    Returns:
+        - grid_shape: (height, width) of the tile
+        - band_data: Dictionary mapping band names to 2D arrays
+        - stats: Dictionary with row/col ranges and data statistics
+    """
+    row_end = row_start + tile_size
+    col_end = col_start + tile_size
+    
+    print(f"Reading tile: rows [{row_start}:{row_end}], cols [{col_start}:{col_end}], year {year}")
+    
+    # Columns to read
+    columns_to_read = ['year', 'row', 'col', 'x', 'y'] + band_columns
+    
+    # Read row groups in chunks and filter
+    all_data = []
+    num_row_groups = pfile.metadata.num_row_groups
+    
+    print(f"Scanning {num_row_groups} row groups...")
+    rows_read = 0
+    
+    for rg_idx in range(num_row_groups):
+        # Read row group
+        table = pfile.read_row_group(rg_idx, columns=columns_to_read)
+        
+        # Convert to pandas for filtering (more efficient than Arrow for this)
+        df = table.to_pandas()
+        
+        # Filter by year, row, and col
+        mask = (
+            (df['year'] == year) &
+            (df['row'] >= row_start) &
+            (df['row'] < row_end) &
+            (df['col'] >= col_start) &
+            (df['col'] < col_end)
+        )
+        
+        filtered_df = df[mask]
+        
+        if len(filtered_df) > 0:
+            all_data.append(filtered_df)
+            rows_read += len(filtered_df)
+        
+        # Progress update every 100 row groups
+        if (rg_idx + 1) % 100 == 0:
+            print(f"  Processed {rg_idx + 1}/{num_row_groups} row groups, found {rows_read:,} matching rows")
+    
+    if not all_data:
+        raise ValueError(f"No data found for year {year}, rows [{row_start}:{row_end}], cols [{col_start}:{col_end}]")
+    
+    # Combine all filtered data
+    import pandas as pd
+    df_tile = pd.concat(all_data, ignore_index=True)
+    print(f"Total matching rows: {len(df_tile):,}")
+    
+    # Get actual row/col ranges in the data
+    actual_row_min = df_tile['row'].min()
+    actual_row_max = df_tile['row'].max()
+    actual_col_min = df_tile['col'].min()
+    actual_col_max = df_tile['col'].max()
+    
+    # Calculate grid dimensions
+    row_range = int(actual_row_max - actual_row_min + 1)
+    col_range = int(actual_col_max - actual_col_min + 1)
+    
+    print(f"Actual data range: rows [{actual_row_min}:{actual_row_max}], cols [{actual_col_min}:{actual_col_max}]")
+    print(f"Grid dimensions: {row_range} x {col_range}")
+    
+    # Create 2D arrays for each band
+    band_data = {}
+    
+    # Create coordinate mapping
+    row_indices = df_tile['row'].values - actual_row_min
+    col_indices = df_tile['col'].values - actual_col_min
+    
+    for band_col in band_columns:
+        if band_col not in df_tile.columns:
+            print(f"  Warning: Column '{band_col}' not found, skipping")
+            continue
+        
+        # Initialize 2D array with NaN
+        band_array = np.full((row_range, col_range), np.nan, dtype=np.float32)
+        
+        # Fill array using row/col indices
+        values = df_tile[band_col].values.astype(np.float32)
+        band_array[row_indices, col_indices] = values
+        
+        band_data[band_col] = band_array
+        
+        # Print statistics
+        valid_count = np.sum(~np.isnan(band_array))
+        valid_pct = 100 * valid_count / band_array.size
+        mean_val = np.nanmean(band_array)
+        print(f"  {band_col}: {valid_count:,} valid pixels ({valid_pct:.1f}%), mean={mean_val:.3f}")
+    
+    stats = {
+        'row_min': int(actual_row_min),
+        'row_max': int(actual_row_max),
+        'col_min': int(actual_col_min),
+        'col_max': int(actual_col_max),
+        'height': row_range,
+        'width': col_range,
+        'year': year,
+        'x_min': float(df_tile['x'].min()),
+        'x_max': float(df_tile['x'].max()),
+        'y_min': float(df_tile['y'].min()),
+        'y_max': float(df_tile['y'].max()),
     }
+    
+    return (row_range, col_range), band_data, stats
+
+
+def create_band_visualization(
+    band_data: Dict[str, np.ndarray],
+    stats: Dict[str, int],
+    band_mapping: Dict[str, str],
+    output_dir: Path
+):
+    """Create 2D map visualizations for requested bands.
+    
+    Args:
+        band_data: Dictionary mapping column names to 2D arrays
+        stats: Statistics dictionary
+        band_mapping: Dictionary mapping requested band names to actual column names
+        output_dir: Output directory for saving figures
+    """
+    requested_bands = list(band_mapping.keys())
+    print(f"\nCreating visualizations for {len(requested_bands)} bands...")
+    
+    # Determine grid layout
+    n_bands = len(requested_bands)
+    n_cols = min(3, n_bands)
+    n_rows = (n_bands + n_cols - 1) // n_cols
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 6 * n_rows))
+    fig.suptitle(
+        f'2D Maps - Year {stats["year"]} | Tile: rows [{stats["row_min"]}:{stats["row_max"]}], '
+        f'cols [{stats["col_min"]}:{stats["col_max"]}]\n'
+        f'Coordinates: ({stats["x_min"]:.2f}, {stats["y_min"]:.2f}) to ({stats["x_max"]:.2f}, {stats["y_max"]:.2f})',
+        fontsize=12, fontweight='bold'
+    )
+    
+    if n_bands == 1:
+        axes = [axes]
+    elif n_rows == 1:
+        axes = axes if isinstance(axes, np.ndarray) else [axes]
+    else:
+        axes = axes.flatten()
+    
+    for idx, band_name in enumerate(requested_bands):
+        ax = axes[idx]
+        
+        # Get the actual column name from mapping
+        band_col = band_mapping.get(band_name)
+        
+        if band_col is None or band_col not in band_data:
+            ax.text(0.5, 0.5, f'Band "{band_name}"\nnot found', 
+                   ha='center', va='center', transform=ax.transAxes)
+            ax.set_title(band_name, fontweight='bold')
+            continue
+        
+        data = band_data[band_col]
+        
+        # Determine colormap and value range based on band type
+        if 'NDVI' in band_col.upper() or 'ndvi' in band_col.lower():
+            cmap = 'RdYlGn'
+            # Check if data is in scaled format (MODIS NDVI: -2000 to 10000)
+            # or standard format (-1 to 1)
+            valid_data = data[~np.isnan(data)]
+            if len(valid_data) > 0:
+                data_max = np.nanmax(data)
+                data_min = np.nanmin(data)
+                # If values are large (likely scaled MODIS format), use data range
+                if data_max > 10:
+                    # MODIS NDVI format: use actual data range or percentiles
+                    vmin = np.nanpercentile(data, 1)
+                    vmax = np.nanpercentile(data, 99)
+                    label = 'NDVI (scaled)'
+                else:
+                    # Standard NDVI format: -0.2 to 1.0
+                    vmin, vmax = -0.2, 1.0
+                    label = 'NDVI'
+            else:
+                vmin, vmax = -0.2, 1.0
+                label = 'NDVI'
+        elif 'elevation' in band_col.lower():
+            cmap = 'terrain'
+            vmin, vmax = np.nanpercentile(data, 1), np.nanpercentile(data, 99)
+            label = 'Elevation (m)'
+        elif 'viirs' in band_col.lower() or 'night' in band_col.lower():
+            cmap = 'hot'
+            vmin, vmax = 0, np.nanpercentile(data, 95)
+            label = 'Night Lights'
+        elif 'landcover' in band_col.lower():
+            cmap = 'tab20'
+            vmin, vmax = None, None
+            label = 'Land Cover'
+        elif 'gsn' in band_col.lower():
+            cmap = 'viridis'
+            vmin, vmax = np.nanpercentile(data, 1), np.nanpercentile(data, 99)
+            label = 'GSN'
+        elif 'wdpa' in band_col.lower():
+            cmap = 'YlOrRd'
+            vmin, vmax = 0, 1
+            label = 'WDPA (Protected Areas)'
+        else:
+            cmap = 'viridis'
+            vmin, vmax = np.nanpercentile(data, 1), np.nanpercentile(data, 99)
+            label = band_col
+        
+        # Create visualization
+        im = ax.imshow(data, cmap=cmap, aspect='auto', vmin=vmin, vmax=vmax, interpolation='nearest')
+        ax.set_title(f'{band_name}\n({band_col})', fontweight='bold', fontsize=10)
+        ax.set_xlabel('Column')
+        ax.set_ylabel('Row')
+        
+        # Add colorbar
+        cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+        cbar.set_label(label, rotation=270, labelpad=15)
+        
+        # Add statistics text
+        valid_data = data[~np.isnan(data)]
+        if len(valid_data) > 0:
+            mean_val = np.nanmean(data)
+            median_val = np.nanmedian(data)
+            stats_text = f'Mean: {mean_val:.3f}\nMedian: {median_val:.3f}\nValid: {len(valid_data):,}'
+            ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
+                   fontsize=8, verticalalignment='top',
+                   bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+    
+    # Hide unused subplots
+    for idx in range(n_bands, len(axes)):
+        axes[idx].axis('off')
+    
+    plt.tight_layout()
+    
+    # Save figure
+    output_file = output_dir / f"tile_maps_year{stats['year']}_r{stats['row_min']}_c{stats['col_min']}.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"Saved: {output_file}")
+    plt.close()
 
 
 def main():
-    """Main analysis function."""
-    print("\n" + "=" * 80)
-    print("FULL DATASET ANALYSIS")
-    print("South America 1km Dataset (2000-2024)")
+    """Main function - hardcoded parameters for random sample check."""
     print("=" * 80)
+    print("2D MAP GENERATION FROM PARQUET FILE (Random Sample Check)")
+    print("=" * 80)
+    print(f"Year: {YEAR if YEAR is not None else 'auto-detect'}")
+    print(f"Tile: rows [{ROW_START if ROW_START is not None else 'auto-detect'}:{TILE_SIZE}], "
+          f"cols [{COL_START if COL_START is not None else 'auto-detect'}:{TILE_SIZE}]")
+    print(f"Requested bands: {', '.join(REQUESTED_BANDS)}")
     print()
     
-    if not PANEL_FILE.exists():
-        print(f"ERROR: Panel file not found: {PANEL_FILE}")
-        print("Please run the merge script first: python scripts/merging/merge_total_optimized")
+    # Find parquet file
+    try:
+        parquet_file = find_parquet_file()
+        print(f"Found parquet file: {parquet_file}")
+        file_size_gb = parquet_file.stat().st_size / (1024**3)
+        print(f"File size: {file_size_gb:.2f} GB")
+    except FileNotFoundError as e:
+        print(f"ERROR: {e}")
         return
     
-    try:
-        log_progress("Mode: FULL DATASET STREAMING ANALYSIS")
-        log_progress("This will process all row groups incrementally.")
-        log_progress("Estimated time: 30-60 minutes")
-        log_progress("Memory usage: Low (processes in batches)\n")
-        
-        # Full dataset streaming analysis
-        streaming_results = analyze_full_dataset_streaming()
-        
-        # Print summary of streaming results
-        log_progress("\n" + "=" * 80)
-        log_progress("STREAMING ANALYSIS RESULTS")
-        log_progress("=" * 80)
-        log_progress(f"Total rows processed: {streaming_results['total_rows']:,}")
-        log_progress(f"Years found: {streaming_results['years']}")
-        log_progress(f"Year counts: {dict(sorted(streaming_results['year_counts'].items()))}")
-        
-        # Save streaming results
-        results_file = OUTPUT_DIR / "full_dataset_analysis.json"
-        with open(results_file, 'w') as f:
-            json.dump({
-                'year_counts': convert_to_native(streaming_results['year_counts']),
-                'coord_ranges': convert_to_native({k: list(v) for k, v in streaming_results['coord_ranges'].items()}),
-                'missing_counts': convert_to_native(streaming_results['missing_counts']),
-                'total_rows': int(streaming_results['total_rows']),
-                'years': convert_to_native(streaming_results['years']),
-                'year_stats': convert_to_native(streaming_results['year_stats'])
-            }, f, indent=2)
-        log_progress(f"\nSaved full analysis results to: {results_file}")
-        
-        print("\n" + "=" * 80)
-        print("ANALYSIS COMPLETE")
-        print("=" * 80)
-        print(f"\nResults saved to: {results_file}")
-        
-    except FileNotFoundError as e:
-        print(f"\nERROR: {e}")
+    # Open parquet file
+    pfile = pq.ParquetFile(parquet_file)
+    print(f"Row groups: {pfile.metadata.num_row_groups:,}")
+    print(f"Total rows: {pfile.metadata.num_rows:,}")
+    
+    # Discover available years
+    available_years = discover_available_years(pfile)
+    if not available_years:
+        print("ERROR: No years found in parquet file!")
         return
+    
+    # Determine year to use
+    if YEAR is None:
+        # Use the most recent year
+        selected_year = available_years[-1]
+        print(f"\nAuto-selected year: {selected_year} (most recent available)")
+    else:
+        if YEAR not in available_years:
+            print(f"ERROR: Year {YEAR} not found in parquet file!")
+            print(f"Available years: {available_years}")
+            print(f"Using most recent year instead: {available_years[-1]}")
+            selected_year = available_years[-1]
+        else:
+            selected_year = YEAR
+    
+    # Find valid tile location if not specified
+    if ROW_START is None or COL_START is None:
+        try:
+            row_start, col_start = find_valid_tile_location(pfile, selected_year, TILE_SIZE)
+        except ValueError as e:
+            print(f"ERROR: {e}")
+            return
+    else:
+        row_start = ROW_START
+        col_start = COL_START
+    
+    # Get available bands
+    available_bands = get_available_bands(pfile)
+    print(f"\nAvailable bands ({len(available_bands)}): {', '.join(available_bands[:10])}...")
+    
+    # Find matching band columns and create mapping
+    band_columns = []
+    band_mapping = {}  # Maps requested band name to actual column name
+    for requested_band in REQUESTED_BANDS:
+        found = find_band_column(requested_band, available_bands)
+        if found:
+            band_columns.append(found)
+            band_mapping[requested_band] = found
+            print(f"  '{requested_band}' -> '{found}'")
+        else:
+            print(f"  Warning: '{requested_band}' not found in available bands")
+    
+    if not band_columns:
+        print("ERROR: No matching bands found!")
+        return
+    
+    # Read tile data
+    try:
+        grid_shape, band_data, stats = read_tile_from_parquet(
+            pfile, row_start, col_start, TILE_SIZE, selected_year, band_columns
+        )
     except Exception as e:
-        print(f"\nERROR: {e}")
+        print(f"ERROR reading tile: {e}")
         import traceback
         traceback.print_exc()
         return
+    
+    # Create visualizations
+    try:
+        create_band_visualization(band_data, stats, band_mapping, OUTPUT_DIR)
+    except Exception as e:
+        print(f"ERROR creating visualizations: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+    
+    print("\n" + "=" * 80)
+    print("VISUALIZATION COMPLETE")
+    print("=" * 80)
+    print(f"Output directory: {OUTPUT_DIR}")
 
 
 if __name__ == "__main__":
     main()
+

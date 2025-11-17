@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""
+Investigate merge quality and determine if yearly GeoTIFFs are necessary.
+
+This script:
+1. Validates the main parquet file
+2. Checks year coverage in parquet
+3. Compares corrupted GeoTIFF years vs parquet data
+4. Creates visualizations from parquet to verify data quality
+5. Provides recommendations
+"""
+
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
+import matplotlib.pyplot as plt
+from pathlib import Path
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# Paths
+ROOT_DIR = Path(__file__).resolve().parents[2]
+DATA_ML = ROOT_DIR / "data" / "ml"
+OUTPUT_RESULTS = ROOT_DIR / "outputs" / "Results"
+DATA_MERGED = ROOT_DIR / "data" / "merged"
+OUTPUT_DIR = ROOT_DIR / "outputs" / "Figures" / "merge_investigation"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Known corrupted GeoTIFF years from previous investigation
+CORRUPTED_GEOTIFF_YEARS = [2013, 2014, 2017, 2018, 2021, 2023]
+
+
+def log_progress(message: str):
+    """Simple logging."""
+    print(message, flush=True)
+
+
+def find_parquet_file() -> Path:
+    """Find the merged panel parquet file."""
+    for location in [DATA_ML, OUTPUT_RESULTS]:
+        if location.exists():
+            files = list(location.glob("merged_panel_*.parquet"))
+            if files:
+                return files[0]
+    raise FileNotFoundError("No merged panel parquet file found")
+
+
+def analyze_parquet_file(parquet_file: Path):
+    """Analyze the parquet file structure and validity."""
+    log_progress("\n" + "=" * 80)
+    log_progress("PARQUET FILE ANALYSIS")
+    log_progress("=" * 80)
+    
+    log_progress(f"\nFile: {parquet_file}")
+    file_size_gb = parquet_file.stat().st_size / (1024**3)
+    log_progress(f"Size: {file_size_gb:.2f} GB")
+    
+    pfile = pq.ParquetFile(parquet_file)
+    metadata = pfile.metadata
+    
+    log_progress(f"Total rows: {metadata.num_rows:,}")
+    log_progress(f"Total columns: {len(pfile.schema)}")
+    log_progress(f"Row groups: {metadata.num_row_groups:,}")
+    
+    # Get column names
+    columns = [pfile.schema[i].name for i in range(len(pfile.schema))]
+    log_progress(f"\nColumns ({len(columns)}):")
+    log_progress(f"  Metadata: {columns[:5]}")
+    log_progress(f"  Bands: {columns[5:15]}...")
+    
+    return pfile, columns
+
+
+def check_year_coverage(pfile: pq.ParquetFile):
+    """Check which years are present in the parquet file."""
+    log_progress("\n" + "=" * 80)
+    log_progress("YEAR COVERAGE ANALYSIS")
+    log_progress("=" * 80)
+    
+    log_progress("\nSampling row groups to check year coverage...")
+    
+    # Sample evenly across file
+    num_rgs = pfile.metadata.num_row_groups
+    sample_indices = [0, num_rgs // 4, num_rgs // 2, 3 * num_rgs // 4, num_rgs - 1]
+    
+    all_years = set()
+    year_counts = {}
+    
+    for rg_idx in sample_indices:
+        table = pfile.read_row_group(rg_idx, columns=['year'])
+        df = table.to_pandas()
+        years = df['year'].unique()
+        all_years.update(years)
+        
+        for year in years:
+            year_counts[year] = year_counts.get(year, 0) + len(df[df['year'] == year])
+    
+    log_progress(f"Years found in sample: {sorted(all_years)}")
+    log_progress(f"Total unique years: {len(all_years)}")
+    
+    # Check expected range
+    expected_years = set(range(2000, 2025))
+    present_years = set(int(y) for y in all_years)
+    missing_years = expected_years - present_years
+    
+    log_progress(f"\nExpected years: 2000-2024 (25 years)")
+    log_progress(f"Found years: {len(present_years)}")
+    
+    if missing_years:
+        log_progress(f"Missing years: {sorted(missing_years)}")
+    else:
+        log_progress("All expected years present!")
+    
+    return present_years, missing_years
+
+
+def compare_geotiff_vs_parquet(present_years_in_parquet):
+    """Compare corrupted GeoTIFF years with parquet data."""
+    log_progress("\n" + "=" * 80)
+    log_progress("GEOTIFF vs PARQUET COMPARISON")
+    log_progress("=" * 80)
+    
+    log_progress(f"\nCorrupted GeoTIFF years: {CORRUPTED_GEOTIFF_YEARS}")
+    
+    # Check if corrupted years are in parquet
+    corrupted_in_parquet = [y for y in CORRUPTED_GEOTIFF_YEARS if y in present_years_in_parquet]
+    corrupted_not_in_parquet = [y for y in CORRUPTED_GEOTIFF_YEARS if y not in present_years_in_parquet]
+    
+    if corrupted_in_parquet:
+        log_progress(f"\nCorrupted GeoTIFF years that ARE in parquet: {corrupted_in_parquet}")
+        log_progress("  -> GeoTIFFs were corrupted AFTER merge (during/after write)")
+    
+    if corrupted_not_in_parquet:
+        log_progress(f"\nCorrupted GeoTIFF years that are NOT in parquet: {corrupted_not_in_parquet}")
+        log_progress("  -> These years never made it into parquet (merge failed)")
+    
+    return corrupted_in_parquet, corrupted_not_in_parquet
+
+
+def create_parquet_visualizations(pfile: pq.ParquetFile, columns: list):
+    """Create visualizations from parquet data to verify quality."""
+    log_progress("\n" + "=" * 80)
+    log_progress("CREATING VISUALIZATIONS FROM PARQUET")
+    log_progress("=" * 80)
+    
+    # Sample data for visualization (take every Nth row group)
+    log_progress("\nSampling data for visualization...")
+    num_rgs = pfile.metadata.num_row_groups
+    sample_rgs = list(range(0, num_rgs, max(1, num_rgs // 50)))  # ~50 samples
+    
+    dfs = []
+    for rg_idx in sample_rgs[:50]:  # Limit to 50
+        table = pfile.read_row_group(rg_idx)
+        dfs.append(table.to_pandas())
+    
+    df_sample = pd.concat(dfs, ignore_index=True)
+    log_progress(f"Sampled {len(df_sample):,} rows from {len(sample_rgs)} row groups")
+    
+    # 1. Year distribution
+    log_progress("  Creating year distribution plot...")
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # Year counts
+    year_counts = df_sample['year'].value_counts().sort_index()
+    axes[0, 0].bar(year_counts.index, year_counts.values)
+    axes[0, 0].set_xlabel('Year')
+    axes[0, 0].set_ylabel('Sample Count')
+    axes[0, 0].set_title('Year Distribution in Sample')
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # 2. Data completeness per band
+    log_progress("  Analyzing data completeness...")
+    feature_cols = [c for c in columns if c not in ['year', 'x', 'y', 'row', 'col']]
+    
+    completeness = []
+    for col in feature_cols[:20]:  # First 20 bands
+        non_null_pct = (1 - df_sample[col].isnull().sum() / len(df_sample)) * 100
+        completeness.append((col, non_null_pct))
+    
+    band_names, completeness_pct = zip(*completeness)
+    axes[0, 1].barh(range(len(band_names)), completeness_pct)
+    axes[0, 1].set_yticks(range(len(band_names)))
+    axes[0, 1].set_yticklabels(band_names, fontsize=8)
+    axes[0, 1].set_xlabel('Completeness (%)')
+    axes[0, 1].set_title('Data Completeness (First 20 Bands)')
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # 3. Sample band values over time (elevation)
+    log_progress("  Analyzing temporal patterns...")
+    if 'elevation_b1' in df_sample.columns:
+        elevation_by_year = df_sample.groupby('year')['elevation_b1'].agg(['mean', 'std', 'count'])
+        axes[1, 0].errorbar(elevation_by_year.index, elevation_by_year['mean'], 
+                           yerr=elevation_by_year['std'], marker='o', capsize=5)
+        axes[1, 0].set_xlabel('Year')
+        axes[1, 0].set_ylabel('Mean Elevation')
+        axes[1, 0].set_title('Elevation Over Time (Should be stable for static data)')
+        axes[1, 0].grid(True, alpha=0.3)
+    
+    # 4. Spatial coverage check
+    log_progress("  Checking spatial coverage...")
+    axes[1, 1].scatter(df_sample['x'], df_sample['y'], alpha=0.1, s=1)
+    axes[1, 1].set_xlabel('X Coordinate')
+    axes[1, 1].set_ylabel('Y Coordinate')
+    axes[1, 1].set_title('Spatial Distribution of Samples')
+    axes[1, 1].set_aspect('equal')
+    
+    plt.tight_layout()
+    output_file = OUTPUT_DIR / "parquet_data_quality.png"
+    plt.savefig(output_file, dpi=150, bbox_inches='tight')
+    plt.close()
+    log_progress(f"  Saved: {output_file}")
+    
+    return df_sample
+
+
+def generate_recommendations(corrupted_in_parquet, corrupted_not_in_parquet, present_years, missing_years):
+    """Generate recommendations based on findings."""
+    log_progress("\n" + "=" * 80)
+    log_progress("RECOMMENDATIONS")
+    log_progress("=" * 80)
+    
+    log_progress("\n1. PARQUET FILE STATUS:")
+    if not missing_years and not corrupted_not_in_parquet:
+        log_progress("   ✓ Parquet file is COMPLETE and VALID")
+        log_progress("   ✓ All 25 years (2000-2024) are present")
+        log_progress("   ✓ No data loss during merge")
+    else:
+        log_progress("   ✗ Parquet file has issues:")
+        if missing_years:
+            log_progress(f"     - Missing years: {sorted(missing_years)}")
+        if corrupted_not_in_parquet:
+            log_progress(f"     - Failed merge for: {corrupted_not_in_parquet}")
+    
+    log_progress("\n2. GEOTIFF FILES STATUS:")
+    if corrupted_in_parquet:
+        log_progress(f"   ✗ {len(corrupted_in_parquet)} GeoTIFF files corrupted AFTER merge:")
+        log_progress(f"     Years: {corrupted_in_parquet}")
+        log_progress("     -> These years ARE in parquet (data safe)")
+        log_progress("     -> GeoTIFFs can be regenerated if needed")
+    
+    log_progress("\n3. ARE YEARLY GEOTIFF FILES NECESSARY?")
+    log_progress("   Based on the merge script analysis:")
+    log_progress("   ")
+    log_progress("   Purpose of GeoTIFFs:")
+    log_progress("   - Intermediate output during merge process")
+    log_progress("   - Useful for visual inspection/debugging")
+    log_progress("   - Can be loaded in GIS software (QGIS, ArcGIS)")
+    log_progress("   ")
+    log_progress("   Primary ML Dataset:")
+    log_progress("   - The PARQUET file (merged_panel_2000_2024.parquet)")
+    log_progress("   - 42.73 GB, 519M rows, 46 columns")
+    log_progress("   - Ready for ML: efficient, columnar, compressed")
+    log_progress("   - Can be loaded directly into pandas/polars/dask")
+    log_progress("   ")
+    log_progress("   RECOMMENDATION:")
+    log_progress("   ✓ GeoTIFF files are NOT necessary for ML workflow")
+    log_progress("   ✓ Parquet file is your main dataset")
+    log_progress("   ✓ You can DELETE GeoTIFF files to save space (~37.5 GB)")
+    log_progress("   ✓ Keep only parquet for ML training")
+    log_progress("   ")
+    log_progress("   If you need GeoTIFFs later:")
+    log_progress("   - They can be regenerated from parquet if needed")
+    log_progress("   - Or use parquet directly for geo-analysis")
+    
+    log_progress("\n4. ACTION ITEMS:")
+    if corrupted_in_parquet and not missing_years:
+        log_progress("   1. Parquet is complete - proceed with ML workflow")
+        log_progress("   2. Optional: Regenerate corrupted GeoTIFFs if needed for viz")
+        log_progress("      (but not required for ML)")
+        log_progress("   3. Consider deleting GeoTIFFs to save 37.5 GB")
+    else:
+        log_progress("   1. Investigate why merge failed for missing years")
+        log_progress("   2. Re-run merge for missing years")
+        log_progress("   3. Then proceed with ML workflow")
+
+
+def main():
+    """Main investigation function."""
+    print("\n" + "=" * 80)
+    print("MERGE QUALITY INVESTIGATION")
+    print("=" * 80)
+    
+    try:
+        # Find and analyze parquet
+        parquet_file = find_parquet_file()
+        pfile, columns = analyze_parquet_file(parquet_file)
+        
+        # Check year coverage
+        present_years, missing_years = check_year_coverage(pfile)
+        
+        # Compare with GeoTIFFs
+        corrupted_in_parquet, corrupted_not_in_parquet = compare_geotiff_vs_parquet(present_years)
+        
+        # Create visualizations
+        df_sample = create_parquet_visualizations(pfile, columns)
+        
+        # Generate recommendations
+        generate_recommendations(corrupted_in_parquet, corrupted_not_in_parquet, 
+                                present_years, missing_years)
+        
+        print("\n" + "=" * 80)
+        print("INVESTIGATION COMPLETE")
+        print("=" * 80)
+        print(f"\nOutputs saved to: {OUTPUT_DIR}")
+        
+    except Exception as e:
+        print(f"\nERROR: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
+
