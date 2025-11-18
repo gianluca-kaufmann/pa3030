@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=merge-run
+#SBATCH --job-name=panel-stats
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
@@ -39,18 +39,18 @@ source "$VENV_DIR/bin/activate"
 #------------------------------------------------------------------------------
 # Run the training
 #------------------------------------------------------------------------------
-echo "Starting merge script..."
+echo "Starting panel statistics script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f scripts/merging/merge_total_optimized ] || {
-  echo "ERROR: merge_total_optimized not found under scripts/merging"
-  find scripts -maxdepth 2 -type f -name "merge_total_optimized"
+[ -f scripts/consistency\ checks/compute_panel_statistics ] || {
+  echo "ERROR: compute_panel_statistics not found under scripts/consistency checks"
+  find scripts -maxdepth 2 -type f -name "compute_panel_statistics"
   exit 1
 }
 # Run the script
-python scripts/merging/merge_total_optimized
+python "scripts/consistency checks/compute_panel_statistics"
 
-echo "Merge script finished."
+echo "Panel statistics script finished."
