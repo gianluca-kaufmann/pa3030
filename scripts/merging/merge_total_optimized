@@ -43,12 +43,11 @@ Yearly datasets (year in filename, time-varying):
   all available data, BACKWARD-FILL is used (reusing the earliest available year).
 
 Outputs:
-- GeoTIFF per year: ``outputs/Results/merged_tifs/merged_SA_1km_<year>.tif`` (or ``$SCRATCH/outputs/...``).
 - Parquet panel: ``outputs/Results/merged_panel_<start>_<end>.parquet`` storing coordinates plus all bands (backbone=1 only).
 
 Key choices:
 - Portable path resolution from ``Path(__file__)`` with automatic ``$SCRATCH`` override for HPC runs.
-- Backbone-based masking: only pixels with backbone=1 are included in the Parquet output (GeoTIFFs remain full extent).
+- Backbone-based masking: only pixels with backbone=1 are included in the Parquet output.
 - Dynamic year detection: automatically discovers all available years from the data (no hardcoded range).
 - Automatic dataset classification: separates static (time-invariant) from yearly (time-varying) datasets.
 - Static datasets are loaded once per window and reused across all years, eliminating artificial NA inflation.
@@ -70,7 +69,7 @@ Short overview of what the script does:
      c) Combine static + yearly arrays in consistent order.
    - Reproject on-the-fly to match the reference grid if needed.
    - Concatenate dataset arrays into a single band stack for the year.
-   - Write a per-year GeoTIFF and convert the stack to a long Arrow table (vectorized coords).
+   - Convert the stack to a long Arrow table (vectorized coords).
    - Apply backbone mask to exclude pixels outside South America before writing to Parquet.
    - Append the year's rows to a single Parquet file using a persistent writer.
    - Immediately free memory for arrays and Arrow tables.
@@ -111,8 +110,7 @@ if "SCRATCH" in os.environ:
 else:
     OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "Results"
 
-OUTPUT_TIFF_DIR = OUTPUT_ROOT / "merged_tifs"
-OUTPUT_TIFF_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
 # YEARS will be determined dynamically from available data
 TILE_SIZE = 512
@@ -318,15 +316,28 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window) -> 
     """
     Read a source raster and reproject only the given reference window to a float32 array (B, h, w).
     
-    Special handling: If src.nodata == 0, we create a temporary in-memory raster with
-    a different nodata value to prevent legitimate zeros from being treated as nodata.
+    Optimization: If already aligned, read window directly without reprojection.
+    Special handling: If src.nodata == 0, we preserve legitimate zeros.
     """
     with rasterio.open(src_path) as src:
         dst_height = int(window.height)
         dst_width = int(window.width)
+        count = src.count
+        
+        # Fast path: if already aligned, just read the window directly (MUCH faster)
+        if (src.shape == (ref_profile["height"], ref_profile["width"]) and
+            src.crs == ref_profile["crs"] and
+            np.allclose(src.transform, ref_profile["transform"], atol=1e-6)):
+            
+            data = src.read(window=window, masked=False).astype(np.float32)
+            # Handle nodata values, but NOT if nodata is 0 (common for masks)
+            if src.nodata is not None and src.nodata not in [0, 0.0]:
+                data[data == src.nodata] = np.nan
+            return data if count > 1 else data[np.newaxis, ...]
+        
+        # Slow path: reprojection needed
         dst_transform = rasterio.windows.transform(window, ref_profile["transform"])
         dst_crs = ref_profile["crs"]
-        count = src.count
         
         # Special handling for nodata=0: read full data and create temp array with different nodata
         if src.nodata in [0, 0.0]:
@@ -371,28 +382,6 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window) -> 
         return dst if count > 1 else dst[0][np.newaxis, ...]
 
 
-def open_year_tif_writer(year: int, band_count: int, band_names: List[str], ref_profile: dict):
-    """Open a GeoTIFF for the given year for windowed writing; returns (dst, out_path)."""
-    profile = ref_profile.copy()
-    profile.update({
-        "count": band_count,
-        "dtype": rasterio.float32,
-        "nodata": np.nan,
-        "compress": "lzw",
-        "tiled": True,
-        "blockxsize": 512,
-        "blockysize": 512,
-    })
-    out_path = OUTPUT_TIFF_DIR / f"merged_SA_1km_{year}.tif"
-    dst = rasterio.open(out_path, "w", **profile)
-    for i, name in enumerate(band_names):
-        try:
-            dst.set_band_description(i + 1, name)
-        except Exception:
-            pass
-    return dst, out_path
-
-
 def window_to_arrow(year: int, window: Window, band_stack: np.ndarray, band_names: List[str], 
                     ref_profile: dict, backbone_window: np.ndarray) -> pa.Table:
     """Create an Arrow table for a window, filtering by backbone mask (only backbone=1 pixels)."""
@@ -404,8 +393,8 @@ def window_to_arrow(year: int, window: Window, band_stack: np.ndarray, band_name
     xs = (transform.a * cols + transform.b * rows + transform.c).astype(np.float64)
     ys = (transform.d * cols + transform.e * rows + transform.f).astype(np.float64)
 
-    # Flatten bands
-    flat_bands = [band_stack[i].reshape(-1).astype(np.float32) for i in range(band_stack.shape[0])]
+    # Flatten bands (band_stack is already float32, no need to convert)
+    flat_bands = [band_stack[i].reshape(-1) for i in range(band_stack.shape[0])]
 
     # Apply backbone mask: only keep pixels where backbone == 1
     backbone_flat = backbone_window.reshape(-1)
@@ -722,46 +711,53 @@ def main():
     parquet_writer = None
     total_rows = 0
     
-    # Process year-by-year using windowed streaming
-    # Key change: Load static datasets ONCE per window and reuse across all years
-    log_progress("\nProcessing years sequentially (windowed streaming with static data caching)...")
+    # Process window-by-window, with all years for each window
+    # Key optimization: Load static datasets ONCE per window and reuse across ALL years
+    log_progress("\nProcessing windows with per-window static data caching (major speedup)...")
     
-    for year_idx, year in enumerate(YEARS):
-        log_progress(f"\n{'='*60}")
-        log_progress(f"Processing year {year_idx+1}/{len(YEARS)}: {year}")
-        log_progress(f"{'='*60}")
+    # Track progress
+    total_windows = sum(1 for _ in iter_reference_windows(ref_profile, TILE_SIZE))
+    window_idx = 0
+    year_rows_dict = {year: 0 for year in YEARS}
+    
+    current_band_names = all_band_names
+    
+    # Iterate windows FIRST, then years
+    for w in iter_reference_windows(ref_profile, TILE_SIZE):
+        window_idx += 1
+        if window_idx % 100 == 0:
+            log_progress(f"Processing window {window_idx}/{total_windows}...")
         
-        try:
-            # Prepare year GeoTIFF writer
-            current_band_names = all_band_names
-            tif_ds, out_tif = open_year_tif_writer(year, len(current_band_names), current_band_names, ref_profile)
-            year_rows = 0
-            
-            # Iterate windows and stream
-            for w in iter_reference_windows(ref_profile, TILE_SIZE):
-                window_height = int(w.height)
-                window_width = int(w.width)
-                
-                # Extract backbone mask window
-                backbone_window = backbone_mask[
-                    int(w.row_off):int(w.row_off + w.height),
-                    int(w.col_off):int(w.col_off + w.width)
-                ]
-                
-                # LOAD STATIC DATA FIRST (these are identical across all years)
-                static_window_arrays: List[np.ndarray] = []
-                for dataset in static_datasets:
-                    entries = catalog[dataset]
-                    # Prefer truly static files; fallback to earliest available year
-                    if None in entries:
-                        paths = entries[None]
-                    else:
-                        years_avail = sorted([y for y in entries.keys() if y is not None])
-                        paths = entries[years_avail[0]] if years_avail else []
-                    expected_bands = static_band_counts.get(dataset, 1)
-                    arrays = load_dataset_window(paths, ref_profile, w, expected_bands, window_height, window_width)
-                    static_window_arrays.extend(arrays)
-                
+        window_height = int(w.height)
+        window_width = int(w.width)
+        
+        # Extract backbone mask window (same for all years)
+        backbone_window = backbone_mask[
+            int(w.row_off):int(w.row_off + w.height),
+            int(w.col_off):int(w.col_off + w.width)
+        ]
+        
+        # Skip windows with no land pixels
+        if (backbone_window == 1).sum() == 0:
+            continue
+        
+        # LOAD STATIC DATA ONCE for this window (reused across all years)
+        static_window_arrays: List[np.ndarray] = []
+        for dataset in static_datasets:
+            entries = catalog[dataset]
+            # Prefer truly static files; fallback to earliest available year
+            if None in entries:
+                paths = entries[None]
+            else:
+                years_avail = sorted([y for y in entries.keys() if y is not None])
+                paths = entries[years_avail[0]] if years_avail else []
+            expected_bands = static_band_counts.get(dataset, 1)
+            arrays = load_dataset_window(paths, ref_profile, w, expected_bands, window_height, window_width)
+            static_window_arrays.extend(arrays)
+        
+        # Now process ALL years for this window
+        for year in YEARS:
+            try:
                 # LOAD YEARLY DATA (varies by year, with forward-fill)
                 yearly_window_arrays: List[np.ndarray] = []
                 for dataset in yearly_datasets:
@@ -800,10 +796,6 @@ def main():
                     log_progress(f"ERROR: {error_msg}")
                     raise ValueError(error_msg)
                 
-                # Write window to GeoTIFF
-                for band_idx in range(band_stack.shape[0]):
-                    tif_ds.write(band_stack[band_idx].astype(np.float32), band_idx + 1, window=w)
-                
                 # Parquet streaming with backbone mask
                 table = window_to_arrow(year, w, band_stack, current_band_names, ref_profile, backbone_window)
                 if parquet_writer is None:
@@ -811,32 +803,33 @@ def main():
                     parquet_writer = pq.ParquetWriter(PARQUET_PATH, table.schema, compression='zstd')
                 if table.num_rows > 0:
                     parquet_writer.write_table(table)
-                    year_rows += table.num_rows
+                    year_rows_dict[year] += table.num_rows
                 
-                # Clean up memory
-                del band_stack, static_window_arrays, yearly_window_arrays, all_window_arrays, table, backbone_window
-                gc.collect()
-            
-            tif_ds.close()
-            file_size_mb = out_tif.stat().st_size / (1024 * 1024)
-            wandb.log({
-                f"year/{year}/rows": year_rows,
-                f"year/{year}/bands": len(current_band_names),
-                f"year/{year}/tiff_size_mb": file_size_mb,
-                f"year/{year}/status": "success"
-            })
-            total_rows += year_rows
-            log_progress(f"  Completed year {year}")
-            
-        except Exception as e:
-            log_progress(f"ERROR processing year {year}: {e}")
-            import traceback
-            traceback.print_exc()
-            wandb.log({
-                f"year/{year}/status": "error",
-                f"year/{year}/error_message": str(e)
-            })
-            continue
+                # Clean up yearly data only (keep static data for next year)
+                del band_stack, yearly_window_arrays, all_window_arrays, table
+                
+            except Exception as e:
+                log_progress(f"ERROR processing year {year}, window {window_idx}: {e}")
+                import traceback
+                traceback.print_exc()
+                continue
+        
+        # Clean up static data and backbone window after processing all years
+        del static_window_arrays, backbone_window
+        # Only gc.collect() periodically to reduce overhead
+        if window_idx % 50 == 0:
+            gc.collect()
+    
+    # Log results per year
+    for year in YEARS:
+        year_rows = year_rows_dict[year]
+        total_rows += year_rows
+        wandb.log({
+            f"year/{year}/rows": year_rows,
+            f"year/{year}/bands": len(current_band_names),
+            f"year/{year}/status": "success"
+        })
+        log_progress(f"Year {year}: {year_rows:,} rows")
 
     # Close Parquet writer
     if parquet_writer is not None:

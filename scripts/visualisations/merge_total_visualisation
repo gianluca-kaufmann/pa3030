@@ -4,10 +4,10 @@ Generate 2D maps from the merged panel Parquet file without loading everything i
 
 This script:
 1. Reads the parquet file in chunks (row groups) to avoid loading everything
-2. Filters by a hardcoded 500x500 pixel tile (random sample check)
-3. Filters by a hardcoded year
-4. Reshapes the data into a 2D grid based on row/col coordinates
-5. Creates visualizations for selected bands (NDVI, landcover, elevation, VIIRS, GSN_1, WDPA)
+2. Automatically finds representative tiles for each requested year
+3. Visualizes predefined band groups across multiple years
+4. Reshapes the data into 2D grids based on row/col coordinates
+5. Saves figures per year showing the requested bands
 
 Usage:
     python scripts/visualisations/merge_total_visualisation
@@ -31,18 +31,31 @@ OUTPUT_DIR = ROOT_DIR / "outputs" / "Figures" / "merge_total_vis"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Hardcoded parameters for random sample check
-TILE_SIZE = 10000
-YEAR = None  # Will be auto-detected if None
-ROW_START = None  # Will be auto-detected if None
-COL_START = None  # Will be auto-detected if None
+TILE_SIZE = 10000  # Size of square tile to visualize
 
-# Bands to visualize
-REQUESTED_BANDS = ['NDVI', 'landcover', 'elevation', 'night_lights', 'GSN_1', 'WDPA']
+# Yearly visualization requests (year → bands)
+YEARLY_VIS_REQUESTS = [
+    {'year': 2024, 'bands': ['WDPA', 'NDVI']},
+    {'year': 2022, 'bands': ['road infrastructure', 'VIIRS']},
+    {'year': 2018, 'bands': ['GPW', 'deforestation']},
+    {'year': 2016, 'bands': ['wildfires', 'gdp']},
+    {'year': 2012, 'bands': ['landcover', 'elevation']},
+    {'year': 2008, 'bands': [f'GSN_b{i}' for i in range(1, 6)]},
+    {'year': 2004, 'bands': ['Oil and Gas', 'Powerplants']},
+    {'year': 2000, 'bands': [f'WorldClim_b{i}' for i in range(1, 20)]},
+]
 
 # Mapping from requested band names to possible column name patterns
 BAND_ALIASES = {
     'night_lights': ['VIIRS', 'viirs'],
+    'VIIRS': ['VIIRS', 'viirs'],
     'GSN_1': ['GSN_b1', 'GSN', 'gsn_b1', 'gsn'],  # Try numbered version first
+    'road infrastructure': ['road_infrastructure', 'road_infrastructure_b1'],
+    'wildfires': ['wildfire', 'wildfires'],
+    'Oil and Gas': ['oil_gas', 'oil_gas_b1'],
+    'Powerplants': ['powerplants', 'powerplants_b1'],
+    'GPW': ['gpw', 'GPW'],
+    'WorldClim': ['WorldClim', 'worldclim'],
 }
 
 
@@ -437,12 +450,12 @@ def create_band_visualization(
 def main():
     """Main function - hardcoded parameters for random sample check."""
     print("=" * 80)
-    print("2D MAP GENERATION FROM PARQUET FILE (Random Sample Check)")
+    print("2D MAP GENERATION FROM PARQUET FILE (Multi-Year Overview)")
     print("=" * 80)
-    print(f"Year: {YEAR if YEAR is not None else 'auto-detect'}")
-    print(f"Tile: rows [{ROW_START if ROW_START is not None else 'auto-detect'}:{TILE_SIZE}], "
-          f"cols [{COL_START if COL_START is not None else 'auto-detect'}:{TILE_SIZE}]")
-    print(f"Requested bands: {', '.join(REQUESTED_BANDS)}")
+    print(f"Tile size: {TILE_SIZE} × {TILE_SIZE} pixels")
+    print("Yearly requests:")
+    for req in YEARLY_VIS_REQUESTS:
+        print(f"  - {req['year']}: {', '.join(req['bands'])}")
     print()
     
     # Find parquet file
@@ -460,79 +473,80 @@ def main():
     print(f"Row groups: {pfile.metadata.num_row_groups:,}")
     print(f"Total rows: {pfile.metadata.num_rows:,}")
     
+    # Get available bands
+    available_bands = get_available_bands(pfile)
+    print(f"\nAvailable bands ({len(available_bands)}): {', '.join(available_bands[:10])}...")
+
     # Discover available years
     available_years = discover_available_years(pfile)
     if not available_years:
         print("ERROR: No years found in parquet file!")
         return
     
-    # Determine year to use
-    if YEAR is None:
-        # Use the most recent year
-        selected_year = available_years[-1]
-        print(f"\nAuto-selected year: {selected_year} (most recent available)")
-    else:
-        if YEAR not in available_years:
-            print(f"ERROR: Year {YEAR} not found in parquet file!")
-            print(f"Available years: {available_years}")
-            print(f"Using most recent year instead: {available_years[-1]}")
-            selected_year = available_years[-1]
-        else:
-            selected_year = YEAR
+    tile_cache: Dict[int, Tuple[int, int]] = {}
     
-    # Find valid tile location if not specified
-    if ROW_START is None or COL_START is None:
+    for request in YEARLY_VIS_REQUESTS:
+        year = request['year']
+        requested_bands = request['bands']
+        
+        print("\n" + "-" * 80)
+        print(f"Processing year {year} with bands: {', '.join(requested_bands)}")
+        print("-" * 80)
+        
+        if year not in available_years:
+            print(f"  Skipping year {year}: not present in parquet file (available: {available_years})")
+            continue
+        
+        # Find tile location (cache per year to avoid repeated scans)
+        if year in tile_cache:
+            row_start, col_start = tile_cache[year]
+        else:
+            try:
+                row_start, col_start = find_valid_tile_location(pfile, year, TILE_SIZE)
+                tile_cache[year] = (row_start, col_start)
+            except ValueError as e:
+                print(f"  Unable to find tile for year {year}: {e}")
+                continue
+        
+        # Determine band columns
+        band_columns = []
+        band_mapping = {}
+        for requested_band in requested_bands:
+            found = find_band_column(requested_band, available_bands)
+            if found:
+                if found not in band_columns:
+                    band_columns.append(found)
+                band_mapping[requested_band] = found
+                print(f"  '{requested_band}' -> '{found}'")
+            else:
+                print(f"  Warning: '{requested_band}' not found in available bands")
+        
+        if not band_columns:
+            print(f"  Skipping year {year}: no matching bands found.")
+            continue
+        
+        # Read tile data for this year
         try:
-            row_start, col_start = find_valid_tile_location(pfile, selected_year, TILE_SIZE)
-        except ValueError as e:
-            print(f"ERROR: {e}")
-            return
-    else:
-        row_start = ROW_START
-        col_start = COL_START
-    
-    # Get available bands
-    available_bands = get_available_bands(pfile)
-    print(f"\nAvailable bands ({len(available_bands)}): {', '.join(available_bands[:10])}...")
-    
-    # Find matching band columns and create mapping
-    band_columns = []
-    band_mapping = {}  # Maps requested band name to actual column name
-    for requested_band in REQUESTED_BANDS:
-        found = find_band_column(requested_band, available_bands)
-        if found:
-            band_columns.append(found)
-            band_mapping[requested_band] = found
-            print(f"  '{requested_band}' -> '{found}'")
-        else:
-            print(f"  Warning: '{requested_band}' not found in available bands")
-    
-    if not band_columns:
-        print("ERROR: No matching bands found!")
-        return
-    
-    # Read tile data
-    try:
-        grid_shape, band_data, stats = read_tile_from_parquet(
-            pfile, row_start, col_start, TILE_SIZE, selected_year, band_columns
-        )
-    except Exception as e:
-        print(f"ERROR reading tile: {e}")
-        import traceback
-        traceback.print_exc()
-        return
-    
-    # Create visualizations
-    try:
-        create_band_visualization(band_data, stats, band_mapping, OUTPUT_DIR)
-    except Exception as e:
-        print(f"ERROR creating visualizations: {e}")
-        import traceback
-        traceback.print_exc()
-        return
+            _, band_data, stats = read_tile_from_parquet(
+                pfile, row_start, col_start, TILE_SIZE, year, band_columns
+            )
+        except Exception as e:
+            print(f"  ERROR reading tile for year {year}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+        
+        # Create visualization
+        try:
+            create_band_visualization(band_data, stats, band_mapping, OUTPUT_DIR)
+        except Exception as e:
+            print(f"  ERROR creating visualization for year {year}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
     
     print("\n" + "=" * 80)
-    print("VISUALIZATION COMPLETE")
+    print("MULTI-YEAR VISUALIZATION COMPLETE")
     print("=" * 80)
     print(f"Output directory: {OUTPUT_DIR}")
 
