@@ -30,10 +30,10 @@ Static datasets (no year in filename, constant across all years):
 
 Yearly datasets (year in filename, time-varying):
   - WDPA: Protected areas (yearly updates)
-  - VIIRS: Nighttime lights (yearly)
+  - VIIRS: Nighttime lights (yearly, valid from 2013+)
   - NDVI: Vegetation index (yearly)
   - GPW: Population density (periodic updates, e.g., 2015, 2020)
-  - gdp: GDP estimates (yearly or periodic)
+  - gdp: GDP estimates (yearly or periodic, valid from 2012+)
   - deforestation: Forest loss (yearly)
   - landcover: Land cover classification (yearly)
   - wildfire: Wildfire occurrence and burned area (yearly)
@@ -41,6 +41,10 @@ Yearly datasets (year in filename, time-varying):
   Handling: If a dataset has no file for a target year, the script performs FORWARD-FILL,
   reusing the most recent prior year to maintain panel completeness. If a year precedes
   all available data, BACKWARD-FILL is used (reusing the earliest available year).
+  
+  Temporal Coverage Rules: Some datasets have explicit temporal coverage constraints:
+  - GDP (gdp_b1): Valid from 2012 onwards; set to NaN for years < 2012
+  - VIIRS (VIIRS_b1): Valid from 2013 onwards; set to NaN for years < 2013
 
 Outputs:
 - Parquet panel: ``outputs/Results/merged_panel_<start>_<end>.parquet`` storing coordinates plus all bands (backbone=1 only).
@@ -441,6 +445,39 @@ def build_band_names(dataset: str, arrays: List[np.ndarray]) -> List[str]:
     return names
 
 
+def apply_temporal_coverage_rules(band_stack: np.ndarray, band_names: List[str], year: int, 
+                                  log_once: dict = {}) -> None:
+    """
+    Apply temporal coverage rules to enforce dataset-specific valid time ranges.
+    Modifies band_stack in-place by setting values to NaN for years outside valid coverage.
+    
+    Temporal coverage rules:
+    - GDP (gdp_b1): Valid from 2012 onwards (data starts 2012)
+    - VIIRS (VIIRS_b1): Valid from 2013 onwards (data starts 2013)
+    
+    Args:
+        band_stack: (bands, height, width) array to modify in-place
+        band_names: List of band names corresponding to band_stack bands
+        year: The year being processed
+        log_once: Mutable dict for tracking which rules have been logged (default: {})
+    """
+    # Define temporal coverage rules: {band_name: first_valid_year}
+    TEMPORAL_RULES = {
+        'gdp_b1': 2012,      # GDP data starts in 2012
+        'VIIRS_b1': 2013,    # VIIRS data starts in 2013
+    }
+    
+    for band_name, first_valid_year in TEMPORAL_RULES.items():
+        if band_name in band_names and year < first_valid_year:
+            band_idx = band_names.index(band_name)
+            band_stack[band_idx, :, :] = np.nan
+            
+            # Log once per band when rule is first applied
+            if band_name not in log_once:
+                log_progress(f"  Temporal coverage: Setting {band_name} to NaN for year {year} < {first_valid_year}")
+                log_once[band_name] = True
+
+
 def classify_datasets(catalog: Dict[str, Dict[Optional[int], List[Path]]]) -> Tuple[List[str], List[str]]:
     """
     Classify datasets as static (time-invariant) or yearly (time-varying).
@@ -608,6 +645,10 @@ def main():
     log_progress(f"\nDataset classification:")
     log_progress(f"  Static datasets (constant across years): {', '.join(static_datasets) if static_datasets else 'none'}")
     log_progress(f"  Yearly datasets (time-varying): {', '.join(yearly_datasets) if yearly_datasets else 'none'}")
+    
+    log_progress(f"\nTemporal coverage rules:")
+    log_progress(f"  GDP (gdp_b1): Valid from 2012 onwards → NaN for years < 2012")
+    log_progress(f"  VIIRS (VIIRS_b1): Valid from 2013 onwards → NaN for years < 2013")
     
     wandb.config.update({
         "datasets": datasets_present, 
@@ -795,6 +836,9 @@ def main():
                                f"expected {len(current_band_names)} bands, got {band_stack.shape[0]}")
                     log_progress(f"ERROR: {error_msg}")
                     raise ValueError(error_msg)
+                
+                # Apply temporal coverage rules (in-place modification)
+                apply_temporal_coverage_rules(band_stack, current_band_names, year)
                 
                 # Parquet streaming with backbone mask
                 table = window_to_arrow(year, w, band_stack, current_band_names, ref_profile, backbone_window)

@@ -12,17 +12,20 @@ cd ~/master_thesis
 # Update code from GitHub
 git pull
 
+# Look at the script directly
+nano scripts/merging/merge_total_optimized
+
 # Load modules and activate venv
-module purge
-module load stack/2024-06
-module load gcc/12.2.0
-module load python_cuda/3.11.6
-module load eth_proxy
-source ~/venv/master-thesis/bin/activate
+# module purge
+# module load stack/2024-06
+# module load gcc/12.2.0
+# module load python_cuda/3.11.6
+# module load eth_proxy
+# source ~/venv/master-thesis/bin/activate
 
 # Update dependencies (if needed)
-pip install --upgrade pip wheel
-pip install -r slurm/requirements.txt
+# pip install --upgrade pip wheel
+# pip install -r slurm/requirements.txt
 
 # Submit job
 sbatch slurm/RUN.slurm
@@ -32,7 +35,7 @@ squeue -u $USER
 ### On Mac (download results)
 
 ```bash
-scp gikaufmann@login.euler.ethz.ch:/cluster/scratch/gikaufmann/outputs/Results/merged_panel_2012_2024.parquet ~/Desktop/
+scp gikaufmann@login.euler.ethz.ch:/cluster/scratch/gikaufmann/outputs/Results/merged_panel_2000_2024.parquet ~/Desktop/
 ```
 
 ## One-Time Setup
@@ -168,4 +171,4 @@ Note: SLURM jobs run independently of tmux; this is only for monitoring.
 - Partition: `normal.24h`
 - Data path: `/cluster/scratch/gikaufmann/data/ready/`
 - Outputs path: `/cluster/scratch/gikaufmann/outputs/Results/`
-- Typical output: `merged_panel_2012_2024.parquet` (~30-40 GB)
+- Typical output: `merged_panel_2000_2024.parquet` (~30-40 GB)
