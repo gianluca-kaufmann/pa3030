@@ -51,11 +51,17 @@ def main() -> None:
     )
     print("✅ W&B connected")
     
+    # Setup paths (outside try block for cleanup in finally)
+    repo_root = Path(__file__).resolve().parents[3]
+    input_path = repo_root / "data/ml/merged_panel_2000_2024.parquet"
+    output_path = repo_root / "data/ml/sample_training.parquet"
+    temp_dir = repo_root / "data/ml/temp"
+    temp_transitions = temp_dir / "temp_transitions.parquet"
+    
     try:
-        # Setup paths
-        repo_root = Path(__file__).resolve().parents[3]
-        input_path = repo_root / "data/ml/merged_panel_2000_2024.parquet"
-        output_path = repo_root / "data/ml/sample_training.parquet"
+        
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         
         print(f"\n📂 Input: {input_path}")
         print(f"📂 Output: {output_path}")
@@ -63,61 +69,73 @@ def main() -> None:
         if not input_path.exists():
             raise FileNotFoundError(f"Input file not found: {input_path}")
         
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize DuckDB
+        # Initialize DuckDB with memory-efficient settings
         con = duckdb.connect()
         num_threads = 8 if os.environ.get("SCRATCH") else 4
         con.execute(f"SET threads={num_threads}")
         con.execute("SET preserve_insertion_order=false")
-        print(f"⚙️  DuckDB configured: {num_threads} threads")
+        con.execute("SET memory_limit='80GB'")  # Leave headroom on 128GB system
         
-        wandb.log({"config/threads": num_threads})
+        # Use SCRATCH temp directory if on Euler
+        temp_dir_env = os.environ.get("SCRATCH") or str(temp_dir)
+        con.execute(f"SET temp_directory='{temp_dir_env}/duckdb_temp'")
+        con.execute("PRAGMA max_temp_directory_size='100GB'")
+        
+        print(f"⚙️  DuckDB configured: {num_threads} threads, memory_limit=80GB")
+        
+        wandb.log({"config/threads": num_threads, "config/memory_limit_gb": 80})
         
         # Escape paths for SQL
         escaped_in = str(input_path).replace("'", "''")
         escaped_out = str(output_path).replace("'", "''")
+        escaped_temp = str(temp_transitions).replace("'", "''")
         
-        # Step 1: Create lagged WDPA and identify transitions
-        print("\n🔄 Step 1: Computing lagged WDPA and transitions...")
+        # Step 1: Create lagged WDPA using memory-efficient self-join
+        print("\n🔄 Step 1: Computing lagged WDPA and transitions (self-join)...")
+        print("   Using self-join instead of window functions for memory efficiency")
         step1_start = time.time()
         
+        # Self-join approach: much more memory-efficient than LAG()
         transition_query = f"""
-        WITH ordered_data AS (
-            SELECT 
-                *,
-                LAG(WDPA_b1) OVER (PARTITION BY row, col ORDER BY year) AS WDPA_prev
-            FROM read_parquet('{escaped_in}')
-        )
         SELECT 
-            *,
+            curr.*,
+            COALESCE(prev.WDPA_b1, 0) AS WDPA_prev,
             CASE 
-                WHEN WDPA_prev = 0 AND WDPA_b1 = 1 THEN 1
+                WHEN COALESCE(prev.WDPA_b1, 0) = 0 AND COALESCE(curr.WDPA_b1, 0) = 1 THEN 1
                 ELSE 0
             END AS transition_01
-        FROM ordered_data
-        WHERE WDPA_prev IS NOT NULL
+        FROM read_parquet('{escaped_in}') AS curr
+        LEFT JOIN read_parquet('{escaped_in}') AS prev
+            ON curr.row = prev.row 
+            AND curr.col = prev.col 
+            AND prev.year = curr.year - 1
+        WHERE prev.year IS NOT NULL
         """
         
-        # Create a temporary view for efficiency
-        con.execute(f"CREATE TEMP VIEW transitions AS ({transition_query})")
+        # Materialize to temporary file to avoid memory overflow
+        print(f"   Materializing to temporary file: {temp_transitions}")
+        con.execute(f"""
+            COPY ({transition_query})
+            TO '{escaped_temp}'
+            (FORMAT PARQUET, COMPRESSION ZSTD)
+        """)
         
         step1_time = time.time() - step1_start
-        print(f"   ✅ Completed in {step1_time:.1f}s")
-        wandb.log({"timing/step1_seconds": step1_time})
+        print(f"   ✅ Completed in {step1_time:.1f}s ({step1_time/60:.1f} min)")
+        wandb.log({"timing/step1_seconds": step1_time, "timing/step1_minutes": step1_time/60})
         
-        # Step 2: Count positives and negatives
+        # Step 2: Count positives and negatives from temporary file
         print("\n🔄 Step 2: Counting transitions...")
         step2_start = time.time()
         
-        counts = con.execute("""
+        counts = con.execute(f"""
             SELECT 
                 SUM(transition_01) AS positives,
                 SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS negatives,
                 COUNT(*) AS total,
                 MIN(year) AS year_min,
                 MAX(year) AS year_max
-            FROM transitions
+            FROM read_parquet('{escaped_temp}')
         """).fetchone()
         
         positives, negatives, total, year_min, year_max = counts
@@ -160,7 +178,7 @@ def main() -> None:
             "sampling/balance": sample_positives / total_sample if total_sample > 0 else 0,
         })
         
-        # Step 4: Sample and write output
+        # Step 4: Sample and write output from temporary file
         print("\n🔄 Step 4: Sampling and writing output...")
         step4_start = time.time()
         
@@ -169,7 +187,7 @@ def main() -> None:
             SELECT * FROM (
                 -- All positives (up to limit)
                 SELECT *
-                FROM transitions
+                FROM read_parquet('{escaped_temp}')
                 WHERE transition_01 = 1
                 USING SAMPLE reservoir({sample_positives} ROWS) REPEATABLE ({RANDOM_STATE})
             )
@@ -177,7 +195,7 @@ def main() -> None:
             SELECT * FROM (
                 -- Equal number of negatives
                 SELECT *
-                FROM transitions
+                FROM read_parquet('{escaped_temp}')
                 WHERE transition_01 = 0
                 USING SAMPLE reservoir({sample_negatives} ROWS) REPEATABLE ({RANDOM_STATE})
             )
@@ -191,6 +209,11 @@ def main() -> None:
         step4_time = time.time() - step4_start
         print(f"   ✅ Written to {output_path} in {step4_time:.1f}s")
         wandb.log({"timing/step4_seconds": step4_time})
+        
+        # Clean up temporary file
+        print("   🧹 Cleaning up temporary files...")
+        temp_transitions.unlink(missing_ok=True)
+        print("   ✅ Temporary files removed")
         
         # Step 5: Verify output
         print("\n🔄 Step 5: Verifying output...")
@@ -260,6 +283,14 @@ def main() -> None:
         raise
     
     finally:
+        # Clean up temporary files in case of error
+        try:
+            if temp_transitions.exists():
+                temp_transitions.unlink()
+                print("🧹 Cleaned up temporary files")
+        except:
+            pass
+        
         wandb.finish()
         print("🏁 W&B run finished")
 
