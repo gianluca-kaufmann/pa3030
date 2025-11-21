@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+
+"""Baseline Sampling Script
+
+Purpose: create a lightweight subset for quick local experimentation.
+Input:  `data/ml/merged_panel_2000_2024.parquet`.
+Process: filter rows to `year == 2020`, then reservoir-sample up to 100k rows
+         without loading the whole parquet into memory (DuckDB COPY query).
+Output: `data/ml/sample_2020_100k.parquet`.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import duckdb
+
+SAMPLE_YEAR = 2020
+SAMPLE_SIZE = 100_000
+RANDOM_STATE = 42
+
+
+def main() -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    input_path = repo_root / "data/ml/merged_panel_2000_2024.parquet"
+    output_path = repo_root / "data/ml/sample_2020_100k.parquet"
+
+    print(f"Sampling from {input_path} …")
+    if not input_path.exists():
+        raise FileNotFoundError(f"Missing source file: {input_path}")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    escaped_in = str(input_path).replace("'", "''")
+    escaped_out = str(output_path).replace("'", "''")
+
+    # Use a subquery to filter first, THEN sample from that filtered result
+    query = f"""
+        COPY (
+            SELECT *
+            FROM (
+                SELECT *
+                FROM read_parquet('{escaped_in}')
+                WHERE year = {SAMPLE_YEAR}
+            ) AS filtered
+            USING SAMPLE reservoir({SAMPLE_SIZE} ROWS) REPEATABLE ({RANDOM_STATE})
+        )
+        TO '{escaped_out}'
+        (FORMAT 'parquet');
+    """
+
+    con = duckdb.connect()
+
+    print(
+        f"Filtering to year == {SAMPLE_YEAR} and taking a "
+        f"reservoir sample of up to {SAMPLE_SIZE:,} rows …"
+    )
+    con.execute(query)
+
+    written = con.execute(
+        f"SELECT count(*) FROM read_parquet('{escaped_out}')"
+    ).fetchone()[0]
+
+    if written == 0:
+        raise ValueError(f"No rows found for year {SAMPLE_YEAR}.")
+
+    print(f"Wrote {written:,} rows to {output_path}. Done.")
+
+
+if __name__ == "__main__":
+    main()
+

@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+
+"""Baseline Training Script
+
+Purpose: benchmark model performance on a lightweight 2020 subset.
+Input:  `data/ml/sample_2020_100k.parquet` created by baseline preprocessing.
+Process: drop rows with missing `WDPA_b1`, keep numeric features, perform an
+         80/20 stratified split, then fit a RandomForest classifier.
+Output: prints a classification report and the 20 most important features.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report
+from sklearn.model_selection import train_test_split
+
+RANDOM_STATE = 42
+N_ESTIMATORS = 100
+TEST_SIZE = 0.2
+
+
+def main() -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    input_path = repo_root / "data/ml/sample_2020_100k.parquet"
+
+    print(f"Loading data from {input_path} …")
+    df = pd.read_parquet(input_path)
+    print(f"Loaded {len(df):,} rows with {len(df.columns)} columns.")
+
+    # Target and features
+    target_col = "WDPA_b1"
+    if target_col not in df.columns:
+        raise ValueError(f"Target column '{target_col}' not found in data.")
+
+    print(f"\nUsing '{target_col}' as target variable.")
+
+    # Drop rows with missing target
+    df_clean = df.dropna(subset=[target_col])
+    print(f"Dropped {len(df) - len(df_clean):,} rows with missing target.")
+    print(f"Remaining: {len(df_clean):,} rows.")
+
+    if len(df_clean) == 0:
+        raise ValueError("No valid rows remaining after dropping missing targets.")
+
+    # Separate features and target
+    y = df_clean[target_col]
+    
+    # Select only numeric columns for features (exclude target)
+    numeric_cols = df_clean.select_dtypes(include=["number"]).columns.tolist()
+    if target_col in numeric_cols:
+        numeric_cols.remove(target_col)
+    
+    X = df_clean[numeric_cols]
+    
+    print(f"\nUsing {len(numeric_cols)} numeric features.")
+    print(f"Target distribution:\n{y.value_counts().sort_index()}")
+
+    # Split train/test with stratification
+    print(f"\nSplitting into train/test ({int((1-TEST_SIZE)*100)}/{int(TEST_SIZE*100)}) with stratification …")
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, 
+        test_size=TEST_SIZE, 
+        stratify=y, 
+        random_state=RANDOM_STATE
+    )
+    print(f"Train: {len(X_train):,} samples")
+    print(f"Test:  {len(X_test):,} samples")
+
+    # Train RandomForest
+    print(f"\nTraining RandomForestClassifier with {N_ESTIMATORS} trees …")
+    rf = RandomForestClassifier(
+        n_estimators=N_ESTIMATORS,
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+        verbose=1
+    )
+    rf.fit(X_train, y_train)
+
+    # Predict and evaluate
+    print("\nEvaluating on test set …")
+    y_pred = rf.predict(X_test)
+    
+    print("\n" + "="*60)
+    print("CLASSIFICATION REPORT")
+    print("="*60)
+    print(classification_report(y_test, y_pred))
+
+    # Feature importance
+    print("\n" + "="*60)
+    print("TOP 20 MOST IMPORTANT FEATURES")
+    print("="*60)
+    feature_importance = pd.DataFrame({
+        "feature": numeric_cols,
+        "importance": rf.feature_importances_
+    }).sort_values("importance", ascending=False)
+    
+    print(feature_importance.head(20).to_string(index=False))
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()
+
