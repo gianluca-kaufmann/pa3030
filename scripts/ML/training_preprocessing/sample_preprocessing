@@ -178,41 +178,63 @@ def main() -> None:
             "sampling/balance": sample_positives / total_sample if total_sample > 0 else 0,
         })
         
-        # Step 4: Sample and write output from temporary file
+        # Step 4: Sample and write output (separate sampling for each class)
         print("\n🔄 Step 4: Sampling and writing output...")
         step4_start = time.time()
         
-        sampling_query = f"""
-        COPY (
-            SELECT * FROM (
-                -- All positives (up to limit)
+        # Create temporary files for each class
+        temp_positives = temp_dir / "temp_positives.parquet"
+        temp_negatives = temp_dir / "temp_negatives.parquet"
+        escaped_pos = str(temp_positives).replace("'", "''")
+        escaped_neg = str(temp_negatives).replace("'", "''")
+        
+        # Sample positives first
+        print(f"   Sampling {sample_positives:,} positive transitions...")
+        con.execute(f"""
+            COPY (
                 SELECT *
                 FROM read_parquet('{escaped_temp}')
                 WHERE transition_01 = 1
                 USING SAMPLE reservoir({sample_positives} ROWS) REPEATABLE ({RANDOM_STATE})
             )
-            UNION ALL
-            SELECT * FROM (
-                -- Equal number of negatives
+            TO '{escaped_pos}'
+            (FORMAT PARQUET, COMPRESSION ZSTD)
+        """)
+        
+        # Sample negatives
+        print(f"   Sampling {sample_negatives:,} negative transitions...")
+        con.execute(f"""
+            COPY (
                 SELECT *
                 FROM read_parquet('{escaped_temp}')
                 WHERE transition_01 = 0
                 USING SAMPLE reservoir({sample_negatives} ROWS) REPEATABLE ({RANDOM_STATE})
             )
-        )
-        TO '{escaped_out}'
-        (FORMAT PARQUET, COMPRESSION ZSTD)
-        """
+            TO '{escaped_neg}'
+            (FORMAT PARQUET, COMPRESSION ZSTD)
+        """)
         
-        con.execute(sampling_query)
+        # Combine both samples into final output
+        print(f"   Combining samples into final output...")
+        con.execute(f"""
+            COPY (
+                SELECT * FROM read_parquet('{escaped_pos}')
+                UNION ALL
+                SELECT * FROM read_parquet('{escaped_neg}')
+            )
+            TO '{escaped_out}'
+            (FORMAT PARQUET, COMPRESSION ZSTD)
+        """)
         
         step4_time = time.time() - step4_start
         print(f"   ✅ Written to {output_path} in {step4_time:.1f}s")
         wandb.log({"timing/step4_seconds": step4_time})
         
-        # Clean up temporary file
+        # Clean up temporary files
         print("   🧹 Cleaning up temporary files...")
         temp_transitions.unlink(missing_ok=True)
+        temp_positives.unlink(missing_ok=True)
+        temp_negatives.unlink(missing_ok=True)
         print("   ✅ Temporary files removed")
         
         # Step 5: Verify output
@@ -285,8 +307,17 @@ def main() -> None:
     finally:
         # Clean up temporary files in case of error
         try:
-            if temp_transitions.exists():
-                temp_transitions.unlink()
+            cleanup_files = [
+                temp_transitions,
+                temp_dir / "temp_positives.parquet",
+                temp_dir / "temp_negatives.parquet"
+            ]
+            cleaned = False
+            for f in cleanup_files:
+                if f.exists():
+                    f.unlink()
+                    cleaned = True
+            if cleaned:
                 print("🧹 Cleaned up temporary files")
         except:
             pass
