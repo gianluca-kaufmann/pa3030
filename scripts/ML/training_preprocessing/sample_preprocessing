@@ -16,6 +16,7 @@ from pathlib import Path
 import duckdb
 import os
 import time
+import sys
 import pyarrow.parquet as pq
 import wandb
 
@@ -27,11 +28,25 @@ RANDOM_STATE = 42
 
 # W&B configuration
 WANDB_PROJECT = "ml-training-preprocessing"
-WANDB_ENTITY = os.environ.get("WANDB_ENTITY", "gianlukauff")
 
 
 def main() -> None:
     start_time = time.time()
+    
+    # Initialize W&B connection FIRST
+    print("🔄 Initializing Weights & Biases connection...")
+    
+    # Get credentials from environment variables
+    wandb_api_key = os.environ.get("WANDB_API_KEY")
+    wandb_entity = os.environ.get("WANDB_ENTITY")
+    
+    if not wandb_api_key:
+        print("Warning: WANDB_API_KEY not found in environment variables")
+        print("   Set it with: export WANDB_API_KEY='your-key-here'")
+    
+    if not wandb_entity:
+        print("Warning: WANDB_ENTITY not found in environment variables")
+        print("   Set it with: export WANDB_ENTITY='your-entity-here'")
     
     repo_root = Path(__file__).resolve().parents[3]
     input_path = repo_root / "data/ml/merged_panel_2000_2024.parquet"
@@ -41,11 +56,15 @@ def main() -> None:
     temp_dir = repo_root / "data/ml/temp"
     temp_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize Weights & Biases
+    print(f"Loading data from {input_path} …")
+    if not input_path.exists():
+        raise FileNotFoundError(f"Missing source file: {input_path}")
+    
+    # Now initialize wandb with configuration
     year_min, year_max = SAMPLE_YEARS
     wandb.init(
         project=WANDB_PROJECT,
-        entity=WANDB_ENTITY,
+        entity=wandb_entity,
         name=f"sample_preprocessing_{year_min}_{year_max}",
         config={
             "sample_years": SAMPLE_YEARS,
@@ -60,61 +79,55 @@ def main() -> None:
     print("Weights & Biases connected successfully!")
     wandb.log({"status": "started", "start_time": start_time})
 
-    print(f"Loading data from {input_path} …")
-    if not input_path.exists():
-        wandb.log({"status": "failed", "error": "input_file_not_found"})
-        wandb.finish()
-        raise FileNotFoundError(f"Missing source file: {input_path}")
+    try:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+        escaped_in = str(input_path).replace("'", "''")
+        con = duckdb.connect()
+        
+        # Configure DuckDB for memory efficiency and large datasets
+        # Use more threads if on Euler (check if SCRATCH exists), otherwise use 2 for laptop
+        num_threads = 8 if os.environ.get("SCRATCH") else 2
+        con.execute(f"SET threads={num_threads}")
+        con.execute("SET preserve_insertion_order=false")
+        
+        # Set temp directory to $SCRATCH if available (more space on Euler)
+        temp_dir_env = os.environ.get("SCRATCH") or str(temp_dir)
+        con.execute(f"SET temp_directory='{temp_dir_env}/duckdb_temp'")
+        # Increase temp directory size limit (100GB on Euler, 20GB on laptop)
+        max_temp_size = "100GB" if os.environ.get("SCRATCH") else "20GB"
+        con.execute(f"PRAGMA max_temp_directory_size='{max_temp_size}'")
+        
+        print(f"DuckDB configured: {num_threads} threads, temp_dir='{temp_dir_env}/duckdb_temp', max_temp={max_temp_size}")
 
-    escaped_in = str(input_path).replace("'", "''")
-    con = duckdb.connect()
-    
-    # Configure DuckDB for memory efficiency and large datasets
-    # Use more threads if on Euler (check if SCRATCH exists), otherwise use 2 for laptop
-    num_threads = 8 if os.environ.get("SCRATCH") else 2
-    con.execute(f"SET threads={num_threads}")
-    con.execute("SET preserve_insertion_order=false")
-    
-    # Set temp directory to $SCRATCH if available (more space on Euler)
-    temp_dir_env = os.environ.get("SCRATCH") or str(temp_dir)
-    con.execute(f"SET temp_directory='{temp_dir_env}/duckdb_temp'")
-    # Increase temp directory size limit (100GB on Euler, 20GB on laptop)
-    max_temp_size = "100GB" if os.environ.get("SCRATCH") else "20GB"
-    con.execute(f"PRAGMA max_temp_directory_size='{max_temp_size}'")
-    
-    print(f"DuckDB configured: {num_threads} threads, temp_dir='{temp_dir_env}/duckdb_temp', max_temp={max_temp_size}")
+        # Verify WDPA_b1 column exists
+        schema_df = con.execute(
+            f"DESCRIBE SELECT * FROM read_parquet('{escaped_in}')"
+        ).df()
+        has_wdpa = schema_df["column_name"].str.lower().eq("wdpa_b1").any()
 
-    # Verify WDPA_b1 column exists
-    schema_df = con.execute(
-        f"DESCRIBE SELECT * FROM read_parquet('{escaped_in}')"
-    ).df()
-    has_wdpa = schema_df["column_name"].str.lower().eq("wdpa_b1").any()
+        if not has_wdpa:
+            wandb.log({"status": "failed", "error": "WDPA_b1_column_missing"})
+            raise ValueError(
+                "'WDPA_b1' column does not exist in the merged panel; "
+                "cannot derive protected labels."
+            )
 
-    if not has_wdpa:
-        wandb.log({"status": "failed", "error": "WDPA_b1_column_missing"})
-        wandb.finish()
-        raise ValueError(
-            "'WDPA_b1' column does not exist in the merged panel; "
-            "cannot derive protected labels."
-        )
+        print(f"Processing years {year_min}–{year_max} …")
+        wandb.log({"processing/year_range": f"{year_min}-{year_max}"})
 
-    print(f"Processing years {year_min}–{year_max} …")
-    wandb.log({"processing/year_range": f"{year_min}-{year_max}"})
-
-    # Step 1: Create transition data using self-join approach (memory-efficient)
-    # For each year Y, join with year Y-1 to get previous WDPA status
-    temp_transitions = temp_dir / "temp_transitions.parquet"
+        # Step 1: Create transition data using self-join approach (memory-efficient)
+        # For each year Y, join with year Y-1 to get previous WDPA status
+        temp_transitions = temp_dir / "temp_transitions.parquet"
     
-    print("Computing transitions using year-by-year self-joins …")
-    print("  This avoids expensive window functions and processes incrementally.")
+        print("Computing transitions using year-by-year self-joins …")
+        print("  This avoids expensive window functions and processes incrementally.")
     
-    # Build the query using self-joins for each consecutive year pair
-    # This is much more memory-efficient than window functions
-    escaped_temp = str(temp_transitions).replace("'", "''")
+        # Build the query using self-joins for each consecutive year pair
+        # This is much more memory-efficient than window functions
+        escaped_temp = str(temp_transitions).replace("'", "''")
     
-    transition_query = f"""
+        transition_query = f"""
         WITH base AS (
             SELECT *
             FROM read_parquet('{escaped_in}')
@@ -133,48 +146,48 @@ def main() -> None:
             AND curr.col = prev.col 
             AND prev.year = curr.year - 1
         WHERE prev.year IS NOT NULL
-    """
+        """
     
-    print(f"  Writing transitions to temporary file …")
-    materialize_start = time.time()
-    con.execute(
+        print(f"  Writing transitions to temporary file …")
+        materialize_start = time.time()
+        con.execute(
         f"""
         COPY ({transition_query})
         TO '{escaped_temp}'
         (FORMAT PARQUET)
         """
-    )
-    materialize_time = time.time() - materialize_start
-    print(f"  Materialized transitions to temporary file in {materialize_time/60:.1f} minutes.")
-    wandb.log({"processing/materialize_time_minutes": materialize_time / 60})
+        )
+        materialize_time = time.time() - materialize_start
+        print(f"  Materialized transitions to temporary file in {materialize_time/60:.1f} minutes.")
+        wandb.log({"processing/materialize_time_minutes": materialize_time / 60})
 
-    # Step 2: Count available transitions from the temporary file
-    print("Counting transitions …")
-    count_query = f"""
+        # Step 2: Count available transitions from the temporary file
+        print("Counting transitions …")
+        count_query = f"""
         SELECT 
             SUM(CASE WHEN transition_01 = 1 THEN 1 ELSE 0 END) AS positive_transitions,
             SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS negative_transitions,
             COUNT(*) AS total_rows
         FROM read_parquet('{escaped_temp}')
-    """
+        """
     
-    counts = con.execute(count_query).fetchone()
-    pos_available, neg_available, total_available = counts
+        counts = con.execute(count_query).fetchone()
+        pos_available, neg_available, total_available = counts
     
-    print(f"  Total rows with lagged data: {total_available:,}")
-    print(f"  Positive transitions (0→1): {pos_available:,}")
-    print(f"  Negative transitions (other): {neg_available:,}")
+        print(f"  Total rows with lagged data: {total_available:,}")
+        print(f"  Positive transitions (0→1): {pos_available:,}")
+        print(f"  Negative transitions (other): {neg_available:,}")
     
-    wandb.log({
+        wandb.log({
         "data/total_rows": total_available,
         "data/positive_transitions": pos_available,
         "data/negative_transitions": neg_available,
         "data/positive_ratio": pos_available / total_available if total_available > 0 else 0,
-    })
+        })
     
-    # Diagnostic: Check WDPA distribution to understand why there are so few transitions
-    print("\nDiagnostic: Checking WDPA_b1 value distribution …")
-    diag_query = f"""
+        # Diagnostic: Check WDPA distribution to understand why there are so few transitions
+        print("\nDiagnostic: Checking WDPA_b1 value distribution …")
+        diag_query = f"""
         SELECT 
             MIN(WDPA_b1) AS min_wdpa,
             MAX(WDPA_b1) AS max_wdpa,
@@ -182,77 +195,76 @@ def main() -> None:
             SUM(CASE WHEN WDPA_b1 > 0 THEN 1 ELSE 0 END) AS protected_pixels,
             COUNT(*) AS total_pixels
         FROM read_parquet('{escaped_temp}')
-    """
-    diag_result = con.execute(diag_query).fetchone()
-    min_wdpa, max_wdpa, avg_wdpa, protected_pixels, total_pixels = diag_result
+        """
+        diag_result = con.execute(diag_query).fetchone()
+        min_wdpa, max_wdpa, avg_wdpa, protected_pixels, total_pixels = diag_result
     
-    print(f"  WDPA_b1 range: [{min_wdpa}, {max_wdpa}]")
-    print(f"  WDPA_b1 average: {avg_wdpa:.4f}")
-    print(f"  Protected pixels: {protected_pixels:,} / {total_pixels:,} ({protected_pixels/total_pixels*100:.1f}%)")
+        print(f"  WDPA_b1 range: [{min_wdpa}, {max_wdpa}]")
+        print(f"  WDPA_b1 average: {avg_wdpa:.4f}")
+        print(f"  Protected pixels: {protected_pixels:,} / {total_pixels:,} ({protected_pixels/total_pixels*100:.1f}%)")
     
-    wandb.log({
+        wandb.log({
         "diagnostics/wdpa_min": min_wdpa,
         "diagnostics/wdpa_max": max_wdpa,
         "diagnostics/wdpa_avg": avg_wdpa,
         "diagnostics/protected_pixels": protected_pixels,
         "diagnostics/protected_ratio": protected_pixels / total_pixels if total_pixels > 0 else 0,
-    })
-    
-    if pos_available == 0:
-        temp_transitions.unlink(missing_ok=True)
-        wandb.log({"status": "failed", "error": "no_positive_transitions"})
-        wandb.finish()
-        raise ValueError(
-            f"No positive transitions found in years {year_min}–{year_max}. "
-            "Cannot build training sample."
-        )
-    
-    if pos_available < 10000:
-        print(f"\n⚠️  WARNING: Only {pos_available:,} positive transitions available!")
-        print(f"  This will result in severe class imbalance and poor model performance.")
-        print(f"  Consider:")
-        print(f"    - Expanding year range (currently {year_min}-{year_max})")
-        print(f"    - Checking if WDPA_b1 is binary or needs thresholding")
-        print(f"    - Investigating the data source for WDPA establishment dates")
-        wandb.log({"warning": "very_few_positive_transitions"})
+        })
+        
+        if pos_available == 0:
+            temp_transitions.unlink(missing_ok=True)
+            wandb.log({"status": "failed", "error": "no_positive_transitions"})
+            raise ValueError(
+                f"No positive transitions found in years {year_min}–{year_max}. "
+                "Cannot build training sample."
+            )
+        
+        if pos_available < 10000:
+            print(f"\n⚠️  WARNING: Only {pos_available:,} positive transitions available!")
+            print(f"  This will result in severe class imbalance and poor model performance.")
+            print(f"  Consider:")
+            print(f"    - Expanding year range (currently {year_min}-{year_max})")
+            print(f"    - Checking if WDPA_b1 is binary or needs thresholding")
+            print(f"    - Investigating the data source for WDPA establishment dates")
+            wandb.log({"warning": "very_few_positive_transitions"})
 
-    # Step 3: Determine sampling strategy
-    # Goal: Create a balanced dataset, but adapt if there are too few positives
-    sample_pos = min(TRANSITION_LIMIT, pos_available)  # Use all positives if fewer than limit
+        # Step 3: Determine sampling strategy
+        # Goal: Create a balanced dataset, but adapt if there are too few positives
+        sample_pos = min(TRANSITION_LIMIT, pos_available)  # Use all positives if fewer than limit
+        
+        # For balanced sampling: match negatives to positives
+        # But cap total sample size at TOTAL_SAMPLE_SIZE
+        if sample_pos * 2 <= TOTAL_SAMPLE_SIZE:
+            # We can do 50/50 balanced sampling
+            sample_neg = sample_pos
+            print(f"\nSampling strategy: BALANCED (50/50)")
+        else:
+            # Too many positives for balanced within total budget
+            sample_pos = TOTAL_SAMPLE_SIZE // 2
+            sample_neg = TOTAL_SAMPLE_SIZE // 2
+            print(f"\nSampling strategy: BALANCED with cap at {TOTAL_SAMPLE_SIZE:,} total")
     
-    # For balanced sampling: match negatives to positives
-    # But cap total sample size at TOTAL_SAMPLE_SIZE
-    if sample_pos * 2 <= TOTAL_SAMPLE_SIZE:
-        # We can do 50/50 balanced sampling
-        sample_neg = sample_pos
-        print(f"\nSampling strategy: BALANCED (50/50)")
-    else:
-        # Too many positives for balanced within total budget
-        sample_pos = TOTAL_SAMPLE_SIZE // 2
-        sample_neg = TOTAL_SAMPLE_SIZE // 2
-        print(f"\nSampling strategy: BALANCED with cap at {TOTAL_SAMPLE_SIZE:,} total")
+        sample_neg = min(sample_neg, neg_available)  # Cap at available negatives
     
-    sample_neg = min(sample_neg, neg_available)  # Cap at available negatives
+        print(f"  Positive transitions: {sample_pos:,} of {pos_available:,}")
+        print(f"  Negative transitions: {sample_neg:,} of {neg_available:,}")
+        print(f"  Total sample size: {sample_pos + sample_neg:,}")
+        print(f"  Class balance: {sample_pos/(sample_pos+sample_neg)*100:.1f}% positive")
     
-    print(f"  Positive transitions: {sample_pos:,} of {pos_available:,}")
-    print(f"  Negative transitions: {sample_neg:,} of {neg_available:,}")
-    print(f"  Total sample size: {sample_pos + sample_neg:,}")
-    print(f"  Class balance: {sample_pos/(sample_pos+sample_neg)*100:.1f}% positive")
-    
-    wandb.log({
+        wandb.log({
         "sampling/positive_sample": sample_pos,
         "sampling/negative_sample": sample_neg,
         "sampling/total_sample": sample_pos + sample_neg,
         "sampling/class_balance": sample_pos / (sample_pos + sample_neg),
-    })
+        })
 
-    # Step 4: Sample and write directly from temporary file
-    print(f"\nWriting sample to {output_path} …")
-    sample_start = time.time()
+        # Step 4: Sample and write directly from temporary file
+        print(f"\nWriting sample to {output_path} …")
+        sample_start = time.time()
     
-    # Combine both samples in one query from the materialized file
-    escaped_out = str(output_path).replace("'", "''")
-    con.execute(
+        # Combine both samples in one query from the materialized file
+        escaped_out = str(output_path).replace("'", "''")
+        con.execute(
         f"""
         COPY (
             SELECT * FROM (
@@ -272,18 +284,18 @@ def main() -> None:
         TO '{escaped_out}'
         (FORMAT PARQUET)
         """
-    )
-    sample_time = time.time() - sample_start
-    print(f"  Sampled and wrote in {sample_time:.1f} seconds.")
-    wandb.log({"processing/sample_time_seconds": sample_time})
+        )
+        sample_time = time.time() - sample_start
+        print(f"  Sampled and wrote in {sample_time:.1f} seconds.")
+        wandb.log({"processing/sample_time_seconds": sample_time})
     
-    # Clean up temporary file
-    temp_transitions.unlink(missing_ok=True)
-    print("  Cleaned up temporary files.")
+        # Clean up temporary file
+        temp_transitions.unlink(missing_ok=True)
+        print("  Cleaned up temporary files.")
 
-    # Step 5: Verify output
-    print("\nVerifying output …")
-    output_counts = con.execute(
+        # Step 5: Verify output
+        print("\nVerifying output …")
+        output_counts = con.execute(
         f"""
         SELECT 
             SUM(CASE WHEN transition_01 = 1 THEN 1 ELSE 0 END) AS positive,
@@ -294,29 +306,29 @@ def main() -> None:
             MAX(year) AS max_year
         FROM read_parquet('{escaped_out}')
         """
-    ).fetchone()
+        ).fetchone()
 
-    pos_written, neg_written, total_written, n_years, min_year, max_year = output_counts
+        pos_written, neg_written, total_written, n_years, min_year, max_year = output_counts
     
-    # Calculate file size
-    parquet_size_mb = output_path.stat().st_size / (1024 * 1024) if output_path.exists() else 0
+        # Calculate file size
+        parquet_size_mb = output_path.stat().st_size / (1024 * 1024) if output_path.exists() else 0
     
-    # Calculate total time
-    total_time = time.time() - start_time
+        # Calculate total time
+        total_time = time.time() - start_time
 
-    print(f"\n{'='*60}")
-    print(f"Successfully wrote {total_written:,} rows to {output_path}")
-    print(f"{'='*60}")
-    print(f"  Positive transitions (0→1): {pos_written:,}")
-    print(f"  Negative transitions:       {neg_written:,}")
-    print(f"  Years covered:              {n_years} ({min_year}–{max_year})")
-    print(f"  Class balance:              {pos_written / total_written * 100:.1f}% positive")
-    print(f"  File size:                  {parquet_size_mb:.1f} MB")
-    print(f"  Total time:                 {total_time/60:.1f} minutes")
-    print(f"{'='*60}")
+        print(f"\n{'='*60}")
+        print(f"Successfully wrote {total_written:,} rows to {output_path}")
+        print(f"{'='*60}")
+        print(f"  Positive transitions (0→1): {pos_written:,}")
+        print(f"  Negative transitions:       {neg_written:,}")
+        print(f"  Years covered:              {n_years} ({min_year}–{max_year})")
+        print(f"  Class balance:              {pos_written / total_written * 100:.1f}% positive")
+        print(f"  File size:                  {parquet_size_mb:.1f} MB")
+        print(f"  Total time:                 {total_time/60:.1f} minutes")
+        print(f"{'='*60}")
     
-    # Log final results to W&B
-    wandb.log({
+        # Log final results to W&B
+        wandb.log({
         "output/positive_count": pos_written,
         "output/negative_count": neg_written,
         "output/total_rows": total_written,
@@ -328,23 +340,42 @@ def main() -> None:
         "summary/total_time_minutes": total_time / 60,
         "summary/total_time_hours": total_time / 3600,
         "summary/status": "completed",
-    })
+        })
+        
+        # Warn if class balance is poor
+        class_balance = pos_written / total_written if total_written > 0 else 0
+        if class_balance < 0.3 or class_balance > 0.7:
+            print(f"\n⚠️  WARNING: Poor class balance ({class_balance*100:.1f}% positive)")
+            print(f"  This may lead to biased model predictions.")
+            print(f"  Consider rerunning with adjusted sampling parameters.")
+            wandb.alert(
+                title="Poor Class Balance",
+                text=f"Class balance is {class_balance*100:.1f}% positive (target: 50%)",
+                level=wandb.AlertLevel.WARN
+            )
+        
+        print("\nPreprocessing complete!")
     
-    # Warn if class balance is poor
-    class_balance = pos_written / total_written if total_written > 0 else 0
-    if class_balance < 0.3 or class_balance > 0.7:
-        print(f"\n⚠️  WARNING: Poor class balance ({class_balance*100:.1f}% positive)")
-        print(f"  This may lead to biased model predictions.")
-        print(f"  Consider rerunning with adjusted sampling parameters.")
-        wandb.alert(
-            title="Poor Class Balance",
-            text=f"Class balance is {class_balance*100:.1f}% positive (target: 50%)",
-            level=wandb.AlertLevel.WARN
-        )
+    except Exception as e:
+        # Log error to W&B and re-raise
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        print(f"\n❌ ERROR: {error_msg}")
+        wandb.log({
+            "status": "failed",
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+        })
+        raise
     
-    wandb.finish()
-    print("\nPreprocessing complete!")
+    finally:
+        # Always finish W&B run
+        wandb.finish()
+        print("W&B run finished.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"Script failed with error: {e}")
+        sys.exit(1)
