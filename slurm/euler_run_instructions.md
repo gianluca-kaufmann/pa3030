@@ -121,54 +121,36 @@ sacct -j <JOBID> --format=JobID,State,ExitCode,Elapsed,MaxRSS
 ls -lh /cluster/scratch/$USER/outputs/Results/
 ```
 
-## SLURM Script Template
+# ============================================================
+#  TRAINING JOB TROUBLESHOOTING (SLURM / TRAIN.slurm)
+# ============================================================
 
-Example `slurm/RUN.slurm`:
+# See your most recent jobs (today)
+sacct -u $USER --starttime today \
+  --format=JobID,JobName,Partition,State,ExitCode,Elapsed,MaxRSS,AllocCPUS | tail -n 20
 
-```bash
-#!/bin/bash
-#SBATCH --job-name=merge_panel
-#SBATCH --output=/cluster/scratch/%u/logs/merge_panel_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/merge_panel_%j.err
-#SBATCH --time=24:00:00
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=128G
-#SBATCH --partition=normal.24h
+# Inspect a specific job (replace <JOBID>)
+job=<JOBID>
+sacct -j ${job} --format=JobID,JobName,State,ExitCode,Elapsed,ReqMem,AllocCPUS,MaxRSS,MaxVMSize
+scontrol show job ${job} | sed -n '1,80p'
 
-module purge
-module load stack/2024-06
-module load gcc/12.2.0
-module load python_cuda/3.11.6
-module load eth_proxy
-source ~/venv/master-thesis/bin/activate
+# Look at the training logs (STDOUT + STDERR)
+#    (adapt the pattern if your TRAIN.slurm uses a different naming scheme)
+ls -lt $SCRATCH/logs/TRAIN_*.out | head
+ls -lt $SCRATCH/logs/TRAIN_*.err | head
 
-cd ~/master_thesis
-python scripts/merging/merge_total_optimized.py
-```
+# newest job id from sacct:
+job=<JOBID>   # e.g. job=49479981
+tail -n 80  $SCRATCH/logs/TRAIN_${job}.out
+tail -n 80  $SCRATCH/logs/TRAIN_${job}.err
 
-## Optional: tmux for Monitoring
+# Quickly search for typical failure reasons
+grep -iE "error|exception|traceback|no such file|not found|OOM|out of memory|Killed" \
+  $SCRATCH/logs/TRAIN_${job}.err || echo "No obvious errors in .err"
 
-Use tmux to keep monitoring sessions alive if SSH drops:
+# If the job is still running, watch live memory usage
+squeue -u $USER
+sstat -j ${job}.batch --format=AveRSS,MaxRSS,MaxVMSize
 
-```bash
-module load tmux
-tmux new -s merge
-
-# Inside tmux:
-cd ~/master_thesis
-tail -f /cluster/scratch/$USER/logs/merge_panel_*.out
-
-# Detach: Ctrl+B, then D
-# Reattach: tmux attach -t merge
-```
-
-Note: SLURM jobs run independently of tmux; this is only for monitoring.
-
-## Reference Configuration
-
-- CPUs: 8
-- Memory: 128 GB total (16 GB per CPU)
-- Partition: `normal.24h`
-- Data path: `/cluster/scratch/gikaufmann/data/ready/`
-- Outputs path: `/cluster/scratch/gikaufmann/outputs/Results/`
-- Typical output: `merged_panel_2000_2024.parquet` (~30-40 GB)
+# Confirm the training output actually exists (adapt path as needed)
+find $SCRATCH/outputs -maxdepth 3 -type f -mmin -60 -printf "%Tc  %p\n" | sort
