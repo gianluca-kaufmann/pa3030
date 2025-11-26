@@ -1,0 +1,593 @@
+#!/usr/bin/env python3
+
+"""Pyramid Multi-Scale Random Forest Training Script (Memory-Optimized)
+
+Purpose: Train a Random Forest model with pyramid multi-scale features to predict 
+         new WDPA establishment (0→1 transitions) using spatial context at multiple scales.
+         
+Approach: Based on Gaussian pyramid feature engineering - each pixel receives features
+          representing its value at multiple spatial scales (pixel-level, neighborhood,
+          regional, etc.). This allows the model to learn from both local and broad
+          spatial patterns.
+          
+          Memory-optimized version that:
+          - Processes features in batches to reduce memory usage
+          - Uses float32 precision for efficiency
+          - Implements aggressive garbage collection
+          - Provides detailed progress tracking
+
+Input:  `data/ml/sample_training_imbalanced.parquet` (realistic class distribution).
+Process: 
+    1. Load tabular data with spatial coordinates (row, col)
+    2. Compute local neighborhood features using efficient rolling windows
+    3. Apply multi-scale aggregation via spatial grouping
+    4. Train Random Forest classifier with multi-scale features
+    5. Evaluate with comprehensive metrics
+    
+Output: Classification report, ROC-AUC, PR-AUC, precision@k, confusion matrix,
+        and feature importance analysis highlighting spatial scale effects.
+"""
+
+from __future__ import annotations
+
+import gc
+import sys
+import warnings
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy.ndimage import uniform_filter
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    roc_auc_score,
+    average_precision_score,
+    precision_recall_curve,
+)
+from sklearn.model_selection import train_test_split
+
+warnings.filterwarnings('ignore', category=UserWarning)
+
+
+class Tee:
+    """Write to both stdout and a file."""
+    def __init__(self, file_path: Path):
+        self.file = open(file_path, 'w', encoding='utf-8')
+        self.stdout = sys.stdout
+    
+    def write(self, text: str) -> None:
+        self.stdout.write(text)
+        self.file.write(text)
+        self.file.flush()
+    
+    def flush(self) -> None:
+        self.stdout.flush()
+        self.file.flush()
+    
+    def close(self) -> None:
+        self.file.close()
+
+
+# Configuration
+RANDOM_STATE = 42
+VAL_SIZE = 0.1    # 10% for validation
+TEST_SIZE = 0.2   # 20% for test
+
+# Multi-scale configuration
+# Kernel sizes for different spatial scales (in cells)
+SCALE_KERNELS = [1, 4, 16, 64]  # Scale 0 (pixel), Scale 1 (4x4), Scale 2 (16x16), Scale 3 (64x64)
+
+# Processing configuration
+FEATURE_BATCH_SIZE = 10  # Process features in batches to manage memory
+USE_FLOAT32 = True  # Use float32 for memory efficiency
+
+# Random Forest configuration
+RF_N_ESTIMATORS = 500
+RF_MAX_DEPTH = 30
+RF_MIN_SAMPLES_SPLIT = 10
+RF_MIN_SAMPLES_LEAF = 5
+RF_MAX_FEATURES = 'sqrt'
+
+# Columns to exclude from features
+EXCLUDE_COLS = {
+    "transition_01",  # Target variable
+    "WDPA_b1",        # Direct leakage of target
+    "WDPA_prev",      # Direct leakage of target
+    "row",            # Spatial identifier (will be used for reconstruction)
+    "col",            # Spatial identifier (will be used for reconstruction)
+    "x",              # Spatial coordinate
+    "y",              # Spatial coordinate
+    "year",           # Temporal identifier (will be used for grouping)
+}
+
+
+def compute_precision_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) -> float:
+    """Compute precision at top k% of predictions.
+    
+    Args:
+        y_true: True labels (0 or 1)
+        y_proba: Predicted probabilities for positive class
+        k: Percentage (e.g., 1 for top 1%, 5 for top 5%)
+    
+    Returns:
+        Precision among top k% predictions
+    """
+    n_samples = len(y_true)
+    n_top_k = max(1, int(n_samples * k / 100))
+    
+    # Get indices of top k% predictions
+    top_k_idx = np.argsort(y_proba)[-n_top_k:]
+    
+    # Calculate precision among top k%
+    precision = y_true[top_k_idx].sum() / n_top_k
+    
+    return precision
+
+
+def compute_multiscale_features_efficient(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    spatial_cols: tuple[str, str] = ("row", "col"),
+) -> pd.DataFrame:
+    """
+    Compute multi-scale spatial features efficiently using memory-optimized approach.
+    
+    Instead of creating full 2D grids and pyramids, this function:
+    1. Processes features in batches
+    2. Uses uniform filters for efficient spatial averaging
+    3. Processes year-by-year with garbage collection
+    4. Uses float32 for memory efficiency
+    
+    Args:
+        df: Input dataframe with spatial coordinates
+        feature_cols: List of feature column names to process
+        spatial_cols: Tuple of (row_col, col_col) column names
+        
+    Returns:
+        DataFrame with original data plus multi-scale features
+    """
+    print("\n" + "=" * 70)
+    print("MULTI-SCALE FEATURE ENGINEERING")
+    print("=" * 70)
+    print(f"Building multi-scale spatial features for {len(feature_cols)} features …")
+    print(f"Scale kernels: {SCALE_KERNELS} cells (pixel, local, neighborhood, regional)")
+    print(f"Processing in batches of {FEATURE_BATCH_SIZE} features")
+    
+    row_col, col_col = spatial_cols
+    
+    # Check if year column exists
+    has_year = "year" in df.columns
+    
+    if has_year:
+        years = sorted(df["year"].unique())
+        print(f"Processing {len(years)} years")
+    else:
+        print("No year column found, processing as single time slice.")
+        years = [None]
+    
+    # Process years one at a time
+    all_year_results = []
+    
+    for year_idx, year in enumerate(years, 1):
+        if has_year:
+            print(f"\nYear {year} ({year_idx}/{len(years)}) …", end=" ", flush=True)
+            df_year = df[df["year"] == year].copy()
+        else:
+            df_year = df.copy()
+        
+        # Store index for merging
+        df_year["_idx"] = df_year.index
+        
+        # Get grid boundaries
+        min_row = int(df_year[row_col].min())
+        max_row = int(df_year[row_col].max())
+        min_col = int(df_year[col_col].min())
+        max_col = int(df_year[col_col].max())
+        
+        n_rows = max_row - min_row + 1
+        n_cols = max_col - min_col + 1
+        
+        # Create coordinate mapping
+        df_year['_r'] = (df_year[row_col] - min_row).astype(np.int32)
+        df_year['_c'] = (df_year[col_col] - min_col).astype(np.int32)
+        
+        # Dictionary to store all scale features
+        scale_features = {}
+        
+        # Process features in batches
+        n_batches = (len(feature_cols) + FEATURE_BATCH_SIZE - 1) // FEATURE_BATCH_SIZE
+        
+        for batch_idx in range(n_batches):
+            start_idx = batch_idx * FEATURE_BATCH_SIZE
+            end_idx = min((batch_idx + 1) * FEATURE_BATCH_SIZE, len(feature_cols))
+            batch_features = feature_cols[start_idx:end_idx]
+            
+            if batch_idx % 2 == 0 or batch_idx == n_batches - 1:
+                print(f"[{end_idx}/{len(feature_cols)}]", end=" ", flush=True)
+            
+            for feat_name in batch_features:
+                # Create sparse grid representation
+                dtype = np.float32 if USE_FLOAT32 else np.float64
+                grid = np.zeros((n_rows, n_cols), dtype=dtype)
+                
+                # Fill grid efficiently using numpy indexing
+                rows = df_year['_r'].values
+                cols = df_year['_c'].values
+                values = df_year[feat_name].fillna(0).astype(dtype).values
+                grid[rows, cols] = values
+                
+                # Compute multi-scale features
+                for scale_idx, kernel_size in enumerate(SCALE_KERNELS):
+                    if kernel_size == 1:
+                        # Scale 0: Original values (already in grid)
+                        scale_grid = grid
+                    else:
+                        # Apply uniform filter for averaging
+                        scale_grid = uniform_filter(grid, size=kernel_size, mode='reflect')
+                    
+                    # Extract values at data points
+                    scale_values = scale_grid[rows, cols]
+                    scale_features[f"{feat_name}_scale_{scale_idx}"] = scale_values
+                
+                # Clear memory
+                del grid
+            
+            # Periodic garbage collection
+            if batch_idx % 4 == 0:
+                gc.collect()
+        
+        # Create DataFrame with scale features
+        scale_df = pd.DataFrame(scale_features, dtype=np.float32 if USE_FLOAT32 else np.float64)
+        scale_df["_idx"] = df_year["_idx"].values
+        
+        all_year_results.append(scale_df)
+        
+        # Clean up
+        del df_year, scale_features, scale_df
+        gc.collect()
+        
+        print("✓")
+    
+    # Concatenate all years
+    print("\nCombining results …", end=" ", flush=True)
+    all_scales = pd.concat(all_year_results, ignore_index=False)
+    
+    # Merge with original dataframe
+    df["_idx"] = df.index
+    df_result = df.merge(all_scales, on="_idx", how="left")
+    df_result.drop(columns=["_idx"], inplace=True)
+    
+    # Clean up
+    del all_year_results, all_scales
+    gc.collect()
+    
+    n_scale_features = len([c for c in df_result.columns if "_scale_" in c])
+    print(f"✓")
+    print(f"\n✓ Multi-scale feature engineering complete!")
+    print(f"  Total scale features created: {n_scale_features}")
+    print(f"  Scales per feature: {len(SCALE_KERNELS)}")
+    
+    return df_result
+
+
+def main() -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    input_path = repo_root / "data/ml/sample_training_imbalanced.parquet"
+
+    print("=" * 70)
+    print("PYRAMID MULTI-SCALE WDPA TRANSITION PREDICTION (Random Forest)")
+    print("=" * 70)
+    print("\nApproach: Multi-scale spatial feature engineering")
+    print("          Each pixel receives features at multiple spatial scales:")
+    print(f"          - Scale 0: Original pixel value ({SCALE_KERNELS[0]}×{SCALE_KERNELS[0]} cell)")
+    print(f"          - Scale 1: Local average ({SCALE_KERNELS[1]}×{SCALE_KERNELS[1]} cells)")
+    print(f"          - Scale 2: Neighborhood average ({SCALE_KERNELS[2]}×{SCALE_KERNELS[2]} cells)")
+    print(f"          - Scale 3: Regional average ({SCALE_KERNELS[3]}×{SCALE_KERNELS[3]} cells)")
+    
+    print(f"\nLoading data from {input_path} …")
+    df = pd.read_parquet(input_path)
+    print(f"Loaded {len(df):,} rows with {len(df.columns)} columns.")
+
+    target_col = "transition_01"
+    if target_col not in df.columns:
+        raise ValueError(
+            f"Target column '{target_col}' not found in data. "
+            "Ensure preprocessing has been run with the transition logic."
+        )
+
+    print(f"\nUsing '{target_col}' as target variable.")
+
+    # Check for required spatial columns
+    if "row" not in df.columns or "col" not in df.columns:
+        raise ValueError("Data must contain 'row' and 'col' columns for spatial reconstruction.")
+
+    # Drop rows with missing target
+    df_clean = df.dropna(subset=[target_col])
+    dropped = len(df) - len(df_clean)
+    if dropped > 0:
+        print(f"Dropped {dropped:,} rows with missing target.")
+    print(f"Remaining: {len(df_clean):,} rows.")
+
+    if len(df_clean) == 0:
+        raise ValueError("No valid rows remaining after dropping missing targets.")
+
+    y = df_clean[target_col]
+
+    # Select base feature columns (before pyramid)
+    numeric_cols = df_clean.select_dtypes(include=["number"]).columns.tolist()
+    base_feature_cols = [
+        col for col in numeric_cols 
+        if col.lower() not in {c.lower() for c in EXCLUDE_COLS}
+    ]
+
+    if not base_feature_cols:
+        raise ValueError("No valid numeric feature columns available for training.")
+
+    print(f"\nIdentified {len(base_feature_cols)} base numeric features.")
+    print(f"Excluded columns: {sorted(EXCLUDE_COLS & set(numeric_cols))}")
+    
+    # Print target distribution
+    transition_counts = y.value_counts().sort_index()
+    n_negatives = transition_counts.get(0, 0)
+    n_positives = transition_counts.get(1, 0)
+    positive_ratio = n_positives / len(y) * 100
+    
+    print(f"\n" + "=" * 70)
+    print("TARGET DISTRIBUTION")
+    print("=" * 70)
+    print(f"  No transition (0): {n_negatives:>12,}  ({100 - positive_ratio:>5.3f}%)")
+    print(f"  New WDPA (0→1):    {n_positives:>12,}  ({positive_ratio:>5.3f}%)")
+    print(f"  Class ratio:       1 : {n_negatives / max(n_positives, 1):.1f}")
+
+    # Apply multi-scale feature engineering
+    df_with_scales = compute_multiscale_features_efficient(
+        df_clean, 
+        base_feature_cols,
+        spatial_cols=("row", "col")
+    )
+    
+    # Extract multi-scale features for modeling
+    scale_feature_cols = [c for c in df_with_scales.columns if "_scale_" in c]
+    X = df_with_scales[scale_feature_cols]
+    
+    print(f"\n" + "=" * 70)
+    print("FEATURE SUMMARY")
+    print("=" * 70)
+    print(f"Base features:           {len(base_feature_cols)}")
+    print(f"Multi-scale features:    {len(scale_feature_cols)}")
+    print(f"Total training features: {len(X.columns)}")
+
+    # Train/val/test split with stratification (70/10/20)
+    print(f"\n" + "=" * 70)
+    print("TRAIN/VAL/TEST SPLIT")
+    print("=" * 70)
+    print(f"Splitting into train/val/test (70/10/20) with stratification …")
+    
+    # First split: separate test set (20%)
+    X_temp, X_test, y_temp, y_test = train_test_split(
+        X,
+        y,
+        test_size=TEST_SIZE,
+        stratify=y,
+        random_state=RANDOM_STATE,
+    )
+    
+    # Second split: separate validation from remaining (10% of original = 12.5% of temp)
+    val_size_adjusted = VAL_SIZE / (1 - TEST_SIZE)
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_temp,
+        y_temp,
+        test_size=val_size_adjusted,
+        stratify=y_temp,
+        random_state=RANDOM_STATE,
+    )
+    
+    # Print split statistics
+    train_pos = y_train.sum()
+    train_neg = len(y_train) - train_pos
+    print(f"\nTraining set: {len(X_train):,} samples ({len(X_train)/len(df_clean)*100:.1f}%)")
+    print(f"  No transition (0): {train_neg:,}")
+    print(f"  New WDPA (0→1):    {train_pos:,}")
+    
+    val_pos = y_val.sum()
+    val_neg = len(y_val) - val_pos
+    print(f"\nValidation set: {len(X_val):,} samples ({len(X_val)/len(df_clean)*100:.1f}%)")
+    print(f"  No transition (0): {val_neg:,}")
+    print(f"  New WDPA (0→1):    {val_pos:,}")
+    
+    test_pos = y_test.sum()
+    test_neg = len(y_test) - test_pos
+    print(f"\nTest set: {len(X_test):,} samples ({len(X_test)/len(df_clean)*100:.1f}%)")
+    print(f"  No transition (0): {test_neg:,}")
+    print(f"  New WDPA (0→1):    {test_pos:,}")
+
+    # Calculate class weight for Random Forest
+    class_weight_ratio = n_negatives / max(n_positives, 1)
+    class_weight_dict = {0: 1.0, 1: class_weight_ratio}
+
+    # Train Random Forest
+    print(f"\n" + "=" * 70)
+    print("MODEL TRAINING")
+    print("=" * 70)
+    print(f"Training Random Forest classifier …")
+    
+    print("\nModel parameters:")
+    print(f"  n_estimators: {RF_N_ESTIMATORS}")
+    print(f"  max_depth: {RF_MAX_DEPTH}")
+    print(f"  min_samples_split: {RF_MIN_SAMPLES_SPLIT}")
+    print(f"  min_samples_leaf: {RF_MIN_SAMPLES_LEAF}")
+    print(f"  max_features: {RF_MAX_FEATURES}")
+    print(f"  class_weight: {{0: 1.0, 1: {class_weight_ratio:.2f}}}")
+    print(f"  random_state: {RANDOM_STATE}")
+    
+    rf_model = RandomForestClassifier(
+        n_estimators=RF_N_ESTIMATORS,
+        max_depth=RF_MAX_DEPTH,
+        min_samples_split=RF_MIN_SAMPLES_SPLIT,
+        min_samples_leaf=RF_MIN_SAMPLES_LEAF,
+        max_features=RF_MAX_FEATURES,
+        class_weight=class_weight_dict,
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+        verbose=1,
+    )
+    
+    print("\nFitting model …")
+    rf_model.fit(X_train, y_train)
+    print("\n✓ Training complete!")
+
+    # Evaluate on validation set
+    print(f"\n" + "=" * 70)
+    print("VALIDATION SET PERFORMANCE")
+    print("=" * 70)
+    y_val_proba = rf_model.predict_proba(X_val)[:, 1]
+    val_roc_auc = roc_auc_score(y_val, y_val_proba)
+    val_pr_auc = average_precision_score(y_val, y_val_proba)
+    print(f"Validation ROC-AUC: {val_roc_auc:.4f}")
+    print(f"Validation PR-AUC:  {val_pr_auc:.4f}")
+
+    # Predict on test set
+    print("\n" + "=" * 70)
+    print("EVALUATION ON TEST SET")
+    print("=" * 70)
+    print("Computing predictions …")
+    y_pred = rf_model.predict(X_test)
+    y_proba = rf_model.predict_proba(X_test)[:, 1]
+
+    # Classification report
+    print("\n" + "=" * 70)
+    print("CLASSIFICATION REPORT")
+    print("=" * 70)
+    print(classification_report(y_test, y_pred, digits=4))
+
+    # Confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    tn, fp, fn, tp = cm.ravel()
+    
+    print("\n" + "=" * 70)
+    print("CONFUSION MATRIX")
+    print("=" * 70)
+    print(f"                 Predicted Negative    Predicted Positive")
+    print(f"Actual Negative  {tn:>18,}    {fp:>18,}")
+    print(f"Actual Positive  {fn:>18,}    {tp:>18,}")
+    print(f"\nTrue Negatives:  {tn:,}")
+    print(f"False Positives: {fp:,}")
+    print(f"False Negatives: {fn:,}")
+    print(f"True Positives:  {tp:,}")
+
+    # ROC-AUC and PR-AUC
+    print("\n" + "=" * 70)
+    print("AREA UNDER CURVE METRICS")
+    print("=" * 70)
+    
+    roc_auc = roc_auc_score(y_test, y_proba)
+    pr_auc = average_precision_score(y_test, y_proba)
+    
+    print(f"ROC-AUC:  {roc_auc:.4f}")
+    print(f"PR-AUC:   {pr_auc:.4f}")
+    
+    # Precision at top k%
+    print("\n" + "=" * 70)
+    print("PRECISION @ TOP-K PREDICTIONS")
+    print("=" * 70)
+    print("(Precision among highest-confidence predictions)")
+    print()
+    
+    for k in [1, 5, 10]:
+        prec_at_k = compute_precision_at_k(y_test.values, y_proba, k)
+        n_top_k = max(1, int(len(y_test) * k / 100))
+        expected_positives = int(n_top_k * prec_at_k)
+        print(f"Precision @ top {k:>2}%:  {prec_at_k:>7.4f}  "
+              f"({expected_positives:>6,} positives in top {n_top_k:>7,} predictions)")
+    
+    # Baseline precision (random ranking)
+    baseline_precision = test_pos / len(y_test)
+    print(f"\nBaseline (random): {baseline_precision:>7.4f}  "
+          f"(overall positive rate in test set)")
+
+    # Feature importance analysis
+    print("\n" + "=" * 70)
+    print("FEATURE IMPORTANCE ANALYSIS")
+    print("=" * 70)
+    
+    feature_importance = pd.DataFrame({
+        "feature": scale_feature_cols,
+        "importance": rf_model.feature_importances_
+    }).sort_values("importance", ascending=False)
+    
+    print("\nTop 30 Most Important Features:")
+    print(feature_importance.head(30).to_string(index=False))
+    
+    # Analyze importance by scale
+    print("\n" + "=" * 70)
+    print("IMPORTANCE BY SPATIAL SCALE")
+    print("=" * 70)
+    
+    scale_importance = {}
+    for scale_idx, kernel_size in enumerate(SCALE_KERNELS):
+        scale_features = [f for f in scale_feature_cols if f"_scale_{scale_idx}" in f]
+        scale_imp = feature_importance[
+            feature_importance["feature"].isin(scale_features)
+        ]["importance"].sum()
+        scale_importance[f"Scale {scale_idx}"] = scale_imp
+    
+    scale_df = pd.DataFrame([
+        {"Scale": k, "Total Importance": v, "Percentage": v / sum(scale_importance.values()) * 100}
+        for k, v in scale_importance.items()
+    ])
+    print(scale_df.to_string(index=False))
+    
+    print("\nScale interpretation:")
+    for scale_idx, kernel_size in enumerate(SCALE_KERNELS):
+        if scale_idx == 0:
+            print(f"  Scale {scale_idx}: Pixel-level ({kernel_size}×{kernel_size} cell)")
+        elif scale_idx == 1:
+            print(f"  Scale {scale_idx}: Local average ({kernel_size}×{kernel_size} cells)")
+        elif scale_idx == 2:
+            print(f"  Scale {scale_idx}: Neighborhood average ({kernel_size}×{kernel_size} cells)")
+        else:
+            print(f"  Scale {scale_idx}: Regional average ({kernel_size}×{kernel_size} cells)")
+    
+    # Summary
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"Model:                 Random Forest (multi-scale)")
+    print(f"N_estimators:          {RF_N_ESTIMATORS}")
+    print(f"Test samples:          {len(y_test):,}")
+    print(f"Positive rate:         {positive_ratio:.3f}%")
+    print(f"Base features:         {len(base_feature_cols)}")
+    print(f"Multi-scale features:  {len(scale_feature_cols)}")
+    print(f"Spatial scales:        {len(SCALE_KERNELS)} ({SCALE_KERNELS})")
+    print(f"Validation ROC-AUC:    {val_roc_auc:.4f}")
+    print(f"Test ROC-AUC:          {roc_auc:.4f}")
+    print(f"Test PR-AUC:           {pr_auc:.4f}")
+    print(f"Precision @ top 1%:    {compute_precision_at_k(y_test.values, y_proba, 1):.4f}")
+    print(f"Precision @ top 5%:    {compute_precision_at_k(y_test.values, y_proba, 5):.4f}")
+    print(f"Precision @ top 10%:   {compute_precision_at_k(y_test.values, y_proba, 10):.4f}")
+    print("=" * 70)
+    print("\nAll done.")
+
+
+if __name__ == "__main__":
+    repo_root = Path(__file__).resolve().parents[3]
+    output_dir = repo_root / "outputs/Results/ml_baselines"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = output_dir / f"train_sample_pyramids_RF_{timestamp}.txt"
+    
+    tee = Tee(output_file)
+    original_stdout = sys.stdout
+    sys.stdout = tee
+    
+    try:
+        main()
+    finally:
+        sys.stdout = original_stdout
+        tee.close()
+        print(f"\nOutput saved to: {output_file}")
+

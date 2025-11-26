@@ -13,7 +13,6 @@ Output: Classification report, ROC-AUC, PR-AUC, precision@k, confusion matrix,
 
 from __future__ import annotations
 
-import argparse
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -55,6 +54,9 @@ VAL_SIZE = 0.1    # 10% for validation (from original data)
 TEST_SIZE = 0.2   # 20% for test (from original data)
 # Training will be 70% (remaining after val+test split)
 
+# Scale pos weight values to test
+SCALE_POS_WEIGHTS = [40, 60]
+
 # Columns to exclude from features (to prevent data leakage or overfitting)
 EXCLUDE_COLS = {
     "transition_01",  # Target variable
@@ -91,7 +93,7 @@ def compute_precision_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) ->
     return precision
 
 
-def main(scale_pos_weight_override: float | None = None) -> None:
+def main(scale_pos_weight: float) -> None:
     repo_root = Path(__file__).resolve().parents[3]
     input_path = repo_root / "data/ml/sample_training_imbalanced.parquet"
 
@@ -157,8 +159,6 @@ def main(scale_pos_weight_override: float | None = None) -> None:
 
     # Calculate scale_pos_weight for LightGBM
     auto_scale_pos_weight = n_negatives / max(n_positives, 1)
-    scale_pos_weight = scale_pos_weight_override if scale_pos_weight_override is not None else auto_scale_pos_weight
-    
     print(f"\nUsing scale_pos_weight: {scale_pos_weight:.2f}")
     print(f"(Automatic value based on class ratio: {auto_scale_pos_weight:.2f})")
 
@@ -221,13 +221,13 @@ def main(scale_pos_weight_override: float | None = None) -> None:
         'objective': 'binary',
         'metric': 'auc',
         'boosting_type': 'gbdt',
-        'num_leaves': 63,
+        'num_leaves': 255,
         'learning_rate': 0.05,
         'feature_fraction': 0.8,
         'bagging_fraction': 0.8,
         'bagging_freq': 5,
-        'max_depth': 12,
-        'min_child_samples': 200,
+        'max_depth': 16,
+        'min_child_samples': 100,
         'scale_pos_weight': scale_pos_weight,
         'random_state': RANDOM_STATE,
         'n_jobs': -1,
@@ -347,34 +347,37 @@ def main(scale_pos_weight_override: float | None = None) -> None:
 
 
 if __name__ == "__main__":
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(
-        description="Train LightGBM on imbalanced WDPA transition data"
-    )
-    parser.add_argument(
-        "--scale_pos_weight",
-        type=float,
-        default=150.0,
-        help="Scale pos weight for imbalanced data (default: 150.0, use 'auto' for n_negatives / n_positives)",
-    )
-    args = parser.parse_args()
-    
-    # Set up output file capture
     repo_root = Path(__file__).resolve().parents[3]
     output_dir = repo_root / "outputs/results/ml_baselines"
     output_dir.mkdir(parents=True, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"train_sample_imbalanced_lgbm_{timestamp}.txt"
     
-    tee = Tee(output_file)
-    sys.stdout = tee
+    print("=" * 70)
+    print(f"RUNNING {len(SCALE_POS_WEIGHTS)} EXPERIMENTS WITH DIFFERENT SCALE_POS_WEIGHTS")
+    print("=" * 70)
+    print(f"Values to test: {SCALE_POS_WEIGHTS}")
+    print("=" * 70)
     
-    try:
-        main(scale_pos_weight_override=args.scale_pos_weight)
-    finally:
-        sys.stdout = tee.stdout
-        tee.close()
-        print(f"\nOutput saved to: {output_file}")
-
-
+    for idx, spw in enumerate(SCALE_POS_WEIGHTS, start=1):
+        print(f"\n{'#' * 70}")
+        print(f"# EXPERIMENT {idx}/{len(SCALE_POS_WEIGHTS)}: scale_pos_weight = {spw}")
+        print(f"{'#' * 70}\n")
+        
+        output_file = output_dir / f"train_sample_imbalanced_lgbm_spw{spw}_{timestamp}.txt"
+        tee = Tee(output_file)
+        original_stdout = sys.stdout
+        sys.stdout = tee
+        
+        try:
+            main(scale_pos_weight=spw)
+        finally:
+            sys.stdout = original_stdout
+            tee.close()
+            print(f"\nExperiment {idx}/{len(SCALE_POS_WEIGHTS)} complete. Output saved to: {output_file}")
+    
+    print(f"\n{'=' * 70}")
+    print("ALL EXPERIMENTS COMPLETE")
+    print("=" * 70)
+    print(f"Results saved in: {output_dir}")
+    print(f"Timestamp: {timestamp}")
