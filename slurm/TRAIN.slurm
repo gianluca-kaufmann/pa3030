@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=train-preprocessing
+#SBATCH --job-name=spatial-features-preprocessing
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=15G
-#SBATCH --output=/cluster/scratch/%u/logs/train_preprocessing_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/train_preprocessing_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/spatial_features_preprocessing_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/spatial_features_preprocessing_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -35,19 +35,19 @@ source "$VENV_DIR/bin/activate"
 #------------------------------------------------------------------------------
 # Run the training preprocessing
 #------------------------------------------------------------------------------
-echo "Starting training preprocessing script..."
+echo "Starting spatial features preprocessing script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f scripts/ML/training_preprocessing/sample_preprocessing_10M ] || {
-  echo "ERROR: sample_preprocessing_10M not found under scripts/ML/training_preprocessing_10M"
-  find scripts -maxdepth 3 -type f -name "sample_preprocessing_10M"
+[ -f scripts/ML/training_preprocessing/spatial_features_preprocessing ] || {
+  echo "ERROR: spatial_features_preprocessing not found under scripts/ML/training_preprocessing"
+  find scripts -maxdepth 3 -type f -name "spatial_features_preprocessing"
   exit 1
 }
 
 # Run the script
-python scripts/ML/training_preprocessing/sample_preprocessing_10M
+python scripts/ML/training_preprocessing/spatial_features_preprocessing
 
-echo "Training preprocessing script finished."
+echo "Spatial features preprocessing script finished."
