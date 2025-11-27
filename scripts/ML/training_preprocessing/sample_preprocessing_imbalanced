@@ -6,7 +6,7 @@ Purpose: Build an evaluation dataset that preserves true class distribution.
 Input:  merged_panel_2000_2024.parquet
 Process: Create lagged WDPA column, identify 0→1 transitions, sample ~10M rows 
          with realistic class ratio, keep only numeric features.
-Output: sample_training_10M.parquet
+Output: sample_training_imbalanced.parquet
 """
 
 from __future__ import annotations
@@ -33,38 +33,38 @@ def main() -> None:
     wandb_entity = os.environ.get("WANDB_ENTITY")
     
     if not wandb_api_key:
-        print("⚠️  Warning: WANDB_API_KEY not found in environment")
+        print("Warning: WANDB_API_KEY not found in environment")
     if not wandb_entity:
-        print("⚠️  Warning: WANDB_ENTITY not found in environment")
+        print("Warning: WANDB_ENTITY not found in environment")
     
     # Initialize W&B
-    print("🔄 Initializing Weights & Biases...")
+    print("Initializing Weights & Biases...")
     wandb.init(
         project="ml-training-preprocessing",
         entity=wandb_entity,
-        name=f"sample_preprocessing_10M_{time.strftime('%Y%m%d_%H%M%S')}",
+        name=f"sample_preprocessing_imbalanced_{time.strftime('%Y%m%d_%H%M%S')}",
         config={
             "target_sample_size": TARGET_SAMPLE_SIZE,
             "random_state": RANDOM_STATE,
             "sampling_strategy": "realistic_ratio",
         },
     )
-    print("✅ W&B connected")
+    print("W&B connected")
     
     # Setup paths (outside try block for cleanup in finally)
     repo_root = Path(__file__).resolve().parents[3]
     input_path = repo_root / "data/ml/merged_panel_2000_2024.parquet"
-    output_path = repo_root / "data/ml/sample_training_10M.parquet"
+    output_path = repo_root / "data/ml/sample_training_imbalanced.parquet"
     temp_dir = repo_root / "data/ml/temp"
-    temp_transitions = temp_dir / "temp_transitions_10M.parquet"
+    temp_transitions = temp_dir / "temp_transitions_imbalanced.parquet"
     
     try:
         
         temp_dir.mkdir(parents=True, exist_ok=True)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
-        print(f"\n📂 Input: {input_path}")
-        print(f"📂 Output: {output_path}")
+        print(f"\nInput: {input_path}")
+        print(f"Output: {output_path}")
         
         if not input_path.exists():
             raise FileNotFoundError(f"Input file not found: {input_path}")
@@ -81,7 +81,7 @@ def main() -> None:
         con.execute(f"SET temp_directory='{temp_dir_env}/duckdb_temp'")
         con.execute("PRAGMA max_temp_directory_size='100GB'")
         
-        print(f"⚙️  DuckDB configured: {num_threads} threads, memory_limit=80GB")
+        print(f"DuckDB configured: {num_threads} threads, memory_limit=80GB")
         
         wandb.log({"config/threads": num_threads, "config/memory_limit_gb": 80})
         
@@ -91,7 +91,7 @@ def main() -> None:
         escaped_temp = str(temp_transitions).replace("'", "''")
         
         # Step 1: Get column information - identify numeric columns
-        print("\n🔄 Step 1: Identifying numeric columns...")
+        print("\nStep 1: Identifying numeric columns...")
         step1_start = time.time()
         
         # Get all columns and their types
@@ -121,10 +121,10 @@ def main() -> None:
         })
         
         step1_time = time.time() - step1_start
-        print(f"   ✅ Completed in {step1_time:.1f}s")
+        print(f"Completed in {step1_time:.1f}s")
         
         # Step 2: Create lagged WDPA and compute transitions
-        print("\n🔄 Step 2: Computing lagged WDPA and transitions (self-join)...")
+        print("\nStep 2: Computing lagged WDPA and transitions (self-join)...")
         print("   Using self-join instead of window functions for memory efficiency")
         step2_start = time.time()
         
@@ -160,11 +160,11 @@ def main() -> None:
         """)
         
         step2_time = time.time() - step2_start
-        print(f"   ✅ Completed in {step2_time:.1f}s ({step2_time/60:.1f} min)")
+        print(f"Completed in {step2_time:.1f}s ({step2_time/60:.1f} min)")
         wandb.log({"timing/step2_seconds": step2_time, "timing/step2_minutes": step2_time/60})
         
         # Step 3: Count positives and negatives from temporary file
-        print("\n🔄 Step 3: Analyzing class distribution...")
+        print("\nStep 3: Analyzing class distribution...")
         step3_start = time.time()
         
         counts = con.execute(f"""
@@ -200,7 +200,7 @@ def main() -> None:
             raise ValueError("No positive transitions found! Cannot build training sample.")
         
         # Step 4: Determine sampling strategy (preserve ratio)
-        print("\n🔄 Step 4: Determining sampling strategy...")
+        print("\nStep 4: Determining sampling strategy...")
         
         # Cap sample size at available data
         actual_sample_size = min(TARGET_SAMPLE_SIZE, total)
@@ -228,12 +228,12 @@ def main() -> None:
         })
         
         # Step 5: Sample and write output (separate sampling for each class)
-        print("\n🔄 Step 5: Sampling and combining with shuffle...")
+        print("\nStep 5: Sampling and combining with shuffle...")
         step5_start = time.time()
         
         # Create temporary files for each class
-        temp_positives = temp_dir / "temp_positives_10M.parquet"
-        temp_negatives = temp_dir / "temp_negatives_10M.parquet"
+        temp_positives = temp_dir / "temp_positives_imbalanced.parquet"
+        temp_negatives = temp_dir / "temp_negatives_imbalanced.parquet"
         escaped_pos = str(temp_positives).replace("'", "''")
         escaped_neg = str(temp_negatives).replace("'", "''")
         
@@ -285,18 +285,18 @@ def main() -> None:
         """)
         
         step5_time = time.time() - step5_start
-        print(f"   ✅ Written to {output_path} in {step5_time:.1f}s ({step5_time/60:.1f} min)")
+        print(f"Written to {output_path} in {step5_time:.1f}s ({step5_time/60:.1f} min)")
         wandb.log({"timing/step5_seconds": step5_time, "timing/step5_minutes": step5_time/60})
         
         # Clean up temporary files
-        print("   🧹 Cleaning up temporary files...")
+        print("Cleaning up temporary files...")
         temp_transitions.unlink(missing_ok=True)
         temp_positives.unlink(missing_ok=True)
         temp_negatives.unlink(missing_ok=True)
-        print("   ✅ Temporary files removed")
+        print("Temporary files removed")
         
         # Step 6: Verify output
-        print("\n🔄 Step 6: Verifying output...")
+        print("\nStep 6: Verifying output...")
         
         verify_counts = con.execute(f"""
             SELECT 
@@ -317,7 +317,7 @@ def main() -> None:
         
         # Print summary
         print("\n" + "="*70)
-        print("✅ REALISTIC RATIO SAMPLING COMPLETE")
+        print("REALISTIC RATIO SAMPLING COMPLETE")
         print("="*70)
         print(f"  Total rows:          {total_written:,}")
         print(f"  Positives (0→1):     {pos_written:,} ({final_ratio*100:.4f}%)")
@@ -348,11 +348,11 @@ def main() -> None:
             "status": "success",
         })
         
-        print("\n✅ All done! Evaluation dataset ready for testing.")
+        print("\nAll done! Evaluation dataset ready for testing.")
         
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
-        print(f"\n❌ ERROR: {error_msg}")
+        print(f"\nERROR: {error_msg}")
         wandb.log({
             "status": "failed",
             "error_type": type(e).__name__,
@@ -365,8 +365,8 @@ def main() -> None:
         try:
             cleanup_files = [
                 temp_transitions,
-                temp_dir / "temp_positives_10M.parquet",
-                temp_dir / "temp_negatives_10M.parquet"
+                temp_dir / "temp_positives_imbalanced.parquet",
+                temp_dir / "temp_negatives_imbalanced.parquet"
             ]
             cleaned = False
             for f in cleanup_files:
@@ -374,18 +374,18 @@ def main() -> None:
                     f.unlink()
                     cleaned = True
             if cleaned:
-                print("🧹 Cleaned up temporary files")
+                print("Cleaned up temporary files")
         except:
             pass
         
         wandb.finish()
-        print("🏁 W&B run finished")
+        print("W&B run finished")
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"\n❌ Script failed: {e}", file=sys.stderr)
+        print(f"\nScript failed: {e}", file=sys.stderr)
         sys.exit(1)
 

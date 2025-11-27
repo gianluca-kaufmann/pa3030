@@ -5,7 +5,7 @@
 Purpose: Build a balanced dataset for predicting new WDPA establishment.
 Input:  merged_panel_2000_2024.parquet
 Process: Create lagged WDPA column, identify 0→1 transitions, sample ~2M rows.
-Output: sample_training.parquet
+Output: sample_training_balanced.parquet
 """
 
 from __future__ import annotations
@@ -33,12 +33,12 @@ def main() -> None:
     wandb_entity = os.environ.get("WANDB_ENTITY")
     
     if not wandb_api_key:
-        print("⚠️  Warning: WANDB_API_KEY not found in environment")
+        print("Warning: WANDB_API_KEY not found in environment")
     if not wandb_entity:
-        print("⚠️  Warning: WANDB_ENTITY not found in environment")
+        print("Warning: WANDB_ENTITY not found in environment")
     
     # Initialize W&B
-    print("🔄 Initializing Weights & Biases...")
+    print("Initializing Weights & Biases...")
     wandb.init(
         project="ml-training-preprocessing",
         entity=wandb_entity,
@@ -49,22 +49,22 @@ def main() -> None:
             "random_state": RANDOM_STATE,
         },
     )
-    print("✅ W&B connected")
+    print("W&B connected")
     
     # Setup paths (outside try block for cleanup in finally)
     repo_root = Path(__file__).resolve().parents[3]
     input_path = repo_root / "data/ml/merged_panel_2000_2024.parquet"
-    output_path = repo_root / "data/ml/sample_training.parquet"
+    output_path = repo_root / "data/ml/sample_training_balanced.parquet"
     temp_dir = repo_root / "data/ml/temp"
-    temp_transitions = temp_dir / "temp_transitions.parquet"
+    temp_transitions = temp_dir / "temp_transitions_balanced.parquet"
     
     try:
         
         temp_dir.mkdir(parents=True, exist_ok=True)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
-        print(f"\n📂 Input: {input_path}")
-        print(f"📂 Output: {output_path}")
+        print(f"\nInput: {input_path}")
+        print(f"Output: {output_path}")
         
         if not input_path.exists():
             raise FileNotFoundError(f"Input file not found: {input_path}")
@@ -81,7 +81,7 @@ def main() -> None:
         con.execute(f"SET temp_directory='{temp_dir_env}/duckdb_temp'")
         con.execute("PRAGMA max_temp_directory_size='100GB'")
         
-        print(f"⚙️  DuckDB configured: {num_threads} threads, memory_limit=80GB")
+        print(f"DuckDB configured: {num_threads} threads, memory_limit=80GB")
         
         wandb.log({"config/threads": num_threads, "config/memory_limit_gb": 80})
         
@@ -91,7 +91,7 @@ def main() -> None:
         escaped_temp = str(temp_transitions).replace("'", "''")
         
         # Step 1: Create lagged WDPA using memory-efficient self-join
-        print("\n🔄 Step 1: Computing lagged WDPA and transitions (self-join)...")
+        print("\nStep 1: Computing lagged WDPA and transitions (self-join)...")
         print("   Using self-join instead of window functions for memory efficiency")
         step1_start = time.time()
         
@@ -121,11 +121,11 @@ def main() -> None:
         """)
         
         step1_time = time.time() - step1_start
-        print(f"   ✅ Completed in {step1_time:.1f}s ({step1_time/60:.1f} min)")
+        print(f"Completed in {step1_time:.1f}s ({step1_time/60:.1f} min)")
         wandb.log({"timing/step1_seconds": step1_time, "timing/step1_minutes": step1_time/60})
         
         # Step 2: Count positives and negatives from temporary file
-        print("\n🔄 Step 2: Counting transitions...")
+        print("\nStep 2: Counting transitions...")
         step2_start = time.time()
         
         counts = con.execute(f"""
@@ -160,7 +160,7 @@ def main() -> None:
             raise ValueError("No positive transitions found! Cannot build training sample.")
         
         # Step 3: Determine sampling strategy
-        print("\n🔄 Step 3: Determining sampling strategy...")
+        print("\nStep 3: Determining sampling strategy...")
         
         sample_positives = min(POSITIVE_LIMIT, positives)
         sample_negatives = min(sample_positives, negatives)  # Match positives for balance
@@ -179,12 +179,12 @@ def main() -> None:
         })
         
         # Step 4: Sample and write output (separate sampling for each class)
-        print("\n🔄 Step 4: Sampling and writing output...")
+        print("\nStep 4: Sampling and writing output...")
         step4_start = time.time()
         
         # Create temporary files for each class
-        temp_positives = temp_dir / "temp_positives.parquet"
-        temp_negatives = temp_dir / "temp_negatives.parquet"
+        temp_positives = temp_dir / "temp_positives_balanced.parquet"
+        temp_negatives = temp_dir / "temp_negatives_balanced.parquet"
         escaped_pos = str(temp_positives).replace("'", "''")
         escaped_neg = str(temp_negatives).replace("'", "''")
         
@@ -233,18 +233,18 @@ def main() -> None:
         """)
         
         step4_time = time.time() - step4_start
-        print(f"   ✅ Written to {output_path} in {step4_time:.1f}s")
+        print(f"Written to {output_path} in {step4_time:.1f}s")
         wandb.log({"timing/step4_seconds": step4_time})
         
         # Clean up temporary files
-        print("   🧹 Cleaning up temporary files...")
+        print("Cleaning up temporary files...")
         temp_transitions.unlink(missing_ok=True)
         temp_positives.unlink(missing_ok=True)
         temp_negatives.unlink(missing_ok=True)
-        print("   ✅ Temporary files removed")
+        print("Temporary files removed")
         
         # Step 5: Verify output
-        print("\n🔄 Step 5: Verifying output...")
+        print("\nStep 5: Verifying output...")
         
         verify_counts = con.execute(f"""
             SELECT 
@@ -263,7 +263,7 @@ def main() -> None:
         
         # Print summary
         print("\n" + "="*70)
-        print("✅ SAMPLING COMPLETE")
+        print("SAMPLING COMPLETE")
         print("="*70)
         print(f"  Total rows:       {total_written:,}")
         print(f"  Positives (0→1):  {pos_written:,} ({pos_written/total_written*100:.1f}%)")
@@ -291,18 +291,18 @@ def main() -> None:
         # Warn if imbalanced
         balance = pos_written / total_written if total_written > 0 else 0
         if balance < 0.4 or balance > 0.6:
-            print(f"\n⚠️  Warning: Class balance is {balance*100:.1f}% (target: 50%)")
+            print(f"\nWarning: Class balance is {balance*100:.1f}% (target: 50%)")
             wandb.alert(
                 title="Class Imbalance Detected",
                 text=f"Class balance is {balance*100:.1f}% positive",
                 level=wandb.AlertLevel.WARN
             )
         
-        print("\n✅ All done!")
+        print("\nAll done!")
         
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
-        print(f"\n❌ ERROR: {error_msg}")
+        print(f"\nERROR: {error_msg}")
         wandb.log({
             "status": "failed",
             "error_type": type(e).__name__,
@@ -315,8 +315,8 @@ def main() -> None:
         try:
             cleanup_files = [
                 temp_transitions,
-                temp_dir / "temp_positives.parquet",
-                temp_dir / "temp_negatives.parquet"
+                temp_dir / "temp_positives_balanced.parquet",
+                temp_dir / "temp_negatives_balanced.parquet"
             ]
             cleaned = False
             for f in cleanup_files:
@@ -324,17 +324,17 @@ def main() -> None:
                     f.unlink()
                     cleaned = True
             if cleaned:
-                print("🧹 Cleaned up temporary files")
+                print("Cleaned up temporary files")
         except:
             pass
         
         wandb.finish()
-        print("🏁 W&B run finished")
+        print("W&B run finished")
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"\n❌ Script failed: {e}", file=sys.stderr)
+        print(f"\nScript failed: {e}", file=sys.stderr)
         sys.exit(1)

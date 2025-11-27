@@ -17,289 +17,123 @@ from __future__ import annotations
 
 import gc
 import logging
-from pathlib import Path
-from typing import List, Tuple
+import time
 import warnings
+from pathlib import Path
+from typing import Tuple
 
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
-from scipy import ndimage
+import wandb
 from scipy.ndimage import distance_transform_edt, uniform_filter
 
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
-
-# Suppress warnings
 warnings.filterwarnings('ignore')
 
-
-# Configuration
-CHUNK_SIZE = 1_000_000  # Process 1M rows at a time for very large years
-DISTANCE_DECAY_SCALE = 10000  # Decay scale in meters
-
-# Variables to smooth
-SMOOTH_VARIABLES = [
-    'NDVI_b1', 
-    'GPW_b1', 
-    'VIIRS_b1', 
-    'gdp_b1', 
-    'deforestation_b1', 
-    'wildfire_b1',
-    'GSN_b1', 
-    'GSN_b2', 
-    'GSN_b3', 
-    'GSN_b4', 
-    'GSN_b5'
-]
-
+DISTANCE_DECAY_SCALE = 10000
+SMOOTH_VARIABLES = ['NDVI_b1', 'GPW_b1', 'VIIRS_b1', 'gdp_b1', 'deforestation_b1', 
+                     'wildfire_b1', 'GSN_b1', 'GSN_b2', 'GSN_b3', 'GSN_b4', 'GSN_b5']
 SMOOTH_SIZES = [4, 16, 64]
 
 
-def reconstruct_grid(
-    df: pd.DataFrame, 
-    value_col: str
-) -> Tuple[np.ndarray, int, int, int, int]:
-    """
-    Reconstruct a 2D grid from panel data.
+def reconstruct_grid(df: pd.DataFrame, value_col: str) -> Tuple[np.ndarray, int, int, int, int]:
+    """Reconstruct 2D grid from panel data."""
+    min_row, max_row = df['row'].min(), df['row'].max()
+    min_col, max_col = df['col'].min(), df['col'].max()
     
-    Args:
-        df: DataFrame with 'row' and 'col' columns
-        value_col: Column name to use as grid values
-        
-    Returns:
-        grid: 2D numpy array
-        min_row, max_row, min_col, max_col: Grid boundaries
-    """
-    min_row = df['row'].min()
-    max_row = df['row'].max()
-    min_col = df['col'].min()
-    max_col = df['col'].max()
-    
-    n_rows = max_row - min_row + 1
-    n_cols = max_col - min_col + 1
-    
-    # Initialize with NaN to handle missing pixels
-    grid = np.full((n_rows, n_cols), np.nan, dtype=np.float32)
-    
-    # Fill grid with values
-    row_idx = (df['row'] - min_row).values
-    col_idx = (df['col'] - min_col).values
-    grid[row_idx, col_idx] = df[value_col].values
+    grid = np.full((max_row - min_row + 1, max_col - min_col + 1), np.nan, dtype=np.float32)
+    grid[(df['row'] - min_row).values, (df['col'] - min_col).values] = df[value_col].values
     
     return grid, min_row, max_row, min_col, max_col
 
 
-def grid_to_dataframe(
-    grid: np.ndarray,
-    df_original: pd.DataFrame,
-    min_row: int,
-    min_col: int
-) -> pd.Series:
-    """
-    Convert grid values back to DataFrame format matching original row order.
-    
-    Args:
-        grid: 2D numpy array
-        df_original: Original DataFrame with 'row' and 'col' columns
-        min_row: Minimum row index used in grid
-        min_col: Minimum column index used in grid
-        
-    Returns:
-        Series with values matching df_original index
-    """
-    row_idx = (df_original['row'] - min_row).values
-    col_idx = (df_original['col'] - min_col).values
-    
-    values = grid[row_idx, col_idx]
-    return pd.Series(values, index=df_original.index)
+def grid_to_dataframe(grid: np.ndarray, df: pd.DataFrame, min_row: int, min_col: int) -> pd.Series:
+    """Convert grid back to DataFrame format."""
+    values = grid[(df['row'] - min_row).values, (df['col'] - min_col).values]
+    return pd.Series(values, index=df.index)
 
 
 def compute_distance_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute distance to nearest WDPA protected area and decay features.
+    """Compute distance to WDPA and decay features."""
+    logger.info("  Computing distance features...")
     
-    Args:
-        df: DataFrame with WDPA_b1 column
-        
-    Returns:
-        DataFrame with added distance columns
-    """
-    logger.info("  Computing distance to WDPA protected areas...")
-    
-    # Reconstruct WDPA grid
-    wdpa_grid, min_row, max_row, min_col, max_col = reconstruct_grid(
-        df, 'WDPA_b1'
-    )
-    
-    # Create binary mask (1 = protected, 0 = not protected)
-    # Handle NaN values - treat them as not protected
+    wdpa_grid, min_row, max_row, min_col, max_col = reconstruct_grid(df, 'WDPA_b1')
     wdpa_binary = np.where(np.isnan(wdpa_grid), 0, wdpa_grid > 0).astype(np.uint8)
-    del wdpa_grid  # Free memory immediately
+    del wdpa_grid
     
-    # Compute distance transform
-    # Distance is in pixels (1 pixel = 1km in this dataset)
-    distance_grid = distance_transform_edt(1 - wdpa_binary)
-    del wdpa_binary  # Free memory immediately
+    distance_grid = distance_transform_edt(1 - wdpa_binary) * 1000  # pixels to meters
+    del wdpa_binary
     
-    # Convert to meters (assuming 1km resolution)
-    distance_grid_m = distance_grid * 1000
-    del distance_grid  # Free memory immediately
-    
-    # Convert grid back to DataFrame
-    df['dist_wdpa'] = grid_to_dataframe(distance_grid_m, df, min_row, min_col)
-    del distance_grid_m  # Free memory immediately
-    
-    # Compute decay feature
+    df['dist_wdpa'] = grid_to_dataframe(distance_grid, df, min_row, min_col)
     df['dist_wdpa_decay'] = np.exp(-df['dist_wdpa'] / DISTANCE_DECAY_SCALE)
-    
-    logger.info(f"    Distance range: {df['dist_wdpa'].min():.0f}m - {df['dist_wdpa'].max():.0f}m")
-    logger.info(f"    Decay range: {df['dist_wdpa_decay'].min():.4f} - {df['dist_wdpa_decay'].max():.4f}")
+    del distance_grid
     
     return df
 
 
-def compute_smooth_feature(
-    df: pd.DataFrame,
-    variable: str,
-    window_size: int
-) -> pd.Series:
-    """
-    Compute smoothed (convolution) feature for a given variable and window size.
-    
-    Args:
-        df: DataFrame with row, col, and the variable
-        variable: Variable name to smooth
-        window_size: Window size for smoothing (e.g., 4, 16, 64)
-        
-    Returns:
-        Series with smoothed values
-    """
-    # Reconstruct grid
+def compute_smooth_feature(df: pd.DataFrame, variable: str, window_size: int) -> pd.Series:
+    """Compute smoothed feature with given window size."""
     grid, min_row, max_row, min_col, max_col = reconstruct_grid(df, variable)
-    
-    # Create mask for valid (non-NaN) pixels
     valid_mask = ~np.isnan(grid)
-    
-    # Replace NaN with 0 for convolution
     grid_filled = np.where(np.isnan(grid), 0, grid)
-    del grid  # Free memory
+    del grid
     
-    # Compute mean using uniform filter
-    # mode='constant' pads with 0, which is correct for our masked approach
     smoothed = uniform_filter(grid_filled, size=window_size, mode='constant')
-    del grid_filled  # Free memory
+    del grid_filled
     
-    # Also smooth the mask to get count of valid pixels in window
     count = uniform_filter(valid_mask.astype(np.float32), size=window_size, mode='constant')
-    del valid_mask  # Free memory
+    del valid_mask
     
-    # Normalize by actual count of valid pixels
-    # Avoid division by zero
-    smoothed = np.where(count > 0, smoothed / (count + 1e-10) * window_size**2 / window_size**2, np.nan)
-    
-    # For more accurate mean, we want: sum of values / count of valid pixels
     smoothed = np.where(count > 0, smoothed, np.nan)
-    del count  # Free memory
+    del count
     
-    # Convert back to DataFrame
     result = grid_to_dataframe(smoothed, df, min_row, min_col)
-    del smoothed  # Free memory
+    del smoothed
     
     return result
 
 
 def compute_all_smooth_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute all smoothed features for all variables and window sizes.
-    
-    Args:
-        df: DataFrame with spatial variables
-        
-    Returns:
-        DataFrame with added smoothed columns
-    """
+    """Compute all smoothed features."""
     logger.info("  Computing smoothed features...")
     
     for variable in SMOOTH_VARIABLES:
         if variable not in df.columns:
-            logger.warning(f"    Variable {variable} not found, skipping...")
             continue
-            
         for window_size in SMOOTH_SIZES:
-            col_name = f"{variable}_smooth{window_size}"
-            logger.info(f"    Computing {col_name}...")
-            
-            df[col_name] = compute_smooth_feature(df, variable, window_size)
-            gc.collect()  # Free memory after each feature
+            df[f"{variable}_smooth{window_size}"] = compute_smooth_feature(df, variable, window_size)
+            gc.collect()
     
     return df
 
 
-def process_year(
-    input_path: Path,
-    year: int,
-    temp_dir: Path,
-    years_processed: List[int]
-) -> Path | None:
-    """
-    Process a single year: load data, compute spatial features, and save to temp file.
-    
-    Args:
-        input_path: Path to input parquet file
-        year: Year to process
-        temp_dir: Directory to save temporary files
-        years_processed: List to track processed years (for logging)
-        
-    Returns:
-        Path to temporary parquet file with processed year, or None if no data
-    """
+def process_year(input_path: Path, year: int, temp_dir: Path) -> tuple[Path | None, dict]:
+    """Process a single year and return temp file path + metrics."""
+    start_time = time.time()
     logger.info(f"\nProcessing year {year}...")
     
-    # Load year data
-    logger.info("  Loading data...")
-    df_year = pd.read_parquet(
-        input_path,
-        filters=[('year', '==', year)],
-        engine='pyarrow'
-    )
-    
+    df_year = pd.read_parquet(input_path, filters=[('year', '==', year)], engine='pyarrow')
     n_rows = len(df_year)
     logger.info(f"  Loaded {n_rows:,} rows")
     
     if n_rows == 0:
-        logger.warning(f"  No data for year {year}, skipping...")
-        return None
+        return None, {}
     
-    # Compute distance features
     df_year = compute_distance_features(df_year)
-    
-    # Compute smoothed features
     df_year = compute_all_smooth_features(df_year)
     
-    # Save to temporary file
     temp_file = temp_dir / f"year_{year}_processed.parquet"
-    logger.info(f"  Saving to temporary file...")
-    df_year.to_parquet(
-        temp_file,
-        engine='pyarrow',
-        compression='snappy',
-        index=False
-    )
+    df_year.to_parquet(temp_file, engine='pyarrow', compression='snappy', index=False)
     
-    # Free memory
     del df_year
     gc.collect()
     
-    years_processed.append(year)
-    logger.info(f"  ✓ Year {year} complete (saved to temp file)")
+    elapsed = time.time() - start_time
+    logger.info(f"  ✓ Year {year} complete in {elapsed:.1f}s")
     
-    return temp_file
+    return temp_file, {"year": year, "rows": n_rows, "time_seconds": elapsed}
 
 
 def main() -> None:
@@ -309,117 +143,117 @@ def main() -> None:
     output_path = repo_root / "data/ml/merged_panel_final.parquet"
     temp_dir = repo_root / "data/ml/.temp_spatial_features"
     
+    # Initialize W&B
+    wandb.init(
+        project="thesis-spatial-features",
+        name="spatial_features_preprocessing",
+        config={
+            "distance_decay_scale": DISTANCE_DECAY_SCALE,
+            "smooth_variables": SMOOTH_VARIABLES,
+            "smooth_sizes": SMOOTH_SIZES,
+        }
+    )
+    
     logger.info("="*80)
     logger.info("SPATIAL FEATURES PREPROCESSING")
     logger.info("="*80)
     logger.info(f"Input:  {input_path}")
     logger.info(f"Output: {output_path}")
-    logger.info(f"Temp:   {temp_dir}")
-    logger.info("")
     
-    # Check input exists
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
     
-    # Create temp directory
     temp_dir.mkdir(parents=True, exist_ok=True)
     
-    # Get year range
+    # Get metadata
     logger.info("Reading metadata...")
     df_sample = pd.read_parquet(input_path, columns=['year'])
     years = sorted(df_sample['year'].unique())
     total_rows = len(df_sample)
-    logger.info(f"Years in dataset: {years[0]} - {years[-1]} ({len(years)} years)")
-    logger.info(f"Total rows: {total_rows:,}")
+    logger.info(f"Years: {years[0]}-{years[-1]} ({len(years)} years), Total rows: {total_rows:,}")
     del df_sample
     gc.collect()
     
-    # Process year by year, saving to temp files
-    years_processed = []
+    wandb.log({"total_years": len(years), "total_rows": total_rows})
+    
+    # Process year by year
     temp_files = []
     
     for year in years:
         try:
-            temp_file = process_year(input_path, year, temp_dir, years_processed)
+            temp_file, metrics = process_year(input_path, year, temp_dir)
             if temp_file is not None:
                 temp_files.append(temp_file)
+                wandb.log(metrics)
         except Exception as e:
             logger.error(f"Error processing year {year}: {e}")
-            # Clean up temp files before raising
-            logger.info("Cleaning up temporary files...")
             for tf in temp_files:
                 if tf.exists():
                     tf.unlink()
-            if temp_dir.exists():
+            if temp_dir.exists() and not list(temp_dir.iterdir()):
                 temp_dir.rmdir()
+            wandb.finish(exit_code=1)
             raise
     
-    # Combine all years using pyarrow for memory efficiency
+    # Combine all years using streaming
     logger.info("\n" + "="*80)
-    logger.info("Combining all years (memory-efficient streaming)...")
-    logger.info(f"Combining {len(temp_files)} temporary files...")
+    logger.info(f"Combining {len(temp_files)} files (streaming)...")
     
-    # Use pyarrow to read and concatenate
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # Read all temp files and write to final output
-    tables = []
+    writer = None
+    total_rows_written = 0
+    concat_start = time.time()
+    
     for i, temp_file in enumerate(temp_files):
-        logger.info(f"  Reading temp file {i+1}/{len(temp_files)}...")
+        logger.info(f"  [{i+1}/{len(temp_files)}] {temp_file.name}...")
         table = pq.read_table(temp_file)
-        tables.append(table)
+        total_rows_written += len(table)
+        
+        if writer is None:
+            logger.info(f"  Initializing output ({len(table.column_names)} columns)...")
+            writer = pq.ParquetWriter(output_path, table.schema, compression='snappy')
+        
+        writer.write_table(table)
+        del table
+        gc.collect()
+        
+        wandb.log({"concatenation_progress": (i + 1) / len(temp_files)})
     
-    logger.info("  Concatenating tables...")
-    import pyarrow as pa
-    final_table = pa.concat_tables(tables)
+    if writer is None:
+        raise RuntimeError("No data was written!")
     
-    logger.info(f"  Total rows: {len(final_table):,}")
-    logger.info(f"  Total columns: {len(final_table.column_names)}")
+    writer.close()
+    concat_time = time.time() - concat_start
+    logger.info(f"  ✓ Wrote {total_rows_written:,} rows in {concat_time:.1f}s")
     
-    # Save output
-    logger.info(f"\nWriting to {output_path}...")
-    pq.write_table(
-        final_table,
-        output_path,
-        compression='snappy'
-    )
-    
-    # Clean up
-    del tables
-    del final_table
-    gc.collect()
-    
-    # Verify output
-    file_size_mb = output_path.stat().st_size / (1024**2)
-    logger.info(f"Output file size: {file_size_mb:.1f} MB")
-    
-    # Clean up temporary files
-    logger.info("\nCleaning up temporary files...")
+    # Clean up temp files
+    logger.info("\nCleaning up temp files...")
     for temp_file in temp_files:
-        if temp_file.exists():
-            temp_file.unlink()
-            logger.info(f"  Deleted {temp_file.name}")
-    
+        temp_file.unlink()
     if temp_dir.exists() and not list(temp_dir.iterdir()):
         temp_dir.rmdir()
-        logger.info(f"  Removed temp directory")
     
-    # Print summary statistics by reading a sample
+    # Summary
+    file_size_mb = output_path.stat().st_size / (1024**2)
+    schema = pq.read_schema(output_path)
+    new_cols = [c for c in schema.names if c.startswith('dist_') or '_smooth' in c]
+    
     logger.info("\n" + "="*80)
     logger.info("SUMMARY")
     logger.info("="*80)
-    logger.info(f"Years processed: {len(years_processed)}")
-    logger.info(f"Total rows: {total_rows:,}")
+    logger.info(f"Total rows: {total_rows_written:,}")
+    logger.info(f"New columns: {len(new_cols)}")
+    logger.info(f"File size: {file_size_mb:.1f} MB")
+    logger.info("✓ Processing complete!")
     
-    # Read schema to show new columns
-    logger.info("Reading output schema...")
-    schema = pq.read_schema(output_path)
-    new_cols = [col for col in schema.names if col.startswith('dist_') or '_smooth' in col]
-    logger.info(f"New columns added ({len(new_cols)} total):")
-    for col in sorted(new_cols):
-        logger.info(f"  - {col}")
-    
-    logger.info("\n✓ Processing complete!")
+    wandb.log({
+        "final_rows": total_rows_written,
+        "new_columns": len(new_cols),
+        "file_size_mb": file_size_mb,
+        "concatenation_time_seconds": concat_time
+    })
+    wandb.finish()
 
 
 if __name__ == "__main__":
