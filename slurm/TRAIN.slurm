@@ -29,7 +29,7 @@ module load eth_proxy
 #------------------------------------------------------------------------------
 # Activate the Python virtual environment (uav-genAI-opti)
 #------------------------------------------------------------------------------
-VENV_DIR="$HOME/venv/master_thesis"
+VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
@@ -41,13 +41,13 @@ echo "Starting compute panel statistics script..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f scripts/consistency checks/compute_panel_statistics ] || {
+[ -f "scripts/consistency checks/compute_panel_statistics" ] || {
   echo "ERROR: compute_panel_statistics not found under scripts/consistency checks"
   find scripts -maxdepth 3 -type f -name "compute_panel_statistics"
   exit 1
 }
 
 # Run the script
-python scripts/consistency checks/compute_panel_statistics
+python "scripts/consistency checks/compute_panel_statistics"
 
 echo "Compute panel statistics script finished."
