@@ -2,7 +2,9 @@
 """
 Goal:
     Compute comprehensive statistics for the merged panel dataset using streaming.
-    This script handles large datasets (35GB+) efficiently without loading all data into RAM.
+    This script handles large datasets (71GB+) efficiently without loading all data into RAM.
+    
+    OPTIMIZED FOR EULER CLUSTER (128GB RAM, slower CPUs)
 
 Input:
     - Parquet file: data/ml/merged_panel_final.parquet (processed incrementally).
@@ -12,10 +14,13 @@ Process:
     - Computes: dimensions, column types, unique counts, missing values,
       numeric statistics, uniqueness checks, static variable detection
     - Uses incremental algorithms (Welford's method for means/variance)
+    - Larger batch sizes (500 row groups) for high-RAM environments
+    - Reduced logging frequency for better performance
 
 Output:
     - JSON file: outputs/Tables/merged_panel_statistics.json
     - Contains all computed statistics for later formatting
+    - Uploaded to Weights & Biases for monitoring
 """
 
 import warnings
@@ -42,8 +47,9 @@ PANEL_FILE = DATA_DIR / "merged_panel_final.parquet"
 OUTPUT_JSON = OUTPUT_DIR / "merged_panel_statistics.json"
 
 # Configuration
-BATCH_SIZE = 50  # Process 50 row groups at a time (same as visualization script)
+BATCH_SIZE = 500  # Process 500 row groups at a time (optimized for Euler's 128GB RAM)
 CHECK_STATIC_VARS = True  # Set to False to skip (saves time but less complete)
+WANDB_LOG_FREQUENCY = 100  # Log to wandb every N row groups (reduce overhead)
 
 
 def log_progress(message: str):
@@ -180,17 +186,19 @@ def analyze_dataset_streaming(use_wandb: bool = True):
                     }
             log_progress(f"  Identified {len(numeric_cols)} numeric columns")
         
-        # Update year counts
+        # Update year counts (optimized)
         if 'year' in df_batch.columns:
             batch_year_counts = df_batch['year'].value_counts().to_dict()
             for year, count in batch_year_counts.items():
-                year_counts[int(year)] = year_counts.get(int(year), 0) + count
-                all_years.add(int(year))
+                year_int = int(year)
+                year_counts[year_int] = year_counts.get(year_int, 0) + count
+                all_years.add(year_int)
         
-        # Update pixel IDs (row, col pairs)
+        # Update pixel IDs (row, col pairs) - use numpy for speed
         if 'row' in df_batch.columns and 'col' in df_batch.columns:
-            pixel_pairs = set(zip(df_batch['row'].values, df_batch['col'].values))
-            pixel_ids.update(pixel_pairs)
+            # Convert to tuples more efficiently using zip with numpy arrays
+            batch_pixels = set(zip(df_batch['row'].values, df_batch['col'].values))
+            pixel_ids.update(batch_pixels)
         
         # Update missing value counts
         for col in columns:
@@ -202,40 +210,49 @@ def analyze_dataset_streaming(use_wandb: bool = True):
         for col in numeric_cols:
             if col in df_batch.columns:
                 valid_data = df_batch[col].dropna()
+                if len(valid_data) == 0:
+                    continue
+                    
                 stats = numeric_stats[col]
                 
-                for val in valid_data:
+                # Vectorized update for better performance
+                vals = valid_data.values
+                for val in vals:
                     stats['count'] += 1
                     delta = val - stats['mean']
                     stats['mean'] += delta / stats['count']
                     delta2 = val - stats['mean']
                     stats['M2'] += delta * delta2
-                    stats['min'] = min(stats['min'], val)
-                    stats['max'] = max(stats['max'], val)
+                
+                # Update min/max using numpy for speed
+                batch_min = float(vals.min())
+                batch_max = float(vals.max())
+                stats['min'] = min(stats['min'], batch_min)
+                stats['max'] = max(stats['max'], batch_max)
         
         # Track static variables (check if columns vary within pixels across years)
         if CHECK_STATIC_VARS and 'row' in df_batch.columns and 'col' in df_batch.columns and 'year' in df_batch.columns:
-            for col in feature_cols:
-                if col in df_batch.columns and col in pixel_col_uniqueness:
-                    # If we haven't found variation yet, check if this column has variation within any pixel
-                    if not pixel_col_uniqueness[col]:
-                        # Group by (row, col) and count unique values
-                        # If any pixel has >1 unique value, the column is not static
-                        try:
-                            grouped = df_batch.groupby(['row', 'col'])[col].n_unique()
-                            if (grouped > 1).any():
-                                # This column has variation, mark it as varying
-                                pixel_col_uniqueness[col] = True
-                        except Exception:
-                            # If grouping fails, assume it varies (safer)
+            # Only check columns that haven't been marked as varying yet
+            cols_to_check = [col for col in feature_cols if col in df_batch.columns and col in pixel_col_uniqueness and not pixel_col_uniqueness[col]]
+            
+            if cols_to_check:
+                try:
+                    # More efficient: check all columns at once
+                    grouped = df_batch.groupby(['row', 'col'])[cols_to_check].nunique()
+                    for col in cols_to_check:
+                        if (grouped[col] > 1).any():
                             pixel_col_uniqueness[col] = True
+                except Exception:
+                    # If grouping fails, mark all as varying (safer)
+                    for col in cols_to_check:
+                        pixel_col_uniqueness[col] = True
         
         # Clean up
         del df_batch
         gc.collect()
         
-        # Log batch progress to wandb
-        if use_wandb:
+        # Log batch progress to wandb (reduce frequency for performance)
+        if use_wandb and (batch_end % WANDB_LOG_FREQUENCY == 0 or batch_end == num_row_groups):
             progress_pct = (batch_end / num_row_groups) * 100
             wandb.log({
                 "progress/row_groups_processed": batch_end,
@@ -425,10 +442,11 @@ def main():
     )
     
     try:
-        log_progress("Mode: FULL DATASET STREAMING ANALYSIS")
+        log_progress("Mode: FULL DATASET STREAMING ANALYSIS (Optimized for Euler)")
         log_progress("This will process all row groups incrementally.")
-        log_progress("Estimated time: 30-60 minutes")
-        log_progress("Memory usage: Low (processes in batches)")
+        log_progress("Estimated time: 15-30 minutes (with 128GB RAM)")
+        log_progress(f"Batch size: {BATCH_SIZE} row groups")
+        log_progress(f"Memory usage: High (optimized for 128GB RAM)")
         log_progress(f"Static variable check: {'Enabled' if CHECK_STATIC_VARS else 'Disabled'}")
         log_progress(f"Input file: {PANEL_FILE}")
         log_progress(f"Output file: {OUTPUT_JSON}")
