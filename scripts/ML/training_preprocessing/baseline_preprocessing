@@ -3,17 +3,22 @@
 """Baseline Sampling Script
 
 Purpose: create a lightweight subset for quick local experimentation.
-Input:  `data/ml/merged_panel_2000_2024.parquet`.
-Process: filter rows to `year == 2020`, then reservoir-sample up to 100k rows
-         without loading the whole parquet into memory (DuckDB COPY query).
+Input:  `data/ml/merged_panel_final.parquet`.
+Process: filter rows to `year == 2020`, then reservoir-sample up to 100k rows.
 Output: `data/ml/sample_2020_100k.parquet`.
+
+Note: For GCS files, uses PyArrow with fsspec for authenticated access.
 """
 
 from __future__ import annotations
 
+import sys
+import os
 from pathlib import Path
 
-import duckdb
+# Add project root to path for config import
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+import config
 
 SAMPLE_YEAR = 2020
 SAMPLE_SIZE = 100_000
@@ -21,50 +26,99 @@ RANDOM_STATE = 42
 
 
 def main() -> None:
-    repo_root = Path(__file__).resolve().parents[3]
-    input_path = repo_root / "data/ml/merged_panel_2000_2024.parquet"
-    output_path = repo_root / "data/ml/sample_2020_100k.parquet"
+    input_path = config._join_path(config.get_ml_dir(), "merged_panel_final.parquet")
+    output_path = config._join_path(config.get_ml_dir(), "sample_2020_100k.parquet")
 
     print(f"Sampling from {input_path} …")
-    if not input_path.exists():
-        raise FileNotFoundError(f"Missing source file: {input_path}")
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    escaped_in = str(input_path).replace("'", "''")
-    escaped_out = str(output_path).replace("'", "''")
-
-    # Use a subquery to filter first, THEN sample from that filtered result
-    query = f"""
-        COPY (
+    print(f"Output to {output_path} …")
+    
+    # Use PyArrow for GCS access (works reliably with fsspec)
+    # Then use DuckDB for the sampling logic
+    import pyarrow.parquet as pq
+    import pyarrow.dataset as ds
+    import duckdb
+    
+    if config.is_gcs_path(input_path):
+        print("\nReading from GCS using PyArrow...")
+        import gcsfs
+        fs = gcsfs.GCSFileSystem(token='google_default')
+        
+        # Open file with gcsfs
+        with fs.open(input_path.replace('gs://', ''), 'rb') as f:
+            # Read parquet file
+            print(f"Opening parquet file...")
+            table = pq.read_table(f, columns=None, use_threads=True)
+            
+            print(f"Read {len(table):,} total rows")
+        
+        # Filter for the target year using PyArrow compute
+        import pyarrow.compute as pc
+        print(f"Filtering to year == {SAMPLE_YEAR}...")
+        mask = pc.equal(table['year'], SAMPLE_YEAR)
+        filtered = table.filter(mask)
+        
+        print(f"Found {len(filtered):,} rows for year {SAMPLE_YEAR}")
+        
+        # Now use DuckDB to sample from the filtered data
+        con = duckdb.connect()
+        print(f"Sampling {SAMPLE_SIZE:,} rows...")
+        
+        # Register the arrow table
+        con.register('filtered_data', filtered)
+        
+        # Sample using reservoir sampling
+        result = con.execute(f"""
             SELECT *
-            FROM (
-                SELECT *
-                FROM read_parquet('{escaped_in}')
-                WHERE year = {SAMPLE_YEAR}
-            ) AS filtered
+            FROM filtered_data
             USING SAMPLE reservoir({SAMPLE_SIZE} ROWS) REPEATABLE ({RANDOM_STATE})
-        )
-        TO '{escaped_out}'
-        (FORMAT 'parquet');
-    """
-
-    con = duckdb.connect()
-
-    print(
-        f"Filtering to year == {SAMPLE_YEAR} and taking a "
-        f"reservoir sample of up to {SAMPLE_SIZE:,} rows …"
-    )
-    con.execute(query)
-
-    written = con.execute(
-        f"SELECT count(*) FROM read_parquet('{escaped_out}')"
-    ).fetchone()[0]
+        """).arrow()
+        
+        written = len(result)
+        
+        # Write output
+        if config.is_gcs_path(output_path):
+            print(f"\nWriting to GCS: {output_path}")
+            with fs.open(output_path.replace('gs://', ''), 'wb') as f_out:
+                pq.write_table(result, f_out)
+        else:
+            print(f"\nWriting to local: {output_path}")
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            pq.write_table(result, output_path)
+            
+    else:
+        # Local file - use DuckDB directly
+        if not Path(input_path).exists():
+            raise FileNotFoundError(f"Missing source file: {input_path}")
+        
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        
+        con = duckdb.connect()
+        
+        query = f"""
+            COPY (
+                SELECT *
+                FROM (
+                    SELECT *
+                    FROM read_parquet('{input_path}')
+                    WHERE year = {SAMPLE_YEAR}
+                ) AS filtered
+                USING SAMPLE reservoir({SAMPLE_SIZE} ROWS) REPEATABLE ({RANDOM_STATE})
+            )
+            TO '{output_path}'
+            (FORMAT 'parquet');
+        """
+        
+        con.execute(query)
+        
+        written = con.execute(
+            f"SELECT count(*) FROM read_parquet('{output_path}')"
+        ).fetchone()[0]
 
     if written == 0:
         raise ValueError(f"No rows found for year {SAMPLE_YEAR}.")
 
-    print(f"Wrote {written:,} rows to {output_path}. Done.")
+    print(f"\n✓ Successfully wrote {written:,} rows to {output_path}")
+    print("Done.")
 
 
 if __name__ == "__main__":
