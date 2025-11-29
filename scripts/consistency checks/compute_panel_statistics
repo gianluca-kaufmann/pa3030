@@ -24,9 +24,10 @@ import json
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
+import wandb
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Set
+from typing import Dict, Set, Optional
 
 warnings.filterwarnings("ignore")
 
@@ -70,10 +71,13 @@ def convert_to_native(obj):
         return obj
 
 
-def analyze_dataset_streaming():
+def analyze_dataset_streaming(use_wandb: bool = True):
     """
     Analyze the full dataset by processing row groups incrementally.
     Computes all required statistics without loading entire dataset into memory.
+    
+    Args:
+        use_wandb: Whether to log progress to Weights & Biases
     
     Returns:
         Dictionary with all computed statistics
@@ -101,6 +105,14 @@ def analyze_dataset_streaming():
     column_types = {schema[i].name: str(schema[i].physical_type) for i in range(len(schema))}
     
     log_progress(f"Schema: {len(columns)} columns")
+    
+    # Log initial metadata to wandb
+    if use_wandb:
+        wandb.log({
+            "dataset/num_columns": len(columns),
+            "dataset/num_row_groups": num_row_groups,
+            "dataset/total_rows": total_rows
+        })
     
     # Initialize aggregators
     year_counts = {}
@@ -222,6 +234,17 @@ def analyze_dataset_streaming():
         del df_batch
         gc.collect()
         
+        # Log batch progress to wandb
+        if use_wandb:
+            progress_pct = (batch_end / num_row_groups) * 100
+            wandb.log({
+                "progress/row_groups_processed": batch_end,
+                "progress/rows_processed": total_processed,
+                "progress/percent_complete": progress_pct,
+                "progress/unique_pixels": len(pixel_ids),
+                "progress/unique_years": len(all_years)
+            })
+        
         # Progress update
         if (batch_end % 500 == 0) or (batch_end == num_row_groups):
             log_progress(f"  Progress: {batch_end}/{num_row_groups} row groups ({total_processed:,} rows processed)")
@@ -231,6 +254,8 @@ def analyze_dataset_streaming():
     # Compute final numeric statistics
     log_progress("\nComputing final numeric statistics...")
     final_numeric_stats = {}
+    wandb_numeric_stats = {}  # For wandb logging
+    
     for col, stats in numeric_stats.items():
         if stats['count'] > 0:
             variance = stats['M2'] / stats['count'] if stats['count'] > 1 else 0.0
@@ -242,6 +267,18 @@ def analyze_dataset_streaming():
                 'std': std,
                 'count': stats['count']
             }
+            
+            # Prepare for wandb logging (only a subset to avoid too many metrics)
+            if use_wandb and col not in metadata_cols:
+                # Log statistics for feature columns
+                wandb_numeric_stats[f"stats/{col}/mean"] = stats['mean']
+                wandb_numeric_stats[f"stats/{col}/std"] = std
+                wandb_numeric_stats[f"stats/{col}/min"] = stats['min'] if stats['min'] != float('inf') else None
+                wandb_numeric_stats[f"stats/{col}/max"] = stats['max'] if stats['max'] != float('-inf') else None
+    
+    # Log numeric statistics to wandb
+    if use_wandb and wandb_numeric_stats:
+        wandb.log(wandb_numeric_stats)
     
     # Check uniqueness
     log_progress("\nChecking uniqueness...")
@@ -264,6 +301,17 @@ def analyze_dataset_streaming():
         'difference': abs(expected_rows - total_processed)
     }
     
+    # Log uniqueness to wandb
+    if use_wandb:
+        wandb.log({
+            "uniqueness/unique_pixels": n_unique_pixels,
+            "uniqueness/unique_years": n_unique_years,
+            "uniqueness/expected_rows": expected_rows,
+            "uniqueness/actual_rows": total_processed,
+            "uniqueness/is_unique": is_unique,
+            "uniqueness/difference": abs(expected_rows - total_processed)
+        })
+    
     if is_unique:
         log_progress("  ✓ All (row, col, year) combinations appear to be unique")
     else:
@@ -278,6 +326,13 @@ def analyze_dataset_streaming():
         log_progress(f"  Found {len(static_vars)} static variables (constant across years)")
         if len(static_vars) > 0:
             log_progress(f"  First 10 static variables: {static_vars[:10]}")
+        
+        # Log to wandb
+        if use_wandb:
+            wandb.log({
+                "static_variables/count": len(static_vars),
+                "static_variables/fraction": len(static_vars) / len(feature_cols) if len(feature_cols) > 0 else 0
+            })
     else:
         log_progress("\nStatic variable detection SKIPPED (set CHECK_STATIC_VARS=True to enable)")
     
@@ -315,6 +370,30 @@ def analyze_dataset_streaming():
         }
     }
     
+    # Log final summary statistics to wandb
+    if use_wandb:
+        # Year counts
+        year_count_dict = {f"year_counts/{year}": count for year, count in year_counts.items()}
+        wandb.log(year_count_dict)
+        
+        # Missing values summary
+        total_missing = sum(missing_counts.values())
+        cols_with_missing = sum(1 for v in missing_counts.values() if v > 0)
+        wandb.log({
+            "missing_values/total": total_missing,
+            "missing_values/columns_affected": cols_with_missing,
+            "missing_values/fraction": total_missing / (total_processed * len(columns)) if total_processed > 0 else 0
+        })
+        
+        # Overall summary
+        wandb.log({
+            "summary/total_rows": total_processed,
+            "summary/total_columns": len(columns),
+            "summary/numeric_columns": len(numeric_cols),
+            "summary/unique_years": len(all_years),
+            "summary/unique_pixels": n_unique_pixels
+        })
+    
     return results
 
 
@@ -331,6 +410,20 @@ def main():
         print("Please check that the file exists in data/ml/")
         return
     
+    # Initialize Weights & Biases
+    run = wandb.init(
+        project="masters-thesis-data-analysis",
+        name=f"panel_statistics_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        config={
+            "dataset": str(PANEL_FILE.name),
+            "batch_size": BATCH_SIZE,
+            "check_static_vars": CHECK_STATIC_VARS,
+            "file_size_gb": PANEL_FILE.stat().st_size / (1024**3)
+        },
+        tags=["statistics", "panel-analysis", "streaming"],
+        notes="Computing comprehensive statistics for merged panel dataset using streaming approach"
+    )
+    
     try:
         log_progress("Mode: FULL DATASET STREAMING ANALYSIS")
         log_progress("This will process all row groups incrementally.")
@@ -338,10 +431,11 @@ def main():
         log_progress("Memory usage: Low (processes in batches)")
         log_progress(f"Static variable check: {'Enabled' if CHECK_STATIC_VARS else 'Disabled'}")
         log_progress(f"Input file: {PANEL_FILE}")
-        log_progress(f"Output file: {OUTPUT_JSON}\n")
+        log_progress(f"Output file: {OUTPUT_JSON}")
+        log_progress(f"Weights & Biases: Enabled (run: {run.name})\n")
         
         # Run streaming analysis
-        results = analyze_dataset_streaming()
+        results = analyze_dataset_streaming(use_wandb=True)
         
         # Save to JSON
         log_progress("\n" + "=" * 80)
@@ -376,13 +470,29 @@ def main():
         log_progress("=" * 80)
         log_progress(f"\nNext step: Run 'inspect_merged_total' to generate human-readable report")
         
+        # Log final results to wandb artifacts
+        artifact = wandb.Artifact(
+            name=f"panel_statistics_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            type="statistics",
+            description="Comprehensive statistics for merged panel dataset"
+        )
+        artifact.add_file(str(OUTPUT_JSON))
+        run.log_artifact(artifact)
+        
+        log_progress(f"\n✓ Results uploaded to Weights & Biases")
+        
+        # Finish wandb run
+        wandb.finish()
+        
     except FileNotFoundError as e:
         print(f"\nERROR: {e}")
+        wandb.finish(exit_code=1)
         return
     except Exception as e:
         print(f"\nERROR: {e}")
         import traceback
         traceback.print_exc()
+        wandb.finish(exit_code=1)
         return
 
 
