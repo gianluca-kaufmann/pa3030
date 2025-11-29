@@ -3,7 +3,7 @@
 """Realistic Ratio Sampling Script
 
 Purpose: Build an evaluation dataset that preserves true class distribution.
-Input:  merged_panel_final.parquet
+Input:  merged_panel_2000_2024.parquet
 Process: Create lagged WDPA column, identify 0→1 transitions, sample ~10M rows 
          with realistic class ratio, keep only numeric features.
 Output: sample_training_imbalanced.parquet
@@ -18,10 +18,6 @@ from pathlib import Path
 
 import duckdb
 import wandb
-
-# Add project root to path for config import
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-import config
 
 
 # Configuration
@@ -55,45 +51,26 @@ def main() -> None:
     )
     print("W&B connected")
     
-    # Setup paths using config
-    input_path = config._join_path(config.get_ml_dir(), "merged_panel_final.parquet")
-    output_path = config._join_path(config.get_ml_dir(), "sample_training_imbalanced.parquet")
-    
-    # For temp files, use local filesystem
+    # Setup paths (outside try block for cleanup in finally)
     repo_root = Path(__file__).resolve().parents[3]
+    input_path = repo_root / "data/ml/merged_panel_2000_2024.parquet"
+    output_path = repo_root / "data/ml/sample_training_imbalanced.parquet"
     temp_dir = repo_root / "data/ml/temp"
     temp_transitions = temp_dir / "temp_transitions_imbalanced.parquet"
     
     try:
         
         temp_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Ensure output directory exists (handle both local and GCS paths)
-        if config.is_gcs_path(output_path):
-            print(f"Output will be written to GCS: {output_path}")
-            # GCS directories don't need to be created, but we need local temp
-            temp_dir.mkdir(parents=True, exist_ok=True)
-        else:
-            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         
         print(f"\nInput: {input_path}")
         print(f"Output: {output_path}")
         
-        # Check if input exists
-        if config.is_gcs_path(input_path):
-            # For GCS paths, DuckDB can read directly
-            print("Input is on GCS - DuckDB will read directly")
-        elif not Path(input_path).exists():
+        if not input_path.exists():
             raise FileNotFoundError(f"Input file not found: {input_path}")
         
         # Initialize DuckDB with memory-efficient settings
         con = duckdb.connect()
-        
-        # Set up GCS authentication if using GCS
-        if config.is_gcs_path(input_path):
-            print("Setting up GCS authentication for DuckDB...")
-            con = config.setup_duckdb_gcs_auth(con)
-        
         num_threads = 8 if os.environ.get("SCRATCH") else 4
         con.execute(f"SET threads={num_threads}")
         con.execute("SET preserve_insertion_order=false")
