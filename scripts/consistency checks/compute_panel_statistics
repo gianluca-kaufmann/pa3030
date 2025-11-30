@@ -2,31 +2,20 @@
 """
 Goal:
     Compute comprehensive statistics for the merged panel dataset using streaming.
-    This script handles large datasets (71GB+) efficiently without loading all data into RAM.
-    
-    memory optimized for euler cluster (128GB RAM, slower CPUs)
-    Designed to avoid OOM (Out of Memory) kills with aggressive memory management.
+    This script handles large datasets (35GB+) efficiently without loading all data into RAM.
 
 Input:
     - Parquet file: data/ml/merged_panel_final.parquet (processed incrementally).
 
 Process:
-    - Streams through row groups in conservative batches (100 at a time)
+    - Streams through row groups to avoid memory issues
     - Computes: dimensions, column types, unique counts, missing values,
-      numeric statistics, uniqueness checks, static variable detection (optional)
+      numeric statistics, uniqueness checks, static variable detection
     - Uses incremental algorithms (Welford's method for means/variance)
-    - MEMORY OPTIMIZATIONS:
-      * Conservative batch sizes to avoid memory spikes
-      * Immediate deletion of intermediate variables
-      * Aggressive garbage collection every 1000 row groups
-      * Efficient pixel tracking (stores rows/cols separately, not tuples)
-      * Two-pass approach for unique pixel counting (memory-efficient)
-      * Static variable detection DISABLED by default (very memory intensive)
 
 Output:
     - JSON file: outputs/Tables/merged_panel_statistics.json
     - Contains all computed statistics for later formatting
-    - Uploaded to Weights & Biases for monitoring
 """
 
 import warnings
@@ -53,9 +42,8 @@ PANEL_FILE = DATA_DIR / "merged_panel_final.parquet"
 OUTPUT_JSON = OUTPUT_DIR / "merged_panel_statistics.json"
 
 # Configuration
-BATCH_SIZE = 100  # Process 100 row groups at a time (balanced for Euler's 128GB RAM)
-CHECK_STATIC_VARS = False  # DISABLED: Very memory intensive, enable only if needed
-WANDB_LOG_FREQUENCY = 50  # Log to wandb every N row groups (reduce overhead)
+BATCH_SIZE = 50  # Process 50 row groups at a time (same as visualization script)
+CHECK_STATIC_VARS = True  # Set to False to skip (saves time but less complete)
 
 
 def log_progress(message: str):
@@ -98,9 +86,12 @@ def analyze_dataset_streaming(use_wandb: bool = True):
     log_progress("STREAMING ANALYSIS OF MERGED PANEL DATASET")
     log_progress("=" * 80)
     
-    log_progress("Opening parquet file and reading metadata...")
+    # Open parquet file
+    log_progress("Opening parquet file (this may take a minute for large files)...")
     parquet_file = pq.ParquetFile(PANEL_FILE)
+    log_progress("Reading metadata...")
     metadata = parquet_file.metadata
+    log_progress("Reading schema...")
     schema = parquet_file.schema
     
     num_row_groups = metadata.num_row_groups
@@ -126,8 +117,7 @@ def analyze_dataset_streaming(use_wandb: bool = True):
     # Initialize aggregators
     year_counts = {}
     all_years = set()
-    unique_rows = set()  # Track rows/cols separately instead of storing all (row,col) tuples
-    unique_cols = set()
+    pixel_ids = set()  # For (row, col) pairs
     missing_counts = {col: 0 for col in columns}
     total_processed = 0
     
@@ -161,7 +151,6 @@ def analyze_dataset_streaming(use_wandb: bool = True):
             try:
                 table = parquet_file.read_row_group(i)
                 chunks.append(table.to_pandas())
-                del table  # Free Arrow table immediately
             except Exception as e:
                 log_progress(f"    Warning: Could not read row group {i}: {e}")
                 continue
@@ -169,10 +158,10 @@ def analyze_dataset_streaming(use_wandb: bool = True):
         if not chunks:
             continue
         
-        # Combine batch - use concat with copy=False to reduce memory
-        df_batch = pd.concat(chunks, ignore_index=True, copy=False)
-        del chunks  # Free list immediately
-        gc.collect()  # Force collection after freeing chunks
+        # Combine batch
+        df_batch = pd.concat(chunks, ignore_index=True)
+        del chunks
+        gc.collect()
         
         batch_size = len(df_batch)
         total_processed += batch_size
@@ -191,19 +180,17 @@ def analyze_dataset_streaming(use_wandb: bool = True):
                     }
             log_progress(f"  Identified {len(numeric_cols)} numeric columns")
         
-        # Update year counts (optimized)
+        # Update year counts
         if 'year' in df_batch.columns:
             batch_year_counts = df_batch['year'].value_counts().to_dict()
             for year, count in batch_year_counts.items():
-                year_int = int(year)
-                year_counts[year_int] = year_counts.get(year_int, 0) + count
-                all_years.add(year_int)
-            del batch_year_counts  # Free immediately
+                year_counts[int(year)] = year_counts.get(int(year), 0) + count
+                all_years.add(int(year))
         
-        # Update pixel tracking (memory optimized - don't store all tuples)
+        # Update pixel IDs (row, col pairs)
         if 'row' in df_batch.columns and 'col' in df_batch.columns:
-            unique_rows.update(df_batch['row'].unique())
-            unique_cols.update(df_batch['col'].unique())
+            pixel_pairs = set(zip(df_batch['row'].values, df_batch['col'].values))
+            pixel_ids.update(pixel_pairs)
         
         # Update missing value counts
         for col in columns:
@@ -215,69 +202,52 @@ def analyze_dataset_streaming(use_wandb: bool = True):
         for col in numeric_cols:
             if col in df_batch.columns:
                 valid_data = df_batch[col].dropna()
-                if len(valid_data) == 0:
-                    continue
-                    
                 stats = numeric_stats[col]
                 
-                # Vectorized update for better performance
-                vals = valid_data.values
-                for val in vals:
+                for val in valid_data:
                     stats['count'] += 1
                     delta = val - stats['mean']
                     stats['mean'] += delta / stats['count']
                     delta2 = val - stats['mean']
                     stats['M2'] += delta * delta2
-                
-                # Update min/max using numpy for speed
-                batch_min = float(vals.min())
-                batch_max = float(vals.max())
-                stats['min'] = min(stats['min'], batch_min)
-                stats['max'] = max(stats['max'], batch_max)
-                
-                # Clean up immediately
-                del valid_data, vals
+                    stats['min'] = min(stats['min'], val)
+                    stats['max'] = max(stats['max'], val)
         
         # Track static variables (check if columns vary within pixels across years)
         if CHECK_STATIC_VARS and 'row' in df_batch.columns and 'col' in df_batch.columns and 'year' in df_batch.columns:
-            # Only check columns that haven't been marked as varying yet
-            cols_to_check = [col for col in feature_cols if col in df_batch.columns and col in pixel_col_uniqueness and not pixel_col_uniqueness[col]]
-            
-            if cols_to_check:
-                try:
-                    # More efficient: check all columns at once
-                    grouped = df_batch.groupby(['row', 'col'])[cols_to_check].nunique()
-                    for col in cols_to_check:
-                        if (grouped[col] > 1).any():
+            for col in feature_cols:
+                if col in df_batch.columns and col in pixel_col_uniqueness:
+                    # If we haven't found variation yet, check if this column has variation within any pixel
+                    if not pixel_col_uniqueness[col]:
+                        # Group by (row, col) and count unique values
+                        # If any pixel has >1 unique value, the column is not static
+                        try:
+                            grouped = df_batch.groupby(['row', 'col'])[col].n_unique()
+                            if (grouped > 1).any():
+                                # This column has variation, mark it as varying
+                                pixel_col_uniqueness[col] = True
+                        except Exception:
+                            # If grouping fails, assume it varies (safer)
                             pixel_col_uniqueness[col] = True
-                except Exception:
-                    # If grouping fails, mark all as varying (safer)
-                    for col in cols_to_check:
-                        pixel_col_uniqueness[col] = True
         
         # Clean up
         del df_batch
         gc.collect()
         
-        # Log batch progress to wandb (reduce frequency for performance)
-        if use_wandb and (batch_end % WANDB_LOG_FREQUENCY == 0 or batch_end == num_row_groups):
+        # Log batch progress to wandb
+        if use_wandb:
             progress_pct = (batch_end / num_row_groups) * 100
             wandb.log({
                 "progress/row_groups_processed": batch_end,
                 "progress/rows_processed": total_processed,
                 "progress/percent_complete": progress_pct,
-                "progress/unique_rows": len(unique_rows),
-                "progress/unique_cols": len(unique_cols),
+                "progress/unique_pixels": len(pixel_ids),
                 "progress/unique_years": len(all_years)
             })
         
         # Progress update
-        if (batch_end % 200 == 0) or (batch_end == num_row_groups):
+        if (batch_end % 500 == 0) or (batch_end == num_row_groups):
             log_progress(f"  Progress: {batch_end}/{num_row_groups} row groups ({total_processed:,} rows processed)")
-        
-        # Force garbage collection every 1000 row groups to prevent memory buildup
-        if batch_end % 1000 == 0:
-            gc.collect()
     
     log_progress(f"\n  Completed! Processed {total_processed:,} rows from {num_row_groups} row groups")
     
@@ -310,41 +280,15 @@ def analyze_dataset_streaming(use_wandb: bool = True):
     if use_wandb and wandb_numeric_stats:
         wandb.log(wandb_numeric_stats)
     
-    # Count exact unique pixels (memory-efficient second pass)
-    log_progress("\nCounting unique pixels (final pass)...")
-    unique_pixel_set = set()
-    
-    for i in range(0, num_row_groups, BATCH_SIZE):
-        batch_end_count = min(i + BATCH_SIZE, num_row_groups)
-        chunks = []
-        for j in range(i, batch_end_count):
-            try:
-                table = parquet_file.read_row_group(j, columns=['row', 'col'])
-                chunks.append(table.to_pandas())
-            except Exception:
-                continue
-        
-        if chunks:
-            df_temp = pd.concat(chunks, ignore_index=True)
-            unique_pixel_set.update(set(zip(df_temp['row'].values, df_temp['col'].values)))
-            del df_temp, chunks
-            gc.collect()
-        
-        if (batch_end_count % 200 == 0) or (batch_end_count == num_row_groups):
-            log_progress(f"  Progress: {batch_end_count}/{num_row_groups} row groups...")
-    
-    n_unique_pixels = len(unique_pixel_set)
-    del unique_pixel_set
-    gc.collect()
-    
-    # Compute and check uniqueness
+    # Check uniqueness
+    log_progress("\nChecking uniqueness...")
+    n_unique_pixels = len(pixel_ids)
     n_unique_years = len(all_years)
     expected_rows = n_unique_pixels * n_unique_years
-    is_unique = (expected_rows == total_processed)
     
-    log_progress(f"\n  Unique pixels: {n_unique_pixels:,}")
+    log_progress(f"  Unique pixels (row, col): {n_unique_pixels:,}")
     log_progress(f"  Unique years: {n_unique_years}")
-    log_progress(f"  Expected rows: {expected_rows:,}")
+    log_progress(f"  Expected rows (pixels × years): {expected_rows:,}")
     log_progress(f"  Actual rows: {total_processed:,}")
     
     is_unique = (expected_rows == total_processed)
@@ -369,9 +313,9 @@ def analyze_dataset_streaming(use_wandb: bool = True):
         })
     
     if is_unique:
-        log_progress("  All (row, col, year) combinations appear to be unique")
+        log_progress("  ✓ All (row, col, year) combinations appear to be unique")
     else:
-        log_progress(f"  WARNING: Row count mismatch! Difference: {abs(expected_rows - total_processed):,}")
+        log_progress(f"  ⚠ Row count mismatch! Difference: {abs(expected_rows - total_processed):,}")
     
     # Static variable detection
     static_vars = []
@@ -470,19 +414,22 @@ def main():
     run = wandb.init(
         project="masters-thesis-data-analysis",
         name=f"panel_statistics_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-        config={"dataset": str(PANEL_FILE.name), "batch_size": BATCH_SIZE, 
-                "check_static_vars": CHECK_STATIC_VARS, 
-                "file_size_gb": PANEL_FILE.stat().st_size / (1024**3)},
-        tags=["statistics", "panel-analysis", "streaming"]
+        config={
+            "dataset": str(PANEL_FILE.name),
+            "batch_size": BATCH_SIZE,
+            "check_static_vars": CHECK_STATIC_VARS,
+            "file_size_gb": PANEL_FILE.stat().st_size / (1024**3)
+        },
+        tags=["statistics", "panel-analysis", "streaming"],
+        notes="Computing comprehensive statistics for merged panel dataset using streaming approach"
     )
     
     try:
-        log_progress("Mode: FULL DATASET STREAMING ANALYSIS (Memory-Optimized for Euler)")
-        log_progress("This will process all row groups incrementally with aggressive memory management.")
-        log_progress("Estimated time: 20-40 minutes (with 128GB RAM)")
-        log_progress(f"Batch size: {BATCH_SIZE} row groups (conservative to avoid OOM)")
-        log_progress(f"Memory management: Aggressive GC, immediate cleanup, efficient data structures")
-        log_progress(f"Static variable check: {'Enabled (MEMORY INTENSIVE!)' if CHECK_STATIC_VARS else 'Disabled (recommended)'}")
+        log_progress("Mode: FULL DATASET STREAMING ANALYSIS")
+        log_progress("This will process all row groups incrementally.")
+        log_progress("Estimated time: 30-60 minutes")
+        log_progress("Memory usage: Low (processes in batches)")
+        log_progress(f"Static variable check: {'Enabled' if CHECK_STATIC_VARS else 'Disabled'}")
         log_progress(f"Input file: {PANEL_FILE}")
         log_progress(f"Output file: {OUTPUT_JSON}")
         log_progress(f"Weights & Biases: Enabled (run: {run.name})\n")
@@ -498,7 +445,7 @@ def main():
         with open(OUTPUT_JSON, 'w') as f:
             json.dump(convert_to_native(results), f, indent=2)
         
-        log_progress(f"Results saved to: {OUTPUT_JSON}")
+        log_progress(f"✓ Results saved to: {OUTPUT_JSON}")
         
         # Print summary
         log_progress("\n" + "=" * 80)
@@ -523,13 +470,18 @@ def main():
         log_progress("=" * 80)
         log_progress(f"\nNext step: Run 'inspect_merged_total' to generate human-readable report")
         
-        # Upload to wandb as artifact
-        artifact = wandb.Artifact(f"panel_statistics_{datetime.now().strftime('%Y%m%d_%H%M%S')}", 
-                                  type="statistics")
+        # Log final results to wandb artifacts
+        artifact = wandb.Artifact(
+            name=f"panel_statistics_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            type="statistics",
+            description="Comprehensive statistics for merged panel dataset"
+        )
         artifact.add_file(str(OUTPUT_JSON))
         run.log_artifact(artifact)
-        log_progress(f"\nResults uploaded to Weights & Biases")
         
+        log_progress(f"\n✓ Results uploaded to Weights & Biases")
+        
+        # Finish wandb run
         wandb.finish()
         
     except FileNotFoundError as e:
