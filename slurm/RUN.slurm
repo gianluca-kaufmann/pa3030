@@ -46,12 +46,12 @@ echo "Starting spatial features preprocessing script..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f scripts/merging/spatial_features_preprocessing ] || {
-  echo "ERROR: spatial_features_preprocessing not found under scripts/merging"
-  find scripts -maxdepth 2 -type f -name "spatial_features_preprocessing"
+[ -f scripts/ML/training_preprocessing/spatial_features_preprocessing ] || {
+  echo "ERROR: spatial_features_preprocessing not found under scripts/ML/training_preprocessing"
+  find scripts -maxdepth 3 -type f -name "spatial_features_preprocessing"
   exit 1
 }
 # Run the script
-python scripts/merging/spatial_features_preprocessing
+python scripts/ML/training_preprocessing/spatial_features_preprocessing
 
 echo "Spatial features preprocessing script finished."
