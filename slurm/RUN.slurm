@@ -1,19 +1,20 @@
 #!/bin/bash
-#SBATCH --job-name=merge-run
+#SBATCH --job-name=spatial-features-preprocessing
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=15G
-#SBATCH --output=/cluster/scratch/%u/logs/merge_run_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/merge_run_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/spatial_features_preprocessing_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/spatial_features_preprocessing_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
 mkdir -p "$SCRATCH/logs"
 mkdir -p "$SCRATCH/data"
 mkdir -p "$SCRATCH/outputs"
-mkdir -p "$SCRATCH/outputs/Results/merged_tifs"
+mkdir -p "$SCRATCH/outputs/Results"
+mkdir -p "$SCRATCH/outputs/Tables"
 mkdir -p "$SCRATCH/wandb/merge"
 
 #------------------------------------------------------------------------------
@@ -39,18 +40,18 @@ source "$VENV_DIR/bin/activate"
 #------------------------------------------------------------------------------
 # Run the training
 #------------------------------------------------------------------------------
-echo "Starting merge script..."
+echo "Starting spatial features preprocessing script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f scripts/merging/merge_total_optimized ] || {
-  echo "ERROR: merge_total_optimized not found under scripts/merging"
-  find scripts -maxdepth 2 -type f -name "merge_total_optimized"
+[ -f scripts/merging/spatial_features_preprocessing ] || {
+  echo "ERROR: spatial_features_preprocessing not found under scripts/merging"
+  find scripts -maxdepth 2 -type f -name "spatial_features_preprocessing"
   exit 1
 }
 # Run the script
-python scripts/merging/merge_total_optimized
+python scripts/merging/spatial_features_preprocessing
 
-echo "Merge script finished."
+echo "Spatial features preprocessing script finished."
