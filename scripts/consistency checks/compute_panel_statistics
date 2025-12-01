@@ -21,6 +21,7 @@ Output:
 import warnings
 import gc
 import json
+import os
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
@@ -44,24 +45,17 @@ PANEL_FILE = DATA_DIR / "merged_panel_final.parquet"
 OUTPUT_JSON = OUTPUT_DIR / "merged_panel_statistics.json"
 
 # Configuration
-BATCH_SIZE = 50 # Process 50 row groups at a time (same as visualization script)
-CHECK_STATIC_VARS = True  # Set to False to skip (saves time but less complete)
-NUM_WORKERS = max(1, cpu_count() - 1)  # Use all CPUs except one for system stability
-
-
-def log_progress(message: str):
-    """Simple logging function with immediate flush."""
-    print(message, flush=True)
+BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 75))  # Increased for better performance
+CHECK_STATIC_VARS = os.environ.get('CHECK_STATIC_VARS', 'True').lower() in ('true', '1', 'yes')
+NUM_WORKERS = int(os.environ.get('SLURM_CPUS_PER_TASK', cpu_count()))  # Use all CPUs
 
 
 def convert_to_native(obj):
-    """Recursively convert numpy types to native Python types for JSON serialization."""
+    """Convert numpy types to Python types for JSON."""
     if isinstance(obj, (np.integer, np.int32, np.int64)):
         return int(obj)
     elif isinstance(obj, (np.floating, np.float32, np.float64)):
-        if np.isnan(obj) or np.isinf(obj):
-            return None
-        return float(obj)
+        return None if (np.isnan(obj) or np.isinf(obj)) else float(obj)
     elif isinstance(obj, np.ndarray):
         return obj.tolist()
     elif isinstance(obj, dict):
@@ -70,411 +64,184 @@ def convert_to_native(obj):
         return [convert_to_native(item) for item in obj]
     elif isinstance(obj, set):
         return sorted([convert_to_native(item) for item in obj])
-    else:
-        return obj
+    return obj
 
 
-def process_row_group_batch(batch_info: tuple, file_path: str, columns: list, 
-                            column_types: dict, check_static_vars: bool):
-    """
-    Worker function to process a batch of row groups in parallel.
+def process_batch(batch_info, file_path, columns, check_static_vars):
+    """Worker function to process a batch of row groups."""
+    batch_start, batch_end = batch_info
     
-    Args:
-        batch_info: Tuple of (batch_start, batch_end, batch_id)
-        file_path: Path to the parquet file
-        columns: List of column names
-        column_types: Dictionary of column types
-        check_static_vars: Whether to check for static variables
+    try:
+        parquet_file = pq.ParquetFile(file_path)
+    except Exception:
+        return None
     
-    Returns:
-        Dictionary with batch results for aggregation
-    """
-    batch_start, batch_end, batch_id = batch_info
-    
-    # Open parquet file in worker process
-    parquet_file = pq.ParquetFile(file_path)
-    
-    # Initialize local aggregators
-    year_counts = {}
-    all_years = set()
-    pixel_ids = set()
-    missing_counts = {col: 0 for col in columns}
-    total_processed = 0
-    
-    # For numeric statistics
-    numeric_stats = {}
-    
-    # For static variable detection
-    metadata_cols = ['year', 'x', 'y', 'row', 'col']
-    feature_cols = [c for c in columns if c not in metadata_cols]
-    pixel_col_uniqueness = {col: False for col in feature_cols} if check_static_vars else {}
-    
-    # Read batch of row groups
+    # Read and combine row groups
     chunks = []
     for i in range(batch_start, batch_end):
         try:
-            table = parquet_file.read_row_group(i)
-            chunks.append(table.to_pandas())
+            chunks.append(parquet_file.read_row_group(i).to_pandas())
         except Exception:
             continue
     
     if not chunks:
         return None
     
-    # Combine batch
-    df_batch = pd.concat(chunks, ignore_index=True)
+    df = pd.concat(chunks, ignore_index=True)
     del chunks
-    gc.collect()
     
-    batch_size = len(df_batch)
-    total_processed = batch_size
-    
-    # Identify numeric columns
-    numeric_cols = []
-    for col in columns:
-        if col in df_batch.columns and pd.api.types.is_numeric_dtype(df_batch[col]):
-            numeric_cols.append(col)
-            numeric_stats[col] = {
-                'count': 0,
-                'mean': 0.0,
-                'M2': 0.0,
-                'min': float('inf'),
-                'max': float('-inf')
-            }
-    
-    # Update year counts
-    if 'year' in df_batch.columns:
-        batch_year_counts = df_batch['year'].value_counts().to_dict()
-        for year, count in batch_year_counts.items():
-            year_counts[int(year)] = year_counts.get(int(year), 0) + count
-            all_years.add(int(year))
-    
-    # Update pixel IDs
-    if 'row' in df_batch.columns and 'col' in df_batch.columns:
-        pixel_pairs = set(zip(df_batch['row'].values, df_batch['col'].values))
-        pixel_ids.update(pixel_pairs)
-    
-    # Update missing value counts
-    for col in columns:
-        if col in df_batch.columns:
-            missing = df_batch[col].isnull().sum()
-            missing_counts[col] = int(missing)
-    
-    # Update numeric statistics using Welford's algorithm
-    for col in numeric_cols:
-        if col in df_batch.columns:
-            valid_data = df_batch[col].dropna()
-            stats = numeric_stats[col]
-            
-            for val in valid_data:
-                stats['count'] += 1
-                delta = val - stats['mean']
-                stats['mean'] += delta / stats['count']
-                delta2 = val - stats['mean']
-                stats['M2'] += delta * delta2
-                stats['min'] = min(stats['min'], val)
-                stats['max'] = max(stats['max'], val)
-    
-    # Track static variables
-    if check_static_vars and 'row' in df_batch.columns and 'col' in df_batch.columns and 'year' in df_batch.columns:
-        for col in feature_cols:
-            if col in df_batch.columns and col in pixel_col_uniqueness:
-                if not pixel_col_uniqueness[col]:
-                    try:
-                        grouped = df_batch.groupby(['row', 'col'])[col].nunique()
-                        if (grouped > 1).any():
-                            pixel_col_uniqueness[col] = True
-                    except Exception:
-                        pixel_col_uniqueness[col] = True
-    
-    # Clean up
-    del df_batch
-    gc.collect()
-    
-    return {
-        'batch_id': batch_id,
-        'year_counts': year_counts,
-        'all_years': all_years,
-        'pixel_ids': pixel_ids,
-        'missing_counts': missing_counts,
-        'total_processed': total_processed,
-        'numeric_stats': numeric_stats,
-        'numeric_cols': numeric_cols,
-        'pixel_col_uniqueness': pixel_col_uniqueness
+    # Initialize results
+    result = {
+        'n_rows': len(df),
+        'year_counts': df['year'].value_counts().to_dict() if 'year' in df.columns else {},
+        'years': set(df['year'].unique()) if 'year' in df.columns else set(),
+        'pixels': set(zip(df['row'], df['col'])) if 'row' in df.columns and 'col' in df.columns else set(),
+        'missing': {col: int(df[col].isnull().sum()) for col in columns if col in df.columns},
+        'numeric_stats': {},
+        'static_vars': {}
     }
+    
+    # Numeric statistics (Welford's algorithm)
+    for col in columns:
+        if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
+            vals = df[col].dropna()
+            if len(vals) > 0:
+                result['numeric_stats'][col] = {
+                    'count': len(vals),
+                    'mean': float(vals.mean()),
+                    'M2': float(((vals - vals.mean()) ** 2).sum()),
+                    'min': float(vals.min()),
+                    'max': float(vals.max())
+                }
+    
+    # Static variable detection
+    if check_static_vars and 'row' in df.columns and 'col' in df.columns:
+        meta = ['year', 'x', 'y', 'row', 'col']
+        for col in [c for c in columns if c not in meta and c in df.columns]:
+            try:
+                has_variation = (df.groupby(['row', 'col'])[col].nunique() > 1).any()
+                result['static_vars'][col] = has_variation
+            except Exception:
+                result['static_vars'][col] = True
+    
+    del df
+    gc.collect()
+    return result
 
 
 def analyze_dataset_streaming(use_wandb: bool = True):
-    """
-    Analyze the full dataset by processing row groups in parallel using multiprocessing.
-    Computes all required statistics without loading entire dataset into memory.
+    """Analyze dataset using parallel processing."""
+    print("\n" + "=" * 80)
+    print("PARALLEL ANALYSIS - MERGED PANEL DATASET")
+    print("=" * 80)
     
-    Args:
-        use_wandb: Whether to log progress to Weights & Biases
-    
-    Returns:
-        Dictionary with all computed statistics
-    """
-    log_progress("\n" + "=" * 80)
-    log_progress("PARALLEL STREAMING ANALYSIS OF MERGED PANEL DATASET")
-    log_progress("=" * 80)
-    
-    # Open parquet file
-    log_progress("Opening parquet file (this may take a minute for large files)...")
+    # Read file metadata
+    print(f"Opening {PANEL_FILE.name}...", flush=True)
     parquet_file = pq.ParquetFile(PANEL_FILE)
-    log_progress("Reading metadata...")
     metadata = parquet_file.metadata
-    log_progress("Reading schema...")
     schema = parquet_file.schema
     
     num_row_groups = metadata.num_row_groups
-    total_rows = metadata.num_rows
-    
-    log_progress(f"Processing all {num_row_groups:,} row groups ({total_rows:,} total rows)...")
-    log_progress(f"Using {NUM_WORKERS} worker processes for parallel processing")
-    log_progress("This will process data incrementally to avoid memory issues.")
-    
-    # Get column names and types from schema
     columns = [schema[i].name for i in range(len(schema))]
     column_types = {schema[i].name: str(schema[i].physical_type) for i in range(len(schema))}
     
-    log_progress(f"Schema: {len(columns)} columns")
+    print(f"Workers: {NUM_WORKERS} | Row groups: {num_row_groups:,} | Columns: {len(columns)}", flush=True)
     
-    # Log initial metadata to wandb
-    if use_wandb:
-        wandb.log({
-            "dataset/num_columns": len(columns),
-            "dataset/num_row_groups": num_row_groups,
-            "dataset/total_rows": total_rows,
-            "dataset/num_workers": NUM_WORKERS
-        })
+    # Create batches
+    batches = [(i, min(i + BATCH_SIZE, num_row_groups)) 
+               for i in range(0, num_row_groups, BATCH_SIZE)]
+    print(f"Processing {len(batches)} batches...", flush=True)
     
-    # Initialize global aggregators
+    # Process in parallel
+    worker_fn = partial(process_batch, file_path=str(PANEL_FILE), 
+                       columns=columns, check_static_vars=CHECK_STATIC_VARS)
+    
+    with Pool(NUM_WORKERS) as pool:
+        results = [r for r in pool.imap_unordered(worker_fn, batches) if r is not None]
+    
+    print(f"Completed {len(results)}/{len(batches)} batches. Aggregating...", flush=True)
+    
+    # Aggregate results
+    total_rows = sum(r['n_rows'] for r in results)
     year_counts = {}
     all_years = set()
-    pixel_ids = set()  # For (row, col) pairs
-    missing_counts = {col: 0 for col in columns}
-    total_processed = 0
+    pixels = set()
+    missing = {col: 0 for col in columns}
+    numeric_stats = {}
+    static_vars = {col: False for col in columns if col not in ['year', 'x', 'y', 'row', 'col']} if CHECK_STATIC_VARS else {}
     
-    # For numeric statistics (will be aggregated from workers)
-    numeric_cols = []
-    numeric_stats = {}  # Will track: count, mean, M2, min, max
-    
-    # For static variable detection
-    feature_cols = [c for c in columns if c not in ['year', 'x', 'y', 'row', 'col']]
-    pixel_col_uniqueness = {col: False for col in feature_cols} if CHECK_STATIC_VARS else {}
-    
-    log_progress("\nStarting parallel computation...")
-    
-    # Create list of batches to process
-    batches = []
-    batch_id = 0
-    for batch_start in range(0, num_row_groups, BATCH_SIZE):
-        batch_end = min(batch_start + BATCH_SIZE, num_row_groups)
-        batches.append((batch_start, batch_end, batch_id))
-        batch_id += 1
-    
-    log_progress(f"Created {len(batches)} batches to process in parallel")
-    
-    # Create worker function with fixed parameters
-    worker_fn = partial(
-        process_row_group_batch,
-        file_path=str(PANEL_FILE),
-        columns=columns,
-        column_types=column_types,
-        check_static_vars=CHECK_STATIC_VARS
-    )
-    
-    # Process batches in parallel using multiprocessing
-    with Pool(processes=NUM_WORKERS) as pool:
-        # Use imap_unordered for better memory efficiency (processes results as they come)
-        results = []
-        completed = 0
+    for r in results:
+        # Years
+        for year, count in r['year_counts'].items():
+            year_counts[int(year)] = year_counts.get(int(year), 0) + count
+        all_years.update(r['years'])
         
-        for result in pool.imap_unordered(worker_fn, batches, chunksize=1):
-            if result is None:
-                continue
-            
-            results.append(result)
-            completed += 1
-            
-            # Progress update every 10 batches or at the end
-            if (completed % 10 == 0) or (completed == len(batches)):
-                batch_end_rg = min(completed * BATCH_SIZE, num_row_groups)
-                log_progress(f"  Progress: {completed}/{len(batches)} batches completed ({batch_end_rg}/{num_row_groups} row groups)")
-    
-    log_progress(f"\n  All batches completed! Aggregating results...")
-    
-    # Aggregate results from all workers
-    for result in results:
-        # Aggregate year counts
-        for year, count in result['year_counts'].items():
-            year_counts[year] = year_counts.get(year, 0) + count
-        all_years.update(result['all_years'])
+        # Pixels
+        pixels.update(r['pixels'])
         
-        # Aggregate pixel IDs
-        pixel_ids.update(result['pixel_ids'])
+        # Missing values
+        for col, count in r['missing'].items():
+            missing[col] += count
         
-        # Aggregate missing counts
-        for col, count in result['missing_counts'].items():
-            missing_counts[col] += count
-        
-        # Aggregate total processed
-        total_processed += result['total_processed']
-        
-        # Identify numeric columns (from first result)
-        if not numeric_cols:
-            numeric_cols = result['numeric_cols']
-            for col in numeric_cols:
-                numeric_stats[col] = {
-                    'count': 0,
-                    'mean': 0.0,
-                    'M2': 0.0,
-                    'min': float('inf'),
-                    'max': float('-inf')
-                }
-            log_progress(f"  Identified {len(numeric_cols)} numeric columns")
-        
-        # Aggregate numeric statistics (parallel mean aggregation)
-        for col, stats in result['numeric_stats'].items():
-            if col in numeric_stats and stats['count'] > 0:
-                global_stats = numeric_stats[col]
-                
-                # Combine counts
-                n1 = global_stats['count']
-                n2 = stats['count']
+        # Numeric stats (Chan's algorithm for parallel variance)
+        for col, stats in r['numeric_stats'].items():
+            if col not in numeric_stats:
+                numeric_stats[col] = stats.copy()
+            else:
+                n1, n2 = numeric_stats[col]['count'], stats['count']
                 n = n1 + n2
-                
-                if n1 == 0:
-                    # First batch with data for this column
-                    numeric_stats[col] = stats.copy()
-                else:
-                    # Parallel variance aggregation (Chan's algorithm)
-                    delta = stats['mean'] - global_stats['mean']
-                    global_stats['mean'] = (n1 * global_stats['mean'] + n2 * stats['mean']) / n
-                    global_stats['M2'] = global_stats['M2'] + stats['M2'] + (delta ** 2) * n1 * n2 / n
-                    global_stats['min'] = min(global_stats['min'], stats['min'])
-                    global_stats['max'] = max(global_stats['max'], stats['max'])
-                    global_stats['count'] = n
+                delta = stats['mean'] - numeric_stats[col]['mean']
+                numeric_stats[col]['mean'] = (n1 * numeric_stats[col]['mean'] + n2 * stats['mean']) / n
+                numeric_stats[col]['M2'] += stats['M2'] + (delta ** 2) * n1 * n2 / n
+                numeric_stats[col]['min'] = min(numeric_stats[col]['min'], stats['min'])
+                numeric_stats[col]['max'] = max(numeric_stats[col]['max'], stats['max'])
+                numeric_stats[col]['count'] = n
         
-        # Aggregate static variable detection
+        # Static variables
         if CHECK_STATIC_VARS:
-            for col, has_variation in result['pixel_col_uniqueness'].items():
-                if has_variation:
-                    pixel_col_uniqueness[col] = True
+            for col, has_var in r['static_vars'].items():
+                if has_var:
+                    static_vars[col] = True
     
-    log_progress(f"  Completed! Processed {total_processed:,} rows from {num_row_groups} row groups")
+    print(f"Processed {total_rows:,} rows", flush=True)
     
-    # Log aggregation progress to wandb
-    if use_wandb:
-        wandb.log({
-            "progress/row_groups_processed": num_row_groups,
-            "progress/rows_processed": total_processed,
-            "progress/percent_complete": 100.0,
-            "progress/unique_pixels": len(pixel_ids),
-            "progress/unique_years": len(all_years)
-        })
-    
-    # Compute final numeric statistics
-    log_progress("\nComputing final numeric statistics...")
+    # Compute final statistics
     final_numeric_stats = {}
-    wandb_numeric_stats = {}  # For wandb logging
-    metadata_cols = ['year', 'x', 'y', 'row', 'col']
-    
     for col, stats in numeric_stats.items():
-        if stats['count'] > 0:
-            variance = stats['M2'] / stats['count'] if stats['count'] > 1 else 0.0
-            std = np.sqrt(variance)
-            final_numeric_stats[col] = {
-                'min': stats['min'] if stats['min'] != float('inf') else None,
-                'max': stats['max'] if stats['max'] != float('-inf') else None,
-                'mean': stats['mean'],
-                'std': std,
-                'count': stats['count']
-            }
-            
-            # Prepare for wandb logging (only a subset to avoid too many metrics)
-            if use_wandb and col not in metadata_cols:
-                # Log statistics for feature columns
-                wandb_numeric_stats[f"stats/{col}/mean"] = stats['mean']
-                wandb_numeric_stats[f"stats/{col}/std"] = std
-                wandb_numeric_stats[f"stats/{col}/min"] = stats['min'] if stats['min'] != float('inf') else None
-                wandb_numeric_stats[f"stats/{col}/max"] = stats['max'] if stats['max'] != float('-inf') else None
+        variance = stats['M2'] / stats['count'] if stats['count'] > 1 else 0.0
+        final_numeric_stats[col] = {
+            'min': stats['min'], 'max': stats['max'],
+            'mean': stats['mean'], 'std': np.sqrt(variance),
+            'count': stats['count']
+        }
     
-    # Log numeric statistics to wandb
-    if use_wandb and wandb_numeric_stats:
-        wandb.log(wandb_numeric_stats)
+    # Uniqueness check
+    n_pixels = len(pixels)
+    n_years = len(all_years)
+    expected = n_pixels * n_years
+    is_unique = (expected == total_rows)
     
-    # Check uniqueness
-    log_progress("\nChecking uniqueness...")
-    n_unique_pixels = len(pixel_ids)
-    n_unique_years = len(all_years)
-    expected_rows = n_unique_pixels * n_unique_years
+    print(f"Pixels: {n_pixels:,} | Years: {n_years} | Expected rows: {expected:,} | Unique: {is_unique}", flush=True)
     
-    log_progress(f"  Unique pixels (row, col): {n_unique_pixels:,}")
-    log_progress(f"  Unique years: {n_unique_years}")
-    log_progress(f"  Expected rows (pixels × years): {expected_rows:,}")
-    log_progress(f"  Actual rows: {total_processed:,}")
-    
-    is_unique = (expected_rows == total_processed)
-    uniqueness_check = {
-        'unique_pixels': n_unique_pixels,
-        'unique_years': n_unique_years,
-        'expected_rows': expected_rows,
-        'actual_rows': total_processed,
-        'is_unique': is_unique,
-        'difference': abs(expected_rows - total_processed)
-    }
-    
-    # Log uniqueness to wandb
-    if use_wandb:
-        wandb.log({
-            "uniqueness/unique_pixels": n_unique_pixels,
-            "uniqueness/unique_years": n_unique_years,
-            "uniqueness/expected_rows": expected_rows,
-            "uniqueness/actual_rows": total_processed,
-            "uniqueness/is_unique": is_unique,
-            "uniqueness/difference": abs(expected_rows - total_processed)
-        })
-    
-    if is_unique:
-        log_progress("  ✓ All (row, col, year) combinations appear to be unique")
-    else:
-        log_progress(f"  ⚠ Row count mismatch! Difference: {abs(expected_rows - total_processed):,}")
-    
-    # Static variable detection
-    static_vars = []
+    # Static variables
+    static_list = [col for col, has_var in static_vars.items() if not has_var] if CHECK_STATIC_VARS else []
     if CHECK_STATIC_VARS:
-        log_progress("\nDetecting static variables...")
-        # Columns that remain False (never found variation) are static
-        static_vars = [col for col, has_variation in pixel_col_uniqueness.items() if not has_variation]
-        log_progress(f"  Found {len(static_vars)} static variables (constant across years)")
-        if len(static_vars) > 0:
-            log_progress(f"  First 10 static variables: {static_vars[:10]}")
-        
-        # Log to wandb
-        if use_wandb:
-            wandb.log({
-                "static_variables/count": len(static_vars),
-                "static_variables/fraction": len(static_vars) / len(feature_cols) if len(feature_cols) > 0 else 0
-            })
-    else:
-        log_progress("\nStatic variable detection SKIPPED (set CHECK_STATIC_VARS=True to enable)")
+        print(f"Static variables: {len(static_list)}", flush=True)
     
-    # Compile results
-    results = {
+    # Return results
+    return {
         'metadata': {
             'file': str(PANEL_FILE.name),
             'generated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'total_rows': total_processed,
+            'total_rows': total_rows,
             'total_columns': len(columns),
             'num_row_groups': num_row_groups
         },
         'columns': {
             'names': columns,
             'types': column_types,
-            'numeric_columns': numeric_cols,
-            'num_numeric': len(numeric_cols)
+            'numeric_columns': list(numeric_stats.keys()),
+            'num_numeric': len(numeric_stats)
         },
         'years': {
             'unique_years': sorted(all_years),
@@ -482,149 +249,72 @@ def analyze_dataset_streaming(use_wandb: bool = True):
             'year_counts': {str(k): int(v) for k, v in year_counts.items()}
         },
         'pixels': {
-            'unique_pixels': n_unique_pixels,
+            'unique_pixels': n_pixels,
             'pixel_identifier': '(row, col)'
         },
-        'uniqueness': uniqueness_check,
-        'missing_values': {col: int(missing_counts[col]) for col in columns},
+        'uniqueness': {
+            'unique_pixels': n_pixels,
+            'unique_years': n_years,
+            'expected_rows': expected,
+            'actual_rows': total_rows,
+            'is_unique': is_unique,
+            'difference': abs(expected - total_rows)
+        },
+        'missing_values': missing,
         'numeric_statistics': final_numeric_stats,
         'static_variables': {
             'enabled': CHECK_STATIC_VARS,
-            'count': len(static_vars),
-            'variables': static_vars
+            'count': len(static_list),
+            'variables': static_list
         }
     }
-    
-    # Log final summary statistics to wandb
-    if use_wandb:
-        # Year counts
-        year_count_dict = {f"year_counts/{year}": count for year, count in year_counts.items()}
-        wandb.log(year_count_dict)
-        
-        # Missing values summary
-        total_missing = sum(missing_counts.values())
-        cols_with_missing = sum(1 for v in missing_counts.values() if v > 0)
-        wandb.log({
-            "missing_values/total": total_missing,
-            "missing_values/columns_affected": cols_with_missing,
-            "missing_values/fraction": total_missing / (total_processed * len(columns)) if total_processed > 0 else 0
-        })
-        
-        # Overall summary
-        wandb.log({
-            "summary/total_rows": total_processed,
-            "summary/total_columns": len(columns),
-            "summary/numeric_columns": len(numeric_cols),
-            "summary/unique_years": len(all_years),
-            "summary/unique_pixels": n_unique_pixels
-        })
-    
-    return results
 
 
 def main():
-    """Main analysis function."""
+    """Main function."""
     print("\n" + "=" * 80)
-    print("MERGED PANEL DATASET - COMPREHENSIVE STATISTICS COMPUTATION")
-    print("South America 1km Dataset (2000-2024)")
+    print("PANEL STATISTICS COMPUTATION")
     print("=" * 80)
+    print(f"Workers: {NUM_WORKERS} | Batch size: {BATCH_SIZE} | Static vars: {CHECK_STATIC_VARS}")
     print()
     
     if not PANEL_FILE.exists():
-        print(f"ERROR: Panel file not found: {PANEL_FILE}")
-        print("Please check that the file exists in data/ml/")
+        print(f"ERROR: File not found: {PANEL_FILE}")
         return
     
-    # Initialize Weights & Biases
+    # Initialize wandb
     run = wandb.init(
         project="masters-thesis-data-analysis",
-        name=f"panel_statistics_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        name=f"panel_stats_{datetime.now().strftime('%Y%m%d_%H%M')}",
         config={
-            "dataset": str(PANEL_FILE.name),
             "batch_size": BATCH_SIZE,
-            "check_static_vars": CHECK_STATIC_VARS,
             "num_workers": NUM_WORKERS,
-            "cpu_count": cpu_count(),
-            "file_size_gb": PANEL_FILE.stat().st_size / (1024**3),
-            "parallel_processing": True
-        },
-        tags=["statistics", "panel-analysis", "streaming", "parallel"],
-        notes="Computing comprehensive statistics for merged panel dataset using parallel streaming approach"
+            "check_static_vars": CHECK_STATIC_VARS
+        }
     )
     
     try:
-        log_progress("Mode: PARALLEL STREAMING ANALYSIS")
-        log_progress("This will process all row groups in parallel using multiprocessing.")
-        log_progress(f"CPU cores available: {cpu_count()}")
-        log_progress(f"Worker processes: {NUM_WORKERS}")
-        log_progress(f"Batch size: {BATCH_SIZE} row groups per batch")
-        log_progress("Estimated time: 15-30 minutes (parallelized)")
-        log_progress("Memory usage: Low (processes in batches, each worker has its own memory)")
-        log_progress(f"Static variable check: {'Enabled' if CHECK_STATIC_VARS else 'Disabled'}")
-        log_progress(f"Input file: {PANEL_FILE}")
-        log_progress(f"Output file: {OUTPUT_JSON}")
-        log_progress(f"Weights & Biases: Enabled (run: {run.name})\n")
+        # Run analysis
+        start = datetime.now()
+        results = analyze_dataset_streaming(use_wandb=False)
+        elapsed = (datetime.now() - start).total_seconds() / 60
         
-        # Run streaming analysis
-        results = analyze_dataset_streaming(use_wandb=True)
-        
-        # Save to JSON
-        log_progress("\n" + "=" * 80)
-        log_progress("Saving results to JSON...")
-        log_progress("=" * 80)
-        
+        # Save results
         with open(OUTPUT_JSON, 'w') as f:
             json.dump(convert_to_native(results), f, indent=2)
         
-        log_progress(f"✓ Results saved to: {OUTPUT_JSON}")
+        print(f"\n✓ Completed in {elapsed:.1f} minutes")
+        print(f"✓ Saved to: {OUTPUT_JSON}")
+        print(f"  Rows: {results['metadata']['total_rows']:,}")
+        print(f"  Years: {results['years']['num_unique_years']}")
+        print(f"  Pixels: {results['pixels']['unique_pixels']:,}")
+        print(f"  Static vars: {results['static_variables']['count']}")
         
-        # Print summary
-        log_progress("\n" + "=" * 80)
-        log_progress("COMPUTATION SUMMARY")
-        log_progress("=" * 80)
-        log_progress(f"Total rows: {results['metadata']['total_rows']:,}")
-        log_progress(f"Total columns: {results['metadata']['total_columns']}")
-        log_progress(f"Numeric columns: {results['columns']['num_numeric']}")
-        log_progress(f"Unique years: {results['years']['num_unique_years']}")
-        log_progress(f"Unique pixels: {results['pixels']['unique_pixels']:,}")
-        log_progress(f"Columns with missing values: {sum(1 for v in results['missing_values'].values() if v > 0)}")
-        log_progress(f"Static variables: {results['static_variables']['count']}")
-        
-        # Show rows per year
-        log_progress("\nRows per year:")
-        for year in sorted(results['years']['unique_years']):
-            count = results['years']['year_counts'].get(str(year), 0)
-            log_progress(f"  Year {year}: {count:,} rows")
-        
-        log_progress("\n" + "=" * 80)
-        log_progress("COMPUTATION COMPLETE")
-        log_progress("=" * 80)
-        log_progress(f"\nNext step: Run 'inspect_merged_total' to generate human-readable report")
-        
-        # Log final results to wandb artifacts
-        artifact = wandb.Artifact(
-            name=f"panel_statistics_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-            type="statistics",
-            description="Comprehensive statistics for merged panel dataset"
-        )
-        artifact.add_file(str(OUTPUT_JSON))
-        run.log_artifact(artifact)
-        
-        log_progress(f"\n✓ Results uploaded to Weights & Biases")
-        
-        # Finish wandb run
         wandb.finish()
         
-    except FileNotFoundError as e:
-        print(f"\nERROR: {e}")
-        wandb.finish(exit_code=1)
-        return
     except Exception as e:
         print(f"\nERROR: {e}")
-        import traceback
-        traceback.print_exc()
         wandb.finish(exit_code=1)
-        return
 
 
 if __name__ == "__main__":
