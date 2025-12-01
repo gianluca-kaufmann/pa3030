@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=inspect-merged-total
+#SBATCH --job-name=merge-total-optimized
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=15G
-#SBATCH --output=/cluster/scratch/%u/logs/inspect_merged_total_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/inspect_merged_total_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/merge_total_optimized_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/merge_total_optimized_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -35,19 +35,19 @@ source "$VENV_DIR/bin/activate"
 #------------------------------------------------------------------------------
 # Run the script
 #------------------------------------------------------------------------------
-echo "Starting inspect merged total script..."
+echo "Starting merge total optimized script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/consistency checks/inspect_merged_total" ] || {
-  echo "ERROR: inspect_merged_total not found under scripts/consistency checks"
-  find scripts -maxdepth 3 -type f -name "inspect_merged_total"
+[ -f "scripts/merging/merge_total_optimized" ] || {
+  echo "ERROR: merge_total_optimized not found under scripts/merging"
+  find scripts -maxdepth 3 -type f -name "merge_total_optimized"
   exit 1
 }
 
 # Run the script
-python "scripts/consistency checks/inspect_merged_total"
+python "scripts/merging/merge_total_optimized"
 
-echo "Inspect merged total script finished."
+echo "Merge total optimized script finished."
