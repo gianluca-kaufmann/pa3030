@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=compute-panel-statistics
+#SBATCH --job-name=inspect-merged-total
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=15G
-#SBATCH --output=/cluster/scratch/%u/logs/compute_panel_statistics_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/compute_panel_statistics_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/inspect_merged_total_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/inspect_merged_total_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -33,21 +33,21 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the compute panel statistics script
+# Run the script
 #------------------------------------------------------------------------------
-echo "Starting compute panel statistics script..."
+echo "Starting inspect merged total script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/consistency checks/compute_panel_statistics" ] || {
-  echo "ERROR: compute_panel_statistics not found under scripts/consistency checks"
-  find scripts -maxdepth 3 -type f -name "compute_panel_statistics"
+[ -f "scripts/consistency checks/inspect_merged_total" ] || {
+  echo "ERROR: inspect_merged_total not found under scripts/consistency checks"
+  find scripts -maxdepth 3 -type f -name "inspect_merged_total"
   exit 1
 }
 
 # Run the script
-python "scripts/consistency checks/compute_panel_statistics"
+python "scripts/consistency checks/inspect_merged_total"
 
-echo "Compute panel statistics script finished."
+echo "Inspect merged total script finished."

@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=balanced-preprocessing
+#SBATCH --job-name=train-sample-balanced
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=15G
-#SBATCH --output=/cluster/scratch/%u/logs/balanced_preprocessing_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/balanced_preprocessing_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/train_sample_balanced_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/train_sample_balanced_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -33,22 +33,22 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the balanced sample preprocessing script
+# Run the train sample balanced script
 #------------------------------------------------------------------------------
-echo "Starting balanced sample preprocessing script..."
+echo "Starting train sample balanced script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/training_preprocessing/sample_preprocessing_balanced" ] || {
-  echo "ERROR: sample_preprocessing_balanced not found under scripts/ML/training_preprocessing"
-  find scripts -maxdepth 4 -type f -name "sample_preprocessing_balanced"
+[ -f "scripts/ML/training/train_sample_balanced" ] || {
+  echo "ERROR: train_sample_balanced not found under scripts/ML/training"
+  find scripts -maxdepth 4 -type f -name "train_sample_balanced"
   exit 1
 }
 
 # Run the script
-python "scripts/ML/training_preprocessing/sample_preprocessing_balanced"
+python "scripts/ML/training/train_sample_balanced"
 
-echo "Balanced sample preprocessing script finished."
+echo "Train sample balanced script finished."
 
