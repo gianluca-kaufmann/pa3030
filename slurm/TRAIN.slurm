@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=merge-total-optimized
+#SBATCH --job-name=compute-panel-statistics
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=15G
-#SBATCH --output=/cluster/scratch/%u/logs/merge_total_optimized_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/merge_total_optimized_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/compute_panel_statistics_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/compute_panel_statistics_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -15,6 +15,7 @@ mkdir -p "$SCRATCH/data"
 mkdir -p "$SCRATCH/data/ml"
 mkdir -p "$SCRATCH/outputs"
 mkdir -p "$SCRATCH/outputs/Tables"
+mkdir -p "$SCRATCH/wandb/consistency"
 
 #------------------------------------------------------------------------------
 # Load modules
@@ -35,19 +36,19 @@ source "$VENV_DIR/bin/activate"
 #------------------------------------------------------------------------------
 # Run the script
 #------------------------------------------------------------------------------
-echo "Starting merge total optimized script..."
+echo "Starting compute panel statistics script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/merging/merge_total_optimized" ] || {
-  echo "ERROR: merge_total_optimized not found under scripts/merging"
-  find scripts -maxdepth 3 -type f -name "merge_total_optimized"
+[ -f "scripts/consistency checks/compute_panel_statistics" ] || {
+  echo "ERROR: compute_panel_statistics not found under scripts/consistency checks"
+  find scripts -maxdepth 3 -type f -name "compute_panel_statistics"
   exit 1
 }
 
 # Run the script
-python "scripts/merging/merge_total_optimized"
+python "scripts/consistency checks/compute_panel_statistics"
 
-echo "Merge total optimized script finished."
+echo "Compute panel statistics script finished."
