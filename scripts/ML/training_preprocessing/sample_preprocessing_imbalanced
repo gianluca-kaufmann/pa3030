@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 
-"""Realistic Ratio Sampling Script
+"""Realistic Ratio Sampling Script (Optimized)
 
 Purpose: Build an evaluation dataset that preserves true class distribution.
-Input:  merged_panel_final.parquet
-Process: Create lagged WDPA column, identify 0→1 transitions, sample ~10M rows 
-         with realistic class ratio, keep only numeric features.
+Input:  merged_panel_final.parquet (with transition_01 column pre-computed)
+Process: Sample transitions on minimal columns, then read full features for sampled rows.
+         Sample ~10M rows with realistic class ratio, keep only numeric features.
 Output: sample_training_imbalanced.parquet
+
+Key optimization: Work with minimal columns for sampling, then filter full features.
 """
 
 from __future__ import annotations
@@ -56,7 +58,6 @@ def main() -> None:
     input_path = repo_root / "data/ml/merged_panel_final.parquet"
     output_path = repo_root / "data/ml/sample_training_imbalanced.parquet"
     temp_dir = repo_root / "data/ml/temp"
-    temp_transitions = temp_dir / "temp_transitions_imbalanced.parquet"
     
     try:
         
@@ -71,24 +72,38 @@ def main() -> None:
         
         # Initialize DuckDB with memory-efficient settings
         con = duckdb.connect()
-        num_threads = 8 if os.environ.get("SCRATCH") else 4
+        
+        # Euler cluster: 128GB nodes, use 48 cores and 100GB memory
+        # Local: more conservative 4 cores and 16GB
+        is_euler = bool(os.environ.get("SCRATCH"))
+        num_threads = 48 if is_euler else 4
+        memory_limit_gb = 100 if is_euler else 16
+        
         con.execute(f"SET threads={num_threads}")
         con.execute("SET preserve_insertion_order=false")
-        con.execute("SET memory_limit='80GB'")  # Leave headroom on 128GB system
+        con.execute(f"SET memory_limit='{memory_limit_gb}GB'")
         
-        # Use SCRATCH temp directory if on Euler
+        # Use SCRATCH temp directory if on Euler, otherwise local temp dir
         temp_dir_env = os.environ.get("SCRATCH") or str(temp_dir)
-        con.execute(f"SET temp_directory='{temp_dir_env}/duckdb_temp'")
-        con.execute("PRAGMA max_temp_directory_size='100GB'")
+        # Escape single quotes for SQL literal (handles paths like "Master's Thesis")
+        temp_dir_sql = temp_dir_env.replace("'", "''")
+        con.execute(f"SET temp_directory='{temp_dir_sql}/duckdb_temp'")
         
-        print(f"DuckDB configured: {num_threads} threads, memory_limit=80GB")
+        if is_euler:
+            con.execute("PRAGMA max_temp_directory_size='200GB'")
         
-        wandb.log({"config/threads": num_threads, "config/memory_limit_gb": 80})
+        print(f"DuckDB configured: {num_threads} threads, memory_limit={memory_limit_gb}GB")
+        print(f"Running on: {'Euler cluster' if is_euler else 'local machine'}")
+        
+        wandb.log({
+            "config/threads": num_threads, 
+            "config/memory_limit_gb": memory_limit_gb,
+            "config/is_euler": is_euler
+        })
         
         # Escape paths for SQL
         escaped_in = str(input_path).replace("'", "''")
         escaped_out = str(output_path).replace("'", "''")
-        escaped_temp = str(temp_transitions).replace("'", "''")
         
         # Step 1: Get column information - identify numeric columns
         print("\nStep 1: Identifying numeric columns...")
@@ -98,7 +113,7 @@ def main() -> None:
         schema = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{escaped_in}')").fetchall()
         
         # Always keep these columns
-        core_columns = {'row', 'col', 'year'}
+        core_columns = {'row', 'col', 'year', 'transition_01'}
         
         # Identify numeric columns (excluding core columns which we handle separately)
         numeric_types = {'BIGINT', 'INTEGER', 'DOUBLE', 'FLOAT', 'DECIMAL', 'HUGEINT', 'UBIGINT'}
@@ -123,39 +138,23 @@ def main() -> None:
         step1_time = time.time() - step1_start
         print(f"Completed in {step1_time:.1f}s")
         
-        # Step 2: Create lagged WDPA and compute transitions
-        print("\nStep 2: Computing lagged WDPA and transitions (self-join)...")
-        print("   Using self-join instead of window functions for memory efficiency")
+        # Step 2: Read minimal columns for transition analysis
+        print("\nStep 2: Reading minimal columns (row, col, year, transition_01)...")
+        print("   Avoiding full feature set (75GB+) for sampling decision")
+        print("   Note: First year has transition_01=0 by design, included in negatives")
         step2_start = time.time()
         
-        # Build SELECT clause for numeric columns only
-        numeric_select = ", ".join([f"curr.{col}" for col in numeric_columns])
+        # Create temporary file with minimal columns only
+        # No need to filter by year - transition_01 column already excludes first year's transitions
+        temp_minimal = temp_dir / "temp_minimal_imbalanced.parquet"
+        escaped_minimal = str(temp_minimal).replace("'", "''")
         
-        # Self-join approach: much more memory-efficient than LAG()
-        transition_query = f"""
-        SELECT 
-            curr.row,
-            curr.col,
-            curr.year,
-            {numeric_select},
-            COALESCE(prev.WDPA_b1, 0) AS WDPA_prev,
-            CASE 
-                WHEN COALESCE(prev.WDPA_b1, 0) = 0 AND COALESCE(curr.WDPA_b1, 0) = 1 THEN 1
-                ELSE 0
-            END AS transition_01
-        FROM read_parquet('{escaped_in}') AS curr
-        LEFT JOIN read_parquet('{escaped_in}') AS prev
-            ON curr.row = prev.row 
-            AND curr.col = prev.col 
-            AND prev.year = curr.year - 1
-        WHERE prev.year IS NOT NULL
-        """
-        
-        # Materialize to temporary file to avoid memory overflow
-        print(f"   Materializing to temporary file: {temp_transitions}")
         con.execute(f"""
-            COPY ({transition_query})
-            TO '{escaped_temp}'
+            COPY (
+                SELECT row, col, year, transition_01
+                FROM read_parquet('{escaped_in}')
+            )
+            TO '{escaped_minimal}'
             (FORMAT PARQUET, COMPRESSION ZSTD)
         """)
         
@@ -163,8 +162,8 @@ def main() -> None:
         print(f"Completed in {step2_time:.1f}s ({step2_time/60:.1f} min)")
         wandb.log({"timing/step2_seconds": step2_time, "timing/step2_minutes": step2_time/60})
         
-        # Step 3: Count positives and negatives from temporary file
-        print("\nStep 3: Analyzing class distribution...")
+        # Step 3: Count positives and negatives from minimal columns
+        print("\nStep 3: Analyzing class distribution from minimal columns...")
         step3_start = time.time()
         
         counts = con.execute(f"""
@@ -174,16 +173,16 @@ def main() -> None:
                 COUNT(*) AS total,
                 MIN(year) AS year_min,
                 MAX(year) AS year_max
-            FROM read_parquet('{escaped_temp}')
+            FROM read_parquet('{escaped_minimal}')
         """).fetchone()
         
         positives, negatives, total, year_min, year_max = counts
         true_positive_ratio = positives / total if total > 0 else 0
         
-        print(f"   Total rows (with lagged data): {total:,}")
-        print(f"   Positive transitions (0→1):    {positives:,} ({true_positive_ratio*100:.4f}%)")
-        print(f"   Negative transitions:          {negatives:,} ({(1-true_positive_ratio)*100:.4f}%)")
-        print(f"   Year range:                    {year_min}–{year_max}")
+        print(f"   Total rows (with transition labels): {total:,}")
+        print(f"   Positive transitions (0→1):          {positives:,} ({true_positive_ratio*100:.4f}%)")
+        print(f"   Negative transitions:                {negatives:,} ({(1-true_positive_ratio)*100:.4f}%)")
+        print(f"   Year range:                          {year_min}–{year_max}")
         
         step3_time = time.time() - step3_start
         wandb.log({
@@ -227,76 +226,79 @@ def main() -> None:
             "sampling/preserved_ratio": sample_positives / total_sample if total_sample > 0 else 0,
         })
         
-        # Step 5: Sample and write output (separate sampling for each class)
-        print("\nStep 5: Sampling and combining with shuffle...")
+        # Step 5: Sample on minimal columns to get (row, col, year) keys
+        print("\nStep 5: Sampling on minimal columns to identify rows to keep...")
         step5_start = time.time()
         
-        # Create temporary files for each class
-        temp_positives = temp_dir / "temp_positives_imbalanced.parquet"
-        temp_negatives = temp_dir / "temp_negatives_imbalanced.parquet"
-        escaped_pos = str(temp_positives).replace("'", "''")
-        escaped_neg = str(temp_negatives).replace("'", "''")
+        # Create temporary file for sampled keys
+        temp_sampled_keys = temp_dir / "temp_sampled_keys_imbalanced.parquet"
+        escaped_keys = str(temp_sampled_keys).replace("'", "''")
         
-        # Sample positives first
-        print(f"   Sampling {sample_positives:,} positive transitions...")
+        # Sample positives and negatives, keep only keys (row, col, year)
+        print(f"   Sampling {sample_positives:,} positives + {sample_negatives:,} negatives (keys only)...")
         con.execute(f"""
             COPY (
-                SELECT *
+                SELECT row, col, year
                 FROM (
-                    SELECT *
-                    FROM read_parquet('{escaped_temp}')
+                    SELECT row, col, year
+                    FROM read_parquet('{escaped_minimal}')
                     WHERE transition_01 = 1
                 )
                 USING SAMPLE reservoir({sample_positives} ROWS) REPEATABLE ({RANDOM_STATE})
-            )
-            TO '{escaped_pos}'
-            (FORMAT PARQUET, COMPRESSION ZSTD)
-        """)
-        
-        # Sample negatives
-        print(f"   Sampling {sample_negatives:,} negative transitions...")
-        con.execute(f"""
-            COPY (
-                SELECT *
+                
+                UNION ALL
+                
+                SELECT row, col, year
                 FROM (
-                    SELECT *
-                    FROM read_parquet('{escaped_temp}')
+                    SELECT row, col, year
+                    FROM read_parquet('{escaped_minimal}')
                     WHERE transition_01 = 0
                 )
                 USING SAMPLE reservoir({sample_negatives} ROWS) REPEATABLE ({RANDOM_STATE})
             )
-            TO '{escaped_neg}'
+            TO '{escaped_keys}'
             (FORMAT PARQUET, COMPRESSION ZSTD)
         """)
         
-        # Combine both samples with shuffle and write to final output
-        print(f"   Combining samples with shuffle into final output...")
+        step5_time = time.time() - step5_start
+        print(f"Sampled keys in {step5_time:.1f}s")
+        wandb.log({"timing/step5_seconds": step5_time})
+        
+        # Step 6: Join sampled keys with full feature set (numeric columns only)
+        print("\nStep 6: Reading numeric features for sampled rows only...")
+        print(f"   This reads only ~{total_sample:,} rows from the full feature set")
+        step6_start = time.time()
+        
+        # Build SELECT clause for numeric columns
+        numeric_select = ", ".join([f"full.{col}" for col in numeric_columns])
+        
+        # Join sampled keys with full dataset (numeric columns only)
         con.execute(f"""
             COPY (
-                SELECT * FROM (
-                    SELECT * FROM read_parquet('{escaped_pos}')
-                    UNION ALL
-                    SELECT * FROM read_parquet('{escaped_neg}')
-                )
+                SELECT full.row, full.col, full.year, {numeric_select}, full.transition_01
+                FROM read_parquet('{escaped_in}') AS full
+                INNER JOIN read_parquet('{escaped_keys}') AS keys
+                    ON full.row = keys.row 
+                    AND full.col = keys.col 
+                    AND full.year = keys.year
                 ORDER BY random()
             )
             TO '{escaped_out}'
             (FORMAT PARQUET, COMPRESSION ZSTD)
         """)
         
-        step5_time = time.time() - step5_start
-        print(f"Written to {output_path} in {step5_time:.1f}s ({step5_time/60:.1f} min)")
-        wandb.log({"timing/step5_seconds": step5_time, "timing/step5_minutes": step5_time/60})
+        step6_time = time.time() - step6_start
+        print(f"Written numeric features to {output_path} in {step6_time:.1f}s ({step6_time/60:.1f} min)")
+        wandb.log({"timing/step6_seconds": step6_time, "timing/step6_minutes": step6_time/60})
         
         # Clean up temporary files
-        print("Cleaning up temporary files...")
-        temp_transitions.unlink(missing_ok=True)
-        temp_positives.unlink(missing_ok=True)
-        temp_negatives.unlink(missing_ok=True)
+        print("\nCleaning up temporary files...")
+        temp_minimal.unlink(missing_ok=True)
+        temp_sampled_keys.unlink(missing_ok=True)
         print("Temporary files removed")
         
-        # Step 6: Verify output
-        print("\nStep 6: Verifying output...")
+        # Step 7: Verify output
+        print("\nStep 7: Verifying output...")
         
         verify_counts = con.execute(f"""
             SELECT 
@@ -364,9 +366,8 @@ def main() -> None:
         # Clean up temporary files in case of error
         try:
             cleanup_files = [
-                temp_transitions,
-                temp_dir / "temp_positives_imbalanced.parquet",
-                temp_dir / "temp_negatives_imbalanced.parquet"
+                temp_dir / "temp_minimal_imbalanced.parquet",
+                temp_dir / "temp_sampled_keys_imbalanced.parquet"
             ]
             cleaned = False
             for f in cleanup_files:

@@ -91,22 +91,59 @@ def main():
         f.write("-" * 80 + "\n")
         f.write(f"{'Column Name':<50} {'Data Type':<30}\n")
         f.write("-" * 80 + "\n")
-        
-        for col_name in stats['columns']['names']:
-            col_type = stats['columns']['types'].get(col_name, 'Unknown')
+
+        # Support both old and new statistics schema
+        column_section = stats.get('columns', {})
+        col_names = column_section.get('names') or column_section.get('all') or []
+        col_types = column_section.get('types', {})
+
+        for col_name in col_names:
+            col_type = col_types.get(col_name, 'Unknown')
             f.write(f"{col_name:<50} {col_type:<30}\n")
-        
-        f.write(f"\nNumeric columns: {stats['columns']['num_numeric']}\n")
+
+        num_numeric = (
+            column_section.get('num_numeric')
+            if 'num_numeric' in column_section
+            else column_section.get('numeric_count', len(stats.get('numeric_statistics', {})))
+        )
+        f.write(f"\nNumeric columns: {num_numeric}\n")
         f.write("\n")
         
-        # 3. Unique Values
-        print("3. Unique values...")
-        f.write("3. UNIQUE VALUES\n")
+        # 3. Unique Values / Structure
+        print("3. Unique values / structure...")
+        f.write("3. UNIQUE VALUES / STRUCTURE\n")
         f.write("-" * 80 + "\n")
-        f.write(f"Pixel identifier: {stats['pixels']['pixel_identifier']}\n")
-        f.write(f"Unique pixels: {format_number(stats['pixels']['unique_pixels'])}\n")
-        f.write(f"Unique years: {stats['years']['num_unique_years']}\n")
-        f.write(f"Year range: {min(stats['years']['unique_years'])} - {max(stats['years']['unique_years'])}\n")
+
+        # Handle both old and new schema
+        if 'years' in stats:
+            # Old schema
+            unique_years = stats['years'].get('unique_years', [])
+            num_unique_years = stats['years'].get('num_unique_years', len(unique_years))
+        elif 'structure' in stats:
+            # New schema
+            unique_years = stats['structure'].get('years', [])
+            num_unique_years = stats['structure'].get('num_years', len(unique_years))
+        else:
+            unique_years = []
+            num_unique_years = 0
+
+        if 'pixels' in stats:
+            # Old schema
+            f.write(f"Pixel identifier: {stats['pixels'].get('pixel_identifier', '(row, col)')}\n")
+            f.write(f"Unique pixels: {format_number(stats['pixels'].get('unique_pixels', 0))}\n")
+        elif 'structure' in stats:
+            # New lightweight schema
+            structure = stats['structure']
+            f.write(f"Pixel identifier: (row, col)\n")
+            f.write(f"Estimated pixels: {format_number(structure.get('estimated_pixels', 0))}\n")
+        else:
+            f.write("Pixel information: not available\n")
+
+        if unique_years:
+            f.write(f"Unique years: {num_unique_years}\n")
+            f.write(f"Year range: {min(unique_years)} - {max(unique_years)}\n")
+        else:
+            f.write("Year information: not available\n")
         f.write("\n")
         
         # 4. Rows Per Year
@@ -117,33 +154,66 @@ def main():
         f.write("-" * 80 + "\n")
         
         total_rows = stats['metadata']['total_rows']
-        for year in sorted(stats['years']['unique_years']):
-            count = stats['years']['year_counts'].get(str(year), 0)
+        
+        # Handle both old and new schema
+        if 'years' in stats:
+            # Old schema
+            unique_years = stats['years']['unique_years']
+            year_counts = stats['years']['year_counts']
+        elif 'structure' in stats:
+            # New schema
+            unique_years = stats['structure']['years']
+            year_counts = stats['structure'].get('rows_per_year_estimate', {})
+        else:
+            unique_years = []
+            year_counts = {}
+        
+        for year in sorted(unique_years):
+            count = year_counts.get(str(year), year_counts.get(year, 0))
             pct = format_percentage(count, total_rows)
             f.write(f"{year:<10} {format_number(count):<20} {pct:<15}\n")
         f.write("\n")
         
-        # 5. Uniqueness Check
-        print("5. Uniqueness check...")
-        f.write("5. UNIQUENESS CHECK\n")
+        # 5. Uniqueness / Balance Check
+        print("5. Uniqueness / balance check...")
+        f.write("5. UNIQUENESS / BALANCE CHECK\n")
         f.write("-" * 80 + "\n")
-        
-        unique_info = stats['uniqueness']
-        f.write(f"Unique pixels: {format_number(unique_info['unique_pixels'])}\n")
-        f.write(f"Unique years: {unique_info['unique_years']}\n")
-        f.write(f"Expected rows (pixels × years): {format_number(unique_info['expected_rows'])}\n")
-        f.write(f"Actual rows: {format_number(unique_info['actual_rows'])}\n")
-        
-        if unique_info['is_unique']:
-            f.write("\n✓ All (pixel, year) pairs are unique\n")
-            f.write(f"  ({format_number(unique_info['actual_rows'])} unique combinations)\n")
-        else:
-            f.write(f"\n✗ WARNING: Potential duplicate or missing (pixel, year) pairs!\n")
-            f.write(f"  Difference: {format_number(unique_info['difference'])} rows\n")
-            if unique_info['actual_rows'] > unique_info['expected_rows']:
-                f.write(f"  → More rows than expected (possible duplicates)\n")
+
+        if 'uniqueness' in stats:
+            # Old schema
+            unique_info = stats['uniqueness']
+            f.write(f"Unique pixels: {format_number(unique_info['unique_pixels'])}\n")
+            f.write(f"Unique years: {unique_info['unique_years']}\n")
+            f.write(f"Expected rows (pixels × years): {format_number(unique_info['expected_rows'])}\n")
+            f.write(f"Actual rows: {format_number(unique_info['actual_rows'])}\n")
+
+            if unique_info['is_unique']:
+                f.write("\n✓ All (pixel, year) pairs are unique\n")
+                f.write(f"  ({format_number(unique_info['actual_rows'])} unique combinations)\n")
             else:
-                f.write(f"  → Fewer rows than expected (missing combinations)\n")
+                f.write(f"\n✗ WARNING: Potential duplicate or missing (pixel, year) pairs!\n")
+                f.write(f"  Difference: {format_number(unique_info['difference'])} rows\n")
+                if unique_info['actual_rows'] > unique_info['expected_rows']:
+                    f.write(f"  → More rows than expected (possible duplicates)\n")
+                else:
+                    f.write(f"  → Fewer rows than expected (missing combinations)\n")
+        elif 'structure' in stats:
+            # New lightweight schema (estimated structure only)
+            structure = stats['structure']
+            est_pixels = structure.get('estimated_pixels', 0)
+            num_years = structure.get('num_years', 0)
+            expected_rows = structure.get('expected_rows', est_pixels * num_years)
+            actual_rows = structure.get('actual_rows', stats['metadata']['total_rows'])
+            is_balanced = structure.get('is_balanced', True)
+
+            f.write(f"Estimated pixels: {format_number(est_pixels)}\n")
+            f.write(f"Years: {num_years}\n")
+            f.write(f"Expected rows (pixels × years): {format_number(expected_rows)}\n")
+            f.write(f"Actual rows: {format_number(actual_rows)}\n")
+            f.write(f"Balanced across years (sample-based): {'Yes' if is_balanced else 'No'}\n")
+            f.write("\nNote: This section is based on sampling and provides an approximate check.\n")
+        else:
+            f.write("No uniqueness / structure information available.\n")
         f.write("\n")
         
         # 6. Missing Values
@@ -152,20 +222,31 @@ def main():
         f.write("-" * 80 + "\n")
         f.write(f"{'Column Name':<50} {'Missing':<20} {'Percentage':<15}\n")
         f.write("-" * 80 + "\n")
-        
-        missing_counts = stats['missing_values']
+
+        missing_section = stats.get('missing_values', {})
+        if isinstance(missing_section, dict) and 'details' in missing_section:
+            # New schema: based on sample
+            missing_counts = missing_section.get('details', {})
+            denom = missing_section.get('sample_rows', total_rows)
+        else:
+            # Old schema: full counts
+            missing_counts = missing_section
+            denom = total_rows
+
         cols_with_missing = 0
-        
-        for col in stats['columns']['names']:
+
+        for col in col_names:
             missing = missing_counts.get(col, 0)
-            pct = format_percentage(missing, total_rows)
-            
+            pct = format_percentage(missing, denom)
+
             if missing > 0:
                 cols_with_missing += 1
-            
+
             f.write(f"{col:<50} {format_number(missing):<20} {pct:<15}\n")
-        
+
         f.write(f"\nSummary: {cols_with_missing} columns have missing values\n")
+        if isinstance(missing_section, dict) and 'details' in missing_section:
+            f.write("Note: Missing value statistics are based on sampled row groups.\n")
         f.write("\n")
         
         # 7. Numeric Statistics
@@ -174,58 +255,68 @@ def main():
         f.write("-" * 80 + "\n")
         f.write(f"{'Column Name':<40} {'Min':<18} {'Max':<18} {'Mean':<18}\n")
         f.write("-" * 80 + "\n")
-        
-        numeric_stats = stats['numeric_statistics']
-        
-        for col in stats['columns']['numeric_columns']:
+
+        numeric_stats = stats.get('numeric_statistics', {})
+
+        numeric_cols = (
+            stats['columns'].get('numeric_columns')
+            if 'columns' in stats and 'numeric_columns' in stats['columns']
+            else list(numeric_stats.keys())
+        )
+
+        for col in numeric_cols:
             if col in numeric_stats:
                 col_stats = numeric_stats[col]
-                min_val = col_stats['min']
-                max_val = col_stats['max']
-                mean_val = col_stats['mean']
-                
+                min_val = col_stats.get('min')
+                max_val = col_stats.get('max')
+                mean_val = col_stats.get('mean')
+
                 # Format values
-                if min_val is not None and isinstance(min_val, (int, float)):
+                if isinstance(min_val, (int, float)):
                     min_str = f"{min_val:.6f}" if isinstance(min_val, float) else str(min_val)
                 else:
                     min_str = "N/A"
-                
-                if max_val is not None and isinstance(max_val, (int, float)):
+
+                if isinstance(max_val, (int, float)):
                     max_str = f"{max_val:.6f}" if isinstance(max_val, float) else str(max_val)
                 else:
                     max_str = "N/A"
-                
-                if mean_val is not None and isinstance(mean_val, (int, float)):
+
+                if isinstance(mean_val, (int, float)):
                     mean_str = f"{mean_val:.6f}" if isinstance(mean_val, float) else str(mean_val)
                 else:
                     mean_str = "N/A"
-                
+
                 f.write(f"{col:<40} {min_str:<18} {max_str:<18} {mean_str:<18}\n")
-        
+
         f.write(f"\nTotal numeric columns: {len(numeric_stats)}\n")
         f.write("\n")
-        
-        # 8. Static Variables
+
+        # 8. Static Variables (optional)
         print("8. Static variables...")
         f.write("8. STATIC VARIABLES (Constant Across Years)\n")
         f.write("-" * 80 + "\n")
-        
-        static_info = stats['static_variables']
-        
-        if not static_info['enabled']:
+
+        static_info = stats.get('static_variables')
+
+        if static_info is None:
+            f.write("Static variable analysis not available in current statistics file.\n")
+        elif not static_info.get('enabled', False):
             f.write("Static variable detection was disabled during computation.\n")
             f.write("To enable, set CHECK_STATIC_VARS=True in compute_panel_statistics script.\n")
         else:
-            f.write(f"Total static variables found: {static_info['count']}\n\n")
-            
-            if static_info['count'] > 0:
+            count = static_info.get('count', 0)
+            vars_list = static_info.get('variables', [])
+            f.write(f"Total static variables found: {count}\n\n")
+
+            if count > 0 and vars_list:
                 f.write("Static columns (constant across all years for each pixel):\n")
-                for var in static_info['variables']:
+                for var in vars_list:
                     f.write(f"  - {var}\n")
             else:
                 f.write("No static variables detected.\n")
                 f.write("All feature columns vary across years within at least some pixels.\n")
-        
+
         f.write("\n")
         
         # Footer
@@ -241,25 +332,67 @@ def main():
     print("=" * 80)
     print(f"Total rows: {format_number(stats['metadata']['total_rows'])}")
     print(f"Total columns: {stats['metadata']['total_columns']}")
-    print(f"Numeric columns: {stats['columns']['num_numeric']}")
-    print(f"Unique pixels: {format_number(stats['pixels']['unique_pixels'])}")
-    print(f"Unique years: {stats['years']['num_unique_years']} (range: {min(stats['years']['unique_years'])}-{max(stats['years']['unique_years'])})")
     
-    # Uniqueness
-    if stats['uniqueness']['is_unique']:
-        print("✓ All (pixel, year) pairs are unique")
-    else:
-        print("✗ WARNING: Potential uniqueness issues detected!")
+    # Numeric columns
+    column_section = stats.get('columns', {})
+    num_numeric = (
+        column_section.get('num_numeric') or
+        column_section.get('numeric_count') or
+        len(stats.get('numeric_statistics', {}))
+    )
+    print(f"Numeric columns: {num_numeric}")
     
-    # Missing values
-    cols_with_missing = sum(1 for v in stats['missing_values'].values() if v > 0)
-    print(f"Columns with missing values: {cols_with_missing}/{stats['metadata']['total_columns']}")
+    # Pixels - handle both schemas
+    if 'pixels' in stats:
+        print(f"Unique pixels: {format_number(stats['pixels']['unique_pixels'])}")
+    elif 'structure' in stats:
+        print(f"Estimated pixels: {format_number(stats['structure'].get('estimated_pixels', 0))}")
     
-    # Static variables
-    if stats['static_variables']['enabled']:
-        print(f"Static variables: {stats['static_variables']['count']}")
-    else:
-        print("Static variables: Not computed")
+    # Years - handle both schemas
+    if 'years' in stats:
+        unique_years = stats['years']['unique_years']
+        num_unique_years = stats['years']['num_unique_years']
+        print(f"Unique years: {num_unique_years} (range: {min(unique_years)}-{max(unique_years)})")
+    elif 'structure' in stats:
+        unique_years = stats['structure'].get('years', [])
+        num_years = stats['structure'].get('num_years', len(unique_years))
+        if unique_years:
+            print(f"Years: {num_years} (range: {min(unique_years)}-{max(unique_years)})")
+    
+    # Uniqueness - handle both schemas
+    if 'uniqueness' in stats:
+        if stats['uniqueness']['is_unique']:
+            print("✓ All (pixel, year) pairs are unique")
+        else:
+            print("✗ WARNING: Potential uniqueness issues detected!")
+    elif 'structure' in stats:
+        structure = stats['structure']
+        expected = structure.get('expected_rows', 0)
+        actual = structure.get('actual_rows', 0)
+        is_balanced = structure.get('is_balanced', False)
+        if abs(expected - actual) / actual < 0.01 if actual > 0 else True:
+            print("✓ Row counts appear consistent with structure")
+        print(f"Balanced across years: {'Yes' if is_balanced else 'No'}")
+    
+    # Missing values - handle both schemas
+    if 'missing_values' in stats:
+        missing_vals = stats['missing_values']
+        if isinstance(missing_vals, dict):
+            if 'details' in missing_vals:
+                # New schema with details
+                cols_with_missing = missing_vals.get('columns_with_missing', 0)
+            else:
+                # Old schema - direct dict
+                cols_with_missing = sum(1 for v in missing_vals.values() if v > 0)
+            print(f"Columns with missing values: {cols_with_missing}/{stats['metadata']['total_columns']}")
+    
+    # Static variables - handle both schemas
+    static_info = stats.get('static_variables')
+    if static_info:
+        if static_info.get('enabled', False):
+            print(f"Static variables: {static_info.get('count', 0)}")
+        else:
+            print("Static variables: Not computed")
     
     print("\n" + "=" * 80)
     print(f"Full report saved to: {OUTPUT_TXT}")

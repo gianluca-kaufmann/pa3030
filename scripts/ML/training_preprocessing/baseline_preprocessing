@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 
-"""Baseline Sampling Script
+"""Baseline Sampling Script (Optimized)
 
 Purpose: create a lightweight subset for quick local experimentation.
 Input:  `data/ml/merged_panel_final.parquet`.
-Process: filter rows to `year == 2020`, then reservoir-sample up to 100k rows
-         without loading the whole parquet into memory (DuckDB COPY query).
+Process: filter rows to `year == 2020`, sample keys on minimal columns,
+         then read full features for sampled rows only.
 Output: `data/ml/sample_2020_100k.parquet`.
+
+Key optimization: Sample on minimal columns first, then read full features for sampled rows.
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import duckdb
@@ -24,38 +27,78 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     input_path = repo_root / "data/ml/merged_panel_final.parquet"
     output_path = repo_root / "data/ml/sample_2020_100k.parquet"
+    temp_dir = repo_root / "data/ml/temp"
 
     print(f"Sampling from {input_path} …")
     if not input_path.exists():
         raise FileNotFoundError(f"Missing source file: {input_path}")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_dir.mkdir(parents=True, exist_ok=True)
 
     escaped_in = str(input_path).replace("'", "''")
     escaped_out = str(output_path).replace("'", "''")
 
-    # Use a subquery to filter first, THEN sample from that filtered result
-    query = f"""
+    con = duckdb.connect()
+    
+    # Configure for Euler or local
+    is_euler = bool(os.environ.get("SCRATCH"))
+    num_threads = 48 if is_euler else 4
+    memory_limit_gb = 100 if is_euler else 16
+    
+    con.execute(f"SET threads={num_threads}")
+    con.execute(f"SET memory_limit='{memory_limit_gb}GB'")
+    
+    # Use SCRATCH temp directory if on Euler
+    if is_euler:
+        temp_dir_env = os.environ.get("SCRATCH")
+        temp_dir_sql = temp_dir_env.replace("'", "''")
+        con.execute(f"SET temp_directory='{temp_dir_sql}/duckdb_temp'")
+    
+    print(f"DuckDB configured: {num_threads} threads, memory_limit={memory_limit_gb}GB")
+    print(f"Running on: {'Euler cluster' if is_euler else 'local machine'}")
+
+    print(
+        f"\nFiltering to year == {SAMPLE_YEAR} and taking a "
+        f"reservoir sample of up to {SAMPLE_SIZE:,} rows …"
+    )
+    
+    # Step 1: Sample keys on minimal columns (much faster)
+    temp_keys = temp_dir / "temp_baseline_keys.parquet"
+    escaped_keys = str(temp_keys).replace("'", "''")
+    
+    print("Step 1: Sampling keys on minimal columns...")
+    con.execute(f"""
         COPY (
-            SELECT *
+            SELECT row, col, year
             FROM (
-                SELECT *
+                SELECT row, col, year
                 FROM read_parquet('{escaped_in}')
                 WHERE year = {SAMPLE_YEAR}
             ) AS filtered
             USING SAMPLE reservoir({SAMPLE_SIZE} ROWS) REPEATABLE ({RANDOM_STATE})
         )
+        TO '{escaped_keys}'
+        (FORMAT 'parquet');
+    """)
+    
+    # Step 2: Read full features for sampled rows only
+    print("Step 2: Reading full features for sampled rows...")
+    con.execute(f"""
+        COPY (
+            SELECT full.*
+            FROM read_parquet('{escaped_in}') AS full
+            INNER JOIN read_parquet('{escaped_keys}') AS keys
+                ON full.row = keys.row 
+                AND full.col = keys.col 
+                AND full.year = keys.year
+        )
         TO '{escaped_out}'
         (FORMAT 'parquet');
-    """
-
-    con = duckdb.connect()
-
-    print(
-        f"Filtering to year == {SAMPLE_YEAR} and taking a "
-        f"reservoir sample of up to {SAMPLE_SIZE:,} rows …"
-    )
-    con.execute(query)
+    """)
+    
+    # Clean up temp file
+    temp_keys.unlink(missing_ok=True)
 
     written = con.execute(
         f"SELECT count(*) FROM read_parquet('{escaped_out}')"

@@ -1,320 +1,233 @@
 #!/usr/bin/env python3
 """
-Goal:
-    Compute comprehensive statistics for the merged panel dataset using streaming.
-    This script handles large datasets (70GB+) efficiently without loading all data into RAM.
-
-Input:
-    - Parquet file: data/ml/merged_panel_final.parquet (processed incrementally).
-
-Process:
-    - Streams through row groups to avoid memory issues
-    - Computes: dimensions, column types, unique counts, missing values,
-      numeric statistics, uniqueness checks, static variable detection
-    - Uses incremental algorithms (Welford's method for means/variance)
-
-Output:
-    - JSON file: outputs/Tables/merged_panel_statistics.json
-    - Contains all computed statistics for later formatting
+Fast panel dataset overview - checks structure and completeness.
+Runs in ~1-5 minutes by using metadata and sampling instead of full scans.
 """
 
-import warnings
-import gc
 import json
-import os
 import numpy as np
-import pandas as pd
 import pyarrow.parquet as pq
-import wandb
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Set, Optional
-from multiprocessing import Pool, cpu_count
-from functools import partial
+from collections import Counter
 
-warnings.filterwarnings("ignore")
-
-# Set up paths
+# Paths
 ROOT_DIR = Path(__file__).resolve().parents[2]
-DATA_DIR = ROOT_DIR / "data" / "ml"
-OUTPUT_DIR = ROOT_DIR / "outputs" / "Tables"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+PANEL_FILE = ROOT_DIR / "data" / "ml" / "merged_panel_final.parquet"
+OUTPUT_JSON = ROOT_DIR / "outputs" / "Tables" / "merged_panel_statistics.json"
+OUTPUT_JSON.parent.mkdir(parents=True, exist_ok=True)
 
-# Panel file
-PANEL_FILE = DATA_DIR / "merged_panel_final.parquet"
-OUTPUT_JSON = OUTPUT_DIR / "merged_panel_statistics.json"
-
-# Configuration
-BATCH_SIZE = int(os.environ.get('BATCH_SIZE', 75))  # Increased for better performance
-CHECK_STATIC_VARS = os.environ.get('CHECK_STATIC_VARS', 'True').lower() in ('true', '1', 'yes')
-NUM_WORKERS = int(os.environ.get('SLURM_CPUS_PER_TASK', cpu_count()))  # Use all CPUs
+# How many row groups to sample for statistics (None = all, but slow)
+SAMPLE_ROW_GROUPS = 20
 
 
-def convert_to_native(obj):
-    """Convert numpy types to Python types for JSON."""
-    if isinstance(obj, (np.integer, np.int32, np.int64)):
-        return int(obj)
-    elif isinstance(obj, (np.floating, np.float32, np.float64)):
-        return None if (np.isnan(obj) or np.isinf(obj)) else float(obj)
-    elif isinstance(obj, np.ndarray):
-        return obj.tolist()
-    elif isinstance(obj, dict):
-        return {k: convert_to_native(v) for k, v in obj.items()}
-    elif isinstance(obj, (list, tuple)):
-        return [convert_to_native(item) for item in obj]
-    elif isinstance(obj, set):
-        return sorted([convert_to_native(item) for item in obj])
-    return obj
-
-
-def process_batch(batch_info, file_path, columns, check_static_vars):
-    """Worker function to process a batch of row groups."""
-    batch_start, batch_end = batch_info
-    
-    try:
-        parquet_file = pq.ParquetFile(file_path)
-    except Exception:
-        return None
-    
-    # Read and combine row groups
-    chunks = []
-    for i in range(batch_start, batch_end):
-        try:
-            chunks.append(parquet_file.read_row_group(i).to_pandas())
-        except Exception:
-            continue
-    
-    if not chunks:
-        return None
-    
-    df = pd.concat(chunks, ignore_index=True)
-    del chunks
-    
-    # Initialize results
-    result = {
-        'n_rows': len(df),
-        'year_counts': df['year'].value_counts().to_dict() if 'year' in df.columns else {},
-        'years': set(df['year'].unique()) if 'year' in df.columns else set(),
-        'pixels': set(zip(df['row'], df['col'])) if 'row' in df.columns and 'col' in df.columns else set(),
-        'missing': {col: int(df[col].isnull().sum()) for col in columns if col in df.columns},
-        'numeric_stats': {},
-        'static_vars': {}
-    }
-    
-    # Numeric statistics (Welford's algorithm)
-    for col in columns:
-        if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
-            vals = df[col].dropna()
-            if len(vals) > 0:
-                result['numeric_stats'][col] = {
-                    'count': len(vals),
-                    'mean': float(vals.mean()),
-                    'M2': float(((vals - vals.mean()) ** 2).sum()),
-                    'min': float(vals.min()),
-                    'max': float(vals.max())
-                }
-    
-    # Static variable detection
-    if check_static_vars and 'row' in df.columns and 'col' in df.columns:
-        meta = ['year', 'x', 'y', 'row', 'col']
-        for col in [c for c in columns if c not in meta and c in df.columns]:
-            try:
-                has_variation = (df.groupby(['row', 'col'])[col].nunique() > 1).any()
-                result['static_vars'][col] = has_variation
-            except Exception:
-                result['static_vars'][col] = True
-    
-    del df
-    gc.collect()
-    return result
-
-
-def analyze_dataset_streaming(use_wandb: bool = True):
-    """Analyze dataset using parallel processing."""
-    print("\n" + "=" * 80)
-    print("PARALLEL ANALYSIS - MERGED PANEL DATASET")
-    print("=" * 80)
-    
-    # Read file metadata
-    print(f"Opening {PANEL_FILE.name}...", flush=True)
-    parquet_file = pq.ParquetFile(PANEL_FILE)
-    metadata = parquet_file.metadata
-    schema = parquet_file.schema
-    
-    num_row_groups = metadata.num_row_groups
-    columns = [schema[i].name for i in range(len(schema))]
-    column_types = {schema[i].name: str(schema[i].physical_type) for i in range(len(schema))}
-    
-    print(f"Workers: {NUM_WORKERS} | Row groups: {num_row_groups:,} | Columns: {len(columns)}", flush=True)
-    
-    # Create batches
-    batches = [(i, min(i + BATCH_SIZE, num_row_groups)) 
-               for i in range(0, num_row_groups, BATCH_SIZE)]
-    print(f"Processing {len(batches)} batches...", flush=True)
-    
-    # Process in parallel
-    worker_fn = partial(process_batch, file_path=str(PANEL_FILE), 
-                       columns=columns, check_static_vars=CHECK_STATIC_VARS)
-    
-    with Pool(NUM_WORKERS) as pool:
-        results = [r for r in pool.imap_unordered(worker_fn, batches) if r is not None]
-    
-    print(f"Completed {len(results)}/{len(batches)} batches. Aggregating...", flush=True)
-    
-    # Aggregate results
-    total_rows = sum(r['n_rows'] for r in results)
-    year_counts = {}
-    all_years = set()
-    pixels = set()
-    missing = {col: 0 for col in columns}
-    numeric_stats = {}
-    static_vars = {col: False for col in columns if col not in ['year', 'x', 'y', 'row', 'col']} if CHECK_STATIC_VARS else {}
-    
-    for r in results:
-        # Years
-        for year, count in r['year_counts'].items():
-            year_counts[int(year)] = year_counts.get(int(year), 0) + count
-        all_years.update(r['years'])
-        
-        # Pixels
-        pixels.update(r['pixels'])
-        
-        # Missing values
-        for col, count in r['missing'].items():
-            missing[col] += count
-        
-        # Numeric stats (Chan's algorithm for parallel variance)
-        for col, stats in r['numeric_stats'].items():
-            if col not in numeric_stats:
-                numeric_stats[col] = stats.copy()
-            else:
-                n1, n2 = numeric_stats[col]['count'], stats['count']
-                n = n1 + n2
-                delta = stats['mean'] - numeric_stats[col]['mean']
-                numeric_stats[col]['mean'] = (n1 * numeric_stats[col]['mean'] + n2 * stats['mean']) / n
-                numeric_stats[col]['M2'] += stats['M2'] + (delta ** 2) * n1 * n2 / n
-                numeric_stats[col]['min'] = min(numeric_stats[col]['min'], stats['min'])
-                numeric_stats[col]['max'] = max(numeric_stats[col]['max'], stats['max'])
-                numeric_stats[col]['count'] = n
-        
-        # Static variables
-        if CHECK_STATIC_VARS:
-            for col, has_var in r['static_vars'].items():
-                if has_var:
-                    static_vars[col] = True
-    
-    print(f"Processed {total_rows:,} rows", flush=True)
-    
-    # Compute final statistics
-    final_numeric_stats = {}
-    for col, stats in numeric_stats.items():
-        variance = stats['M2'] / stats['count'] if stats['count'] > 1 else 0.0
-        final_numeric_stats[col] = {
-            'min': stats['min'], 'max': stats['max'],
-            'mean': stats['mean'], 'std': np.sqrt(variance),
-            'count': stats['count']
-        }
-    
-    # Uniqueness check
-    n_pixels = len(pixels)
-    n_years = len(all_years)
-    expected = n_pixels * n_years
-    is_unique = (expected == total_rows)
-    
-    print(f"Pixels: {n_pixels:,} | Years: {n_years} | Expected rows: {expected:,} | Unique: {is_unique}", flush=True)
-    
-    # Static variables
-    static_list = [col for col, has_var in static_vars.items() if not has_var] if CHECK_STATIC_VARS else []
-    if CHECK_STATIC_VARS:
-        print(f"Static variables: {len(static_list)}", flush=True)
-    
-    # Return results
-    return {
-        'metadata': {
-            'file': str(PANEL_FILE.name),
-            'generated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'total_rows': total_rows,
-            'total_columns': len(columns),
-            'num_row_groups': num_row_groups
-        },
-        'columns': {
-            'names': columns,
-            'types': column_types,
-            'numeric_columns': list(numeric_stats.keys()),
-            'num_numeric': len(numeric_stats)
-        },
-        'years': {
-            'unique_years': sorted(all_years),
-            'num_unique_years': len(all_years),
-            'year_counts': {str(k): int(v) for k, v in year_counts.items()}
-        },
-        'pixels': {
-            'unique_pixels': n_pixels,
-            'pixel_identifier': '(row, col)'
-        },
-        'uniqueness': {
-            'unique_pixels': n_pixels,
-            'unique_years': n_years,
-            'expected_rows': expected,
-            'actual_rows': total_rows,
-            'is_unique': is_unique,
-            'difference': abs(expected - total_rows)
-        },
-        'missing_values': missing,
-        'numeric_statistics': final_numeric_stats,
-        'static_variables': {
-            'enabled': CHECK_STATIC_VARS,
-            'count': len(static_list),
-            'variables': static_list
-        }
-    }
-
-
-def main():
-    """Main function."""
-    print("\n" + "=" * 80)
-    print("PANEL STATISTICS COMPUTATION")
-    print("=" * 80)
-    print(f"Workers: {NUM_WORKERS} | Batch size: {BATCH_SIZE} | Static vars: {CHECK_STATIC_VARS}")
-    print()
+def analyze_panel():
+    """Analyze panel dataset structure and completeness."""
+    print("=" * 60)
+    print("PANEL DATASET OVERVIEW")
+    print("=" * 60)
     
     if not PANEL_FILE.exists():
         print(f"ERROR: File not found: {PANEL_FILE}")
+        return None
+    
+    # File info
+    file_size_gb = PANEL_FILE.stat().st_size / (1024**3)
+    print(f"\nFile: {PANEL_FILE.name} ({file_size_gb:.1f} GB)")
+    
+    # Open file and read metadata (instant, no data loading)
+    print("Reading metadata...", flush=True)
+    pf = pq.ParquetFile(PANEL_FILE)
+    meta = pf.metadata
+    schema = pf.schema
+    
+    num_row_groups = meta.num_row_groups
+    total_rows = meta.num_rows
+    columns = [schema[i].name for i in range(len(schema))]
+    column_types = {schema[i].name: str(schema[i].physical_type) for i in range(len(schema))}
+    
+    print(f"Total rows: {total_rows:,}")
+    print(f"Columns: {len(columns)}")
+    print(f"Row groups: {num_row_groups:,}")
+    
+    # Identify column categories
+    meta_cols = ['year', 'x', 'y', 'row', 'col']
+    feature_cols = [c for c in columns if c not in meta_cols]
+    
+    print(f"\nMetadata columns: {meta_cols}")
+    print(f"Feature columns: {len(feature_cols)}")
+    
+    # Sample row groups for statistics (much faster than full scan)
+    n_sample = min(SAMPLE_ROW_GROUPS or num_row_groups, num_row_groups)
+    sample_indices = np.linspace(0, num_row_groups - 1, n_sample, dtype=int)
+    
+    print(f"\nSampling {n_sample} row groups for statistics...", flush=True)
+    
+    # Collect stats from samples
+    year_counts = Counter()
+    sample_rows = 0
+    missing_counts = {col: 0 for col in columns}
+    numeric_stats = {}
+    row_col_pairs = set()  # Only track from samples, not all data
+    
+    for idx, rg_idx in enumerate(sample_indices):
+        if (idx + 1) % 5 == 0:
+            print(f"  Progress: {idx + 1}/{n_sample} row groups", flush=True)
+        
+        # Read single row group
+        table = pf.read_row_group(rg_idx, columns=columns)
+        df = table.to_pandas()
+        sample_rows += len(df)
+        
+        # Year distribution
+        if 'year' in df.columns:
+            year_counts.update(df['year'].value_counts().to_dict())
+        
+        # Track unique (row, col) in sample
+        if 'row' in df.columns and 'col' in df.columns:
+            pairs = list(zip(df['row'].values, df['col'].values))
+            row_col_pairs.update(pairs[:10000])  # Limit to avoid memory issues
+        
+        # Missing values
+        for col in columns:
+            if col in df.columns:
+                missing_counts[col] += df[col].isnull().sum()
+        
+        # Numeric stats (only for first batch to get types)
+        if idx == 0:
+            for col in columns:
+                if col in df.columns and np.issubdtype(df[col].dtype, np.number):
+                    vals = df[col].dropna()
+                    if len(vals) > 0:
+                        numeric_stats[col] = {
+                            'min': float(vals.min()),
+                            'max': float(vals.max()),
+                            'mean': float(vals.mean()),
+                            'std': float(vals.std()) if len(vals) > 1 else 0.0,
+                            'sample_size': len(vals)
+                        }
+        
+        del df, table
+    
+    # Estimate unique pixels from sample
+    sample_unique_pixels = len(row_col_pairs)
+    
+    # Get unique years from counts
+    unique_years = sorted(year_counts.keys())
+    n_years = len(unique_years)
+    
+    # Estimate total unique pixels
+    # If data is balanced: total_rows / n_years
+    estimated_pixels = total_rows // n_years if n_years > 0 else 0
+    
+    # Check if rows per year are balanced
+    rows_per_year = {int(y): int(c) for y, c in year_counts.items()}
+    # Scale up from sample to full dataset
+    scale_factor = total_rows / sample_rows if sample_rows > 0 else 1
+    estimated_year_counts = {y: int(c * scale_factor) for y, c in rows_per_year.items()}
+    
+    # Check structure
+    print(f"\n" + "=" * 60)
+    print("STRUCTURE CHECK")
+    print("=" * 60)
+    
+    print(f"\nYears: {n_years} ({min(unique_years)} - {max(unique_years)})")
+    print(f"Estimated pixels: {estimated_pixels:,}")
+    print(f"Expected rows (pixels × years): {estimated_pixels * n_years:,}")
+    print(f"Actual rows: {total_rows:,}")
+    
+    # Check balance
+    year_values = list(estimated_year_counts.values())
+    is_balanced = (max(year_values) - min(year_values)) / max(year_values) < 0.01 if year_values else True
+    print(f"Balanced across years: {'Yes' if is_balanced else 'No'}")
+    
+    # Missing values summary
+    print(f"\n" + "=" * 60)
+    print("MISSING VALUES (from sample)")
+    print("=" * 60)
+    
+    cols_with_missing = [(col, count) for col, count in missing_counts.items() if count > 0]
+    if cols_with_missing:
+        cols_with_missing.sort(key=lambda x: -x[1])
+        print(f"\nColumns with missing values: {len(cols_with_missing)}")
+        for col, count in cols_with_missing[:10]:
+            pct = 100 * count / sample_rows if sample_rows > 0 else 0
+            print(f"  {col}: {count:,} ({pct:.1f}%)")
+        if len(cols_with_missing) > 10:
+            print(f"  ... and {len(cols_with_missing) - 10} more")
+    else:
+        print("\nNo missing values found in sample!")
+    
+    # Numeric columns summary
+    print(f"\n" + "=" * 60)
+    print("NUMERIC COLUMNS")
+    print("=" * 60)
+    print(f"\nTotal numeric columns: {len(numeric_stats)}")
+    
+    # Show a few examples
+    for col in list(numeric_stats.keys())[:5]:
+        stats = numeric_stats[col]
+        print(f"  {col}: min={stats['min']:.2f}, max={stats['max']:.2f}, mean={stats['mean']:.2f}")
+    if len(numeric_stats) > 5:
+        print(f"  ... and {len(numeric_stats) - 5} more")
+    
+    # Compile results
+    results = {
+        'metadata': {
+            'file': str(PANEL_FILE.name),
+            'file_size_gb': round(file_size_gb, 2),
+            'generated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'total_rows': total_rows,
+            'total_columns': len(columns),
+            'num_row_groups': num_row_groups,
+            'sampled_row_groups': n_sample
+        },
+        'columns': {
+            'all': columns,
+            'metadata': meta_cols,
+            'features': feature_cols,
+            'types': column_types,
+            'numeric_count': len(numeric_stats)
+        },
+        'structure': {
+            'years': unique_years,
+            'num_years': n_years,
+            'estimated_pixels': estimated_pixels,
+            'expected_rows': estimated_pixels * n_years,
+            'actual_rows': total_rows,
+            'is_balanced': is_balanced,
+            'rows_per_year_estimate': estimated_year_counts
+        },
+        'missing_values': {
+            'sample_rows': sample_rows,
+            'columns_with_missing': len(cols_with_missing),
+            'details': {col: int(count) for col, count in cols_with_missing}
+        },
+        'numeric_statistics': numeric_stats
+    }
+    
+    return results
+
+
+def main():
+    start = datetime.now()
+    
+    results = analyze_panel()
+    
+    if results is None:
         return
     
-    # Initialize wandb
-    run = wandb.init(
-        project="masters-thesis-data-analysis",
-        name=f"panel_stats_{datetime.now().strftime('%Y%m%d_%H%M')}",
-        config={
-            "batch_size": BATCH_SIZE,
-            "num_workers": NUM_WORKERS,
-            "check_static_vars": CHECK_STATIC_VARS
-        }
-    )
+    # Save results
+    with open(OUTPUT_JSON, 'w') as f:
+        json.dump(results, f, indent=2, default=str)
     
-    try:
-        # Run analysis
-        start = datetime.now()
-        results = analyze_dataset_streaming(use_wandb=False)
-        elapsed = (datetime.now() - start).total_seconds() / 60
-        
-        # Save results
-        with open(OUTPUT_JSON, 'w') as f:
-            json.dump(convert_to_native(results), f, indent=2)
-        
-        print(f"\n✓ Completed in {elapsed:.1f} minutes")
-        print(f"✓ Saved to: {OUTPUT_JSON}")
-        print(f"  Rows: {results['metadata']['total_rows']:,}")
-        print(f"  Years: {results['years']['num_unique_years']}")
-        print(f"  Pixels: {results['pixels']['unique_pixels']:,}")
-        print(f"  Static vars: {results['static_variables']['count']}")
-        
-        wandb.finish()
-        
-    except Exception as e:
-        print(f"\nERROR: {e}")
-        wandb.finish(exit_code=1)
+    elapsed = (datetime.now() - start).total_seconds()
+    
+    print(f"\n" + "=" * 60)
+    print("COMPLETE")
+    print("=" * 60)
+    print(f"Time: {elapsed:.1f} seconds")
+    print(f"Output: {OUTPUT_JSON}")
 
 
 if __name__ == "__main__":

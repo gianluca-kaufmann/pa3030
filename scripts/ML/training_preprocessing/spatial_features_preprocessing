@@ -2,15 +2,21 @@
 
 """Spatial Features Preprocessing Script
 
-Purpose: Add spatial features to the merged panel data:
-    1. Distance features: distance to nearest WDPA protected area pixel
-    2. Decay features: exp(-distance / 10000)
-    3. Smoothed features: 4x4, 16x16, 64x64 mean for specified variables
+Purpose: Add spatial and transition features to the merged panel data:
+    1. Transition features: WDPA_prev and transition_01 (0→1 transitions)
+       - For each year Y, join with year Y-1 to get previous WDPA status
+       - Compute transition_01 = (WDPA_prev==0 & WDPA_b1==1)
+       - Uses minimal columns (row, col, year, WDPA_b1) for memory efficiency
+    2. Distance features: distance to nearest WDPA protected area pixel
+    3. Decay features: exp(-distance / 10000)
+    4. Smoothed features: 4x4, 16x16, 64x64 mean for specified variables
 
 Input:  data/ml/merged_panel_2000_2024.parquet
-Output: data/ml/merged_panel_final.parquet
+Output: data/ml/merged_panel_final.parquet (with transition_01 column)
 
-Processing: Year-by-year and chunked for memory efficiency with 500M+ rows
+Processing: Year-by-year for memory efficiency with 500M+ rows.
+Transition detection is done here (not in sampling scripts) to avoid heavy
+joins on the full 75GB+ feature set later.
 """
 
 from __future__ import annotations
@@ -109,7 +115,49 @@ def compute_all_smooth_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def process_year(input_path: Path, year: int, temp_dir: Path) -> tuple[Path | None, dict]:
+def compute_transition_features(input_path: Path, year: int) -> pd.DataFrame:
+    """Compute WDPA_prev and transition_01 for a given year by joining with previous year."""
+    logger.info(f"  Computing transition features for year {year}...")
+    
+    # Read minimal columns for current year
+    df_curr = pd.read_parquet(
+        input_path, 
+        columns=['row', 'col', 'year', 'WDPA_b1'],
+        filters=[('year', '==', year)]
+    )
+    
+    # Read minimal columns for previous year
+    df_prev = pd.read_parquet(
+        input_path,
+        columns=['row', 'col', 'year', 'WDPA_b1'],
+        filters=[('year', '==', year - 1)]
+    )
+    
+    # Rename for join
+    df_prev = df_prev.rename(columns={'WDPA_b1': 'WDPA_prev'})
+    df_prev = df_prev.drop(columns=['year'])
+    
+    # Merge on spatial coordinates
+    df_merged = df_curr.merge(df_prev, on=['row', 'col'], how='left')
+    
+    # Fill missing with 0 (pixels that didn't exist in previous year)
+    df_merged['WDPA_prev'] = df_merged['WDPA_prev'].fillna(0)
+    
+    # Compute transition (0→1)
+    df_merged['transition_01'] = (
+        (df_merged['WDPA_prev'] == 0) & (df_merged['WDPA_b1'] == 1)
+    ).astype(np.uint8)
+    
+    # Keep only the new columns
+    result = df_merged[['row', 'col', 'WDPA_prev', 'transition_01']].copy()
+    
+    del df_curr, df_prev, df_merged
+    gc.collect()
+    
+    return result
+
+
+def process_year(input_path: Path, year: int, temp_dir: Path, is_first_year: bool) -> tuple[Path | None, dict]:
     """Process a single year and return temp file path + metrics."""
     start_time = time.time()
     logger.info(f"\nProcessing year {year}...")
@@ -120,6 +168,17 @@ def process_year(input_path: Path, year: int, temp_dir: Path) -> tuple[Path | No
     
     if n_rows == 0:
         return None, {}
+    
+    # Add transition features (except for first year)
+    if not is_first_year:
+        df_transitions = compute_transition_features(input_path, year)
+        df_year = df_year.merge(df_transitions, on=['row', 'col'], how='left')
+        del df_transitions
+        gc.collect()
+    else:
+        logger.info(f"  Skipping transition features for first year {year}")
+        df_year['WDPA_prev'] = 0
+        df_year['transition_01'] = 0
     
     df_year = compute_distance_features(df_year)
     df_year = compute_all_smooth_features(df_year)
@@ -179,9 +238,10 @@ def main() -> None:
     # Process year by year
     temp_files = []
     
-    for year in years:
+    for i, year in enumerate(years):
         try:
-            temp_file, metrics = process_year(input_path, year, temp_dir)
+            is_first_year = (i == 0)
+            temp_file, metrics = process_year(input_path, year, temp_dir, is_first_year)
             if temp_file is not None:
                 temp_files.append(temp_file)
                 wandb.log(metrics)
