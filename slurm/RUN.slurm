@@ -1,21 +1,21 @@
 #!/bin/bash
-#SBATCH --job-name=spatial-features-preprocessing
+#SBATCH --job-name=inspect-merged-total
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=15G
-#SBATCH --output=/cluster/scratch/%u/logs/spatial_features_preprocessing_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/spatial_features_preprocessing_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/inspect_merged_total_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/inspect_merged_total_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
 mkdir -p "$SCRATCH/logs"
 mkdir -p "$SCRATCH/data"
+mkdir -p "$SCRATCH/data/ml"
 mkdir -p "$SCRATCH/outputs"
-mkdir -p "$SCRATCH/outputs/Results"
 mkdir -p "$SCRATCH/outputs/Tables"
-mkdir -p "$SCRATCH/wandb/merge"
+mkdir -p "$SCRATCH/wandb/consistency"
 
 #------------------------------------------------------------------------------
 # Load modules
@@ -30,28 +30,25 @@ module load eth_proxy
 #------------------------------------------------------------------------------
 # Activate the Python virtual environment (uav-genAI-opti)
 #------------------------------------------------------------------------------
-VENV_DIR="$HOME/venv/master-thesis"
+VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Navigate to training script directory
+# Run the script
 #------------------------------------------------------------------------------
-
-#------------------------------------------------------------------------------
-# Run the training
-#------------------------------------------------------------------------------
-echo "Starting spatial features preprocessing script..."
+echo "Starting inspect merged total script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f scripts/ML/training_preprocessing/spatial_features_preprocessing ] || {
-  echo "ERROR: spatial_features_preprocessing not found under scripts/ML/training_preprocessing"
-  find scripts -maxdepth 3 -type f -name "spatial_features_preprocessing"
+[ -f "scripts/consistency checks/inspect_merged_total" ] || {
+  echo "ERROR: inspect_merged_total not found under scripts/consistency checks"
+  find scripts -maxdepth 3 -type f -name "inspect_merged_total"
   exit 1
 }
-# Run the script
-python scripts/ML/training_preprocessing/spatial_features_preprocessing
 
-echo "Spatial features preprocessing script finished."
+# Run the script
+python "scripts/consistency checks/inspect_merged_total"
+
+echo "Inspect merged total script finished."
