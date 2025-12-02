@@ -2,21 +2,19 @@
 
 """Spatial Features Preprocessing Script
 
-Purpose: Add spatial and transition features to the merged panel data:
-    1. Transition features: WDPA_prev and transition_01 (0→1 transitions)
-       - For each year Y, join with year Y-1 to get previous WDPA status
-       - Compute transition_01 = (WDPA_prev==0 & WDPA_b1==1)
-       - Uses minimal columns (row, col, year, WDPA_b1) for memory efficiency
-    2. Distance features: distance to nearest WDPA protected area pixel
-    3. Decay features: exp(-distance / 10000)
-    4. Smoothed features: 4x4, 16x16, 64x64 mean for specified variables
+Purpose: Add spatial and transition features to the merged panel data with Risk Set filtering:
+    1. Lag feature: WDPA_prev (1-year lag of WDPA_b1, default 0 for first year)
+    2. Risk Set filter: Keep only rows where WDPA_prev == 0 (pixels not previously protected)
+    3. Target variable: transition_01 = WDPA_b1 (simplified since WDPA_prev guaranteed to be 0)
+    4. Distance features: distance to nearest WDPA protected area pixel
+    5. Decay features: exp(-distance / 10000)
+    6. Smoothed features: 4x4, 16x16, 64x64 mean for specified variables
 
 Input:  data/ml/merged_panel_2000_2024.parquet
-Output: data/ml/merged_panel_final.parquet (with transition_01 column)
+Output: data/ml/merged_panel_final.parquet (Risk Set only, with transition_01 column)
 
 Processing: Year-by-year for memory efficiency with 500M+ rows.
-Transition detection is done here (not in sampling scripts) to avoid heavy
-joins on the full 75GB+ feature set later.
+Risk Set filtering significantly reduces output size by excluding already-protected pixels.
 """
 
 from __future__ import annotations
@@ -39,7 +37,7 @@ logger = logging.getLogger(__name__)
 warnings.filterwarnings('ignore')
 
 DISTANCE_DECAY_SCALE = 10000
-SMOOTH_VARIABLES = ['NDVI_b1', 'GPW_b1', 'VIIRS_b1', 'gdp_b1', 'deforestation_b1', 
+SMOOTH_VARIABLES = ['NDVI_b1', 'GPW_b1', 'HNTL_b1', 'gdp_b1', 'deforestation_b1', 
                      'wildfire_b1', 'GSN_b1', 'GSN_b2', 'GSN_b3', 'GSN_b4', 'GSN_b5']
 SMOOTH_SIZES = [4, 16, 64]
 
@@ -115,14 +113,14 @@ def compute_all_smooth_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def compute_transition_features(input_path: Path, year: int) -> pd.DataFrame:
-    """Compute WDPA_prev and transition_01 for a given year by joining with previous year."""
-    logger.info(f"  Computing transition features for year {year}...")
+def compute_lag_feature(input_path: Path, year: int) -> pd.DataFrame:
+    """Compute WDPA_prev (1-year lag) for a given year by joining with previous year."""
+    logger.info(f"  Computing lag feature (WDPA_prev) for year {year}...")
     
     # Read minimal columns for current year
     df_curr = pd.read_parquet(
         input_path, 
-        columns=['row', 'col', 'year', 'WDPA_b1'],
+        columns=['row', 'col', 'year'],
         filters=[('year', '==', year)]
     )
     
@@ -143,13 +141,8 @@ def compute_transition_features(input_path: Path, year: int) -> pd.DataFrame:
     # Fill missing with 0 (pixels that didn't exist in previous year)
     df_merged['WDPA_prev'] = df_merged['WDPA_prev'].fillna(0)
     
-    # Compute transition (0→1)
-    df_merged['transition_01'] = (
-        (df_merged['WDPA_prev'] == 0) & (df_merged['WDPA_b1'] == 1)
-    ).astype(np.uint8)
-    
-    # Keep only the new columns
-    result = df_merged[['row', 'col', 'WDPA_prev', 'transition_01']].copy()
+    # Keep only the new column
+    result = df_merged[['row', 'col', 'WDPA_prev']].copy()
     
     del df_curr, df_prev, df_merged
     gc.collect()
@@ -163,23 +156,36 @@ def process_year(input_path: Path, year: int, temp_dir: Path, is_first_year: boo
     logger.info(f"\nProcessing year {year}...")
     
     df_year = pd.read_parquet(input_path, filters=[('year', '==', year)], engine='pyarrow')
-    n_rows = len(df_year)
-    logger.info(f"  Loaded {n_rows:,} rows")
+    n_rows_initial = len(df_year)
+    logger.info(f"  Loaded {n_rows_initial:,} rows")
     
-    if n_rows == 0:
+    if n_rows_initial == 0:
         return None, {}
     
-    # Add transition features (except for first year)
+    # Step 1: Add WDPA_prev (1-year lag)
     if not is_first_year:
-        df_transitions = compute_transition_features(input_path, year)
-        df_year = df_year.merge(df_transitions, on=['row', 'col'], how='left')
-        del df_transitions
+        df_lag = compute_lag_feature(input_path, year)
+        df_year = df_year.merge(df_lag, on=['row', 'col'], how='left')
+        df_year['WDPA_prev'] = df_year['WDPA_prev'].fillna(0)  # Safety fallback
+        del df_lag
         gc.collect()
     else:
-        logger.info(f"  Skipping transition features for first year {year}")
+        logger.info(f"  First year {year}: setting WDPA_prev = 0")
         df_year['WDPA_prev'] = 0
-        df_year['transition_01'] = 0
     
+    # Step 2: Apply Risk Set filter (keep only WDPA_prev == 0)
+    df_year = df_year[df_year['WDPA_prev'] == 0].copy()
+    n_rows_filtered = len(df_year)
+    logger.info(f"  Risk Set filter: {n_rows_filtered:,} rows (kept {100*n_rows_filtered/n_rows_initial:.1f}%)")
+    
+    if n_rows_filtered == 0:
+        logger.warning(f"  No rows remaining after Risk Set filter for year {year}")
+        return None, {}
+    
+    # Step 3: Create transition_01 = WDPA_b1 (since WDPA_prev guaranteed to be 0)
+    df_year['transition_01'] = df_year['WDPA_b1'].astype(np.uint8)
+    
+    # Step 4: Compute spatial features
     df_year = compute_distance_features(df_year)
     df_year = compute_all_smooth_features(df_year)
     
@@ -192,7 +198,13 @@ def process_year(input_path: Path, year: int, temp_dir: Path, is_first_year: boo
     elapsed = time.time() - start_time
     logger.info(f"  ✓ Year {year} complete in {elapsed:.1f}s")
     
-    return temp_file, {"year": year, "rows": n_rows, "time_seconds": elapsed}
+    return temp_file, {
+        "year": year, 
+        "rows_initial": n_rows_initial,
+        "rows_filtered": n_rows_filtered,
+        "filter_ratio": n_rows_filtered / n_rows_initial,
+        "time_seconds": elapsed
+    }
 
 
 def main() -> None:
@@ -237,6 +249,8 @@ def main() -> None:
     
     # Process year by year
     temp_files = []
+    total_rows_initial = 0
+    total_rows_filtered = 0
     
     for i, year in enumerate(years):
         try:
@@ -245,6 +259,9 @@ def main() -> None:
             if temp_file is not None:
                 temp_files.append(temp_file)
                 wandb.log(metrics)
+                if 'rows_initial' in metrics:
+                    total_rows_initial += metrics['rows_initial']
+                    total_rows_filtered += metrics['rows_filtered']
         except Exception as e:
             logger.error(f"Error processing year {year}: {e}")
             for tf in temp_files:
@@ -298,17 +315,23 @@ def main() -> None:
     file_size_mb = output_path.stat().st_size / (1024**2)
     schema = pq.read_schema(output_path)
     new_cols = [c for c in schema.names if c.startswith('dist_') or '_smooth' in c]
+    filter_ratio = total_rows_filtered / total_rows_initial if total_rows_initial > 0 else 0
     
     logger.info("\n" + "="*80)
     logger.info("SUMMARY")
     logger.info("="*80)
-    logger.info(f"Total rows: {total_rows_written:,}")
+    logger.info(f"Initial rows:   {total_rows_initial:,}")
+    logger.info(f"Filtered rows:  {total_rows_filtered:,} ({100*filter_ratio:.1f}% kept)")
+    logger.info(f"Risk Set filter removed: {total_rows_initial - total_rows_filtered:,} already-protected pixels")
     logger.info(f"New columns: {len(new_cols)}")
     logger.info(f"File size: {file_size_mb:.1f} MB")
     logger.info("✓ Processing complete!")
     
     wandb.log({
-        "final_rows": total_rows_written,
+        "initial_rows": total_rows_initial,
+        "final_rows": total_rows_filtered,
+        "filter_ratio": filter_ratio,
+        "rows_removed": total_rows_initial - total_rows_filtered,
         "new_columns": len(new_cols),
         "file_size_mb": file_size_mb,
         "concatenation_time_seconds": concat_time

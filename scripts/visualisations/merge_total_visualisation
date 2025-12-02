@@ -37,14 +37,14 @@ TILE_SIZE = 10000  # Size of square tile to visualize
 # Yearly visualization requests (year → bands)
 YEARLY_VIS_REQUESTS = [
     {'year': 2024, 'bands': ['WDPA', 'NDVI']},
-    {'year': 2022, 'bands': ['road infrastructure', 'VIIRS']},
+    {'year': 2022, 'bands': ['road infrastructure', 'HNTL']},
     {'year': 2018, 'bands': ['GPW', 'deforestation']},
     {'year': 2016, 'bands': ['wildfires', 'gdp']},
     {'year': 2012, 'bands': ['landcover', 'elevation']},
     {'year': 2008, 'bands': [f'GSN_b{i}' for i in range(1, 6)]},
     {'year': 2004, 'bands': ['Oil and Gas', 'Powerplants']},
     {'year': 2000, 'bands': [f'WorldClim_b{i}' for i in range(1, 20)]},
-    {'year': 2000, 'bands': ['VIIRS', 'gdp']},  # sanity-check request (expected NaNs)
+    {'year': 2000, 'bands': ['HNTL', 'gdp']},  # sanity-check request (expected NaNs)
 ]
 BAND_ALIASES = {
 }
@@ -58,8 +58,8 @@ LANDCOVER_COLORMAP = ListedColormap([
 
 # Mapping from requested band names to possible column name patterns
 BAND_ALIASES = {
-    'night_lights': ['VIIRS', 'viirs'],
-    'VIIRS': ['VIIRS', 'viirs'],
+    'night_lights': ['HNTL', 'hntl'],
+    'HNTL': ['HNTL', 'hntl'],
     'GSN_1': ['GSN_b1', 'GSN', 'gsn_b1', 'gsn'],  # Try numbered version first
     'road infrastructure': ['road_infrastructure', 'road_infrastructure_b1'],
     'wildfires': ['wildfire', 'wildfires'],
@@ -184,7 +184,7 @@ def find_band_column(band_name: str, available_bands: List[str]) -> Optional[str
         if col_lower.startswith(name_lower) or name_lower in col_lower:
             return col
     
-    # Check aliases (e.g., 'night_lights' -> 'VIIRS', 'GSN_1' -> 'GSN')
+        # Check aliases (e.g., 'night_lights' -> 'HNTL', 'GSN_1' -> 'GSN')
     if band_name in BAND_ALIASES:
         for alias_pattern in BAND_ALIASES[band_name]:
             # Try exact match with alias
@@ -195,7 +195,7 @@ def find_band_column(band_name: str, available_bands: List[str]) -> Optional[str
                 if col.lower() == alias_pattern.lower():
                     return col
             # Try partial match - alias pattern at start of column name
-            # (e.g., 'VIIRS' matches 'VIIRS_b1', 'VIIRS_b2', etc.)
+            # (e.g., 'HNTL' matches 'HNTL_b1', 'HNTL_b2', etc.)
             for col in available_bands:
                 col_lower = col.lower()
                 pattern_lower = alias_pattern.lower()
@@ -404,7 +404,7 @@ def create_band_visualization(
             cmap = 'terrain'
             vmin, vmax = np.nanpercentile(data, 1), np.nanpercentile(data, 99)
             label = 'Elevation (m)'
-        elif 'viirs' in band_col.lower() or 'night' in band_col.lower():
+        elif 'hntl' in band_col.lower() or 'night' in band_col.lower():
             cmap = 'hot'
             vmin, vmax = 0, np.nanpercentile(data, 95)
             label = 'Night Lights'

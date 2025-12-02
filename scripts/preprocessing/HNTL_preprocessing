@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""
+HNTL nighttime lights preprocessing
+====================================
+
+Description:
+    Align all HNTL nighttime lights GeoTIFF files (2000-2020) to match the 2021
+    reference file's extent, CRS, and resolution. Set all pixels outside the 2021
+    valid area to NaN.
+
+Source data:
+    - HNTL GeoTIFF files from 2000-2022 in `data/ready/HNTL/`.
+    - Files follow pattern: `HNTL_SA_1km_YYYY.tif` where YYYY is the year.
+
+Process:
+    1. Load 2021 file as reference (fallback to 2022 if needed)
+    2. Create land mask from reference (valid pixels only)
+    3. For each 2000-2020 file:
+       - Reproject and resample to match reference
+       - Apply land mask (set ocean/invalid pixels to NaN)
+       - Overwrite original file
+
+Outputs:
+    - Overwrites original HNTL files with spatially aligned versions.
+    - All files will have identical dimensions and valid pixel locations.
+"""
+
+import numpy as np
+import rasterio
+from rasterio.warp import reproject
+from rasterio.enums import Resampling
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+# Configuration
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+HNTL_DIR = PROJECT_ROOT / "data" / "ready" / "HNTL"
+YEARS_TO_ALIGN = list(range(2000, 2021))  # 2000-2020
+REFERENCE_YEARS = [2021, 2022]  # Prefer 2021, fallback to 2022
+
+
+def find_files():
+    """Find reference file and target files to process."""
+    print("Searching for HNTL files...")
+    
+    # Find reference file
+    reference_file = None
+    for year in REFERENCE_YEARS:
+        ref_path = HNTL_DIR / f"HNTL_SA_1km_{year}.tif"
+        if ref_path.exists():
+            reference_file = ref_path
+            print(f"  Reference: {reference_file.name}")
+            break
+    
+    if not reference_file:
+        raise FileNotFoundError(f"No reference file found for years: {REFERENCE_YEARS}")
+    
+    # Find target files
+    target_files = []
+    for year in YEARS_TO_ALIGN:
+        target_path = HNTL_DIR / f"HNTL_SA_1km_{year}.tif"
+        if target_path.exists():
+            target_files.append(target_path)
+    
+    print(f"  Found {len(target_files)} files to process")
+    return reference_file, target_files
+
+
+def load_reference(reference_file):
+    """Load reference file metadata and land mask."""
+    print(f"\nLoading reference: {reference_file.name}")
+    
+    with rasterio.open(reference_file) as src:
+        ref_data = src.read(1)
+        
+        # Create land mask: True where reference has valid data
+        land_mask = ~np.isnan(ref_data)
+        valid_pixels = np.sum(land_mask)
+        
+        ref_meta = {
+            'crs': src.crs,
+            'transform': src.transform,
+            'width': src.width,
+            'height': src.height,
+            'dtype': np.float32,  # Force float32 for NaN support
+            'land_mask': land_mask
+        }
+        
+        print(f"  Dimensions: {ref_meta['width']} x {ref_meta['height']}")
+        print(f"  Valid pixels: {valid_pixels:,}")
+        
+        return ref_meta
+
+
+def process_file(target_file, ref_meta):
+    """Process a single file: align to reference and apply land mask."""
+    print(f"\nProcessing: {target_file.name}")
+    
+    with rasterio.open(target_file) as src:
+        # Read source data
+        src_array = src.read(1)
+        
+        # Check if spatial alignment needed
+        needs_reprojection = (
+            src.crs != ref_meta['crs'] or
+            src.transform != ref_meta['transform'] or
+            src.width != ref_meta['width'] or
+            src.height != ref_meta['height']
+        )
+        
+        if needs_reprojection:
+            print("  Reprojecting...")
+            # Create output array
+            dst_array = np.full(
+                (ref_meta['height'], ref_meta['width']),
+                np.nan,
+                dtype=np.float32
+            )
+            
+            # Reproject
+            reproject(
+                source=src_array,
+                destination=dst_array,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=ref_meta['transform'],
+                dst_crs=ref_meta['crs'],
+                resampling=Resampling.bilinear
+            )
+        else:
+            # Already aligned spatially, just convert to float32
+            dst_array = src_array.astype(np.float32)
+        
+        # Apply land mask: set ocean/invalid pixels to NaN
+        dst_array[~ref_meta['land_mask']] = np.nan
+        
+        # Report statistics
+        valid_pixels = np.sum(~np.isnan(dst_array))
+        print(f"  Valid pixels: {valid_pixels:,}")
+        
+        # Write output
+        profile = {
+            'driver': 'GTiff',
+            'height': ref_meta['height'],
+            'width': ref_meta['width'],
+            'count': 1,
+            'dtype': np.float32,
+            'crs': ref_meta['crs'],
+            'transform': ref_meta['transform'],
+            'nodata': np.nan,
+            'compress': 'lzw',
+            'tiled': True,
+            'blockxsize': 512,
+            'blockysize': 512,
+        }
+        
+        with rasterio.open(target_file, 'w', **profile) as dst:
+            dst.write(dst_array, 1)
+        
+        print("  ✓ Done")
+
+
+def verify_files(reference_file, target_files):
+    """Verify all files have matching spatial properties and pixel counts."""
+    print("\n" + "="*60)
+    print("Verification")
+    print("="*60)
+    
+    with rasterio.open(reference_file) as ref:
+        ref_data = ref.read(1)
+        ref_valid = np.sum(~np.isnan(ref_data))
+        print(f"Reference: {reference_file.name}")
+        print(f"  Valid pixels: {ref_valid:,}\n")
+    
+    all_match = True
+    for target_file in target_files:
+        with rasterio.open(target_file) as tgt:
+            tgt_data = tgt.read(1)
+            tgt_valid = np.sum(~np.isnan(tgt_data))
+            match = (tgt_valid == ref_valid)
+            
+            status = "✓" if match else "✗"
+            print(f"{status} {target_file.name}: {tgt_valid:,} pixels")
+            
+            if not match:
+                all_match = False
+    
+    print()
+    if all_match:
+        print("✓ All files match reference!")
+    else:
+        print("✗ Some files don't match")
+    
+    return all_match
+
+
+def main():
+    print("="*60)
+    print("HNTL Preprocessing")
+    print("="*60)
+    
+    # Find files
+    reference_file, target_files = find_files()
+    
+    # Load reference
+    ref_meta = load_reference(reference_file)
+    
+    # Process each file
+    print("\n" + "="*60)
+    print("Processing files")
+    print("="*60)
+    
+    for target_file in target_files:
+        process_file(target_file, ref_meta)
+    
+    # Verify
+    verify_files(reference_file, target_files)
+    
+    print("\n" + "="*60)
+    print("Complete!")
+    print("="*60)
+
+
+if __name__ == "__main__":
+    main()
+
