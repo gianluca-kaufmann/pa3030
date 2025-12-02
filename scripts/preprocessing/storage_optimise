@@ -2,7 +2,7 @@
 """
 Storage Optimization Script for GeoTIFF Rasters.
 
-Optimizes GeoTIFFs from data/ready and saves them to data/ml/ready using GDAL.
+Optimizes GeoTIFFs from data/ready and saves them to data/ml/ready using rasterio + GDAL.
 
 Strategy:
 - For WorldClim bands 1-11, GSN bands 1-5, and small-range bands (powerplants, oil_gas):
@@ -13,6 +13,11 @@ Strategy:
   - Store as Float32 (PREDICTOR=3)
 
 All outputs use: TILED=YES, COMPRESS=DEFLATE
+
+Requirements:
+- gdal_translate (for compression)
+- rasterio (for scaling operations, replaces gdal_calc.py)
+- numpy (for array operations)
 
 Usage:
     python storage_optimise [--dry-run] [--dataset DATASET]
@@ -41,6 +46,18 @@ try:
     HAS_NUMPY = True
 except ImportError:
     HAS_NUMPY = False
+    print("ERROR: numpy is required. Install with: pip install numpy")
+    import sys
+    sys.exit(1)
+
+try:
+    import rasterio
+    HAS_RASTERIO = True
+except ImportError:
+    HAS_RASTERIO = False
+    print("ERROR: rasterio is required. Install with: pip install rasterio")
+    import sys
+    sys.exit(1)
 
 try:
     import wandb
@@ -228,10 +245,10 @@ def optimize_to_int16(
     dry_run: bool = False
 ) -> bool:
     """
-    Convert raster to Int16 with ×100 scaling using gdal_calc.py + gdal_translate.
+    Convert raster to Int16 with ×100 scaling using rasterio + gdal_translate.
     
     Pipeline:
-    1. gdal_calc.py: Scale values ×100 and round
+    1. rasterio: Scale values ×100 and round (replaces gdal_calc.py)
     2. gdal_translate: Convert to Int16 with compression
     """
     if dry_run:
@@ -245,24 +262,34 @@ def optimize_to_int16(
         tmp_path = Path(tmp.name)
     
     try:
-        # Step 1: Scale with gdal_calc.py (output as Float32 first)
-        calc_cmd = [
-            "gdal_calc.py",
-            "-A", str(input_path),
-            f"--outfile={tmp_path}",
-            "--calc=numpy.round(A * 100)",
-            "--type=Float32",
-            "--co=COMPRESS=DEFLATE",
-            "--overwrite"
-        ]
-        if nodata is not None:
-            calc_cmd.extend([f"--NoDataValue={nodata * SCALE_FACTOR}"])
-        
+        # Step 1: Scale with rasterio (replaces gdal_calc.py)
         log(f"  Scaling ×100: {input_path.name}")
-        result = subprocess.run(calc_cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            log(f"  gdal_calc.py failed: {result.stderr}", "ERROR")
-            return False
+        with rasterio.open(input_path) as src:
+            # Read all bands
+            data = src.read()
+            
+            # Scale by 100 and round
+            scaled_data = np.round(data * SCALE_FACTOR).astype(np.float32)
+            
+            # Handle nodata
+            scaled_nodata = None
+            if nodata is not None:
+                scaled_nodata = nodata * SCALE_FACTOR
+                # Replace nodata values
+                if src.nodata is not None:
+                    mask = data == src.nodata
+                    scaled_data[mask] = scaled_nodata
+            
+            # Write to temp file
+            profile = src.profile.copy()
+            profile.update({
+                'dtype': rasterio.float32,
+                'compress': 'deflate',
+                'nodata': scaled_nodata
+            })
+            
+            with rasterio.open(tmp_path, 'w', **profile) as dst:
+                dst.write(scaled_data)
         
         # Step 2: Convert to Int16 with optimal compression
         translate_cmd = [
@@ -504,15 +531,9 @@ def main():
             wandb.finish()
         sys.exit(1)
     
-    try:
-        result = subprocess.run(["gdal_calc.py", "--help"], capture_output=True, text=True)
-        log("gdal_calc.py: available")
-    except FileNotFoundError:
-        log("gdal_calc.py not found. Please install GDAL Python bindings.", "ERROR")
-        if HAS_WANDB:
-            wandb.log({"status": "failed", "error": "gdal_calc_not_found"})
-            wandb.finish()
-        sys.exit(1)
+    # Check rasterio availability (replaces gdal_calc.py)
+    log(f"rasterio version: {rasterio.__version__}")
+    log(f"numpy version: {np.__version__}")
     
     log("")
     

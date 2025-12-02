@@ -55,12 +55,12 @@ echo "PWD = $(pwd)"
   exit 1
 }
 
-# Check GDAL availability
-echo "Checking GDAL..."
-which gdal_translate || { echo "ERROR: gdal_translate not found. Install with: pip install gdal"; exit 1; }
-which gdal_calc.py || { echo "ERROR: gdal_calc.py not found. Install with: pip install gdal"; exit 1; }
-echo "GDAL available"
-echo ""
+# Check dependencies
+echo "Checking dependencies..."
+which gdal_translate || { echo "ERROR: gdal_translate not found"; exit 1; }
+python -c "import rasterio" || { echo "ERROR: rasterio not found. Install with: pip install rasterio"; exit 1; }
+python -c "import numpy" || { echo "ERROR: numpy not found. Install with: pip install numpy"; exit 1; }
+echo "All dependencies available"
 
 # List input data
 echo ""
