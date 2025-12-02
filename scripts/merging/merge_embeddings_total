@@ -4,12 +4,15 @@ Merge all yearly satellite embedding mosaics into a single multi-temporal file.
 
 Data sources:
 - Consumes yearly merged GeoTIFF mosaics produced by the per-year embedding pipeline. The files are
-  expected under ``data/ready/embeddings/embeddings_<year>/SatelliteEmbeddings_SA_1km_<year>_merged.tif``.
+  expected under ``data/ml/embeddings/embeddings_<year>/SatelliteEmbeddings_SA_1km_<year>_merged.tif``
+  (storage-optimized) with fallback to ``data/embeddings/embeddings_<year>/`` (original).
 
 Data location strategy:
 - Resolves the repository root from the script's location so paths remain portable. When the
   ``SCRATCH`` environment variable is available (e.g., on the Euler cluster) the script transparently
-  switches to ``$SCRATCH/data`` for inputs and writes outputs to ``$SCRATCH/data/ready/embeddings``.
+  switches to ``$SCRATCH/data`` for inputs.
+- Prefers storage-optimized embeddings from ``data/ml/embeddings`` if available, otherwise uses
+  original embeddings from ``data/embeddings``.
 
 Temporal scope:
 - Processes seven yearly mosaics for 2018–2024. The order is chronological, and band names encode the
@@ -44,7 +47,18 @@ if "SCRATCH" in os.environ:
 else:
     DATA_ROOT = PROJECT_ROOT / "data"
 
-EMBEDDINGS_DIR = DATA_ROOT / "ready" / "embeddings"
+# Prefer storage-optimized embeddings with fallback to original
+ML_EMBEDDINGS_DIR = DATA_ROOT / "ml" / "embeddings"
+ORIG_EMBEDDINGS_DIR = DATA_ROOT / "embeddings"
+
+# Select the best available source
+if ML_EMBEDDINGS_DIR.exists() and any(ML_EMBEDDINGS_DIR.iterdir()):
+    EMBEDDINGS_DIR = ML_EMBEDDINGS_DIR
+    USING_OPTIMIZED = True
+else:
+    EMBEDDINGS_DIR = ORIG_EMBEDDINGS_DIR
+    USING_OPTIMIZED = False
+
 ML_OUTPUT_DIR = PROJECT_ROOT / "data" / "ml"
 
 # Years to merge
@@ -331,9 +345,18 @@ def main():
     log_progress("Multi-Temporal Satellite Embeddings Merge Script (2018-2024)")
     log_progress("=" * 80)
     
+    # Log data source
+    if USING_OPTIMIZED:
+        log_progress(f"Using STORAGE-OPTIMIZED embeddings from: {EMBEDDINGS_DIR}")
+    else:
+        log_progress(f"Using ORIGINAL embeddings from: {EMBEDDINGS_DIR}")
+        log_progress("  (Run storage_optimise script to create optimized embeddings)")
+    
     # Check embeddings directory
     if not EMBEDDINGS_DIR.exists():
         print(f"ERROR: Embeddings directory not found: {EMBEDDINGS_DIR}")
+        print(f"  Checked optimized: {ML_EMBEDDINGS_DIR}")
+        print(f"  Checked original: {ORIG_EMBEDDINGS_DIR}")
         sys.exit(1)
     
     # Find all yearly files

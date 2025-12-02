@@ -82,8 +82,8 @@ else:
     PROJECT_ROOT = SCRIPT_DIR.parent.parent
     DATA_ROOT = PROJECT_ROOT / "data"
 
-INPUT_ROOT = DATA_ROOT / "ready"
-OUTPUT_ROOT = DATA_ROOT / "ml" / "ready"
+INPUT_ROOT = DATA_ROOT
+OUTPUT_ROOT = DATA_ROOT / "ml"
 
 # Datasets that should have multi-band files split into single-band files
 MULTIBAND_SPLIT = {"WorldClim", "GSN"}
@@ -654,6 +654,10 @@ def discover_rasters(input_root: Path, dataset_filter: Optional[str] = None) -> 
     """
     Discover all rasters in input directory, grouped by dataset.
     
+    Handles special cases:
+    - embeddings/embeddings_YYYY directories are treated as separate datasets
+    - Other directories are treated as single datasets
+    
     Returns:
         {dataset_name: [list of tif paths]}
     """
@@ -665,6 +669,26 @@ def discover_rasters(input_root: Path, dataset_filter: Optional[str] = None) -> 
     
     for subdir in sorted([p for p in input_root.iterdir() if p.is_dir()]):
         dataset = subdir.name
+        
+        # Special handling for embeddings directory
+        if dataset == "embeddings":
+            # Look for embeddings_YYYY subdirectories
+            for year_dir in sorted(subdir.iterdir()):
+                if year_dir.is_dir() and year_dir.name.startswith("embeddings_"):
+                    year_dataset = f"embeddings/{year_dir.name}"
+                    
+                    # Apply filter if specified
+                    if dataset_filter and not (
+                        dataset_filter.lower() in year_dataset.lower() or
+                        year_dataset.lower() == dataset_filter.lower()
+                    ):
+                        continue
+                    
+                    tif_files = sorted(year_dir.rglob("*.tif"))
+                    if tif_files:
+                        catalog[year_dataset] = tif_files
+                        log(f"Found {len(tif_files)} files in {year_dataset}")
+            continue
         
         # Apply filter if specified
         if dataset_filter and dataset.lower() != dataset_filter.lower():
@@ -800,8 +824,11 @@ def main():
             rel_path = input_path.relative_to(INPUT_ROOT)
             output_path = OUTPUT_ROOT / rel_path
             
+            # Extract simple dataset name for processing logic (without embeddings/ prefix)
+            simple_dataset = dataset.split('/')[-1] if '/' in dataset else dataset
+            
             # Process file (may return multiple results if splitting occurs)
-            file_results = process_file(input_path, output_path, dataset, args.dry_run)
+            file_results = process_file(input_path, output_path, simple_dataset, args.dry_run)
             
             # Add all results to main list
             for result in file_results:

@@ -11,8 +11,8 @@
 
 # Create necessary folders on $SCRATCH if they don't exist
 mkdir -p "$SCRATCH/logs"
-mkdir -p "$SCRATCH/data/ready"
-mkdir -p "$SCRATCH/data/ml/ready"
+mkdir -p "$SCRATCH/data"
+mkdir -p "$SCRATCH/data/ml"
 mkdir -p "$SCRATCH/outputs"
 mkdir -p "$SCRATCH/outputs/Results"
 mkdir -p "$SCRATCH/outputs/Tables"

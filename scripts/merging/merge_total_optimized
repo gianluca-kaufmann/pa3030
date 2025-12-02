@@ -112,13 +112,22 @@ if "SCRATCH" in os.environ:
 else:
     DATA_ROOT = PROJECT_ROOT / "data"
 
-# Prefer storage-optimized data (data/ml/ready) with fallback to original (data/ready)
+# Prefer storage-optimized data (data/ml) with fallback to original (data)
 # The storage_optimise script converts some datasets to Int16 for smaller file sizes
-ML_READY_ROOT = DATA_ROOT / "ml" / "ready"
-ORIG_READY_ROOT = DATA_ROOT / "ready"
+ML_READY_ROOT = DATA_ROOT / "ml"
+ORIG_READY_ROOT = DATA_ROOT
 
 # Select the best available data source
-if ML_READY_ROOT.exists() and any(ML_READY_ROOT.iterdir()):
+# Check if ml directory exists and has datasets (not just embeddings)
+ml_has_datasets = False
+if ML_READY_ROOT.exists():
+    # Check for any dataset folders other than embeddings
+    for item in ML_READY_ROOT.iterdir():
+        if item.is_dir() and item.name != "embeddings":
+            ml_has_datasets = True
+            break
+
+if ml_has_datasets:
     READY_ROOT = ML_READY_ROOT
     USING_OPTIMIZED = True
 else:
@@ -154,11 +163,12 @@ def open_reference_backbone() -> Tuple[Path, rasterio.DatasetReader, np.ndarray]
     """Open backbone.tif as reference grid and return path, dataset, and mask array."""
     log_progress("Loading backbone reference grid...")
     
-    # Search for backbone.tif in ready/backbone (check both optimized and original locations)
+    # Search for backbone.tif (check both optimized and original locations)
     backbone_paths = [
         READY_ROOT / "backbone" / "backbone.tif",
         ML_READY_ROOT / "backbone" / "backbone.tif",
         ORIG_READY_ROOT / "backbone" / "backbone.tif",
+        DATA_ROOT / "backbone" / "backbone.tif",
     ]
     
     backbone_path = None
@@ -202,6 +212,7 @@ def discover_raster_catalog() -> Dict[str, Dict[Optional[int], List[Path]]]:
         print(f"ERROR: No data directory found.")
         print(f"  Checked: {ML_READY_ROOT} (storage-optimized)")
         print(f"  Checked: {ORIG_READY_ROOT} (original)")
+        print(f"  Data root: {DATA_ROOT}")
         print("\nPlease ensure data exists in one of these locations.")
         sys.exit(1)
     

@@ -11,8 +11,8 @@
 
 # Create necessary folders on $SCRATCH if they don't exist
 mkdir -p "$SCRATCH/logs"
-mkdir -p "$SCRATCH/data/ready"
-mkdir -p "$SCRATCH/data/ml/ready"
+mkdir -p "$SCRATCH/data"
+mkdir -p "$SCRATCH/data/ml"
 mkdir -p "$SCRATCH/wandb/storage_optimisation"
 
 #------------------------------------------------------------------------------
@@ -41,9 +41,13 @@ export WANDB_CACHE_DIR="$SCRATCH/wandb/storage_optimisation/.cache"
 # Run the script
 #------------------------------------------------------------------------------
 echo "Starting storage optimization script..."
-echo "Input:  $SCRATCH/data/ready"
-echo "Output: $SCRATCH/data/ml/ready"
+echo "Input:  $SCRATCH/data"
+echo "Output: $SCRATCH/data/ml"
 echo "WANDB:  $WANDB_DIR"
+echo ""
+echo "Note: This will optimize all datasets including:"
+echo "  - Regular datasets (elevation, NDVI, landcover, etc.)"
+echo "  - Embeddings (embeddings/embeddings_2018, embeddings_2019, etc.)"
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
@@ -65,7 +69,7 @@ echo "All dependencies available"
 # List input data
 echo ""
 echo "Input data structure:"
-ls -la "$SCRATCH/data/ready/"
+ls -la "$SCRATCH/data/" | head -20
 echo ""
 
 # Run the script (remove --dry-run for actual execution)
@@ -77,5 +81,5 @@ python "scripts/preprocessing/storage_optimise"
 echo ""
 echo "Storage optimization finished."
 echo "Output data structure:"
-ls -la "$SCRATCH/data/ml/ready/"
+ls -la "$SCRATCH/data/ml/" | head -20
 
