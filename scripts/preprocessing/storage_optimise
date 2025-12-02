@@ -5,18 +5,26 @@ Storage Optimization Script for GeoTIFF Rasters.
 Optimizes GeoTIFFs from data/ready and saves them to data/ml/ready using rasterio + GDAL.
 
 Strategy:
-- For WorldClim bands 1-11, GSN bands 1-5, and small-range bands (powerplants, oil_gas):
-  - Check if abs(max_value) <= 327.67
-  - If true: scale ×100, round, and store as Int16 (PREDICTOR=2)
-  - If false: store as Float32 (PREDICTOR=3)
-- For all other rasters (elevation, slope, GPW, NDVI, HNTL, etc.):
-  - Store as Float32 (PREDICTOR=3)
+
+1. Multi-band splitting (WorldClim, GSN):
+   - If a file has multiple bands, split into separate single-band files (*_bN.tif)
+   - Each band is processed independently
+
+2. Int16 scaling (WorldClim 1-11, GSN 1-5, powerplants, oil_gas):
+   - Check if abs(max_value) <= 327.67
+   - If true: scale ×100, round, and store as Int16 (PREDICTOR=2)
+   - If false: fallback to Float32 (PREDICTOR=3)
+
+3. Dtype preservation (all other datasets):
+   - Preserve original integer dtypes (Byte/Int16/UInt16) with PREDICTOR=2
+   - Only use Float32 (PREDICTOR=3) if source was float
+   - Prevents unnecessary upcasting of integer files (landcover, roads, backbone, etc.)
 
 All outputs use: TILED=YES, COMPRESS=DEFLATE
 
 Requirements:
 - gdal_translate (for compression)
-- rasterio (for scaling operations, replaces gdal_calc.py)
+- rasterio (for splitting and scaling operations)
 - numpy (for array operations)
 
 Usage:
@@ -77,6 +85,9 @@ else:
 INPUT_ROOT = DATA_ROOT / "ready"
 OUTPUT_ROOT = DATA_ROOT / "ml" / "ready"
 
+# Datasets that should have multi-band files split into single-band files
+MULTIBAND_SPLIT = {"WorldClim", "GSN"}
+
 # Datasets eligible for Int16 scaling (small value ranges)
 # These will be checked for abs(max) <= 327.67
 INT16_CANDIDATES = {
@@ -90,6 +101,16 @@ INT16_CANDIDATES = {
 # Int16 range: -32768 to 32767, so max unscaled value = 327.67
 INT16_MAX_UNSCALED = 327.67
 SCALE_FACTOR = 100
+
+# Integer dtype mapping for GDAL translate
+INTEGER_DTYPES = {
+    'uint8': ('Byte', 2),
+    'int8': ('Byte', 2),
+    'int16': ('Int16', 2),
+    'uint16': ('UInt16', 2),
+    'int32': ('Int32', 2),
+    'uint32': ('UInt32', 2),
+}
 
 
 @dataclass
@@ -202,6 +223,49 @@ def get_all_band_stats(path: Path) -> List[Tuple[float, float]]:
         return []
 
 
+def split_multiband_file(input_path: Path, output_dir: Path) -> List[Path]:
+    """
+    Split a multi-band raster into separate single-band files.
+    
+    Returns:
+        List of output file paths (one per band)
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_paths = []
+    
+    with rasterio.open(input_path) as src:
+        num_bands = src.count
+        
+        # If single band, no need to split
+        if num_bands == 1:
+            return [input_path]
+        
+        log(f"  Splitting {num_bands} bands from {input_path.name}")
+        
+        for band_idx in range(1, num_bands + 1):
+            # Create output filename with band suffix
+            stem = input_path.stem
+            suffix = input_path.suffix
+            output_name = f"{stem}_b{band_idx}{suffix}"
+            output_path = output_dir / output_name
+            
+            # Extract single band
+            band_data = src.read(band_idx)
+            
+            # Copy profile and update for single band
+            profile = src.profile.copy()
+            profile.update({'count': 1})
+            
+            # Write single-band file
+            with rasterio.open(output_path, 'w', **profile) as dst:
+                dst.write(band_data, 1)
+            
+            output_paths.append(output_path)
+            log(f"    Extracted band {band_idx} -> {output_name}")
+    
+    return output_paths
+
+
 def should_use_int16(
     path: Path,
     dataset: str,
@@ -224,7 +288,24 @@ def should_use_int16(
     if not band_stats:
         return False, "Could not retrieve band statistics"
     
-    # Check each band
+    # For split bands, only check the specific band
+    if band_idx is not None:
+        if band_idx > len(band_stats):
+            return False, f"Band index {band_idx} out of range"
+        
+        min_val, max_val = band_stats[band_idx - 1]
+        
+        # Check if this band is eligible
+        if eligible_bands is not None and band_idx not in eligible_bands:
+            return False, f"Band {band_idx} not in eligible list for {dataset}"
+        
+        max_abs = max(abs(min_val), abs(max_val))
+        if max_abs > INT16_MAX_UNSCALED:
+            return False, f"Band {band_idx}: abs(max)={max_abs:.2f} > {INT16_MAX_UNSCALED}"
+        
+        return True, f"Band {band_idx}: abs(max)={max_abs:.2f} <= {INT16_MAX_UNSCALED}"
+    
+    # Check all bands if no specific band index
     for i, (min_val, max_val) in enumerate(band_stats, start=1):
         # Skip bands not in eligible list (if list is specified)
         if eligible_bands is not None and i not in eligible_bands:
@@ -318,6 +399,62 @@ def optimize_to_int16(
             tmp_path.unlink()
 
 
+def optimize_preserve_dtype(
+    input_path: Path,
+    output_path: Path,
+    nodata: Optional[float] = None,
+    dry_run: bool = False
+) -> bool:
+    """
+    Optimize raster while preserving original dtype (for integer types) or using Float32 (for float types).
+    Preserves Byte/Int16/UInt16 types with PREDICTOR=2, uses Float32 with PREDICTOR=3 for float types.
+    """
+    if dry_run:
+        log(f"  [DRY-RUN] Would optimize preserving dtype: {input_path.name}")
+        return True
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Detect source dtype
+    try:
+        with rasterio.open(input_path) as src:
+            source_dtype = src.dtypes[0]
+            source_dtype_lower = source_dtype.lower()
+    except Exception as e:
+        log(f"  Could not read source dtype: {e}", "ERROR")
+        return False
+    
+    # Determine output dtype and predictor
+    if source_dtype_lower in INTEGER_DTYPES:
+        # Preserve integer type
+        output_dtype, predictor = INTEGER_DTYPES[source_dtype_lower]
+        log(f"  Preserving integer dtype: {source_dtype} -> {output_dtype}")
+    else:
+        # Use Float32 for float types
+        output_dtype = "Float32"
+        predictor = 3
+        log(f"  Converting float dtype: {source_dtype} -> {output_dtype}")
+    
+    translate_cmd = [
+        "gdal_translate",
+        "-ot", output_dtype,
+        "-co", "TILED=YES",
+        "-co", "COMPRESS=DEFLATE",
+        "-co", f"PREDICTOR={predictor}",
+        str(input_path),
+        str(output_path)
+    ]
+    if nodata is not None:
+        translate_cmd.extend(["-a_nodata", str(nodata)])
+    
+    result = subprocess.run(translate_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        log(f"  gdal_translate failed: {result.stderr}", "ERROR")
+        return False
+    
+    return True
+
+
 def optimize_to_float32(
     input_path: Path,
     output_path: Path,
@@ -326,6 +463,7 @@ def optimize_to_float32(
 ) -> bool:
     """
     Convert raster to Float32 with compression using gdal_translate.
+    Used as fallback when Int16 scaling check fails for Int16 candidates.
     """
     if dry_run:
         log(f"  [DRY-RUN] Would convert to Float32: {input_path.name}")
@@ -354,15 +492,14 @@ def optimize_to_float32(
     return True
 
 
-def process_file(
+def process_single_band_file(
     input_path: Path,
     output_path: Path,
     dataset: str,
+    band_idx: Optional[int] = None,
     dry_run: bool = False
 ) -> OptimizationResult:
-    """Process a single raster file."""
-    log(f"Processing: {input_path.relative_to(INPUT_ROOT)}")
-    
+    """Process a single-band raster file (or specific band of multi-band file)."""
     # Get input stats
     stats = get_raster_stats_gdalinfo(input_path)
     if stats is None:
@@ -383,22 +520,40 @@ def process_file(
     input_size_mb = input_path.stat().st_size / (1024 * 1024)
     
     # Log input stats
-    log(f"  Input: dtype={stats.dtype}, size={stats.width}x{stats.height}, "
+    band_str = f" band {band_idx}" if band_idx else ""
+    log(f"  Input{band_str}: dtype={stats.dtype}, size={stats.width}x{stats.height}, "
         f"bands={stats.bands}, range=[{stats.min_val:.2f}, {stats.max_val:.2f}]")
     
     # Determine optimization strategy
-    use_int16, reason = should_use_int16(input_path, dataset)
+    use_int16, reason = should_use_int16(input_path, dataset, band_idx=band_idx)
     
     if use_int16:
+        # Int16 candidates with small enough range: scale ×100
         log(f"  Strategy: Int16 (×100 scaling) - {reason}")
         success = optimize_to_int16(input_path, output_path, stats.nodata, dry_run)
         output_dtype = "Int16"
         scaled = True
         scale_factor = SCALE_FACTOR
-    else:
-        log(f"  Strategy: Float32 - {reason}")
+    elif dataset in INT16_CANDIDATES:
+        # Int16 candidate but range too large: fallback to Float32
+        log(f"  Strategy: Float32 (Int16 range check failed) - {reason}")
         success = optimize_to_float32(input_path, output_path, stats.nodata, dry_run)
         output_dtype = "Float32"
+        scaled = False
+        scale_factor = None
+    else:
+        # Not an Int16 candidate: preserve original dtype
+        log(f"  Strategy: Preserve dtype - {reason}")
+        success = optimize_preserve_dtype(input_path, output_path, stats.nodata, dry_run)
+        # Get actual output dtype
+        if success and not dry_run and output_path.exists():
+            try:
+                with rasterio.open(output_path) as dst:
+                    output_dtype = dst.dtypes[0]
+            except:
+                output_dtype = stats.dtype
+        else:
+            output_dtype = stats.dtype
         scaled = False
         scale_factor = None
     
@@ -414,7 +569,7 @@ def process_file(
         input_path=input_path,
         output_path=output_path,
         original_dtype=stats.dtype,
-        output_dtype=output_dtype,
+        output_dtype=str(output_dtype),
         scaled=scaled,
         scale_factor=scale_factor,
         input_size_mb=input_size_mb,
@@ -422,6 +577,77 @@ def process_file(
         compression_ratio=compression_ratio,
         success=success
     )
+
+
+def process_file(
+    input_path: Path,
+    output_path: Path,
+    dataset: str,
+    dry_run: bool = False
+) -> List[OptimizationResult]:
+    """
+    Process a single raster file. May return multiple results if multi-band splitting occurs.
+    
+    Returns:
+        List of OptimizationResult (one per output file)
+    """
+    log(f"Processing: {input_path.relative_to(INPUT_ROOT)}")
+    
+    # Check if this dataset needs multi-band splitting
+    if dataset in MULTIBAND_SPLIT:
+        # Get band count
+        try:
+            with rasterio.open(input_path) as src:
+                num_bands = src.count
+        except Exception as e:
+            log(f"  ERROR: Could not read file: {e}", "ERROR")
+            return [OptimizationResult(
+                input_path=input_path,
+                output_path=output_path,
+                original_dtype="Unknown",
+                output_dtype="Unknown",
+                scaled=False,
+                scale_factor=None,
+                input_size_mb=0,
+                output_size_mb=0,
+                compression_ratio=0,
+                success=False,
+                error=f"Could not read file: {e}"
+            )]
+        
+        if num_bands > 1:
+            log(f"  Multi-band file detected ({num_bands} bands), splitting...")
+            
+            # Create temp directory for split bands
+            temp_dir = output_path.parent / "_temp_split"
+            split_paths = split_multiband_file(input_path, temp_dir)
+            
+            # Process each split band
+            results = []
+            for band_idx, split_path in enumerate(split_paths, start=1):
+                # Construct output path with band suffix
+                stem = output_path.stem
+                suffix = output_path.suffix
+                band_output_path = output_path.parent / f"{stem}_b{band_idx}{suffix}"
+                
+                log(f"\n  Processing band {band_idx}/{num_bands}:")
+                result = process_single_band_file(
+                    split_path, band_output_path, dataset, band_idx=band_idx, dry_run=dry_run
+                )
+                results.append(result)
+            
+            # Clean up temp directory
+            if not dry_run:
+                try:
+                    import shutil
+                    shutil.rmtree(temp_dir)
+                except Exception as e:
+                    log(f"  Warning: Could not clean up temp directory: {e}", "WARNING")
+            
+            return results
+    
+    # Single-band or no splitting needed
+    return [process_single_band_file(input_path, output_path, dataset, dry_run=dry_run)]
 
 
 def discover_rasters(input_root: Path, dataset_filter: Optional[str] = None) -> Dict[str, List[Path]]:
@@ -574,19 +800,24 @@ def main():
             rel_path = input_path.relative_to(INPUT_ROOT)
             output_path = OUTPUT_ROOT / rel_path
             
-            result = process_file(input_path, output_path, dataset, args.dry_run)
-            results.append(result)
-            dataset_results.append(result)
+            # Process file (may return multiple results if splitting occurs)
+            file_results = process_file(input_path, output_path, dataset, args.dry_run)
             
-            # Log per-file to wandb
-            if HAS_WANDB and not args.dry_run:
-                wandb.log({
-                    f"file/{dataset}/{input_path.name}/success": 1 if result.success else 0,
-                    f"file/{dataset}/{input_path.name}/scaled": 1 if result.scaled else 0,
-                    f"file/{dataset}/{input_path.name}/input_mb": result.input_size_mb,
-                    f"file/{dataset}/{input_path.name}/output_mb": result.output_size_mb,
-                    f"file/{dataset}/{input_path.name}/compression_ratio": result.compression_ratio,
-                })
+            # Add all results to main list
+            for result in file_results:
+                results.append(result)
+                dataset_results.append(result)
+                
+                # Log per-file to wandb
+                if HAS_WANDB and not args.dry_run:
+                    output_name = result.output_path.name
+                    wandb.log({
+                        f"file/{dataset}/{output_name}/success": 1 if result.success else 0,
+                        f"file/{dataset}/{output_name}/scaled": 1 if result.scaled else 0,
+                        f"file/{dataset}/{output_name}/input_mb": result.input_size_mb,
+                        f"file/{dataset}/{output_name}/output_mb": result.output_size_mb,
+                        f"file/{dataset}/{output_name}/compression_ratio": result.compression_ratio,
+                    })
             
             log("")
         
