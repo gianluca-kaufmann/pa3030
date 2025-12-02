@@ -28,18 +28,26 @@ import argparse
 import subprocess
 import json
 import re
+import time
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 import tempfile
 import shutil
 
-# Try to import rasterio for reading stats; fall back to gdalinfo if unavailable
+# Try to import required packages
 try:
     import numpy as np
     HAS_NUMPY = True
 except ImportError:
     HAS_NUMPY = False
+
+try:
+    import wandb
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
+    print("Warning: wandb not available. Run 'pip install wandb' for experiment tracking.")
 
 # Determine paths - use $SCRATCH on cluster
 if "SCRATCH" in os.environ:
@@ -439,6 +447,8 @@ def main():
     )
     args = parser.parse_args()
     
+    start_time = time.time()
+    
     log("=" * 60)
     log("GeoTIFF Storage Optimization Script")
     log("=" * 60)
@@ -449,12 +459,49 @@ def main():
         log(f"Dataset filter: {args.dataset}")
     log("")
     
+    # Initialize wandb if available
+    if HAS_WANDB:
+        log("🔄 Initializing Weights & Biases connection...")
+        
+        wandb_api_key = os.environ.get("WANDB_API_KEY")
+        wandb_entity = os.environ.get("WANDB_ENTITY")
+        
+        if not wandb_api_key:
+            log("Warning: WANDB_API_KEY not found in environment variables", "WARNING")
+        
+        if not wandb_entity:
+            log("Warning: WANDB_ENTITY not found in environment variables", "WARNING")
+        
+        wandb.init(
+            project="storage-optimization",
+            entity=wandb_entity,
+            save_code=True,
+            config={
+                "input_root": str(INPUT_ROOT),
+                "output_root": str(OUTPUT_ROOT),
+                "dry_run": args.dry_run,
+                "dataset_filter": args.dataset,
+                "int16_candidates": list(INT16_CANDIDATES.keys()),
+                "int16_max_unscaled": INT16_MAX_UNSCALED,
+                "scale_factor": SCALE_FACTOR,
+                "scratch_mode": "SCRATCH" in os.environ,
+            }
+        )
+        log("Weights & Biases connected successfully!")
+        wandb.log({"status": "started", "start_time": start_time})
+    else:
+        log("Weights & Biases not available (wandb not installed)")
+    log("")
+    
     # Check GDAL availability
     try:
         result = subprocess.run(["gdal_translate", "--version"], capture_output=True, text=True)
         log(f"GDAL version: {result.stdout.strip()}")
     except FileNotFoundError:
         log("gdal_translate not found. Please install GDAL.", "ERROR")
+        if HAS_WANDB:
+            wandb.log({"status": "failed", "error": "gdal_translate_not_found"})
+            wandb.finish()
         sys.exit(1)
     
     try:
@@ -462,6 +509,9 @@ def main():
         log("gdal_calc.py: available")
     except FileNotFoundError:
         log("gdal_calc.py not found. Please install GDAL Python bindings.", "ERROR")
+        if HAS_WANDB:
+            wandb.log({"status": "failed", "error": "gdal_calc_not_found"})
+            wandb.finish()
         sys.exit(1)
     
     log("")
@@ -471,28 +521,76 @@ def main():
     
     if not catalog:
         log("No rasters found to process.", "ERROR")
+        if HAS_WANDB:
+            wandb.log({"status": "failed", "error": "no_rasters_found"})
+            wandb.finish()
         sys.exit(1)
     
     total_files = sum(len(files) for files in catalog.values())
     log(f"\nTotal files to process: {total_files}")
+    
+    if HAS_WANDB:
+        wandb.config.update({
+            "datasets": list(catalog.keys()),
+            "num_datasets": len(catalog),
+            "total_files": total_files,
+        })
     log("")
     
     # Process each dataset
     results: List[OptimizationResult] = []
     
-    for dataset, files in sorted(catalog.items()):
+    for dataset_idx, (dataset, files) in enumerate(sorted(catalog.items()), start=1):
         log(f"\n{'='*40}")
-        log(f"Dataset: {dataset}")
+        log(f"Dataset {dataset_idx}/{len(catalog)}: {dataset}")
         log(f"{'='*40}")
         
-        for input_path in files:
+        dataset_start_time = time.time()
+        dataset_results: List[OptimizationResult] = []
+        
+        for file_idx, input_path in enumerate(files, start=1):
             # Construct output path (preserve directory structure)
             rel_path = input_path.relative_to(INPUT_ROOT)
             output_path = OUTPUT_ROOT / rel_path
             
             result = process_file(input_path, output_path, dataset, args.dry_run)
             results.append(result)
+            dataset_results.append(result)
+            
+            # Log per-file to wandb
+            if HAS_WANDB and not args.dry_run:
+                wandb.log({
+                    f"file/{dataset}/{input_path.name}/success": 1 if result.success else 0,
+                    f"file/{dataset}/{input_path.name}/scaled": 1 if result.scaled else 0,
+                    f"file/{dataset}/{input_path.name}/input_mb": result.input_size_mb,
+                    f"file/{dataset}/{input_path.name}/output_mb": result.output_size_mb,
+                    f"file/{dataset}/{input_path.name}/compression_ratio": result.compression_ratio,
+                })
+            
             log("")
+        
+        # Dataset summary
+        dataset_elapsed = time.time() - dataset_start_time
+        dataset_successful = [r for r in dataset_results if r.success]
+        dataset_scaled = [r for r in dataset_successful if r.scaled]
+        dataset_input_mb = sum(r.input_size_mb for r in dataset_results)
+        dataset_output_mb = sum(r.output_size_mb for r in dataset_successful)
+        
+        log(f"Dataset {dataset} complete:")
+        log(f"  Files: {len(dataset_results)}, Successful: {len(dataset_successful)}, "
+            f"Int16-scaled: {len(dataset_scaled)}, Time: {dataset_elapsed:.1f}s")
+        
+        if HAS_WANDB and not args.dry_run:
+            wandb.log({
+                f"dataset/{dataset}/files": len(dataset_results),
+                f"dataset/{dataset}/successful": len(dataset_successful),
+                f"dataset/{dataset}/int16_scaled": len(dataset_scaled),
+                f"dataset/{dataset}/float32": len(dataset_successful) - len(dataset_scaled),
+                f"dataset/{dataset}/input_mb": dataset_input_mb,
+                f"dataset/{dataset}/output_mb": dataset_output_mb,
+                f"dataset/{dataset}/compression_ratio": dataset_input_mb / dataset_output_mb if dataset_output_mb > 0 else 0,
+                f"dataset/{dataset}/time_seconds": dataset_elapsed,
+            })
     
     # Summary
     log("\n" + "=" * 60)
@@ -505,6 +603,8 @@ def main():
     
     total_input_mb = sum(r.input_size_mb for r in results)
     total_output_mb = sum(r.output_size_mb for r in successful)
+    overall_compression = total_input_mb / total_output_mb if total_output_mb > 0 else 0
+    space_saved_mb = total_input_mb - total_output_mb
     
     log(f"Files processed: {len(results)}")
     log(f"  Successful:    {len(successful)}")
@@ -516,8 +616,28 @@ def main():
     if not args.dry_run and total_output_mb > 0:
         log(f"Total input size:  {total_input_mb:.2f} MB")
         log(f"Total output size: {total_output_mb:.2f} MB")
-        log(f"Overall compression: {total_input_mb / total_output_mb:.2f}x")
-        log(f"Space saved: {total_input_mb - total_output_mb:.2f} MB")
+        log(f"Overall compression: {overall_compression:.2f}x")
+        log(f"Space saved: {space_saved_mb:.2f} MB")
+    
+    # Log summary to wandb
+    if HAS_WANDB:
+        total_elapsed = time.time() - start_time
+        wandb.log({
+            "summary/files_processed": len(results),
+            "summary/successful": len(successful),
+            "summary/failed": len(failed),
+            "summary/int16_scaled": len(scaled),
+            "summary/float32": len(successful) - len(scaled),
+            "summary/total_input_mb": total_input_mb,
+            "summary/total_output_mb": total_output_mb,
+            "summary/overall_compression_ratio": overall_compression,
+            "summary/space_saved_mb": space_saved_mb,
+            "summary/space_saved_gb": space_saved_mb / 1024,
+            "summary/total_time_seconds": total_elapsed,
+            "summary/total_time_minutes": total_elapsed / 60,
+            "summary/files_per_second": len(results) / total_elapsed if total_elapsed > 0 else 0,
+            "summary/status": "completed" if not failed else "completed_with_errors",
+        })
     
     if failed:
         log("\nFailed files:", "WARNING")
@@ -540,7 +660,18 @@ def main():
     
     log("\n" + "=" * 60)
     log("Optimization complete!")
+    if not args.dry_run:
+        total_elapsed = time.time() - start_time
+        log(f"Total time: {total_elapsed/60:.1f} minutes ({total_elapsed:.1f}s)")
+        if total_output_mb > 0:
+            log(f"Overall compression: {overall_compression:.2f}x")
+            log(f"Storage saved: {space_saved_mb/1024:.2f} GB")
     log("=" * 60)
+    
+    # Finish wandb
+    if HAS_WANDB:
+        log("\n📊 View results at: " + wandb.run.get_url())
+        wandb.finish()
     
     # Return non-zero exit code if any failures
     sys.exit(0 if not failed else 1)

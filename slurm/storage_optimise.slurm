@@ -13,6 +13,7 @@
 mkdir -p "$SCRATCH/logs"
 mkdir -p "$SCRATCH/data/ready"
 mkdir -p "$SCRATCH/data/ml/ready"
+mkdir -p "$SCRATCH/wandb/storage_optimisation"
 
 #------------------------------------------------------------------------------
 # Load modules
@@ -22,6 +23,7 @@ module load stack/2024-06
 module load gcc/12.2.0
 module load python_cuda/3.11.6
 module load gdal/3.8.4
+module load eth_proxy
 
 #------------------------------------------------------------------------------
 # Activate the Python virtual environment
@@ -30,11 +32,18 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
+# Configure Weights & Biases
+#------------------------------------------------------------------------------
+export WANDB_DIR="$SCRATCH/wandb/storage_optimisation"
+export WANDB_CACHE_DIR="$SCRATCH/wandb/storage_optimisation/.cache"
+
+#------------------------------------------------------------------------------
 # Run the script
 #------------------------------------------------------------------------------
 echo "Starting storage optimization script..."
 echo "Input:  $SCRATCH/data/ready"
 echo "Output: $SCRATCH/data/ml/ready"
+echo "WANDB:  $WANDB_DIR"
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
