@@ -22,7 +22,6 @@ module purge
 module load stack/2024-06
 module load gcc/12.2.0
 module load python_cuda/3.11.6
-module load gdal/3.8.4
 module load eth_proxy
 
 #------------------------------------------------------------------------------
@@ -56,8 +55,11 @@ echo "PWD = $(pwd)"
 }
 
 # Check GDAL availability
-which gdal_translate || { echo "ERROR: gdal_translate not found"; exit 1; }
-which gdal_calc.py || { echo "ERROR: gdal_calc.py not found"; exit 1; }
+echo "Checking GDAL..."
+which gdal_translate || { echo "ERROR: gdal_translate not found. Install with: pip install gdal"; exit 1; }
+which gdal_calc.py || { echo "ERROR: gdal_calc.py not found. Install with: pip install gdal"; exit 1; }
+echo "GDAL available"
+echo ""
 
 # List input data
 echo ""
