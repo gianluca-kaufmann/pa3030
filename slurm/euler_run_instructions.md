@@ -22,7 +22,11 @@ squeue
 ### Sync from Euler to Mac
 
 ```bash
+# scratch outputs
 scp gikaufmann@login.euler.ethz.ch:/cluster/scratch/gikaufmann/outputs/Results/merged_panel_2000_2024.parquet ~/Desktop/
+
+# txt and other outputs
+scp -r gikaufmann@euler.ethz.ch:~/master_thesis/outputs/Tables/merged_panel_validation.txt ~/Desktop/
 ```
 ### Sync Between Euler ↔ GCS
 

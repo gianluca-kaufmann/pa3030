@@ -132,10 +132,12 @@ def main():
             f.write(f"Pixel identifier: {stats['pixels'].get('pixel_identifier', '(row, col)')}\n")
             f.write(f"Unique pixels: {format_number(stats['pixels'].get('unique_pixels', 0))}\n")
         elif 'structure' in stats:
-            # New lightweight schema
+            # New schema with exact counts
             structure = stats['structure']
             f.write(f"Pixel identifier: (row, col)\n")
-            f.write(f"Estimated pixels: {format_number(structure.get('estimated_pixels', 0))}\n")
+            # Use exact unique_pixels if available, fallback to estimated_pixels for old reports
+            pixels = structure.get('unique_pixels', structure.get('estimated_pixels', 0))
+            f.write(f"Unique pixels: {format_number(pixels)}\n")
         else:
             f.write("Pixel information: not available\n")
 
@@ -161,9 +163,9 @@ def main():
             unique_years = stats['years']['unique_years']
             year_counts = stats['years']['year_counts']
         elif 'structure' in stats:
-            # New schema
+            # New schema (updated to use exact counts)
             unique_years = stats['structure']['years']
-            year_counts = stats['structure'].get('rows_per_year_estimate', {})
+            year_counts = stats['structure'].get('rows_per_year', stats['structure'].get('rows_per_year_estimate', {}))
         else:
             unique_years = []
             year_counts = {}
@@ -198,20 +200,31 @@ def main():
                 else:
                     f.write(f"  → Fewer rows than expected (missing combinations)\n")
         elif 'structure' in stats:
-            # New lightweight schema (estimated structure only)
+            # New schema with exact structure counts
             structure = stats['structure']
-            est_pixels = structure.get('estimated_pixels', 0)
+            # Use exact unique_pixels if available, fallback to estimated_pixels for old reports
+            pixels = structure.get('unique_pixels', structure.get('estimated_pixels', 0))
             num_years = structure.get('num_years', 0)
-            expected_rows = structure.get('expected_rows', est_pixels * num_years)
+            expected_rows = structure.get('expected_rows', pixels * num_years)
             actual_rows = structure.get('actual_rows', stats['metadata']['total_rows'])
             is_balanced = structure.get('is_balanced', True)
 
-            f.write(f"Estimated pixels: {format_number(est_pixels)}\n")
+            f.write(f"Unique pixels: {format_number(pixels)}\n")
             f.write(f"Years: {num_years}\n")
             f.write(f"Expected rows (pixels × years): {format_number(expected_rows)}\n")
             f.write(f"Actual rows: {format_number(actual_rows)}\n")
-            f.write(f"Balanced across years (sample-based): {'Yes' if is_balanced else 'No'}\n")
-            f.write("\nNote: This section is based on sampling and provides an approximate check.\n")
+            f.write(f"Balanced across years: {'Yes' if is_balanced else 'No'}\n")
+            
+            # Check for structural issues
+            if expected_rows != actual_rows:
+                f.write(f"\n⚠ WARNING: Row count mismatch!\n")
+                diff = actual_rows - expected_rows
+                if diff > 0:
+                    f.write(f"  → {format_number(diff)} more rows than expected (possible duplicates)\n")
+                else:
+                    f.write(f"  → {format_number(-diff)} fewer rows than expected (missing data)\n")
+            else:
+                f.write(f"\n✓ Row counts match expected structure perfectly\n")
         else:
             f.write("No uniqueness / structure information available.\n")
         f.write("\n")
@@ -346,7 +359,8 @@ def main():
     if 'pixels' in stats:
         print(f"Unique pixels: {format_number(stats['pixels']['unique_pixels'])}")
     elif 'structure' in stats:
-        print(f"Estimated pixels: {format_number(stats['structure'].get('estimated_pixels', 0))}")
+        pixels = stats['structure'].get('unique_pixels', stats['structure'].get('estimated_pixels', 0))
+        print(f"Unique pixels: {format_number(pixels)}")
     
     # Years - handle both schemas
     if 'years' in stats:

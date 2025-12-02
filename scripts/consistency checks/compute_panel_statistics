@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Fast panel dataset overview - checks structure and completeness.
-Runs in ~1-5 minutes by using metadata and sampling instead of full scans.
+Runs in ~1-5 minutes by reading all metadata columns for exact structure stats,
+then sampling for feature statistics (missing values, numeric ranges).
 """
 
 import json
@@ -57,18 +58,45 @@ def analyze_panel():
     print(f"\nMetadata columns: {meta_cols}")
     print(f"Feature columns: {len(feature_cols)}")
     
-    # Sample row groups for statistics (much faster than full scan)
+    # ===================================================================
+    # STEP 1: Get EXACT structure statistics (year counts, unique pixels)
+    # Read only metadata columns for all rows - fast since they're small!
+    # ===================================================================
+    print(f"\nReading metadata columns for exact structure statistics...", flush=True)
+    meta_table = pf.read(columns=['year', 'row', 'col'])
+    meta_df = meta_table.to_pandas()
+    
+    # Exact year counts
+    year_counts = meta_df['year'].value_counts().to_dict()
+    unique_years = sorted(year_counts.keys())
+    n_years = len(unique_years)
+    rows_per_year = {int(y): int(c) for y, c in year_counts.items()}
+    
+    # Exact unique pixels
+    print(f"Computing unique pixels...", flush=True)
+    unique_pixels = meta_df[['row', 'col']].drop_duplicates()
+    n_unique_pixels = len(unique_pixels)
+    
+    # Check structure
+    expected_rows = n_unique_pixels * n_years
+    
+    print(f"✓ Found {n_years} years, {n_unique_pixels:,} unique pixels, {total_rows:,} total rows")
+    
+    # Free memory
+    del meta_df, meta_table, unique_pixels
+    
+    # ===================================================================
+    # STEP 2: Sample row groups for feature statistics (missing values, numeric stats)
+    # These can be estimates - don't need exact counts
+    # ===================================================================
     n_sample = min(SAMPLE_ROW_GROUPS or num_row_groups, num_row_groups)
     sample_indices = np.linspace(0, num_row_groups - 1, n_sample, dtype=int)
     
-    print(f"\nSampling {n_sample} row groups for statistics...", flush=True)
+    print(f"\nSampling {n_sample} row groups for feature statistics...", flush=True)
     
-    # Collect stats from samples
-    year_counts = Counter()
     sample_rows = 0
     missing_counts = {col: 0 for col in columns}
     numeric_stats = {}
-    row_col_pairs = set()  # Only track from samples, not all data
     
     for idx, rg_idx in enumerate(sample_indices):
         if (idx + 1) % 5 == 0:
@@ -78,15 +106,6 @@ def analyze_panel():
         table = pf.read_row_group(rg_idx, columns=columns)
         df = table.to_pandas()
         sample_rows += len(df)
-        
-        # Year distribution
-        if 'year' in df.columns:
-            year_counts.update(df['year'].value_counts().to_dict())
-        
-        # Track unique (row, col) in sample
-        if 'row' in df.columns and 'col' in df.columns:
-            pairs = list(zip(df['row'].values, df['col'].values))
-            row_col_pairs.update(pairs[:10000])  # Limit to avoid memory issues
         
         # Missing values
         for col in columns:
@@ -109,58 +128,49 @@ def analyze_panel():
         
         del df, table
     
-    # Estimate unique pixels from sample
-    sample_unique_pixels = len(row_col_pairs)
-    
-    # Get unique years from counts
-    unique_years = sorted(year_counts.keys())
-    n_years = len(unique_years)
-    
-    # Estimate total unique pixels
-    # If data is balanced: total_rows / n_years
-    estimated_pixels = total_rows // n_years if n_years > 0 else 0
-    
-    # Check if rows per year are balanced
-    rows_per_year = {int(y): int(c) for y, c in year_counts.items()}
-    # Scale up from sample to full dataset
-    scale_factor = total_rows / sample_rows if sample_rows > 0 else 1
-    estimated_year_counts = {y: int(c * scale_factor) for y, c in rows_per_year.items()}
-    
     # Check structure
     print(f"\n" + "=" * 60)
-    print("STRUCTURE CHECK")
+    print("STRUCTURE CHECK (EXACT)")
     print("=" * 60)
     
     print(f"\nYears: {n_years} ({min(unique_years)} - {max(unique_years)})")
-    print(f"Estimated pixels: {estimated_pixels:,}")
-    print(f"Expected rows (pixels × years): {estimated_pixels * n_years:,}")
+    print(f"Unique pixels: {n_unique_pixels:,}")
+    print(f"Expected rows (pixels × years): {expected_rows:,}")
     print(f"Actual rows: {total_rows:,}")
     
     # Check balance
-    year_values = list(estimated_year_counts.values())
+    year_values = list(rows_per_year.values())
     is_balanced = (max(year_values) - min(year_values)) / max(year_values) < 0.01 if year_values else True
     print(f"Balanced across years: {'Yes' if is_balanced else 'No'}")
     
+    # Show rows per year
+    print(f"\nRows per year:")
+    for year in sorted(rows_per_year.keys()):
+        count = rows_per_year[year]
+        pct = 100 * count / total_rows if total_rows > 0 else 0
+        print(f"  {year}: {count:,} ({pct:.1f}%)")
+    
     # Missing values summary
     print(f"\n" + "=" * 60)
-    print("MISSING VALUES (from sample)")
+    print(f"MISSING VALUES (ESTIMATED from {n_sample} row groups)")
     print("=" * 60)
     
     cols_with_missing = [(col, count) for col, count in missing_counts.items() if count > 0]
     if cols_with_missing:
         cols_with_missing.sort(key=lambda x: -x[1])
         print(f"\nColumns with missing values: {len(cols_with_missing)}")
+        print(f"Sampled rows: {sample_rows:,} of {total_rows:,}")
         for col, count in cols_with_missing[:10]:
             pct = 100 * count / sample_rows if sample_rows > 0 else 0
-            print(f"  {col}: {count:,} ({pct:.1f}%)")
+            print(f"  {col}: {count:,} ({pct:.1f}% of sample)")
         if len(cols_with_missing) > 10:
             print(f"  ... and {len(cols_with_missing) - 10} more")
     else:
-        print("\nNo missing values found in sample!")
+        print(f"\nNo missing values found in sample of {sample_rows:,} rows!")
     
     # Numeric columns summary
     print(f"\n" + "=" * 60)
-    print("NUMERIC COLUMNS")
+    print("NUMERIC COLUMNS (ESTIMATED from sample)")
     print("=" * 60)
     print(f"\nTotal numeric columns: {len(numeric_stats)}")
     
@@ -192,11 +202,11 @@ def analyze_panel():
         'structure': {
             'years': unique_years,
             'num_years': n_years,
-            'estimated_pixels': estimated_pixels,
-            'expected_rows': estimated_pixels * n_years,
+            'unique_pixels': n_unique_pixels,
+            'expected_rows': expected_rows,
             'actual_rows': total_rows,
             'is_balanced': is_balanced,
-            'rows_per_year_estimate': estimated_year_counts
+            'rows_per_year': rows_per_year
         },
         'missing_values': {
             'sample_rows': sample_rows,
