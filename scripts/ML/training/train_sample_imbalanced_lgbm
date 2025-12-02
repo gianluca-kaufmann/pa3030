@@ -13,13 +13,16 @@ Output: Classification report, ROC-AUC, PR-AUC, precision@k, confusion matrix,
 
 from __future__ import annotations
 
+import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
+import wandb
 from sklearn.metrics import (
     classification_report,
     confusion_matrix,
@@ -94,6 +97,33 @@ def compute_precision_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) ->
 
 
 def main(scale_pos_weight: float) -> None:
+    start_time = time.time()
+    
+    # Initialize W&B for this specific run
+    wandb_api_key = os.environ.get("WANDB_API_KEY")
+    wandb_entity = os.environ.get("WANDB_ENTITY")
+    
+    if not wandb_api_key:
+        print("Warning: WANDB_API_KEY not found in environment")
+    if not wandb_entity:
+        print("Warning: WANDB_ENTITY not found in environment")
+    
+    print("Initializing Weights & Biases...")
+    wandb.init(
+        project="ml-training-imbalanced",
+        entity=wandb_entity,
+        name=f"train_imbalanced_lgbm_spw{scale_pos_weight}_{time.strftime('%Y%m%d_%H%M%S')}",
+        config={
+            "model": "LightGBM",
+            "scale_pos_weight": scale_pos_weight,
+            "val_size": VAL_SIZE,
+            "test_size": TEST_SIZE,
+            "random_state": RANDOM_STATE,
+            "target": "transition_01",
+        },
+    )
+    print("W&B connected\n")
+    
     repo_root = Path(__file__).resolve().parents[3]
     input_path = repo_root / "data/ml/sample_training_imbalanced.parquet"
 
@@ -161,6 +191,16 @@ def main(scale_pos_weight: float) -> None:
     auto_scale_pos_weight = n_negatives / max(n_positives, 1)
     print(f"\nUsing scale_pos_weight: {scale_pos_weight:.2f}")
     print(f"(Automatic value based on class ratio: {auto_scale_pos_weight:.2f})")
+    
+    wandb.log({
+        "data/n_features": len(feature_cols),
+        "data/n_samples": len(df_clean),
+        "data/n_positives": n_positives,
+        "data/n_negatives": n_negatives,
+        "data/positive_ratio": positive_ratio / 100,
+        "data/class_ratio": n_negatives / max(n_positives, 1),
+        "data/auto_scale_pos_weight": auto_scale_pos_weight,
+    })
 
     # Train/val/test split with stratification (70/10/20)
     print(f"\n" + "=" * 70)
@@ -331,6 +371,10 @@ def main(scale_pos_weight: float) -> None:
     print(feature_importance.head(20).to_string(index=False))
     
     # Summary
+    prec_at_1 = compute_precision_at_k(y_test.values, y_proba, 1)
+    prec_at_5 = compute_precision_at_k(y_test.values, y_proba, 5)
+    prec_at_10 = compute_precision_at_k(y_test.values, y_proba, 10)
+    
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
@@ -339,11 +383,39 @@ def main(scale_pos_weight: float) -> None:
     print(f"Positive rate:        {positive_ratio:.3f}%")
     print(f"ROC-AUC:              {roc_auc:.4f}")
     print(f"PR-AUC:               {pr_auc:.4f}")
-    print(f"Precision @ top 1%:   {compute_precision_at_k(y_test.values, y_proba, 1):.4f}")
-    print(f"Precision @ top 5%:   {compute_precision_at_k(y_test.values, y_proba, 5):.4f}")
-    print(f"Precision @ top 10%:  {compute_precision_at_k(y_test.values, y_proba, 10):.4f}")
+    print(f"Precision @ top 1%:   {prec_at_1:.4f}")
+    print(f"Precision @ top 5%:   {prec_at_5:.4f}")
+    print(f"Precision @ top 10%:  {prec_at_10:.4f}")
     print("=" * 70)
-    print("\nAll done.")
+    
+    # Log to W&B
+    total_time = time.time() - start_time
+    
+    wandb.log({
+        "metrics/true_negatives": int(tn),
+        "metrics/false_positives": int(fp),
+        "metrics/false_negatives": int(fn),
+        "metrics/true_positives": int(tp),
+        "metrics/accuracy": (tp + tn) / (tp + tn + fp + fn),
+        "metrics/precision": tp / (tp + fp) if (tp + fp) > 0 else 0,
+        "metrics/recall": tp / (tp + fn) if (tp + fn) > 0 else 0,
+        "metrics/f1": 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0,
+        "metrics/roc_auc": roc_auc,
+        "metrics/pr_auc": pr_auc,
+        "metrics/precision_at_1": prec_at_1,
+        "metrics/precision_at_5": prec_at_5,
+        "metrics/precision_at_10": prec_at_10,
+        "metrics/best_iteration": lgbm.best_iteration_,
+        "metrics/best_val_auc": lgbm.best_score_['valid_0']['auc'],
+        "timing/total_seconds": total_time,
+        "timing/total_minutes": total_time / 60,
+        "status": "success"
+    })
+    
+    print(f"\nTotal time: {total_time:.1f}s ({total_time/60:.1f} min)")
+    print("All done.")
+    
+    wandb.finish()
 
 
 if __name__ == "__main__":

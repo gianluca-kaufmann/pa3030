@@ -13,12 +13,15 @@ Output: Classification report, ROC-AUC, PR-AUC, precision@k, confusion matrix,
 
 from __future__ import annotations
 
+import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import wandb
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import (
     classification_report,
@@ -91,6 +94,34 @@ def compute_precision_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) ->
 
 
 def main() -> None:
+    start_time = time.time()
+    
+    # Initialize W&B
+    wandb_api_key = os.environ.get("WANDB_API_KEY")
+    wandb_entity = os.environ.get("WANDB_ENTITY")
+    
+    if not wandb_api_key:
+        print("Warning: WANDB_API_KEY not found in environment")
+    if not wandb_entity:
+        print("Warning: WANDB_ENTITY not found in environment")
+    
+    print("Initializing Weights & Biases...")
+    wandb.init(
+        project="ml-training-imbalanced",
+        entity=wandb_entity,
+        name=f"train_imbalanced_rf_{time.strftime('%Y%m%d_%H%M%S')}",
+        config={
+            "model": "RandomForest",
+            "n_estimators": N_ESTIMATORS,
+            "test_size": TEST_SIZE,
+            "random_state": RANDOM_STATE,
+            "max_sample_size": MAX_SAMPLE_SIZE,
+            "class_weight": "balanced",
+            "target": "transition_01",
+        },
+    )
+    print("W&B connected\n")
+    
     repo_root = Path(__file__).resolve().parents[3]
     input_path = repo_root / "data/ml/sample_training_imbalanced.parquet"
 
@@ -176,6 +207,15 @@ def main() -> None:
     print(f"  No transition (0): {n_negatives:>12,}  ({100 - positive_ratio:>5.3f}%)")
     print(f"  New WDPA (0→1):    {n_positives:>12,}  ({positive_ratio:>5.3f}%)")
     print(f"  Class ratio:       1 : {n_negatives / max(n_positives, 1):.1f}")
+    
+    wandb.log({
+        "data/n_features": len(feature_cols),
+        "data/n_samples": len(df_clean),
+        "data/n_positives": n_positives,
+        "data/n_negatives": n_negatives,
+        "data/positive_ratio": positive_ratio / 100,
+        "data/class_ratio": n_negatives / max(n_positives, 1),
+    })
 
     # Train/test split with stratification
     print(f"\n" + "=" * 70)
@@ -298,6 +338,10 @@ def main() -> None:
     print(feature_importance.head(20).to_string(index=False))
     
     # Summary
+    prec_at_1 = compute_precision_at_k(y_test.values, y_proba, 1)
+    prec_at_5 = compute_precision_at_k(y_test.values, y_proba, 5)
+    prec_at_10 = compute_precision_at_k(y_test.values, y_proba, 10)
+    
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
@@ -306,11 +350,37 @@ def main() -> None:
     print(f"Positive rate:        {positive_ratio:.3f}%")
     print(f"ROC-AUC:              {roc_auc:.4f}")
     print(f"PR-AUC:               {pr_auc:.4f}")
-    print(f"Precision @ top 1%:   {compute_precision_at_k(y_test.values, y_proba, 1):.4f}")
-    print(f"Precision @ top 5%:   {compute_precision_at_k(y_test.values, y_proba, 5):.4f}")
-    print(f"Precision @ top 10%:  {compute_precision_at_k(y_test.values, y_proba, 10):.4f}")
+    print(f"Precision @ top 1%:   {prec_at_1:.4f}")
+    print(f"Precision @ top 5%:   {prec_at_5:.4f}")
+    print(f"Precision @ top 10%:  {prec_at_10:.4f}")
     print("=" * 70)
-    print("\nAll done.")
+    
+    # Log to W&B
+    total_time = time.time() - start_time
+    
+    wandb.log({
+        "metrics/true_negatives": int(tn),
+        "metrics/false_positives": int(fp),
+        "metrics/false_negatives": int(fn),
+        "metrics/true_positives": int(tp),
+        "metrics/accuracy": (tp + tn) / (tp + tn + fp + fn),
+        "metrics/precision": tp / (tp + fp) if (tp + fp) > 0 else 0,
+        "metrics/recall": tp / (tp + fn) if (tp + fn) > 0 else 0,
+        "metrics/f1": 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0,
+        "metrics/roc_auc": roc_auc,
+        "metrics/pr_auc": pr_auc,
+        "metrics/precision_at_1": prec_at_1,
+        "metrics/precision_at_5": prec_at_5,
+        "metrics/precision_at_10": prec_at_10,
+        "timing/total_seconds": total_time,
+        "timing/total_minutes": total_time / 60,
+        "status": "success"
+    })
+    
+    print(f"\nTotal time: {total_time:.1f}s ({total_time/60:.1f} min)")
+    print("All done.")
+    
+    wandb.finish()
 
 
 if __name__ == "__main__":

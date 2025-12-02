@@ -11,13 +11,16 @@ Output: prints a classification report and the 20 most important features.
 
 from __future__ import annotations
 
+import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+import wandb
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, roc_auc_score, confusion_matrix, average_precision_score
 from sklearn.model_selection import train_test_split
 
 
@@ -58,6 +61,33 @@ EXCLUDE_COLS = {
 
 
 def main() -> None:
+    start_time = time.time()
+    
+    # Initialize W&B
+    wandb_api_key = os.environ.get("WANDB_API_KEY")
+    wandb_entity = os.environ.get("WANDB_ENTITY")
+    
+    if not wandb_api_key:
+        print("Warning: WANDB_API_KEY not found in environment")
+    if not wandb_entity:
+        print("Warning: WANDB_ENTITY not found in environment")
+    
+    print("Initializing Weights & Biases...")
+    wandb.init(
+        project="ml-training-balanced",
+        entity=wandb_entity,
+        name=f"train_balanced_{time.strftime('%Y%m%d_%H%M%S')}",
+        config={
+            "model": "RandomForest",
+            "n_estimators": N_ESTIMATORS,
+            "test_size": TEST_SIZE,
+            "random_state": RANDOM_STATE,
+            "max_sample_size": MAX_SAMPLE_SIZE,
+            "target": "transition_01",
+        },
+    )
+    print("W&B connected\n")
+    
     repo_root = Path(__file__).resolve().parents[3]
     input_path = repo_root / "data/ml/sample_training_balanced.parquet"
 
@@ -116,10 +146,22 @@ def main() -> None:
     
     # Print target distribution
     transition_counts = y.value_counts().sort_index()
+    n_negatives = transition_counts.get(0, 0)
+    n_positives = transition_counts.get(1, 0)
+    positive_ratio = n_positives / len(y) * 100
+    
     print(f"\nTarget distribution:")
-    print(f"  No transition (0): {transition_counts.get(0, 0):,}")
-    print(f"  New WDPA (0→1):    {transition_counts.get(1, 0):,}")
-    print(f"  Class balance:     {transition_counts.get(1, 0) / len(y) * 100:.1f}% positive")
+    print(f"  No transition (0): {n_negatives:,}")
+    print(f"  New WDPA (0→1):    {n_positives:,}")
+    print(f"  Class balance:     {positive_ratio:.1f}% positive")
+    
+    wandb.log({
+        "data/n_features": len(feature_cols),
+        "data/n_samples": len(df_clean),
+        "data/n_positives": n_positives,
+        "data/n_negatives": n_negatives,
+        "data/positive_ratio": positive_ratio / 100,
+    })
 
     # Train/test split with stratification
     print(
@@ -158,11 +200,29 @@ def main() -> None:
     # Evaluate
     print("\nEvaluating on test set …")
     y_pred = rf.predict(X_test)
+    y_proba = rf.predict_proba(X_test)[:, 1]
 
     print("\n" + "=" * 60)
     print("CLASSIFICATION REPORT")
     print("=" * 60)
     print(classification_report(y_test, y_pred))
+    
+    # Confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    tn, fp, fn, tp = cm.ravel()
+    
+    print("\nConfusion Matrix:")
+    print(f"True Negatives:  {tn:,}")
+    print(f"False Positives: {fp:,}")
+    print(f"False Negatives: {fn:,}")
+    print(f"True Positives:  {tp:,}")
+    
+    # Compute AUC metrics
+    roc_auc = roc_auc_score(y_test, y_proba)
+    pr_auc = average_precision_score(y_test, y_proba)
+    
+    print(f"\nROC-AUC: {roc_auc:.4f}")
+    print(f"PR-AUC:  {pr_auc:.4f}")
 
     # Feature importance
     print("\n" + "=" * 60)
@@ -173,7 +233,30 @@ def main() -> None:
     ).sort_values("importance", ascending=False)
 
     print(feature_importance.head(20).to_string(index=False))
-    print("\nDone.")
+    
+    # Log to W&B
+    total_time = time.time() - start_time
+    
+    wandb.log({
+        "metrics/true_negatives": int(tn),
+        "metrics/false_positives": int(fp),
+        "metrics/false_negatives": int(fn),
+        "metrics/true_positives": int(tp),
+        "metrics/accuracy": (tp + tn) / (tp + tn + fp + fn),
+        "metrics/precision": tp / (tp + fp) if (tp + fp) > 0 else 0,
+        "metrics/recall": tp / (tp + fn) if (tp + fn) > 0 else 0,
+        "metrics/f1": 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0,
+        "metrics/roc_auc": roc_auc,
+        "metrics/pr_auc": pr_auc,
+        "timing/total_seconds": total_time,
+        "timing/total_minutes": total_time / 60,
+        "status": "success"
+    })
+    
+    print(f"\nTotal time: {total_time:.1f}s ({total_time/60:.1f} min)")
+    print("Done.")
+    
+    wandb.finish()
 
 
 if __name__ == "__main__":
