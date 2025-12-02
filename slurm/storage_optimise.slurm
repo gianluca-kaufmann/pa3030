@@ -21,6 +21,7 @@ mkdir -p "$SCRATCH/wandb/storage_optimisation"
 module purge
 module load stack/2024-06
 module load gcc/12.2.0
+module load gdal/3.7.3
 module load python_cuda/3.11.6
 module load eth_proxy
 
