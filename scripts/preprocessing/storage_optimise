@@ -1,0 +1,551 @@
+#!/usr/bin/python3
+"""
+Storage Optimization Script for GeoTIFF Rasters.
+
+Optimizes GeoTIFFs from data/ready and saves them to data/ml/ready using GDAL.
+
+Strategy:
+- For WorldClim bands 1-11, GSN bands 1-5, and small-range bands (powerplants, oil_gas):
+  - Check if abs(max_value) <= 327.67
+  - If true: scale ×100, round, and store as Int16 (PREDICTOR=2)
+  - If false: store as Float32 (PREDICTOR=3)
+- For all other rasters (elevation, slope, GPW, NDVI, HNTL, etc.):
+  - Store as Float32 (PREDICTOR=3)
+
+All outputs use: TILED=YES, COMPRESS=DEFLATE
+
+Usage:
+    python storage_optimise [--dry-run] [--dataset DATASET]
+
+Options:
+    --dry-run       Print what would be done without executing
+    --dataset NAME  Process only the specified dataset (e.g., WorldClim, GSN)
+"""
+
+import os
+import sys
+import argparse
+import subprocess
+import json
+import re
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
+import tempfile
+import shutil
+
+# Try to import rasterio for reading stats; fall back to gdalinfo if unavailable
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+
+# Determine paths - use $SCRATCH on cluster
+if "SCRATCH" in os.environ:
+    DATA_ROOT = Path(os.environ["SCRATCH"]) / "data"
+else:
+    SCRIPT_DIR = Path(__file__).resolve().parent
+    PROJECT_ROOT = SCRIPT_DIR.parent.parent
+    DATA_ROOT = PROJECT_ROOT / "data"
+
+INPUT_ROOT = DATA_ROOT / "ready"
+OUTPUT_ROOT = DATA_ROOT / "ml" / "ready"
+
+# Datasets eligible for Int16 scaling (small value ranges)
+# These will be checked for abs(max) <= 327.67
+INT16_CANDIDATES = {
+    "WorldClim": list(range(1, 12)),  # Bands 1-11
+    "GSN": list(range(1, 6)),          # Bands 1-5
+    "powerplants": None,               # All bands (None = check all)
+    "oil_gas": None,                   # All bands
+}
+
+# Maximum absolute value for Int16 scaling (scaled by 100)
+# Int16 range: -32768 to 32767, so max unscaled value = 327.67
+INT16_MAX_UNSCALED = 327.67
+SCALE_FACTOR = 100
+
+
+@dataclass
+class FileStats:
+    """Statistics for a raster file."""
+    path: Path
+    min_val: float
+    max_val: float
+    mean_val: float
+    std_val: float
+    nodata: Optional[float]
+    dtype: str
+    bands: int
+    width: int
+    height: int
+
+
+@dataclass
+class OptimizationResult:
+    """Result of optimization for a single file."""
+    input_path: Path
+    output_path: Path
+    original_dtype: str
+    output_dtype: str
+    scaled: bool
+    scale_factor: Optional[int]
+    input_size_mb: float
+    output_size_mb: float
+    compression_ratio: float
+    success: bool
+    error: Optional[str] = None
+
+
+def log(message: str, level: str = "INFO"):
+    """Simple logging to stdout."""
+    print(f"[{level}] {message}")
+
+
+def get_raster_stats_gdalinfo(path: Path) -> Optional[FileStats]:
+    """Get raster statistics using gdalinfo."""
+    try:
+        # Run gdalinfo with statistics
+        result = subprocess.run(
+            ["gdalinfo", "-json", "-stats", str(path)],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        info = json.loads(result.stdout)
+        
+        bands = len(info.get("bands", []))
+        size = info.get("size", [0, 0])
+        width, height = size[0], size[1]
+        
+        # Get stats from first band (representative)
+        band_info = info.get("bands", [{}])[0]
+        
+        min_val = band_info.get("minimum", band_info.get("computedMin", 0))
+        max_val = band_info.get("maximum", band_info.get("computedMax", 0))
+        mean_val = band_info.get("mean", 0)
+        std_val = band_info.get("stdDev", 0)
+        nodata = band_info.get("noDataValue")
+        dtype = band_info.get("type", "Unknown")
+        
+        return FileStats(
+            path=path,
+            min_val=float(min_val) if min_val is not None else 0,
+            max_val=float(max_val) if max_val is not None else 0,
+            mean_val=float(mean_val) if mean_val is not None else 0,
+            std_val=float(std_val) if std_val is not None else 0,
+            nodata=float(nodata) if nodata is not None else None,
+            dtype=dtype,
+            bands=bands,
+            width=width,
+            height=height
+        )
+    except subprocess.CalledProcessError as e:
+        log(f"gdalinfo failed for {path}: {e.stderr}", "ERROR")
+        return None
+    except json.JSONDecodeError as e:
+        log(f"Failed to parse gdalinfo JSON for {path}: {e}", "ERROR")
+        return None
+    except Exception as e:
+        log(f"Error getting stats for {path}: {e}", "ERROR")
+        return None
+
+
+def get_all_band_stats(path: Path) -> List[Tuple[float, float]]:
+    """Get min/max for all bands in a raster using gdalinfo."""
+    try:
+        result = subprocess.run(
+            ["gdalinfo", "-json", "-stats", str(path)],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        info = json.loads(result.stdout)
+        
+        band_stats = []
+        for band in info.get("bands", []):
+            min_val = band.get("minimum", band.get("computedMin", 0))
+            max_val = band.get("maximum", band.get("computedMax", 0))
+            band_stats.append((
+                float(min_val) if min_val is not None else 0,
+                float(max_val) if max_val is not None else 0
+            ))
+        return band_stats
+    except Exception as e:
+        log(f"Error getting band stats for {path}: {e}", "ERROR")
+        return []
+
+
+def should_use_int16(
+    path: Path,
+    dataset: str,
+    band_idx: Optional[int] = None
+) -> Tuple[bool, str]:
+    """
+    Determine if a raster should be converted to Int16 with scaling.
+    
+    Returns:
+        (use_int16, reason)
+    """
+    # Check if dataset is a candidate for Int16
+    if dataset not in INT16_CANDIDATES:
+        return False, f"Dataset '{dataset}' not in Int16 candidates list"
+    
+    eligible_bands = INT16_CANDIDATES[dataset]
+    
+    # Get band statistics
+    band_stats = get_all_band_stats(path)
+    if not band_stats:
+        return False, "Could not retrieve band statistics"
+    
+    # Check each band
+    for i, (min_val, max_val) in enumerate(band_stats, start=1):
+        # Skip bands not in eligible list (if list is specified)
+        if eligible_bands is not None and i not in eligible_bands:
+            continue
+        
+        # Check if values fit in Int16 after scaling
+        max_abs = max(abs(min_val), abs(max_val))
+        if max_abs > INT16_MAX_UNSCALED:
+            return False, f"Band {i}: abs(max)={max_abs:.2f} > {INT16_MAX_UNSCALED}"
+    
+    return True, f"All eligible bands have abs(max) <= {INT16_MAX_UNSCALED}"
+
+
+def optimize_to_int16(
+    input_path: Path,
+    output_path: Path,
+    nodata: Optional[float] = None,
+    dry_run: bool = False
+) -> bool:
+    """
+    Convert raster to Int16 with ×100 scaling using gdal_calc.py + gdal_translate.
+    
+    Pipeline:
+    1. gdal_calc.py: Scale values ×100 and round
+    2. gdal_translate: Convert to Int16 with compression
+    """
+    if dry_run:
+        log(f"  [DRY-RUN] Would scale ×100 and convert to Int16: {input_path.name}")
+        return True
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Use temp file for intermediate result
+    with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    
+    try:
+        # Step 1: Scale with gdal_calc.py (output as Float32 first)
+        calc_cmd = [
+            "gdal_calc.py",
+            "-A", str(input_path),
+            f"--outfile={tmp_path}",
+            "--calc=numpy.round(A * 100)",
+            "--type=Float32",
+            "--co=COMPRESS=DEFLATE",
+            "--overwrite"
+        ]
+        if nodata is not None:
+            calc_cmd.extend([f"--NoDataValue={nodata * SCALE_FACTOR}"])
+        
+        log(f"  Scaling ×100: {input_path.name}")
+        result = subprocess.run(calc_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            log(f"  gdal_calc.py failed: {result.stderr}", "ERROR")
+            return False
+        
+        # Step 2: Convert to Int16 with optimal compression
+        translate_cmd = [
+            "gdal_translate",
+            "-ot", "Int16",
+            "-co", "TILED=YES",
+            "-co", "COMPRESS=DEFLATE",
+            "-co", "PREDICTOR=2",
+            str(tmp_path),
+            str(output_path)
+        ]
+        if nodata is not None:
+            translate_cmd.extend(["-a_nodata", str(int(nodata * SCALE_FACTOR))])
+        
+        log(f"  Converting to Int16: {output_path.name}")
+        result = subprocess.run(translate_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            log(f"  gdal_translate failed: {result.stderr}", "ERROR")
+            return False
+        
+        return True
+        
+    finally:
+        # Clean up temp file
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def optimize_to_float32(
+    input_path: Path,
+    output_path: Path,
+    nodata: Optional[float] = None,
+    dry_run: bool = False
+) -> bool:
+    """
+    Convert raster to Float32 with compression using gdal_translate.
+    """
+    if dry_run:
+        log(f"  [DRY-RUN] Would convert to Float32: {input_path.name}")
+        return True
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    translate_cmd = [
+        "gdal_translate",
+        "-ot", "Float32",
+        "-co", "TILED=YES",
+        "-co", "COMPRESS=DEFLATE",
+        "-co", "PREDICTOR=3",
+        str(input_path),
+        str(output_path)
+    ]
+    if nodata is not None:
+        translate_cmd.extend(["-a_nodata", str(nodata)])
+    
+    log(f"  Converting to Float32: {output_path.name}")
+    result = subprocess.run(translate_cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        log(f"  gdal_translate failed: {result.stderr}", "ERROR")
+        return False
+    
+    return True
+
+
+def process_file(
+    input_path: Path,
+    output_path: Path,
+    dataset: str,
+    dry_run: bool = False
+) -> OptimizationResult:
+    """Process a single raster file."""
+    log(f"Processing: {input_path.relative_to(INPUT_ROOT)}")
+    
+    # Get input stats
+    stats = get_raster_stats_gdalinfo(input_path)
+    if stats is None:
+        return OptimizationResult(
+            input_path=input_path,
+            output_path=output_path,
+            original_dtype="Unknown",
+            output_dtype="Unknown",
+            scaled=False,
+            scale_factor=None,
+            input_size_mb=0,
+            output_size_mb=0,
+            compression_ratio=0,
+            success=False,
+            error="Failed to get input statistics"
+        )
+    
+    input_size_mb = input_path.stat().st_size / (1024 * 1024)
+    
+    # Log input stats
+    log(f"  Input: dtype={stats.dtype}, size={stats.width}x{stats.height}, "
+        f"bands={stats.bands}, range=[{stats.min_val:.2f}, {stats.max_val:.2f}]")
+    
+    # Determine optimization strategy
+    use_int16, reason = should_use_int16(input_path, dataset)
+    
+    if use_int16:
+        log(f"  Strategy: Int16 (×100 scaling) - {reason}")
+        success = optimize_to_int16(input_path, output_path, stats.nodata, dry_run)
+        output_dtype = "Int16"
+        scaled = True
+        scale_factor = SCALE_FACTOR
+    else:
+        log(f"  Strategy: Float32 - {reason}")
+        success = optimize_to_float32(input_path, output_path, stats.nodata, dry_run)
+        output_dtype = "Float32"
+        scaled = False
+        scale_factor = None
+    
+    # Get output stats
+    output_size_mb = 0
+    compression_ratio = 0
+    if success and not dry_run and output_path.exists():
+        output_size_mb = output_path.stat().st_size / (1024 * 1024)
+        compression_ratio = input_size_mb / output_size_mb if output_size_mb > 0 else 0
+        log(f"  Output: {output_size_mb:.2f} MB (compression ratio: {compression_ratio:.2f}x)")
+    
+    return OptimizationResult(
+        input_path=input_path,
+        output_path=output_path,
+        original_dtype=stats.dtype,
+        output_dtype=output_dtype,
+        scaled=scaled,
+        scale_factor=scale_factor,
+        input_size_mb=input_size_mb,
+        output_size_mb=output_size_mb,
+        compression_ratio=compression_ratio,
+        success=success
+    )
+
+
+def discover_rasters(input_root: Path, dataset_filter: Optional[str] = None) -> Dict[str, List[Path]]:
+    """
+    Discover all rasters in input directory, grouped by dataset.
+    
+    Returns:
+        {dataset_name: [list of tif paths]}
+    """
+    catalog: Dict[str, List[Path]] = {}
+    
+    if not input_root.exists():
+        log(f"Input directory does not exist: {input_root}", "ERROR")
+        return catalog
+    
+    for subdir in sorted([p for p in input_root.iterdir() if p.is_dir()]):
+        dataset = subdir.name
+        
+        # Apply filter if specified
+        if dataset_filter and dataset.lower() != dataset_filter.lower():
+            continue
+        
+        tif_files = sorted(subdir.rglob("*.tif"))
+        if tif_files:
+            catalog[dataset] = tif_files
+            log(f"Found {len(tif_files)} files in {dataset}")
+    
+    return catalog
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Optimize GeoTIFF storage using Int16 scaling or Float32 compression."
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print what would be done without executing"
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Process only the specified dataset (e.g., WorldClim, GSN)"
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging"
+    )
+    args = parser.parse_args()
+    
+    log("=" * 60)
+    log("GeoTIFF Storage Optimization Script")
+    log("=" * 60)
+    log(f"Input root:  {INPUT_ROOT}")
+    log(f"Output root: {OUTPUT_ROOT}")
+    log(f"Dry run:     {args.dry_run}")
+    if args.dataset:
+        log(f"Dataset filter: {args.dataset}")
+    log("")
+    
+    # Check GDAL availability
+    try:
+        result = subprocess.run(["gdal_translate", "--version"], capture_output=True, text=True)
+        log(f"GDAL version: {result.stdout.strip()}")
+    except FileNotFoundError:
+        log("gdal_translate not found. Please install GDAL.", "ERROR")
+        sys.exit(1)
+    
+    try:
+        result = subprocess.run(["gdal_calc.py", "--help"], capture_output=True, text=True)
+        log("gdal_calc.py: available")
+    except FileNotFoundError:
+        log("gdal_calc.py not found. Please install GDAL Python bindings.", "ERROR")
+        sys.exit(1)
+    
+    log("")
+    
+    # Discover rasters
+    catalog = discover_rasters(INPUT_ROOT, args.dataset)
+    
+    if not catalog:
+        log("No rasters found to process.", "ERROR")
+        sys.exit(1)
+    
+    total_files = sum(len(files) for files in catalog.values())
+    log(f"\nTotal files to process: {total_files}")
+    log("")
+    
+    # Process each dataset
+    results: List[OptimizationResult] = []
+    
+    for dataset, files in sorted(catalog.items()):
+        log(f"\n{'='*40}")
+        log(f"Dataset: {dataset}")
+        log(f"{'='*40}")
+        
+        for input_path in files:
+            # Construct output path (preserve directory structure)
+            rel_path = input_path.relative_to(INPUT_ROOT)
+            output_path = OUTPUT_ROOT / rel_path
+            
+            result = process_file(input_path, output_path, dataset, args.dry_run)
+            results.append(result)
+            log("")
+    
+    # Summary
+    log("\n" + "=" * 60)
+    log("SUMMARY")
+    log("=" * 60)
+    
+    successful = [r for r in results if r.success]
+    failed = [r for r in results if not r.success]
+    scaled = [r for r in successful if r.scaled]
+    
+    total_input_mb = sum(r.input_size_mb for r in results)
+    total_output_mb = sum(r.output_size_mb for r in successful)
+    
+    log(f"Files processed: {len(results)}")
+    log(f"  Successful:    {len(successful)}")
+    log(f"  Failed:        {len(failed)}")
+    log(f"  Int16 scaled:  {len(scaled)}")
+    log(f"  Float32:       {len(successful) - len(scaled)}")
+    log("")
+    
+    if not args.dry_run and total_output_mb > 0:
+        log(f"Total input size:  {total_input_mb:.2f} MB")
+        log(f"Total output size: {total_output_mb:.2f} MB")
+        log(f"Overall compression: {total_input_mb / total_output_mb:.2f}x")
+        log(f"Space saved: {total_input_mb - total_output_mb:.2f} MB")
+    
+    if failed:
+        log("\nFailed files:", "WARNING")
+        for r in failed:
+            log(f"  {r.input_path}: {r.error}", "WARNING")
+    
+    # Detailed per-file summary
+    log("\n" + "-" * 60)
+    log("Per-file details:")
+    log("-" * 60)
+    log(f"{'File':<50} {'In DType':<10} {'Out DType':<10} {'Scaled':<8} {'Ratio':<8}")
+    log("-" * 60)
+    
+    for r in results:
+        filename = str(r.input_path.relative_to(INPUT_ROOT))[:48]
+        scaled_str = f"×{r.scale_factor}" if r.scaled else "No"
+        ratio_str = f"{r.compression_ratio:.2f}x" if r.compression_ratio > 0 else "-"
+        status = "✓" if r.success else "✗"
+        log(f"{filename:<50} {r.original_dtype:<10} {r.output_dtype:<10} {scaled_str:<8} {ratio_str:<8} {status}")
+    
+    log("\n" + "=" * 60)
+    log("Optimization complete!")
+    log("=" * 60)
+    
+    # Return non-zero exit code if any failures
+    sys.exit(0 if not failed else 1)
+
+
+if __name__ == "__main__":
+    main()
+
