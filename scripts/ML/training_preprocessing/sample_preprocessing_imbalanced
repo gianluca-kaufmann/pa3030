@@ -269,18 +269,19 @@ def main() -> None:
         print(f"   This reads only ~{total_sample:,} rows from the full feature set")
         step6_start = time.time()
         
-        # Build SELECT clause for numeric columns (with proper quoting)
-        numeric_select = ", ".join([f'full."{col}"' for col in numeric_columns])
+        # Build SELECT clause for numeric columns (without table alias prefix)
+        core_cols = "row, col, year"
+        numeric_select = ", ".join(numeric_columns)
         
-        # Join sampled keys with full dataset (numeric columns only)
+        # Use SEMI JOIN pattern with WHERE IN to avoid table alias issues
         con.execute(f"""
             COPY (
-                SELECT full."row", full."col", full."year", {numeric_select}, full."transition_01"
-                FROM read_parquet('{escaped_in}') AS full
-                INNER JOIN read_parquet('{escaped_keys}') AS keys
-                    ON full."row" = keys."row" 
-                    AND full."col" = keys."col" 
-                    AND full."year" = keys."year"
+                SELECT {core_cols}, {numeric_select}, transition_01
+                FROM read_parquet('{escaped_in}')
+                WHERE (row, col, year) IN (
+                    SELECT row, col, year 
+                    FROM read_parquet('{escaped_keys}')
+                )
                 ORDER BY random()
             )
             TO '{escaped_out}'

@@ -116,14 +116,17 @@ def main() -> None:
     
     # Step 2: Read full features for sampled rows only
     print("Step 2: Reading full features for sampled rows...")
+    
+    # Use SEMI JOIN instead of INNER JOIN to avoid column naming issues
+    # This approach leverages DuckDB's WHERE IN optimization
     con.execute(f"""
         COPY (
-            SELECT full.*
-            FROM read_parquet('{escaped_in}') AS full
-            INNER JOIN read_parquet('{escaped_keys}') AS keys
-                ON full."row" = keys."row" 
-                AND full."col" = keys."col" 
-                AND full."year" = keys."year"
+            SELECT *
+            FROM read_parquet('{escaped_in}')
+            WHERE (row, col, year) IN (
+                SELECT row, col, year 
+                FROM read_parquet('{escaped_keys}')
+            )
         )
         TO '{escaped_out}'
         (FORMAT 'parquet');

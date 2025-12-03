@@ -228,15 +228,16 @@ def main() -> None:
         print(f"   This reads only ~{total_sample:,} rows from the full feature set")
         step5_start = time.time()
         
-        # Join sampled keys with full dataset - DuckDB optimizes this as a semi-join
+        # Use SEMI JOIN pattern with WHERE IN to avoid column naming issues
+        # DuckDB optimizes this efficiently
         con.execute(f"""
             COPY (
-                SELECT full.*
-                FROM read_parquet('{escaped_in}') AS full
-                INNER JOIN read_parquet('{escaped_keys}') AS keys
-                    ON full.row = keys.row 
-                    AND full.col = keys.col 
-                    AND full.year = keys.year
+                SELECT *
+                FROM read_parquet('{escaped_in}')
+                WHERE (row, col, year) IN (
+                    SELECT row, col, year 
+                    FROM read_parquet('{escaped_keys}')
+                )
             )
             TO '{escaped_out}'
             (FORMAT PARQUET, COMPRESSION ZSTD)
