@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=compute-panel-statistics
+#SBATCH --job-name=spatial-features-preprocessing
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=15G
-#SBATCH --output=/cluster/scratch/%u/logs/compute_panel_statistics_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/compute_panel_statistics_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/spatial_features_preprocessing_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/spatial_features_preprocessing_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -15,7 +15,7 @@ mkdir -p "$SCRATCH/data"
 mkdir -p "$SCRATCH/data/ml"
 mkdir -p "$SCRATCH/outputs"
 mkdir -p "$SCRATCH/outputs/Tables"
-mkdir -p "$SCRATCH/wandb/consistency"
+mkdir -p "$SCRATCH/wandb/ML/training_preprocessing"
 
 #------------------------------------------------------------------------------
 # Load modules
@@ -36,19 +36,19 @@ source "$VENV_DIR/bin/activate"
 #------------------------------------------------------------------------------
 # Run the script
 #------------------------------------------------------------------------------
-echo "Starting compute panel statistics script..."
+echo "Starting spatial features preprocessing script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/consistency checks/compute_panel_statistics" ] || {
-  echo "ERROR: compute_panel_statistics not found under scripts/consistency checks"
-  find scripts -maxdepth 3 -type f -name "compute_panel_statistics"
+[ -f "scripts/ML/training_preprocessing/spatial_features_preprocessing" ] || {
+  echo "ERROR: spatial_features_preprocessing not found under scripts/ML/training_preprocessing"
+  find scripts -maxdepth 3 -type f -name "spatial_features_preprocessing"
   exit 1
 }
 
 # Run the script
-python "scripts/consistency checks/compute_panel_statistics"
+python "scripts/ML/training_preprocessing/spatial_features_preprocessing"
 
-echo "Compute panel statistics script finished."
+echo "Spatial features preprocessing script finished."
