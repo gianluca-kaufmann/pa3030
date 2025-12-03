@@ -7,7 +7,7 @@ Purpose: Add spatial and transition features to the merged panel data with Risk 
 Processing order (per year):
     1. Lag feature: WDPA_prev (1-year lag of WDPA_b1, default 0 for first year)
     2. Spatial features computed on FULL grid (before Risk Set filtering):
-       - Distance features: distance to nearest WDPA protected area pixel
+       - Distance features: distance to nearest WDPA_prev (t-1) protected pixel [avoids target leakage]
        - Decay features: exp(-distance / 10000)
        - Smoothed features: 4x4, 16x16, 64x64 mean for specified variables
     3. Risk Set filter: Keep only rows where WDPA_prev == 0 (pixels not previously protected)
@@ -64,10 +64,10 @@ def grid_to_dataframe(grid: np.ndarray, df: pd.DataFrame, min_row: int, min_col:
 
 
 def compute_distance_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute distance to WDPA and decay features."""
-    logger.info("  Computing distance features...")
+    """Compute distance to WDPA and decay features using WDPA_prev (t-1) to avoid target leakage."""
+    logger.info("  Computing distance features from WDPA_prev (t-1)...")
     
-    wdpa_grid, min_row, max_row, min_col, max_col = reconstruct_grid(df, 'WDPA_b1')
+    wdpa_grid, min_row, max_row, min_col, max_col = reconstruct_grid(df, 'WDPA_prev')
     wdpa_binary = np.where(np.isnan(wdpa_grid), 0, wdpa_grid > 0).astype(np.uint8)
     del wdpa_grid
     
