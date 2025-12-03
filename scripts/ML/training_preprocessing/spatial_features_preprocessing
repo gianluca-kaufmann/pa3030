@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
 import time
 import warnings
 from pathlib import Path
@@ -210,9 +211,43 @@ def process_year(input_path: Path, year: int, temp_dir: Path, is_first_year: boo
 def main() -> None:
     """Main processing function."""
     repo_root = Path(__file__).resolve().parents[3]
-    input_path = repo_root / "data/ml/merged_panel_2000_2024.parquet"
-    output_path = repo_root / "data/ml/merged_panel_final.parquet"
-    temp_dir = repo_root / "data/ml/.temp_spatial_features"
+    scratch_root = Path(os.environ["SCRATCH"]) if "SCRATCH" in os.environ else None
+
+    # Resolve input path with sensible defaults:
+    #  1) Explicit override via env var SPATIAL_FEATURES_INPUT_PATH
+    #  2) Common Euler location on $SCRATCH
+    #  3) Fallback to local repo path (original behaviour)
+    env_input = os.environ.get("SPATIAL_FEATURES_INPUT_PATH")
+    if env_input:
+        input_path = Path(env_input)
+    else:
+        candidate_paths = []
+        if scratch_root is not None:
+            candidate_paths.append(
+                scratch_root / "outputs/Results/merged_panel_2000_2024.parquet"
+            )
+            candidate_paths.append(
+                scratch_root / "data/ml/merged_panel_2000_2024.parquet"
+            )
+        candidate_paths.append(
+            repo_root / "data/ml/merged_panel_2000_2024.parquet"
+        )
+
+        # Default to the last candidate (original local path) if none exist
+        input_path = candidate_paths[-1]
+        for cand in candidate_paths:
+            if cand.exists():
+                input_path = cand
+                break
+
+    # On clusters, write large outputs to $SCRATCH; locally keep them under the repo
+    if scratch_root is not None:
+        base_ml_dir = scratch_root / "data/ml"
+    else:
+        base_ml_dir = repo_root / "data/ml"
+
+    output_path = base_ml_dir / "merged_panel_final.parquet"
+    temp_dir = base_ml_dir / ".temp_spatial_features"
     
     # Initialize W&B
     wandb.init(
