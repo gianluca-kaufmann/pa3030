@@ -151,7 +151,7 @@ def main() -> None:
         
         con.execute(f"""
             COPY (
-                SELECT row, col, year, transition_01
+                SELECT "row", "col", "year", "transition_01"
                 FROM read_parquet('{escaped_in}')
             )
             TO '{escaped_minimal}'
@@ -168,11 +168,11 @@ def main() -> None:
         
         counts = con.execute(f"""
             SELECT 
-                SUM(transition_01) AS positives,
-                SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS negatives,
+                SUM("transition_01") AS positives,
+                SUM(CASE WHEN "transition_01" = 0 THEN 1 ELSE 0 END) AS negatives,
                 COUNT(*) AS total,
-                MIN(year) AS year_min,
-                MAX(year) AS year_max
+                MIN("year") AS year_min,
+                MAX("year") AS year_max
             FROM read_parquet('{escaped_minimal}')
         """).fetchone()
         
@@ -238,21 +238,21 @@ def main() -> None:
         print(f"   Sampling {sample_positives:,} positives + {sample_negatives:,} negatives (keys only)...")
         con.execute(f"""
             COPY (
-                SELECT row, col, year
+                SELECT "row", "col", "year"
                 FROM (
-                    SELECT row, col, year
+                    SELECT "row", "col", "year"
                     FROM read_parquet('{escaped_minimal}')
-                    WHERE transition_01 = 1
+                    WHERE "transition_01" = 1
                 )
                 USING SAMPLE reservoir({sample_positives} ROWS) REPEATABLE ({RANDOM_STATE})
                 
                 UNION ALL
                 
-                SELECT row, col, year
+                SELECT "row", "col", "year"
                 FROM (
-                    SELECT row, col, year
+                    SELECT "row", "col", "year"
                     FROM read_parquet('{escaped_minimal}')
-                    WHERE transition_01 = 0
+                    WHERE "transition_01" = 0
                 )
                 USING SAMPLE reservoir({sample_negatives} ROWS) REPEATABLE ({RANDOM_STATE})
             )
@@ -269,18 +269,18 @@ def main() -> None:
         print(f"   This reads only ~{total_sample:,} rows from the full feature set")
         step6_start = time.time()
         
-        # Build SELECT clause for numeric columns
-        numeric_select = ", ".join([f"full.{col}" for col in numeric_columns])
+        # Build SELECT clause for numeric columns (with proper quoting)
+        numeric_select = ", ".join([f'full."{col}"' for col in numeric_columns])
         
         # Join sampled keys with full dataset (numeric columns only)
         con.execute(f"""
             COPY (
-                SELECT full.row, full.col, full.year, {numeric_select}, full.transition_01
+                SELECT full."row", full."col", full."year", {numeric_select}, full."transition_01"
                 FROM read_parquet('{escaped_in}') AS full
                 INNER JOIN read_parquet('{escaped_keys}') AS keys
-                    ON full.row = keys.row 
-                    AND full.col = keys.col 
-                    AND full.year = keys.year
+                    ON full."row" = keys."row" 
+                    AND full."col" = keys."col" 
+                    AND full."year" = keys."year"
                 ORDER BY random()
             )
             TO '{escaped_out}'
@@ -302,12 +302,12 @@ def main() -> None:
         
         verify_counts = con.execute(f"""
             SELECT 
-                SUM(transition_01) AS pos_written,
-                SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS neg_written,
+                SUM("transition_01") AS pos_written,
+                SUM(CASE WHEN "transition_01" = 0 THEN 1 ELSE 0 END) AS neg_written,
                 COUNT(*) AS total_written,
-                COUNT(DISTINCT year) AS n_years,
-                MIN(year) AS min_year,
-                MAX(year) AS max_year
+                COUNT(DISTINCT "year") AS n_years,
+                MIN("year") AS min_year,
+                MAX("year") AS max_year
             FROM read_parquet('{escaped_out}')
         """).fetchone()
         
