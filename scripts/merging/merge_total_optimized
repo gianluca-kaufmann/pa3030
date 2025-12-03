@@ -3,21 +3,20 @@
 Merge South America 1 km rasters into a yearly panel with streaming I/O and low memory use.
 
 Summary:
-- Reads per-dataset rasters from ``data/ml/ready`` (storage-optimized) or ``data/ready`` (fallback).
-- On cluster: uses ``$SCRATCH/data/ml/ready`` with fallback to ``$SCRATCH/data/ready``.
+- Reads per-dataset rasters from ``data`` (or ``$SCRATCH/data`` on cluster).
 - Processes one year at a time, reusing earlier data when a dataset is missing for a given year.
 - Masks out all pixels where backbone = 0 (outside South America) to reduce output size.
 - Streams window batches to a single Parquet panel while cleaning up memory eagerly.
 
 Inputs:
-- Year-specific raster folders under ``data/ml/ready/<dataset>`` (or ``data/ready/<dataset>``).
+- Year-specific raster folders under ``data/<dataset>`` with filenames containing the year.
 - Static rasters (no year in filename) read once and injected into every year.
 - backbone.tif (binary mask) that defines the reference grid and South America extent.
 
-Storage-Optimized Input Handling:
-- The storage_optimise script may convert certain datasets to Int16 with ×100 scaling.
-- Scaled datasets: WorldClim (bands 1-11), GSN (bands 1-5), powerplants, oil_gas.
-- This script automatically detects Int16 data and unscales (÷100) during reading.
+Int16 Auto-Unscaling:
+- Automatically detects Int16-scaled data (WorldClim, GSN, powerplants, oil_gas) and unscales (÷100).
+- Works seamlessly with both original and storage-optimized inputs.
+- No configuration needed - detection is automatic based on dtype.
 
 Static vs. Yearly Datasets:
 Static datasets (no year in filename, constant across all years):
@@ -62,12 +61,12 @@ Key choices:
 - Forward-fill for yearly datasets to maintain complete panel and avoid gaps in derived indicators.
 - Vectorized coordinate generation and Arrow streaming to avoid pandas and large in-memory tables.
 - Explicit cleanup (`del`, `gc.collect`) after each window and year to keep RAM usage bounded.
-- Automatic Int16 unscaling for storage-optimized inputs (no speed penalty).
+- Automatic Int16 unscaling for storage-optimized inputs (no speed penalty, dtype-based detection).
 
 Short overview of what the script does:
 1) Initialize Weights & Biases and resolve paths for data and outputs.
 2) Open backbone.tif to define the reference grid (shape, CRS, transform) and load the binary mask.
-3) Discover all candidate rasters in data/ml/ready (or data/ready fallback) and group them by dataset and year.
+3) Discover all candidate rasters in data and group them by dataset and year.
 4) Automatically determine the year range from available data (all years with at least one dataset).
 5) Classify datasets into static (time-invariant) and yearly (time-varying) categories.
 6) Determine the final band list by probing static and yearly datasets separately.
@@ -75,9 +74,9 @@ Short overview of what the script does:
    - For each window:
      a) Load static datasets ONCE (these remain constant across all years).
      b) Load yearly datasets for the current year (with forward/backward-fill fallback).
-     c) Combine static + yearly arrays in consistent order.
+     c) Auto-detect and unscale Int16 data if present (÷100 for WorldClim, GSN, etc.).
+     d) Combine static + yearly arrays in consistent order.
    - Reproject on-the-fly to match the reference grid if needed.
-   - Auto-unscale Int16 data from storage-optimized inputs.
    - Concatenate dataset arrays into a single band stack for the year.
    - Convert the stack to a long Arrow table (vectorized coords).
    - Apply backbone mask to exclude pixels outside South America before writing to Parquet.
@@ -112,30 +111,12 @@ if "SCRATCH" in os.environ:
 else:
     DATA_ROOT = PROJECT_ROOT / "data"
 
-# Prefer storage-optimized data (data/ml) with fallback to original (data)
-# The storage_optimise script converts some datasets to Int16 for smaller file sizes
-ML_READY_ROOT = DATA_ROOT / "ml"
-ORIG_READY_ROOT = DATA_ROOT
+# Use data directory directly
+READY_ROOT = DATA_ROOT
 
-# Select the best available data source
-# Check if ml directory exists and has datasets (not just embeddings)
-ml_has_datasets = False
-if ML_READY_ROOT.exists():
-    # Check for any dataset folders other than embeddings
-    for item in ML_READY_ROOT.iterdir():
-        if item.is_dir() and item.name != "embeddings":
-            ml_has_datasets = True
-            break
-
-if ml_has_datasets:
-    READY_ROOT = ML_READY_ROOT
-    USING_OPTIMIZED = True
-else:
-    READY_ROOT = ORIG_READY_ROOT
-    USING_OPTIMIZED = False
-
-# Datasets that may be Int16-scaled (×100) in storage-optimized inputs
+# Datasets that may be Int16-scaled (×100) if using storage-optimized inputs
 # These need to be unscaled (÷100) when reading
+# The script will auto-detect Int16 dtype and unscale accordingly
 INT16_SCALED_DATASETS = {"WorldClim", "GSN", "powerplants", "oil_gas"}
 
 # Use $SCRATCH if on cluster, otherwise use local outputs
@@ -163,11 +144,9 @@ def open_reference_backbone() -> Tuple[Path, rasterio.DatasetReader, np.ndarray]
     """Open backbone.tif as reference grid and return path, dataset, and mask array."""
     log_progress("Loading backbone reference grid...")
     
-    # Search for backbone.tif (check both optimized and original locations)
+    # Search for backbone.tif
     backbone_paths = [
         READY_ROOT / "backbone" / "backbone.tif",
-        ML_READY_ROOT / "backbone" / "backbone.tif",
-        ORIG_READY_ROOT / "backbone" / "backbone.tif",
         DATA_ROOT / "backbone" / "backbone.tif",
     ]
     
@@ -209,11 +188,9 @@ def discover_raster_catalog() -> Dict[str, Dict[Optional[int], List[Path]]]:
     catalog: Dict[str, Dict[Optional[int], List[Path]]] = {}
     year_re = re.compile(r"(19|20)\d{2}")
     if not READY_ROOT.exists():
-        print(f"ERROR: No data directory found.")
-        print(f"  Checked: {ML_READY_ROOT} (storage-optimized)")
-        print(f"  Checked: {ORIG_READY_ROOT} (original)")
+        print(f"ERROR: Data directory not found: {READY_ROOT}")
         print(f"  Data root: {DATA_ROOT}")
-        print("\nPlease ensure data exists in one of these locations.")
+        print("\nPlease ensure data directory exists.")
         sys.exit(1)
     
     total_files = 0
@@ -360,18 +337,17 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
     Optimization: If already aligned, read window directly without reprojection.
     Special handling: If src.nodata == 0, we preserve legitimate zeros.
     
-    Int16 unscaling: If using storage-optimized inputs and the dataset is in INT16_SCALED_DATASETS,
-    automatically detects Int16 data and divides by 100 to restore original values.
-    This adds negligible overhead (just a division operation on float32 array).
+    Int16 auto-unscaling: If the dataset is in INT16_SCALED_DATASETS and the file dtype is Int16,
+    automatically divides by 100 to restore original values. This allows seamless use of storage-optimized
+    inputs without manual intervention.
     """
     with rasterio.open(src_path) as src:
         dst_height = int(window.height)
         dst_width = int(window.width)
         count = src.count
         
-        # Detect if this is Int16 scaled data that needs unscaling
+        # Auto-detect if this is Int16 scaled data that needs unscaling
         needs_unscaling = (
-            USING_OPTIMIZED and 
             dataset is not None and 
             dataset in INT16_SCALED_DATASETS and
             src.dtypes[0] in ('int16', 'Int16')
@@ -387,7 +363,7 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
             if src.nodata is not None and src.nodata not in [0, 0.0]:
                 data[data == src.nodata] = np.nan
             
-            # Unscale Int16 data (÷100) - minimal overhead
+            # Auto-unscale Int16 data (÷100) if detected
             if needs_unscaling:
                 data = data / 100.0
             
@@ -437,7 +413,7 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
                     dst_nodata=np.nan,
                 )
         
-        # Unscale Int16 data (÷100) - minimal overhead
+        # Auto-unscale Int16 data (÷100) if detected
         if needs_unscaling:
             dst = dst / 100.0
         
@@ -626,12 +602,8 @@ def main():
     log_progress("Starting optimized merge process...")
     
     # Log data source
-    if USING_OPTIMIZED:
-        log_progress(f"Using STORAGE-OPTIMIZED data from: {READY_ROOT}")
-        log_progress(f"  Int16-scaled datasets (auto-unscaled): {', '.join(INT16_SCALED_DATASETS)}")
-    else:
-        log_progress(f"Using ORIGINAL data from: {READY_ROOT}")
-        log_progress("  (Run storage_optimise script to create optimized inputs)")
+    log_progress(f"Using data from: {READY_ROOT}")
+    log_progress(f"Int16 auto-unscaling enabled for: {', '.join(INT16_SCALED_DATASETS)}")
     
     # Setup reference using backbone
     ref_path, ref_src, backbone_mask = open_reference_backbone()
@@ -669,8 +641,8 @@ def main():
             "ready_root": str(READY_ROOT),
             "output_root": str(OUTPUT_ROOT),
             "scratch_mode": "SCRATCH" in os.environ,
-            "using_optimized_inputs": USING_OPTIMIZED,
-            "int16_scaled_datasets": list(INT16_SCALED_DATASETS) if USING_OPTIMIZED else [],
+            "int16_auto_unscaling_enabled": True,
+            "int16_scaled_datasets": list(INT16_SCALED_DATASETS),
         }
     )
     print("Weights & Biases connected successfully!")
@@ -766,8 +738,7 @@ def main():
             if band_names:
                 static_band_names.extend(band_names)
                 static_band_counts[dataset] = len(band_names)
-                scaled_note = " [Int16-scaled]" if USING_OPTIMIZED and dataset in INT16_SCALED_DATASETS else ""
-                log_progress(f"    {dataset}: {len(band_names)} bands (static){scaled_note}")
+                log_progress(f"    {dataset}: {len(band_names)} bands (static)")
         except Exception as e:
             log_progress(f"    Warning: Could not probe static dataset {dataset}: {e}")
             continue
@@ -800,8 +771,7 @@ def main():
             if band_names:
                 yearly_band_names.extend(band_names)
                 yearly_band_counts[dataset] = len(band_names)
-                scaled_note = " [Int16-scaled]" if USING_OPTIMIZED and dataset in INT16_SCALED_DATASETS else ""
-                log_progress(f"    {dataset}: {len(band_names)} bands (yearly){scaled_note}")
+                log_progress(f"    {dataset}: {len(band_names)} bands (yearly)")
         except Exception as e:
             log_progress(f"    Warning: Could not probe yearly dataset {dataset}: {e}")
             continue
