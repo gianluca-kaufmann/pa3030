@@ -20,7 +20,7 @@ Strategy:
    - Only use Float32 (PREDICTOR=3) if source was float
    - Prevents unnecessary upcasting of integer files (landcover, roads, backbone, etc.)
 
-All outputs use: TILED=YES, COMPRESS=DEFLATE
+All outputs use: TILED=YES, COMPRESS=DEFLATE, clean EPSG:3857 CRS
 
 Requirements:
 - gdal_translate (for compression)
@@ -226,6 +226,7 @@ def get_all_band_stats(path: Path) -> List[Tuple[float, float]]:
 def split_multiband_file(input_path: Path, output_dir: Path) -> List[Path]:
     """
     Split a multi-band raster into separate single-band files.
+    Ensures clean EPSG:3857 CRS in output files.
     
     Returns:
         List of output file paths (one per band)
@@ -252,9 +253,12 @@ def split_multiband_file(input_path: Path, output_dir: Path) -> List[Path]:
             # Extract single band
             band_data = src.read(band_idx)
             
-            # Copy profile and update for single band
+            # Copy profile and update for single band with clean CRS
             profile = src.profile.copy()
-            profile.update({'count': 1})
+            profile.update({
+                'count': 1,
+                'crs': 'EPSG:3857'  # Ensure clean CRS
+            })
             
             # Write single-band file
             with rasterio.open(output_path, 'w', **profile) as dst:
@@ -330,7 +334,7 @@ def optimize_to_int16(
     
     Pipeline:
     1. rasterio: Scale values ×100 and round (replaces gdal_calc.py)
-    2. gdal_translate: Convert to Int16 with compression
+    2. gdal_translate: Convert to Int16 with compression and clean EPSG:3857 CRS
     """
     if dry_run:
         log(f"  [DRY-RUN] Would scale ×100 and convert to Int16: {input_path.name}")
@@ -361,21 +365,23 @@ def optimize_to_int16(
                     mask = data == src.nodata
                     scaled_data[mask] = scaled_nodata
             
-            # Write to temp file
+            # Write to temp file with clean EPSG:3857 CRS
             profile = src.profile.copy()
             profile.update({
                 'dtype': rasterio.float32,
                 'compress': 'deflate',
-                'nodata': scaled_nodata
+                'nodata': scaled_nodata,
+                'crs': 'EPSG:3857'  # Ensure clean CRS
             })
             
             with rasterio.open(tmp_path, 'w', **profile) as dst:
                 dst.write(scaled_data)
         
-        # Step 2: Convert to Int16 with optimal compression
+        # Step 2: Convert to Int16 with optimal compression and explicitly set EPSG:3857
         translate_cmd = [
             "gdal_translate",
             "-ot", "Int16",
+            "-a_srs", "EPSG:3857",  # Explicitly set clean CRS
             "-co", "TILED=YES",
             "-co", "COMPRESS=DEFLATE",
             "-co", "PREDICTOR=2",
@@ -408,6 +414,7 @@ def optimize_preserve_dtype(
     """
     Optimize raster while preserving original dtype (for integer types) or using Float32 (for float types).
     Preserves Byte/Int16/UInt16 types with PREDICTOR=2, uses Float32 with PREDICTOR=3 for float types.
+    Ensures clean EPSG:3857 CRS in output.
     """
     if dry_run:
         log(f"  [DRY-RUN] Would optimize preserving dtype: {input_path.name}")
@@ -438,6 +445,7 @@ def optimize_preserve_dtype(
     translate_cmd = [
         "gdal_translate",
         "-ot", output_dtype,
+        "-a_srs", "EPSG:3857",  # Explicitly set clean CRS
         "-co", "TILED=YES",
         "-co", "COMPRESS=DEFLATE",
         "-co", f"PREDICTOR={predictor}",
@@ -464,6 +472,7 @@ def optimize_to_float32(
     """
     Convert raster to Float32 with compression using gdal_translate.
     Used as fallback when Int16 scaling check fails for Int16 candidates.
+    Ensures clean EPSG:3857 CRS in output.
     """
     if dry_run:
         log(f"  [DRY-RUN] Would convert to Float32: {input_path.name}")
@@ -474,6 +483,7 @@ def optimize_to_float32(
     translate_cmd = [
         "gdal_translate",
         "-ot", "Float32",
+        "-a_srs", "EPSG:3857",  # Explicitly set clean CRS
         "-co", "TILED=YES",
         "-co", "COMPRESS=DEFLATE",
         "-co", "PREDICTOR=3",
@@ -734,6 +744,7 @@ def main():
     log(f"Dry run:     {args.dry_run}")
     if args.dataset:
         log(f"Dataset filter: {args.dataset}")
+    log(f"CRS:         All outputs will use clean EPSG:3857")
     log("")
     
     # Initialize wandb if available

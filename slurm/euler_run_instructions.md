@@ -27,6 +27,12 @@ scp gikaufmann@login.euler.ethz.ch:/cluster/scratch/gikaufmann/outputs/Results/m
 
 # txt and other outputs
 scp -r gikaufmann@euler.ethz.ch:~/master_thesis/outputs/Tables/merged_panel_validation.txt ~/Desktop/
+
+# Download from GCS → Desktop
+gsutil -m cp gs://protected-areas/data/ml/merged_panel_final.parquet 
+
+# whole folder
+gsutil -m cp -r gs://protected-areas/outputs/Results /Users/gianluca/Desktop/
 ```
 ### Sync Between Euler ↔ GCS
 
