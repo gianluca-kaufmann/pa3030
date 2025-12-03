@@ -12,7 +12,7 @@
 # Create necessary folders on $SCRATCH if they don't exist
 mkdir -p "$SCRATCH/logs"
 mkdir -p "$SCRATCH/data"
-mkdir -p "$SCRATCH/data/ml"
+mkdir -p "$SCRATCH/data/ml/ready"
 mkdir -p "$SCRATCH/wandb/storage_optimisation"
 
 #------------------------------------------------------------------------------
@@ -42,7 +42,7 @@ export WANDB_CACHE_DIR="$SCRATCH/wandb/storage_optimisation/.cache"
 #------------------------------------------------------------------------------
 echo "Starting storage optimization script..."
 echo "Input:  $SCRATCH/data"
-echo "Output: $SCRATCH/data/ml"
+echo "Output: $SCRATCH/data/ml/ready"
 echo "WANDB:  $WANDB_DIR"
 echo ""
 echo "Note: This will optimize all datasets including:"
@@ -81,5 +81,5 @@ python "scripts/preprocessing/storage_optimise"
 echo ""
 echo "Storage optimization finished."
 echo "Output data structure:"
-ls -la "$SCRATCH/data/ml/" | head -20
+ls -la "$SCRATCH/data/ml/ready/" | head -20
 

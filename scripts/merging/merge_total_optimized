@@ -3,7 +3,7 @@
 Merge South America 1 km rasters into a yearly panel with streaming I/O and low memory use.
 
 Summary:
-- Reads per-dataset rasters from ``data`` (or ``$SCRATCH/data`` on cluster).
+- Reads per-dataset rasters from ``data`` (or ``$SCRATCH/data/ml/ready`` on cluster for storage-optimized inputs).
 - Processes one year at a time, reusing earlier data when a dataset is missing for a given year.
 - Masks out all pixels where backbone = 0 (outside South America) to reduce output size.
 - Streams window batches to a single Parquet panel while cleaning up memory eagerly.
@@ -108,11 +108,12 @@ PROJECT_ROOT = SCRIPT_DIR.parent.parent
 # Use $SCRATCH for data if on cluster, otherwise use project root
 if "SCRATCH" in os.environ:
     DATA_ROOT = Path(os.environ["SCRATCH"]) / "data"
+    # On cluster, read from storage-optimized rasters
+    READY_ROOT = DATA_ROOT / "ml" / "ready"
 else:
     DATA_ROOT = PROJECT_ROOT / "data"
-
-# Use data directory directly
-READY_ROOT = DATA_ROOT
+    # Locally, read from original data directory
+    READY_ROOT = DATA_ROOT
 
 # Datasets that may be Int16-scaled (×100) if using storage-optimized inputs
 # These need to be unscaled (÷100) when reading
