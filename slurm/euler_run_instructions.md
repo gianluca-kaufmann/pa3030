@@ -100,4 +100,7 @@ find /cluster/scratch/gikaufmann -type f -mtime -1 -print
 # Check txt/json in repo
 cd ~/master_thesis
 find outputs -type f
+
+# folder delete
+rm -rf ~/master_thesis/wandb/*
 ```

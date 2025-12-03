@@ -2,19 +2,22 @@
 
 """Spatial Features Preprocessing Script
 
-Purpose: Add spatial and transition features to the merged panel data with Risk Set filtering:
-    1. Lag feature: WDPA_prev (1-year lag of WDPA_b1, default 0 for first year)
-    2. Risk Set filter: Keep only rows where WDPA_prev == 0 (pixels not previously protected)
-    3. Target variable: transition_01 = WDPA_b1 (simplified since WDPA_prev guaranteed to be 0)
-    4. Distance features: distance to nearest WDPA protected area pixel
-    5. Decay features: exp(-distance / 10000)
-    6. Smoothed features: 4x4, 16x16, 64x64 mean for specified variables
+Purpose: Add spatial and transition features to the merged panel data with Risk Set filtering.
 
-Input:  data/ml/merged_panel_2000_2024.parquet
+Processing order (per year):
+    1. Lag feature: WDPA_prev (1-year lag of WDPA_b1, default 0 for first year)
+    2. Spatial features computed on FULL grid (before Risk Set filtering):
+       - Distance features: distance to nearest WDPA protected area pixel
+       - Decay features: exp(-distance / 10000)
+       - Smoothed features: 4x4, 16x16, 64x64 mean for specified variables
+    3. Risk Set filter: Keep only rows where WDPA_prev == 0 (pixels not previously protected)
+    4. Target variable: transition_01 = WDPA_b1 (simplified since WDPA_prev guaranteed to be 0)
+
+Input:  data/ml/merged_panel_2000_2024.parquet (or $SCRATCH path on Euler)
 Output: data/ml/merged_panel_final.parquet (Risk Set only, with transition_01 column)
 
 Processing: Year-by-year for memory efficiency with 500M+ rows.
-Risk Set filtering significantly reduces output size by excluding already-protected pixels.
+Spatial features reflect the full landscape context, then Risk Set filtering reduces output size.
 """
 
 from __future__ import annotations
@@ -177,7 +180,12 @@ def process_year(input_path: Path, year: int, temp_dir: Path, is_first_year: boo
         logger.info(f"  First year {year}: setting WDPA_prev = 0")
         df_year['WDPA_prev'] = np.uint8(0)
     
-    # Step 2: Apply Risk Set filter (keep only WDPA_prev == 0)
+    # Step 2: Compute spatial features on FULL grid (before Risk Set filtering)
+    logger.info(f"  Computing spatial features on full grid ({n_rows_initial:,} rows)...")
+    df_year = compute_distance_features(df_year)
+    df_year = compute_all_smooth_features(df_year)
+    
+    # Step 3: Apply Risk Set filter (keep only WDPA_prev == 0)
     df_year = df_year[df_year['WDPA_prev'] == 0].copy()
     n_rows_filtered = len(df_year)
     logger.info(f"  Risk Set filter: {n_rows_filtered:,} rows (kept {100*n_rows_filtered/n_rows_initial:.1f}%)")
@@ -186,17 +194,13 @@ def process_year(input_path: Path, year: int, temp_dir: Path, is_first_year: boo
         logger.warning(f"  No rows remaining after Risk Set filter for year {year}")
         return None, {}
     
-    # Step 3: Create transition_01 = WDPA_b1 (since WDPA_prev guaranteed to be 0)
+    # Step 4: Create transition_01 = WDPA_b1 (since WDPA_prev guaranteed to be 0)
     # Handle NaN values: treat missing WDPA status as not protected (0)
     wdpa_values = df_year['WDPA_b1'].fillna(0)
     n_nan = df_year['WDPA_b1'].isna().sum()
     if n_nan > 0:
         logger.warning(f"  Found {n_nan:,} NaN values in WDPA_b1, filling with 0")
     df_year['transition_01'] = wdpa_values.astype(np.uint8)
-    
-    # Step 4: Compute spatial features
-    df_year = compute_distance_features(df_year)
-    df_year = compute_all_smooth_features(df_year)
     
     temp_file = temp_dir / f"year_{year}_processed.parquet"
     df_year.to_parquet(temp_file, engine='pyarrow', compression='snappy', index=False)
