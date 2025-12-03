@@ -20,7 +20,7 @@ Strategy:
    - Only use Float32 (PREDICTOR=3) if source was float
    - Prevents unnecessary upcasting of integer files (landcover, roads, backbone, etc.)
 
-All outputs use: TILED=YES, COMPRESS=DEFLATE, clean EPSG:3857 CRS
+All outputs use: TILED=YES, COMPRESS=DEFLATE, CRS from backbone raster
 
 Requirements:
 - gdal_translate (for compression)
@@ -223,10 +223,13 @@ def get_all_band_stats(path: Path) -> List[Tuple[float, float]]:
         return []
 
 
-def split_multiband_file(input_path: Path, output_dir: Path) -> List[Path]:
+def split_multiband_file(input_path: Path, output_dir: Path, backbone_crs=None) -> List[Path]:
     """
     Split a multi-band raster into separate single-band files.
-    Ensures clean EPSG:3857 CRS in output files.
+    Uses backbone CRS if provided, otherwise preserves input CRS.
+    
+    Args:
+        backbone_crs: CRS object from backbone raster to use for all outputs
     
     Returns:
         List of output file paths (one per band)
@@ -253,12 +256,13 @@ def split_multiband_file(input_path: Path, output_dir: Path) -> List[Path]:
             # Extract single band
             band_data = src.read(band_idx)
             
-            # Copy profile and update for single band with clean CRS
+            # Copy profile and update for single band
             profile = src.profile.copy()
-            profile.update({
-                'count': 1,
-                'crs': 'EPSG:3857'  # Ensure clean CRS
-            })
+            profile.update({'count': 1})
+            
+            # Use backbone CRS if provided, otherwise keep source CRS
+            if backbone_crs is not None:
+                profile['crs'] = backbone_crs
             
             # Write single-band file
             with rasterio.open(output_path, 'w', **profile) as dst:
@@ -327,14 +331,18 @@ def optimize_to_int16(
     input_path: Path,
     output_path: Path,
     nodata: Optional[float] = None,
-    dry_run: bool = False
+    dry_run: bool = False,
+    backbone_crs = None
 ) -> bool:
     """
     Convert raster to Int16 with ×100 scaling using rasterio + gdal_translate.
     
     Pipeline:
     1. rasterio: Scale values ×100 and round (replaces gdal_calc.py)
-    2. gdal_translate: Convert to Int16 with compression and clean EPSG:3857 CRS
+    2. gdal_translate: Convert to Int16 with compression
+    
+    Args:
+        backbone_crs: CRS object from backbone raster to use for output (if provided)
     """
     if dry_run:
         log(f"  [DRY-RUN] Would scale ×100 and convert to Int16: {input_path.name}")
@@ -365,23 +373,25 @@ def optimize_to_int16(
                     mask = data == src.nodata
                     scaled_data[mask] = scaled_nodata
             
-            # Write to temp file with clean EPSG:3857 CRS
+            # Write to temp file
             profile = src.profile.copy()
             profile.update({
                 'dtype': rasterio.float32,
                 'compress': 'deflate',
-                'nodata': scaled_nodata,
-                'crs': 'EPSG:3857'  # Ensure clean CRS
+                'nodata': scaled_nodata
             })
+            
+            # Use backbone CRS if provided, otherwise keep source CRS
+            if backbone_crs is not None:
+                profile['crs'] = backbone_crs
             
             with rasterio.open(tmp_path, 'w', **profile) as dst:
                 dst.write(scaled_data)
         
-        # Step 2: Convert to Int16 with optimal compression and explicitly set EPSG:3857
+        # Step 2: Convert to Int16 with optimal compression (CRS preserved from temp file)
         translate_cmd = [
             "gdal_translate",
             "-ot", "Int16",
-            "-a_srs", "EPSG:3857",  # Explicitly set clean CRS
             "-co", "TILED=YES",
             "-co", "COMPRESS=DEFLATE",
             "-co", "PREDICTOR=2",
@@ -409,12 +419,15 @@ def optimize_preserve_dtype(
     input_path: Path,
     output_path: Path,
     nodata: Optional[float] = None,
-    dry_run: bool = False
+    dry_run: bool = False,
+    backbone_crs = None
 ) -> bool:
     """
     Optimize raster while preserving original dtype (for integer types) or using Float32 (for float types).
     Preserves Byte/Int16/UInt16 types with PREDICTOR=2, uses Float32 with PREDICTOR=3 for float types.
-    Ensures clean EPSG:3857 CRS in output.
+    
+    Args:
+        backbone_crs: CRS object from backbone raster (not used here, CRS preserved from input)
     """
     if dry_run:
         log(f"  [DRY-RUN] Would optimize preserving dtype: {input_path.name}")
@@ -422,57 +435,91 @@ def optimize_preserve_dtype(
     
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # Detect source dtype
-    try:
-        with rasterio.open(input_path) as src:
-            source_dtype = src.dtypes[0]
-            source_dtype_lower = source_dtype.lower()
-    except Exception as e:
-        log(f"  Could not read source dtype: {e}", "ERROR")
-        return False
-    
-    # Determine output dtype and predictor
-    if source_dtype_lower in INTEGER_DTYPES:
-        # Preserve integer type
-        output_dtype, predictor = INTEGER_DTYPES[source_dtype_lower]
-        log(f"  Preserving integer dtype: {source_dtype} -> {output_dtype}")
+    # If backbone_crs is provided, we need to update the CRS via rasterio first
+    if backbone_crs is not None:
+        # Use temp file to update CRS
+        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        
+        try:
+            # Copy file with updated CRS
+            with rasterio.open(input_path) as src:
+                profile = src.profile.copy()
+                profile['crs'] = backbone_crs
+                
+                with rasterio.open(tmp_path, 'w', **profile) as dst:
+                    for i in range(1, src.count + 1):
+                        dst.write(src.read(i), i)
+            
+            # Now use the temp file as input
+            actual_input_path = tmp_path
+        except Exception as e:
+            log(f"  Warning: Could not update CRS: {e}", "WARNING")
+            actual_input_path = input_path
+            tmp_path = None
     else:
-        # Use Float32 for float types
-        output_dtype = "Float32"
-        predictor = 3
-        log(f"  Converting float dtype: {source_dtype} -> {output_dtype}")
+        actual_input_path = input_path
+        tmp_path = None
     
-    translate_cmd = [
-        "gdal_translate",
-        "-ot", output_dtype,
-        "-a_srs", "EPSG:3857",  # Explicitly set clean CRS
-        "-co", "TILED=YES",
-        "-co", "COMPRESS=DEFLATE",
-        "-co", f"PREDICTOR={predictor}",
-        str(input_path),
-        str(output_path)
-    ]
-    if nodata is not None:
-        translate_cmd.extend(["-a_nodata", str(nodata)])
+    try:
+        # Detect source dtype
+        try:
+            with rasterio.open(actual_input_path) as src:
+                source_dtype = src.dtypes[0]
+                source_dtype_lower = source_dtype.lower()
+        except Exception as e:
+            log(f"  Could not read source dtype: {e}", "ERROR")
+            return False
+        
+        # Determine output dtype and predictor
+        if source_dtype_lower in INTEGER_DTYPES:
+            # Preserve integer type
+            output_dtype, predictor = INTEGER_DTYPES[source_dtype_lower]
+            log(f"  Preserving integer dtype: {source_dtype} -> {output_dtype}")
+        else:
+            # Use Float32 for float types
+            output_dtype = "Float32"
+            predictor = 3
+            log(f"  Converting float dtype: {source_dtype} -> {output_dtype}")
+        
+        translate_cmd = [
+            "gdal_translate",
+            "-ot", output_dtype,
+            "-co", "TILED=YES",
+            "-co", "COMPRESS=DEFLATE",
+            "-co", f"PREDICTOR={predictor}",
+            str(actual_input_path),
+            str(output_path)
+        ]
+        if nodata is not None:
+            translate_cmd.extend(["-a_nodata", str(nodata)])
+        
+        result = subprocess.run(translate_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            log(f"  gdal_translate failed: {result.stderr}", "ERROR")
+            return False
+        
+        return True
     
-    result = subprocess.run(translate_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        log(f"  gdal_translate failed: {result.stderr}", "ERROR")
-        return False
-    
-    return True
+    finally:
+        # Clean up temp file if it was created
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink()
 
 
 def optimize_to_float32(
     input_path: Path,
     output_path: Path,
     nodata: Optional[float] = None,
-    dry_run: bool = False
+    dry_run: bool = False,
+    backbone_crs = None
 ) -> bool:
     """
     Convert raster to Float32 with compression using gdal_translate.
     Used as fallback when Int16 scaling check fails for Int16 candidates.
-    Ensures clean EPSG:3857 CRS in output.
+    
+    Args:
+        backbone_crs: CRS object from backbone raster (not used here, CRS preserved from input)
     """
     if dry_run:
         log(f"  [DRY-RUN] Would convert to Float32: {input_path.name}")
@@ -480,26 +527,57 @@ def optimize_to_float32(
     
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    translate_cmd = [
-        "gdal_translate",
-        "-ot", "Float32",
-        "-a_srs", "EPSG:3857",  # Explicitly set clean CRS
-        "-co", "TILED=YES",
-        "-co", "COMPRESS=DEFLATE",
-        "-co", "PREDICTOR=3",
-        str(input_path),
-        str(output_path)
-    ]
-    if nodata is not None:
-        translate_cmd.extend(["-a_nodata", str(nodata)])
+    # If backbone_crs is provided, we need to update the CRS via rasterio first
+    if backbone_crs is not None:
+        # Use temp file to update CRS
+        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        
+        try:
+            # Copy file with updated CRS
+            with rasterio.open(input_path) as src:
+                profile = src.profile.copy()
+                profile['crs'] = backbone_crs
+                
+                with rasterio.open(tmp_path, 'w', **profile) as dst:
+                    for i in range(1, src.count + 1):
+                        dst.write(src.read(i), i)
+            
+            # Now use the temp file as input
+            actual_input_path = tmp_path
+        except Exception as e:
+            log(f"  Warning: Could not update CRS: {e}", "WARNING")
+            actual_input_path = input_path
+            tmp_path = None
+    else:
+        actual_input_path = input_path
+        tmp_path = None
     
-    log(f"  Converting to Float32: {output_path.name}")
-    result = subprocess.run(translate_cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        log(f"  gdal_translate failed: {result.stderr}", "ERROR")
-        return False
+    try:
+        translate_cmd = [
+            "gdal_translate",
+            "-ot", "Float32",
+            "-co", "TILED=YES",
+            "-co", "COMPRESS=DEFLATE",
+            "-co", "PREDICTOR=3",
+            str(actual_input_path),
+            str(output_path)
+        ]
+        if nodata is not None:
+            translate_cmd.extend(["-a_nodata", str(nodata)])
+        
+        log(f"  Converting to Float32: {output_path.name}")
+        result = subprocess.run(translate_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            log(f"  gdal_translate failed: {result.stderr}", "ERROR")
+            return False
+        
+        return True
     
-    return True
+    finally:
+        # Clean up temp file if it was created
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink()
 
 
 def process_single_band_file(
@@ -507,9 +585,14 @@ def process_single_band_file(
     output_path: Path,
     dataset: str,
     band_idx: Optional[int] = None,
-    dry_run: bool = False
+    dry_run: bool = False,
+    backbone_crs = None
 ) -> OptimizationResult:
-    """Process a single-band raster file (or specific band of multi-band file)."""
+    """Process a single-band raster file (or specific band of multi-band file).
+    
+    Args:
+        backbone_crs: CRS object from backbone raster to use for output
+    """
     # Get input stats
     stats = get_raster_stats_gdalinfo(input_path)
     if stats is None:
@@ -540,21 +623,21 @@ def process_single_band_file(
     if use_int16:
         # Int16 candidates with small enough range: scale ×100
         log(f"  Strategy: Int16 (×100 scaling) - {reason}")
-        success = optimize_to_int16(input_path, output_path, stats.nodata, dry_run)
+        success = optimize_to_int16(input_path, output_path, stats.nodata, dry_run, backbone_crs)
         output_dtype = "Int16"
         scaled = True
         scale_factor = SCALE_FACTOR
     elif dataset in INT16_CANDIDATES:
         # Int16 candidate but range too large: fallback to Float32
         log(f"  Strategy: Float32 (Int16 range check failed) - {reason}")
-        success = optimize_to_float32(input_path, output_path, stats.nodata, dry_run)
+        success = optimize_to_float32(input_path, output_path, stats.nodata, dry_run, backbone_crs)
         output_dtype = "Float32"
         scaled = False
         scale_factor = None
     else:
         # Not an Int16 candidate: preserve original dtype
         log(f"  Strategy: Preserve dtype - {reason}")
-        success = optimize_preserve_dtype(input_path, output_path, stats.nodata, dry_run)
+        success = optimize_preserve_dtype(input_path, output_path, stats.nodata, dry_run, backbone_crs)
         # Get actual output dtype
         if success and not dry_run and output_path.exists():
             try:
@@ -593,10 +676,14 @@ def process_file(
     input_path: Path,
     output_path: Path,
     dataset: str,
-    dry_run: bool = False
+    dry_run: bool = False,
+    backbone_crs = None
 ) -> List[OptimizationResult]:
     """
     Process a single raster file. May return multiple results if multi-band splitting occurs.
+    
+    Args:
+        backbone_crs: CRS object from backbone raster to use for all outputs
     
     Returns:
         List of OptimizationResult (one per output file)
@@ -630,7 +717,7 @@ def process_file(
             
             # Create temp directory for split bands
             temp_dir = output_path.parent / "_temp_split"
-            split_paths = split_multiband_file(input_path, temp_dir)
+            split_paths = split_multiband_file(input_path, temp_dir, backbone_crs)
             
             # Process each split band
             results = []
@@ -642,7 +729,7 @@ def process_file(
                 
                 log(f"\n  Processing band {band_idx}/{num_bands}:")
                 result = process_single_band_file(
-                    split_path, band_output_path, dataset, band_idx=band_idx, dry_run=dry_run
+                    split_path, band_output_path, dataset, band_idx=band_idx, dry_run=dry_run, backbone_crs=backbone_crs
                 )
                 results.append(result)
             
@@ -657,7 +744,7 @@ def process_file(
             return results
     
     # Single-band or no splitting needed
-    return [process_single_band_file(input_path, output_path, dataset, dry_run=dry_run)]
+    return [process_single_band_file(input_path, output_path, dataset, dry_run=dry_run, backbone_crs=backbone_crs)]
 
 
 def discover_rasters(input_root: Path, dataset_filter: Optional[str] = None) -> Dict[str, List[Path]]:
@@ -744,7 +831,6 @@ def main():
     log(f"Dry run:     {args.dry_run}")
     if args.dataset:
         log(f"Dataset filter: {args.dataset}")
-    log(f"CRS:         All outputs will use clean EPSG:3857")
     log("")
     
     # Initialize wandb if available
@@ -798,6 +884,28 @@ def main():
     
     log("")
     
+    # Load backbone CRS to reuse in all outputs (avoids PROJ database errors)
+    backbone_crs = None
+    backbone_paths = [
+        INPUT_ROOT / "backbone" / "backbone.tif",
+        DATA_ROOT / "backbone" / "backbone.tif",
+    ]
+    for backbone_path in backbone_paths:
+        if backbone_path.exists():
+            try:
+                with rasterio.open(backbone_path) as src:
+                    backbone_crs = src.crs
+                    log(f"Loaded backbone CRS from {backbone_path}")
+                    log(f"  CRS: {backbone_crs}")
+                    break
+            except Exception as e:
+                log(f"Warning: Could not read backbone CRS from {backbone_path}: {e}", "WARNING")
+    
+    if backbone_crs is None:
+        log("Warning: Could not load backbone CRS. Outputs will preserve input CRS.", "WARNING")
+    
+    log("")
+    
     # Discover rasters
     catalog = discover_rasters(INPUT_ROOT, args.dataset)
     
@@ -839,7 +947,7 @@ def main():
             simple_dataset = dataset.split('/')[-1] if '/' in dataset else dataset
             
             # Process file (may return multiple results if splitting occurs)
-            file_results = process_file(input_path, output_path, simple_dataset, args.dry_run)
+            file_results = process_file(input_path, output_path, simple_dataset, args.dry_run, backbone_crs)
             
             # Add all results to main list
             for result in file_results:
