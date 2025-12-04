@@ -6,6 +6,7 @@ then sampling for feature statistics (missing values, numeric ranges).
 """
 
 import json
+import os
 import numpy as np
 import pyarrow.parquet as pq
 from pathlib import Path
@@ -14,7 +15,20 @@ from collections import Counter
 
 # Paths
 ROOT_DIR = Path(__file__).resolve().parents[2]
-PANEL_FILE = ROOT_DIR / "data" / "ml" / "merged_panel_final.parquet"
+SCRATCH_ROOT = Path(os.environ["SCRATCH"]) if "SCRATCH" in os.environ else None
+
+# Prefer panel file on $SCRATCH (Euler) if available, otherwise fall back to repo path
+candidate_panel_paths = []
+if SCRATCH_ROOT is not None:
+    candidate_panel_paths.append(SCRATCH_ROOT / "data" / "ml" / "merged_panel_final.parquet")
+candidate_panel_paths.append(ROOT_DIR / "data" / "ml" / "merged_panel_final.parquet")
+
+PANEL_FILE = candidate_panel_paths[-1]
+for cand in candidate_panel_paths:
+    if cand.exists():
+        PANEL_FILE = cand
+        break
+
 OUTPUT_JSON = ROOT_DIR / "outputs" / "Tables" / "merged_panel_statistics.json"
 OUTPUT_JSON.parent.mkdir(parents=True, exist_ok=True)
 

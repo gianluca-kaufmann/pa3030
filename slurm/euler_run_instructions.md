@@ -58,15 +58,6 @@ gsutil -m rsync -r outputs \
 ### Job troubleshooting
 
 ```bash
-# See your most recent jobs (today)
-sacct -u $USER --starttime today \
-  --format=JobID,JobName,Partition,State,ExitCode,Elapsed,MaxRSS,AllocCPUS | tail -n 20
-
-# Inspect a specific job (replace <JOBID>)
-job=<JOBID>
-sacct -j ${job} --format=JobID,JobName,State,ExitCode,Elapsed,ReqMem,AllocCPUS,MaxRSS,MaxVMSize
-scontrol show job ${job} | sed -n '1,80p'
-
 # Find the log files for successful and failed runs
 ls -lt $SCRATCH/logs | head
 
@@ -75,30 +66,12 @@ less $SCRATCH/logs/<LOGFILE>.out
 # Inspect the .err file
 less $SCRATCH/logs/<LOGFILE>.err
 
-# Look at the training logs (STDOUT + STDERR)
-#    (adapt the pattern if your TRAIN.slurm uses a different naming scheme)
-ls -lt $SCRATCH/logs/TRAIN_*.out | head
-ls -lt $SCRATCH/logs/TRAIN_*.err | head
-```
-
 ### Check Files & Folders on Euler
 
 ```bash
 # Go to your scratch root
 cd /cluster/scratch/gikaufmann
 ls
-
-# Check sizes of main folders
-du -sh data data_v2 outputs logs
-
-# Inspect dataset
-ls data/ready
-ls data/ml
-
-# Inspect outputs
-ls outputs
-ls outputs/Results
-ls outputs/Tables
 
 # Find recently modified files (last 1 day)
 find /cluster/scratch/gikaufmann -type f -mtime -1 -print
@@ -107,6 +80,9 @@ find /cluster/scratch/gikaufmann -type f -mtime -1 -print
 cd ~/master_thesis
 find outputs -type f
 
-# folder delete
+# folder contents delete
 rm -rf ~/master_thesis/wandb/*
+
+# folder total delete
+rm -rf ~/master_thesis/wandb
 ```
