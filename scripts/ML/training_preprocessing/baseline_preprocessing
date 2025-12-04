@@ -51,9 +51,24 @@ def main() -> None:
     print("W&B connected")
     
     repo_root = Path(__file__).resolve().parents[3]
-    input_path = repo_root / "data/ml/merged_panel_final.parquet"
-    output_path = repo_root / "data/ml/sample_2020_100k.parquet"
-    temp_dir = repo_root / "data/ml/temp"
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    # Prefer large panel file on $SCRATCH if available (Euler); fall back to repo path locally
+    candidate_inputs = []
+    if scratch_root is not None:
+        candidate_inputs.append(scratch_root / "data/ml/merged_panel_final.parquet")
+    candidate_inputs.append(repo_root / "data/ml/merged_panel_final.parquet")
+
+    input_path = candidate_inputs[-1]
+    for cand in candidate_inputs:
+        if cand.exists():
+            input_path = cand
+            break
+
+    # Write outputs alongside the chosen input directory to avoid copying huge files back and forth
+    base_ml_dir = input_path.parent
+    output_path = base_ml_dir / "sample_2020_100k.parquet"
+    temp_dir = base_ml_dir / "temp"
 
     print(f"\nSampling from {input_path} …")
     if not input_path.exists():
