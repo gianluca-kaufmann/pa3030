@@ -33,7 +33,7 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the sample preprocessing imbalanced script
+# Run the baseline preprocessing script (creates imbalanced sample)
 #------------------------------------------------------------------------------
 echo "Starting sample preprocessing imbalanced script..."
 
@@ -41,14 +41,14 @@ echo "Starting sample preprocessing imbalanced script..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/training_preprocessing/sample_preprocessing_imbalanced" ] || {
-  echo "ERROR: sample_preprocessing_balanced not found under scripts/ML/training_preprocessing"
-  find scripts -maxdepth 4 -type f -name "sample_preprocessing_imbalanced"
+[ -f "scripts/ML/training_preprocessing/baseline_pre" ] || {
+  echo "ERROR: baseline_pre not found under scripts/ML/training_preprocessing"
+  find scripts -maxdepth 4 -type f -name "baseline_pre"
   exit 1
 }
 
 # Run the script
-python "scripts/ML/training_preprocessing/sample_preprocessing_imbalanced"
+python "scripts/ML/training_preprocessing/baseline_pre"
 
-echo "Sample preprocessing imbalanced script finished."
+echo "Baseline preprocessing script finished."
 

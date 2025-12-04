@@ -53,7 +53,19 @@ def main() -> None:
     print("W&B connected\n")
     
     repo_root = Path(__file__).resolve().parents[3]
-    input_path = repo_root / "data/ml/sample_2020_100k.parquet"
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    # Prefer sample file on $SCRATCH if available (Euler); fall back to repo path locally
+    candidate_inputs = []
+    if scratch_root is not None:
+        candidate_inputs.append(scratch_root / "data/ml/sample_2020_100k.parquet")
+    candidate_inputs.append(repo_root / "data/ml/sample_2020_100k.parquet")
+
+    input_path = candidate_inputs[-1]
+    for cand in candidate_inputs:
+        if cand.exists():
+            input_path = cand
+            break
 
     print(f"Loading data from {input_path} …")
     df = pd.read_parquet(input_path)

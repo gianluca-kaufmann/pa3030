@@ -35,20 +35,24 @@ source "$VENV_DIR/bin/activate"
 #------------------------------------------------------------------------------
 # Run the train sample balanced script
 #------------------------------------------------------------------------------
+# NOTE: This script references train_sample_balanced which is currently
+# in the old/ directory. Update this path if balanced training is needed.
+#------------------------------------------------------------------------------
 echo "Starting train sample balanced script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/training/train_sample_balanced" ] || {
-  echo "ERROR: train_sample_balanced not found under scripts/ML/training"
+[ -f "scripts/ML/training/old/train_sample_balanced" ] || {
+  echo "ERROR: train_sample_balanced not found"
+  echo "NOTE: Balanced training script is in old/ directory"
   find scripts -maxdepth 4 -type f -name "train_sample_balanced"
   exit 1
 }
 
 # Run the script
-python "scripts/ML/training/train_sample_balanced"
+python "scripts/ML/training/old/train_sample_balanced"
 
 echo "Train sample balanced script finished."
 

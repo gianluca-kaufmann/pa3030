@@ -33,22 +33,22 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the train sample imbalanced script
+# Run the baseline RF training script (imbalanced data)
 #------------------------------------------------------------------------------
-echo "Starting train sample imbalanced script..."
+echo "Starting baseline RF training script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/training/train_sample_imbalanced" ] || {
-  echo "ERROR: train_sample_imbalanced not found under scripts/ML/training"
-  find scripts -maxdepth 4 -type f -name "train_sample_imbalanced"
+[ -f "scripts/ML/training/baseline_RF" ] || {
+  echo "ERROR: baseline_RF not found under scripts/ML/training"
+  find scripts -maxdepth 4 -type f -name "baseline_RF"
   exit 1
 }
 
 # Run the script
-python "scripts/ML/training/train_sample_imbalanced"
+python "scripts/ML/training/baseline_RF"
 
-echo "Train sample imbalanced script finished."
+echo "Baseline RF training script finished."
 

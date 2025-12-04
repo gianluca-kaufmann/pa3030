@@ -35,20 +35,24 @@ source "$VENV_DIR/bin/activate"
 #------------------------------------------------------------------------------
 # Run the sample preprocessing balanced script
 #------------------------------------------------------------------------------
+# NOTE: This script references sample_preprocessing_balanced which is currently
+# in the old/ directory. Update this path if balanced preprocessing is needed.
+#------------------------------------------------------------------------------
 echo "Starting sample preprocessing balanced script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/training_preprocessing/sample_preprocessing_balanced" ] || {
-  echo "ERROR: sample_preprocessing_balanced not found under scripts/ML/training_preprocessing"
+[ -f "scripts/ML/training_preprocessing/old/sample_preprocessing_balanced" ] || {
+  echo "ERROR: sample_preprocessing_balanced not found"
+  echo "NOTE: Balanced preprocessing script is in old/ directory"
   find scripts -maxdepth 4 -type f -name "sample_preprocessing_balanced"
   exit 1
 }
 
 # Run the script
-python "scripts/ML/training_preprocessing/sample_preprocessing_balanced"
+python "scripts/ML/training_preprocessing/old/sample_preprocessing_balanced"
 
 echo "Sample preprocessing balanced script finished."
 

@@ -33,22 +33,22 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the train baseline script
+# Run the baseline static training script
 #------------------------------------------------------------------------------
-echo "Starting train baseline script..."
+echo "Starting baseline static training script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/training/train_baseline" ] || {
-  echo "ERROR: train_baseline not found under scripts/ML/training"
-  find scripts -maxdepth 4 -type f -name "train_baseline"
+[ -f "scripts/ML/training/baseline_static" ] || {
+  echo "ERROR: baseline_static not found under scripts/ML/training"
+  find scripts -maxdepth 4 -type f -name "baseline_static"
   exit 1
 }
 
 # Run the script
-python "scripts/ML/training/train_baseline"
+python "scripts/ML/training/baseline_static"
 
-echo "Train baseline script finished."
+echo "Baseline static training script finished."
 

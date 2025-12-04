@@ -33,7 +33,7 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the baseline preprocessing script
+# Run the baseline static preprocessing script
 #------------------------------------------------------------------------------
 echo "Starting baseline preprocessing script..."
 
@@ -41,13 +41,13 @@ echo "Starting baseline preprocessing script..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/training_preprocessing/baseline_preprocessing" ] || {
-  echo "ERROR: baseline_preprocessing not found under scripts/ML/training_preprocessing"
-  find scripts -maxdepth 4 -type f -name "baseline_preprocessing"
+[ -f "scripts/ML/training_preprocessing/baseline_static_pre" ] || {
+  echo "ERROR: baseline_static_pre not found under scripts/ML/training_preprocessing"
+  find scripts -maxdepth 4 -type f -name "baseline_static_pre"
   exit 1
 }
 
 # Run the script
-python "scripts/ML/training_preprocessing/baseline_preprocessing"
+python "scripts/ML/training_preprocessing/baseline_static_pre"
 
-echo "Baseline preprocessing script finished."
+echo "Baseline static preprocessing script finished."

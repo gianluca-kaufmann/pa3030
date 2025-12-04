@@ -33,22 +33,22 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the train sample imbalanced LGBM script
+# Run the baseline LGBM training script (imbalanced data)
 #------------------------------------------------------------------------------
-echo "Starting train sample imbalanced LGBM script..."
+echo "Starting baseline LGBM training script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/training/train_sample_imbalanced_lgbm" ] || {
-  echo "ERROR: train_sample_imbalanced_lgbm not found under scripts/ML/training"
-  find scripts -maxdepth 4 -type f -name "train_sample_imbalanced_lgbm"
+[ -f "scripts/ML/training/baseline_LGBM" ] || {
+  echo "ERROR: baseline_LGBM not found under scripts/ML/training"
+  find scripts -maxdepth 4 -type f -name "baseline_LGBM"
   exit 1
 }
 
 # Run the script
-python "scripts/ML/training/train_sample_imbalanced_lgbm"
+python "scripts/ML/training/baseline_LGBM"
 
-echo "Train sample imbalanced LGBM script finished."
+echo "Baseline LGBM training script finished."
 
