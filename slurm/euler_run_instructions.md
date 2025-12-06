@@ -8,6 +8,9 @@
 ssh gikaufmann@login.euler.ethz.ch
 cd ~/master_thesis
 
+cd /cluster/scratch/gikaufmann
+ls
+
 # Update code from GitHub
 git pull
 
@@ -69,10 +72,6 @@ less $SCRATCH/logs/<LOGFILE>.err
 ### Check Files & Folders on Euler
 
 ```bash
-# Go to your scratch root
-cd /cluster/scratch/gikaufmann
-ls
-
 # Find recently modified files (last 1 day)
 find /cluster/scratch/gikaufmann -type f -mtime -1 -print
 

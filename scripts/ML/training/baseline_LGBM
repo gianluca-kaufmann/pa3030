@@ -1,35 +1,40 @@
 #!/usr/bin/env python3
 
-"""Imbalanced Transition Prediction Training Script (LightGBM)
+"""Baseline Suitability Model for Protected Area Prediction
 
-Purpose: Train a LightGBM model to predict new WDPA establishment (0→1 transitions) on
-         realistic imbalanced data with comprehensive evaluation metrics.
-Input:  `data/ml/sample_training_imbalanced.parquet` (realistic class distribution).
-Process: Use transition_01 as target, perform 80/20 stratified split, fit a
-         LightGBM classifier with scale_pos_weight, and evaluate with multiple metrics.
-Output: Classification report, ROC-AUC, PR-AUC, precision@k, confusion matrix,
-        and feature importance.
+Purpose: Estimate how "protection-like" each pixel looked in year 2000.
+         A model trained only on 2000 (protected vs unprotected) learns the
+         spatial signature of protected areas. Its predicted probability for
+         each unprotected pixel becomes a suitability score. We then check
+         whether high-suitability pixels actually became protected by 2024.
+
+Input:   `data/ml/merged_panel_2000_2024.parquet`
+Output:  - Trained LightGBM model (baseline_lgbm_2000.txt)
+         - Suitability scores (baseline_scores_2000.parquet)
+         - Evaluation metrics (baseline_lgbm_metrics.json)
+         - Scored outcome table (baseline_scored_outcomes.parquet)
 """
 
 from __future__ import annotations
 
+import gc
+import json
 import os
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import lightgbm as lgb
-import wandb
 from sklearn.metrics import (
     classification_report,
     confusion_matrix,
     roc_auc_score,
     average_precision_score,
-    precision_recall_curve,
-    roc_curve,
 )
 from sklearn.model_selection import train_test_split
 
@@ -52,26 +57,48 @@ class Tee:
     def close(self) -> None:
         self.file.close()
 
+
+# =============================================================================
+# Configuration
+# =============================================================================
 RANDOM_STATE = 42
-VAL_SIZE = 0.1    # 10% for validation (from original data)
-TEST_SIZE = 0.2   # 20% for test (from original data)
-# Training will be 70% (remaining after val+test split)
+TEST_SIZE = 0.2
 
-# Scale pos weight values to test
-SCALE_POS_WEIGHTS = [40, 60]
-
-# Columns to exclude from features (to prevent data leakage or overfitting)
+# Columns to exclude from features (prevent data leakage)
 EXCLUDE_COLS = {
-    "transition_01",  # Target variable
-    "WDPA_b1",        # Direct leakage of target
-    "WDPA_prev",      # Direct leakage of target
-    "row",            # Spatial identifier
-    "col",            # Spatial identifier
-    "x",              # Spatial coordinate
-    "y",              # Spatial coordinate
-    "year",           # Temporal identifier
+    # Target and derived fields
+    "WDPA_b1",          # Target variable (protection status)
+    "dist_wdpa",        # Derived from WDPA (distance to protected area)
+    "dist_wdpa_decay",  # Derived from WDPA (decay function)
+    # Identifiers and coordinates
+    "row",
+    "col",
+    "x",
+    "y",
+    "year",
 }
 
+# LightGBM parameters
+LGBM_PARAMS = {
+    'objective': 'binary',
+    'metric': 'auc',
+    'boosting_type': 'gbdt',
+    'num_leaves': 255,
+    'learning_rate': 0.05,
+    'feature_fraction': 0.8,
+    'bagging_fraction': 0.8,
+    'bagging_freq': 5,
+    'max_depth': 16,
+    'min_child_samples': 100,
+    'random_state': RANDOM_STATE,
+    'n_jobs': -1,
+    'verbose': -1,
+}
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
 
 def compute_precision_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) -> float:
     """Compute precision at top k% of predictions.
@@ -91,217 +118,225 @@ def compute_precision_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) ->
     top_k_idx = np.argsort(y_proba)[-n_top_k:]
     
     # Calculate precision among top k%
-    precision = y_true[top_k_idx].sum() / n_top_k
+    return y_true[top_k_idx].sum() / n_top_k
+
+
+def load_year_data(parquet_path: Path, year: int, columns: Optional[list] = None) -> pd.DataFrame:
+    """Load data for a specific year from parquet file efficiently.
     
-    return precision
+    Uses row group filtering to minimize memory usage.
+    """
+    print(f"Loading data for year {year} from {parquet_path} ...")
+    
+    # Read parquet file with filter
+    filters = [('year', '==', year)]
+    df = pd.read_parquet(parquet_path, filters=filters, columns=columns)
+    
+    print(f"  Loaded {len(df):,} rows")
+    return df
 
 
-def main(scale_pos_weight: float) -> None:
+def load_future_protection_status(parquet_path: Path, years_after: range) -> pd.DataFrame:
+    """Load WDPA status for years after 2000 to compute ever_protected_after_2000.
+    
+    Returns DataFrame with row, col, and ever_protected_after_2000 columns.
+    """
+    print(f"\nLoading future protection status (years {years_after.start}-{years_after.stop - 1}) ...")
+    
+    # Only load necessary columns
+    columns = ['row', 'col', 'year', 'WDPA_b1']
+    
+    # Load all future years
+    filters = [('year', '>=', years_after.start), ('year', '<=', years_after.stop - 1)]
+    df = pd.read_parquet(parquet_path, filters=filters, columns=columns)
+    
+    print(f"  Loaded {len(df):,} rows across {df['year'].nunique()} years")
+    
+    # Compute max WDPA_b1 per pixel (ever protected after 2000)
+    print("  Computing ever_protected_after_2000 ...")
+    protection_max = df.groupby(['row', 'col'])['WDPA_b1'].max().reset_index()
+    protection_max.columns = ['row', 'col', 'ever_protected_after_2000']
+    
+    # Convert to binary
+    protection_max['ever_protected_after_2000'] = (
+        protection_max['ever_protected_after_2000'] > 0
+    ).astype(np.int8)
+    
+    del df
+    gc.collect()
+    
+    print(f"  Computed for {len(protection_max):,} unique pixels")
+    return protection_max
+
+
+def get_feature_columns(df: pd.DataFrame) -> list:
+    """Get valid feature columns, excluding identifiers and leakage columns."""
+    numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+    feature_cols = [
+        col for col in numeric_cols
+        if col.lower() not in {c.lower() for c in EXCLUDE_COLS}
+    ]
+    return feature_cols
+
+
+# =============================================================================
+# Main Pipeline
+# =============================================================================
+
+def main() -> None:
     start_time = time.time()
     
-    # Initialize W&B for this specific run
-    wandb_api_key = os.environ.get("WANDB_API_KEY")
-    wandb_entity = os.environ.get("WANDB_ENTITY")
-    
-    if not wandb_api_key:
-        print("Warning: WANDB_API_KEY not found in environment")
-    if not wandb_entity:
-        print("Warning: WANDB_ENTITY not found in environment")
-    
-    print("Initializing Weights & Biases...")
-    wandb.init(
-        project="ml-training-imbalanced",
-        entity=wandb_entity,
-        name=f"train_imbalanced_lgbm_spw{scale_pos_weight}_{time.strftime('%Y%m%d_%H%M%S')}",
-        config={
-            "model": "LightGBM",
-            "scale_pos_weight": scale_pos_weight,
-            "val_size": VAL_SIZE,
-            "test_size": TEST_SIZE,
-            "random_state": RANDOM_STATE,
-            "target": "transition_01",
-        },
-    )
-    print("W&B connected\n")
-    
+    # -------------------------------------------------------------------------
+    # Setup paths
+    # -------------------------------------------------------------------------
     repo_root = Path(__file__).resolve().parents[3]
-    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
-
-    # Prefer sample file on $SCRATCH if available (Euler); fall back to repo path locally
+    scratch_root = Path(os.environ.get("SCRATCH", ""))
+    
+    # Input path (prefer SCRATCH on Euler)
     candidate_inputs = []
-    if scratch_root is not None:
-        candidate_inputs.append(scratch_root / "data/ml/sample_training_imbalanced.parquet")
-    candidate_inputs.append(repo_root / "data/ml/sample_training_imbalanced.parquet")
-
-    input_path = candidate_inputs[-1]
+    if scratch_root.exists():
+        candidate_inputs.append(scratch_root / "data/ml/merged_panel_2000_2024.parquet")
+    candidate_inputs.append(repo_root / "data/ml/merged_panel_2000_2024.parquet")
+    
+    input_path = None
     for cand in candidate_inputs:
         if cand.exists():
             input_path = cand
             break
-
-    print("=" * 70)
-    print("IMBALANCED SAMPLE TRAINING WDPA TRANSITION PREDICTION (LightGBM)")
-    print("=" * 70)
     
-    print(f"\nLoading data from {input_path} …")
-    df = pd.read_parquet(input_path)
-    print(f"Loaded {len(df):,} rows with {len(df.columns)} columns.")
-
-    target_col = "transition_01"
-    if target_col not in df.columns:
-        raise ValueError(
-            f"Target column '{target_col}' not found in data. "
-            "Ensure preprocessing has been run with the transition logic."
+    if input_path is None:
+        raise FileNotFoundError(
+            "Could not find merged_panel_2000_2024.parquet in any expected location."
         )
-
-    print(f"\nUsing '{target_col}' as target variable.")
-
+    
+    # Output directories
+    output_dir = repo_root / "outputs/Results/ml_baselines"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    data_output_dir = repo_root / "data/ml"
+    data_output_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    print("=" * 70)
+    print("BASELINE SUITABILITY MODEL FOR PROTECTED AREA PREDICTION")
+    print("=" * 70)
+    print(f"\nInput:  {input_path}")
+    print(f"Output: {output_dir}")
+    
+    # -------------------------------------------------------------------------
+    # Step 1: Load 2000 snapshot
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 1: LOAD YEAR 2000 SNAPSHOT")
+    print("=" * 70)
+    
+    df_2000 = load_year_data(input_path, year=2000)
+    
+    # Target: is_protected_2000 = WDPA_b1
+    target_col = "is_protected_2000"
+    df_2000[target_col] = df_2000['WDPA_b1']
+    
     # Drop rows with missing target
-    df_clean = df.dropna(subset=[target_col])
-    dropped = len(df) - len(df_clean)
+    df_2000_clean = df_2000.dropna(subset=[target_col])
+    dropped = len(df_2000) - len(df_2000_clean)
     if dropped > 0:
-        print(f"Dropped {dropped:,} rows with missing target.")
-    print(f"Remaining: {len(df_clean):,} rows.")
-
-    if len(df_clean) == 0:
-        raise ValueError("No valid rows remaining after dropping missing targets.")
-
-    # No subsampling - use full dataset
-    print(f"\nUsing full dataset: {len(df_clean):,} rows.")
-
-    y = df_clean[target_col]
-
-    # Select numeric features, excluding identity and leakage columns
-    numeric_cols = df_clean.select_dtypes(include=["number"]).columns.tolist()
-    feature_cols = [
-        col for col in numeric_cols 
-        if col.lower() not in {c.lower() for c in EXCLUDE_COLS}
-    ]
-
-    if not feature_cols:
-        raise ValueError("No valid numeric feature columns available for training.")
-
-    X = df_clean[feature_cols]
-
-    print(f"\nUsing {len(feature_cols)} numeric features.")
-    print(f"Excluded columns: {sorted(EXCLUDE_COLS & set(numeric_cols))}")
+        print(f"Dropped {dropped:,} rows with missing target")
     
-    # Print target distribution
-    transition_counts = y.value_counts().sort_index()
-    n_negatives = transition_counts.get(0, 0)
-    n_positives = transition_counts.get(1, 0)
-    positive_ratio = n_positives / len(y) * 100
+    print(f"Total pixels in 2000: {len(df_2000_clean):,}")
     
-    print(f"\n" + "=" * 70)
-    print("TARGET DISTRIBUTION (IMBALANCED)")
+    # Get feature columns
+    feature_cols = get_feature_columns(df_2000_clean)
+    print(f"\nUsing {len(feature_cols)} features")
+    print(f"Excluded columns: {sorted(EXCLUDE_COLS & set(df_2000_clean.columns))}")
+    
+    # Target distribution
+    n_protected = (df_2000_clean[target_col] > 0).sum()
+    n_unprotected = (df_2000_clean[target_col] == 0).sum()
+    pct_protected = n_protected / len(df_2000_clean) * 100
+    
+    print(f"\n" + "-" * 40)
+    print("Protection status in 2000:")
+    print(f"  Protected:   {n_protected:>12,}  ({pct_protected:.2f}%)")
+    print(f"  Unprotected: {n_unprotected:>12,}  ({100 - pct_protected:.2f}%)")
+    print("-" * 40)
+    
+    # -------------------------------------------------------------------------
+    # Step 2: Prepare features and target
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 2: PREPARE FEATURES AND TARGET")
     print("=" * 70)
-    print(f"  No transition (0): {n_negatives:>12,}  ({100 - positive_ratio:>5.3f}%)")
-    print(f"  New WDPA (0→1):    {n_positives:>12,}  ({positive_ratio:>5.3f}%)")
-    print(f"  Class ratio:       1 : {n_negatives / max(n_positives, 1):.1f}")
-
-    # Calculate scale_pos_weight for LightGBM
-    auto_scale_pos_weight = n_negatives / max(n_positives, 1)
-    print(f"\nUsing scale_pos_weight: {scale_pos_weight:.2f}")
-    print(f"(Automatic value based on class ratio: {auto_scale_pos_weight:.2f})")
     
-    wandb.log({
-        "data/n_features": len(feature_cols),
-        "data/n_samples": len(df_clean),
-        "data/n_positives": n_positives,
-        "data/n_negatives": n_negatives,
-        "data/positive_ratio": positive_ratio / 100,
-        "data/class_ratio": n_negatives / max(n_positives, 1),
-        "data/auto_scale_pos_weight": auto_scale_pos_weight,
-    })
-
-    # Train/val/test split with stratification (70/10/20)
-    print(f"\n" + "=" * 70)
-    print("TRAIN/VAL/TEST SPLIT")
+    # Binary target
+    y = (df_2000_clean[target_col] > 0).astype(np.int8)
+    X = df_2000_clean[feature_cols]
+    
+    # Store pixel identifiers for scoring later
+    pixel_ids = df_2000_clean[['row', 'col', 'x', 'y']].copy()
+    
+    print(f"Feature matrix shape: {X.shape}")
+    print(f"Target shape: {y.shape}")
+    
+    # Check for missing values
+    missing_counts = X.isnull().sum()
+    cols_with_missing = missing_counts[missing_counts > 0]
+    if len(cols_with_missing) > 0:
+        print(f"\nColumns with missing values: {len(cols_with_missing)}")
+        print("  Top 5:")
+        for col, count in cols_with_missing.head().items():
+            print(f"    {col}: {count:,} ({count/len(X)*100:.2f}%)")
+    
+    # -------------------------------------------------------------------------
+    # Step 3: Train/test split and model training
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 3: TRAIN LIGHTGBM MODEL")
     print("=" * 70)
-    print(f"Splitting into train/val/test (70/10/20) with stratification …")
     
-    # First split: separate test set (20%)
-    X_temp, X_test, y_temp, y_test = train_test_split(
-        X,
-        y,
+    # Split data
+    print(f"\nSplitting data (80/20) with stratification ...")
+    X_train, X_test, y_train, y_test, idx_train, idx_test = train_test_split(
+        X, y, pixel_ids.index,
         test_size=TEST_SIZE,
         stratify=y,
-        random_state=RANDOM_STATE,
+        random_state=RANDOM_STATE
     )
     
-    # Second split: separate validation from remaining (10% of original = 12.5% of temp)
-    val_size_adjusted = VAL_SIZE / (1 - TEST_SIZE)  # 0.1 / 0.8 = 0.125
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_temp,
-        y_temp,
-        test_size=val_size_adjusted,
-        stratify=y_temp,
-        random_state=RANDOM_STATE,
-    )
+    print(f"Training set: {len(X_train):,} samples")
+    print(f"  Protected:   {y_train.sum():,}")
+    print(f"  Unprotected: {(y_train == 0).sum():,}")
+    print(f"\nTest set: {len(X_test):,} samples")
+    print(f"  Protected:   {y_test.sum():,}")
+    print(f"  Unprotected: {(y_test == 0).sum():,}")
     
-    # Print training set statistics
-    train_transition_counts = y_train.value_counts().sort_index()
-    train_pos = train_transition_counts.get(1, 0)
-    train_neg = train_transition_counts.get(0, 0)
-    print(f"\nTraining set: {len(X_train):,} samples ({len(X_train)/len(df_clean)*100:.1f}%)")
-    print(f"  No transition (0): {train_neg:,}")
-    print(f"  New WDPA (0→1):    {train_pos:,}")
+    # Calculate scale_pos_weight
+    scale_pos_weight = (y_train == 0).sum() / max(y_train.sum(), 1)
+    print(f"\nScale pos weight (auto): {scale_pos_weight:.2f}")
     
-    val_transition_counts = y_val.value_counts().sort_index()
-    val_pos = val_transition_counts.get(1, 0)
-    val_neg = val_transition_counts.get(0, 0)
-    print(f"\nValidation set: {len(X_val):,} samples ({len(X_val)/len(df_clean)*100:.1f}%)")
-    print(f"  No transition (0): {val_neg:,}")
-    print(f"  New WDPA (0→1):    {val_pos:,}")
+    # Update params with scale_pos_weight
+    lgbm_params = LGBM_PARAMS.copy()
+    lgbm_params['scale_pos_weight'] = scale_pos_weight
     
-    test_transition_counts = y_test.value_counts().sort_index()
-    test_pos = test_transition_counts.get(1, 0)
-    test_neg = test_transition_counts.get(0, 0)
-    print(f"\nTest set: {len(X_test):,} samples ({len(X_test)/len(df_clean)*100:.1f}%)")
-    print(f"  No transition (0): {test_neg:,}")
-    print(f"  New WDPA (0→1):    {test_pos:,}")
-
-    # Train LightGBM with scale_pos_weight
-    print(f"\n" + "=" * 70)
-    print("MODEL TRAINING")
-    print("=" * 70)
-    print(f"Training LightGBM classifier …")
-    print(f"Using scale_pos_weight={scale_pos_weight:.2f} to handle imbalanced data …")
-    
-    # LightGBM parameters optimized for imbalanced binary classification
-    lgbm_params = {
-        'objective': 'binary',
-        'metric': 'auc',
-        'boosting_type': 'gbdt',
-        'num_leaves': 255,
-        'learning_rate': 0.05,
-        'feature_fraction': 0.8,
-        'bagging_fraction': 0.8,
-        'bagging_freq': 5,
-        'max_depth': 16,
-        'min_child_samples': 100,
-        'scale_pos_weight': scale_pos_weight,
-        'random_state': RANDOM_STATE,
-        'n_jobs': -1,
-        'verbose': -1,
-    }
-    
-    print("\nModel parameters:")
+    print("\nLightGBM parameters:")
     for param, value in lgbm_params.items():
         if param != 'verbose':
             print(f"  {param}: {value}")
     
-    # Create LightGBM classifier
-    lgbm = lgb.LGBMClassifier(
-        n_estimators=500,
-        **lgbm_params
+    # Create and train model
+    print("\nTraining LightGBM ...")
+    model = lgb.LGBMClassifier(n_estimators=500, **lgbm_params)
+    
+    # Use part of training set for early stopping
+    X_train_fit, X_val, y_train_fit, y_val = train_test_split(
+        X_train, y_train,
+        test_size=0.1,
+        stratify=y_train,
+        random_state=RANDOM_STATE
     )
     
-    # Fit with early stopping using validation set
-    print(f"\nTraining with early stopping on validation set (patience=50) …")
-    lgbm.fit(
-        X_train, 
-        y_train,
+    model.fit(
+        X_train_fit, y_train_fit,
         eval_set=[(X_val, y_val)],
         eval_metric='auc',
         callbacks=[
@@ -310,158 +345,264 @@ def main(scale_pos_weight: float) -> None:
         ]
     )
     
-    print(f"\nTraining complete. Best iteration: {lgbm.best_iteration_}")
-    print(f"Best validation AUC: {lgbm.best_score_['valid_0']['auc']:.4f}")
-
-    # Predict probabilities and classes
+    print(f"\nTraining complete!")
+    print(f"Best iteration: {model.best_iteration_}")
+    print(f"Best validation AUC: {model.best_score_['valid_0']['auc']:.4f}")
+    
+    # Save model
+    model_path = data_output_dir / "baseline_lgbm_2000.txt"
+    model.booster_.save_model(str(model_path))
+    print(f"\nModel saved to: {model_path}")
+    
+    # -------------------------------------------------------------------------
+    # Step 4: Evaluate on test set
+    # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("EVALUATION ON TEST SET")
+    print("STEP 4: EVALUATE ON TEST SET (YEAR 2000)")
     print("=" * 70)
-    print("Computing predictions …")
-    y_pred = lgbm.predict(X_test)
-    y_proba = lgbm.predict_proba(X_test)[:, 1]  # Probability of positive class
-
+    
+    y_pred = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)[:, 1]
+    
     # Classification report
-    print("\n" + "=" * 70)
-    print("CLASSIFICATION REPORT")
-    print("=" * 70)
+    print("\nClassification Report:")
     print(classification_report(y_test, y_pred, digits=4))
-
+    
     # Confusion matrix
     cm = confusion_matrix(y_test, y_pred)
     tn, fp, fn, tp = cm.ravel()
     
-    print("\n" + "=" * 70)
-    print("CONFUSION MATRIX")
-    print("=" * 70)
-    print(f"                 Predicted Negative    Predicted Positive")
-    print(f"Actual Negative  {tn:>18,}    {fp:>18,}")
-    print(f"Actual Positive  {fn:>18,}    {tp:>18,}")
-    print(f"\nTrue Negatives:  {tn:,}")
-    print(f"False Positives: {fp:,}")
-    print(f"False Negatives: {fn:,}")
-    print(f"True Positives:  {tp:,}")
-
-    # ROC-AUC and PR-AUC
-    print("\n" + "=" * 70)
-    print("AREA UNDER CURVE METRICS")
-    print("=" * 70)
+    print("\nConfusion Matrix:")
+    print(f"                 Predicted 0    Predicted 1")
+    print(f"Actual 0  {tn:>15,}  {fp:>14,}")
+    print(f"Actual 1  {fn:>15,}  {tp:>14,}")
     
+    # AUC metrics
     roc_auc = roc_auc_score(y_test, y_proba)
     pr_auc = average_precision_score(y_test, y_proba)
     
-    print(f"ROC-AUC:  {roc_auc:.4f}")
-    print(f"PR-AUC:   {pr_auc:.4f}")
+    print(f"\nROC-AUC: {roc_auc:.4f}")
+    print(f"PR-AUC:  {pr_auc:.4f}")
     
-    # Precision at top k%
-    print("\n" + "=" * 70)
-    print("PRECISION @ TOP-K PREDICTIONS")
-    print("=" * 70)
-    print("(Precision among highest-confidence predictions)")
-    print()
-    
-    for k in [1, 5, 10]:
-        prec_at_k = compute_precision_at_k(y_test.values, y_proba, k)
-        n_top_k = max(1, int(len(y_test) * k / 100))
-        expected_positives = int(n_top_k * prec_at_k)
-        print(f"Precision @ top {k:>2}%:  {prec_at_k:>7.4f}  "
-              f"({expected_positives:>6,} positives in top {n_top_k:>7,} predictions)")
-    
-    # Baseline precision (random ranking)
-    baseline_precision = test_pos / len(y_test)
-    print(f"\nBaseline (random): {baseline_precision:>7.4f}  "
-          f"(overall positive rate in test set)")
-
     # Feature importance
-    print("\n" + "=" * 70)
-    print("TOP 20 MOST IMPORTANT FEATURES")
-    print("=" * 70)
-    feature_importance = pd.DataFrame(
-        {"feature": feature_cols, "importance": lgbm.feature_importances_}
-    ).sort_values("importance", ascending=False)
-
+    print("\n" + "-" * 40)
+    print("Top 20 Most Important Features:")
+    print("-" * 40)
+    feature_importance = pd.DataFrame({
+        'feature': feature_cols,
+        'importance': model.feature_importances_
+    }).sort_values('importance', ascending=False)
     print(feature_importance.head(20).to_string(index=False))
     
+    # -------------------------------------------------------------------------
+    # Step 5: Score all unprotected 2000 pixels
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 5: SCORE UNPROTECTED 2000 PIXELS")
+    print("=" * 70)
+    
+    # Get unprotected pixels in 2000
+    unprotected_mask = y == 0
+    X_unprotected = X[unprotected_mask]
+    pixel_ids_unprotected = pixel_ids[unprotected_mask].copy()
+    
+    print(f"\nUnprotected pixels in 2000: {len(X_unprotected):,}")
+    
+    # Compute suitability scores
+    print("Computing suitability scores ...")
+    suitability_scores = model.predict_proba(X_unprotected)[:, 1]
+    
+    # Create scores dataframe
+    scores_df = pixel_ids_unprotected.copy()
+    scores_df['score'] = suitability_scores
+    
+    # Save scores
+    scores_path = data_output_dir / "baseline_scores_2000.parquet"
+    scores_df.to_parquet(scores_path, index=False)
+    print(f"\nScores saved to: {scores_path}")
+    print(f"Score statistics:")
+    print(f"  Min:    {suitability_scores.min():.4f}")
+    print(f"  Max:    {suitability_scores.max():.4f}")
+    print(f"  Mean:   {suitability_scores.mean():.4f}")
+    print(f"  Median: {np.median(suitability_scores):.4f}")
+    
+    # Free memory
+    del df_2000, df_2000_clean, X, y, pixel_ids
+    del X_train, X_test, y_train, y_test
+    del X_train_fit, X_val, y_train_fit, y_val
+    gc.collect()
+    
+    # -------------------------------------------------------------------------
+    # Step 6: Build 2000→2024 outcome
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 6: BUILD 2000→2024 OUTCOME")
+    print("=" * 70)
+    
+    # Load future protection status
+    future_protection = load_future_protection_status(input_path, years_after=range(2001, 2025))
+    
+    # Join with suitability scores
+    print("\nJoining scores with future protection status ...")
+    outcome_df = scores_df.merge(
+        future_protection,
+        on=['row', 'col'],
+        how='left'
+    )
+    
+    # Fill NaN (pixels that might not exist in future years) with 0
+    outcome_df['ever_protected_after_2000'] = (
+        outcome_df['ever_protected_after_2000'].fillna(0).astype(np.int8)
+    )
+    
+    n_became_protected = outcome_df['ever_protected_after_2000'].sum()
+    n_remained_unprotected = len(outcome_df) - n_became_protected
+    pct_became_protected = n_became_protected / len(outcome_df) * 100
+    
+    print(f"\nOutcome for unprotected 2000 pixels:")
+    print(f"  Became protected (2001-2024): {n_became_protected:>12,}  ({pct_became_protected:.2f}%)")
+    print(f"  Remained unprotected:         {n_remained_unprotected:>12,}  ({100 - pct_became_protected:.2f}%)")
+    
+    # -------------------------------------------------------------------------
+    # Step 7: Evaluate suitability scores as predictor of future protection
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 7: EVALUATE SUITABILITY AS PREDICTOR OF FUTURE PROTECTION")
+    print("=" * 70)
+    
+    y_future = outcome_df['ever_protected_after_2000'].values
+    y_score = outcome_df['score'].values
+    
+    # ROC-AUC and PR-AUC
+    future_roc_auc = roc_auc_score(y_future, y_score)
+    future_pr_auc = average_precision_score(y_future, y_score)
+    
+    print(f"\nPredicting future protection (2001-2024) from 2000 suitability:")
+    print(f"  ROC-AUC: {future_roc_auc:.4f}")
+    print(f"  PR-AUC:  {future_pr_auc:.4f}")
+    
+    # Precision at top k%
+    print("\nPrecision @ Top-K:")
+    print("(Among top k% highest suitability scores, what fraction became protected?)")
+    print()
+    
+    prec_at_k = {}
+    for k in [1, 5, 10]:
+        prec = compute_precision_at_k(y_future, y_score, k)
+        prec_at_k[k] = prec
+        n_top_k = max(1, int(len(y_future) * k / 100))
+        n_protected_in_top_k = int(n_top_k * prec)
+        print(f"  Precision @ top {k:>2}%:  {prec:.4f}  "
+              f"({n_protected_in_top_k:>7,} protected in top {n_top_k:>9,})")
+    
+    # Baseline (random)
+    baseline_rate = y_future.mean()
+    print(f"\n  Baseline (random):    {baseline_rate:.4f}  "
+          f"(overall protection rate among unprotected 2000 pixels)")
+    
+    # Lift over baseline
+    print("\nLift over baseline (precision / baseline):")
+    for k, prec in prec_at_k.items():
+        lift = prec / baseline_rate if baseline_rate > 0 else 0
+        print(f"  Top {k:>2}%: {lift:.2f}x")
+    
+    # -------------------------------------------------------------------------
+    # Step 8: Save results
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 8: SAVE RESULTS")
+    print("=" * 70)
+    
+    # Save scored outcomes
+    outcomes_path = data_output_dir / "baseline_scored_outcomes.parquet"
+    outcome_df.to_parquet(outcomes_path, index=False)
+    print(f"\nScored outcomes saved to: {outcomes_path}")
+    
+    # Compile metrics
+    metrics = {
+        "metadata": {
+            "timestamp": timestamp,
+            "model": "LightGBM",
+            "random_state": RANDOM_STATE,
+            "test_size": TEST_SIZE,
+            "n_features": len(feature_cols),
+            "best_iteration": model.best_iteration_,
+        },
+        "year_2000_data": {
+            "n_total_pixels": n_protected + n_unprotected,
+            "n_protected": int(n_protected),
+            "n_unprotected": int(n_unprotected),
+            "pct_protected": float(pct_protected),
+        },
+        "model_performance_2000": {
+            "roc_auc": float(roc_auc),
+            "pr_auc": float(pr_auc),
+            "confusion_matrix": {
+                "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)
+            },
+        },
+        "future_prediction_2001_2024": {
+            "n_unprotected_2000": int(len(outcome_df)),
+            "n_became_protected": int(n_became_protected),
+            "pct_became_protected": float(pct_became_protected),
+            "roc_auc": float(future_roc_auc),
+            "pr_auc": float(future_pr_auc),
+            "precision_at_1pct": float(prec_at_k[1]),
+            "precision_at_5pct": float(prec_at_k[5]),
+            "precision_at_10pct": float(prec_at_k[10]),
+            "baseline_rate": float(baseline_rate),
+            "lift_at_1pct": float(prec_at_k[1] / baseline_rate) if baseline_rate > 0 else 0,
+            "lift_at_5pct": float(prec_at_k[5] / baseline_rate) if baseline_rate > 0 else 0,
+            "lift_at_10pct": float(prec_at_k[10] / baseline_rate) if baseline_rate > 0 else 0,
+        },
+        "top_features": feature_importance.head(20).to_dict('records'),
+    }
+    
+    # Save metrics
+    metrics_path = output_dir / "baseline_lgbm_metrics.json"
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+    print(f"Metrics saved to: {metrics_path}")
+    
+    # -------------------------------------------------------------------------
     # Summary
-    prec_at_1 = compute_precision_at_k(y_test.values, y_proba, 1)
-    prec_at_5 = compute_precision_at_k(y_test.values, y_proba, 5)
-    prec_at_10 = compute_precision_at_k(y_test.values, y_proba, 10)
+    # -------------------------------------------------------------------------
+    total_time = time.time() - start_time
     
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    print(f"Model:                LightGBM ({lgbm.best_iteration_} iterations, scale_pos_weight={scale_pos_weight:.2f})")
-    print(f"Test samples:         {len(y_test):,}")
-    print(f"Positive rate:        {positive_ratio:.3f}%")
-    print(f"ROC-AUC:              {roc_auc:.4f}")
-    print(f"PR-AUC:               {pr_auc:.4f}")
-    print(f"Precision @ top 1%:   {prec_at_1:.4f}")
-    print(f"Precision @ top 5%:   {prec_at_5:.4f}")
-    print(f"Precision @ top 10%:  {prec_at_10:.4f}")
-    print("=" * 70)
-    
-    # Log to W&B
-    total_time = time.time() - start_time
-    
-    wandb.log({
-        "metrics/true_negatives": int(tn),
-        "metrics/false_positives": int(fp),
-        "metrics/false_negatives": int(fn),
-        "metrics/true_positives": int(tp),
-        "metrics/accuracy": (tp + tn) / (tp + tn + fp + fn),
-        "metrics/precision": tp / (tp + fp) if (tp + fp) > 0 else 0,
-        "metrics/recall": tp / (tp + fn) if (tp + fn) > 0 else 0,
-        "metrics/f1": 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0,
-        "metrics/roc_auc": roc_auc,
-        "metrics/pr_auc": pr_auc,
-        "metrics/precision_at_1": prec_at_1,
-        "metrics/precision_at_5": prec_at_5,
-        "metrics/precision_at_10": prec_at_10,
-        "metrics/best_iteration": lgbm.best_iteration_,
-        "metrics/best_val_auc": lgbm.best_score_['valid_0']['auc'],
-        "timing/total_seconds": total_time,
-        "timing/total_minutes": total_time / 60,
-        "status": "success"
-    })
-    
+    print(f"Model:                       LightGBM ({model.best_iteration_} iterations)")
+    print(f"Features used:               {len(feature_cols)}")
+    print(f"\n2000 Classification (protected vs unprotected):")
+    print(f"  ROC-AUC:                   {roc_auc:.4f}")
+    print(f"  PR-AUC:                    {pr_auc:.4f}")
+    print(f"\nFuture Protection Prediction (unprotected 2000 → protected by 2024):")
+    print(f"  ROC-AUC:                   {future_roc_auc:.4f}")
+    print(f"  PR-AUC:                    {future_pr_auc:.4f}")
+    print(f"  Precision @ top 1%:        {prec_at_k[1]:.4f} ({prec_at_k[1]/baseline_rate:.1f}x lift)")
+    print(f"  Precision @ top 5%:        {prec_at_k[5]:.4f} ({prec_at_k[5]/baseline_rate:.1f}x lift)")
+    print(f"  Precision @ top 10%:       {prec_at_k[10]:.4f} ({prec_at_k[10]/baseline_rate:.1f}x lift)")
     print(f"\nTotal time: {total_time:.1f}s ({total_time/60:.1f} min)")
-    print("All done.")
-    
-    wandb.finish()
+    print("=" * 70)
+    print("Done.")
 
 
 if __name__ == "__main__":
+    # Set up output file capture
     repo_root = Path(__file__).resolve().parents[3]
-    output_dir = repo_root / "outputs/results/ml_baselines"
+    output_dir = repo_root / "outputs/Results/ml_baselines"
     output_dir.mkdir(parents=True, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = output_dir / f"baseline_lgbm_{timestamp}.txt"
     
-    print("=" * 70)
-    print(f"RUNNING {len(SCALE_POS_WEIGHTS)} EXPERIMENTS WITH DIFFERENT SCALE_POS_WEIGHTS")
-    print("=" * 70)
-    print(f"Values to test: {SCALE_POS_WEIGHTS}")
-    print("=" * 70)
+    tee = Tee(output_file)
+    sys.stdout = tee
     
-    for idx, spw in enumerate(SCALE_POS_WEIGHTS, start=1):
-        print(f"\n{'#' * 70}")
-        print(f"# EXPERIMENT {idx}/{len(SCALE_POS_WEIGHTS)}: scale_pos_weight = {spw}")
-        print(f"{'#' * 70}\n")
-        
-        output_file = output_dir / f"train_sample_imbalanced_lgbm_spw{spw}_{timestamp}.txt"
-        tee = Tee(output_file)
-        original_stdout = sys.stdout
-        sys.stdout = tee
-        
-        try:
-            main(scale_pos_weight=spw)
-        finally:
-            sys.stdout = original_stdout
-            tee.close()
-            print(f"\nExperiment {idx}/{len(SCALE_POS_WEIGHTS)} complete. Output saved to: {output_file}")
-    
-    print(f"\n{'=' * 70}")
-    print("ALL EXPERIMENTS COMPLETE")
-    print("=" * 70)
-    print(f"Results saved in: {output_dir}")
-    print(f"Timestamp: {timestamp}")
+    try:
+        main()
+    finally:
+        sys.stdout = tee.stdout
+        tee.close()
+        print(f"\nOutput saved to: {output_file}")
