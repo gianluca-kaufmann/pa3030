@@ -28,8 +28,8 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
 import lightgbm as lgb
+import wandb
 from sklearn.metrics import (
     classification_report,
     confusion_matrix,
@@ -130,9 +130,11 @@ def load_year_data(parquet_path: Path, year: int, columns: Optional[list] = None
     
     # Read parquet file with filter
     filters = [('year', '==', year)]
+    load_start = time.time()
     df = pd.read_parquet(parquet_path, filters=filters, columns=columns)
+    load_time = time.time() - load_start
     
-    print(f"  Loaded {len(df):,} rows")
+    print(f"  Loaded {len(df):,} rows in {load_time:.1f}s")
     return df
 
 
@@ -147,13 +149,16 @@ def load_future_protection_status(parquet_path: Path, years_after: range) -> pd.
     columns = ['row', 'col', 'year', 'WDPA_b1']
     
     # Load all future years
+    load_start = time.time()
     filters = [('year', '>=', years_after.start), ('year', '<=', years_after.stop - 1)]
     df = pd.read_parquet(parquet_path, filters=filters, columns=columns)
+    load_time = time.time() - load_start
     
-    print(f"  Loaded {len(df):,} rows across {df['year'].nunique()} years")
+    print(f"  Loaded {len(df):,} rows across {df['year'].nunique()} years in {load_time:.1f}s")
     
     # Compute max WDPA_b1 per pixel (ever protected after 2000)
     print("  Computing ever_protected_after_2000 ...")
+    compute_start = time.time()
     protection_max = df.groupby(['row', 'col'])['WDPA_b1'].max().reset_index()
     protection_max.columns = ['row', 'col', 'ever_protected_after_2000']
     
@@ -161,11 +166,12 @@ def load_future_protection_status(parquet_path: Path, years_after: range) -> pd.
     protection_max['ever_protected_after_2000'] = (
         protection_max['ever_protected_after_2000'] > 0
     ).astype(np.int8)
+    compute_time = time.time() - compute_start
     
     del df
     gc.collect()
     
-    print(f"  Computed for {len(protection_max):,} unique pixels")
+    print(f"  Computed for {len(protection_max):,} unique pixels in {compute_time:.1f}s")
     return protection_max
 
 
@@ -190,24 +196,32 @@ def main() -> None:
     # Setup paths
     # -------------------------------------------------------------------------
     repo_root = Path(__file__).resolve().parents[3]
-    scratch_root = Path(os.environ.get("SCRATCH", ""))
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
     
-    # Input path (prefer SCRATCH on Euler)
+    # Input path (prefer SCRATCH on Euler; check multiple possible locations)
     candidate_inputs = []
-    if scratch_root.exists():
+    if scratch_root is not None and scratch_root.exists():
+        # Euler cluster: outputs/Results/merged_panel_2000_2024.parquet
+        candidate_inputs.append(scratch_root / "outputs/Results/merged_panel_2000_2024.parquet")
+        # Alternative: data/ml/merged_panel_2000_2024.parquet
         candidate_inputs.append(scratch_root / "data/ml/merged_panel_2000_2024.parquet")
+    # Local fallback
     candidate_inputs.append(repo_root / "data/ml/merged_panel_2000_2024.parquet")
     
-    input_path = None
+    input_path = candidate_inputs[-1]  # Default to last (local repo path)
     for cand in candidate_inputs:
         if cand.exists():
             input_path = cand
             break
     
-    if input_path is None:
-        raise FileNotFoundError(
-            "Could not find merged_panel_2000_2024.parquet in any expected location."
+    if input_path is None or not input_path.exists():
+        error_msg = (
+            "Could not find merged_panel_2000_2024.parquet in any expected location.\n"
+            f"Checked:\n"
         )
+        for cand in candidate_inputs:
+            error_msg += f"  - {cand}\n"
+        raise FileNotFoundError(error_msg)
     
     # Output directories
     output_dir = repo_root / "outputs/Results/ml_baselines"
@@ -217,6 +231,31 @@ def main() -> None:
     data_output_dir.mkdir(parents=True, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Initialize W&B
+    wandb_api_key = os.environ.get("WANDB_API_KEY")
+    wandb_entity = os.environ.get("WANDB_ENTITY")
+    
+    if not wandb_api_key:
+        print("Warning: WANDB_API_KEY not found in environment")
+    if not wandb_entity:
+        print("Warning: WANDB_ENTITY not found in environment")
+    
+    print("Initializing Weights & Biases...")
+    wandb.init(
+        project="ml-training-baselines",
+        entity=wandb_entity,
+        name=f"baseline_lgbm_suitability_{timestamp}",
+        config={
+            "model": "LightGBM",
+            "task": "baseline_suitability_2000",
+            "random_state": RANDOM_STATE,
+            "test_size": TEST_SIZE,
+            "target": "is_protected_2000",
+            "future_prediction": "ever_protected_after_2000",
+        },
+    )
+    print("W&B connected\n")
     
     print("=" * 70)
     print("BASELINE SUITABILITY MODEL FOR PROTECTED AREA PREDICTION")
@@ -260,6 +299,16 @@ def main() -> None:
     print(f"  Protected:   {n_protected:>12,}  ({pct_protected:.2f}%)")
     print(f"  Unprotected: {n_unprotected:>12,}  ({100 - pct_protected:.2f}%)")
     print("-" * 40)
+    
+    # Log data statistics to wandb
+    wandb.log({
+        "data/n_features": len(feature_cols),
+        "data/n_total_pixels_2000": int(len(df_2000_clean)),
+        "data/n_protected_2000": int(n_protected),
+        "data/n_unprotected_2000": int(n_unprotected),
+        "data/pct_protected_2000": float(pct_protected),
+        "data/class_ratio_2000": float(n_unprotected / max(n_protected, 1)),
+    })
     
     # -------------------------------------------------------------------------
     # Step 2: Prepare features and target
@@ -314,6 +363,17 @@ def main() -> None:
     scale_pos_weight = (y_train == 0).sum() / max(y_train.sum(), 1)
     print(f"\nScale pos weight (auto): {scale_pos_weight:.2f}")
     
+    # Log split information
+    wandb.log({
+        "data/train_size": len(X_train),
+        "data/test_size": len(X_test),
+        "data/train_protected": int(y_train.sum()),
+        "data/train_unprotected": int((y_train == 0).sum()),
+        "data/test_protected": int(y_test.sum()),
+        "data/test_unprotected": int((y_test == 0).sum()),
+        "model/scale_pos_weight": float(scale_pos_weight),
+    })
+    
     # Update params with scale_pos_weight
     lgbm_params = LGBM_PARAMS.copy()
     lgbm_params['scale_pos_weight'] = scale_pos_weight
@@ -335,6 +395,11 @@ def main() -> None:
         random_state=RANDOM_STATE
     )
     
+    print(f"  Training on {len(X_train_fit):,} samples")
+    print(f"  Validating on {len(X_val):,} samples")
+    print(f"  Using early stopping (patience=50, period=100) ...\n")
+    
+    train_start = time.time()
     model.fit(
         X_train_fit, y_train_fit,
         eval_set=[(X_val, y_val)],
@@ -344,10 +409,18 @@ def main() -> None:
             lgb.log_evaluation(period=100)
         ]
     )
+    train_time = time.time() - train_start
+    print(f"\nTraining completed in {train_time:.1f}s")
     
     print(f"\nTraining complete!")
     print(f"Best iteration: {model.best_iteration_}")
     print(f"Best validation AUC: {model.best_score_['valid_0']['auc']:.4f}")
+    
+    # Log training progress
+    wandb.log({
+        "training/best_iteration": model.best_iteration_,
+        "training/best_val_auc": float(model.best_score_['valid_0']['auc']),
+    })
     
     # Save model
     model_path = data_output_dir / "baseline_lgbm_2000.txt"
@@ -384,6 +457,20 @@ def main() -> None:
     print(f"\nROC-AUC: {roc_auc:.4f}")
     print(f"PR-AUC:  {pr_auc:.4f}")
     
+    # Log 2000 classification metrics
+    wandb.log({
+        "metrics_2000/roc_auc": float(roc_auc),
+        "metrics_2000/pr_auc": float(pr_auc),
+        "metrics_2000/true_negatives": int(tn),
+        "metrics_2000/false_positives": int(fp),
+        "metrics_2000/false_negatives": int(fn),
+        "metrics_2000/true_positives": int(tp),
+        "metrics_2000/accuracy": float((tp + tn) / (tp + tn + fp + fn)),
+        "metrics_2000/precision": float(tp / (tp + fp)) if (tp + fp) > 0 else 0,
+        "metrics_2000/recall": float(tp / (tp + fn)) if (tp + fn) > 0 else 0,
+        "metrics_2000/f1": float(2 * tp / (2 * tp + fp + fn)) if (2 * tp + fp + fn) > 0 else 0,
+    })
+    
     # Feature importance
     print("\n" + "-" * 40)
     print("Top 20 Most Important Features:")
@@ -410,7 +497,10 @@ def main() -> None:
     
     # Compute suitability scores
     print("Computing suitability scores ...")
+    score_start = time.time()
     suitability_scores = model.predict_proba(X_unprotected)[:, 1]
+    score_time = time.time() - score_start
+    print(f"  Scored {len(X_unprotected):,} pixels in {score_time:.1f}s")
     
     # Create scores dataframe
     scores_df = pixel_ids_unprotected.copy()
@@ -425,6 +515,16 @@ def main() -> None:
     print(f"  Max:    {suitability_scores.max():.4f}")
     print(f"  Mean:   {suitability_scores.mean():.4f}")
     print(f"  Median: {np.median(suitability_scores):.4f}")
+    
+    # Log score statistics
+    wandb.log({
+        "scores/n_unprotected_scored": len(X_unprotected),
+        "scores/min": float(suitability_scores.min()),
+        "scores/max": float(suitability_scores.max()),
+        "scores/mean": float(suitability_scores.mean()),
+        "scores/median": float(np.median(suitability_scores)),
+        "scores/std": float(suitability_scores.std()),
+    })
     
     # Free memory
     del df_2000, df_2000_clean, X, y, pixel_ids
@@ -462,6 +562,14 @@ def main() -> None:
     print(f"\nOutcome for unprotected 2000 pixels:")
     print(f"  Became protected (2001-2024): {n_became_protected:>12,}  ({pct_became_protected:.2f}%)")
     print(f"  Remained unprotected:         {n_remained_unprotected:>12,}  ({100 - pct_became_protected:.2f}%)")
+    
+    # Log future protection outcome
+    wandb.log({
+        "future/n_unprotected_2000": int(len(outcome_df)),
+        "future/n_became_protected": int(n_became_protected),
+        "future/n_remained_unprotected": int(n_remained_unprotected),
+        "future/pct_became_protected": float(pct_became_protected),
+    })
     
     # -------------------------------------------------------------------------
     # Step 7: Evaluate suitability scores as predictor of future protection
@@ -505,6 +613,19 @@ def main() -> None:
     for k, prec in prec_at_k.items():
         lift = prec / baseline_rate if baseline_rate > 0 else 0
         print(f"  Top {k:>2}%: {lift:.2f}x")
+    
+    # Log future prediction metrics
+    wandb.log({
+        "metrics_future/roc_auc": float(future_roc_auc),
+        "metrics_future/pr_auc": float(future_pr_auc),
+        "metrics_future/precision_at_1pct": float(prec_at_k[1]),
+        "metrics_future/precision_at_5pct": float(prec_at_k[5]),
+        "metrics_future/precision_at_10pct": float(prec_at_k[10]),
+        "metrics_future/baseline_rate": float(baseline_rate),
+        "metrics_future/lift_at_1pct": float(prec_at_k[1] / baseline_rate) if baseline_rate > 0 else 0,
+        "metrics_future/lift_at_5pct": float(prec_at_k[5] / baseline_rate) if baseline_rate > 0 else 0,
+        "metrics_future/lift_at_10pct": float(prec_at_k[10] / baseline_rate) if baseline_rate > 0 else 0,
+    })
     
     # -------------------------------------------------------------------------
     # Step 8: Save results
@@ -586,6 +707,15 @@ def main() -> None:
     print(f"\nTotal time: {total_time:.1f}s ({total_time/60:.1f} min)")
     print("=" * 70)
     print("Done.")
+    
+    # Log final timing
+    wandb.log({
+        "timing/total_seconds": total_time,
+        "timing/total_minutes": total_time / 60,
+        "status": "success"
+    })
+    
+    wandb.finish()
 
 
 if __name__ == "__main__":
