@@ -92,9 +92,10 @@ def plot_similarity_map(similarity_data: np.ndarray, wdpa_data: np.ndarray, ax: 
                    interpolation='nearest', aspect='auto')
     
     if wdpa_data is not None:
-        # Create overlay: 1 where protected (WDPA == 1), NaN elsewhere
+        # Create overlay: 1 where protected (WDPA == 1), masked elsewhere
         wdpa_float = wdpa_data.astype(float)
-        wdpa_overlay = np.where((wdpa_float == 1) & (~np.isnan(wdpa_float)), 1, np.nan)
+        wdpa_mask = (wdpa_float == 1) & (~np.isnan(wdpa_float))
+        wdpa_overlay = np.ma.masked_where(~wdpa_mask, np.ones_like(wdpa_float))
         ax.imshow(wdpa_overlay, cmap=ListedColormap(['none', WDPA_2000_COLOR]),
                   vmin=0, vmax=1, interpolation='nearest', aspect='auto', alpha=0.5)
     
@@ -136,22 +137,31 @@ def plot_protected_areas_map(pa_data: np.ndarray, ax: plt.Axes) -> None:
                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
 
-def plot_overlay(similarity_data: np.ndarray, pa_data: np.ndarray, ax: plt.Axes) -> None:
-    masked_similarity = np.ma.masked_invalid(similarity_data)
-    vmin, vmax = get_similarity_normalization(similarity_data)
+def plot_overlay(similarity_data: np.ndarray, pa_data: np.ndarray, wdpa_data: np.ndarray, ax: plt.Axes) -> None:
     ax.set_facecolor('white')
     
-    im1 = ax.imshow(masked_similarity, cmap=create_similarity_colormap(), vmin=vmin, vmax=vmax,
-                    interpolation='nearest', aspect='auto')
-    
+    # Base layer: Protected areas 2000-2024 (green)
     binary_pa = pa_data.copy().astype(float)
     binary_pa[binary_pa == NODATA_UINT8] = np.nan
     protected_mask = (binary_pa == 1)
-    masked_pa = np.ma.masked_where(~protected_mask, protected_mask)
+    masked_pa = np.ma.masked_invalid(binary_pa)
+    darker_green = '#228B22'
+    ax.imshow(masked_pa, cmap=ListedColormap(['#FFFFFF', darker_green]),
+              vmin=0, vmax=1, interpolation='nearest', aspect='auto')
     
-    darker_green = '#228B22'  # More saturated forest green
-    ax.imshow(masked_pa, cmap=ListedColormap(['none', darker_green]),
-              vmin=0, vmax=1, interpolation='nearest', aspect='auto', alpha=0.55)
+    # Second layer: WDPA 2000 (light red)
+    if wdpa_data is not None:
+        wdpa_float = wdpa_data.astype(float)
+        wdpa_mask = (wdpa_float == 1) & (~np.isnan(wdpa_float))
+        wdpa_overlay = np.ma.masked_where(~wdpa_mask, np.ones_like(wdpa_float))
+        ax.imshow(wdpa_overlay, cmap=ListedColormap(['none', WDPA_2000_COLOR]),
+                  vmin=0, vmax=1, interpolation='nearest', aspect='auto', alpha=0.5)
+    
+    # Top layer: Similarity map (semi-transparent)
+    masked_similarity = np.ma.masked_invalid(similarity_data)
+    vmin, vmax = get_similarity_normalization(similarity_data)
+    im1 = ax.imshow(masked_similarity, cmap=create_similarity_colormap(), vmin=vmin, vmax=vmax,
+                    interpolation='nearest', aspect='auto', alpha=0.7)
     
     ax.set_title('Similarity Map with Protected Areas Overlay', fontsize=14, fontweight='bold', pad=10)
     ax.set_xticks([])
@@ -161,8 +171,12 @@ def plot_overlay(similarity_data: np.ndarray, pa_data: np.ndarray, ax: plt.Axes)
     cbar.set_label('Similarity Score', rotation=270, labelpad=20, fontsize=11)
     
     from matplotlib.patches import Patch
-    ax.legend(handles=[Patch(facecolor=darker_green, alpha=0.55, label='Protected Areas')],
-             loc='upper right', fontsize=10, facecolor='white', edgecolor='black', framealpha=0.8)
+    legend_elements = [
+        Patch(facecolor=darker_green, label='Protected Areas 2000-2024'),
+        Patch(facecolor=WDPA_2000_COLOR, alpha=0.5, label='WDPA 2000')
+    ]
+    ax.legend(handles=legend_elements, loc='upper right', fontsize=10,
+             facecolor='white', edgecolor='black', framealpha=0.8)
 
 
 def main() -> int:
@@ -187,7 +201,7 @@ def main() -> int:
         
         plot_similarity_map(similarity_data, wdpa_data, axes[0])
         plot_protected_areas_map(pa_data, axes[1])
-        plot_overlay(similarity_data, pa_data, axes[2])
+        plot_overlay(similarity_data, pa_data, wdpa_data, axes[2])
         
         plt.tight_layout()
         plt.savefig(OUTPUT_PNG, dpi=300, bbox_inches='tight')
@@ -203,4 +217,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
