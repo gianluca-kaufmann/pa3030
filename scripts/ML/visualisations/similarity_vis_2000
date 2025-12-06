@@ -89,6 +89,12 @@ def load_raster(raster_path: Path) -> np.ndarray:
             data[data == src.nodata] = np.nan
     return data
 
+def load_wdpa_raster(raster_path: Path) -> np.ndarray:
+    """Load WDPA raster without converting nodata (binary 0/1 data)."""
+    with rasterio.open(raster_path) as src:
+        data = src.read(1)  # Read first band
+    return data
+
 
 def plot_similarity_map(similarity_data: np.ndarray, wdpa_data: np.ndarray, ax: plt.Axes) -> None:
     masked_data = np.ma.masked_invalid(similarity_data)
@@ -99,12 +105,13 @@ def plot_similarity_map(similarity_data: np.ndarray, wdpa_data: np.ndarray, ax: 
                    interpolation='nearest', aspect='auto')
     
     if wdpa_data is not None:
-        # Create overlay: 1 where protected (WDPA == 1), masked elsewhere
-        wdpa_float = wdpa_data.astype(float)
-        wdpa_mask = (wdpa_float == 1) & (~np.isnan(wdpa_float))
-        wdpa_overlay = np.ma.masked_where(~wdpa_mask, np.ones_like(wdpa_float))
-        ax.imshow(wdpa_overlay, cmap=ListedColormap(['none', WDPA_2000_COLOR]),
-                  vmin=0, vmax=1, interpolation='nearest', aspect='auto', alpha=0.5)
+        # WDPA data is binary: 0 = not protected, 1 = protected
+        # Create RGBA overlay: red where protected, transparent elsewhere
+        from matplotlib.colors import to_rgba
+        wdpa_mask = (wdpa_data == 1)
+        rgba_overlay = np.zeros((*wdpa_data.shape, 4), dtype=float)
+        rgba_overlay[wdpa_mask] = to_rgba(WDPA_2000_COLOR, alpha=0.5)
+        ax.imshow(rgba_overlay, interpolation='nearest', aspect='auto')
     
     ax.set_title('Baseline Similarity Map 2000', fontsize=14, fontweight='bold', pad=10)
     ax.set_xticks([])
@@ -158,11 +165,11 @@ def plot_overlay(similarity_data: np.ndarray, pa_data: np.ndarray, wdpa_data: np
     
     # Second layer: WDPA 2000 (light red)
     if wdpa_data is not None:
-        wdpa_float = wdpa_data.astype(float)
-        wdpa_mask = (wdpa_float == 1) & (~np.isnan(wdpa_float))
-        wdpa_overlay = np.ma.masked_where(~wdpa_mask, np.ones_like(wdpa_float))
-        ax.imshow(wdpa_overlay, cmap=ListedColormap(['none', WDPA_2000_COLOR]),
-                  vmin=0, vmax=1, interpolation='nearest', aspect='auto', alpha=0.5)
+        from matplotlib.colors import to_rgba
+        wdpa_mask = (wdpa_data == 1)
+        rgba_overlay = np.zeros((*wdpa_data.shape, 4), dtype=float)
+        rgba_overlay[wdpa_mask] = to_rgba(WDPA_2000_COLOR, alpha=0.5)
+        ax.imshow(rgba_overlay, interpolation='nearest', aspect='auto')
     
     # Top layer: Similarity map (semi-transparent)
     masked_similarity = np.ma.masked_invalid(similarity_data)
@@ -196,7 +203,7 @@ def main() -> int:
         
         wdpa_data = None
         try:
-            wdpa_data = load_raster(find_wdpa_2000_file())
+            wdpa_data = load_wdpa_raster(find_wdpa_2000_file())
             if wdpa_data.shape != similarity_data.shape:
                 wdpa_data = None
         except FileNotFoundError:
