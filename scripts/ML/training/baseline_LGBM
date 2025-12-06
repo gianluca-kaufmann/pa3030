@@ -68,6 +68,7 @@ TEST_SIZE = 0.2
 EXCLUDE_COLS = {
     # Target and derived fields
     "WDPA_b1",          # Target variable (protection status)
+    "is_protected_2000", # Target variable (derived from WDPA_b1)
     "dist_wdpa",        # Derived from WDPA (distance to protected area)
     "dist_wdpa_decay",  # Derived from WDPA (decay function)
     # Identifiers and coordinates
@@ -78,18 +79,19 @@ EXCLUDE_COLS = {
     "year",
 }
 
-# LightGBM parameters
+# LightGBM parameters (increased flexibility for complex patterns)
 LGBM_PARAMS = {
     'objective': 'binary',
     'metric': 'auc',
     'boosting_type': 'gbdt',
-    'num_leaves': 255,
+    'num_leaves': 511,          # Increased from 255 for more flexibility
     'learning_rate': 0.05,
     'feature_fraction': 0.8,
     'bagging_fraction': 0.8,
     'bagging_freq': 5,
-    'max_depth': 16,
-    'min_child_samples': 100,
+    'max_depth': -1,            # Unlimited depth (num_leaves controls complexity)
+    'min_child_samples': 20,    # Reduced from 100 for more granular splits
+    'min_data_in_leaf': 20,     # Additional constraint for leaf size
     'random_state': RANDOM_STATE,
     'n_jobs': -1,
     'verbose': -1,
@@ -99,6 +101,48 @@ LGBM_PARAMS = {
 # =============================================================================
 # Utility Functions
 # =============================================================================
+
+def convert_numpy_types(obj):
+    """Recursively convert NumPy types to native Python types for JSON serialization.
+    
+    Handles:
+    - NumPy scalars (int64, float64, etc.) -> int, float
+    - NumPy arrays -> lists
+    - Dicts and lists (recursively)
+    - None, bool, str pass through unchanged
+    
+    Args:
+        obj: Object that may contain NumPy types
+        
+    Returns:
+        Object with all NumPy types converted to native Python types
+    """
+    if isinstance(obj, (np.integer, np.int_, np.intc, np.intp, np.int8,
+                        np.int16, np.int32, np.int64, np.uint8, np.uint16,
+                        np.uint32, np.uint64)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float_, np.float16, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_numpy_types(item) for item in obj]
+    elif obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    else:
+        # Fallback: try to convert to native type
+        try:
+            if hasattr(obj, 'item'):  # NumPy scalar
+                return obj.item()
+            else:
+                return obj
+        except (ValueError, TypeError, AttributeError):
+            return str(obj)  # Last resort: convert to string
+
 
 def compute_precision_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) -> float:
     """Compute precision at top k% of predictions.
@@ -286,8 +330,13 @@ def main() -> None:
     
     # Get feature columns
     feature_cols = get_feature_columns(df_2000_clean)
+    excluded_cols = sorted(EXCLUDE_COLS & set(df_2000_clean.columns))
+    
     print(f"\nUsing {len(feature_cols)} features")
-    print(f"Excluded columns: {sorted(EXCLUDE_COLS & set(df_2000_clean.columns))}")
+    print(f"Excluded columns ({len(excluded_cols)}): {excluded_cols}")
+    print(f"\nFeature list:")
+    for i, feat in enumerate(sorted(feature_cols), 1):
+        print(f"  {i:3d}. {feat}")
     
     # Target distribution
     n_protected = (df_2000_clean[target_col] > 0).sum()
@@ -308,6 +357,8 @@ def main() -> None:
         "data/n_unprotected_2000": int(n_unprotected),
         "data/pct_protected_2000": float(pct_protected),
         "data/class_ratio_2000": float(n_unprotected / max(n_protected, 1)),
+        "data/features": feature_cols,  # Log feature names
+        "data/excluded_columns": excluded_cols,
     })
     
     # -------------------------------------------------------------------------
@@ -359,24 +410,33 @@ def main() -> None:
     print(f"  Protected:   {y_test.sum():,}")
     print(f"  Unprotected: {(y_test == 0).sum():,}")
     
-    # Calculate scale_pos_weight
-    scale_pos_weight = (y_train == 0).sum() / max(y_train.sum(), 1)
-    print(f"\nScale pos weight (auto): {scale_pos_weight:.2f}")
+    # Calculate scale_pos_weight for imbalanced classification
+    n_train_pos = y_train.sum()
+    n_train_neg = (y_train == 0).sum()
+    scale_pos_weight = n_train_neg / max(n_train_pos, 1)
+    
+    print(f"\nClass imbalance handling:")
+    print(f"  Positive (protected): {n_train_pos:,}")
+    print(f"  Negative (unprotected): {n_train_neg:,}")
+    print(f"  Imbalance ratio: 1:{n_train_neg / max(n_train_pos, 1):.2f}")
+    print(f"  Scale pos weight (auto): {scale_pos_weight:.2f}")
     
     # Log split information
     wandb.log({
         "data/train_size": len(X_train),
         "data/test_size": len(X_test),
-        "data/train_protected": int(y_train.sum()),
-        "data/train_unprotected": int((y_train == 0).sum()),
+        "data/train_protected": int(n_train_pos),
+        "data/train_unprotected": int(n_train_neg),
         "data/test_protected": int(y_test.sum()),
         "data/test_unprotected": int((y_test == 0).sum()),
+        "data/train_imbalance_ratio": float(n_train_neg / max(n_train_pos, 1)),
         "model/scale_pos_weight": float(scale_pos_weight),
     })
     
-    # Update params with scale_pos_weight
+    # Update params with scale_pos_weight for balanced learning
     lgbm_params = LGBM_PARAMS.copy()
     lgbm_params['scale_pos_weight'] = scale_pos_weight
+    lgbm_params['is_unbalance'] = True  # Explicit imbalance flag
     
     print("\nLightGBM parameters:")
     for param, value in lgbm_params.items():
@@ -682,7 +742,9 @@ def main() -> None:
     # Save metrics
     metrics_path = output_dir / "baseline_lgbm_metrics.json"
     with open(metrics_path, 'w') as f:
-        json.dump(metrics, f, indent=2)
+        # Convert NumPy types to native Python types for JSON serialization
+        metrics_serializable = convert_numpy_types(metrics)
+        json.dump(metrics_serializable, f, indent=2)
     print(f"Metrics saved to: {metrics_path}")
     
     # -------------------------------------------------------------------------
