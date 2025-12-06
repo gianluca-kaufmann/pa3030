@@ -81,35 +81,60 @@ def find_wdpa_2000_file() -> Path:
     raise FileNotFoundError(f"WDPA file not found. Checked:\n  - {path}\n  - {alt_path}")
 
 
-def load_raster(raster_path: Path) -> np.ndarray:
+def load_raster(raster_path: Path) -> tuple:
+    """Load raster and return data array and profile (for geospatial info)."""
     with rasterio.open(raster_path) as src:
         data = src.read(1)
+        profile = src.profile.copy()
         if src.nodata is not None:
             data = data.astype(float)
             data[data == src.nodata] = np.nan
-    return data
+    return data, profile
 
-def load_wdpa_raster(raster_path: Path, target_shape: tuple = None) -> np.ndarray:
-    """Load WDPA raster and optionally resample to target shape."""
+def load_wdpa_raster(raster_path: Path, target_profile: dict = None) -> np.ndarray:
+    """Load WDPA raster and reproject/resample to match target geospatial properties."""
     print(f"Loading WDPA from: {raster_path}")
     with rasterio.open(raster_path) as src:
-        data = src.read(1)  # Read first band
-        print(f"  WDPA original shape: {data.shape}")
-        print(f"  WDPA dtype: {data.dtype}")
-        print(f"  WDPA unique values: {np.unique(data)}")
-        print(f"  WDPA pixels == 1: {np.sum(data == 1):,}")
-        print(f"  WDPA pixels == 0: {np.sum(data == 0):,}")
+        print(f"  WDPA original shape: {src.shape}")
+        print(f"  WDPA CRS: {src.crs}")
+        print(f"  WDPA transform: {src.transform}")
         
-        # Resample if target shape is provided and different
-        if target_shape is not None and data.shape != target_shape:
-            print(f"  Resampling WDPA from {data.shape} to {target_shape}")
-            from scipy.ndimage import zoom
-            scale_factors = (target_shape[0] / data.shape[0], target_shape[1] / data.shape[1])
-            data_resampled = zoom(data, scale_factors, order=0)  # order=0 for nearest neighbor
-            print(f"  Resampled WDPA pixels == 1: {np.sum(data_resampled == 1):,}")
-            return data_resampled
-        
-    return data
+        # If target profile provided, reproject/resample to match
+        if target_profile is not None:
+            print(f"  Reprojecting WDPA to match target:")
+            print(f"    Target shape: {target_profile['height']} x {target_profile['width']}")
+            print(f"    Target CRS: {target_profile['crs']}")
+            print(f"    Target transform: {target_profile['transform']}")
+            
+            from rasterio.warp import reproject, Resampling
+            
+            # Read source data
+            src_data = src.read(1)
+            
+            # Create destination array
+            dst_data = np.zeros((target_profile['height'], target_profile['width']), dtype=src.dtypes[0])
+            
+            # Reproject
+            reproject(
+                source=src_data,
+                destination=dst_data,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=target_profile['transform'],
+                dst_crs=target_profile['crs'],
+                resampling=Resampling.nearest  # Nearest neighbor for binary data
+            )
+            
+            print(f"  Reprojected WDPA pixels == 1: {np.sum(dst_data == 1):,}")
+            print(f"  Reprojected WDPA pixels == 0: {np.sum(dst_data == 0):,}")
+            return dst_data
+        else:
+            # No reprojection needed
+            data = src.read(1)
+            print(f"  WDPA unique values: {np.unique(data)}")
+            print(f"  WDPA pixels == 1: {np.sum(data == 1):,}")
+            print(f"  WDPA pixels == 0: {np.sum(data == 0):,}")
+            return data
 
 
 def plot_similarity_map(similarity_data: np.ndarray, wdpa_data: np.ndarray, ax: plt.Axes) -> None:
@@ -212,8 +237,8 @@ def plot_overlay(similarity_data: np.ndarray, pa_data: np.ndarray, wdpa_data: np
 
 def main() -> int:
     try:
-        similarity_data = load_raster(INPUT_SIMILARITY_TIF)
-        pa_data = load_raster(INPUT_PAS_TIF)
+        similarity_data, similarity_profile = load_raster(INPUT_SIMILARITY_TIF)
+        pa_data, pa_profile = load_raster(INPUT_PAS_TIF)
         
         if similarity_data.shape != pa_data.shape:
             raise ValueError(f"Raster dimensions do not match: similarity {similarity_data.shape} vs PA {pa_data.shape}")
@@ -222,9 +247,11 @@ def main() -> int:
         try:
             wdpa_path = find_wdpa_2000_file()
             print(f"\nFound WDPA file: {wdpa_path}")
-            print(f"Target shape (similarity): {similarity_data.shape}")
-            wdpa_data = load_wdpa_raster(wdpa_path, target_shape=similarity_data.shape)
-            print("WDPA data loaded and resampled successfully")
+            print(f"Target profile from similarity raster:")
+            print(f"  Shape: {similarity_profile['height']} x {similarity_profile['width']}")
+            print(f"  CRS: {similarity_profile['crs']}")
+            wdpa_data = load_wdpa_raster(wdpa_path, target_profile=similarity_profile)
+            print("WDPA data loaded and reprojected successfully")
         except FileNotFoundError as e:
             print(f"WDPA file not found: {e}")
         
