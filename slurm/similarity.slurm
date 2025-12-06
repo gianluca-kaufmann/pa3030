@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=sample-preprocessing-balanced
+#SBATCH --job-name=similarity-map-2000
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem-per-cpu=15G
-#SBATCH --output=/cluster/scratch/%u/logs/sample_preprocessing_balanced_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/sample_preprocessing_balanced_%j.err
+#SBATCH --mem-per-cpu=16G
+#SBATCH --output=/cluster/scratch/%u/logs/similarity_map_2000_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/similarity_map_2000_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -33,26 +33,21 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the sample preprocessing balanced script
+# Run the similarity map 2000 script
 #------------------------------------------------------------------------------
-# NOTE: This script references sample_preprocessing_balanced which is currently
-# in the old/ directory. Update this path if balanced preprocessing is needed.
-#------------------------------------------------------------------------------
-echo "Starting sample preprocessing balanced script..."
+echo "Starting similarity map 2000 script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/training_preprocessing/old/sample_preprocessing_balanced" ] || {
-  echo "ERROR: sample_preprocessing_balanced not found"
-  echo "NOTE: Balanced preprocessing script is in old/ directory"
-  find scripts -maxdepth 4 -type f -name "sample_preprocessing_balanced"
+[ -f "scripts/ML/visualisations/similarity_map_2000" ] || {
+  echo "ERROR: similarity_map_2000 not found"
+  echo "NOTE: similarity_map_2000 script is in visualisations/ directory"
+  find scripts -maxdepth 4 -type f -name "similarity_map_2000"
   exit 1
 }
-
 # Run the script
-python "scripts/ML/training_preprocessing/old/sample_preprocessing_balanced"
+python "scripts/ML/visualisations/similarity_map_2000"
 
-echo "Sample preprocessing balanced script finished."
-
+echo "similarity_map_2000 script finished."

@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+"""
+Create visualization for baseline similarity map and protected areas.
+
+Loads baseline similarity scores and protected areas GeoTIFFs and creates
+three visualization plots: individual similarity map, individual protected areas map,
+and an overlay of both.
+
+Inputs:
+- GeoTIFF: baseline_similarity_2000.tif (on scratch: $SCRATCH/data/ml/baseline_similarity_2000.tif)
+- GeoTIFF: new_PAs_2000_2024.tif (on scratch: $SCRATCH/data/ml/new_PAs_2000_2024.tif)
+
+Outputs:
+- PNG figure: similarity_vis_2000.png (3 subplots) saved to outputs/Figures/
+"""
+
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+import rasterio
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# Path resolution
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
+
+# Use $SCRATCH for data if on cluster, otherwise use project root
+if "SCRATCH" in os.environ:
+    DATA_ROOT = Path(os.environ["SCRATCH"]) / "data" / "ml"
+else:
+    DATA_ROOT = PROJECT_ROOT / "data" / "ml"
+
+# Output directory
+OUTPUT_DIR = PROJECT_ROOT / "outputs" / "Figures"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Input paths
+INPUT_SIMILARITY_TIF = DATA_ROOT / "baseline_similarity_2000.tif"
+INPUT_PAS_TIF = DATA_ROOT / "new_PAs_2000_2024.tif"
+
+# Output path
+OUTPUT_PNG = OUTPUT_DIR / "similarity_vis_2000.png"
+
+# Nodata values (matching similarity_map_2000 script)
+NODATA_FLOAT = -9999.0
+NODATA_UINT8 = 255
+
+# Color for protected areas (green)
+PROTECTED_COLOR = '#2E8B57'  # Sea Green
+
+
+def load_raster(raster_path: Path) -> tuple:
+    """Load GeoTIFF raster and return data array and metadata."""
+    if not raster_path.exists():
+        raise FileNotFoundError(f"GeoTIFF not found: {raster_path}")
+    
+    print(f"Loading {raster_path.name}...")
+    with rasterio.open(raster_path) as src:
+        data = src.read(1)  # Read first band
+        nodata = src.nodata
+        profile = src.profile
+        
+        # Convert nodata to NaN for visualization
+        if nodata is not None:
+            data = data.astype(float)
+            data[data == nodata] = np.nan
+        
+        print(f"  Shape: {data.shape}")
+        print(f"  Data type: {data.dtype}")
+        if nodata is not None:
+            valid_pixels = (~np.isnan(data)).sum()
+            print(f"  Valid pixels: {valid_pixels:,} ({100*valid_pixels/data.size:.2f}%)")
+        
+        return data, profile
+
+
+def plot_similarity_map(similarity_data: np.ndarray, ax: plt.Axes) -> None:
+    """Plot similarity map with viridis colormap."""
+    # Mask nodata values
+    masked_data = np.ma.masked_invalid(similarity_data)
+    
+    # Get valid data range for normalization
+    valid_data = similarity_data[~np.isnan(similarity_data)]
+    if len(valid_data) > 0:
+        vmin = np.nanpercentile(similarity_data, 1)
+        vmax = np.nanpercentile(similarity_data, 99)
+    else:
+        vmin = 0
+        vmax = 1
+    
+    im = ax.imshow(masked_data, cmap='viridis', vmin=vmin, vmax=vmax, 
+                   interpolation='nearest', aspect='auto')
+    
+    ax.set_title('Baseline Similarity Map 2000', fontsize=14, fontweight='bold', pad=10)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    
+    # Add colorbar
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+    cbar.set_label('Similarity Score', rotation=270, labelpad=20, fontsize=11)
+    
+    # Add statistics
+    if len(valid_data) > 0:
+        stats_text = f'Min: {valid_data.min():.4f}\n'
+        stats_text += f'Max: {valid_data.max():.4f}\n'
+        stats_text += f'Mean: {valid_data.mean():.4f}'
+        ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
+                fontsize=9, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+
+def plot_protected_areas_map(pa_data: np.ndarray, ax: plt.Axes) -> None:
+    """Plot protected areas map with green color."""
+    # Create binary mask: 1 for protected, 0 for not protected, NaN for nodata
+    binary_data = pa_data.copy().astype(float)
+    
+    # Handle nodata (255) - set to NaN
+    binary_data[binary_data == NODATA_UINT8] = np.nan
+    
+    # Create custom colormap: transparent/white for 0, green for 1
+    colors = ['#FFFFFF', PROTECTED_COLOR]  # White for 0, Green for 1
+    cmap = ListedColormap(colors)
+    
+    # Mask NaN values
+    masked_data = np.ma.masked_invalid(binary_data)
+    
+    im = ax.imshow(masked_data, cmap=cmap, vmin=0, vmax=1,
+                   interpolation='nearest', aspect='auto')
+    
+    ax.set_title('Protected Areas 2000-2024', fontsize=14, fontweight='bold', pad=10)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    
+    # Add colorbar with custom labels
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8, ticks=[0, 1])
+    cbar.set_ticklabels(['Not Protected', 'Protected'])
+    cbar.set_label('Protection Status', rotation=270, labelpad=20, fontsize=11)
+    
+    # Add statistics
+    valid_data = binary_data[~np.isnan(binary_data)]
+    if len(valid_data) > 0:
+        protected_count = (valid_data == 1).sum()
+        protected_pct = 100 * protected_count / len(valid_data)
+        stats_text = f'Protected: {protected_count:,}\n'
+        stats_text += f'Percentage: {protected_pct:.2f}%'
+        ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
+                fontsize=9, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+
+def plot_overlay(similarity_data: np.ndarray, pa_data: np.ndarray, ax: plt.Axes) -> None:
+    """Plot overlay of similarity map and protected areas with semi-transparent colors."""
+    # Prepare similarity data
+    masked_similarity = np.ma.masked_invalid(similarity_data)
+    valid_similarity = similarity_data[~np.isnan(similarity_data)]
+    
+    if len(valid_similarity) > 0:
+        vmin = np.nanpercentile(similarity_data, 1)
+        vmax = np.nanpercentile(similarity_data, 99)
+    else:
+        vmin = 0
+        vmax = 1
+    
+    # Plot similarity as base layer
+    im1 = ax.imshow(masked_similarity, cmap='viridis', vmin=vmin, vmax=vmax,
+                    interpolation='nearest', aspect='auto')
+    
+    # Prepare protected areas overlay
+    binary_pa = pa_data.copy().astype(float)
+    binary_pa[binary_pa == NODATA_UINT8] = np.nan
+    
+    # Create overlay: green for protected areas with transparency
+    # Create a mask for protected areas (value == 1)
+    protected_mask = (binary_pa == 1)
+    masked_pa = np.ma.masked_where(~protected_mask, protected_mask)
+    
+    # Overlay protected areas in green with transparency
+    im2 = ax.imshow(masked_pa, cmap=ListedColormap(['none', PROTECTED_COLOR]),
+                    vmin=0, vmax=1, interpolation='nearest', aspect='auto', alpha=0.6)
+    
+    ax.set_title('Similarity Map with Protected Areas Overlay', 
+                fontsize=14, fontweight='bold', pad=10)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    
+    # Add colorbar for similarity
+    cbar = plt.colorbar(im1, ax=ax, shrink=0.8)
+    cbar.set_label('Similarity Score', rotation=270, labelpad=20, fontsize=11)
+    
+    # Add legend for protected areas
+    from matplotlib.patches import Patch
+    legend_elements = [Patch(facecolor=PROTECTED_COLOR, alpha=0.6, label='Protected Areas')]
+    ax.legend(handles=legend_elements, loc='upper right', fontsize=10,
+             facecolor='white', edgecolor='black', alpha=0.8)
+
+
+def main() -> int:
+    """Main processing function."""
+    print("=" * 60)
+    print("Baseline Similarity & Protected Areas Visualization")
+    print("=" * 60)
+    
+    try:
+        # Load rasters
+        print("\n" + "-" * 60)
+        similarity_data, similarity_profile = load_raster(INPUT_SIMILARITY_TIF)
+        
+        print("\n" + "-" * 60)
+        pa_data, pa_profile = load_raster(INPUT_PAS_TIF)
+        
+        # Verify both rasters have the same dimensions
+        if similarity_data.shape != pa_data.shape:
+            raise ValueError(
+                f"Raster dimensions do not match: "
+                f"similarity {similarity_data.shape} vs PA {pa_data.shape}"
+            )
+        
+        # Create figure with 3 subplots
+        print("\n" + "-" * 60)
+        print("Creating visualization plots...")
+        
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        fig.suptitle('Baseline Similarity Map 2000 & Protected Areas 2000-2024', 
+                    fontsize=16, fontweight='bold', y=1.02)
+        
+        # Plot 1: Similarity map
+        plot_similarity_map(similarity_data, axes[0])
+        
+        # Plot 2: Protected areas map
+        plot_protected_areas_map(pa_data, axes[1])
+        
+        # Plot 3: Overlay
+        plot_overlay(similarity_data, pa_data, axes[2])
+        
+        plt.tight_layout()
+        
+        # Save figure
+        print(f"\nSaving figure to {OUTPUT_PNG.name}...")
+        plt.savefig(OUTPUT_PNG, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        file_size_mb = OUTPUT_PNG.stat().st_size / (1024 * 1024)
+        print(f"  Successfully saved ({file_size_mb:.1f} MB)")
+        
+        print("\n" + "=" * 60)
+        print(f"Output: {OUTPUT_PNG}")
+        print("=" * 60)
+        
+        return 0
+        
+    except FileNotFoundError as e:
+        print(f"\nERROR: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"\nERROR: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
