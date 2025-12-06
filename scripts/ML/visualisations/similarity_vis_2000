@@ -91,8 +91,14 @@ def load_raster(raster_path: Path) -> np.ndarray:
 
 def load_wdpa_raster(raster_path: Path) -> np.ndarray:
     """Load WDPA raster without converting nodata (binary 0/1 data)."""
+    print(f"Loading WDPA from: {raster_path}")
     with rasterio.open(raster_path) as src:
         data = src.read(1)  # Read first band
+        print(f"  WDPA shape: {data.shape}")
+        print(f"  WDPA dtype: {data.dtype}")
+        print(f"  WDPA unique values: {np.unique(data)}")
+        print(f"  WDPA pixels == 1: {np.sum(data == 1):,}")
+        print(f"  WDPA pixels == 0: {np.sum(data == 0):,}")
     return data
 
 
@@ -109,6 +115,7 @@ def plot_similarity_map(similarity_data: np.ndarray, wdpa_data: np.ndarray, ax: 
         # Create RGBA overlay: red where protected, transparent elsewhere
         from matplotlib.colors import to_rgba
         wdpa_mask = (wdpa_data == 1)
+        print(f"  WDPA overlay: {wdpa_mask.sum():,} protected pixels")
         rgba_overlay = np.zeros((*wdpa_data.shape, 4), dtype=float)
         rgba_overlay[wdpa_mask] = to_rgba(WDPA_2000_COLOR, alpha=0.5)
         ax.imshow(rgba_overlay, interpolation='nearest', aspect='auto')
@@ -203,10 +210,17 @@ def main() -> int:
         
         wdpa_data = None
         try:
-            wdpa_data = load_wdpa_raster(find_wdpa_2000_file())
+            wdpa_path = find_wdpa_2000_file()
+            print(f"\nFound WDPA file: {wdpa_path}")
+            wdpa_data = load_wdpa_raster(wdpa_path)
+            print(f"Similarity shape: {similarity_data.shape}")
             if wdpa_data.shape != similarity_data.shape:
+                print(f"WARNING: Shape mismatch - WDPA {wdpa_data.shape} vs similarity {similarity_data.shape}")
                 wdpa_data = None
-        except FileNotFoundError:
+            else:
+                print("WDPA data loaded successfully")
+        except FileNotFoundError as e:
+            print(f"WDPA file not found: {e}")
             pass
         
         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
