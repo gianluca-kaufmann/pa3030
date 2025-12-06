@@ -56,6 +56,9 @@ gsutil -m rsync -r /cluster/scratch/gikaufmann/outputs \
 cd ~/master_thesis
 gsutil -m rsync -r outputs \
   gs://protected-areas/outputs
+
+#For single files
+gsutil cp outputs/Figures/similarity_vis_2000.png gs://protected-areas/outputs/Figures/ml/
 ```
 
 ### Job troubleshooting
