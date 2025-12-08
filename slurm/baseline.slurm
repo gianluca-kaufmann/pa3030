@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=train-sample-imbalanced-lgbm
+#SBATCH --job-name=train-baseline-rf
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=15G
-#SBATCH --output=/cluster/scratch/%u/logs/train_sample_imbalanced_lgbm_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/train_sample_imbalanced_lgbm_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/train_baseline_rf_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/train_baseline_rf_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -33,22 +33,22 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the baseline LGBM training script (imbalanced data)
+# Run the baseline RF training script
 #------------------------------------------------------------------------------
-echo "Starting baseline LGBM training script..."
+echo "Starting baseline RF training script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/training/baseline_LGBM" ] || {
-  echo "ERROR: baseline_LGBM not found under scripts/ML/training"
-  find scripts -maxdepth 4 -type f -name "baseline_LGBM"
+[ -f "scripts/ML/training/baseline_RF" ] || {
+  echo "ERROR: baseline_RF not found under scripts/ML/training"
+  find scripts -maxdepth 4 -type f -name "baseline_RF"
   exit 1
 }
 
 # Run the script
-python "scripts/ML/training/baseline_LGBM"
+python "scripts/ML/training/baseline_RF"
 
-echo "Baseline LGBM training script finished."
+echo "Baseline RF training script finished."
 

@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=similarity-map-2000
+#SBATCH --job-name=similarity-vis-2000-rf
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/similarity_map_2000_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/similarity_map_2000_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/similarity_vis_2000_rf_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/similarity_vis_2000_rf_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -33,21 +33,21 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the similarity map 2000 script
+# Run the similarity vis 2000 RF script
 #------------------------------------------------------------------------------
-echo "Starting similarity map 2000 script..."
+echo "Starting similarity vis 2000 RF script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/visualisations/similarity_map_2000" ] || {
-  echo "ERROR: similarity_map_2000 not found"
-  echo "NOTE: similarity_map_2000 script is in visualisations/ directory"
-  find scripts -maxdepth 4 -type f -name "similarity_map_2000"
+[ -f "scripts/ML/visualisations/similarity_vis_2000_rf" ] || {
+  echo "ERROR: similarity_vis_2000_rf not found"
+  echo "NOTE: similarity_vis_2000_rf script is in visualisations/ directory"
+  find scripts -maxdepth 4 -type f -name "similarity_vis_2000_rf"
   exit 1
 }
 # Run the script
-python "scripts/ML/visualisations/similarity_map_2000"
+python "scripts/ML/visualisations/similarity_vis_2000_rf"
 
-echo "similarity_map_2000 script finished."
+echo "similarity_vis_2000_rf script finished."
