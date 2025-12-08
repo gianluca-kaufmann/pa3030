@@ -1,37 +1,42 @@
 #!/usr/bin/env python3
 
-"""Imbalanced Transition Prediction Training Script
+"""RF Transition Model (0→1 Prediction)
 
-Purpose: Train a model to predict new WDPA establishment (0→1 transitions) on
-         realistic imbalanced data with comprehensive evaluation metrics.
-Input:  `data/ml/sample_training_imbalanced.parquet` (realistic class distribution).
-Process: Use transition_01 as target, perform 80/20 stratified split, fit a
-         RandomForest classifier with class weights, and evaluate with multiple metrics.
-Output: Classification report, ROC-AUC, PR-AUC, precision@k, confusion matrix,
-        and feature importance.
+Purpose: Train a Random Forest model to predict transitions to protected areas (0→1).
+         Uses temporal split (train: 2000-2017, test: 2018-2024) with GroupKFold 
+         cross-validation for hyperparameter tuning.
+
+Input:   `merged_panel_final.parquet`
+Output:  - Trained model (.pkl)
+         - Test predictions (.parquet)
+         - Evaluation metrics (.json)
 """
 
 from __future__ import annotations
 
+import gc
+import json
 import os
 import sys
 import time
+import pickle
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, Dict, Any
 
 import numpy as np
 import pandas as pd
 import wandb
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     classification_report,
     confusion_matrix,
     roc_auc_score,
     average_precision_score,
-    precision_recall_curve,
-    roc_curve,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupKFold, RandomizedSearchCV
+from sklearn.pipeline import Pipeline
 
 
 class Tee:
@@ -52,22 +57,85 @@ class Tee:
     def close(self) -> None:
         self.file.close()
 
-RANDOM_STATE = 42
-N_ESTIMATORS = 100
-TEST_SIZE = 0.2
-MAX_SAMPLE_SIZE = 10_000_000  # Subsample if dataset is larger to avoid memory issues
 
-# Columns to exclude from features (to prevent data leakage or overfitting)
+# =============================================================================
+# Configuration
+# =============================================================================
+RANDOM_STATE = 42
+
+# Temporal split
+TRAIN_YEARS = range(2000, 2018)  # 2000-2017
+TEST_YEARS = range(2018, 2025)   # 2018-2024
+
+# Columns to exclude from features
 EXCLUDE_COLS = {
-    "transition_01",  # Target variable
-    "WDPA_b1",        # Direct leakage of target
-    "WDPA_prev",      # Direct leakage of target
-    "row",            # Spatial identifier
-    "col",            # Spatial identifier
-    "x",              # Spatial coordinate
-    "y",              # Spatial coordinate
-    "year",           # Temporal identifier
+    'transition_01',  # Target variable
+    'WDPA_b1',        # Leakage
+    'WDPA_prev',      # Leakage
+    'x',              # Coordinate
+    'y',              # Coordinate
+    'row',            # Identifier
+    'col',            # Identifier
+    'year',           # Temporal identifier
 }
+
+# GroupKFold configuration
+N_SPLITS = 5
+
+# Stratified sampling configuration (optional, for reducing training size before tuning)
+# Set ENABLE_STRATIFIED_SAMPLING=True to enable, or use environment variable
+ENABLE_STRATIFIED_SAMPLING = os.environ.get("ENABLE_STRATIFIED_SAMPLING", "False").lower() == "true"
+# If enabled, sample this many negatives (keep all positives)
+STRATIFIED_NEGATIVE_SAMPLE_SIZE = int(os.environ.get("STRATIFIED_NEGATIVE_SAMPLE_SIZE", "1000000"))
+
+# Hyperparameter search space (for Pipeline: rf__param_name)
+PARAM_GRID = {
+    'rf__n_estimators': [100, 300, 500],
+    'rf__max_depth': [10, 20, None],
+    'rf__min_samples_leaf': [10, 50, 100],
+    'rf__max_features': ['sqrt', 'log2', 0.3],
+}
+
+# Fixed parameters
+FIXED_PARAMS = {
+    'random_state': RANDOM_STATE,
+    'n_jobs': int(os.environ.get("SLURM_CPUS_PER_TASK", 1)),
+    'verbose': 0,
+    'class_weight': 'balanced_subsample',
+    'bootstrap': True,
+}
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def convert_numpy_types(obj: Any) -> Any:
+    """Recursively convert NumPy types to native Python types for JSON serialization."""
+    if isinstance(obj, (np.integer, np.int_, np.intc, np.intp, np.int8,
+                        np.int16, np.int32, np.int64, np.uint8, np.uint16,
+                        np.uint32, np.uint64)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float_, np.float16, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_numpy_types(item) for item in obj]
+    elif obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    else:
+        try:
+            if hasattr(obj, 'item'):
+                return obj.item()
+            else:
+                return obj
+        except (ValueError, TypeError, AttributeError):
+            return str(obj)
 
 
 def compute_precision_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) -> float:
@@ -88,13 +156,153 @@ def compute_precision_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) ->
     top_k_idx = np.argsort(y_proba)[-n_top_k:]
     
     # Calculate precision among top k%
-    precision = y_true[top_k_idx].sum() / n_top_k
-    
-    return precision
+    return y_true[top_k_idx].sum() / n_top_k
 
+
+def load_data(parquet_path: Path, years: range, columns: Optional[list] = None) -> pd.DataFrame:
+    """Load data for specified years from parquet file efficiently."""
+    print(f"Loading data for years {years.start}-{years.stop-1} from {parquet_path} ...")
+    
+    # Read parquet file with filter
+    filters = [('year', '>=', years.start), ('year', '<=', years.stop - 1)]
+    load_start = time.time()
+    df = pd.read_parquet(parquet_path, filters=filters, columns=columns)
+    load_time = time.time() - load_start
+    
+    print(f"  Loaded {len(df):,} rows in {load_time:.1f}s")
+    print(f"  Years: {sorted(df['year'].unique())}")
+    return df
+
+
+def downcast_numeric_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """Downcast numeric dtypes to reduce memory usage.
+    
+    Converts:
+    - float64 → float32
+    - int64 → int32
+    
+    Args:
+        df: DataFrame to downcast
+        
+    Returns:
+        DataFrame with downcasted dtypes
+    """
+    df = df.copy()
+    
+    # Downcast floats: float64 → float32
+    float_cols = df.select_dtypes(include=['float64']).columns
+    for col in float_cols:
+        df[col] = df[col].astype('float32')
+    
+    # Downcast integers: int64 → int32
+    int_cols = df.select_dtypes(include=['int64']).columns
+    for col in int_cols:
+        df[col] = df[col].astype('int32')
+    
+    return df
+
+
+def get_feature_columns(df: pd.DataFrame) -> list:
+    """Get valid feature columns, excluding identifiers and leakage columns."""
+    numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+    feature_cols = [
+        col for col in numeric_cols
+        if col.lower() not in {c.lower() for c in EXCLUDE_COLS}
+    ]
+    return feature_cols
+
+
+def stratified_sample_negatives(
+    df: pd.DataFrame,
+    target_col: str,
+    negative_sample_size: int,
+    random_state: int = RANDOM_STATE
+) -> pd.DataFrame:
+    """Perform stratified sampling: keep all positives, sample negatives.
+    
+    Args:
+        df: DataFrame with target column
+        target_col: Name of target column (0 = negative, >0 = positive)
+        negative_sample_size: Number of negative samples to keep
+        random_state: Random seed for reproducibility
+    
+    Returns:
+        Sampled DataFrame with all positives and sampled negatives
+    """
+    # Separate positives and negatives
+    positives = df[df[target_col] > 0]
+    negatives = df[df[target_col] == 0]
+    
+    print(f"\nStratified sampling:")
+    print(f"  Original positives: {len(positives):,}")
+    print(f"  Original negatives: {len(negatives):,}")
+    
+    # Keep all positives
+    # Sample negatives (without replacement if sample size < total negatives)
+    n_negatives_to_sample = min(negative_sample_size, len(negatives))
+    
+    negatives_sampled = negatives.sample(
+        n=n_negatives_to_sample,
+        random_state=random_state,
+        replace=False
+    )
+    
+    print(f"  Sampled negatives:  {len(negatives_sampled):,}")
+    
+    # Combine
+    df_sampled = pd.concat([positives, negatives_sampled], ignore_index=True)
+    
+    print(f"  Final size:         {len(df_sampled):,}")
+    print(f"  Reduction:          {len(df) - len(df_sampled):,} rows ({(1 - len(df_sampled)/len(df))*100:.1f}%)")
+    
+    return df_sampled
+
+
+# =============================================================================
+# Main Pipeline
+# =============================================================================
 
 def main() -> None:
     start_time = time.time()
+    
+    # -------------------------------------------------------------------------
+    # Setup paths
+    # -------------------------------------------------------------------------
+    repo_root = Path(__file__).resolve().parents[3]
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+    
+    # Input path (prefer SCRATCH on Euler; check multiple possible locations)
+    candidate_inputs = []
+    if scratch_root is not None and scratch_root.exists():
+        # Euler cluster: Check common locations
+        candidate_inputs.append(scratch_root / "outputs/Results/merged_panel_final.parquet")
+        candidate_inputs.append(scratch_root / "data/ml/merged_panel_final.parquet")
+    # Local fallback
+    candidate_inputs.append(repo_root / "data/ml/merged_panel_final.parquet")
+    
+    input_path = None
+    for cand in candidate_inputs:
+        if cand.exists():
+            input_path = cand
+            break
+    
+    if input_path is None:
+        error_msg = (
+            "Could not find merged_panel_final.parquet in any expected location.\n"
+            f"Checked:\n"
+        )
+        for cand in candidate_inputs:
+            error_msg += f"  - {cand}\n"
+        raise FileNotFoundError(error_msg)
+    
+    # Output directories
+    output_dir = repo_root / "outputs/Results/ml_models"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    model_dir = repo_root / "data/ml/models"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
     # Initialize W&B
     wandb_api_key = os.environ.get("WANDB_API_KEY")
@@ -107,290 +315,507 @@ def main() -> None:
     
     print("Initializing Weights & Biases...")
     wandb.init(
-        project="ml-training-imbalanced",
+        project="ml-training-transitions",
         entity=wandb_entity,
-        name=f"train_imbalanced_rf_{time.strftime('%Y%m%d_%H%M%S')}",
+        name=f"model1_rf_{timestamp}",
         config={
             "model": "RandomForest",
-            "n_estimators": N_ESTIMATORS,
-            "test_size": TEST_SIZE,
+            "task": "transition_01_prediction",
             "random_state": RANDOM_STATE,
-            "max_sample_size": MAX_SAMPLE_SIZE,
-            "class_weight": "balanced",
-            "target": "transition_01",
+            "train_years": f"{TRAIN_YEARS.start}-{TRAIN_YEARS.stop-1}",
+            "test_years": f"{TEST_YEARS.start}-{TEST_YEARS.stop-1}",
+            "n_splits": N_SPLITS,
+            "param_distributions": PARAM_GRID,
+            "n_iter": 50,
+            "search_method": "RandomizedSearchCV",
+            "enable_stratified_sampling": ENABLE_STRATIFIED_SAMPLING,
+            "stratified_negative_sample_size": STRATIFIED_NEGATIVE_SAMPLE_SIZE if ENABLE_STRATIFIED_SAMPLING else None,
         },
     )
     print("W&B connected\n")
     
-    repo_root = Path(__file__).resolve().parents[3]
-    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
-
-    # Prefer sample file on $SCRATCH if available (Euler); fall back to repo path locally
-    candidate_inputs = []
-    if scratch_root is not None:
-        candidate_inputs.append(scratch_root / "data/ml/sample_training_imbalanced.parquet")
-    candidate_inputs.append(repo_root / "data/ml/sample_training_imbalanced.parquet")
-
-    input_path = candidate_inputs[-1]
-    for cand in candidate_inputs:
-        if cand.exists():
-            input_path = cand
-            break
-
     print("=" * 70)
-    print("IMBALANCED SAMPLE TRAINING WDPA TRANSITION PREDICTION")
+    print("RF TRANSITION MODEL (0→1 PREDICTION)")
+    print("=" * 70)
+    print(f"\nInput:  {input_path}")
+    print(f"Output: {output_dir}")
+    
+    # -------------------------------------------------------------------------
+    # Step 1: Load data
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 1: LOAD DATA")
     print("=" * 70)
     
-    print(f"\nLoading data from {input_path} …")
-    df = pd.read_parquet(input_path)
-    print(f"Loaded {len(df):,} rows with {len(df.columns)} columns.")
-
+    # Load training data (2000-2017)
+    df_train = load_data(input_path, TRAIN_YEARS)
+    
+    # Load test data (2018-2024)
+    df_test = load_data(input_path, TEST_YEARS)
+    
+    # Downcast numeric dtypes to reduce memory usage
+    print("\nDowncasting numeric dtypes (float64→float32, int64→int32)...")
+    df_train = downcast_numeric_dtypes(df_train)
+    df_test = downcast_numeric_dtypes(df_test)
+    print("  Downcasting completed")
+    
     target_col = "transition_01"
-    if target_col not in df.columns:
-        raise ValueError(
-            f"Target column '{target_col}' not found in data. "
-            "Ensure preprocessing has been run with the transition logic."
-        )
-
-    print(f"\nUsing '{target_col}' as target variable.")
-
+    
+    # Check target column exists
+    if target_col not in df_train.columns:
+        raise ValueError(f"Target column '{target_col}' not found in training data")
+    if target_col not in df_test.columns:
+        raise ValueError(f"Target column '{target_col}' not found in test data")
+    
     # Drop rows with missing target
-    df_clean = df.dropna(subset=[target_col])
-    dropped = len(df) - len(df_clean)
-    if dropped > 0:
-        print(f"Dropped {dropped:,} rows with missing target.")
-    print(f"Remaining: {len(df_clean):,} rows.")
-
-    if len(df_clean) == 0:
-        raise ValueError("No valid rows remaining after dropping missing targets.")
-
-    # Subsample if dataset is too large (with stratification)
-    if len(df_clean) > MAX_SAMPLE_SIZE:
-        print(
-            f"\nDataset has {len(df_clean):,} rows. "
-            f"Subsampling to {MAX_SAMPLE_SIZE:,} for memory efficiency …"
+    df_train_clean = df_train.dropna(subset=[target_col])
+    dropped_train = len(df_train) - len(df_train_clean)
+    if dropped_train > 0:
+        print(f"\nDropped {dropped_train:,} training rows with missing target")
+    
+    df_test_clean = df_test.dropna(subset=[target_col])
+    dropped_test = len(df_test) - len(df_test_clean)
+    if dropped_test > 0:
+        print(f"Dropped {dropped_test:,} test rows with missing target")
+    
+    print(f"\nTraining set: {len(df_train_clean):,} rows")
+    print(f"Test set:     {len(df_test_clean):,} rows")
+    
+    # Get feature columns
+    feature_cols = get_feature_columns(df_train_clean)
+    excluded_cols = sorted(EXCLUDE_COLS & set(df_train_clean.columns))
+    
+    print(f"\nUsing {len(feature_cols)} features")
+    print(f"Excluded columns ({len(excluded_cols)}): {excluded_cols}")
+    
+    # Target distribution
+    train_pos = (df_train_clean[target_col] > 0).sum()
+    train_neg = (df_train_clean[target_col] == 0).sum()
+    train_pos_pct = train_pos / len(df_train_clean) * 100
+    
+    test_pos = (df_test_clean[target_col] > 0).sum()
+    test_neg = (df_test_clean[target_col] == 0).sum()
+    test_pos_pct = test_pos / len(df_test_clean) * 100
+    
+    print(f"\n" + "-" * 40)
+    print("Training set distribution:")
+    print(f"  No transition (0): {train_neg:>12,}  ({100 - train_pos_pct:.3f}%)")
+    print(f"  Transition (0→1):  {train_pos:>12,}  ({train_pos_pct:.3f}%)")
+    print(f"  Class ratio:       1 : {train_neg / max(train_pos, 1):.1f}")
+    print(f"\nTest set distribution:")
+    print(f"  No transition (0): {test_neg:>12,}  ({100 - test_pos_pct:.3f}%)")
+    print(f"  Transition (0→1):  {test_pos:>12,}  ({test_pos_pct:.3f}%)")
+    print(f"  Class ratio:       1 : {test_neg / max(test_pos, 1):.1f}")
+    print("-" * 40)
+    
+    # -------------------------------------------------------------------------
+    # Optional stratified sampling (before tuning)
+    # -------------------------------------------------------------------------
+    if ENABLE_STRATIFIED_SAMPLING:
+        print("\n" + "=" * 70)
+        print("STRATIFIED SAMPLING (Before Tuning)")
+        print("=" * 70)
+        df_train_clean = stratified_sample_negatives(
+            df_train_clean,
+            target_col,
+            STRATIFIED_NEGATIVE_SAMPLE_SIZE,
+            random_state=RANDOM_STATE
         )
         
-        # Stratified sampling: sample proportionally from each class
-        class_counts = df_clean[target_col].value_counts()
-        class_ratios = class_counts / len(df_clean)
+        # Recalculate statistics after sampling
+        train_pos = (df_train_clean[target_col] > 0).sum()
+        train_neg = (df_train_clean[target_col] == 0).sum()
+        train_pos_pct = train_pos / len(df_train_clean) * 100
         
-        sampled_dfs = []
-        for class_label, ratio in class_ratios.items():
-            n_samples = int(MAX_SAMPLE_SIZE * ratio)
-            class_df = df_clean[df_clean[target_col] == class_label]
-            sampled_class = class_df.sample(
-                n=min(n_samples, len(class_df)),
-                random_state=RANDOM_STATE
-            )
-            sampled_dfs.append(sampled_class)
-        
-        df_clean = pd.concat(sampled_dfs, ignore_index=True)
-        # Shuffle the combined dataframe
-        df_clean = df_clean.sample(frac=1.0, random_state=RANDOM_STATE).reset_index(drop=True)
-        print(f"Subsampled to {len(df_clean):,} rows (stratified by class).")
-
-    y = df_clean[target_col]
-
-    # Select numeric features, excluding identity and leakage columns
-    numeric_cols = df_clean.select_dtypes(include=["number"]).columns.tolist()
-    feature_cols = [
-        col for col in numeric_cols 
-        if col.lower() not in {c.lower() for c in EXCLUDE_COLS}
-    ]
-
-    if not feature_cols:
-        raise ValueError("No valid numeric feature columns available for training.")
-
-    X = df_clean[feature_cols]
-
-    print(f"\nUsing {len(feature_cols)} numeric features.")
-    print(f"Excluded columns: {sorted(EXCLUDE_COLS & set(numeric_cols))}")
+        print(f"\nAfter sampling - Training set distribution:")
+        print(f"  No transition (0): {train_neg:>12,}  ({100 - train_pos_pct:.3f}%)")
+        print(f"  Transition (0→1):  {train_pos:>12,}  ({train_pos_pct:.3f}%)")
+        print(f"  Class ratio:       1 : {train_neg / max(train_pos, 1):.1f}")
+    else:
+        print("\nStratified sampling: DISABLED (set ENABLE_STRATIFIED_SAMPLING=True to enable)")
     
-    # Print target distribution
-    transition_counts = y.value_counts().sort_index()
-    n_negatives = transition_counts.get(0, 0)
-    n_positives = transition_counts.get(1, 0)
-    positive_ratio = n_positives / len(y) * 100
-    
-    print(f"\n" + "=" * 70)
-    print("TARGET DISTRIBUTION (IMBALANCED)")
-    print("=" * 70)
-    print(f"  No transition (0): {n_negatives:>12,}  ({100 - positive_ratio:>5.3f}%)")
-    print(f"  New WDPA (0→1):    {n_positives:>12,}  ({positive_ratio:>5.3f}%)")
-    print(f"  Class ratio:       1 : {n_negatives / max(n_positives, 1):.1f}")
-    
+    # Log data statistics to wandb
     wandb.log({
         "data/n_features": len(feature_cols),
-        "data/n_samples": len(df_clean),
-        "data/n_positives": n_positives,
-        "data/n_negatives": n_negatives,
-        "data/positive_ratio": positive_ratio / 100,
-        "data/class_ratio": n_negatives / max(n_positives, 1),
+        "data/n_train": int(len(df_train_clean)),
+        "data/n_test": int(len(df_test_clean)),
+        "data/train_positives": int(train_pos),
+        "data/train_negatives": int(train_neg),
+        "data/train_positive_pct": float(train_pos_pct),
+        "data/test_positives": int(test_pos),
+        "data/test_negatives": int(test_neg),
+        "data/test_positive_pct": float(test_pos_pct),
     })
-
-    # Train/test split with stratification
-    print(f"\n" + "=" * 70)
-    print("TRAIN/TEST SPLIT")
-    print("=" * 70)
-    print(
-        f"Splitting into train/test "
-        f"({int((1-TEST_SIZE)*100)}/{int(TEST_SIZE*100)}) with stratification …"
-    )
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=TEST_SIZE,
-        stratify=y,
-        random_state=RANDOM_STATE,
-    )
     
-    # Print training set statistics
-    train_transition_counts = y_train.value_counts().sort_index()
-    train_pos = train_transition_counts.get(1, 0)
-    train_neg = train_transition_counts.get(0, 0)
-    print(f"Training set: {len(X_train):,} samples")
-    print(f"  No transition (0): {train_neg:,}")
-    print(f"  New WDPA (0→1):    {train_pos:,}")
-    
-    test_transition_counts = y_test.value_counts().sort_index()
-    test_pos = test_transition_counts.get(1, 0)
-    test_neg = test_transition_counts.get(0, 0)
-    print(f"\nTest set: {len(X_test):,} samples")
-    print(f"  No transition (0): {test_neg:,}")
-    print(f"  New WDPA (0→1):    {test_pos:,}")
-
-    # Train Random Forest with balanced class weights
-    print(f"\n" + "=" * 70)
-    print("MODEL TRAINING")
-    print("=" * 70)
-    print(f"Training RandomForestClassifier with {N_ESTIMATORS} trees …")
-    print(f"Using class_weight='balanced' to handle imbalanced data …")
-    
-    rf = RandomForestClassifier(
-        n_estimators=N_ESTIMATORS,
-        random_state=RANDOM_STATE,
-        n_jobs=-1,
-        class_weight='balanced',  # Important for imbalanced data
-        verbose=1,
-        max_depth=20,  # Prevent overfitting
-        min_samples_split=100,  # Prevent overfitting
-        min_samples_leaf=50,    # Prevent overfitting
-    )
-    rf.fit(X_train, y_train)
-    print("Training complete.")
-
-    # Predict probabilities and classes
+    # -------------------------------------------------------------------------
+    # Step 2: Prepare features and target
+    # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("EVALUATION ON TEST SET")
+    print("STEP 2: PREPARE FEATURES AND TARGET")
     print("=" * 70)
-    print("Computing predictions …")
-    y_pred = rf.predict(X_test)
-    y_proba = rf.predict_proba(X_test)[:, 1]  # Probability of positive class
-
+    
+    # Training set
+    y_train = (df_train_clean[target_col] > 0).astype(np.int8)
+    X_train = df_train_clean[feature_cols]
+    groups_train = df_train_clean['year'].values
+    
+    # Test set
+    y_test = (df_test_clean[target_col] > 0).astype(np.int8)
+    X_test = df_test_clean[feature_cols]
+    
+    print(f"Training feature matrix shape: {X_train.shape}")
+    print(f"Training target shape: {y_train.shape}")
+    print(f"Test feature matrix shape: {X_test.shape}")
+    print(f"Test target shape: {y_test.shape}")
+    
+    # Check for missing values
+    missing_train = X_train.isnull().sum()
+    cols_with_missing = missing_train[missing_train > 0]
+    if len(cols_with_missing) > 0:
+        print(f"\nWarning: {len(cols_with_missing)} columns have missing values in training set")
+        print("  Top 5:")
+        for col, count in cols_with_missing.head().items():
+            print(f"    {col}: {count:,} ({count/len(X_train)*100:.2f}%)")
+    
+    # -------------------------------------------------------------------------
+    # Step 3: Hyperparameter tuning with GroupKFold
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 3: HYPERPARAMETER TUNING WITH GROUPKFOLD")
+    print("=" * 70)
+    
+    print(f"\nUsing GroupKFold with {N_SPLITS} splits (grouped by year)")
+    
+    # Calculate number of parameter combinations (for reference)
+    n_combinations = 1
+    for values in PARAM_GRID.values():
+        n_combinations *= len(values)
+    print(f"Total possible combinations: {n_combinations}")
+    print(f"Randomized search will sample 50 combinations")
+    
+    # Create Pipeline with imputer and Random Forest
+    rf_model = RandomForestClassifier(**FIXED_PARAMS)
+    pipeline = Pipeline([
+        ('imputer', SimpleImputer(strategy='median')),
+        ('rf', rf_model)
+    ])
+    
+    # Create GroupKFold
+    group_kfold = GroupKFold(n_splits=N_SPLITS)
+    
+    print("\nParameter grid:")
+    for param, values in PARAM_GRID.items():
+        print(f"  {param}: {values}")
+    
+    print("\nFixed parameters:")
+    for param, value in FIXED_PARAMS.items():
+        print(f"  {param}: {value}")
+    
+    print("\nPipeline: SimpleImputer(strategy='median') → RandomForestClassifier")
+    
+    # Randomized search
+    print(f"\nStarting randomized search (n_iter=50)...")
+    print(f"This may take a while...\n")
+    
+    grid_search = RandomizedSearchCV(
+        estimator=pipeline,
+        param_distributions=PARAM_GRID,
+        n_iter=50,
+        cv=group_kfold,
+        scoring='average_precision',  # PR-AUC (better for imbalanced data)
+        n_jobs=int(os.environ.get("SLURM_CPUS_PER_TASK", 1)),
+        verbose=2,
+        return_train_score=True,
+        random_state=RANDOM_STATE,
+    )
+    
+    tune_start = time.time()
+    grid_search.fit(X_train, y_train, groups=groups_train)
+    tune_time = time.time() - tune_start
+    
+    print(f"\nRandomized search completed in {tune_time:.1f}s ({tune_time/60:.1f} min)")
+    print(f"\nBest parameters:")
+    for param, value in grid_search.best_params_.items():
+        print(f"  {param}: {value}")
+    print(f"\nBest CV score (PR-AUC): {grid_search.best_score_:.4f}")
+    
+    # Log tuning results
+    wandb.log({
+        "tuning/best_cv_score": float(grid_search.best_score_),
+        "tuning/best_params": grid_search.best_params_,
+        "tuning/n_iter": 50,
+        "tuning/total_combinations": n_combinations,
+        "tuning/time_seconds": tune_time,
+    })
+    
+    # -------------------------------------------------------------------------
+    # Step 4: Train final model with best parameters
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 4: TRAIN FINAL MODEL WITH BEST PARAMETERS")
+    print("=" * 70)
+    
+    # Use the best estimator from grid search (Pipeline with imputer + tuned RF)
+    final_model = grid_search.best_estimator_
+    
+    print(f"\nRetraining Pipeline (imputer + Random Forest) with best parameters...")
+    print(f"  Training on {len(X_train):,} samples")
+    print(f"  This may take several minutes...\n")
+    
+    train_start = time.time()
+    final_model.fit(X_train, y_train)
+    train_time = time.time() - train_start
+    
+    print(f"\nTraining completed in {train_time:.1f}s ({train_time/60:.1f} min)")
+    
+    # Save best parameters and score before deleting grid_search
+    best_params = grid_search.best_params_
+    best_cv_score = grid_search.best_score_
+    
+    # Save model
+    model_path = model_dir / f"model1_rf_{timestamp}.pkl"
+    with open(model_path, 'wb') as f:
+        pickle.dump(final_model, f)
+    print(f"\nModel saved to: {model_path}")
+    
+    # Log training time
+    wandb.log({
+        "training/time_seconds": train_time,
+        "training/time_minutes": train_time / 60,
+    })
+    
+    # Free memory (keep grid_search for later use)
+    del df_train, df_train_clean
+    gc.collect()
+    
+    # -------------------------------------------------------------------------
+    # Step 5: Evaluate on test set
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 5: EVALUATE ON TEST SET (2018-2024)")
+    print("=" * 70)
+    
+    print("\nComputing predictions...")
+    pred_start = time.time()
+    y_pred = final_model.predict(X_test)
+    y_proba = final_model.predict_proba(X_test)[:, 1]
+    pred_time = time.time() - pred_start
+    print(f"  Predicted {len(y_test):,} samples in {pred_time:.1f}s")
+    
     # Classification report
-    print("\n" + "=" * 70)
-    print("CLASSIFICATION REPORT")
-    print("=" * 70)
+    print("\n" + "-" * 40)
+    print("Classification Report:")
+    print("-" * 40)
     print(classification_report(y_test, y_pred, digits=4))
-
+    
     # Confusion matrix
     cm = confusion_matrix(y_test, y_pred)
     tn, fp, fn, tp = cm.ravel()
     
-    print("\n" + "=" * 70)
-    print("CONFUSION MATRIX")
-    print("=" * 70)
-    print(f"                 Predicted Negative    Predicted Positive")
-    print(f"Actual Negative  {tn:>18,}    {fp:>18,}")
-    print(f"Actual Positive  {fn:>18,}    {tp:>18,}")
-    print(f"\nTrue Negatives:  {tn:,}")
-    print(f"False Positives: {fp:,}")
-    print(f"False Negatives: {fn:,}")
-    print(f"True Positives:  {tp:,}")
-
-    # ROC-AUC and PR-AUC
-    print("\n" + "=" * 70)
-    print("AREA UNDER CURVE METRICS")
-    print("=" * 70)
+    print("\n" + "-" * 40)
+    print("Confusion Matrix:")
+    print("-" * 40)
+    print(f"                 Predicted 0    Predicted 1")
+    print(f"Actual 0  {tn:>15,}  {fp:>14,}")
+    print(f"Actual 1  {fn:>15,}  {tp:>14,}")
     
+    # AUC metrics
     roc_auc = roc_auc_score(y_test, y_proba)
     pr_auc = average_precision_score(y_test, y_proba)
     
-    print(f"ROC-AUC:  {roc_auc:.4f}")
-    print(f"PR-AUC:   {pr_auc:.4f}")
+    print(f"\n" + "-" * 40)
+    print("Area Under Curve Metrics:")
+    print("-" * 40)
+    print(f"ROC-AUC: {roc_auc:.4f}")
+    print(f"PR-AUC:  {pr_auc:.4f}")
     
     # Precision at top k%
-    print("\n" + "=" * 70)
-    print("PRECISION @ TOP-K PREDICTIONS")
-    print("=" * 70)
+    print(f"\n" + "-" * 40)
+    print("Precision @ Top-K Predictions:")
+    print("-" * 40)
     print("(Precision among highest-confidence predictions)")
     print()
     
+    prec_at_k = {}
     for k in [1, 5, 10]:
-        prec_at_k = compute_precision_at_k(y_test.values, y_proba, k)
+        prec = compute_precision_at_k(y_test.values, y_proba, k)
+        prec_at_k[k] = prec
         n_top_k = max(1, int(len(y_test) * k / 100))
-        expected_positives = int(n_top_k * prec_at_k)
-        print(f"Precision @ top {k:>2}%:  {prec_at_k:>7.4f}  "
-              f"({expected_positives:>6,} positives in top {n_top_k:>7,} predictions)")
+        n_protected_in_top_k = int(n_top_k * prec)
+        print(f"  Precision @ top {k:>2}%:  {prec:.4f}  "
+              f"({n_protected_in_top_k:>7,} transitions in top {n_top_k:>9,})")
     
-    # Baseline precision (random ranking)
-    baseline_precision = test_pos / len(y_test)
-    print(f"\nBaseline (random): {baseline_precision:>7.4f}  "
-          f"(overall positive rate in test set)")
-
-    # Feature importance
-    print("\n" + "=" * 70)
-    print("TOP 20 MOST IMPORTANT FEATURES")
-    print("=" * 70)
-    feature_importance = pd.DataFrame(
-        {"feature": feature_cols, "importance": rf.feature_importances_}
-    ).sort_values("importance", ascending=False)
-
+    # Baseline (random)
+    baseline_rate = y_test.mean()
+    print(f"\n  Baseline (random):    {baseline_rate:.4f}  "
+          f"(overall transition rate in test set)")
+    
+    # Lift over baseline
+    print("\nLift over baseline:")
+    for k, prec in prec_at_k.items():
+        lift = prec / baseline_rate if baseline_rate > 0 else 0
+        print(f"  Top {k:>2}%: {lift:.2f}x")
+    
+    # Log test metrics
+    wandb.log({
+        "test/roc_auc": float(roc_auc),
+        "test/pr_auc": float(pr_auc),
+        "test/true_negatives": int(tn),
+        "test/false_positives": int(fp),
+        "test/false_negatives": int(fn),
+        "test/true_positives": int(tp),
+        "test/accuracy": float((tp + tn) / (tp + tn + fp + fn)),
+        "test/precision": float(tp / (tp + fp)) if (tp + fp) > 0 else 0,
+        "test/recall": float(tp / (tp + fn)) if (tp + fn) > 0 else 0,
+        "test/f1": float(2 * tp / (2 * tp + fp + fn)) if (2 * tp + fp + fn) > 0 else 0,
+        "test/precision_at_1pct": float(prec_at_k[1]),
+        "test/precision_at_5pct": float(prec_at_k[5]),
+        "test/precision_at_10pct": float(prec_at_k[10]),
+        "test/baseline_rate": float(baseline_rate),
+        "test/lift_at_1pct": float(prec_at_k[1] / baseline_rate) if baseline_rate > 0 else 0,
+        "test/lift_at_5pct": float(prec_at_k[5] / baseline_rate) if baseline_rate > 0 else 0,
+        "test/lift_at_10pct": float(prec_at_k[10] / baseline_rate) if baseline_rate > 0 else 0,
+    })
+    
+    # Feature importance (extract from the RF step in the pipeline)
+    print("\n" + "-" * 40)
+    print("Top 20 Most Important Features:")
+    print("-" * 40)
+    rf_model = final_model.named_steps['rf']
+    feature_importance = pd.DataFrame({
+        'feature': feature_cols,
+        'importance': rf_model.feature_importances_
+    }).sort_values('importance', ascending=False)
     print(feature_importance.head(20).to_string(index=False))
     
+    # -------------------------------------------------------------------------
+    # Step 6: Save predictions and metrics
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 6: SAVE PREDICTIONS AND METRICS")
+    print("=" * 70)
+    
+    # Create predictions dataframe
+    predictions_df = pd.DataFrame({
+        'row': df_test_clean['row'].values,
+        'col': df_test_clean['col'].values,
+        'year': df_test_clean['year'].values,
+        'x': df_test_clean['x'].values if 'x' in df_test_clean.columns else np.nan,
+        'y': df_test_clean['y'].values if 'y' in df_test_clean.columns else np.nan,
+        'true_label': y_test.values,
+        'predicted_label': y_pred,
+        'predicted_proba': y_proba,
+    })
+    
+    # Save predictions
+    predictions_path = output_dir / f"model1_rf_predictions_{timestamp}.parquet"
+    predictions_df.to_parquet(predictions_path, index=False)
+    print(f"\nPredictions saved to: {predictions_path}")
+    
+    # Compile metrics
+    metrics = {
+        "metadata": {
+            "timestamp": timestamp,
+            "model": "RandomForest",
+            "task": "transition_01_prediction",
+            "random_state": RANDOM_STATE,
+            "train_years": f"{TRAIN_YEARS.start}-{TRAIN_YEARS.stop-1}",
+            "test_years": f"{TEST_YEARS.start}-{TEST_YEARS.stop-1}",
+            "n_features": len(feature_cols),
+            "features": feature_cols,
+        },
+        "data": {
+            "n_train": int(len(X_train)),
+            "n_test": int(len(X_test)),
+            "train_positives": int(train_pos),
+            "train_negatives": int(train_neg),
+            "test_positives": int(test_pos),
+            "test_negatives": int(test_neg),
+        },
+        "hyperparameter_tuning": {
+            "method": "RandomizedSearchCV",
+            "n_iter": 50,
+            "cv_strategy": f"GroupKFold(n_splits={N_SPLITS})",
+            "scoring": "average_precision",
+            "best_cv_score": float(best_cv_score),
+            "best_params": best_params,
+            "tuning_time_seconds": tune_time,
+        },
+        "model_parameters": {
+            **FIXED_PARAMS,
+            **{k.replace('rf__', ''): v for k, v in best_params.items()}
+        },
+        "test_performance": {
+            "roc_auc": float(roc_auc),
+            "pr_auc": float(pr_auc),
+            "confusion_matrix": {
+                "tn": int(tn),
+                "fp": int(fp),
+                "fn": int(fn),
+                "tp": int(tp),
+            },
+            "accuracy": float((tp + tn) / (tp + tn + fp + fn)),
+            "precision": float(tp / (tp + fp)) if (tp + fp) > 0 else 0,
+            "recall": float(tp / (tp + fn)) if (tp + fn) > 0 else 0,
+            "f1": float(2 * tp / (2 * tp + fp + fn)) if (2 * tp + fp + fn) > 0 else 0,
+            "precision_at_1pct": float(prec_at_k[1]),
+            "precision_at_5pct": float(prec_at_k[5]),
+            "precision_at_10pct": float(prec_at_k[10]),
+            "baseline_rate": float(baseline_rate),
+            "lift_at_1pct": float(prec_at_k[1] / baseline_rate) if baseline_rate > 0 else 0,
+            "lift_at_5pct": float(prec_at_k[5] / baseline_rate) if baseline_rate > 0 else 0,
+            "lift_at_10pct": float(prec_at_k[10] / baseline_rate) if baseline_rate > 0 else 0,
+        },
+        "feature_importance": feature_importance.head(20).to_dict('records'),
+        "timing": {
+            "tuning_seconds": tune_time,
+            "training_seconds": train_time,
+            "prediction_seconds": pred_time,
+            "total_seconds": time.time() - start_time,
+        },
+    }
+    
+    # Convert NumPy types to native Python types
+    metrics = convert_numpy_types(metrics)
+    
+    # Save metrics
+    metrics_path = output_dir / f"model1_rf_metrics_{timestamp}.json"
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+    print(f"Metrics saved to: {metrics_path}")
+    
+    # -------------------------------------------------------------------------
     # Summary
-    prec_at_1 = compute_precision_at_k(y_test.values, y_proba, 1)
-    prec_at_5 = compute_precision_at_k(y_test.values, y_proba, 5)
-    prec_at_10 = compute_precision_at_k(y_test.values, y_proba, 10)
+    # -------------------------------------------------------------------------
+    total_time = time.time() - start_time
     
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    print(f"Model:                RandomForest ({N_ESTIMATORS} trees, balanced weights)")
-    print(f"Test samples:         {len(y_test):,}")
-    print(f"Positive rate:        {positive_ratio:.3f}%")
-    print(f"ROC-AUC:              {roc_auc:.4f}")
-    print(f"PR-AUC:               {pr_auc:.4f}")
-    print(f"Precision @ top 1%:   {prec_at_1:.4f}")
-    print(f"Precision @ top 5%:   {prec_at_5:.4f}")
-    print(f"Precision @ top 10%:  {prec_at_10:.4f}")
+    print(f"Model:                       Random Forest (Pipeline: imputer + RF)")
+    print(f"Best parameters:             {best_params}")
+    print(f"Features used:               {len(feature_cols)}")
+    print(f"\nTest Set Performance (2018-2024):")
+    print(f"  Samples:                   {len(y_test):,}")
+    print(f"  Positive rate:             {test_pos_pct:.3f}%")
+    print(f"  ROC-AUC:                   {roc_auc:.4f}")
+    print(f"  PR-AUC:                    {pr_auc:.4f}")
+    print(f"  Precision @ top 1%:        {prec_at_k[1]:.4f} ({prec_at_k[1]/baseline_rate:.1f}x lift)")
+    print(f"  Precision @ top 5%:        {prec_at_k[5]:.4f} ({prec_at_k[5]/baseline_rate:.1f}x lift)")
+    print(f"  Precision @ top 10%:       {prec_at_k[10]:.4f} ({prec_at_k[10]/baseline_rate:.1f}x lift)")
+    print(f"\nTimings:")
+    print(f"  Hyperparameter tuning:     {tune_time:.1f}s ({tune_time/60:.1f} min)")
+    print(f"  Final model training:      {train_time:.1f}s ({train_time/60:.1f} min)")
+    print(f"  Total time:                {total_time:.1f}s ({total_time/60:.1f} min)")
     print("=" * 70)
+    print("Done.")
     
-    # Log to W&B
-    total_time = time.time() - start_time
-    
+    # Log final summary
     wandb.log({
-        "metrics/true_negatives": int(tn),
-        "metrics/false_positives": int(fp),
-        "metrics/false_negatives": int(fn),
-        "metrics/true_positives": int(tp),
-        "metrics/accuracy": (tp + tn) / (tp + tn + fp + fn),
-        "metrics/precision": tp / (tp + fp) if (tp + fp) > 0 else 0,
-        "metrics/recall": tp / (tp + fn) if (tp + fn) > 0 else 0,
-        "metrics/f1": 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0,
-        "metrics/roc_auc": roc_auc,
-        "metrics/pr_auc": pr_auc,
-        "metrics/precision_at_1": prec_at_1,
-        "metrics/precision_at_5": prec_at_5,
-        "metrics/precision_at_10": prec_at_10,
-        "timing/total_seconds": total_time,
-        "timing/total_minutes": total_time / 60,
+        "summary/total_time_seconds": total_time,
+        "summary/total_time_minutes": total_time / 60,
         "status": "success"
     })
-    
-    print(f"\nTotal time: {total_time:.1f}s ({total_time/60:.1f} min)")
-    print("All done.")
     
     wandb.finish()
 
@@ -398,11 +823,11 @@ def main() -> None:
 if __name__ == "__main__":
     # Set up output file capture
     repo_root = Path(__file__).resolve().parents[3]
-    output_dir = repo_root / "outputs/results/ml_baselines"
+    output_dir = repo_root / "outputs/Results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"train_sample_imbalanced_{timestamp}.txt"
+    output_file = output_dir / f"model1_rf_{timestamp}.txt"
     
     tee = Tee(output_file)
     sys.stdout = tee
@@ -413,4 +838,3 @@ if __name__ == "__main__":
         sys.stdout = tee.stdout
         tee.close()
         print(f"\nOutput saved to: {output_file}")
-

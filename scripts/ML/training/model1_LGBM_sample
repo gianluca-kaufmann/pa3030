@@ -1,0 +1,534 @@
+#!/usr/bin/env python3
+
+"""LGBM Transition Model - Stratified Sample (0→1 Prediction)
+
+Purpose: Train a LightGBM model to predict transitions to protected areas (0→1).
+         Uses a stratified sample of 10M rows from training years (2000-2017) 
+         with GroupKFold cross-validation for hyperparameter tuning.
+         Only performs tuning, does not train final model.
+
+Input:   `merged_panel_final.parquet`
+Output:  - Best parameters and CV score (.json)
+"""
+
+from __future__ import annotations
+
+import gc
+import json
+import os
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Dict, Any
+
+import numpy as np
+import pandas as pd
+from lightgbm import LGBMClassifier
+from sklearn.model_selection import GroupKFold, GridSearchCV
+
+
+class Tee:
+    """Write to both stdout and a file."""
+    def __init__(self, file_path: Path):
+        self.file = open(file_path, 'w', encoding='utf-8')
+        self.stdout = sys.stdout
+    
+    def write(self, text: str) -> None:
+        self.stdout.write(text)
+        self.file.write(text)
+        self.file.flush()
+    
+    def flush(self) -> None:
+        self.stdout.flush()
+        self.file.flush()
+    
+    def close(self) -> None:
+        self.file.close()
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+RANDOM_STATE = 42
+
+# Temporal split - only training years
+TRAIN_YEARS = range(2000, 2018)  # 2000-2017
+
+# Sample size
+SAMPLE_SIZE = 10_000_000  # 10 million rows
+
+# Columns to exclude from features
+EXCLUDE_COLS = {
+    'transition_01',  # Target variable
+    'WDPA_b1',        # Leakage
+    'WDPA_prev',      # Leakage
+    'x',              # Coordinate
+    'y',              # Coordinate
+    'row',            # Identifier
+    'col',            # Identifier
+    'year',           # Temporal identifier
+}
+
+# GroupKFold configuration
+N_SPLITS = 5
+
+# Hyperparameter search space (kept compact to limit combinations)
+PARAM_GRID = {
+    'n_estimators': [200, 500],
+    'learning_rate': [0.05, 0.1],
+    'num_leaves': [31, 63],
+    'max_depth': [-1, 10, 20],
+    'min_child_samples': [20, 100],
+    'subsample': [0.7, 1.0],
+    'colsample_bytree': [0.7, 1.0],
+}
+
+# Fixed parameters
+FIXED_PARAMS = {
+    'random_state': RANDOM_STATE,
+    'n_jobs': -1,
+    'boosting_type': 'gbdt',
+    'objective': 'binary',
+    'class_weight': 'balanced',
+    'verbose': -1,
+}
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def convert_numpy_types(obj: Any) -> Any:
+    """Recursively convert NumPy types to native Python types for JSON serialization."""
+    if isinstance(obj, (np.integer, np.int_, np.intc, np.intp, np.int8,
+                        np.int16, np.int32, np.int64, np.uint8, np.uint16,
+                        np.uint32, np.uint64)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float_, np.float16, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_numpy_types(item) for item in obj]
+    elif obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    else:
+        try:
+            if hasattr(obj, 'item'):
+                return obj.item()
+            else:
+                return obj
+        except (ValueError, TypeError, AttributeError):
+            return str(obj)
+
+
+def load_data(parquet_path: Path, years: range, columns: Optional[list] = None) -> pd.DataFrame:
+    """Load data for specified years from parquet file efficiently."""
+    print(f"Loading data for years {years.start}-{years.stop-1} from {parquet_path} ...")
+    
+    # Read parquet file with filter
+    filters = [('year', '>=', years.start), ('year', '<=', years.stop - 1)]
+    load_start = time.time()
+    df = pd.read_parquet(parquet_path, filters=filters, columns=columns)
+    load_time = time.time() - load_start
+    
+    print(f"  Loaded {len(df):,} rows in {load_time:.1f}s")
+    print(f"  Years: {sorted(df['year'].unique())}")
+    return df
+
+
+def stratified_sample(df: pd.DataFrame, n_samples: int, stratify_cols: list, random_state: int = 42) -> pd.DataFrame:
+    """
+    Draw a stratified sample preserving the distribution of specified columns.
+    
+    Args:
+        df: DataFrame to sample from
+        n_samples: Number of samples to draw
+        stratify_cols: List of column names to preserve distribution for
+        random_state: Random seed
+    
+    Returns:
+        Sampled DataFrame
+    """
+    print(f"\nDrawing stratified sample of {n_samples:,} rows...")
+    print(f"  Preserving distribution of: {', '.join(stratify_cols)}")
+    
+    if len(df) <= n_samples:
+        print(f"  Dataset has {len(df):,} rows <= {n_samples:,}, returning full dataset")
+        return df.copy()
+    
+    # Create stratification key
+    df = df.copy()
+    df['_stratify_key'] = df[stratify_cols].apply(lambda x: '_'.join(x.astype(str)), axis=1)
+    
+    # Get counts per stratum
+    stratum_counts = df['_stratify_key'].value_counts()
+    n_strata = len(stratum_counts)
+    print(f"  Found {n_strata} unique strata")
+    
+    # Calculate sampling fraction
+    total_rows = len(df)
+    sampling_fraction = n_samples / total_rows
+    
+    # Sample proportionally from each stratum
+    sampled_dfs = []
+    for stratum_key, stratum_size in stratum_counts.items():
+        stratum_df = df[df['_stratify_key'] == stratum_key]
+        n_sample_stratum = max(1, int(stratum_size * sampling_fraction))
+        
+        # If stratum is smaller than needed sample, take all
+        if n_sample_stratum >= len(stratum_df):
+            sampled_dfs.append(stratum_df)
+        else:
+            sampled_dfs.append(
+                stratum_df.sample(n=n_sample_stratum, random_state=random_state)
+            )
+    
+    # Combine and check if we need to adjust
+    sampled_df = pd.concat(sampled_dfs, ignore_index=True)
+    
+    # If we got more than needed, randomly sample down
+    if len(sampled_df) > n_samples:
+        sampled_df = sampled_df.sample(n=n_samples, random_state=random_state).reset_index(drop=True)
+    # If we got less than needed (shouldn't happen with proportional sampling), 
+    # we'll accept it but warn
+    elif len(sampled_df) < n_samples:
+        print(f"  Warning: Only sampled {len(sampled_df):,} rows (requested {n_samples:,})")
+    
+    # Drop temporary column
+    sampled_df = sampled_df.drop(columns=['_stratify_key'])
+    
+    print(f"  Sampled {len(sampled_df):,} rows")
+    
+    # Verify distribution preservation
+    print(f"\n  Verifying distribution preservation:")
+    for col in stratify_cols:
+        original_dist = df[col].value_counts(normalize=True).sort_index()
+        sampled_dist = sampled_df[col].value_counts(normalize=True).sort_index()
+        
+        # Calculate max difference
+        common_keys = set(original_dist.index) & set(sampled_dist.index)
+        if common_keys:
+            max_diff = max(abs(original_dist[k] - sampled_dist.get(k, 0)) for k in common_keys)
+            print(f"    {col}: max distribution difference = {max_diff:.4f}")
+    
+    return sampled_df
+
+
+def get_feature_columns(df: pd.DataFrame) -> list:
+    """Get valid feature columns, excluding identifiers and leakage columns."""
+    numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+    feature_cols = [
+        col for col in numeric_cols
+        if col.lower() not in {c.lower() for c in EXCLUDE_COLS}
+    ]
+    return feature_cols
+
+
+# =============================================================================
+# Main Pipeline
+# =============================================================================
+
+def main() -> None:
+    start_time = time.time()
+    
+    # -------------------------------------------------------------------------
+    # Setup paths
+    # -------------------------------------------------------------------------
+    repo_root = Path(__file__).resolve().parents[3]
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+    
+    # Input path (prefer SCRATCH on Euler; check multiple possible locations)
+    candidate_inputs = []
+    if scratch_root is not None and scratch_root.exists():
+        # Euler cluster: Check common locations
+        candidate_inputs.append(scratch_root / "outputs/Results/merged_panel_final.parquet")
+        candidate_inputs.append(scratch_root / "data/ml/merged_panel_final.parquet")
+    # Local fallback
+    candidate_inputs.append(repo_root / "data/ml/merged_panel_final.parquet")
+    
+    input_path = None
+    for cand in candidate_inputs:
+        if cand.exists():
+            input_path = cand
+            break
+    
+    if input_path is None:
+        error_msg = (
+            "Could not find merged_panel_final.parquet in any expected location.\n"
+            f"Checked:\n"
+        )
+        for cand in candidate_inputs:
+            error_msg += f"  - {cand}\n"
+        raise FileNotFoundError(error_msg)
+    
+    # Output directories
+    output_dir = repo_root / "outputs/Results/ml_models"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    print("=" * 70)
+    print("LGBM TRANSITION MODEL - STRATIFIED SAMPLE (0→1 PREDICTION)")
+    print("=" * 70)
+    print(f"\nInput:  {input_path}")
+    print(f"Output: {output_dir}")
+    
+    # -------------------------------------------------------------------------
+    # Step 1: Load data
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 1: LOAD DATA")
+    print("=" * 70)
+    
+    # Load training data (2000-2017) only
+    df_train = load_data(input_path, TRAIN_YEARS)
+    
+    target_col = "transition_01"
+    
+    # Check target column exists
+    if target_col not in df_train.columns:
+        raise ValueError(f"Target column '{target_col}' not found in training data")
+    
+    # Drop rows with missing target
+    df_train_clean = df_train.dropna(subset=[target_col])
+    dropped_train = len(df_train) - len(df_train_clean)
+    if dropped_train > 0:
+        print(f"\nDropped {dropped_train:,} training rows with missing target")
+    
+    print(f"\nTraining set: {len(df_train_clean):,} rows")
+    
+    # Get feature columns
+    feature_cols = get_feature_columns(df_train_clean)
+    excluded_cols = sorted(EXCLUDE_COLS & set(df_train_clean.columns))
+    
+    print(f"\nUsing {len(feature_cols)} features")
+    print(f"Excluded columns ({len(excluded_cols)}): {excluded_cols}")
+    
+    # Target distribution
+    train_pos = (df_train_clean[target_col] > 0).sum()
+    train_neg = (df_train_clean[target_col] == 0).sum()
+    train_pos_pct = train_pos / len(df_train_clean) * 100
+    
+    print(f"\n" + "-" * 40)
+    print("Training set distribution (before sampling):")
+    print(f"  No transition (0): {train_neg:>12,}  ({100 - train_pos_pct:.3f}%)")
+    print(f"  Transition (0→1):  {train_pos:>12,}  ({train_pos_pct:.3f}%)")
+    print(f"  Class ratio:       1 : {train_neg / max(train_pos, 1):.1f}")
+    print("-" * 40)
+    
+    # -------------------------------------------------------------------------
+    # Step 2: Stratified sampling
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 2: STRATIFIED SAMPLING")
+    print("=" * 70)
+    
+    # Create binary target for stratification
+    df_train_clean['transition_01_binary'] = (df_train_clean[target_col] > 0).astype(int)
+    
+    # Draw stratified sample preserving year and transition_01 distribution
+    df_sample = stratified_sample(
+        df_train_clean,
+        n_samples=SAMPLE_SIZE,
+        stratify_cols=['year', 'transition_01_binary'],
+        random_state=RANDOM_STATE
+    )
+    
+    # Drop temporary binary column
+    df_sample = df_sample.drop(columns=['transition_01_binary'])
+    
+    # Show sample distribution
+    sample_pos = (df_sample[target_col] > 0).sum()
+    sample_neg = (df_sample[target_col] == 0).sum()
+    sample_pos_pct = sample_pos / len(df_sample) * 100
+    
+    # Calculate class ratio and add scale_pos_weight to parameter grid
+    ratio = sample_neg / max(sample_pos, 1)
+    PARAM_GRID['scale_pos_weight'] = [0.5 * ratio, ratio, 2 * ratio]
+    
+    print(f"\n" + "-" * 40)
+    print("Sampled set distribution:")
+    print(f"  No transition (0): {sample_neg:>12,}  ({100 - sample_pos_pct:.3f}%)")
+    print(f"  Transition (0→1):  {sample_pos:>12,}  ({sample_pos_pct:.3f}%)")
+    print(f"  Class ratio:       1 : {sample_neg / max(sample_pos, 1):.1f}")
+    print("-" * 40)
+    
+    # Free memory
+    del df_train, df_train_clean
+    gc.collect()
+    
+    # -------------------------------------------------------------------------
+    # Step 3: Prepare features and target
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 3: PREPARE FEATURES AND TARGET")
+    print("=" * 70)
+    
+    # Prepare target and features
+    y_sample = (df_sample[target_col] > 0).astype(np.int8)
+    X_sample = df_sample[feature_cols]
+    groups_sample = df_sample['year'].values
+    
+    print(f"Feature matrix shape: {X_sample.shape}")
+    print(f"Target shape: {y_sample.shape}")
+    
+    # Check for missing values
+    missing_sample = X_sample.isnull().sum()
+    cols_with_missing = missing_sample[missing_sample > 0]
+    if len(cols_with_missing) > 0:
+        print(f"\nWarning: {len(cols_with_missing)} columns have missing values")
+        print("  Top 5:")
+        for col, count in cols_with_missing.head().items():
+            print(f"    {col}: {count:,} ({count/len(X_sample)*100:.2f}%)")
+    
+    # -------------------------------------------------------------------------
+    # Step 4: Hyperparameter tuning with GroupKFold
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 4: HYPERPARAMETER TUNING WITH GROUPKFOLD")
+    print("=" * 70)
+    
+    print(f"\nUsing GroupKFold with {N_SPLITS} splits (grouped by year)")
+    
+    # Calculate number of parameter combinations
+    n_combinations = 1
+    for values in PARAM_GRID.values():
+        n_combinations *= len(values)
+    print(f"Searching over {n_combinations} hyperparameter combinations")
+    
+    # Create base model
+    base_model = LGBMClassifier(**FIXED_PARAMS)
+    
+    # Create GroupKFold
+    group_kfold = GroupKFold(n_splits=N_SPLITS)
+    
+    print("\nParameter grid:")
+    for param, values in PARAM_GRID.items():
+        print(f"  {param}: {values}")
+    
+    print("\nFixed parameters:")
+    for param, value in FIXED_PARAMS.items():
+        print(f"  {param}: {value}")
+    
+    # Grid search
+    print(f"\nStarting grid search...")
+    print(f"This may take a while...\n")
+    
+    grid_search = GridSearchCV(
+        estimator=base_model,
+        param_grid=PARAM_GRID,
+        cv=group_kfold,
+        scoring='average_precision',  # PR-AUC (better for imbalanced data)
+        n_jobs=-1,
+        verbose=2,
+        return_train_score=True,
+    )
+    
+    tune_start = time.time()
+    grid_search.fit(X_sample, y_sample, groups=groups_sample)
+    tune_time = time.time() - tune_start
+    
+    print(f"\nGrid search completed in {tune_time:.1f}s ({tune_time/60:.1f} min)")
+    
+    # Extract best CV score and params
+    best_cv_score = float(grid_search.best_score_)
+    best_cv_params = grid_search.best_params_.copy()
+    
+    # -------------------------------------------------------------------------
+    # Step 5: Save results
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 5: SAVE RESULTS")
+    print("=" * 70)
+    
+    # Print results clearly
+    print("\n" + "=" * 70)
+    print("HYPERPARAMETER TUNING RESULTS")
+    print("=" * 70)
+    print(f"\nBest CV Score (PR-AUC): {best_cv_score:.6f}")
+    print(f"\nBest Parameters:")
+    for param, value in sorted(best_cv_params.items()):
+        print(f"  {param:25s}: {value}")
+    print("=" * 70)
+    
+    # Prepare results dictionary
+    results = {
+        "metadata": {
+            "timestamp": timestamp,
+            "model": "LightGBM",
+            "task": "transition_01_prediction",
+            "random_state": RANDOM_STATE,
+            "train_years": f"{TRAIN_YEARS.start}-{TRAIN_YEARS.stop-1}",
+            "sample_size": SAMPLE_SIZE,
+            "n_features": len(feature_cols),
+        },
+        "hyperparameter_tuning": {
+            "method": "GridSearchCV",
+            "cv_strategy": f"GroupKFold(n_splits={N_SPLITS})",
+            "scoring": "average_precision",
+            "best_score": best_cv_score,
+            "best_params": best_cv_params,
+            "tuning_time_seconds": tune_time,
+            "n_combinations": n_combinations,
+        },
+        "data": {
+            "n_samples": int(len(X_sample)),
+            "sample_positives": int(sample_pos),
+            "sample_negatives": int(sample_neg),
+            "sample_positive_pct": float(sample_pos_pct),
+        },
+    }
+    
+    # Convert NumPy types to native Python types
+    results = convert_numpy_types(results)
+    
+    # Save results
+    results_path = output_dir / f"model1_lgbm_sample_results_{timestamp}.json"
+    with open(results_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f"\nResults saved to: {results_path}")
+    
+    # -------------------------------------------------------------------------
+    # Summary
+    # -------------------------------------------------------------------------
+    total_time = time.time() - start_time
+    
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"Model:                       LightGBM")
+    print(f"Sample size:                  {len(X_sample):,}")
+    print(f"Best CV score (PR-AUC):       {best_cv_score:.6f}")
+    print(f"Best parameters:              {best_cv_params}")
+    print(f"Features used:                {len(feature_cols)}")
+    print(f"\nTimings:")
+    print(f"  Hyperparameter tuning:      {tune_time:.1f}s ({tune_time/60:.1f} min)")
+    print(f"  Total time:                 {total_time:.1f}s ({total_time/60:.1f} min)")
+    print("=" * 70)
+    print("Done.")
+
+
+if __name__ == "__main__":
+    # Set up output file capture
+    repo_root = Path(__file__).resolve().parents[3]
+    output_dir = repo_root / "outputs/Results/ml_models"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = output_dir / f"model1_lgbm_sample_{timestamp}.txt"
+    
+    tee = Tee(output_file)
+    sys.stdout = tee
+    
+    try:
+        main()
+    finally:
+        sys.stdout = tee.stdout
+        tee.close()
+        print(f"\nOutput saved to: {output_file}")
