@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""
+Create visualization for baseline similarity map and protected areas (RF version).
+
+Loads baseline similarity scores and protected areas GeoTIFFs and creates
+three visualization plots: individual similarity map, individual protected areas map,
+and an overlay of both.
+
+Inputs:
+- GeoTIFF: baseline_similarity_2000_rf.tif (on scratch: $SCRATCH/data/ml/baseline_similarity_2000_rf.tif)
+- GeoTIFF: new_PAs_2000_2024_rf.tif (on scratch: $SCRATCH/data/ml/new_PAs_2000_2024_rf.tif)
+
+Outputs:
+- PNG figure: similarity_vis_2000_rf.png (3 subplots) saved to outputs/Figures/
+"""
+
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+import rasterio
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, LinearSegmentedColormap
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# Path resolution
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
+
+# Use $SCRATCH for data if on cluster, otherwise use project root
+if "SCRATCH" in os.environ:
+    DATA_ROOT = Path(os.environ["SCRATCH"]) / "data" / "ml"
+    READY_ROOT = Path(os.environ["SCRATCH"]) / "data" / "ml" / "ready"
+else:
+    DATA_ROOT = PROJECT_ROOT / "data" / "ml"
+    READY_ROOT = PROJECT_ROOT / "data" / "ml" / "ready"
+
+# Output directory
+OUTPUT_DIR = PROJECT_ROOT / "outputs" / "Figures"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Input paths
+INPUT_SIMILARITY_TIF = DATA_ROOT / "baseline_similarity_2000_rf.tif"
+INPUT_PAS_TIF = DATA_ROOT / "new_PAs_2000_2024_rf.tif"
+WDPA_DIR = READY_ROOT / "WDPA"
+
+# Output path
+OUTPUT_PNG = OUTPUT_DIR / "similarity_vis_2000_rf.png"
+
+NODATA_UINT8 = 255
+PROTECTED_COLOR = '#2E8B57'
+WDPA_2000_COLOR = '#FFB6C1'
+
+
+def create_similarity_colormap():
+    colors = ['#FFFFFF', '#E8F4F8', '#B3E0F0', '#7DC8E8', '#47B0E0', '#1E90FF', '#0066CC', '#003399']
+    return LinearSegmentedColormap.from_list('similarity_highlight', colors, N=256)
+
+
+def get_similarity_normalization(similarity_data: np.ndarray) -> tuple:
+    valid_data = similarity_data[~np.isnan(similarity_data)]
+    if len(valid_data) > 0:
+        return np.nanpercentile(similarity_data, 50), np.nanpercentile(similarity_data, 99)
+    return 0, 1
+
+
+def find_wdpa_2000_file() -> Path:
+    # Primary location: data/ml/ready/WDPA
+    path = WDPA_DIR / "WDPA_SA_1km_2000.tif"
+    if path.exists():
+        return path
+    
+    # Alternative location: data/ready/WDPA (if different structure)
+    alt_path = (PROJECT_ROOT / "data" / "ready" / "WDPA" / "WDPA_SA_1km_2000.tif")
+    if alt_path.exists():
+        return alt_path
+    
+    raise FileNotFoundError(f"WDPA file not found. Checked:\n  - {path}\n  - {alt_path}")
+
+
+def load_raster(raster_path: Path) -> tuple:
+    """Load raster and return data array and profile (for geospatial info)."""
+    with rasterio.open(raster_path) as src:
+        data = src.read(1)
+        profile = src.profile.copy()
+        if src.nodata is not None:
+            data = data.astype(float)
+            data[data == src.nodata] = np.nan
+    return data, profile
+
+def load_wdpa_raster(raster_path: Path, target_profile: dict = None) -> np.ndarray:
+    """Load WDPA raster and reproject/resample to match target geospatial properties."""
+    print(f"Loading WDPA from: {raster_path}")
+    with rasterio.open(raster_path) as src:
+        print(f"  WDPA original shape: {src.shape}")
+        print(f"  WDPA CRS: {src.crs}")
+        print(f"  WDPA transform: {src.transform}")
+        
+        # If target profile provided, reproject/resample to match
+        if target_profile is not None:
+            print(f"  Reprojecting WDPA to match target:")
+            print(f"    Target shape: {target_profile['height']} x {target_profile['width']}")
+            print(f"    Target CRS: {target_profile['crs']}")
+            print(f"    Target transform: {target_profile['transform']}")
+            
+            from rasterio.warp import reproject, Resampling
+            
+            # Read source data
+            src_data = src.read(1)
+            
+            # Create destination array
+            dst_data = np.zeros((target_profile['height'], target_profile['width']), dtype=src.dtypes[0])
+            
+            # Reproject
+            reproject(
+                source=src_data,
+                destination=dst_data,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                dst_transform=target_profile['transform'],
+                dst_crs=target_profile['crs'],
+                resampling=Resampling.nearest  # Nearest neighbor for binary data
+            )
+            
+            print(f"  Reprojected WDPA pixels == 1: {np.sum(dst_data == 1):,}")
+            print(f"  Reprojected WDPA pixels == 0: {np.sum(dst_data == 0):,}")
+            return dst_data
+        else:
+            # No reprojection needed
+            data = src.read(1)
+            print(f"  WDPA unique values: {np.unique(data)}")
+            print(f"  WDPA pixels == 1: {np.sum(data == 1):,}")
+            print(f"  WDPA pixels == 0: {np.sum(data == 0):,}")
+            return data
+
+
+def plot_similarity_map(similarity_data: np.ndarray, wdpa_data: np.ndarray, ax: plt.Axes) -> None:
+    masked_data = np.ma.masked_invalid(similarity_data)
+    vmin, vmax = get_similarity_normalization(similarity_data)
+    ax.set_facecolor('white')
+    
+    im = ax.imshow(masked_data, cmap=create_similarity_colormap(), vmin=vmin, vmax=vmax, 
+                   interpolation='nearest', aspect='auto')
+    
+    if wdpa_data is not None:
+        # WDPA data is binary: 0 = not protected, 1 = protected
+        # Create RGBA overlay: red where protected, transparent elsewhere
+        from matplotlib.colors import to_rgba
+        wdpa_mask = (wdpa_data == 1)
+        print(f"  WDPA overlay: {wdpa_mask.sum():,} protected pixels")
+        rgba_overlay = np.zeros((*wdpa_data.shape, 4), dtype=float)
+        rgba_overlay[wdpa_mask] = to_rgba(WDPA_2000_COLOR, alpha=0.5)
+        ax.imshow(rgba_overlay, interpolation='nearest', aspect='auto')
+    
+    ax.set_title('Baseline Similarity Map 2000 (RF)', fontsize=14, fontweight='bold', pad=10)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+    cbar.set_label('Similarity Score', rotation=270, labelpad=20, fontsize=11)
+    
+    valid_data = similarity_data[~np.isnan(similarity_data)]
+    if len(valid_data) > 0:
+        stats_text = f'Min: {valid_data.min():.4f}\nMax: {valid_data.max():.4f}\nMean: {valid_data.mean():.4f}'
+        ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=9,
+                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+
+def plot_protected_areas_map(pa_data: np.ndarray, ax: plt.Axes) -> None:
+    binary_data = pa_data.copy().astype(float)
+    binary_data[binary_data == NODATA_UINT8] = np.nan
+    masked_data = np.ma.masked_invalid(binary_data)
+    
+    im = ax.imshow(masked_data, cmap=ListedColormap(['#FFFFFF', PROTECTED_COLOR]),
+                   vmin=0, vmax=1, interpolation='nearest', aspect='auto')
+    
+    ax.set_title('Protected Areas 2000-2024 (RF)', fontsize=14, fontweight='bold', pad=10)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8, ticks=[0, 1])
+    cbar.set_ticklabels(['Not Protected', 'Protected'])
+    cbar.set_label('Protection Status', rotation=270, labelpad=20, fontsize=11)
+    
+    valid_data = binary_data[~np.isnan(binary_data)]
+    if len(valid_data) > 0:
+        protected_count = (valid_data == 1).sum()
+        stats_text = f'Protected: {protected_count:,}\nPercentage: {100 * protected_count / len(valid_data):.2f}%'
+        ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=9,
+                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+
+def plot_overlay(similarity_data: np.ndarray, pa_data: np.ndarray, wdpa_data: np.ndarray, ax: plt.Axes) -> None:
+    ax.set_facecolor('white')
+    
+    # Base layer: Protected areas 2000-2024 (green)
+    binary_pa = pa_data.copy().astype(float)
+    binary_pa[binary_pa == NODATA_UINT8] = np.nan
+    protected_mask = (binary_pa == 1)
+    masked_pa = np.ma.masked_invalid(binary_pa)
+    darker_green = '#228B22'
+    ax.imshow(masked_pa, cmap=ListedColormap(['#FFFFFF', darker_green]),
+              vmin=0, vmax=1, interpolation='nearest', aspect='auto')
+    
+    # Second layer: WDPA 2000 (light red)
+    if wdpa_data is not None:
+        from matplotlib.colors import to_rgba
+        wdpa_mask = (wdpa_data == 1)
+        rgba_overlay = np.zeros((*wdpa_data.shape, 4), dtype=float)
+        rgba_overlay[wdpa_mask] = to_rgba(WDPA_2000_COLOR, alpha=0.5)
+        ax.imshow(rgba_overlay, interpolation='nearest', aspect='auto')
+    
+    # Top layer: Similarity map (semi-transparent)
+    masked_similarity = np.ma.masked_invalid(similarity_data)
+    vmin, vmax = get_similarity_normalization(similarity_data)
+    im1 = ax.imshow(masked_similarity, cmap=create_similarity_colormap(), vmin=vmin, vmax=vmax,
+                    interpolation='nearest', aspect='auto', alpha=0.7)
+    
+    ax.set_title('Similarity Map with Protected Areas Overlay (RF)', fontsize=14, fontweight='bold', pad=10)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    
+    cbar = plt.colorbar(im1, ax=ax, shrink=0.8)
+    cbar.set_label('Similarity Score', rotation=270, labelpad=20, fontsize=11)
+    
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor=darker_green, label='Protected Areas 2000-2024'),
+        Patch(facecolor=WDPA_2000_COLOR, alpha=0.5, label='WDPA 2000')
+    ]
+    ax.legend(handles=legend_elements, loc='upper right', fontsize=10,
+             facecolor='white', edgecolor='black', framealpha=0.8)
+
+
+def main() -> int:
+    try:
+        similarity_data, similarity_profile = load_raster(INPUT_SIMILARITY_TIF)
+        pa_data, pa_profile = load_raster(INPUT_PAS_TIF)
+        
+        if similarity_data.shape != pa_data.shape:
+            raise ValueError(f"Raster dimensions do not match: similarity {similarity_data.shape} vs PA {pa_data.shape}")
+        
+        wdpa_data = None
+        try:
+            wdpa_path = find_wdpa_2000_file()
+            print(f"\nFound WDPA file: {wdpa_path}")
+            print(f"Target profile from similarity raster:")
+            print(f"  Shape: {similarity_profile['height']} x {similarity_profile['width']}")
+            print(f"  CRS: {similarity_profile['crs']}")
+            wdpa_data = load_wdpa_raster(wdpa_path, target_profile=similarity_profile)
+            print("WDPA data loaded and reprojected successfully")
+        except FileNotFoundError as e:
+            print(f"WDPA file not found: {e}")
+        
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        fig.suptitle('Baseline Similarity Map 2000 (RF) & Protected Areas 2000-2024', 
+                    fontsize=16, fontweight='bold', y=1.02)
+        
+        plot_similarity_map(similarity_data, wdpa_data, axes[0])
+        plot_protected_areas_map(pa_data, axes[1])
+        plot_overlay(similarity_data, pa_data, wdpa_data, axes[2])
+        
+        plt.tight_layout()
+        plt.savefig(OUTPUT_PNG, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        return 0
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

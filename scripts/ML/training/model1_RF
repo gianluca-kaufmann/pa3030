@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+
+"""Imbalanced Transition Prediction Training Script
+
+Purpose: Train a model to predict new WDPA establishment (0→1 transitions) on
+         realistic imbalanced data with comprehensive evaluation metrics.
+Input:  `data/ml/sample_training_imbalanced.parquet` (realistic class distribution).
+Process: Use transition_01 as target, perform 80/20 stratified split, fit a
+         RandomForest classifier with class weights, and evaluate with multiple metrics.
+Output: Classification report, ROC-AUC, PR-AUC, precision@k, confusion matrix,
+        and feature importance.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import wandb
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    roc_auc_score,
+    average_precision_score,
+    precision_recall_curve,
+    roc_curve,
+)
+from sklearn.model_selection import train_test_split
+
+
+class Tee:
+    """Write to both stdout and a file."""
+    def __init__(self, file_path: Path):
+        self.file = open(file_path, 'w', encoding='utf-8')
+        self.stdout = sys.stdout
+    
+    def write(self, text: str) -> None:
+        self.stdout.write(text)
+        self.file.write(text)
+        self.file.flush()
+    
+    def flush(self) -> None:
+        self.stdout.flush()
+        self.file.flush()
+    
+    def close(self) -> None:
+        self.file.close()
+
+RANDOM_STATE = 42
+N_ESTIMATORS = 100
+TEST_SIZE = 0.2
+MAX_SAMPLE_SIZE = 10_000_000  # Subsample if dataset is larger to avoid memory issues
+
+# Columns to exclude from features (to prevent data leakage or overfitting)
+EXCLUDE_COLS = {
+    "transition_01",  # Target variable
+    "WDPA_b1",        # Direct leakage of target
+    "WDPA_prev",      # Direct leakage of target
+    "row",            # Spatial identifier
+    "col",            # Spatial identifier
+    "x",              # Spatial coordinate
+    "y",              # Spatial coordinate
+    "year",           # Temporal identifier
+}
+
+
+def compute_precision_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) -> float:
+    """Compute precision at top k% of predictions.
+    
+    Args:
+        y_true: True labels (0 or 1)
+        y_proba: Predicted probabilities for positive class
+        k: Percentage (e.g., 1 for top 1%, 5 for top 5%)
+    
+    Returns:
+        Precision among top k% predictions
+    """
+    n_samples = len(y_true)
+    n_top_k = max(1, int(n_samples * k / 100))
+    
+    # Get indices of top k% predictions
+    top_k_idx = np.argsort(y_proba)[-n_top_k:]
+    
+    # Calculate precision among top k%
+    precision = y_true[top_k_idx].sum() / n_top_k
+    
+    return precision
+
+
+def main() -> None:
+    start_time = time.time()
+    
+    # Initialize W&B
+    wandb_api_key = os.environ.get("WANDB_API_KEY")
+    wandb_entity = os.environ.get("WANDB_ENTITY")
+    
+    if not wandb_api_key:
+        print("Warning: WANDB_API_KEY not found in environment")
+    if not wandb_entity:
+        print("Warning: WANDB_ENTITY not found in environment")
+    
+    print("Initializing Weights & Biases...")
+    wandb.init(
+        project="ml-training-imbalanced",
+        entity=wandb_entity,
+        name=f"train_imbalanced_rf_{time.strftime('%Y%m%d_%H%M%S')}",
+        config={
+            "model": "RandomForest",
+            "n_estimators": N_ESTIMATORS,
+            "test_size": TEST_SIZE,
+            "random_state": RANDOM_STATE,
+            "max_sample_size": MAX_SAMPLE_SIZE,
+            "class_weight": "balanced",
+            "target": "transition_01",
+        },
+    )
+    print("W&B connected\n")
+    
+    repo_root = Path(__file__).resolve().parents[3]
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    # Prefer sample file on $SCRATCH if available (Euler); fall back to repo path locally
+    candidate_inputs = []
+    if scratch_root is not None:
+        candidate_inputs.append(scratch_root / "data/ml/sample_training_imbalanced.parquet")
+    candidate_inputs.append(repo_root / "data/ml/sample_training_imbalanced.parquet")
+
+    input_path = candidate_inputs[-1]
+    for cand in candidate_inputs:
+        if cand.exists():
+            input_path = cand
+            break
+
+    print("=" * 70)
+    print("IMBALANCED SAMPLE TRAINING WDPA TRANSITION PREDICTION")
+    print("=" * 70)
+    
+    print(f"\nLoading data from {input_path} …")
+    df = pd.read_parquet(input_path)
+    print(f"Loaded {len(df):,} rows with {len(df.columns)} columns.")
+
+    target_col = "transition_01"
+    if target_col not in df.columns:
+        raise ValueError(
+            f"Target column '{target_col}' not found in data. "
+            "Ensure preprocessing has been run with the transition logic."
+        )
+
+    print(f"\nUsing '{target_col}' as target variable.")
+
+    # Drop rows with missing target
+    df_clean = df.dropna(subset=[target_col])
+    dropped = len(df) - len(df_clean)
+    if dropped > 0:
+        print(f"Dropped {dropped:,} rows with missing target.")
+    print(f"Remaining: {len(df_clean):,} rows.")
+
+    if len(df_clean) == 0:
+        raise ValueError("No valid rows remaining after dropping missing targets.")
+
+    # Subsample if dataset is too large (with stratification)
+    if len(df_clean) > MAX_SAMPLE_SIZE:
+        print(
+            f"\nDataset has {len(df_clean):,} rows. "
+            f"Subsampling to {MAX_SAMPLE_SIZE:,} for memory efficiency …"
+        )
+        
+        # Stratified sampling: sample proportionally from each class
+        class_counts = df_clean[target_col].value_counts()
+        class_ratios = class_counts / len(df_clean)
+        
+        sampled_dfs = []
+        for class_label, ratio in class_ratios.items():
+            n_samples = int(MAX_SAMPLE_SIZE * ratio)
+            class_df = df_clean[df_clean[target_col] == class_label]
+            sampled_class = class_df.sample(
+                n=min(n_samples, len(class_df)),
+                random_state=RANDOM_STATE
+            )
+            sampled_dfs.append(sampled_class)
+        
+        df_clean = pd.concat(sampled_dfs, ignore_index=True)
+        # Shuffle the combined dataframe
+        df_clean = df_clean.sample(frac=1.0, random_state=RANDOM_STATE).reset_index(drop=True)
+        print(f"Subsampled to {len(df_clean):,} rows (stratified by class).")
+
+    y = df_clean[target_col]
+
+    # Select numeric features, excluding identity and leakage columns
+    numeric_cols = df_clean.select_dtypes(include=["number"]).columns.tolist()
+    feature_cols = [
+        col for col in numeric_cols 
+        if col.lower() not in {c.lower() for c in EXCLUDE_COLS}
+    ]
+
+    if not feature_cols:
+        raise ValueError("No valid numeric feature columns available for training.")
+
+    X = df_clean[feature_cols]
+
+    print(f"\nUsing {len(feature_cols)} numeric features.")
+    print(f"Excluded columns: {sorted(EXCLUDE_COLS & set(numeric_cols))}")
+    
+    # Print target distribution
+    transition_counts = y.value_counts().sort_index()
+    n_negatives = transition_counts.get(0, 0)
+    n_positives = transition_counts.get(1, 0)
+    positive_ratio = n_positives / len(y) * 100
+    
+    print(f"\n" + "=" * 70)
+    print("TARGET DISTRIBUTION (IMBALANCED)")
+    print("=" * 70)
+    print(f"  No transition (0): {n_negatives:>12,}  ({100 - positive_ratio:>5.3f}%)")
+    print(f"  New WDPA (0→1):    {n_positives:>12,}  ({positive_ratio:>5.3f}%)")
+    print(f"  Class ratio:       1 : {n_negatives / max(n_positives, 1):.1f}")
+    
+    wandb.log({
+        "data/n_features": len(feature_cols),
+        "data/n_samples": len(df_clean),
+        "data/n_positives": n_positives,
+        "data/n_negatives": n_negatives,
+        "data/positive_ratio": positive_ratio / 100,
+        "data/class_ratio": n_negatives / max(n_positives, 1),
+    })
+
+    # Train/test split with stratification
+    print(f"\n" + "=" * 70)
+    print("TRAIN/TEST SPLIT")
+    print("=" * 70)
+    print(
+        f"Splitting into train/test "
+        f"({int((1-TEST_SIZE)*100)}/{int(TEST_SIZE*100)}) with stratification …"
+    )
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=TEST_SIZE,
+        stratify=y,
+        random_state=RANDOM_STATE,
+    )
+    
+    # Print training set statistics
+    train_transition_counts = y_train.value_counts().sort_index()
+    train_pos = train_transition_counts.get(1, 0)
+    train_neg = train_transition_counts.get(0, 0)
+    print(f"Training set: {len(X_train):,} samples")
+    print(f"  No transition (0): {train_neg:,}")
+    print(f"  New WDPA (0→1):    {train_pos:,}")
+    
+    test_transition_counts = y_test.value_counts().sort_index()
+    test_pos = test_transition_counts.get(1, 0)
+    test_neg = test_transition_counts.get(0, 0)
+    print(f"\nTest set: {len(X_test):,} samples")
+    print(f"  No transition (0): {test_neg:,}")
+    print(f"  New WDPA (0→1):    {test_pos:,}")
+
+    # Train Random Forest with balanced class weights
+    print(f"\n" + "=" * 70)
+    print("MODEL TRAINING")
+    print("=" * 70)
+    print(f"Training RandomForestClassifier with {N_ESTIMATORS} trees …")
+    print(f"Using class_weight='balanced' to handle imbalanced data …")
+    
+    rf = RandomForestClassifier(
+        n_estimators=N_ESTIMATORS,
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+        class_weight='balanced',  # Important for imbalanced data
+        verbose=1,
+        max_depth=20,  # Prevent overfitting
+        min_samples_split=100,  # Prevent overfitting
+        min_samples_leaf=50,    # Prevent overfitting
+    )
+    rf.fit(X_train, y_train)
+    print("Training complete.")
+
+    # Predict probabilities and classes
+    print("\n" + "=" * 70)
+    print("EVALUATION ON TEST SET")
+    print("=" * 70)
+    print("Computing predictions …")
+    y_pred = rf.predict(X_test)
+    y_proba = rf.predict_proba(X_test)[:, 1]  # Probability of positive class
+
+    # Classification report
+    print("\n" + "=" * 70)
+    print("CLASSIFICATION REPORT")
+    print("=" * 70)
+    print(classification_report(y_test, y_pred, digits=4))
+
+    # Confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    tn, fp, fn, tp = cm.ravel()
+    
+    print("\n" + "=" * 70)
+    print("CONFUSION MATRIX")
+    print("=" * 70)
+    print(f"                 Predicted Negative    Predicted Positive")
+    print(f"Actual Negative  {tn:>18,}    {fp:>18,}")
+    print(f"Actual Positive  {fn:>18,}    {tp:>18,}")
+    print(f"\nTrue Negatives:  {tn:,}")
+    print(f"False Positives: {fp:,}")
+    print(f"False Negatives: {fn:,}")
+    print(f"True Positives:  {tp:,}")
+
+    # ROC-AUC and PR-AUC
+    print("\n" + "=" * 70)
+    print("AREA UNDER CURVE METRICS")
+    print("=" * 70)
+    
+    roc_auc = roc_auc_score(y_test, y_proba)
+    pr_auc = average_precision_score(y_test, y_proba)
+    
+    print(f"ROC-AUC:  {roc_auc:.4f}")
+    print(f"PR-AUC:   {pr_auc:.4f}")
+    
+    # Precision at top k%
+    print("\n" + "=" * 70)
+    print("PRECISION @ TOP-K PREDICTIONS")
+    print("=" * 70)
+    print("(Precision among highest-confidence predictions)")
+    print()
+    
+    for k in [1, 5, 10]:
+        prec_at_k = compute_precision_at_k(y_test.values, y_proba, k)
+        n_top_k = max(1, int(len(y_test) * k / 100))
+        expected_positives = int(n_top_k * prec_at_k)
+        print(f"Precision @ top {k:>2}%:  {prec_at_k:>7.4f}  "
+              f"({expected_positives:>6,} positives in top {n_top_k:>7,} predictions)")
+    
+    # Baseline precision (random ranking)
+    baseline_precision = test_pos / len(y_test)
+    print(f"\nBaseline (random): {baseline_precision:>7.4f}  "
+          f"(overall positive rate in test set)")
+
+    # Feature importance
+    print("\n" + "=" * 70)
+    print("TOP 20 MOST IMPORTANT FEATURES")
+    print("=" * 70)
+    feature_importance = pd.DataFrame(
+        {"feature": feature_cols, "importance": rf.feature_importances_}
+    ).sort_values("importance", ascending=False)
+
+    print(feature_importance.head(20).to_string(index=False))
+    
+    # Summary
+    prec_at_1 = compute_precision_at_k(y_test.values, y_proba, 1)
+    prec_at_5 = compute_precision_at_k(y_test.values, y_proba, 5)
+    prec_at_10 = compute_precision_at_k(y_test.values, y_proba, 10)
+    
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"Model:                RandomForest ({N_ESTIMATORS} trees, balanced weights)")
+    print(f"Test samples:         {len(y_test):,}")
+    print(f"Positive rate:        {positive_ratio:.3f}%")
+    print(f"ROC-AUC:              {roc_auc:.4f}")
+    print(f"PR-AUC:               {pr_auc:.4f}")
+    print(f"Precision @ top 1%:   {prec_at_1:.4f}")
+    print(f"Precision @ top 5%:   {prec_at_5:.4f}")
+    print(f"Precision @ top 10%:  {prec_at_10:.4f}")
+    print("=" * 70)
+    
+    # Log to W&B
+    total_time = time.time() - start_time
+    
+    wandb.log({
+        "metrics/true_negatives": int(tn),
+        "metrics/false_positives": int(fp),
+        "metrics/false_negatives": int(fn),
+        "metrics/true_positives": int(tp),
+        "metrics/accuracy": (tp + tn) / (tp + tn + fp + fn),
+        "metrics/precision": tp / (tp + fp) if (tp + fp) > 0 else 0,
+        "metrics/recall": tp / (tp + fn) if (tp + fn) > 0 else 0,
+        "metrics/f1": 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0,
+        "metrics/roc_auc": roc_auc,
+        "metrics/pr_auc": pr_auc,
+        "metrics/precision_at_1": prec_at_1,
+        "metrics/precision_at_5": prec_at_5,
+        "metrics/precision_at_10": prec_at_10,
+        "timing/total_seconds": total_time,
+        "timing/total_minutes": total_time / 60,
+        "status": "success"
+    })
+    
+    print(f"\nTotal time: {total_time:.1f}s ({total_time/60:.1f} min)")
+    print("All done.")
+    
+    wandb.finish()
+
+
+if __name__ == "__main__":
+    # Set up output file capture
+    repo_root = Path(__file__).resolve().parents[3]
+    output_dir = repo_root / "outputs/results/ml_baselines"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = output_dir / f"train_sample_imbalanced_{timestamp}.txt"
+    
+    tee = Tee(output_file)
+    sys.stdout = tee
+    
+    try:
+        main()
+    finally:
+        sys.stdout = tee.stdout
+        tee.close()
+        print(f"\nOutput saved to: {output_file}")
+

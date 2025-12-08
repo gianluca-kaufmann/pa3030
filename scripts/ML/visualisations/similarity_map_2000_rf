@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""
+Create similarity map and protected areas GeoTIFFs from baseline RF parquet files.
+
+Loads baseline scores and outcomes from parquet files and creates GeoTIFF rasters
+with the same CRS, transform, width, and height as the backbone template.
+
+Inputs:
+- Parquet file: data/ml/baseline_scores_2000_rf.parquet (on scratch: $SCRATCH/data/ml/baseline_scores_2000_rf.parquet)
+- Parquet file: data/ml/baseline_scored_outcomes_rf.parquet (on scratch: $SCRATCH/data/ml/baseline_scored_outcomes_rf.parquet)
+- Template GeoTIFF: data/ready/backbone/backbone.tif
+
+Outputs:
+- GeoTIFF: baseline_similarity_2000_rf.tif (similarity scores, float32)
+- GeoTIFF: new_PAs_2000_2024_rf.tif (protected areas, uint8: 1 if ever_protected_after_2000 == 1, else 0)
+"""
+
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import rasterio
+
+# Path resolution
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
+
+# Use $SCRATCH for data if on cluster, otherwise use project root
+if "SCRATCH" in os.environ:
+    DATA_ROOT = Path(os.environ["SCRATCH"]) / "data" / "ml"
+else:
+    DATA_ROOT = PROJECT_ROOT / "data" / "ml"
+
+# Template backbone path
+if "SCRATCH" in os.environ:
+    BACKBONE_ROOT = Path(os.environ["SCRATCH"]) / "data" / "ml" / "ready"
+else:
+    BACKBONE_ROOT = PROJECT_ROOT / "data" / "ready"
+
+BACKBONE_PATH = BACKBONE_ROOT / "backbone" / "backbone.tif"
+
+# Input and output paths
+INPUT_SCORES_PARQUET = DATA_ROOT / "baseline_scores_2000_rf.parquet"
+INPUT_OUTCOMES_PARQUET = DATA_ROOT / "baseline_scored_outcomes_rf.parquet"
+OUTPUT_SIMILARITY_TIF = DATA_ROOT / "baseline_similarity_2000_rf.tif"
+OUTPUT_PAS_TIF = DATA_ROOT / "new_PAs_2000_2024_rf.tif"
+
+# Nodata values
+NODATA_FLOAT = -9999.0
+NODATA_UINT8 = 255  # Standard nodata for uint8
+
+
+def load_scores(parquet_path: Path) -> pd.DataFrame:
+    """Load baseline scores from parquet file."""
+    if not parquet_path.exists():
+        raise FileNotFoundError(
+            f"Parquet file not found: {parquet_path}\n"
+            f"Expected columns: row, col, x, y, score"
+        )
+    
+    print(f"Loading scores from {parquet_path.name}...")
+    df = pd.read_parquet(parquet_path, columns=['row', 'col', 'x', 'y', 'score'])
+    
+    print(f"  Loaded {len(df):,} rows")
+    print(f"  Row range: [{df['row'].min()}, {df['row'].max()}]")
+    print(f"  Col range: [{df['col'].min()}, {df['col'].max()}]")
+    print(f"  Score range: [{df['score'].min():.4f}, {df['score'].max():.4f}]")
+    
+    return df
+
+
+def load_template(template_path: Path) -> tuple:
+    """Load template GeoTIFF and return metadata."""
+    if not template_path.exists():
+        # Try alternative location
+        alt_path = PROJECT_ROOT / "data" / "ready" / "backbone" / "backbone.tif"
+        if alt_path.exists():
+            template_path = alt_path
+        else:
+            raise FileNotFoundError(
+                f"Template GeoTIFF not found: {template_path}\n"
+                f"Also checked: {alt_path}"
+            )
+    
+    print(f"Loading template from {template_path.name}...")
+    with rasterio.open(template_path) as src:
+        crs = src.crs
+        transform = src.transform
+        width = src.width
+        height = src.height
+        
+        print(f"  CRS: {crs}")
+        print(f"  Shape: {height} x {width}")
+        print(f"  Transform: {transform}")
+    
+    return crs, transform, width, height
+
+
+def load_outcomes(parquet_path: Path) -> pd.DataFrame:
+    """Load baseline outcomes from parquet file."""
+    if not parquet_path.exists():
+        raise FileNotFoundError(
+            f"Parquet file not found: {parquet_path}\n"
+            f"Expected columns: row, col, ever_protected_after_2000"
+        )
+    
+    print(f"Loading outcomes from {parquet_path.name}...")
+    df = pd.read_parquet(parquet_path, columns=['row', 'col', 'ever_protected_after_2000'])
+    
+    print(f"  Loaded {len(df):,} rows")
+    print(f"  Row range: [{df['row'].min()}, {df['row'].max()}]")
+    print(f"  Col range: [{df['col'].min()}, {df['col'].max()}]")
+    protected_count = (df['ever_protected_after_2000'] == 1).sum()
+    print(f"  Protected pixels (ever_protected_after_2000 == 1): {protected_count:,} ({100*protected_count/len(df):.2f}%)")
+    
+    return df
+
+
+def create_similarity_raster(
+    df: pd.DataFrame,
+    crs: str,
+    transform: rasterio.Affine,
+    width: int,
+    height: int,
+    output_path: Path
+) -> None:
+    """Create similarity GeoTIFF from scores dataframe."""
+    print(f"\nCreating similarity raster...")
+    
+    # Initialize array with nodata
+    raster_array = np.full((height, width), NODATA_FLOAT, dtype=np.float32)
+    
+    # Convert row, col to numpy arrays for vectorized indexing
+    rows = df['row'].values.astype(np.int32)
+    cols = df['col'].values.astype(np.int32)
+    scores = df['score'].values.astype(np.float32)
+    
+    # Validate indices are within bounds
+    valid_rows = (rows >= 0) & (rows < height)
+    valid_cols = (cols >= 0) & (cols < width)
+    valid_mask = valid_rows & valid_cols
+    
+    if not valid_mask.all():
+        n_invalid = (~valid_mask).sum()
+        print(f"  Warning: {n_invalid:,} indices out of bounds, skipping them")
+        rows = rows[valid_mask]
+        cols = cols[valid_mask]
+        scores = scores[valid_mask]
+    
+    # Vectorized assignment: write scores at [row, col] positions
+    raster_array[rows, cols] = scores
+    
+    # Count filled pixels
+    filled_pixels = (raster_array != NODATA_FLOAT).sum()
+    print(f"  Filled {filled_pixels:,} pixels ({100*filled_pixels/(height*width):.2f}%)")
+    
+    # Create output directory if needed
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Write GeoTIFF
+    print(f"Writing GeoTIFF to {output_path.name}...")
+    profile = {
+        'driver': 'GTiff',
+        'dtype': rasterio.float32,
+        'nodata': NODATA_FLOAT,
+        'width': width,
+        'height': height,
+        'count': 1,
+        'crs': crs,
+        'transform': transform,
+        'compress': 'lzw',
+        'tiled': True,
+        'blockxsize': 512,
+        'blockysize': 512,
+    }
+    
+    with rasterio.open(output_path, 'w', **profile) as dst:
+        dst.write(raster_array, 1)
+    
+    file_size_mb = output_path.stat().st_size / (1024 * 1024)
+    print(f"  Successfully wrote {output_path.name} ({file_size_mb:.1f} MB)")
+
+
+def create_protected_areas_raster(
+    df: pd.DataFrame,
+    crs: str,
+    transform: rasterio.Affine,
+    width: int,
+    height: int,
+    output_path: Path
+) -> None:
+    """Create protected areas GeoTIFF from outcomes dataframe."""
+    print(f"\nCreating protected areas raster...")
+    
+    # Initialize array with nodata
+    raster_array = np.full((height, width), NODATA_UINT8, dtype=np.uint8)
+    
+    # Convert row, col to numpy arrays for vectorized indexing
+    rows = df['row'].values.astype(np.int32)
+    cols = df['col'].values.astype(np.int32)
+    protected = df['ever_protected_after_2000'].values.astype(np.uint8)
+    
+    # Validate indices are within bounds
+    valid_rows = (rows >= 0) & (rows < height)
+    valid_cols = (cols >= 0) & (cols < width)
+    valid_mask = valid_rows & valid_cols
+    
+    if not valid_mask.all():
+        n_invalid = (~valid_mask).sum()
+        print(f"  Warning: {n_invalid:,} indices out of bounds, skipping them")
+        rows = rows[valid_mask]
+        cols = cols[valid_mask]
+        protected = protected[valid_mask]
+    
+    # Create binary values: 1 if ever_protected_after_2000 == 1, else 0
+    binary_values = np.where(protected == 1, 1, 0).astype(np.uint8)
+    
+    # Vectorized assignment: write binary values at [row, col] positions
+    raster_array[rows, cols] = binary_values
+    
+    # Count filled pixels
+    filled_pixels = (raster_array != NODATA_UINT8).sum()
+    protected_pixels = (raster_array == 1).sum()
+    print(f"  Filled {filled_pixels:,} pixels ({100*filled_pixels/(height*width):.2f}%)")
+    print(f"  Protected pixels (value=1): {protected_pixels:,} ({100*protected_pixels/filled_pixels:.2f}% of filled)")
+    
+    # Create output directory if needed
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Write GeoTIFF
+    print(f"Writing GeoTIFF to {output_path.name}...")
+    profile = {
+        'driver': 'GTiff',
+        'dtype': rasterio.uint8,
+        'nodata': NODATA_UINT8,
+        'width': width,
+        'height': height,
+        'count': 1,
+        'crs': crs,
+        'transform': transform,
+        'compress': 'lzw',
+        'tiled': True,
+        'blockxsize': 512,
+        'blockysize': 512,
+    }
+    
+    with rasterio.open(output_path, 'w', **profile) as dst:
+        dst.write(raster_array, 1)
+    
+    file_size_mb = output_path.stat().st_size / (1024 * 1024)
+    print(f"  Successfully wrote {output_path.name} ({file_size_mb:.1f} MB)")
+
+
+def main() -> int:
+    """Main processing function."""
+    print("=" * 60)
+    print("Baseline Similarity Map 2000 (RF) & Protected Areas Map")
+    print("=" * 60)
+    
+    try:
+        # Load template (shared for both outputs)
+        crs, transform, width, height = load_template(BACKBONE_PATH)
+        
+        # Process similarity map
+        print("\n" + "-" * 60)
+        df_scores = load_scores(INPUT_SCORES_PARQUET)
+        create_similarity_raster(df_scores, crs, transform, width, height, OUTPUT_SIMILARITY_TIF)
+        
+        # Process protected areas map
+        print("\n" + "-" * 60)
+        df_outcomes = load_outcomes(INPUT_OUTCOMES_PARQUET)
+        create_protected_areas_raster(df_outcomes, crs, transform, width, height, OUTPUT_PAS_TIF)
+        
+        print("\n" + "=" * 60)
+        print("Outputs:")
+        print(f"  Similarity map: {OUTPUT_SIMILARITY_TIF}")
+        print(f"  Protected areas: {OUTPUT_PAS_TIF}")
+        print("=" * 60)
+        
+        return 0
+        
+    except FileNotFoundError as e:
+        print(f"\nERROR: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"\nERROR: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
