@@ -127,95 +127,174 @@ def convert_numpy_types(obj: Any) -> Any:
             return str(obj)
 
 
-def load_data(parquet_path: Path, years: range, columns: Optional[list] = None) -> pd.DataFrame:
-    """Load data for specified years from parquet file efficiently."""
-    print(f"Loading data for years {years.start}-{years.stop-1} from {parquet_path} ...")
-    
-    # Read parquet file with filter
-    filters = [('year', '>=', years.start), ('year', '<=', years.stop - 1)]
-    load_start = time.time()
+def load_data_year(parquet_path: Path, year: int, columns: Optional[list] = None) -> pd.DataFrame:
+    """Load data for a single year from parquet file efficiently."""
+    filters = [('year', '==', year)]
     df = pd.read_parquet(parquet_path, filters=filters, columns=columns)
-    load_time = time.time() - load_start
-    
-    print(f"  Loaded {len(df):,} rows in {load_time:.1f}s")
-    print(f"  Years: {sorted(df['year'].unique())}")
     return df
 
 
-def stratified_sample(df: pd.DataFrame, n_samples: int, stratify_cols: list, random_state: int = 42) -> pd.DataFrame:
+def stratified_sample_chunked(
+    parquet_path: Path,
+    years: range,
+    n_samples: int,
+    stratify_cols: list,
+    target_col: str,
+    random_state: int = 42
+) -> pd.DataFrame:
     """
-    Draw a stratified sample preserving the distribution of specified columns.
+    Draw a stratified sample by reading year-by-year, preserving distribution.
+    Uses chunked reading to avoid loading all years into memory at once.
     
     Args:
-        df: DataFrame to sample from
+        parquet_path: Path to parquet file
+        years: Range of years to process
         n_samples: Number of samples to draw
         stratify_cols: List of column names to preserve distribution for
+        target_col: Target column name
         random_state: Random seed
     
     Returns:
         Sampled DataFrame
     """
-    print(f"\nDrawing stratified sample of {n_samples:,} rows...")
+    print(f"\nDrawing stratified sample of {n_samples:,} rows (chunked by year)...")
     print(f"  Preserving distribution of: {', '.join(stratify_cols)}")
+    print(f"  Processing years {years.start}-{years.stop-1} year-by-year")
     
-    if len(df) <= n_samples:
-        print(f"  Dataset has {len(df):,} rows <= {n_samples:,}, returning full dataset")
-        return df.copy()
+    # First pass: Count rows per stratum across all years
+    print("\n  First pass: Counting rows per stratum...")
+    stratum_counts = {}
+    total_rows = 0
     
-    # Create stratification key
-    df = df.copy()
-    df['_stratify_key'] = df[stratify_cols].apply(lambda x: '_'.join(x.astype(str)), axis=1)
-    
-    # Get counts per stratum
-    stratum_counts = df['_stratify_key'].value_counts()
-    n_strata = len(stratum_counts)
-    print(f"  Found {n_strata} unique strata")
-    
-    # Calculate sampling fraction
-    total_rows = len(df)
-    sampling_fraction = n_samples / total_rows
-    
-    # Sample proportionally from each stratum
-    sampled_dfs = []
-    for stratum_key, stratum_size in stratum_counts.items():
-        stratum_df = df[df['_stratify_key'] == stratum_key]
-        n_sample_stratum = max(1, int(stratum_size * sampling_fraction))
+    for year in years:
+        df_year = load_data_year(parquet_path, year)
+        if len(df_year) == 0:
+            continue
         
-        # If stratum is smaller than needed sample, take all
-        if n_sample_stratum >= len(stratum_df):
-            sampled_dfs.append(stratum_df)
-        else:
-            sampled_dfs.append(
-                stratum_df.sample(n=n_sample_stratum, random_state=random_state)
-            )
+        if target_col not in df_year.columns:
+            del df_year
+            gc.collect()
+            continue
+        
+        df_year_clean = df_year.dropna(subset=[target_col])
+        if len(df_year_clean) == 0:
+            del df_year
+            gc.collect()
+            continue
+        
+        df_year_clean = downcast_float64_to_float32(df_year_clean)
+        
+        # Create binary target for stratification
+        df_year_clean['transition_01_binary'] = (df_year_clean[target_col] > 0).astype(int)
+        
+        # Count per stratum (year, transition_01_binary) - vectorized
+        stratum_counts_year = df_year_clean.groupby(['year', 'transition_01_binary']).size()
+        for (y, trans), count in stratum_counts_year.items():
+            stratum_key = (int(y), int(trans))
+            stratum_counts[stratum_key] = stratum_counts.get(stratum_key, 0) + count
+            total_rows += count
+        
+        del df_year, df_year_clean
+        gc.collect()
     
-    # Combine and check if we need to adjust
+    if total_rows == 0:
+        raise ValueError("No data found in specified years")
+    
+    if total_rows <= n_samples:
+        print(f"  Dataset has {total_rows:,} rows <= {n_samples:,}, loading full dataset")
+        # Load all data if it fits
+        sampled_dfs = []
+        for year in years:
+            df_year = load_data_year(parquet_path, year)
+            if len(df_year) == 0:
+                continue
+            if target_col not in df_year.columns:
+                continue
+            df_year_clean = df_year.dropna(subset=[target_col])
+            if len(df_year_clean) > 0:
+                sampled_dfs.append(df_year_clean)
+            del df_year
+            gc.collect()
+        return pd.concat(sampled_dfs, ignore_index=True)
+    
+    n_strata = len(stratum_counts)
+    print(f"  Found {n_strata} unique strata across {total_rows:,} total rows")
+    
+    # Calculate sampling fraction per stratum
+    sampling_fraction = n_samples / total_rows
+    stratum_sample_sizes = {
+        stratum_key: max(1, int(count * sampling_fraction))
+        for stratum_key, count in stratum_counts.items()
+    }
+    
+    # Second pass: Sample from each year proportionally
+    print("\n  Second pass: Sampling from each year...")
+    sampled_dfs = []
+    np.random.seed(random_state)
+    
+    for year in years:
+        df_year = load_data_year(parquet_path, year)
+        if len(df_year) == 0:
+            continue
+        
+        if target_col not in df_year.columns:
+            del df_year
+            gc.collect()
+            continue
+        
+        df_year_clean = df_year.dropna(subset=[target_col])
+        if len(df_year_clean) == 0:
+            del df_year
+            gc.collect()
+            continue
+        
+        df_year_clean = downcast_float64_to_float32(df_year_clean)
+        df_year_clean['transition_01_binary'] = (df_year_clean[target_col] > 0).astype(int)
+        
+        # Sample from each stratum in this year
+        year_samples = []
+        for stratum_key, n_sample in stratum_sample_sizes.items():
+            stratum_year, stratum_transition = stratum_key
+            if stratum_year != year:
+                continue
+            
+            stratum_df = df_year_clean[
+                df_year_clean['transition_01_binary'] == stratum_transition
+            ]
+            
+            if len(stratum_df) == 0:
+                continue
+            
+            if n_sample >= len(stratum_df):
+                year_samples.append(stratum_df)
+            else:
+                year_samples.append(
+                    stratum_df.sample(n=n_sample, random_state=random_state)
+                )
+        
+        if year_samples:
+            sampled_dfs.append(pd.concat(year_samples, ignore_index=True))
+        
+        del df_year, df_year_clean
+        gc.collect()
+    
+    # Combine all samples
+    if not sampled_dfs:
+        raise ValueError("No samples collected")
+    
     sampled_df = pd.concat(sampled_dfs, ignore_index=True)
     
     # If we got more than needed, randomly sample down
     if len(sampled_df) > n_samples:
         sampled_df = sampled_df.sample(n=n_samples, random_state=random_state).reset_index(drop=True)
-    # If we got less than needed (shouldn't happen with proportional sampling), 
-    # we'll accept it but warn
     elif len(sampled_df) < n_samples:
         print(f"  Warning: Only sampled {len(sampled_df):,} rows (requested {n_samples:,})")
     
     # Drop temporary column
-    sampled_df = sampled_df.drop(columns=['_stratify_key'])
+    if 'transition_01_binary' in sampled_df.columns:
+        sampled_df = sampled_df.drop(columns=['transition_01_binary'])
     
     print(f"  Sampled {len(sampled_df):,} rows")
-    
-    # Verify distribution preservation
-    print(f"\n  Verifying distribution preservation:")
-    for col in stratify_cols:
-        original_dist = df[col].value_counts(normalize=True).sort_index()
-        sampled_dist = sampled_df[col].value_counts(normalize=True).sort_index()
-        
-        # Calculate max difference
-        common_keys = set(original_dist.index) & set(sampled_dist.index)
-        if common_keys:
-            max_diff = max(abs(original_dist[k] - sampled_dist.get(k, 0)) for k in common_keys)
-            print(f"    {col}: max distribution difference = {max_diff:.4f}")
     
     return sampled_df
 
@@ -289,70 +368,34 @@ def main() -> None:
     print(f"Output: {output_dir}")
     
     # -------------------------------------------------------------------------
-    # Step 1: Load data
+    # Step 1: Chunked stratified sampling (year-by-year)
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("STEP 1: LOAD DATA")
+    print("STEP 1: CHUNKED STRATIFIED SAMPLING")
     print("=" * 70)
-    
-    # Load training data (2000-2017) only
-    df_train = load_data(input_path, TRAIN_YEARS)
-    df_train = downcast_float64_to_float32(df_train)
     
     target_col = "transition_01"
     
-    # Check target column exists
-    if target_col not in df_train.columns:
-        raise ValueError(f"Target column '{target_col}' not found in training data")
+    # Draw stratified sample preserving year and transition_01 distribution
+    # This reads year-by-year to avoid OOM - never loads all 18 years at once
+    df_sample = stratified_sample_chunked(
+        parquet_path=input_path,
+        years=TRAIN_YEARS,
+        n_samples=SAMPLE_SIZE,
+        stratify_cols=['year', 'transition_01_binary'],
+        target_col=target_col,
+        random_state=RANDOM_STATE
+    )
     
-    # Drop rows with missing target
-    df_train_clean = df_train.dropna(subset=[target_col])
-    dropped_train = len(df_train) - len(df_train_clean)
-    if dropped_train > 0:
-        print(f"\nDropped {dropped_train:,} training rows with missing target")
+    # Downcast to save memory
+    df_sample = downcast_float64_to_float32(df_sample)
     
-    print(f"\nTraining set: {len(df_train_clean):,} rows")
-    
-    # Get feature columns
-    feature_cols = get_feature_columns(df_train_clean)
-    excluded_cols = sorted(EXCLUDE_COLS & set(df_train_clean.columns))
+    # Get feature columns from sample
+    feature_cols = get_feature_columns(df_sample)
+    excluded_cols = sorted(EXCLUDE_COLS & set(df_sample.columns))
     
     print(f"\nUsing {len(feature_cols)} features")
     print(f"Excluded columns ({len(excluded_cols)}): {excluded_cols}")
-    
-    # Target distribution
-    train_pos = (df_train_clean[target_col] > 0).sum()
-    train_neg = (df_train_clean[target_col] == 0).sum()
-    train_pos_pct = train_pos / len(df_train_clean) * 100
-    
-    print(f"\n" + "-" * 40)
-    print("Training set distribution (before sampling):")
-    print(f"  No transition (0): {train_neg:>12,}  ({100 - train_pos_pct:.3f}%)")
-    print(f"  Transition (0→1):  {train_pos:>12,}  ({train_pos_pct:.3f}%)")
-    print(f"  Class ratio:       1 : {train_neg / max(train_pos, 1):.1f}")
-    print("-" * 40)
-    
-    # -------------------------------------------------------------------------
-    # Step 2: Stratified sampling
-    # -------------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("STEP 2: STRATIFIED SAMPLING")
-    print("=" * 70)
-    
-    # Create binary target for stratification
-    df_train_clean['transition_01_binary'] = (df_train_clean[target_col] > 0).astype(int)
-    
-    # Draw stratified sample preserving year and transition_01 distribution
-    df_sample = stratified_sample(
-        df_train_clean,
-        n_samples=SAMPLE_SIZE,
-        stratify_cols=['year', 'transition_01_binary'],
-        random_state=RANDOM_STATE
-    )
-    df_sample = downcast_float64_to_float32(df_sample)
-    
-    # Drop temporary binary column
-    df_sample = df_sample.drop(columns=['transition_01_binary'])
     
     # Show sample distribution
     sample_pos = (df_sample[target_col] > 0).sum()
@@ -370,15 +413,13 @@ def main() -> None:
     print(f"  Class ratio:       1 : {sample_neg / max(sample_pos, 1):.1f}")
     print("-" * 40)
     
-    # Free memory
-    del df_train, df_train_clean
     gc.collect()
     
     # -------------------------------------------------------------------------
-    # Step 3: Prepare features and target
+    # Step 2: Prepare features and target
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("STEP 3: PREPARE FEATURES AND TARGET")
+    print("STEP 2: PREPARE FEATURES AND TARGET")
     print("=" * 70)
     
     # Prepare target and features
@@ -399,10 +440,10 @@ def main() -> None:
             print(f"    {col}: {count:,} ({count/len(X_sample)*100:.2f}%)")
     
     # -------------------------------------------------------------------------
-    # Step 4: Hyperparameter tuning with GroupKFold
+    # Step 3: Hyperparameter tuning with GroupKFold
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("STEP 4: HYPERPARAMETER TUNING WITH GROUPKFOLD")
+    print("STEP 3: HYPERPARAMETER TUNING WITH GROUPKFOLD")
     print("=" * 70)
     
     print(f"\nUsing GroupKFold with {N_SPLITS} splits (grouped by year)")
@@ -453,10 +494,10 @@ def main() -> None:
     best_cv_params = grid_search.best_params_.copy()
     
     # -------------------------------------------------------------------------
-    # Step 5: Save results
+    # Step 4: Save results
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("STEP 5: SAVE RESULTS")
+    print("STEP 4: SAVE RESULTS")
     print("=" * 70)
     
     # Print results clearly
