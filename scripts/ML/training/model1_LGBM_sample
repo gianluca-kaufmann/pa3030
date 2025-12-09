@@ -230,6 +230,15 @@ def get_feature_columns(df: pd.DataFrame) -> list:
     return feature_cols
 
 
+def downcast_float64_to_float32(df: pd.DataFrame) -> pd.DataFrame:
+    """Downcast float64 columns to float32 to reduce memory footprint."""
+    float64_cols = df.select_dtypes(include=["float64"]).columns
+    if len(float64_cols) > 0:
+        print(f"  Downcasting {len(float64_cols)} float64 columns to float32")
+        df[float64_cols] = df[float64_cols].astype(np.float32)
+    return df
+
+
 # =============================================================================
 # Main Pipeline
 # =============================================================================
@@ -288,6 +297,7 @@ def main() -> None:
     
     # Load training data (2000-2017) only
     df_train = load_data(input_path, TRAIN_YEARS)
+    df_train = downcast_float64_to_float32(df_train)
     
     target_col = "transition_01"
     
@@ -339,6 +349,7 @@ def main() -> None:
         stratify_cols=['year', 'transition_01_binary'],
         random_state=RANDOM_STATE
     )
+    df_sample = downcast_float64_to_float32(df_sample)
     
     # Drop temporary binary column
     df_sample = df_sample.drop(columns=['transition_01_binary'])
@@ -420,6 +431,7 @@ def main() -> None:
     print(f"\nStarting grid search...")
     print(f"This may take a while...\n")
     
+    gc.collect()
     grid_search = GridSearchCV(
         estimator=base_model,
         param_grid=PARAM_GRID,
