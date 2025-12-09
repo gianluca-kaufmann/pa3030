@@ -41,13 +41,13 @@ echo "Starting map script..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/visualisations/similarity_vis_2000_rf" ] || {
-  echo "ERROR: similarity_vis_2000_rf not found"
-  echo "NOTE: similarity_vis_2000_rf script is in visualisations/ directory"
-  find scripts -maxdepth 4 -type f -name "similarity_vis_2000_rf"
+[ -f "scripts/ML/visualisations/similarity_map_2000_rf" ] || {
+  echo "ERROR: similarity_map_2000_rf not found"
+  echo "NOTE: similarity_map_2000_rf script is in visualisations/ directory"
+  find scripts -maxdepth 4 -type f -name "similarity_map_2000_rf"
   exit 1
 }
 # Run the script
-python "scripts/ML/visualisations/similarity_vis_2000_rf"
+python "scripts/ML/visualisations/similarity_map_2000_rf"
 
-echo "similarity_vis_2000_rf script finished."
+echo "similarity_map_2000_rf script finished."
