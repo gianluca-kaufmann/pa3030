@@ -68,7 +68,7 @@ def configure_duckdb(con: duckdb.DuckDBPyConnection) -> None:
     print(f"Running on: {'Euler cluster' if is_euler else 'local machine'}")
 
 
-def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: str) -> None:
+def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: str, use_wandb: bool = False) -> None:
     escaped = str(parquet_path).replace("'", "''")
     rows = con.execute(
         f"""
@@ -88,7 +88,8 @@ def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: s
     for year, pos, neg, total, ratio in rows:
         print(f"  {year}: total={total:,} pos={pos:,} neg={neg:,} pos_ratio={ratio:.5f}")
 
-    wandb.log({f"{label.lower().replace(' ', '_')}/per_year": [dict(year=y, positives=p, negatives=n, total=t, pos_ratio=r) for y, p, n, t, r in rows]})
+    if use_wandb:
+        wandb.log({f"{label.lower().replace(' ', '_')}/per_year": [dict(year=y, positives=p, negatives=n, total=t, pos_ratio=r) for y, p, n, t, r in rows]})
 
 
 def main() -> None:
@@ -184,8 +185,8 @@ def main() -> None:
         print(f"TEST written in {time.time() - test_start:.1f}s")
 
         # Log counts
-        log_year_counts(con, train_out, "TRAIN")
-        log_year_counts(con, test_out, "TEST")
+        log_year_counts(con, train_out, "TRAIN", use_wandb)
+        log_year_counts(con, test_out, "TEST", use_wandb)
 
         total_train = con.execute(
             f"SELECT COUNT(*) FROM read_parquet('{escaped_train}')"
