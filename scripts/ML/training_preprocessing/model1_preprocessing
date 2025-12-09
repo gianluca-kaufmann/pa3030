@@ -134,32 +134,32 @@ def main() -> None:
     try:
         # TRAIN: positives + 20x negatives per year
         train_sql = f"""
-        WITH base AS (
-            SELECT * FROM read_parquet('{escaped_in}')
-            WHERE year BETWEEN {TRAIN_YEARS[0]} AND {TRAIN_YEARS[1]}
-        ),
-        positives AS (
-            SELECT * FROM base WHERE transition_01 = 1
-        ),
-        neg_with_counts AS (
-            SELECT
-                b.*,
-                COALESCE(p.pos_count, 0) AS pos_count,
-                ROW_NUMBER() OVER (PARTITION BY b.year ORDER BY random({RANDOM_STATE})) AS rn
-            FROM base b
-            LEFT JOIN (
-                SELECT year, COUNT(*) AS pos_count
-                FROM positives
-                GROUP BY year
-            ) p
-            ON b.year = p.year
-            WHERE b.transition_01 = 0
-        ),
-        sampled_negs AS (
-            SELECT * FROM neg_with_counts
-            WHERE rn <= 20 * pos_count
-        )
         COPY (
+            WITH base AS (
+                SELECT * FROM read_parquet('{escaped_in}')
+                WHERE year BETWEEN {TRAIN_YEARS[0]} AND {TRAIN_YEARS[1]}
+            ),
+            positives AS (
+                SELECT * FROM base WHERE transition_01 = 1
+            ),
+            neg_with_counts AS (
+                SELECT
+                    b.*,
+                    COALESCE(p.pos_count, 0) AS pos_count,
+                    ROW_NUMBER() OVER (PARTITION BY b.year ORDER BY random({RANDOM_STATE})) AS rn
+                FROM base b
+                LEFT JOIN (
+                    SELECT year, COUNT(*) AS pos_count
+                    FROM positives
+                    GROUP BY year
+                ) p
+                ON b.year = p.year
+                WHERE b.transition_01 = 0
+            ),
+            sampled_negs AS (
+                SELECT * FROM neg_with_counts
+                WHERE rn <= 20 * pos_count
+            )
             SELECT * FROM positives
             UNION ALL
             SELECT * FROM sampled_negs
