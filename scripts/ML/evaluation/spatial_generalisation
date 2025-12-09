@@ -1,0 +1,540 @@
+#!/usr/bin/env python3
+
+"""Spatial Generalization Evaluation
+
+Purpose: Evaluate model performance across different spatial regions (region_id/biome/country).
+         Loads scored outputs from RF and LGBM models, restricts to test years (2018-2024),
+         and computes region-wise metrics: PR-AUC, ROC-AUC, Precision@Top-1%, Top-5%, Top-10%.
+
+Input:   - model1_rf_scored_*.parquet
+         - model1_lgbm_scored_*.parquet
+         - (Optional) region_id/biome/country columns in scored outputs
+
+Output:  - Region-wise metrics summary (.parquet, .csv)
+         - Top/bottom regions printed to console
+         - (Optional) W&B tables with region-wise metrics
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Dict, Any
+
+import numpy as np
+import pandas as pd
+import wandb
+from sklearn.metrics import roc_auc_score, average_precision_score
+
+
+class Tee:
+    """Write to both stdout and a file."""
+    def __init__(self, file_path: Path):
+        self.file = open(file_path, 'w', encoding='utf-8')
+        self.stdout = sys.stdout
+    
+    def write(self, text: str) -> None:
+        self.stdout.write(text)
+        self.file.write(text)
+        self.file.flush()
+    
+    def flush(self) -> None:
+        self.stdout.flush()
+        self.file.flush()
+    
+    def close(self) -> None:
+        self.file.close()
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+TEST_YEAR_MIN = 2018
+TEST_YEAR_MAX = 2024
+
+# Region grouping priority: try region_id first, then biome, then country
+REGION_COLUMNS = ['region_id', 'biome', 'country']
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def compute_precision_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) -> float:
+    """Compute precision at top k% of predictions.
+    
+    Args:
+        y_true: True labels (0 or 1)
+        y_proba: Predicted probabilities for positive class
+        k: Percentage (e.g., 1 for top 1%, 5 for top 5%)
+    
+    Returns:
+        Precision among top k% predictions
+    """
+    if len(y_true) == 0:
+        return np.nan
+    
+    n_samples = len(y_true)
+    n_top_k = max(1, int(n_samples * k / 100))
+    
+    # Get indices of top k% predictions
+    top_k_idx = np.argsort(y_proba)[-n_top_k:]
+    
+    # Calculate precision among top k%
+    return y_true[top_k_idx].sum() / n_top_k
+
+
+def find_scored_files(output_dir: Path, model_name: str) -> Optional[Path]:
+    """Find the most recent scored output file for a model.
+    
+    Args:
+        output_dir: Directory containing scored outputs
+        model_name: 'rf' or 'lgbm'
+    
+    Returns:
+        Path to scored file, or None if not found
+    """
+    pattern = f"model1_{model_name}_scored_*.parquet"
+    files = list(output_dir.glob(pattern))
+    
+    if not files:
+        return None
+    
+    # Return most recent file (by modification time)
+    return max(files, key=lambda p: p.stat().st_mtime)
+
+
+def detect_region_column(df: pd.DataFrame) -> Optional[str]:
+    """Detect which region column is available in the dataframe.
+    
+    Args:
+        df: DataFrame to check
+    
+    Returns:
+        Column name if found, None otherwise
+    """
+    for col in REGION_COLUMNS:
+        if col in df.columns:
+            return col
+    return None
+
+
+def compute_region_metrics(
+    y_true: np.ndarray,
+    y_proba: np.ndarray,
+    region_name: str
+) -> Dict[str, Any]:
+    """Compute all metrics for a region.
+    
+    Args:
+        y_true: True labels (0 or 1)
+        y_proba: Predicted probabilities for positive class
+        region_name: Name of the region (for error messages)
+    
+    Returns:
+        Dictionary with metrics
+    """
+    metrics = {
+        'n_samples': len(y_true),
+        'n_positives': int(y_true.sum()),
+        'positive_rate': float(y_true.mean()) if len(y_true) > 0 else 0.0,
+    }
+    
+    # Check if we have enough data for metrics
+    if len(y_true) == 0:
+        metrics.update({
+            'roc_auc': np.nan,
+            'pr_auc': np.nan,
+            'precision_at_1pct': np.nan,
+            'precision_at_5pct': np.nan,
+            'precision_at_10pct': np.nan,
+        })
+        return metrics
+    
+    # Check if we have both classes
+    unique_labels = np.unique(y_true)
+    if len(unique_labels) < 2:
+        # Only one class present - can't compute ROC-AUC
+        metrics.update({
+            'roc_auc': np.nan,
+            'pr_auc': np.nan if len(unique_labels) == 0 or unique_labels[0] == 0 else 1.0,
+            'precision_at_1pct': np.nan if len(unique_labels) == 0 or unique_labels[0] == 0 else 1.0,
+            'precision_at_5pct': np.nan if len(unique_labels) == 0 or unique_labels[0] == 0 else 1.0,
+            'precision_at_10pct': np.nan if len(unique_labels) == 0 or unique_labels[0] == 0 else 1.0,
+        })
+        return metrics
+    
+    # Compute ROC-AUC
+    try:
+        roc_auc = roc_auc_score(y_true, y_proba)
+    except ValueError as e:
+        print(f"  Warning: Could not compute ROC-AUC for {region_name}: {e}")
+        roc_auc = np.nan
+    
+    # Compute PR-AUC
+    try:
+        pr_auc = average_precision_score(y_true, y_proba)
+    except ValueError as e:
+        print(f"  Warning: Could not compute PR-AUC for {region_name}: {e}")
+        pr_auc = np.nan
+    
+    # Compute Precision@Top-K
+    prec_at_1 = compute_precision_at_k(y_true, y_proba, 1.0)
+    prec_at_5 = compute_precision_at_k(y_true, y_proba, 5.0)
+    prec_at_10 = compute_precision_at_k(y_true, y_proba, 10.0)
+    
+    metrics.update({
+        'roc_auc': float(roc_auc),
+        'pr_auc': float(pr_auc),
+        'precision_at_1pct': float(prec_at_1),
+        'precision_at_5pct': float(prec_at_5),
+        'precision_at_10pct': float(prec_at_10),
+    })
+    
+    return metrics
+
+
+def resolve_output_dir() -> Path:
+    """Locate output directory for scored files."""
+    repo_root = Path(__file__).resolve().parents[3]
+    output_dir = repo_root / "outputs/Results/ml_models"
+    return output_dir
+
+
+# =============================================================================
+# Main Pipeline
+# =============================================================================
+
+def main() -> None:
+    start_time = time.time()
+    
+    # -------------------------------------------------------------------------
+    # Setup paths
+    # -------------------------------------------------------------------------
+    repo_root = Path(__file__).resolve().parents[3]
+    output_dir = resolve_output_dir()
+    
+    # Output directory for evaluation results
+    eval_output_dir = repo_root / "outputs/Results/spatial_generalisation"
+    eval_output_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Initialize W&B
+    wandb_api_key = os.environ.get("WANDB_API_KEY")
+    wandb_entity = os.environ.get("WANDB_ENTITY")
+    use_wandb = bool(wandb_api_key and wandb_entity)
+    
+    if use_wandb:
+        print("Initializing Weights & Biases...")
+        wandb.init(
+            project="ml-evaluation-spatial",
+            entity=wandb_entity,
+            name=f"spatial_generalisation_{timestamp}",
+            config={
+                "test_years": f"{TEST_YEAR_MIN}-{TEST_YEAR_MAX}",
+                "models": ["RF", "LGBM"],
+            },
+        )
+        print("W&B connected\n")
+    else:
+        print("W&B not configured (WANDB_API_KEY or WANDB_ENTITY not set)\n")
+    
+    print("=" * 70)
+    print("SPATIAL GENERALIZATION EVALUATION")
+    print("=" * 70)
+    print(f"\nOutput directory: {output_dir}")
+    print(f"Evaluation output: {eval_output_dir}")
+    
+    # -------------------------------------------------------------------------
+    # Step 1: Find and load scored outputs
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 1: LOAD SCORED OUTPUTS")
+    print("=" * 70)
+    
+    rf_file = find_scored_files(output_dir, "rf")
+    lgbm_file = find_scored_files(output_dir, "lgbm")
+    
+    if rf_file is None:
+        raise FileNotFoundError(f"No RF scored output found in {output_dir}")
+    if lgbm_file is None:
+        raise FileNotFoundError(f"No LGBM scored output found in {output_dir}")
+    
+    print(f"\nRF file:   {rf_file.name}")
+    print(f"LGBM file: {lgbm_file.name}")
+    
+    print("\nLoading RF scored outputs...")
+    load_start = time.time()
+    df_rf = pd.read_parquet(rf_file)
+    print(f"  Loaded {len(df_rf):,} rows in {time.time() - load_start:.1f}s")
+    
+    print("\nLoading LGBM scored outputs...")
+    load_start = time.time()
+    df_lgbm = pd.read_parquet(lgbm_file)
+    print(f"  Loaded {len(df_lgbm):,} rows in {time.time() - load_start:.1f}s")
+    
+    # Check required columns
+    required_cols = ['year', 'y_true', 'y_pred_proba']
+    for col in required_cols:
+        if col not in df_rf.columns:
+            raise ValueError(f"Required column '{col}' not found in RF scored output")
+        if col not in df_lgbm.columns:
+            raise ValueError(f"Required column '{col}' not found in LGBM scored output")
+    
+    # Detect region column
+    region_col = detect_region_column(df_rf)
+    if region_col is None:
+        print("\n" + "!" * 70)
+        print("WARNING: No region column (region_id/biome/country) found in scored outputs.")
+        print("Creating a dummy 'region_id' column with value 'all' for global evaluation.")
+        print("To evaluate by region, add region_id/biome/country columns to scored outputs.")
+        print("!" * 70 + "\n")
+        df_rf['region_id'] = 'all'
+        df_lgbm['region_id'] = 'all'
+        region_col = 'region_id'
+    else:
+        print(f"\nUsing region column: {region_col}")
+    
+    # -------------------------------------------------------------------------
+    # Step 2: Filter to test years
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 2: FILTER TO TEST YEARS")
+    print("=" * 70)
+    
+    mask_rf = (df_rf['year'] >= TEST_YEAR_MIN) & (df_rf['year'] <= TEST_YEAR_MAX)
+    mask_lgbm = (df_lgbm['year'] >= TEST_YEAR_MIN) & (df_lgbm['year'] <= TEST_YEAR_MAX)
+    
+    df_rf_test = df_rf[mask_rf].copy()
+    df_lgbm_test = df_lgbm[mask_lgbm].copy()
+    
+    print(f"\nRF test set:   {len(df_rf_test):,} rows ({TEST_YEAR_MIN}-{TEST_YEAR_MAX})")
+    print(f"LGBM test set: {len(df_lgbm_test):,} rows ({TEST_YEAR_MIN}-{TEST_YEAR_MAX})")
+    
+    # Check year coverage
+    rf_years = sorted(df_rf_test['year'].unique())
+    lgbm_years = sorted(df_lgbm_test['year'].unique())
+    print(f"\nRF years:   {rf_years}")
+    print(f"LGBM years: {lgbm_years}")
+    
+    # Free memory
+    del df_rf, df_lgbm
+    import gc
+    gc.collect()
+    
+    # -------------------------------------------------------------------------
+    # Step 3: Compute region-wise metrics
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 3: COMPUTE REGION-WISE METRICS")
+    print("=" * 70)
+    
+    def compute_all_regions(df: pd.DataFrame, model_name: str) -> pd.DataFrame:
+        """Compute metrics for all regions in a dataframe."""
+        regions = sorted(df[region_col].unique())
+        print(f"\nComputing metrics for {len(regions)} regions ({model_name})...")
+        
+        results = []
+        for region in regions:
+            region_data = df[df[region_col] == region]
+            
+            if len(region_data) == 0:
+                continue
+            
+            y_true = region_data['y_true'].values
+            y_proba = region_data['y_pred_proba'].values
+            
+            metrics = compute_region_metrics(y_true, y_proba, str(region))
+            metrics['model'] = model_name
+            metrics[region_col] = region
+            
+            results.append(metrics)
+            
+            # Progress update
+            if len(results) % max(1, len(regions) // 10) == 0:
+                print(f"  Processed {len(results)}/{len(regions)} regions...")
+        
+        return pd.DataFrame(results)
+    
+    # Compute metrics for both models
+    results_rf = compute_all_regions(df_rf_test, "RF")
+    results_lgbm = compute_all_regions(df_lgbm_test, "LGBM")
+    
+    # Combine results
+    results_all = pd.concat([results_rf, results_lgbm], ignore_index=True)
+    
+    # Reorder columns
+    col_order = ['model', region_col, 'n_samples', 'n_positives', 'positive_rate',
+                 'roc_auc', 'pr_auc', 'precision_at_1pct', 'precision_at_5pct', 'precision_at_10pct']
+    results_all = results_all[col_order]
+    
+    print(f"\nComputed metrics for {len(results_all)} region-model combinations")
+    
+    # -------------------------------------------------------------------------
+    # Step 4: Save summary table
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 4: SAVE SUMMARY TABLE")
+    print("=" * 70)
+    
+    # Save as parquet
+    parquet_path = eval_output_dir / f"spatial_generalisation_{timestamp}.parquet"
+    results_all.to_parquet(parquet_path, index=False)
+    print(f"\nSaved to parquet: {parquet_path}")
+    
+    # Save as CSV
+    csv_path = eval_output_dir / f"spatial_generalisation_{timestamp}.csv"
+    results_all.to_csv(csv_path, index=False)
+    print(f"Saved to CSV: {csv_path}")
+    
+    # -------------------------------------------------------------------------
+    # Step 5: Print top/bottom regions
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 5: TOP/BOTTOM REGIONS")
+    print("=" * 70)
+    
+    # Filter out regions with insufficient data or NaN metrics
+    valid_results = results_all.dropna(subset=['roc_auc', 'pr_auc'])
+    valid_results = valid_results[valid_results['n_samples'] >= 100]  # At least 100 samples
+    
+    if len(valid_results) == 0:
+        print("\nNo regions with valid metrics (need at least 100 samples and non-NaN metrics)")
+    else:
+        print(f"\nAnalyzing {len(valid_results)} region-model combinations with valid metrics")
+        
+        for model in ['RF', 'LGBM']:
+            model_results = valid_results[valid_results['model'] == model]
+            
+            if len(model_results) == 0:
+                continue
+            
+            print(f"\n{'=' * 70}")
+            print(f"{model} MODEL")
+            print(f"{'=' * 70}")
+            
+            # Top regions by PR-AUC
+            print(f"\nTop 10 regions by PR-AUC:")
+            top_pr = model_results.nlargest(10, 'pr_auc')
+            for idx, row in top_pr.iterrows():
+                print(f"  {row[region_col]:<20} PR-AUC: {row['pr_auc']:.4f}  "
+                      f"ROC-AUC: {row['roc_auc']:.4f}  "
+                      f"P@1%: {row['precision_at_1pct']:.4f}  "
+                      f"n={row['n_samples']:,}")
+            
+            # Bottom regions by PR-AUC
+            print(f"\nBottom 10 regions by PR-AUC:")
+            bottom_pr = model_results.nsmallest(10, 'pr_auc')
+            for idx, row in bottom_pr.iterrows():
+                print(f"  {row[region_col]:<20} PR-AUC: {row['pr_auc']:.4f}  "
+                      f"ROC-AUC: {row['roc_auc']:.4f}  "
+                      f"P@1%: {row['precision_at_1pct']:.4f}  "
+                      f"n={row['n_samples']:,}")
+            
+            # Top regions by Precision@Top-1%
+            print(f"\nTop 10 regions by Precision@Top-1%:")
+            top_p1 = model_results.nlargest(10, 'precision_at_1pct')
+            for idx, row in top_p1.iterrows():
+                print(f"  {row[region_col]:<20} P@1%: {row['precision_at_1pct']:.4f}  "
+                      f"PR-AUC: {row['pr_auc']:.4f}  "
+                      f"n={row['n_samples']:,}")
+    
+    # -------------------------------------------------------------------------
+    # Step 6: Log to W&B (optional)
+    # -------------------------------------------------------------------------
+    if use_wandb:
+        print("\n" + "=" * 70)
+        print("STEP 6: LOG TO W&B")
+        print("=" * 70)
+        
+        # Log summary statistics
+        for model in ['RF', 'LGBM']:
+            model_results = results_all[results_all['model'] == model]
+            
+            # Overall statistics
+            wandb.log({
+                f"{model.lower()}/n_regions": len(model_results),
+                f"{model.lower()}/mean_pr_auc": float(model_results['pr_auc'].mean()),
+                f"{model.lower()}/mean_roc_auc": float(model_results['roc_auc'].mean()),
+                f"{model.lower()}/mean_precision_at_1pct": float(model_results['precision_at_1pct'].mean()),
+            })
+        
+        # Create W&B table with region-wise metrics
+        try:
+            # Convert DataFrame to W&B table format
+            table_data = []
+            for _, row in results_all.iterrows():
+                table_data.append({
+                    'model': row['model'],
+                    region_col: str(row[region_col]),
+                    'n_samples': int(row['n_samples']),
+                    'n_positives': int(row['n_positives']),
+                    'positive_rate': float(row['positive_rate']),
+                    'roc_auc': float(row['roc_auc']) if pd.notna(row['roc_auc']) else None,
+                    'pr_auc': float(row['pr_auc']) if pd.notna(row['pr_auc']) else None,
+                    'precision_at_1pct': float(row['precision_at_1pct']) if pd.notna(row['precision_at_1pct']) else None,
+                    'precision_at_5pct': float(row['precision_at_5pct']) if pd.notna(row['precision_at_5pct']) else None,
+                    'precision_at_10pct': float(row['precision_at_10pct']) if pd.notna(row['precision_at_10pct']) else None,
+                })
+            
+            # Create W&B table
+            table = wandb.Table(columns=list(table_data[0].keys()), data=[list(row.values()) for row in table_data])
+            wandb.log({f"spatial_generalisation_table": table})
+            
+            print("\nLogged region-wise metrics to W&B table")
+        except Exception as e:
+            print(f"\nWarning: Could not log to W&B table: {e}")
+    
+    # -------------------------------------------------------------------------
+    # Summary
+    # -------------------------------------------------------------------------
+    total_time = time.time() - start_time
+    
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"Test years:              {TEST_YEAR_MIN}-{TEST_YEAR_MAX}")
+    print(f"Region column:          {region_col}")
+    print(f"Total regions:          {len(results_all[region_col].unique())}")
+    print(f"Region-model combos:   {len(results_all)}")
+    print(f"Output files:")
+    print(f"  Parquet:              {parquet_path}")
+    print(f"  CSV:                  {csv_path}")
+    print(f"Total time:             {total_time:.1f}s ({total_time/60:.1f} min)")
+    print("=" * 70)
+    print("Done.")
+    
+    if use_wandb:
+        wandb.log({
+            "summary/total_time_seconds": total_time,
+            "summary/total_time_minutes": total_time / 60,
+            "summary/n_regions": len(results_all[region_col].unique()),
+            "summary/n_combinations": len(results_all),
+            "status": "success"
+        })
+        wandb.finish()
+
+
+if __name__ == "__main__":
+    # Set up output file capture
+    repo_root = Path(__file__).resolve().parents[3]
+    output_dir = repo_root / "outputs/Results/spatial_generalisation"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = output_dir / f"spatial_generalisation_{timestamp}.txt"
+    
+    tee = Tee(output_file)
+    sys.stdout = tee
+    
+    try:
+        main()
+    finally:
+        sys.stdout = tee.stdout
+        tee.close()
+        print(f"\nOutput saved to: {output_file}")
+

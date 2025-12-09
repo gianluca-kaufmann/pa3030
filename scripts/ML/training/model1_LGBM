@@ -3,10 +3,16 @@
 """LGBM Transition Model (0→1 Prediction)
 
 Purpose: Train a LightGBM model to predict transitions to protected areas (0→1).
-         Uses temporal split (train: 2000-2017, test: 2018-2024) with pre-tuned
-         hyperparameters from the sample script.
+         Uses train.parquet (2000-2017) and test.parquet (2018-2024) with pre-tuned hyperparameters
+         from lgbm_best_params.json. Uses strict temporal split for internal validation:
+         - train_early (≤2014) for training
+         - val_late (2015-2017) for validation
+         - Final model retrained on full train.parquet (2000-2017)
+         - Evaluation on test.parquet (2018-2024)
 
-Input:   `merged_panel_final.parquet`
+Input:   - train.parquet (2000-2017)
+         - test.parquet (2018-2024)
+         - lgbm_best_params.json
 Output:  - Trained model (.pkl)
          - Test predictions (.parquet)
          - Evaluation metrics (.json)
@@ -60,10 +66,6 @@ class Tee:
 # =============================================================================
 RANDOM_STATE = 42
 
-# Temporal split
-TRAIN_YEARS = range(2000, 2018)  # 2000-2017
-TEST_YEARS = range(2018, 2025)   # 2018-2024
-
 # Columns to exclude from features
 EXCLUDE_COLS = {
     'transition_01',  # Target variable
@@ -76,13 +78,17 @@ EXCLUDE_COLS = {
     'year',           # Temporal identifier
 }
 
-# Fixed parameters
+# Temporal split configuration for internal validation
+TRAIN_EARLY_YEAR_MAX = 2014  # train_early: year <= 2014
+VAL_LATE_YEAR_MIN = 2015     # val_late: 2015-2017
+VAL_LATE_YEAR_MAX = 2017
+
+# Fixed parameters (will be merged with best_params from JSON)
 FIXED_PARAMS = {
     'random_state': RANDOM_STATE,
-    'n_jobs': -1,
+    'n_jobs': int(os.environ.get("SLURM_CPUS_PER_TASK", -1)),
     'boosting_type': 'gbdt',
     'objective': 'binary',
-    'class_weight': 'balanced',
     'verbose': -1,
 }
 
@@ -140,18 +146,73 @@ def compute_precision_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) ->
     return y_true[top_k_idx].sum() / n_top_k
 
 
-def load_data(parquet_path: Path, years: range, columns: Optional[list] = None) -> pd.DataFrame:
-    """Load data for specified years from parquet file efficiently."""
-    print(f"Loading data for years {years.start}-{years.stop-1} from {parquet_path} ...")
+def resolve_parquet_file(filename: str) -> Path:
+    """Locate parquet file (prefer $SCRATCH if present)."""
+    repo_root = Path(__file__).resolve().parents[3]
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    candidates = []
+    if scratch_root is not None:
+        candidates.append(scratch_root / f"data/ml/{filename}")
+    candidates.append(repo_root / f"data/ml/{filename}")
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    raise FileNotFoundError(f"{filename} not found in expected locations")
+
+
+def resolve_best_params_json() -> Path:
+    """Locate lgbm_best_params.json (in same directory as this script)."""
+    script_dir = Path(__file__).resolve().parent
+    params_path = script_dir / "lgbm_best_params.json"
     
-    # Read parquet file with filter
-    filters = [('year', '>=', years.start), ('year', '<=', years.stop - 1)]
-    load_start = time.time()
-    df = pd.read_parquet(parquet_path, filters=filters, columns=columns)
-    load_time = time.time() - load_start
+    if not params_path.exists():
+        raise FileNotFoundError(f"lgbm_best_params.json not found at {params_path}")
     
-    print(f"  Loaded {len(df):,} rows in {load_time:.1f}s")
-    print(f"  Years: {sorted(df['year'].unique())}")
+    return params_path
+
+
+def load_best_params(params_path: Path) -> Dict[str, Any]:
+    """Load best parameters from JSON and merge with fixed params."""
+    with open(params_path, 'r') as f:
+        params_data = json.load(f)
+    
+    # Extract best_params
+    best_params = params_data.get('best_params', {})
+    
+    # Merge with fixed params (best_params override fixed_params)
+    final_params = {**FIXED_PARAMS, **best_params}
+    
+    return final_params, params_data.get('best_cv_score', None)
+
+
+def downcast_numeric_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """Downcast numeric dtypes to reduce memory usage.
+    
+    Converts:
+    - float64 → float32
+    - int64 → int32
+    
+    Args:
+        df: DataFrame to downcast
+        
+    Returns:
+        DataFrame with downcasted dtypes
+    """
+    df = df.copy()
+    
+    # Downcast floats: float64 → float32
+    float_cols = df.select_dtypes(include=['float64']).columns
+    for col in float_cols:
+        df[col] = df[col].astype('float32')
+    
+    # Downcast integers: int64 → int32
+    int_cols = df.select_dtypes(include=['int64']).columns
+    for col in int_cols:
+        df[col] = df[col].astype('int32')
+    
     return df
 
 
@@ -165,15 +226,6 @@ def get_feature_columns(df: pd.DataFrame) -> list:
     return feature_cols
 
 
-def downcast_float64_to_float32(df: pd.DataFrame) -> pd.DataFrame:
-    """Downcast float64 columns to float32 to save memory."""
-    float64_cols = df.select_dtypes(include=["float64"]).columns
-    if len(float64_cols) > 0:
-        print(f"  Downcasting {len(float64_cols)} float64 columns to float32")
-        df[float64_cols] = df[float64_cols].astype(np.float32)
-    return df
-
-
 # =============================================================================
 # Main Pipeline
 # =============================================================================
@@ -185,31 +237,11 @@ def main() -> None:
     # Setup paths
     # -------------------------------------------------------------------------
     repo_root = Path(__file__).resolve().parents[3]
-    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
     
-    # Input path (prefer SCRATCH on Euler; check multiple possible locations)
-    candidate_inputs = []
-    if scratch_root is not None and scratch_root.exists():
-        # Euler cluster: Check common locations
-        candidate_inputs.append(scratch_root / "outputs/Results/merged_panel_final.parquet")
-        candidate_inputs.append(scratch_root / "data/ml/merged_panel_final.parquet")
-    # Local fallback
-    candidate_inputs.append(repo_root / "data/ml/merged_panel_final.parquet")
-    
-    input_path = None
-    for cand in candidate_inputs:
-        if cand.exists():
-            input_path = cand
-            break
-    
-    if input_path is None:
-        error_msg = (
-            "Could not find merged_panel_final.parquet in any expected location.\n"
-            f"Checked:\n"
-        )
-        for cand in candidate_inputs:
-            error_msg += f"  - {cand}\n"
-        raise FileNotFoundError(error_msg)
+    # Input paths
+    train_path = resolve_parquet_file("train.parquet")
+    test_path = resolve_parquet_file("test.parquet")
+    params_path = resolve_best_params_json()
     
     # Output directories
     output_dir = repo_root / "outputs/Results/ml_models"
@@ -220,147 +252,288 @@ def main() -> None:
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
+    # Initialize W&B
+    wandb_api_key = os.environ.get("WANDB_API_KEY")
+    wandb_entity = os.environ.get("WANDB_ENTITY")
+    use_wandb = bool(wandb_api_key and wandb_entity)
+    
+    if use_wandb:
+        print("Initializing Weights & Biases...")
+        wandb.init(
+            project="ml-training-transitions",
+            entity=wandb_entity,
+            name=f"model1_lgbm_{timestamp}",
+            config={
+                "model": "LightGBM",
+                "task": "transition_01_prediction",
+                "random_state": RANDOM_STATE,
+                "temporal_split": {
+                    "train_early_max_year": TRAIN_EARLY_YEAR_MAX,
+                    "val_late_min_year": VAL_LATE_YEAR_MIN,
+                    "val_late_max_year": VAL_LATE_YEAR_MAX,
+                },
+            },
+        )
+        print("W&B connected\n")
+    else:
+        print("W&B not configured (WANDB_API_KEY or WANDB_ENTITY not set)\n")
+    
     print("=" * 70)
     print("LGBM TRANSITION MODEL (0→1 PREDICTION)")
     print("=" * 70)
-    print(f"\nInput:  {input_path}")
+    print(f"\nTrain:  {train_path}")
+    print(f"Test:   {test_path}")
+    print(f"Params: {params_path}")
     print(f"Output: {output_dir}")
     
     # -------------------------------------------------------------------------
-    # Step 1: Load and prepare training data (only)
+    # Step 1: Load best parameters
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("STEP 1: LOAD TRAINING DATA")
+    print("STEP 1: LOAD BEST PARAMETERS")
     print("=" * 70)
+    
+    best_params, best_cv_score = load_best_params(params_path)
+    
+    print(f"\nLoaded parameters from: {params_path}")
+    print(f"\nBest parameters:")
+    for param, value in sorted(best_params.items()):
+        if param != 'verbose':  # Skip verbose in display
+            print(f"  {param}: {value}")
+    
+    if best_cv_score is not None:
+        print(f"\nBest CV score (from tuning): {best_cv_score:.4f}")
+    
+    # -------------------------------------------------------------------------
+    # Step 2: Load data
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 2: LOAD DATA")
+    print("=" * 70)
+    
+    print(f"\nLoading train.parquet...")
+    load_start = time.time()
+    df_train = pd.read_parquet(train_path)
+    load_time = time.time() - load_start
+    print(f"  Loaded {len(df_train):,} rows in {load_time:.1f}s")
+    
+    print(f"\nLoading test.parquet...")
+    load_start = time.time()
+    df_test = pd.read_parquet(test_path)
+    load_time = time.time() - load_start
+    print(f"  Loaded {len(df_test):,} rows in {load_time:.1f}s")
+    
+    # Downcast numeric dtypes to reduce memory usage
+    print("\nDowncasting numeric dtypes (float64→float32, int64→int32)...")
+    df_train = downcast_numeric_dtypes(df_train)
+    df_test = downcast_numeric_dtypes(df_test)
+    print("  Downcasting completed")
     
     target_col = "transition_01"
     
-    df_train = load_data(input_path, TRAIN_YEARS)
-    df_train = downcast_float64_to_float32(df_train)
-    
+    # Check target column exists
     if target_col not in df_train.columns:
         raise ValueError(f"Target column '{target_col}' not found in training data")
+    if target_col not in df_test.columns:
+        raise ValueError(f"Target column '{target_col}' not found in test data")
     
+    # Drop rows with missing target
     df_train_clean = df_train.dropna(subset=[target_col])
     dropped_train = len(df_train) - len(df_train_clean)
     if dropped_train > 0:
         print(f"\nDropped {dropped_train:,} training rows with missing target")
     
-    print(f"\nTraining set: {len(df_train_clean):,} rows")
+    df_test_clean = df_test.dropna(subset=[target_col])
+    dropped_test = len(df_test) - len(df_test_clean)
+    if dropped_test > 0:
+        print(f"Dropped {dropped_test:,} test rows with missing target")
     
+    print(f"\nTraining set: {len(df_train_clean):,} rows")
+    print(f"Test set:     {len(df_test_clean):,} rows")
+    
+    # Get feature columns
     feature_cols = get_feature_columns(df_train_clean)
     excluded_cols = sorted(EXCLUDE_COLS & set(df_train_clean.columns))
     
     print(f"\nUsing {len(feature_cols)} features")
     print(f"Excluded columns ({len(excluded_cols)}): {excluded_cols}")
     
+    # Target distribution
     train_pos = (df_train_clean[target_col] > 0).sum()
     train_neg = (df_train_clean[target_col] == 0).sum()
     train_pos_pct = train_pos / len(df_train_clean) * 100
+    
+    test_pos = (df_test_clean[target_col] > 0).sum()
+    test_neg = (df_test_clean[target_col] == 0).sum()
+    test_pos_pct = test_pos / len(df_test_clean) * 100
     
     print(f"\n" + "-" * 40)
     print("Training set distribution:")
     print(f"  No transition (0): {train_neg:>12,}  ({100 - train_pos_pct:.3f}%)")
     print(f"  Transition (0→1):  {train_pos:>12,}  ({train_pos_pct:.3f}%)")
     print(f"  Class ratio:       1 : {train_neg / max(train_pos, 1):.1f}")
+    print(f"\nTest set distribution:")
+    print(f"  No transition (0): {test_neg:>12,}  ({100 - test_pos_pct:.3f}%)")
+    print(f"  Transition (0→1):  {test_pos:>12,}  ({test_pos_pct:.3f}%)")
+    print(f"  Class ratio:       1 : {test_neg / max(test_pos, 1):.1f}")
     print("-" * 40)
     
+    # Log data statistics to wandb
+    if use_wandb:
+        wandb.log({
+            "data/n_features": len(feature_cols),
+            "data/n_train": int(len(df_train_clean)),
+            "data/n_test": int(len(df_test_clean)),
+            "data/train_positives": int(train_pos),
+            "data/train_negatives": int(train_neg),
+            "data/train_positive_pct": float(train_pos_pct),
+            "data/test_positives": int(test_pos),
+            "data/test_negatives": int(test_neg),
+            "data/test_positive_pct": float(test_pos_pct),
+        })
+    
     # -------------------------------------------------------------------------
-    # Step 2: Prepare training features and target
+    # Step 3: Prepare features and target
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("STEP 2: PREPARE TRAINING FEATURES AND TARGET")
+    print("STEP 3: PREPARE FEATURES AND TARGET")
     print("=" * 70)
     
-    y_train = (df_train_clean[target_col] > 0).astype(np.int8)
-    X_train = df_train_clean[feature_cols]
-    n_train_samples = len(X_train)
+    # Check year ranges
+    train_years = sorted(df_train_clean['year'].unique())
+    test_years = sorted(df_test_clean['year'].unique())
+    print(f"\nTraining set years: {train_years[0]}-{train_years[-1]}")
+    print(f"Test set years: {test_years[0]}-{test_years[-1]}")
     
-    print(f"Training feature matrix shape: {X_train.shape}")
-    print(f"Training target shape: {y_train.shape}")
+    # Test set (unchanged)
+    y_test = (df_test_clean[target_col] > 0).astype(np.int8)
+    X_test = df_test_clean[feature_cols]
     
-    missing_train = X_train.isnull().sum()
-    cols_with_missing = missing_train[missing_train > 0]
+    print(f"\nTest feature matrix shape: {X_test.shape}")
+    print(f"Test target shape: {y_test.shape}")
+    
+    # -------------------------------------------------------------------------
+    # Step 4: Create temporal split for internal validation
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 4: TEMPORAL SPLIT FOR INTERNAL VALIDATION")
+    print("=" * 70)
+    
+    # Create temporal split: train_early (≤2014) and val_late (2015-2017)
+    mask_train_early = df_train_clean['year'] <= TRAIN_EARLY_YEAR_MAX
+    mask_val_late = (df_train_clean['year'] >= VAL_LATE_YEAR_MIN) & (df_train_clean['year'] <= VAL_LATE_YEAR_MAX)
+    
+    df_train_early = df_train_clean[mask_train_early].copy()
+    df_val_late = df_train_clean[mask_val_late].copy()
+    
+    print(f"\nTemporal split:")
+    print(f"  train_early (≤{TRAIN_EARLY_YEAR_MAX}): {len(df_train_early):,} rows")
+    print(f"  val_late ({VAL_LATE_YEAR_MIN}-{VAL_LATE_YEAR_MAX}): {len(df_val_late):,} rows")
+    
+    # Prepare features and targets for temporal split
+    y_train_early = (df_train_early[target_col] > 0).astype(np.int8)
+    X_train_early = df_train_early[feature_cols]
+    
+    y_val_late = (df_val_late[target_col] > 0).astype(np.int8)
+    X_val_late = df_val_late[feature_cols]
+    
+    print(f"\n  train_early: {X_train_early.shape[0]:,} samples, {y_train_early.sum():,} positives ({y_train_early.mean()*100:.3f}%)")
+    print(f"  val_late:     {X_val_late.shape[0]:,} samples, {y_val_late.sum():,} positives ({y_val_late.mean()*100:.3f}%)")
+    
+    # Check for missing values
+    missing_train_early = X_train_early.isnull().sum()
+    cols_with_missing = missing_train_early[missing_train_early > 0]
     if len(cols_with_missing) > 0:
-        print(f"\nWarning: {len(cols_with_missing)} columns have missing values in training set")
+        print(f"\nWarning: {len(cols_with_missing)} columns have missing values in train_early")
         print("  Top 5:")
         for col, count in cols_with_missing.head().items():
-            print(f"    {col}: {count:,} ({count/len(X_train)*100:.2f}%)")
+            print(f"    {col}: {count:,} ({count/len(X_train_early)*100:.2f}%)")
     
     # -------------------------------------------------------------------------
-    # Step 3: Train model with optimal parameters
+    # Step 5: Train on train_early and evaluate on val_late
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("STEP 3: TRAIN MODEL WITH OPTIMAL PARAMETERS")
+    print("STEP 5: TRAIN ON TRAIN_EARLY AND EVALUATE ON VAL_LATE")
     print("=" * 70)
     
-    # Optimal parameters from sample script tuning (update from model1_lgbm_sample_results JSON)
-    # TODO: Update these values from the latest model1_lgbm_sample_results_*.json output
-    best_params = {
-        **FIXED_PARAMS,
-        'n_estimators': 500,  # Update from sample script output
-        'learning_rate': 0.1,  # Update from sample script output
-        'num_leaves': 63,  # Update from sample script output
-        'max_depth': 20,  # Update from sample script output
-        'min_child_samples': 20,  # Update from sample script output
-        'subsample': 1.0,  # Update from sample script output
-        'colsample_bytree': 1.0,  # Update from sample script output
-        'scale_pos_weight': 1.0,  # Update from sample script output
-        'verbose': 1,  # Show training progress
-    }
-    
-    # Initialize W&B
-    wandb_api_key = os.environ.get("WANDB_API_KEY")
-    wandb_entity = os.environ.get("WANDB_ENTITY")
-    
-    if not wandb_api_key:
-        print("Warning: WANDB_API_KEY not found in environment")
-    if not wandb_entity:
-        print("Warning: WANDB_ENTITY not found in environment")
-    
-    print("Initializing Weights & Biases...")
-    wandb.init(
-        project="ml-training-transitions",
-        entity=wandb_entity,
-        name=f"model1_lgbm_{timestamp}",
-        config={
-            "model": "LightGBM",
-            "task": "transition_01_prediction",
-            "random_state": RANDOM_STATE,
-            "train_years": f"{TRAIN_YEARS.start}-{TRAIN_YEARS.stop-1}",
-            "test_years": f"{TEST_YEARS.start}-{TEST_YEARS.stop-1}",
-            "parameters": best_params,
-        },
-    )
-    print("W&B connected\n")
-    
-    # Log data statistics to wandb
-    wandb.log({
-        "data/n_features": len(feature_cols),
-        "data/n_train": int(len(df_train_clean)),
-        "data/n_test": int(len(df_test_clean)),
-        "data/train_positives": int(train_pos),
-        "data/train_negatives": int(train_neg),
-        "data/train_positive_pct": float(train_pos_pct),
-        "data/test_positives": int(test_pos),
-        "data/test_negatives": int(test_neg),
-        "data/test_positive_pct": float(test_pos_pct),
-    })
-    
-    print(f"\nUsing optimal parameters from sample script tuning:")
-    for param, value in sorted(best_params.items()):
-        if param != 'verbose':  # Skip verbose in display
-            print(f"  {param}: {value}")
-    
-    print(f"\nTraining LightGBM on full dataset...")
-    print(f"  Training on {len(X_train):,} samples")
+    print(f"\nTraining LightGBM on train_early...")
+    print(f"  Training on {len(X_train_early):,} samples")
     print(f"  This may take several minutes...\n")
     
-    final_model = LGBMClassifier(**best_params)
+    train_early_start = time.time()
+    model_train_early = LGBMClassifier(**best_params)
+    model_train_early.fit(X_train_early, y_train_early)
+    train_early_time = time.time() - train_early_start
     
+    print(f"\nTraining completed in {train_early_time:.1f}s ({train_early_time/60:.1f} min)")
+    
+    # Evaluate on val_late
+    print("\nEvaluating on val_late...")
+    val_start = time.time()
+    y_val_proba = model_train_early.predict_proba(X_val_late)[:, 1]
+    val_time = time.time() - val_start
+    
+    # Compute metrics on val_late
+    val_roc_auc = roc_auc_score(y_val_late, y_val_proba)
+    val_pr_auc = average_precision_score(y_val_late, y_val_proba)
+    
+    val_prec_at_k = {}
+    for k in [1, 5, 10]:
+        val_prec_at_k[k] = compute_precision_at_k(y_val_late.values, y_val_proba, k)
+    
+    val_baseline_rate = y_val_late.mean()
+    
+    print(f"\n" + "-" * 40)
+    print("Validation Set (val_late) Performance:")
+    print("-" * 40)
+    print(f"ROC-AUC: {val_roc_auc:.4f}")
+    print(f"PR-AUC:  {val_pr_auc:.4f}")
+    print(f"Precision @ top 1%:  {val_prec_at_k[1]:.4f}")
+    print(f"Precision @ top 5%:  {val_prec_at_k[5]:.4f}")
+    print(f"Precision @ top 10%: {val_prec_at_k[10]:.4f}")
+    print(f"Baseline rate: {val_baseline_rate:.4f}")
+    print("-" * 40)
+    
+    # Log validation metrics to W&B
+    if use_wandb:
+        wandb.log({
+            "val/roc_auc": float(val_roc_auc),
+            "val/pr_auc": float(val_pr_auc),
+            "val/precision_at_1pct": float(val_prec_at_k[1]),
+            "val/precision_at_5pct": float(val_prec_at_k[5]),
+            "val/precision_at_10pct": float(val_prec_at_k[10]),
+            "val/baseline_rate": float(val_baseline_rate),
+            "val/lift_at_1pct": float(val_prec_at_k[1] / val_baseline_rate) if val_baseline_rate > 0 else 0,
+            "val/lift_at_5pct": float(val_prec_at_k[5] / val_baseline_rate) if val_baseline_rate > 0 else 0,
+            "val/lift_at_10pct": float(val_prec_at_k[10] / val_baseline_rate) if val_baseline_rate > 0 else 0,
+            "val/n_samples": int(len(y_val_late)),
+            "val/n_positives": int(y_val_late.sum()),
+            "val/time_seconds": val_time,
+        })
+    
+    # Free memory
+    del df_train_early, df_val_late, X_train_early, y_train_early, X_val_late, y_val_late, model_train_early
     gc.collect()
+    
+    # -------------------------------------------------------------------------
+    # Step 6: Retrain final model on full training data (2000-2017)
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 6: RETRAIN FINAL MODEL ON FULL TRAINING DATA (2000-2017)")
+    print("=" * 70)
+    
+    # Prepare full training data
+    y_train_full = (df_train_clean[target_col] > 0).astype(np.int8)
+    X_train_full = df_train_clean[feature_cols]
+    n_train_full = len(df_train_clean)  # Save before deletion
+    
+    print(f"\nTraining LightGBM on full training dataset...")
+    print(f"  Training on {len(X_train_full):,} samples (2000-2017)")
+    print(f"  This may take several minutes...\n")
+    
     train_start = time.time()
-    final_model.fit(X_train, y_train)
+    final_model = LGBMClassifier(**best_params)
+    final_model.fit(X_train_full, y_train_full)
     train_time = time.time() - train_start
     
     print(f"\nTraining completed in {train_time:.1f}s ({train_time/60:.1f} min)")
@@ -371,91 +544,31 @@ def main() -> None:
         pickle.dump(final_model, f)
     print(f"\nModel saved to: {model_path}")
     
-    # Log training time and parameters
-    wandb.log({
-        "training/time_seconds": train_time,
-        "training/time_minutes": train_time / 60,
-        "model/parameters": best_params,
-    })
+    # Log training time
+    if use_wandb:
+        wandb.log({
+            "training/train_early_time_seconds": train_early_time,
+            "training/train_early_time_minutes": train_early_time / 60,
+            "training/final_train_time_seconds": train_time,
+            "training/final_train_time_minutes": train_time / 60,
+        })
     
-    # Free memory before loading test set
-    del df_train, df_train_clean, X_train, y_train
+    # Free memory
+    del df_train, df_train_clean, X_train_full, y_train_full
     gc.collect()
     
     # -------------------------------------------------------------------------
-    # Step 4: Load and prepare test data after training
+    # Step 7: Evaluate on test set (2018-2024)
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("STEP 4: LOAD TEST DATA")
-    print("=" * 70)
-    
-    df_test = load_data(input_path, TEST_YEARS, columns=list(feature_cols + [target_col]))
-    df_test = downcast_float64_to_float32(df_test)
-    
-    if target_col not in df_test.columns:
-        raise ValueError(f"Target column '{target_col}' not found in test data")
-    
-    df_test_clean = df_test.dropna(subset=[target_col])
-    dropped_test = len(df_test) - len(df_test_clean)
-    if dropped_test > 0:
-        print(f"Dropped {dropped_test:,} test rows with missing target")
-    
-    print(f"\nTest set: {len(df_test_clean):,} rows")
-    
-    test_pos = (df_test_clean[target_col] > 0).sum()
-    test_neg = (df_test_clean[target_col] == 0).sum()
-    test_pos_pct = test_pos / len(df_test_clean) * 100
-    
-    print(f"\n" + "-" * 40)
-    print("Test set distribution:")
-    print(f"  No transition (0): {test_neg:>12,}  ({100 - test_pos_pct:.3f}%)")
-    print(f"  Transition (0→1):  {test_pos:>12,}  ({test_pos_pct:.3f}%)")
-    print(f"  Class ratio:       1 : {test_neg / max(test_pos, 1):.1f}")
-    print("-" * 40)
-    
-    print("\n" + "=" * 70)
-    print("STEP 5: PREPARE TEST FEATURES AND TARGET")
-    print("=" * 70)
-    
-    y_test = (df_test_clean[target_col] > 0).astype(np.int8)
-    X_test = df_test_clean[feature_cols]
-    n_test_samples = len(X_test)
-    
-    print(f"Test feature matrix shape: {X_test.shape}")
-    print(f"Test target shape: {y_test.shape}")
-    
-    gc.collect()
-    
-    # -------------------------------------------------------------------------
-    # Step 6: Evaluate on test set
-    # -------------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("STEP 6: EVALUATE ON TEST SET (2018-2024)")
+    print("STEP 7: EVALUATE ON TEST SET (2018-2024)")
     print("=" * 70)
     
     print("\nComputing predictions...")
     pred_start = time.time()
-    y_pred = final_model.predict(X_test)
     y_proba = final_model.predict_proba(X_test)[:, 1]
     pred_time = time.time() - pred_start
     print(f"  Predicted {len(y_test):,} samples in {pred_time:.1f}s")
-    
-    # Classification report
-    print("\n" + "-" * 40)
-    print("Classification Report:")
-    print("-" * 40)
-    print(classification_report(y_test, y_pred, digits=4))
-    
-    # Confusion matrix
-    cm = confusion_matrix(y_test, y_pred)
-    tn, fp, fn, tp = cm.ravel()
-    
-    print("\n" + "-" * 40)
-    print("Confusion Matrix:")
-    print("-" * 40)
-    print(f"                 Predicted 0    Predicted 1")
-    print(f"Actual 0  {tn:>15,}  {fp:>14,}")
-    print(f"Actual 1  {fn:>15,}  {tp:>14,}")
     
     # AUC metrics
     roc_auc = roc_auc_score(y_test, y_proba)
@@ -495,25 +608,18 @@ def main() -> None:
         print(f"  Top {k:>2}%: {lift:.2f}x")
     
     # Log test metrics
-    wandb.log({
-        "test/roc_auc": float(roc_auc),
-        "test/pr_auc": float(pr_auc),
-        "test/true_negatives": int(tn),
-        "test/false_positives": int(fp),
-        "test/false_negatives": int(fn),
-        "test/true_positives": int(tp),
-        "test/accuracy": float((tp + tn) / (tp + tn + fp + fn)),
-        "test/precision": float(tp / (tp + fp)) if (tp + fp) > 0 else 0,
-        "test/recall": float(tp / (tp + fn)) if (tp + fn) > 0 else 0,
-        "test/f1": float(2 * tp / (2 * tp + fp + fn)) if (2 * tp + fp + fn) > 0 else 0,
-        "test/precision_at_1pct": float(prec_at_k[1]),
-        "test/precision_at_5pct": float(prec_at_k[5]),
-        "test/precision_at_10pct": float(prec_at_k[10]),
-        "test/baseline_rate": float(baseline_rate),
-        "test/lift_at_1pct": float(prec_at_k[1] / baseline_rate) if baseline_rate > 0 else 0,
-        "test/lift_at_5pct": float(prec_at_k[5] / baseline_rate) if baseline_rate > 0 else 0,
-        "test/lift_at_10pct": float(prec_at_k[10] / baseline_rate) if baseline_rate > 0 else 0,
-    })
+    if use_wandb:
+        wandb.log({
+            "test/roc_auc": float(roc_auc),
+            "test/pr_auc": float(pr_auc),
+            "test/precision_at_1pct": float(prec_at_k[1]),
+            "test/precision_at_5pct": float(prec_at_k[5]),
+            "test/precision_at_10pct": float(prec_at_k[10]),
+            "test/baseline_rate": float(baseline_rate),
+            "test/lift_at_1pct": float(prec_at_k[1] / baseline_rate) if baseline_rate > 0 else 0,
+            "test/lift_at_5pct": float(prec_at_k[5] / baseline_rate) if baseline_rate > 0 else 0,
+            "test/lift_at_10pct": float(prec_at_k[10] / baseline_rate) if baseline_rate > 0 else 0,
+        })
     
     # Feature importance
     print("\n" + "-" * 40)
@@ -526,28 +632,31 @@ def main() -> None:
     print(feature_importance.head(20).to_string(index=False))
     
     # -------------------------------------------------------------------------
-    # Step 5: Save predictions and metrics
+    # Step 8: Save predictions and metrics
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("STEP 5: SAVE PREDICTIONS AND METRICS")
+    print("STEP 8: SAVE PREDICTIONS AND METRICS")
     print("=" * 70)
     
-    # Create predictions dataframe
-    predictions_df = pd.DataFrame({
+    # Create scored outputs dataframe (id columns + y_true + y_pred_proba)
+    scored_df = pd.DataFrame({
         'row': df_test_clean['row'].values,
         'col': df_test_clean['col'].values,
         'year': df_test_clean['year'].values,
-        'x': df_test_clean['x'].values if 'x' in df_test_clean.columns else np.nan,
-        'y': df_test_clean['y'].values if 'y' in df_test_clean.columns else np.nan,
-        'true_label': y_test.values,
-        'predicted_label': y_pred,
-        'predicted_proba': y_proba,
+        'y_true': y_test.values,
+        'y_pred_proba': y_proba,
     })
     
-    # Save predictions
-    predictions_path = output_dir / f"model1_lgbm_predictions_{timestamp}.parquet"
-    predictions_df.to_parquet(predictions_path, index=False)
-    print(f"\nPredictions saved to: {predictions_path}")
+    # Add x, y if available
+    if 'x' in df_test_clean.columns:
+        scored_df['x'] = df_test_clean['x'].values
+    if 'y' in df_test_clean.columns:
+        scored_df['y'] = df_test_clean['y'].values
+    
+    # Save scored outputs
+    scored_path = output_dir / f"model1_lgbm_scored_{timestamp}.parquet"
+    scored_df.to_parquet(scored_path, index=False)
+    print(f"\nScored outputs saved to: {scored_path}")
     
     # Compile metrics
     metrics = {
@@ -556,38 +665,38 @@ def main() -> None:
             "model": "LightGBM",
             "task": "transition_01_prediction",
             "random_state": RANDOM_STATE,
-            "train_years": f"{TRAIN_YEARS.start}-{TRAIN_YEARS.stop-1}",
-            "test_years": f"{TEST_YEARS.start}-{TEST_YEARS.stop-1}",
             "n_features": len(feature_cols),
             "features": feature_cols,
         },
         "data": {
-            "n_train": int(n_train_samples),
-            "n_test": int(n_test_samples),
+            "n_train_full": int(n_train_full),
+            "n_test": int(len(X_test)),
             "train_positives": int(train_pos),
             "train_negatives": int(train_neg),
             "test_positives": int(test_pos),
             "test_negatives": int(test_neg),
         },
-        "hyperparameter_tuning": {
-            "method": "Pre-tuned (from sample script)",
-            "source": "model1_lgbm_sample_results JSON",
-            "best_params": best_params,
+        "temporal_split": {
+            "method": "strict_temporal_split",
+            "train_early_max_year": TRAIN_EARLY_YEAR_MAX,
+            "val_late_min_year": VAL_LATE_YEAR_MIN,
+            "val_late_max_year": VAL_LATE_YEAR_MAX,
+        },
+        "validation_performance": {
+            "roc_auc": float(val_roc_auc),
+            "pr_auc": float(val_pr_auc),
+            "precision_at_1pct": float(val_prec_at_k[1]),
+            "precision_at_5pct": float(val_prec_at_k[5]),
+            "precision_at_10pct": float(val_prec_at_k[10]),
+            "baseline_rate": float(val_baseline_rate),
+            "lift_at_1pct": float(val_prec_at_k[1] / val_baseline_rate) if val_baseline_rate > 0 else 0,
+            "lift_at_5pct": float(val_prec_at_k[5] / val_baseline_rate) if val_baseline_rate > 0 else 0,
+            "lift_at_10pct": float(val_prec_at_k[10] / val_baseline_rate) if val_baseline_rate > 0 else 0,
         },
         "model_parameters": best_params,
         "test_performance": {
             "roc_auc": float(roc_auc),
             "pr_auc": float(pr_auc),
-            "confusion_matrix": {
-                "tn": int(tn),
-                "fp": int(fp),
-                "fn": int(fn),
-                "tp": int(tp),
-            },
-            "accuracy": float((tp + tn) / (tp + tn + fp + fn)),
-            "precision": float(tp / (tp + fp)) if (tp + fp) > 0 else 0,
-            "recall": float(tp / (tp + fn)) if (tp + fn) > 0 else 0,
-            "f1": float(2 * tp / (2 * tp + fp + fn)) if (2 * tp + fp + fn) > 0 else 0,
             "precision_at_1pct": float(prec_at_k[1]),
             "precision_at_5pct": float(prec_at_k[5]),
             "precision_at_10pct": float(prec_at_k[10]),
@@ -598,7 +707,9 @@ def main() -> None:
         },
         "feature_importance": feature_importance.head(20).to_dict('records'),
         "timing": {
-            "training_seconds": train_time,
+            "train_early_seconds": train_early_time,
+            "validation_seconds": val_time,
+            "final_training_seconds": train_time,
             "prediction_seconds": pred_time,
             "total_seconds": time.time() - start_time,
         },
@@ -624,6 +735,10 @@ def main() -> None:
     print(f"Model:                       LightGBM")
     print(f"Parameters:                  {best_params}")
     print(f"Features used:               {len(feature_cols)}")
+    print(f"\nTemporal Split (Internal Validation):")
+    print(f"  train_early (≤{TRAIN_EARLY_YEAR_MAX}) → val_late ({VAL_LATE_YEAR_MIN}-{VAL_LATE_YEAR_MAX})")
+    print(f"  Validation PR-AUC:         {val_pr_auc:.4f}")
+    print(f"  Validation ROC-AUC:        {val_roc_auc:.4f}")
     print(f"\nTest Set Performance (2018-2024):")
     print(f"  Samples:                   {len(y_test):,}")
     print(f"  Positive rate:             {test_pos_pct:.3f}%")
@@ -633,19 +748,21 @@ def main() -> None:
     print(f"  Precision @ top 5%:        {prec_at_k[5]:.4f} ({prec_at_k[5]/baseline_rate:.1f}x lift)")
     print(f"  Precision @ top 10%:       {prec_at_k[10]:.4f} ({prec_at_k[10]/baseline_rate:.1f}x lift)")
     print(f"\nTimings:")
-    print(f"  Model training:            {train_time:.1f}s ({train_time/60:.1f} min)")
+    print(f"  Train early (≤{TRAIN_EARLY_YEAR_MAX}):     {train_early_time:.1f}s ({train_early_time/60:.1f} min)")
+    print(f"  Validation (2015-2017):    {val_time:.1f}s")
+    print(f"  Final training (2000-2017): {train_time:.1f}s ({train_time/60:.1f} min)")
     print(f"  Total time:                {total_time:.1f}s ({total_time/60:.1f} min)")
     print("=" * 70)
     print("Done.")
     
     # Log final summary
-    wandb.log({
-        "summary/total_time_seconds": total_time,
-        "summary/total_time_minutes": total_time / 60,
-        "status": "success"
-    })
-    
-    wandb.finish()
+    if use_wandb:
+        wandb.log({
+            "summary/total_time_seconds": total_time,
+            "summary/total_time_minutes": total_time / 60,
+            "status": "success"
+        })
+        wandb.finish()
 
 
 if __name__ == "__main__":
