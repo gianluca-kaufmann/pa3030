@@ -51,12 +51,11 @@ def configure_duckdb(con: duckdb.DuckDBPyConnection) -> None:
     """Apply sensible local/Euler defaults."""
     is_euler = bool(os.environ.get("SCRATCH"))
     num_threads = 48 if is_euler else 4
-    memory_limit_gb = 100 if is_euler else 16
+    memory_limit_gb = 128 if is_euler else 16
 
     con.execute(f"SET threads={num_threads}")
     con.execute("SET preserve_insertion_order=false")
     con.execute(f"SET memory_limit='{memory_limit_gb}GB'")
-    con.execute(f"PRAGMA random_seed={RANDOM_STATE}")
 
     temp_dir = os.environ.get("SCRATCH") or (Path(__file__).parent / "temp")
     temp_dir_sql = str(temp_dir).replace("'", "''")
@@ -133,7 +132,7 @@ def main() -> None:
     escaped_test = str(test_out).replace("'", "''")
 
     try:
-        # TRAIN: positives + 10x negatives per year
+        # TRAIN: positives + 20x negatives per year
         train_sql = f"""
         WITH base AS (
             SELECT * FROM read_parquet('{escaped_in}')
@@ -158,7 +157,7 @@ def main() -> None:
         ),
         sampled_negs AS (
             SELECT * FROM neg_with_counts
-            WHERE rn <= 10 * pos_count
+            WHERE rn <= 20 * pos_count
         )
         COPY (
             SELECT * FROM positives
@@ -168,7 +167,7 @@ def main() -> None:
         TO '{escaped_train}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """
 
-        print("\nCreating TRAIN split (2000–2017) with 1:10 stratified negatives...")
+        print("\nCreating TRAIN split (2000–2017) with 1:20 stratified negatives...")
         train_start = time.time()
         con.execute(train_sql)
         print(f"TRAIN written in {time.time() - train_start:.1f}s")
