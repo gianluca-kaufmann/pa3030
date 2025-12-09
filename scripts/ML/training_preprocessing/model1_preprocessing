@@ -142,23 +142,17 @@ def main() -> None:
             positives AS (
                 SELECT * FROM base WHERE transition_01 = 1
             ),
-            neg_with_counts AS (
-                SELECT
-                    b.*,
-                    COALESCE(p.pos_count, 0) AS pos_count,
-                    ROW_NUMBER() OVER (PARTITION BY b.year ORDER BY random()) AS rn
-                FROM base b
-                LEFT JOIN (
-                    SELECT year, COUNT(*) AS pos_count
-                    FROM positives
-                    GROUP BY year
-                ) p
-                ON b.year = p.year
-                WHERE b.transition_01 = 0
+            pos_counts AS (
+                SELECT year, COUNT(*) AS pos_count
+                FROM positives
+                GROUP BY year
             ),
             sampled_negs AS (
-                SELECT * FROM neg_with_counts
-                WHERE rn <= 20 * pos_count
+                SELECT b.*
+                FROM base b
+                LEFT JOIN pos_counts p ON b.year = p.year
+                WHERE b.transition_01 = 0
+                QUALIFY ROW_NUMBER() OVER (PARTITION BY b.year ORDER BY random()) <= 20 * COALESCE(p.pos_count, 0)
             )
             SELECT * FROM positives
             UNION ALL
