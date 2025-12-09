@@ -146,7 +146,7 @@ def main() -> None:
                 SELECT
                     b.*,
                     COALESCE(p.pos_count, 0) AS pos_count,
-                    ROW_NUMBER() OVER (PARTITION BY b.year ORDER BY random({RANDOM_STATE})) AS rn
+                    ROW_NUMBER() OVER (PARTITION BY b.year ORDER BY random()) AS rn
                 FROM base b
                 LEFT JOIN (
                     SELECT year, COUNT(*) AS pos_count
@@ -168,6 +168,9 @@ def main() -> None:
         """
 
         print("\nCreating TRAIN split (2000–2017) with 1:20 stratified negatives...")
+        # Set random seed for reproducible sampling (normalize integer seed to 0-1 range)
+        seed_value = RANDOM_STATE / 100.0
+        con.execute(f"SELECT setseed({seed_value})")
         train_start = time.time()
         con.execute(train_sql)
         print(f"TRAIN written in {time.time() - train_start:.1f}s")
