@@ -470,53 +470,136 @@ def phase2_testing(
     best_params: Dict[str, Any],
     start_time: float,
 ) -> None:
-    """Phase 2: Testing phase - loads test.parquet, loads model, evaluates."""
+    """Phase 2: Testing phase - loads test.parquet in batches, loads model, evaluates."""
     print("\n" + "=" * 70)
-    print("PHASE 2: TESTING")
+    print("PHASE 2: TESTING (BATCH PROCESSING)")
     print("=" * 70)
     
     # -------------------------------------------------------------------------
-    # Load test data
+    # Load model
     # -------------------------------------------------------------------------
-    df_test = load_and_preprocess(test_path, keep_cols_test, target_col, "test.parquet")
-    y_test = (df_test[target_col] > 0).astype(np.int8)
-    X_test = df_test[feature_cols]
-    test_pos, test_neg = int(y_test.sum()), int((y_test == 0).sum())
-    test_years = sorted(df_test['year'].unique())
+    print(f"\nLoading saved model from: {model_path}")
+    with open(model_path, 'rb') as f:
+        final_model = pickle.load(f)
+    
+    # -------------------------------------------------------------------------
+    # Batch processing for inference
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("BATCH PROCESSING FOR INFERENCE")
+    print("=" * 70)
+    
+    batch_size = 100_000
+    print(f"\nProcessing test.parquet in batches of {batch_size:,} rows...")
+    
+    # Open parquet file for batch iteration
+    parquet_file = pq.ParquetFile(test_path)
+    
+    # Accumulators for results and statistics
+    scored_results = []  # List of DataFrames with (row, col, year, y_true, y_pred_proba, x, y)
+    y_true_all = []  # Accumulate all y_true for metrics
+    y_proba_all = []  # Accumulate all y_proba for metrics
+    test_pos = 0
+    test_neg = 0
+    test_years_set = set()
+    n_test_total = 0
+    
+    pred_start = time.time()
+    batch_num = 0
+    
+    # Iterate over batches
+    for batch in parquet_file.iter_batches(batch_size=batch_size, columns=keep_cols_test):
+        batch_num += 1
+        batch_df = batch.to_pandas()
+        
+        # Drop rows with missing target
+        batch_df = batch_df.dropna(subset=[target_col])
+        if len(batch_df) == 0:
+            continue
+        
+        # Downcast numeric dtypes to reduce memory
+        downcast_numeric_dtypes(batch_df)
+        
+        # Extract target and features
+        y_batch = (batch_df[target_col] > 0).astype(np.int8)
+        X_batch = batch_df[feature_cols].copy()
+        
+        # Make predictions
+        y_proba_batch = final_model.predict_proba(X_batch)[:, 1]
+        
+        # Accumulate for metrics
+        y_true_all.append(y_batch.values)
+        y_proba_all.append(y_proba_batch)
+        test_pos += int(y_batch.sum())
+        test_neg += int((y_batch == 0).sum())
+        test_years_set.update(batch_df['year'].unique())
+        n_test_total += len(y_batch)
+        
+        # Create lightweight result DataFrame with only necessary columns
+        result_dict = {
+            'row': batch_df['row'].values,
+            'col': batch_df['col'].values,
+            'year': batch_df['year'].values,
+            'y_true': y_batch.values,
+            'y_pred_proba': y_proba_batch,
+        }
+        # Add optional coordinate columns if present
+        for col in ['x', 'y']:
+            if col in batch_df.columns:
+                result_dict[col] = batch_df[col].values
+        
+        scored_results.append(pd.DataFrame(result_dict))
+        
+        # Free memory immediately
+        del batch_df, X_batch, y_batch, y_proba_batch
+        gc.collect()
+        
+        if batch_num % 10 == 0:
+            print(f"  Processed {batch_num} batches ({n_test_total:,} rows so far)...")
+    
+    pred_time = time.time() - pred_start
+    print(f"\n  Completed {batch_num} batches in {pred_time:.1f}s")
+    print(f"  Total rows processed: {n_test_total:,}")
+    
+    # Concatenate all results into single DataFrame
+    print("\nConcatenating batch results...")
+    scored_df = pd.concat(scored_results, ignore_index=True)
+    del scored_results
+    gc.collect()
+    print(f"  Concatenated DataFrame: {len(scored_df):,} rows")
+    
+    # Concatenate y_true and y_proba for metrics
+    y_test = np.concatenate(y_true_all)
+    y_proba = np.concatenate(y_proba_all)
+    del y_true_all, y_proba_all
+    gc.collect()
+    
+    test_years = sorted(test_years_set)
     
     print(f"\nTest set distribution:")
-    print(f"  No transition (0): {test_neg:>12,}  ({100 - test_pos/len(y_test)*100:.3f}%)")
-    print(f"  Transition (0→1):  {test_pos:>12,}  ({test_pos/len(y_test)*100:.3f}%)")
+    print(f"  No transition (0): {test_neg:>12,}  ({100 - test_pos/n_test_total*100:.3f}%)")
+    print(f"  Transition (0→1):  {test_pos:>12,}  ({test_pos/n_test_total*100:.3f}%)")
     print(f"  Class ratio:       1 : {test_neg / max(test_pos, 1):.1f}")
     print(f"  Years: {test_years[0]}-{test_years[-1]}")
     
     # Log data statistics to wandb
     if use_wandb:
         wandb.log({
-            "data/n_test": int(len(X_test)),
+            "data/n_test": int(n_test_total),
             "data/test_positives": test_pos,
             "data/test_negatives": test_neg,
-            "data/test_positive_pct": test_pos/len(y_test)*100,
+            "data/test_positive_pct": test_pos/n_test_total*100,
         })
     
     # -------------------------------------------------------------------------
-    # Load model and evaluate
+    # Compute metrics
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
     print("EVALUATE ON TEST SET (2018-2024)")
     print("=" * 70)
     
-    print(f"\nLoading saved model from: {model_path}")
-    with open(model_path, 'rb') as f:
-        final_model = pickle.load(f)
-    
-    print("\nComputing predictions...")
-    pred_start = time.time()
-    y_proba = final_model.predict_proba(X_test)[:, 1]
-    pred_time = time.time() - pred_start
-    print(f"  Predicted {len(y_test):,} samples in {pred_time:.1f}s")
-    
-    test_metrics = compute_metrics(y_test.values, y_proba)
+    print("\nComputing metrics...")
+    test_metrics = compute_metrics(y_test, y_proba)
     baseline_rate = test_metrics['baseline_rate']
     prec_at_k = {k: test_metrics[f'precision_at_{k}pct'] for k in [1, 5, 10]}
     
@@ -557,14 +640,6 @@ def phase2_testing(
     print("SAVE PREDICTIONS AND METRICS")
     print("=" * 70)
     
-    scored_df = pd.DataFrame({
-        'row': df_test['row'].values, 'col': df_test['col'].values,
-        'year': df_test['year'].values, 'y_true': y_test.values, 'y_pred_proba': y_proba,
-    })
-    for col in ['x', 'y']:
-        if col in df_test.columns:
-            scored_df[col] = df_test[col].values
-    
     # Save scored outputs
     scored_path = output_dir / f"model1_lgbm_scored_{timestamp}.parquet"
     scored_df.to_parquet(scored_path, index=False)
@@ -582,7 +657,7 @@ def phase2_testing(
         },
         "data": {
             "n_train_full": n_train_full,
-            "n_test": int(len(X_test)),
+            "n_test": int(n_test_total),
             "train_positives": train_pos,
             "train_negatives": train_neg,
             "test_positives": test_pos,
@@ -616,6 +691,10 @@ def phase2_testing(
         json.dump(metrics, f, indent=2)
     print(f"Metrics saved to: {metrics_path}")
     
+    # Free memory
+    del scored_df, y_test, y_proba, final_model
+    gc.collect()
+    
     # -------------------------------------------------------------------------
     # Summary
     # -------------------------------------------------------------------------
@@ -632,8 +711,8 @@ def phase2_testing(
     print(f"  Validation PR-AUC:         {validation_metrics['pr_auc']:.4f}")
     print(f"  Validation ROC-AUC:        {validation_metrics['roc_auc']:.4f}")
     print(f"\nTest Set Performance (2018-2024):")
-    print(f"  Samples:                   {len(y_test):,}")
-    print(f"  Positive rate:             {test_pos/len(y_test)*100:.3f}%")
+    print(f"  Samples:                   {n_test_total:,}")
+    print(f"  Positive rate:             {test_pos/n_test_total*100:.3f}%")
     print(f"  ROC-AUC:                   {test_metrics['roc_auc']:.4f}")
     print(f"  PR-AUC:                    {test_metrics['pr_auc']:.4f}")
     print(f"  Precision @ top 1%:        {prec_at_k[1]:.4f} ({test_metrics['lift_at_1pct']:.1f}x lift)")
@@ -643,6 +722,7 @@ def phase2_testing(
     print(f"  Train early (≤{TRAIN_EARLY_YEAR_MAX}):     {train_early_time:.1f}s ({train_early_time/60:.1f} min)")
     print(f"  Validation (2015-2017):    {val_time:.1f}s")
     print(f"  Final training (2000-2017): {train_time:.1f}s ({train_time/60:.1f} min)")
+    print(f"  Prediction (batch):        {pred_time:.1f}s ({pred_time/60:.1f} min)")
     print(f"  Total time:                {total_time:.1f}s ({total_time/60:.1f} min)")
     print("=" * 70)
     print("Done.")

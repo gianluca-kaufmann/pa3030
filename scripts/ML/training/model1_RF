@@ -99,12 +99,12 @@ def get_n_jobs() -> int:
     """Get safe number of jobs for parallel processing.
     
     Returns:
-        Number of CPUs to use, or -1 for all available CPUs.
+        Number of CPUs to use, capped at 8 to prevent OOM errors.
     """
     slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
     if slurm_cpus:
         try:
-            return int(slurm_cpus)
+            return min(int(slurm_cpus), 8)
         except ValueError:
             return -1
     return -1
@@ -209,7 +209,7 @@ def load_best_params(params_path: Path) -> Dict[str, Any]:
     # Merge with fixed params in correct order: FIXED_PARAMS → json_fixed_params → best_params
     final_params = {**FIXED_PARAMS, **json_fixed_params, **cleaned_params}
     
-    # Ensure n_jobs is set using safe function
+    # Force n_jobs override to prevent OOM errors (cap at 8)
     final_params['n_jobs'] = get_n_jobs()
     
     return final_params, params_data.get('best_cv_score', None)
@@ -302,10 +302,10 @@ def phase1_training(
     print("=" * 70)
     
     # =========================================================================
-    # STEP A: Load train_early (year <= 2014)
+    # STEP A: Load train_early, train model, then delete train_early
     # =========================================================================
     print("\n" + "=" * 70)
-    print("STEP A: LOAD TRAIN_EARLY (year <= 2014)")
+    print("STEP A: LOAD TRAIN_EARLY, TRAIN MODEL, DELETE TRAIN_EARLY")
     print("=" * 70)
     
     df_train = load_and_preprocess(train_path, keep_cols_train, target_col, "train.parquet")
@@ -318,33 +318,8 @@ def phase1_training(
     gc.collect()
     print("  Memory cleaned up after train_early extraction")
     
-    # =========================================================================
-    # STEP B: Load val_late (2015 <= year <= 2017)
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("STEP B: LOAD VAL_LATE (2015 <= year <= 2017)")
-    print("=" * 70)
-    
-    df_train = load_and_preprocess(train_path, keep_cols_train, target_col, "train.parquet")
-    print(f"\nFiltering val_late ({VAL_LATE_YEAR_MIN} <= year <= {VAL_LATE_YEAR_MAX})...")
-    X_val_late, y_val_late, val_late_pos, val_late_neg = extract_split(
-        df_train, feature_cols, target_col,
-        lambda y: (y >= VAL_LATE_YEAR_MIN) & (y <= VAL_LATE_YEAR_MAX), "Val late"
-    )
-    del df_train
-    gc.collect()
-    print("  Memory cleaned up after val_late extraction")
-    
-    # =========================================================================
-    # STEP C: Train early model, evaluate on val_late, compute metrics
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("STEP C: TRAIN EARLY MODEL AND EVALUATE ON VAL_LATE")
-    print("=" * 70)
-    
     print(f"\nTemporal split summary:")
     print(f"  train_early (≤{TRAIN_EARLY_YEAR_MAX}): {len(X_train_early):,} rows, {y_train_early.sum():,} positives ({y_train_early.mean()*100:.3f}%)")
-    print(f"  val_late ({VAL_LATE_YEAR_MIN}-{VAL_LATE_YEAR_MAX}): {len(X_val_late):,} rows, {y_val_late.sum():,} positives ({y_val_late.mean()*100:.3f}%)")
     
     # Create Pipeline with imputer and Random Forest
     rf_model = RandomForestClassifier(**best_params)
@@ -360,6 +335,30 @@ def phase1_training(
     train_early_time = time.time() - train_early_start
     
     print(f"\nTraining completed in {train_early_time:.1f}s ({train_early_time/60:.1f} min)")
+    
+    # Delete train_early immediately after training
+    del X_train_early, y_train_early
+    gc.collect()
+    print("  Memory cleaned up: train_early deleted, model kept in memory")
+    
+    # =========================================================================
+    # STEP B: Load val_late, evaluate, then delete val_late
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("STEP B: LOAD VAL_LATE, EVALUATE, DELETE VAL_LATE")
+    print("=" * 70)
+    
+    df_train = load_and_preprocess(train_path, keep_cols_train, target_col, "train.parquet")
+    print(f"\nFiltering val_late ({VAL_LATE_YEAR_MIN} <= year <= {VAL_LATE_YEAR_MAX})...")
+    X_val_late, y_val_late, val_late_pos, val_late_neg = extract_split(
+        df_train, feature_cols, target_col,
+        lambda y: (y >= VAL_LATE_YEAR_MIN) & (y <= VAL_LATE_YEAR_MAX), "Val late"
+    )
+    del df_train
+    gc.collect()
+    print("  Memory cleaned up after val_late extraction")
+    
+    print(f"  val_late ({VAL_LATE_YEAR_MIN}-{VAL_LATE_YEAR_MAX}): {len(X_val_late):,} rows, {y_val_late.sum():,} positives ({y_val_late.mean()*100:.3f}%)")
     
     # Evaluate on val_late
     print("\nEvaluating on val_late...")
@@ -388,10 +387,10 @@ def phase1_training(
             "val/time_seconds": val_time,
         })
     
-    # Free memory: delete all datasets and models from validation phase
-    del X_train_early, y_train_early, X_val_late, y_val_late, model_train_early
+    # Free memory: delete val_late and early model
+    del X_val_late, y_val_late, model_train_early
     gc.collect()
-    print("\n  Memory cleaned up after validation phase")
+    print("\n  Memory cleaned up: val_late and early model deleted")
     
     # =========================================================================
     # STEP D: Load full training data (2000-2017) and train final model
@@ -483,19 +482,107 @@ def phase2_testing(
     best_params: Dict[str, Any],
     start_time: float,
 ) -> None:
-    """Phase 2: Testing phase - loads test.parquet, loads model, evaluates."""
+    """Phase 2: Testing phase - batched inference to prevent OOM errors."""
     print("\n" + "=" * 70)
-    print("PHASE 2: TESTING")
+    print("PHASE 2: TESTING (BATCHED INFERENCE)")
     print("=" * 70)
     
     # -------------------------------------------------------------------------
-    # Load test data
+    # Load model first
     # -------------------------------------------------------------------------
-    df_test = load_and_preprocess(test_path, keep_cols_test, target_col, "test.parquet")
-    y_test = (df_test[target_col] > 0).astype(np.int8)
-    X_test = df_test[feature_cols]
-    test_pos, test_neg = int(y_test.sum()), int((y_test == 0).sum())
-    test_years = sorted(df_test['year'].unique())
+    print(f"\nLoading saved model from: {model_path}")
+    with open(model_path, 'rb') as f:
+        final_model = pickle.load(f)
+    
+    # -------------------------------------------------------------------------
+    # Batched inference using ParquetFile.iter_batches
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("BATCHED INFERENCE ON TEST SET (2018-2024)")
+    print("=" * 70)
+    
+    parquet_file = pq.ParquetFile(test_path)
+    batch_size = 100000
+    
+    print(f"\nProcessing test data in batches of {batch_size:,} rows...")
+    print("  Each batch: load → predict → save metadata/preds → delete")
+    
+    # Collect results from all batches
+    batch_results = []
+    test_pos = 0
+    test_neg = 0
+    test_years_set = set()
+    total_samples = 0
+    batch_idx = -1
+    
+    pred_start = time.time()
+    
+    for batch_idx, batch in enumerate(parquet_file.iter_batches(batch_size=batch_size, columns=keep_cols_test)):
+        # Convert batch to pandas
+        df_batch = batch.to_pandas()
+        
+        # Downcast to save memory
+        downcast_numeric_dtypes(df_batch)
+        
+        # Drop rows with missing target
+        df_batch.dropna(subset=[target_col], inplace=True)
+        
+        if len(df_batch) == 0:
+            del df_batch
+            gc.collect()
+            continue
+        
+        # Extract metadata and target
+        y_batch = (df_batch[target_col] > 0).astype(np.int8)
+        X_batch = df_batch[feature_cols].copy()
+        
+        # Update statistics
+        test_pos += int(y_batch.sum())
+        test_neg += int((y_batch == 0).sum())
+        test_years_set.update(df_batch['year'].unique())
+        total_samples += len(y_batch)
+        
+        # Predict
+        y_proba_batch = final_model.predict_proba(X_batch)[:, 1]
+        
+        # Save only metadata and predictions
+        batch_result = pd.DataFrame({
+            'row': df_batch['row'].values,
+            'col': df_batch['col'].values,
+            'year': df_batch['year'].values,
+            'y_true': y_batch.values,
+            'y_pred_proba': y_proba_batch,
+        })
+        
+        # Add coordinates if available
+        for col in ['x', 'y']:
+            if col in df_batch.columns:
+                batch_result[col] = df_batch[col].values
+        
+        batch_results.append(batch_result)
+        
+        # Delete batch immediately
+        del df_batch, X_batch, y_batch, y_proba_batch, batch_result
+        gc.collect()
+        
+        if (batch_idx + 1) % 10 == 0:
+            print(f"  Processed {batch_idx + 1} batches ({total_samples:,} samples so far)...")
+    
+    pred_time = time.time() - pred_start
+    n_batches = batch_idx + 1
+    print(f"\n  Completed {n_batches} batches ({total_samples:,} total samples) in {pred_time:.1f}s")
+    
+    # Concatenate all results
+    print("\nConcatenating batch results...")
+    scored_df = pd.concat(batch_results, ignore_index=True)
+    del batch_results
+    gc.collect()
+    
+    # Extract arrays for metrics computation
+    y_test = scored_df['y_true'].values
+    y_proba = scored_df['y_pred_proba'].values
+    
+    test_years = sorted(test_years_set)
     
     print(f"\nTest set distribution:")
     print(f"  No transition (0): {test_neg:>12,}  ({100 - test_pos/len(y_test)*100:.3f}%)")
@@ -506,30 +593,20 @@ def phase2_testing(
     # Log data statistics to wandb
     if use_wandb:
         wandb.log({
-            "data/n_test": int(len(X_test)),
+            "data/n_test": int(len(y_test)),
             "data/test_positives": test_pos,
             "data/test_negatives": test_neg,
             "data/test_positive_pct": test_pos/len(y_test)*100,
         })
     
     # -------------------------------------------------------------------------
-    # Load model and evaluate
+    # Compute metrics
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("EVALUATE ON TEST SET (2018-2024)")
+    print("COMPUTING METRICS")
     print("=" * 70)
     
-    print(f"\nLoading saved model from: {model_path}")
-    with open(model_path, 'rb') as f:
-        final_model = pickle.load(f)
-    
-    print("\nComputing predictions...")
-    pred_start = time.time()
-    y_proba = final_model.predict_proba(X_test)[:, 1]
-    pred_time = time.time() - pred_start
-    print(f"  Predicted {len(y_test):,} samples in {pred_time:.1f}s")
-    
-    test_metrics = compute_metrics(y_test.values, y_proba)
+    test_metrics = compute_metrics(y_test, y_proba)
     baseline_rate = test_metrics['baseline_rate']
     prec_at_k = {k: test_metrics[f'precision_at_{k}pct'] for k in [1, 5, 10]}
     
@@ -571,18 +648,14 @@ def phase2_testing(
     print("SAVE PREDICTIONS AND METRICS")
     print("=" * 70)
     
-    scored_df = pd.DataFrame({
-        'row': df_test['row'].values, 'col': df_test['col'].values,
-        'year': df_test['year'].values, 'y_true': y_test.values, 'y_pred_proba': y_proba,
-    })
-    for col in ['x', 'y']:
-        if col in df_test.columns:
-            scored_df[col] = df_test[col].values
-    
     # Save scored outputs
     scored_path = output_dir / f"model1_rf_scored_{timestamp}.parquet"
     scored_df.to_parquet(scored_path, index=False)
     print(f"\nScored outputs saved to: {scored_path}")
+    
+    # Clean up scored_df after saving
+    del scored_df
+    gc.collect()
     
     # Compile metrics
     metrics = {
@@ -596,7 +669,7 @@ def phase2_testing(
         },
         "data": {
             "n_train_full": n_train_full,
-            "n_test": int(len(X_test)),
+            "n_test": int(len(y_test)),
             "train_positives": train_pos,
             "train_negatives": train_neg,
             "test_positives": test_pos,
