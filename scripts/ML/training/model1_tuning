@@ -41,6 +41,7 @@ class Tee:
     
     def write(self, text: str) -> None:
         self.stdout.write(text)
+        self.stdout.flush()
         self.file.write(text)
         self.file.flush()
     
@@ -50,6 +51,21 @@ class Tee:
     
     def close(self) -> None:
         self.file.close()
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def get_n_jobs() -> int:
+    """Get number of jobs from SLURM_CPUS_PER_TASK, returning -1 on missing/invalid values."""
+    try:
+        cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+        if cpus is None:
+            return -1
+        return int(cpus)
+    except (ValueError, TypeError):
+        return -1
 
 
 # =============================================================================
@@ -89,7 +105,7 @@ RF_PARAM_GRID = {
 # Random Forest fixed parameters
 RF_FIXED_PARAMS = {
     'random_state': RANDOM_STATE,
-    'n_jobs': int(os.environ.get("SLURM_CPUS_PER_TASK", -1)),
+    'n_jobs': get_n_jobs(),
     'verbose': 0,
     'class_weight': 'balanced_subsample',
     'bootstrap': True,
@@ -109,7 +125,7 @@ LGBM_PARAM_GRID = {
 # LightGBM fixed parameters
 LGBM_FIXED_PARAMS = {
     'random_state': RANDOM_STATE,
-    'n_jobs': int(os.environ.get("SLURM_CPUS_PER_TASK", -1)),
+    'n_jobs': get_n_jobs(),
     'boosting_type': 'gbdt',
     'objective': 'binary',
     'verbose': -1,
@@ -195,9 +211,13 @@ def main() -> None:
     # Initialize W&B
     wandb_api_key = os.environ.get("WANDB_API_KEY")
     wandb_entity = os.environ.get("WANDB_ENTITY")
-    use_wandb = bool(wandb_api_key and wandb_entity)
+    if not wandb_api_key:
+        print("Warning: WANDB_API_KEY not found in environment")
+    if not wandb_entity:
+        print("Warning: WANDB_ENTITY not found in environment (will use default)")
     
-    if use_wandb:
+    use_wandb = False
+    try:
         print("Initializing Weights & Biases...")
         wandb.init(
             project="ml-hyperparameter-tuning",
@@ -215,9 +235,10 @@ def main() -> None:
                 "n_iter_lgbm": N_ITER_LGBM,
             },
         )
+        use_wandb = True
         print("W&B connected\n")
-    else:
-        print("W&B not configured (WANDB_API_KEY or WANDB_ENTITY not set)\n")
+    except Exception as err:
+        print(f"W&B initialization failed: {err}\n")
     
     print("=" * 70)
     print("MODEL1 HYPERPARAMETER TUNING")
@@ -423,7 +444,7 @@ def main() -> None:
         n_iter=N_ITER_RF,
         cv=predefined_split,  # Use fixed train/val split
         scoring='average_precision',  # PR-AUC (better for imbalanced data)
-        n_jobs=int(os.environ.get("SLURM_CPUS_PER_TASK", -1)),
+        n_jobs=1,  # Avoid nested parallelism
         verbose=2,
         random_state=RANDOM_STATE,
         return_train_score=True,
@@ -508,7 +529,7 @@ def main() -> None:
         n_iter=N_ITER_LGBM,
         cv=predefined_split,  # Use fixed train/val split
         scoring='average_precision',  # PR-AUC (better for imbalanced data)
-        n_jobs=int(os.environ.get("SLURM_CPUS_PER_TASK", -1)),
+        n_jobs=1,  # Avoid nested parallelism
         verbose=2,
         random_state=RANDOM_STATE,
         return_train_score=True,

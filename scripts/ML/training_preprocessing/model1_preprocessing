@@ -105,9 +105,13 @@ def main() -> None:
 
     wandb_api_key = os.environ.get("WANDB_API_KEY")
     wandb_entity = os.environ.get("WANDB_ENTITY")
-    use_wandb = bool(wandb_api_key and wandb_entity)
+    if not wandb_api_key:
+        print("Warning: WANDB_API_KEY not found in environment")
+    if not wandb_entity:
+        print("Warning: WANDB_ENTITY not found in environment (will use default)")
     
-    if use_wandb:
+    use_wandb = False
+    try:
         print("Initializing Weights & Biases...")
         wandb.init(
             project=WANDB_PROJECT,
@@ -120,9 +124,10 @@ def main() -> None:
                 "sampling_ratio_neg_per_pos": 20,
             },
         )
+        use_wandb = True
         print("W&B connected\n")
-    else:
-        print("W&B not configured (WANDB_API_KEY or WANDB_ENTITY not set)\n")
+    except Exception as err:
+        print(f"W&B initialization failed: {err}\n")
 
     input_path = resolve_input()
     base_dir = input_path.parent
