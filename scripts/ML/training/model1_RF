@@ -240,10 +240,58 @@ def load_and_preprocess(df_path: Path, columns: list, target_col: str, name: str
 
 
 def extract_split(df: pd.DataFrame, feature_cols: list, target_col: str, 
-                  year_filter, split_name: str) -> tuple:
-    """Extract X, y and stats from filtered DataFrame."""
+                  year_filter, split_name: str, max_samples: int | None = None) -> tuple:
+    """Extract X, y and stats from filtered DataFrame.
+    
+    Args:
+        df: Input DataFrame
+        feature_cols: List of feature column names
+        target_col: Target column name
+        year_filter: Function to filter years
+        split_name: Name of the split for logging
+        max_samples: Maximum number of samples. If len(df) > max_samples, keep all
+                     positives (y=1) and randomly sample negatives (y=0) to reach
+                     max_samples total. If None, use all samples.
+    
+    Returns:
+        Tuple of (X, y, pos, neg)
+    """
     df_split = df[year_filter(df['year'])].copy()
     y = (df_split[target_col] > 0).astype(np.int8)
+    
+    # Apply downsampling if needed
+    if max_samples is not None and len(df_split) > max_samples:
+        original_len = len(df_split)
+        n_pos = int(y.sum())
+        n_neg_needed = max_samples - n_pos
+        
+        if n_neg_needed < 0:
+            # Edge case: more positives than max_samples, keep all positives
+            print(f"\n  Warning: {n_pos:,} positives exceed max_samples={max_samples:,}, keeping all positives")
+            n_neg_needed = 0
+        
+        # Get indices of positives and negatives
+        pos_idx = df_split.index[y == 1]
+        neg_idx = df_split.index[y == 0]
+        
+        # Keep all positives, sample negatives
+        if n_neg_needed > 0 and len(neg_idx) > 0:
+            n_neg_to_sample = min(n_neg_needed, len(neg_idx))
+            neg_sampled_idx = np.random.RandomState(RANDOM_STATE).choice(
+                neg_idx, size=n_neg_to_sample, replace=False
+            )
+            selected_idx = pos_idx.union(pd.Index(neg_sampled_idx))
+        else:
+            selected_idx = pos_idx
+        
+        # Filter dataframe and shuffle
+        df_split = df_split.loc[selected_idx].copy()
+        df_split = df_split.sample(frac=1, random_state=RANDOM_STATE).reset_index(drop=True)
+        
+        # Re-extract y after downsampling
+        y = (df_split[target_col] > 0).astype(np.int8)
+        print(f"\n  Downsampled from {original_len:,} to {len(df_split):,} samples")
+    
     X = df_split[feature_cols].copy()
     pos, neg = int(y.sum()), int((y == 0).sum())
     years = sorted(df_split['year'].unique())
@@ -312,7 +360,8 @@ def phase1_training(
     print(f"\nFiltering train_early (year <= {TRAIN_EARLY_YEAR_MAX})...")
     X_train_early, y_train_early, train_early_pos, train_early_neg = extract_split(
         df_train, feature_cols, target_col, 
-        lambda y: y <= TRAIN_EARLY_YEAR_MAX, "Train early"
+        lambda y: y <= TRAIN_EARLY_YEAR_MAX, "Train early",
+        max_samples=5000000
     )
     del df_train
     gc.collect()
@@ -352,7 +401,8 @@ def phase1_training(
     print(f"\nFiltering val_late ({VAL_LATE_YEAR_MIN} <= year <= {VAL_LATE_YEAR_MAX})...")
     X_val_late, y_val_late, val_late_pos, val_late_neg = extract_split(
         df_train, feature_cols, target_col,
-        lambda y: (y >= VAL_LATE_YEAR_MIN) & (y <= VAL_LATE_YEAR_MAX), "Val late"
+        lambda y: (y >= VAL_LATE_YEAR_MIN) & (y <= VAL_LATE_YEAR_MAX), "Val late",
+        max_samples=None
     )
     del df_train
     gc.collect()
@@ -401,6 +451,41 @@ def phase1_training(
     
     df_train = load_and_preprocess(train_path, keep_cols_train, target_col, "train.parquet")
     y = (df_train[target_col] > 0).astype(np.int8)
+    
+    # Apply downsampling if needed (max_samples=5000000)
+    max_samples = 5000000
+    if len(df_train) > max_samples:
+        original_len = len(df_train)
+        n_pos = int(y.sum())
+        n_neg_needed = max_samples - n_pos
+        
+        if n_neg_needed < 0:
+            # Edge case: more positives than max_samples, keep all positives
+            print(f"\n  Warning: {n_pos:,} positives exceed max_samples={max_samples:,}, keeping all positives")
+            n_neg_needed = 0
+        
+        # Get indices of positives and negatives
+        pos_idx = df_train.index[y == 1]
+        neg_idx = df_train.index[y == 0]
+        
+        # Keep all positives, sample negatives
+        if n_neg_needed > 0 and len(neg_idx) > 0:
+            n_neg_to_sample = min(n_neg_needed, len(neg_idx))
+            neg_sampled_idx = np.random.RandomState(RANDOM_STATE).choice(
+                neg_idx, size=n_neg_to_sample, replace=False
+            )
+            selected_idx = pos_idx.union(pd.Index(neg_sampled_idx))
+        else:
+            selected_idx = pos_idx
+        
+        # Filter dataframe and shuffle
+        df_train = df_train.loc[selected_idx].copy()
+        df_train = df_train.sample(frac=1, random_state=RANDOM_STATE).reset_index(drop=True)
+        
+        # Re-extract y after downsampling
+        y = (df_train[target_col] > 0).astype(np.int8)
+        print(f"\n  Downsampled from {original_len:,} to {len(df_train):,} samples")
+    
     X = df_train[feature_cols].copy()
     train_pos, train_neg = int(y.sum()), int((y == 0).sum())
     train_years = sorted(df_train['year'].unique())
