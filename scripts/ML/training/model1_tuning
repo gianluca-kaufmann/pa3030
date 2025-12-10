@@ -3,7 +3,7 @@
 """Model1 Hyperparameter Tuning Script
 
 Purpose: Perform hyperparameter tuning for Random Forest and LightGBM models
-         using a random sample of ~200k rows from train.parquet with a strict
+         using a random sample of ~1M rows from train.parquet with a strict
          temporal split (train: year <= 2014, val: 2015 <= year <= 2017).
 
 Input:   `train.parquet`
@@ -72,7 +72,7 @@ def get_n_jobs() -> int:
 # Configuration
 # =============================================================================
 RANDOM_STATE = 42
-SAMPLE_SIZE = 200_000  # ~200k rows
+SAMPLE_SIZE = 1_000_000  # ~1M rows
 
 # Temporal split configuration
 TRAIN_YEAR_MAX = 2014  # train_idx = year <= 2014
@@ -92,17 +92,18 @@ EXCLUDE_COLS = {
 }
 
 # RandomizedSearchCV configuration
-N_ITER_RF = 20   # Number of parameter settings sampled for RF
-N_ITER_LGBM = 20 # Number of parameter settings sampled for LGBM
+N_ITER_RF = 10   
+N_ITER_LGBM = 50 
 
-# Random Forest parameter grid (smaller for RandomizedSearchCV)
+# Random Forest parameter grid
 RF_PARAM_GRID = {
-    'rf__n_estimators': [100, 200, 300, 500],
-    'rf__max_depth': [10, 15, 20, None],
+    'rf__n_estimators': [300, 500],
+    'rf__max_depth': [15, 20, None],
     'rf__max_features': ['sqrt', 'log2', 0.3],
+    'rf__min_samples_leaf': [2, 5, 10], 
 }
 
-# Random Forest fixed parameters
+# Random Forest fixed parameters (CORRECTED)
 RF_FIXED_PARAMS = {
     'random_state': RANDOM_STATE,
     'n_jobs': get_n_jobs(),
@@ -111,26 +112,28 @@ RF_FIXED_PARAMS = {
     'bootstrap': True,
 }
 
-# LightGBM parameter grid (smaller for RandomizedSearchCV)
+# LightGBM parameter grid
 LGBM_PARAM_GRID = {
     'num_leaves': [31, 63, 127],
-    'max_depth': [-1, 10, 20],
-    'learning_rate': [0.05, 0.1, 0.2],
+    'max_depth': [-1, 15, 25],
+    'learning_rate': [0.03, 0.05, 0.1], 
     'min_child_samples': [20, 50, 100],
-    'subsample': [0.7, 0.9, 1.0],
-    'colsample_bytree': [0.7, 0.9, 1.0],
-    'scale_pos_weight': [1.0, 2.0, 5.0],
+    'subsample': [0.7, 0.9],
+    'colsample_bytree': [0.7, 0.9],
+    'scale_pos_weight': [2.0, 5.0, 10.0],
+    'reg_alpha': [0, 0.1, 1.0],
+    'reg_lambda': [0, 0.1, 1.0], 
 }
 
-# LightGBM fixed parameters
+# LightGBM fixed parameters (CORRECTED)
 LGBM_FIXED_PARAMS = {
     'random_state': RANDOM_STATE,
     'n_jobs': get_n_jobs(),
     'boosting_type': 'gbdt',
     'objective': 'binary',
     'verbose': -1,
+    'n_estimators': 500, 
 }
-
 
 # =============================================================================
 # Utility Functions
