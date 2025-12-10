@@ -50,8 +50,16 @@ def resolve_input() -> Path:
 def configure_duckdb(con: duckdb.DuckDBPyConnection) -> None:
     """Apply sensible local/Euler defaults."""
     is_euler = bool(os.environ.get("SCRATCH"))
-    num_threads = 48 if is_euler else 4
-    memory_limit_gb = 128 if is_euler else 16
+    slurm_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", "0"))
+    num_threads = slurm_cpus if slurm_cpus > 0 else (48 if is_euler else 4)
+
+    # Match DuckDB memory to Slurm allocation when present
+    slurm_mem_per_cpu_mb = os.environ.get("SLURM_MEM_PER_CPU")
+    if slurm_mem_per_cpu_mb and slurm_cpus:
+        total_mem_mb = int(slurm_mem_per_cpu_mb) * slurm_cpus
+        memory_limit_gb = max(1, total_mem_mb // 1024)
+    else:
+        memory_limit_gb = 128 if is_euler else 16
 
     con.execute(f"SET threads={num_threads}")
     con.execute("SET preserve_insertion_order=false")
@@ -140,20 +148,24 @@ def main() -> None:
                 SELECT * FROM read_parquet('{escaped_in}')
                 WHERE year BETWEEN {TRAIN_YEARS[0]} AND {TRAIN_YEARS[1]}
             ),
+            year_counts AS (
+                SELECT
+                    year,
+                    SUM(transition_01) AS pos_count,
+                    SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS neg_count
+                FROM base
+                GROUP BY year
+            ),
             positives AS (
                 SELECT * FROM base WHERE transition_01 = 1
-            ),
-            pos_counts AS (
-                SELECT year, COUNT(*) AS pos_count
-                FROM positives
-                GROUP BY year
             ),
             sampled_negs AS (
                 SELECT b.*
                 FROM base b
-                LEFT JOIN pos_counts p ON b.year = p.year
-                WHERE b.transition_01 = 0
-                QUALIFY ROW_NUMBER() OVER (PARTITION BY b.year ORDER BY random()) <= 20 * COALESCE(p.pos_count, 0)
+                LEFT JOIN year_counts yc ON b.year = yc.year
+                WHERE
+                    b.transition_01 = 0
+                    AND random() < LEAST(1.0, 20 * COALESCE(yc.pos_count, 0)::DOUBLE / NULLIF(COALESCE(yc.neg_count, 0), 0))
             )
             SELECT * FROM positives
             UNION ALL
