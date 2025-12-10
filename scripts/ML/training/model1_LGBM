@@ -51,6 +51,7 @@ class Tee:
     def write(self, text: str) -> None:
         self.stdout.write(text)
         self.file.write(text)
+        self.stdout.flush()
         self.file.flush()
     
     def flush(self) -> None:
@@ -86,7 +87,6 @@ VAL_LATE_YEAR_MAX = 2017
 # Fixed parameters (will be merged with best_params from JSON)
 FIXED_PARAMS = {
     'random_state': RANDOM_STATE,
-    'n_jobs': int(os.environ.get("SLURM_CPUS_PER_TASK", -1)),
     'boosting_type': 'gbdt',
     'objective': 'binary',
     'verbose': -1,
@@ -96,6 +96,21 @@ FIXED_PARAMS = {
 # =============================================================================
 # Utility Functions
 # =============================================================================
+
+def get_n_jobs() -> int:
+    """Get safe number of jobs for parallel processing.
+    
+    Returns:
+        Number of CPUs to use, or -1 for all available CPUs.
+    """
+    slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+    if slurm_cpus:
+        try:
+            return int(slurm_cpus)
+        except ValueError:
+            return -1
+    return -1
+
 
 def convert_numpy_types(obj: Any) -> Any:
     """Recursively convert NumPy types to native Python types for JSON serialization."""
@@ -175,45 +190,48 @@ def resolve_best_params_json() -> Path:
 
 
 def load_best_params(params_path: Path) -> Dict[str, Any]:
-    """Load best parameters from JSON and merge with fixed params."""
+    """Load best parameters from JSON and merge with fixed params.
+    
+    Merge order (later sources override earlier):
+    1. FIXED_PARAMS (from this script)
+    2. json_fixed_params (from JSON file)
+    3. best_params (from JSON file)
+    """
     with open(params_path, 'r') as f:
         params_data = json.load(f)
     
     # Extract best_params
     best_params = params_data.get('best_params', {})
+    json_fixed_params = params_data.get('fixed_params', {})
     
-    # Merge with fixed params (best_params override fixed_params)
-    final_params = {**FIXED_PARAMS, **best_params}
+    # Merge with fixed params in correct order: FIXED_PARAMS → json_fixed_params → best_params
+    final_params = {**FIXED_PARAMS, **json_fixed_params, **best_params}
+    
+    # Ensure n_jobs is set using safe function
+    final_params['n_jobs'] = get_n_jobs()
     
     return final_params, params_data.get('best_cv_score', None)
 
 
-def downcast_numeric_dtypes(df: pd.DataFrame) -> pd.DataFrame:
-    """Downcast numeric dtypes to reduce memory usage.
+def downcast_numeric_dtypes(df: pd.DataFrame) -> None:
+    """Downcast numeric dtypes to reduce memory usage (in-place).
     
     Converts:
     - float64 → float32
     - int64 → int32
     
     Args:
-        df: DataFrame to downcast
-        
-    Returns:
-        DataFrame with downcasted dtypes
+        df: DataFrame to downcast (modified in-place)
     """
-    df = df.copy()
-    
-    # Downcast floats: float64 → float32
+    # Downcast floats: float64 → float32 (in-place with copy=False)
     float_cols = df.select_dtypes(include=['float64']).columns
     for col in float_cols:
-        df[col] = df[col].astype('float32')
+        df[col] = df[col].astype('float32', copy=False)
     
-    # Downcast integers: int64 → int32
+    # Downcast integers: int64 → int32 (in-place with copy=False)
     int_cols = df.select_dtypes(include=['int64']).columns
     for col in int_cols:
-        df[col] = df[col].astype('int32')
-    
-    return df
+        df[col] = df[col].astype('int32', copy=False)
 
 
 def get_feature_columns(df: pd.DataFrame) -> list:
@@ -310,31 +328,60 @@ def main() -> None:
         print(f"\nBest CV score (from tuning): {best_cv_score:.4f}")
     
     # -------------------------------------------------------------------------
-    # Step 2: Load data
+    # Step 2: Load data (with lazy loading)
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
     print("STEP 2: LOAD DATA")
     print("=" * 70)
     
-    print(f"\nLoading train.parquet...")
+    # Lazy loading: read column names and schema first
+    print(f"\nReading column names from train.parquet...")
+    df_schema = pd.read_parquet(train_path, nrows=0)
+    all_cols_train = df_schema.columns
+    all_cols_test = pd.read_parquet(test_path, nrows=0).columns
+    
+    # Build feature columns (all numeric columns except excluded ones)
+    target_col = "transition_01"
+    numeric_cols = df_schema.select_dtypes(include=['number']).columns.tolist()
+    feature_cols = [
+        col for col in numeric_cols
+        if col.lower() not in {c.lower() for c in EXCLUDE_COLS}
+    ]
+    
+    # Build keep_cols: feature_cols + required columns
+    required_cols = [target_col, 'year', 'row', 'col']
+    optional_cols = []
+    if 'x' in all_cols_train:
+        optional_cols.append('x')
+    if 'y' in all_cols_train:
+        optional_cols.append('y')
+    
+    keep_cols_train = feature_cols + required_cols + optional_cols
+    keep_cols_test = feature_cols + required_cols + [col for col in ['x', 'y'] if col in all_cols_test]
+    
+    print(f"  Selected {len(feature_cols)} feature columns")
+    print(f"  Loading {len(keep_cols_train)} columns (features + metadata) from train")
+    print(f"  Loading {len(keep_cols_test)} columns (features + metadata) from test")
+    
+    # Load only needed columns
+    print(f"\nLoading train.parquet (lazy loading: selected columns only)...")
     load_start = time.time()
-    df_train = pd.read_parquet(train_path)
+    df_train = pd.read_parquet(train_path, columns=keep_cols_train)
     load_time = time.time() - load_start
     print(f"  Loaded {len(df_train):,} rows in {load_time:.1f}s")
     
-    print(f"\nLoading test.parquet...")
+    print(f"\nLoading test.parquet (lazy loading: selected columns only)...")
     load_start = time.time()
-    df_test = pd.read_parquet(test_path)
+    df_test = pd.read_parquet(test_path, columns=keep_cols_test)
     load_time = time.time() - load_start
     print(f"  Loaded {len(df_test):,} rows in {load_time:.1f}s")
     
-    # Downcast numeric dtypes to reduce memory usage
+    # Downcast numeric dtypes to reduce memory usage (in-place)
     print("\nDowncasting numeric dtypes (float64→float32, int64→int32)...")
-    df_train = downcast_numeric_dtypes(df_train)
-    df_test = downcast_numeric_dtypes(df_test)
+    downcast_numeric_dtypes(df_train)
+    downcast_numeric_dtypes(df_test)
     print("  Downcasting completed")
-    
-    target_col = "transition_01"
+    gc.collect()
     
     # Check target column exists
     if target_col not in df_train.columns:
@@ -348,16 +395,23 @@ def main() -> None:
     if dropped_train > 0:
         print(f"\nDropped {dropped_train:,} training rows with missing target")
     
+    # Early cleanup: delete original df_train and collect garbage
+    del df_train
+    gc.collect()
+    
     df_test_clean = df_test.dropna(subset=[target_col])
     dropped_test = len(df_test) - len(df_test_clean)
     if dropped_test > 0:
         print(f"Dropped {dropped_test:,} test rows with missing target")
     
+    # Early cleanup: delete original df_test and collect garbage
+    del df_test
+    gc.collect()
+    
     print(f"\nTraining set: {len(df_train_clean):,} rows")
     print(f"Test set:     {len(df_test_clean):,} rows")
     
-    # Get feature columns
-    feature_cols = get_feature_columns(df_train_clean)
+    # Feature columns already computed during lazy loading
     excluded_cols = sorted(EXCLUDE_COLS & set(df_train_clean.columns))
     
     print(f"\nUsing {len(feature_cols)} features")
@@ -559,7 +613,7 @@ def main() -> None:
         })
     
     # Free memory
-    del df_train, df_train_clean, X_train_full, y_train_full
+    del df_train_clean, X_train_full, y_train_full
     gc.collect()
     
     # -------------------------------------------------------------------------
