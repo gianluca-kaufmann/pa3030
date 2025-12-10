@@ -28,7 +28,7 @@ import time
 import pickle
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Dict, Any
 
 import numpy as np
 import pandas as pd
@@ -36,12 +36,7 @@ import wandb
 import pyarrow.parquet as pq
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import (
-    classification_report,
-    confusion_matrix,
-    roc_auc_score,
-    average_precision_score,
-)
+from sklearn.metrics import roc_auc_score, average_precision_score
 from sklearn.pipeline import Pipeline
 
 
@@ -117,9 +112,8 @@ def get_n_jobs() -> int:
 
 def convert_numpy_types(obj: Any) -> Any:
     """Recursively convert NumPy types to native Python types for JSON serialization."""
-    if isinstance(obj, (np.integer, np.int_, np.intc, np.intp, np.int8,
-                        np.int16, np.int32, np.int64, np.uint8, np.uint16,
-                        np.uint32, np.uint64)):
+    if isinstance(obj, (np.integer, np.int_, np.intc, np.intp, np.int8, np.int16, np.int32, 
+                        np.int64, np.uint8, np.uint16, np.uint32, np.uint64)):
         return int(obj)
     elif isinstance(obj, (np.floating, np.float_, np.float16, np.float32, np.float64)):
         return float(obj)
@@ -135,10 +129,7 @@ def convert_numpy_types(obj: Any) -> Any:
         return obj
     else:
         try:
-            if hasattr(obj, 'item'):
-                return obj.item()
-            else:
-                return obj
+            return obj.item() if hasattr(obj, 'item') else obj
         except (ValueError, TypeError, AttributeError):
             return str(obj)
 
@@ -225,303 +216,135 @@ def load_best_params(params_path: Path) -> Dict[str, Any]:
 
 
 def downcast_numeric_dtypes(df: pd.DataFrame) -> None:
-    """Downcast numeric dtypes to reduce memory usage (in-place).
-    
-    Converts:
-    - float64 → float32
-    - int64 → int32
-    
-    Args:
-        df: DataFrame to downcast (modified in-place)
-    """
-    # Downcast floats: float64 → float32 (in-place with copy=False)
-    float_cols = df.select_dtypes(include=['float64']).columns
-    for col in float_cols:
+    """Downcast numeric dtypes to reduce memory usage (in-place)."""
+    for col in df.select_dtypes(include=['float64']).columns:
         df[col] = df[col].astype('float32', copy=False)
-    
-    # Downcast integers: int64 → int32 (in-place with copy=False)
-    int_cols = df.select_dtypes(include=['int64']).columns
-    for col in int_cols:
+    for col in df.select_dtypes(include=['int64']).columns:
         df[col] = df[col].astype('int32', copy=False)
 
 
-def get_feature_columns(df: pd.DataFrame) -> list:
-    """Get valid feature columns, excluding identifiers and leakage columns."""
-    numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
-    feature_cols = [
-        col for col in numeric_cols
-        if col.lower() not in {c.lower() for c in EXCLUDE_COLS}
-    ]
-    return feature_cols
+def load_and_preprocess(df_path: Path, columns: list, target_col: str, name: str = "") -> pd.DataFrame:
+    """Load, downcast, and preprocess DataFrame."""
+    print(f"\nLoading {name or df_path.name} (selected columns only)...")
+    load_start = time.time()
+    df = pd.read_parquet(df_path, columns=columns)
+    print(f"  Loaded {len(df):,} rows in {time.time() - load_start:.1f}s")
+    print("\nDowncasting numeric dtypes...")
+    downcast_numeric_dtypes(df)
+    gc.collect()
+    if target_col not in df.columns:
+        raise ValueError(f"Target column '{target_col}' not found")
+    df.dropna(subset=[target_col], inplace=True)
+    print(f"  {len(df):,} rows after dropna")
+    return df
+
+
+def extract_split(df: pd.DataFrame, feature_cols: list, target_col: str, 
+                  year_filter, split_name: str) -> tuple:
+    """Extract X, y and stats from filtered DataFrame."""
+    df_split = df[year_filter(df['year'])].copy()
+    y = (df_split[target_col] > 0).astype(np.int8)
+    X = df_split[feature_cols].copy()
+    pos, neg = int(y.sum()), int((y == 0).sum())
+    years = sorted(df_split['year'].unique())
+    print(f"\n{split_name} distribution:")
+    print(f"  No transition (0): {neg:>12,}  ({100 - pos/len(y)*100:.3f}%)")
+    print(f"  Transition (0→1):  {pos:>12,}  ({pos/len(y)*100:.3f}%)")
+    print(f"  Class ratio:       1 : {neg / max(pos, 1):.1f}")
+    print(f"  Years: {years[0]}-{years[-1]}")
+    return X, y, pos, neg
+
+
+def compute_metrics(y_true: np.ndarray, y_proba: np.ndarray) -> Dict[str, float]:
+    """Compute all validation/test metrics."""
+    roc_auc = roc_auc_score(y_true, y_proba)
+    pr_auc = average_precision_score(y_true, y_proba)
+    baseline_rate = y_true.mean()
+    prec_at_k = {k: compute_precision_at_k(y_true, y_proba, k) for k in [1, 5, 10]}
+    return {
+        "roc_auc": float(roc_auc), "pr_auc": float(pr_auc),
+        "precision_at_1pct": float(prec_at_k[1]),
+        "precision_at_5pct": float(prec_at_k[5]),
+        "precision_at_10pct": float(prec_at_k[10]),
+        "baseline_rate": float(baseline_rate),
+        "lift_at_1pct": float(prec_at_k[1] / baseline_rate) if baseline_rate > 0 else 0,
+        "lift_at_5pct": float(prec_at_k[5] / baseline_rate) if baseline_rate > 0 else 0,
+        "lift_at_10pct": float(prec_at_k[10] / baseline_rate) if baseline_rate > 0 else 0,
+    }
 
 
 # =============================================================================
 # Main Pipeline
 # =============================================================================
 
-def main() -> None:
-    start_time = time.time()
+def phase1_training(
+    train_path: Path,
+    params_path: Path,
+    feature_cols: list,
+    keep_cols_train: list,
+    best_params: Dict[str, Any],
+    timestamp: str,
+    model_dir: Path,
+    output_dir: Path,
+    use_wandb: bool,
+    target_col: str,
+) -> tuple[Path, Dict[str, Any], Dict[str, Any], float, float, float, float, int, int]:
+    """Phase 1: Training phase - loads only train.parquet, trains model, saves it.
     
-    # -------------------------------------------------------------------------
-    # Setup paths
-    # -------------------------------------------------------------------------
-    repo_root = Path(__file__).resolve().parents[3]
+    Uses multi-pass loading to prevent memory spikes by ensuring splits never coexist.
     
-    # Input paths
-    train_path = resolve_parquet_file("train.parquet")
-    test_path = resolve_parquet_file("test.parquet")
-    params_path = resolve_best_params_json()
-    
-    # Output directories
-    output_dir = repo_root / "outputs/Results/ml_models"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    model_dir = repo_root / "data/ml/models"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Initialize W&B
-    wandb_api_key = os.environ.get("WANDB_API_KEY")
-    wandb_entity = os.environ.get("WANDB_ENTITY")
-    if not wandb_api_key:
-        print("Warning: WANDB_API_KEY not found in environment")
-    if not wandb_entity:
-        print("Warning: WANDB_ENTITY not found in environment (will use default)")
-    
-    use_wandb = False
-    try:
-        print("Initializing Weights & Biases...")
-        wandb.init(
-            project="ml-training-transitions",
-            entity=wandb_entity,
-            name=f"model1_rf_{timestamp}",
-            config={
-                "model": "RandomForest",
-                "task": "transition_01_prediction",
-                "random_state": RANDOM_STATE,
-                "temporal_split": {
-                    "train_early_max_year": TRAIN_EARLY_YEAR_MAX,
-                    "val_late_min_year": VAL_LATE_YEAR_MIN,
-                    "val_late_max_year": VAL_LATE_YEAR_MAX,
-                },
-            },
-        )
-        use_wandb = True
-        print("W&B connected\n")
-    except Exception as err:
-        print(f"W&B initialization failed: {err}\n")
-    
-    print("=" * 70)
-    print("RF TRANSITION MODEL (0→1 PREDICTION)")
-    print("=" * 70)
-    print(f"\nTrain:  {train_path}")
-    print(f"Test:   {test_path}")
-    print(f"Params: {params_path}")
-    print(f"Output: {output_dir}")
-    
-    # -------------------------------------------------------------------------
-    # Step 1: Load best parameters
-    # -------------------------------------------------------------------------
+    Returns:
+        Tuple of (model_path, validation_metrics, train_stats, train_early_time, 
+                 val_time, train_time, train_pos, train_neg, n_train_full)
+    """
     print("\n" + "=" * 70)
-    print("STEP 1: LOAD BEST PARAMETERS")
+    print("PHASE 1: TRAINING (MULTI-PASS LOADING)")
     print("=" * 70)
     
-    best_params, best_cv_score = load_best_params(params_path)
-    
-    print(f"\nLoaded parameters from: {params_path}")
-    print(f"\nBest parameters:")
-    for param, value in sorted(best_params.items()):
-        if param != 'verbose':  # Skip verbose in display
-            print(f"  {param}: {value}")
-    
-    if best_cv_score is not None:
-        print(f"\nBest CV score (from tuning): {best_cv_score:.4f}")
-    
-    # -------------------------------------------------------------------------
-    # Step 2: Load data (with lazy loading)
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # STEP A: Load train_early (year <= 2014)
+    # =========================================================================
     print("\n" + "=" * 70)
-    print("STEP 2: LOAD DATA")
+    print("STEP A: LOAD TRAIN_EARLY (year <= 2014)")
     print("=" * 70)
     
-    # Lazy loading: read column names and schema first
-    print(f"\nReading column names from train.parquet...")
-    parquet_file_train = pq.ParquetFile(train_path)
-    all_cols_train = parquet_file_train.schema_arrow.names
-    parquet_file_test = pq.ParquetFile(test_path)
-    all_cols_test = parquet_file_test.schema_arrow.names
-    
-    # Read a small sample to get dtypes (read first row, then drop it)
-    df_schema = pd.read_parquet(train_path, columns=all_cols_train).head(1)
-    
-    # Build feature columns (all numeric columns except excluded ones)
-    target_col = "transition_01"
-    numeric_cols = df_schema.select_dtypes(include=['number']).columns.tolist()
-    feature_cols = [
-        col for col in numeric_cols
-        if col.lower() not in {c.lower() for c in EXCLUDE_COLS}
-    ]
-    
-    # Build keep_cols: feature_cols + required columns
-    required_cols = [target_col, 'year', 'row', 'col']
-    optional_cols = []
-    if 'x' in all_cols_train:
-        optional_cols.append('x')
-    if 'y' in all_cols_train:
-        optional_cols.append('y')
-    
-    keep_cols_train = feature_cols + required_cols + optional_cols
-    keep_cols_test = feature_cols + required_cols + [col for col in ['x', 'y'] if col in all_cols_test]
-    
-    print(f"  Selected {len(feature_cols)} feature columns")
-    print(f"  Loading {len(keep_cols_train)} columns (features + metadata) from train")
-    print(f"  Loading {len(keep_cols_test)} columns (features + metadata) from test")
-    
-    # Load only needed columns
-    print(f"\nLoading train.parquet (lazy loading: selected columns only)...")
-    load_start = time.time()
-    df_train = pd.read_parquet(train_path, columns=keep_cols_train)
-    load_time = time.time() - load_start
-    print(f"  Loaded {len(df_train):,} rows in {load_time:.1f}s")
-    
-    print(f"\nLoading test.parquet (lazy loading: selected columns only)...")
-    load_start = time.time()
-    df_test = pd.read_parquet(test_path, columns=keep_cols_test)
-    load_time = time.time() - load_start
-    print(f"  Loaded {len(df_test):,} rows in {load_time:.1f}s")
-    
-    # Downcast numeric dtypes to reduce memory usage (in-place)
-    print("\nDowncasting numeric dtypes (float64→float32, int64→int32)...")
-    downcast_numeric_dtypes(df_train)
-    downcast_numeric_dtypes(df_test)
-    print("  Downcasting completed")
-    gc.collect()
-    
-    # Check target column exists
-    if target_col not in df_train.columns:
-        raise ValueError(f"Target column '{target_col}' not found in training data")
-    if target_col not in df_test.columns:
-        raise ValueError(f"Target column '{target_col}' not found in test data")
-    
-    # Drop rows with missing target
-    df_train_clean = df_train.dropna(subset=[target_col])
-    dropped_train = len(df_train) - len(df_train_clean)
-    if dropped_train > 0:
-        print(f"\nDropped {dropped_train:,} training rows with missing target")
-    
-    # Early cleanup: delete original df_train and collect garbage
+    df_train = load_and_preprocess(train_path, keep_cols_train, target_col, "train.parquet")
+    print(f"\nFiltering train_early (year <= {TRAIN_EARLY_YEAR_MAX})...")
+    X_train_early, y_train_early, train_early_pos, train_early_neg = extract_split(
+        df_train, feature_cols, target_col, 
+        lambda y: y <= TRAIN_EARLY_YEAR_MAX, "Train early"
+    )
     del df_train
     gc.collect()
+    print("  Memory cleaned up after train_early extraction")
     
-    df_test_clean = df_test.dropna(subset=[target_col])
-    dropped_test = len(df_test) - len(df_test_clean)
-    if dropped_test > 0:
-        print(f"Dropped {dropped_test:,} test rows with missing target")
+    # =========================================================================
+    # STEP B: Load val_late (2015 <= year <= 2017)
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("STEP B: LOAD VAL_LATE (2015 <= year <= 2017)")
+    print("=" * 70)
     
-    # Early cleanup: delete original df_test and collect garbage
-    del df_test
+    df_train = load_and_preprocess(train_path, keep_cols_train, target_col, "train.parquet")
+    print(f"\nFiltering val_late ({VAL_LATE_YEAR_MIN} <= year <= {VAL_LATE_YEAR_MAX})...")
+    X_val_late, y_val_late, val_late_pos, val_late_neg = extract_split(
+        df_train, feature_cols, target_col,
+        lambda y: (y >= VAL_LATE_YEAR_MIN) & (y <= VAL_LATE_YEAR_MAX), "Val late"
+    )
+    del df_train
     gc.collect()
+    print("  Memory cleaned up after val_late extraction")
     
-    print(f"\nTraining set: {len(df_train_clean):,} rows")
-    print(f"Test set:     {len(df_test_clean):,} rows")
-    
-    # Feature columns already computed during lazy loading
-    excluded_cols = sorted(EXCLUDE_COLS & set(df_train_clean.columns))
-    
-    print(f"\nUsing {len(feature_cols)} features")
-    print(f"Excluded columns ({len(excluded_cols)}): {excluded_cols}")
-    
-    # Target distribution
-    train_pos = (df_train_clean[target_col] > 0).sum()
-    train_neg = (df_train_clean[target_col] == 0).sum()
-    train_pos_pct = train_pos / len(df_train_clean) * 100
-    
-    test_pos = (df_test_clean[target_col] > 0).sum()
-    test_neg = (df_test_clean[target_col] == 0).sum()
-    test_pos_pct = test_pos / len(df_test_clean) * 100
-    
-    print(f"\n" + "-" * 40)
-    print("Training set distribution:")
-    print(f"  No transition (0): {train_neg:>12,}  ({100 - train_pos_pct:.3f}%)")
-    print(f"  Transition (0→1):  {train_pos:>12,}  ({train_pos_pct:.3f}%)")
-    print(f"  Class ratio:       1 : {train_neg / max(train_pos, 1):.1f}")
-    print(f"\nTest set distribution:")
-    print(f"  No transition (0): {test_neg:>12,}  ({100 - test_pos_pct:.3f}%)")
-    print(f"  Transition (0→1):  {test_pos:>12,}  ({test_pos_pct:.3f}%)")
-    print(f"  Class ratio:       1 : {test_neg / max(test_pos, 1):.1f}")
-    print("-" * 40)
-    
-    # Log data statistics to wandb
-    if use_wandb:
-        wandb.log({
-            "data/n_features": len(feature_cols),
-            "data/n_train": int(len(df_train_clean)),
-            "data/n_test": int(len(df_test_clean)),
-            "data/train_positives": int(train_pos),
-            "data/train_negatives": int(train_neg),
-            "data/train_positive_pct": float(train_pos_pct),
-            "data/test_positives": int(test_pos),
-            "data/test_negatives": int(test_neg),
-            "data/test_positive_pct": float(test_pos_pct),
-        })
-    
-    # -------------------------------------------------------------------------
-    # Step 3: Prepare features and target
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # STEP C: Train early model, evaluate on val_late, compute metrics
+    # =========================================================================
     print("\n" + "=" * 70)
-    print("STEP 3: PREPARE FEATURES AND TARGET")
+    print("STEP C: TRAIN EARLY MODEL AND EVALUATE ON VAL_LATE")
     print("=" * 70)
     
-    # Check year ranges
-    train_years = sorted(df_train_clean['year'].unique())
-    test_years = sorted(df_test_clean['year'].unique())
-    print(f"\nTraining set years: {train_years[0]}-{train_years[-1]}")
-    print(f"Test set years: {test_years[0]}-{test_years[-1]}")
-    
-    # Test set (unchanged)
-    y_test = (df_test_clean[target_col] > 0).astype(np.int8)
-    X_test = df_test_clean[feature_cols]
-    
-    print(f"\nTest feature matrix shape: {X_test.shape}")
-    print(f"Test target shape: {y_test.shape}")
-    
-    # -------------------------------------------------------------------------
-    # Step 4: Create temporal split for internal validation
-    # -------------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("STEP 4: TEMPORAL SPLIT FOR INTERNAL VALIDATION")
-    print("=" * 70)
-    
-    # Create temporal split: train_early (≤2014) and val_late (2015-2017)
-    mask_train_early = df_train_clean['year'] <= TRAIN_EARLY_YEAR_MAX
-    mask_val_late = (df_train_clean['year'] >= VAL_LATE_YEAR_MIN) & (df_train_clean['year'] <= VAL_LATE_YEAR_MAX)
-    
-    df_train_early = df_train_clean[mask_train_early].copy()
-    df_val_late = df_train_clean[mask_val_late].copy()
-    
-    print(f"\nTemporal split:")
-    print(f"  train_early (≤{TRAIN_EARLY_YEAR_MAX}): {len(df_train_early):,} rows")
-    print(f"  val_late ({VAL_LATE_YEAR_MIN}-{VAL_LATE_YEAR_MAX}): {len(df_val_late):,} rows")
-    
-    # Prepare features and targets for temporal split
-    y_train_early = (df_train_early[target_col] > 0).astype(np.int8)
-    X_train_early = df_train_early[feature_cols]
-    
-    y_val_late = (df_val_late[target_col] > 0).astype(np.int8)
-    X_val_late = df_val_late[feature_cols]
-    
-    print(f"\n  train_early: {X_train_early.shape[0]:,} samples, {y_train_early.sum():,} positives ({y_train_early.mean()*100:.3f}%)")
-    print(f"  val_late:     {X_val_late.shape[0]:,} samples, {y_val_late.sum():,} positives ({y_val_late.mean()*100:.3f}%)")
-    
-    # Check for missing values
-    missing_train_early = X_train_early.isnull().sum()
-    cols_with_missing = missing_train_early[missing_train_early > 0]
-    if len(cols_with_missing) > 0:
-        print(f"\nWarning: {len(cols_with_missing)} columns have missing values in train_early")
-        print("  Top 5:")
-        for col, count in cols_with_missing.head().items():
-            print(f"    {col}: {count:,} ({count/len(X_train_early)*100:.2f}%)")
+    print(f"\nTemporal split summary:")
+    print(f"  train_early (≤{TRAIN_EARLY_YEAR_MAX}): {len(X_train_early):,} rows, {y_train_early.sum():,} positives ({y_train_early.mean()*100:.3f}%)")
+    print(f"  val_late ({VAL_LATE_YEAR_MIN}-{VAL_LATE_YEAR_MAX}): {len(X_val_late):,} rows, {y_val_late.sum():,} positives ({y_val_late.mean()*100:.3f}%)")
     
     # Create Pipeline with imputer and Random Forest
     rf_model = RandomForestClassifier(**best_params)
@@ -530,16 +353,7 @@ def main() -> None:
         ('rf', rf_model)
     ])
     
-    # -------------------------------------------------------------------------
-    # Step 5: Train on train_early and evaluate on val_late
-    # -------------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("STEP 5: TRAIN ON TRAIN_EARLY AND EVALUATE ON VAL_LATE")
-    print("=" * 70)
-    
-    print(f"\nTraining Pipeline (imputer + Random Forest) on train_early...")
-    print(f"  Training on {len(X_train_early):,} samples")
-    print(f"  This may take several minutes...\n")
+    print(f"\nTraining Pipeline (imputer + Random Forest) on train_early ({len(X_train_early):,} samples)...")
     
     train_early_start = time.time()
     model_train_early = pipeline.fit(X_train_early, y_train_early)
@@ -553,66 +367,73 @@ def main() -> None:
     y_val_proba = model_train_early.predict_proba(X_val_late)[:, 1]
     val_time = time.time() - val_start
     
-    # Compute metrics on val_late
-    val_roc_auc = roc_auc_score(y_val_late, y_val_proba)
-    val_pr_auc = average_precision_score(y_val_late, y_val_proba)
-    
-    val_prec_at_k = {}
-    for k in [1, 5, 10]:
-        val_prec_at_k[k] = compute_precision_at_k(y_val_late.values, y_val_proba, k)
-    
-    val_baseline_rate = y_val_late.mean()
-    
+    validation_metrics = compute_metrics(y_val_late.values, y_val_proba)
     print(f"\n" + "-" * 40)
     print("Validation Set (val_late) Performance:")
     print("-" * 40)
-    print(f"ROC-AUC: {val_roc_auc:.4f}")
-    print(f"PR-AUC:  {val_pr_auc:.4f}")
-    print(f"Precision @ top 1%:  {val_prec_at_k[1]:.4f}")
-    print(f"Precision @ top 5%:  {val_prec_at_k[5]:.4f}")
-    print(f"Precision @ top 10%: {val_prec_at_k[10]:.4f}")
-    print(f"Baseline rate: {val_baseline_rate:.4f}")
+    print(f"ROC-AUC: {validation_metrics['roc_auc']:.4f}")
+    print(f"PR-AUC:  {validation_metrics['pr_auc']:.4f}")
+    print(f"Precision @ top 1%:  {validation_metrics['precision_at_1pct']:.4f}")
+    print(f"Precision @ top 5%:  {validation_metrics['precision_at_5pct']:.4f}")
+    print(f"Precision @ top 10%: {validation_metrics['precision_at_10pct']:.4f}")
+    print(f"Baseline rate: {validation_metrics['baseline_rate']:.4f}")
     print("-" * 40)
     
     # Log validation metrics to W&B
     if use_wandb:
         wandb.log({
-            "val/roc_auc": float(val_roc_auc),
-            "val/pr_auc": float(val_pr_auc),
-            "val/precision_at_1pct": float(val_prec_at_k[1]),
-            "val/precision_at_5pct": float(val_prec_at_k[5]),
-            "val/precision_at_10pct": float(val_prec_at_k[10]),
-            "val/baseline_rate": float(val_baseline_rate),
-            "val/lift_at_1pct": float(val_prec_at_k[1] / val_baseline_rate) if val_baseline_rate > 0 else 0,
-            "val/lift_at_5pct": float(val_prec_at_k[5] / val_baseline_rate) if val_baseline_rate > 0 else 0,
-            "val/lift_at_10pct": float(val_prec_at_k[10] / val_baseline_rate) if val_baseline_rate > 0 else 0,
+            **{f"val/{k}": v for k, v in validation_metrics.items()},
             "val/n_samples": int(len(y_val_late)),
             "val/n_positives": int(y_val_late.sum()),
             "val/time_seconds": val_time,
         })
     
-    # Free memory
-    del df_train_early, df_val_late, X_train_early, y_train_early, X_val_late, y_val_late, model_train_early
+    # Free memory: delete all datasets and models from validation phase
+    del X_train_early, y_train_early, X_val_late, y_val_late, model_train_early
     gc.collect()
+    print("\n  Memory cleaned up after validation phase")
     
-    # -------------------------------------------------------------------------
-    # Step 6: Retrain final model on full training data (2000-2017)
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # STEP D: Load full training data (2000-2017) and train final model
+    # =========================================================================
     print("\n" + "=" * 70)
-    print("STEP 6: RETRAIN FINAL MODEL ON FULL TRAINING DATA (2000-2017)")
+    print("STEP D: LOAD FULL TRAINING DATA (2000-2017) AND TRAIN FINAL MODEL")
     print("=" * 70)
     
-    # Prepare full training data
-    y_train_full = (df_train_clean[target_col] > 0).astype(np.int8)
-    X_train_full = df_train_clean[feature_cols]
-    n_train_full = len(df_train_clean)  # Save before deletion
+    df_train = load_and_preprocess(train_path, keep_cols_train, target_col, "train.parquet")
+    y = (df_train[target_col] > 0).astype(np.int8)
+    X = df_train[feature_cols].copy()
+    train_pos, train_neg = int(y.sum()), int((y == 0).sum())
+    train_years = sorted(df_train['year'].unique())
+    n_train_full = len(df_train)
+    del df_train
+    gc.collect()
     
-    print(f"\nTraining Pipeline (imputer + Random Forest) on full training dataset...")
-    print(f"  Training on {len(X_train_full):,} samples (2000-2017)")
-    print(f"  This may take several minutes...\n")
+    print(f"\nFull training set distribution:")
+    print(f"  No transition (0): {train_neg:>12,}  ({100 - train_pos/len(y)*100:.3f}%)")
+    print(f"  Transition (0→1):  {train_pos:>12,}  ({train_pos/len(y)*100:.3f}%)")
+    print(f"  Class ratio:       1 : {train_neg / max(train_pos, 1):.1f}")
+    print(f"  Years: {train_years[0]}-{train_years[-1]}")
+    
+    train_stats = {
+        "n_train": n_train_full, "train_positives": train_pos, "train_negatives": train_neg,
+        "train_positive_pct": train_pos/len(y)*100, "train_years": f"{train_years[0]}-{train_years[-1]}",
+    }
+    
+    # Log data statistics to wandb
+    if use_wandb:
+        wandb.log({
+            "data/n_features": len(feature_cols),
+            "data/n_train": n_train_full,
+            "data/train_positives": train_pos,
+            "data/train_negatives": train_neg,
+            "data/train_positive_pct": train_pos/len(y)*100,
+        })
+    
+    print(f"\nTraining Pipeline (imputer + Random Forest) on full training dataset ({len(X):,} samples, 2000-2017)...")
     
     train_start = time.time()
-    final_model = pipeline.fit(X_train_full, y_train_full)
+    final_model = pipeline.fit(X, y)
     train_time = time.time() - train_start
     
     print(f"\nTraining completed in {train_time:.1f}s ({train_time/60:.1f} min)")
@@ -632,16 +453,75 @@ def main() -> None:
             "training/final_train_time_minutes": train_time / 60,
         })
     
-    # Free memory
-    del df_train_clean, X_train_full, y_train_full
+    # Cleanup: delete X, y, model
+    del X, y, final_model
     gc.collect()
     
+    print("\nPhase 1 completed. Memory cleaned up.")
+    
+    return (model_path, validation_metrics, train_stats, train_early_time, 
+            val_time, train_time, train_pos, train_neg, n_train_full)
+
+
+def phase2_testing(
+    test_path: Path,
+    model_path: Path,
+    feature_cols: list,
+    keep_cols_test: list,
+    timestamp: str,
+    output_dir: Path,
+    use_wandb: bool,
+    target_col: str,
+    validation_metrics: Dict[str, Any],
+    train_stats: Dict[str, Any],
+    train_early_time: float,
+    val_time: float,
+    train_time: float,
+    train_pos: int,
+    train_neg: int,
+    n_train_full: int,
+    best_params: Dict[str, Any],
+    start_time: float,
+) -> None:
+    """Phase 2: Testing phase - loads test.parquet, loads model, evaluates."""
+    print("\n" + "=" * 70)
+    print("PHASE 2: TESTING")
+    print("=" * 70)
+    
     # -------------------------------------------------------------------------
-    # Step 7: Evaluate on test set (2018-2024)
+    # Load test data
+    # -------------------------------------------------------------------------
+    df_test = load_and_preprocess(test_path, keep_cols_test, target_col, "test.parquet")
+    y_test = (df_test[target_col] > 0).astype(np.int8)
+    X_test = df_test[feature_cols]
+    test_pos, test_neg = int(y_test.sum()), int((y_test == 0).sum())
+    test_years = sorted(df_test['year'].unique())
+    
+    print(f"\nTest set distribution:")
+    print(f"  No transition (0): {test_neg:>12,}  ({100 - test_pos/len(y_test)*100:.3f}%)")
+    print(f"  Transition (0→1):  {test_pos:>12,}  ({test_pos/len(y_test)*100:.3f}%)")
+    print(f"  Class ratio:       1 : {test_neg / max(test_pos, 1):.1f}")
+    print(f"  Years: {test_years[0]}-{test_years[-1]}")
+    
+    # Log data statistics to wandb
+    if use_wandb:
+        wandb.log({
+            "data/n_test": int(len(X_test)),
+            "data/test_positives": test_pos,
+            "data/test_negatives": test_neg,
+            "data/test_positive_pct": test_pos/len(y_test)*100,
+        })
+    
+    # -------------------------------------------------------------------------
+    # Load model and evaluate
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("STEP 7: EVALUATE ON TEST SET (2018-2024)")
+    print("EVALUATE ON TEST SET (2018-2024)")
     print("=" * 70)
+    
+    print(f"\nLoading saved model from: {model_path}")
+    with open(model_path, 'rb') as f:
+        final_model = pickle.load(f)
     
     print("\nComputing predictions...")
     pred_start = time.time()
@@ -649,89 +529,55 @@ def main() -> None:
     pred_time = time.time() - pred_start
     print(f"  Predicted {len(y_test):,} samples in {pred_time:.1f}s")
     
-    # AUC metrics
-    roc_auc = roc_auc_score(y_test, y_proba)
-    pr_auc = average_precision_score(y_test, y_proba)
+    test_metrics = compute_metrics(y_test.values, y_proba)
+    baseline_rate = test_metrics['baseline_rate']
+    prec_at_k = {k: test_metrics[f'precision_at_{k}pct'] for k in [1, 5, 10]}
     
     print(f"\n" + "-" * 40)
     print("Area Under Curve Metrics:")
     print("-" * 40)
-    print(f"ROC-AUC: {roc_auc:.4f}")
-    print(f"PR-AUC:  {pr_auc:.4f}")
+    print(f"ROC-AUC: {test_metrics['roc_auc']:.4f}")
+    print(f"PR-AUC:  {test_metrics['pr_auc']:.4f}")
     
-    # Precision at top k%
     print(f"\n" + "-" * 40)
     print("Precision @ Top-K Predictions:")
     print("-" * 40)
-    print("(Precision among highest-confidence predictions)")
-    print()
-    
-    prec_at_k = {}
     for k in [1, 5, 10]:
-        prec = compute_precision_at_k(y_test.values, y_proba, k)
-        prec_at_k[k] = prec
         n_top_k = max(1, int(len(y_test) * k / 100))
-        n_protected_in_top_k = int(n_top_k * prec)
-        print(f"  Precision @ top {k:>2}%:  {prec:.4f}  "
+        n_protected_in_top_k = int(n_top_k * prec_at_k[k])
+        print(f"  Precision @ top {k:>2}%:  {prec_at_k[k]:.4f}  "
               f"({n_protected_in_top_k:>7,} transitions in top {n_top_k:>9,})")
-    
-    # Baseline (random)
-    baseline_rate = y_test.mean()
-    print(f"\n  Baseline (random):    {baseline_rate:.4f}  "
-          f"(overall transition rate in test set)")
-    
-    # Lift over baseline
+    print(f"\n  Baseline (random):    {baseline_rate:.4f}")
     print("\nLift over baseline:")
-    for k, prec in prec_at_k.items():
-        lift = prec / baseline_rate if baseline_rate > 0 else 0
-        print(f"  Top {k:>2}%: {lift:.2f}x")
+    for k in [1, 5, 10]:
+        print(f"  Top {k:>2}%: {test_metrics[f'lift_at_{k}pct']:.2f}x")
     
-    # Log test metrics
     if use_wandb:
-        wandb.log({
-            "test/roc_auc": float(roc_auc),
-            "test/pr_auc": float(pr_auc),
-            "test/precision_at_1pct": float(prec_at_k[1]),
-            "test/precision_at_5pct": float(prec_at_k[5]),
-            "test/precision_at_10pct": float(prec_at_k[10]),
-            "test/baseline_rate": float(baseline_rate),
-            "test/lift_at_1pct": float(prec_at_k[1] / baseline_rate) if baseline_rate > 0 else 0,
-            "test/lift_at_5pct": float(prec_at_k[5] / baseline_rate) if baseline_rate > 0 else 0,
-            "test/lift_at_10pct": float(prec_at_k[10] / baseline_rate) if baseline_rate > 0 else 0,
-        })
+        wandb.log({**{f"test/{k}": v for k, v in test_metrics.items()}})
     
-    # Feature importance (extract from the RF step in the pipeline)
     print("\n" + "-" * 40)
     print("Top 20 Most Important Features:")
     print("-" * 40)
     rf_model = final_model.named_steps['rf']
     feature_importance = pd.DataFrame({
-        'feature': feature_cols,
-        'importance': rf_model.feature_importances_
-    }).sort_values('importance', ascending=False)
-    print(feature_importance.head(20).to_string(index=False))
+        'feature': feature_cols, 'importance': rf_model.feature_importances_
+    }).sort_values('importance', ascending=False).head(20)
+    print(feature_importance.to_string(index=False))
     
     # -------------------------------------------------------------------------
-    # Step 8: Save predictions and metrics
+    # Save predictions and metrics
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("STEP 8: SAVE PREDICTIONS AND METRICS")
+    print("SAVE PREDICTIONS AND METRICS")
     print("=" * 70)
     
-    # Create scored outputs dataframe (id columns + y_true + y_pred_proba)
     scored_df = pd.DataFrame({
-        'row': df_test_clean['row'].values,
-        'col': df_test_clean['col'].values,
-        'year': df_test_clean['year'].values,
-        'y_true': y_test.values,
-        'y_pred_proba': y_proba,
+        'row': df_test['row'].values, 'col': df_test['col'].values,
+        'year': df_test['year'].values, 'y_true': y_test.values, 'y_pred_proba': y_proba,
     })
-    
-    # Add x, y if available
-    if 'x' in df_test_clean.columns:
-        scored_df['x'] = df_test_clean['x'].values
-    if 'y' in df_test_clean.columns:
-        scored_df['y'] = df_test_clean['y'].values
+    for col in ['x', 'y']:
+        if col in df_test.columns:
+            scored_df[col] = df_test[col].values
     
     # Save scored outputs
     scored_path = output_dir / f"model1_rf_scored_{timestamp}.parquet"
@@ -749,12 +595,12 @@ def main() -> None:
             "features": feature_cols,
         },
         "data": {
-            "n_train_full": int(n_train_full),
+            "n_train_full": n_train_full,
             "n_test": int(len(X_test)),
-            "train_positives": int(train_pos),
-            "train_negatives": int(train_neg),
-            "test_positives": int(test_pos),
-            "test_negatives": int(test_neg),
+            "train_positives": train_pos,
+            "train_negatives": train_neg,
+            "test_positives": test_pos,
+            "test_negatives": test_neg,
         },
         "temporal_split": {
             "method": "strict_temporal_split",
@@ -762,29 +608,9 @@ def main() -> None:
             "val_late_min_year": VAL_LATE_YEAR_MIN,
             "val_late_max_year": VAL_LATE_YEAR_MAX,
         },
-        "validation_performance": {
-            "roc_auc": float(val_roc_auc),
-            "pr_auc": float(val_pr_auc),
-            "precision_at_1pct": float(val_prec_at_k[1]),
-            "precision_at_5pct": float(val_prec_at_k[5]),
-            "precision_at_10pct": float(val_prec_at_k[10]),
-            "baseline_rate": float(val_baseline_rate),
-            "lift_at_1pct": float(val_prec_at_k[1] / val_baseline_rate) if val_baseline_rate > 0 else 0,
-            "lift_at_5pct": float(val_prec_at_k[5] / val_baseline_rate) if val_baseline_rate > 0 else 0,
-            "lift_at_10pct": float(val_prec_at_k[10] / val_baseline_rate) if val_baseline_rate > 0 else 0,
-        },
+        "validation_performance": validation_metrics,
         "model_parameters": best_params,
-        "test_performance": {
-            "roc_auc": float(roc_auc),
-            "pr_auc": float(pr_auc),
-            "precision_at_1pct": float(prec_at_k[1]),
-            "precision_at_5pct": float(prec_at_k[5]),
-            "precision_at_10pct": float(prec_at_k[10]),
-            "baseline_rate": float(baseline_rate),
-            "lift_at_1pct": float(prec_at_k[1] / baseline_rate) if baseline_rate > 0 else 0,
-            "lift_at_5pct": float(prec_at_k[5] / baseline_rate) if baseline_rate > 0 else 0,
-            "lift_at_10pct": float(prec_at_k[10] / baseline_rate) if baseline_rate > 0 else 0,
-        },
+        "test_performance": test_metrics,
         "feature_importance": feature_importance.head(20).to_dict('records'),
         "timing": {
             "train_early_seconds": train_early_time,
@@ -817,16 +643,16 @@ def main() -> None:
     print(f"Features used:               {len(feature_cols)}")
     print(f"\nTemporal Split (Internal Validation):")
     print(f"  train_early (≤{TRAIN_EARLY_YEAR_MAX}) → val_late ({VAL_LATE_YEAR_MIN}-{VAL_LATE_YEAR_MAX})")
-    print(f"  Validation PR-AUC:         {val_pr_auc:.4f}")
-    print(f"  Validation ROC-AUC:        {val_roc_auc:.4f}")
+    print(f"  Validation PR-AUC:         {validation_metrics['pr_auc']:.4f}")
+    print(f"  Validation ROC-AUC:        {validation_metrics['roc_auc']:.4f}")
     print(f"\nTest Set Performance (2018-2024):")
     print(f"  Samples:                   {len(y_test):,}")
-    print(f"  Positive rate:             {test_pos_pct:.3f}%")
-    print(f"  ROC-AUC:                   {roc_auc:.4f}")
-    print(f"  PR-AUC:                    {pr_auc:.4f}")
-    print(f"  Precision @ top 1%:        {prec_at_k[1]:.4f} ({prec_at_k[1]/baseline_rate:.1f}x lift)")
-    print(f"  Precision @ top 5%:        {prec_at_k[5]:.4f} ({prec_at_k[5]/baseline_rate:.1f}x lift)")
-    print(f"  Precision @ top 10%:       {prec_at_k[10]:.4f} ({prec_at_k[10]/baseline_rate:.1f}x lift)")
+    print(f"  Positive rate:             {test_pos/len(y_test)*100:.3f}%")
+    print(f"  ROC-AUC:                   {test_metrics['roc_auc']:.4f}")
+    print(f"  PR-AUC:                    {test_metrics['pr_auc']:.4f}")
+    print(f"  Precision @ top 1%:        {prec_at_k[1]:.4f} ({test_metrics['lift_at_1pct']:.1f}x lift)")
+    print(f"  Precision @ top 5%:        {prec_at_k[5]:.4f} ({test_metrics['lift_at_5pct']:.1f}x lift)")
+    print(f"  Precision @ top 10%:       {prec_at_k[10]:.4f} ({test_metrics['lift_at_10pct']:.1f}x lift)")
     print(f"\nTimings:")
     print(f"  Train early (≤{TRAIN_EARLY_YEAR_MAX}):     {train_early_time:.1f}s ({train_early_time/60:.1f} min)")
     print(f"  Validation (2015-2017):    {val_time:.1f}s")
@@ -843,6 +669,142 @@ def main() -> None:
             "status": "success"
         })
         wandb.finish()
+
+
+def main() -> None:
+    start_time = time.time()
+    
+    # -------------------------------------------------------------------------
+    # Setup paths
+    # -------------------------------------------------------------------------
+    repo_root = Path(__file__).resolve().parents[3]
+    
+    # Input paths
+    train_path = resolve_parquet_file("train.parquet")
+    test_path = resolve_parquet_file("test.parquet")
+    params_path = resolve_best_params_json()
+    
+    # Output directories
+    output_dir = repo_root / "outputs/Results/ml_models"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    model_dir = repo_root / "data/ml/models"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    use_wandb = False
+    try:
+        print("Initializing Weights & Biases...")
+        wandb.init(
+            project="ml-training-transitions",
+            entity=os.environ.get("WANDB_ENTITY"),
+            name=f"model1_rf_{timestamp}",
+            config={
+                "model": "RandomForest", "task": "transition_01_prediction",
+                "random_state": RANDOM_STATE,
+                "temporal_split": {
+                    "train_early_max_year": TRAIN_EARLY_YEAR_MAX,
+                    "val_late_min_year": VAL_LATE_YEAR_MIN,
+                    "val_late_max_year": VAL_LATE_YEAR_MAX,
+                },
+            },
+        )
+        use_wandb = True
+        print("W&B connected\n")
+    except Exception as err:
+        print(f"W&B initialization failed: {err}\n")
+    
+    print("=" * 70)
+    print("RF TRANSITION MODEL (0→1 PREDICTION)")
+    print("=" * 70)
+    print(f"\nTrain:  {train_path}")
+    print(f"Test:   {test_path}")
+    print(f"Params: {params_path}")
+    print(f"Output: {output_dir}")
+    
+    # -------------------------------------------------------------------------
+    # Step 1: Load best parameters
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 1: LOAD BEST PARAMETERS")
+    print("=" * 70)
+    
+    best_params, best_cv_score = load_best_params(params_path)
+    print(f"\nLoaded parameters from: {params_path}")
+    print(f"\nBest parameters:")
+    for param, value in sorted(best_params.items()):
+        if param != 'verbose':
+            print(f"  {param}: {value}")
+    if best_cv_score is not None:
+        print(f"\nBest CV score (from tuning): {best_cv_score:.4f}")
+    
+    # -------------------------------------------------------------------------
+    # Step 2: Schema checks (lazy loading - read schema only)
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 2: SCHEMA CHECKS (LAZY LOADING)")
+    print("=" * 70)
+    
+    print(f"\nReading column names from parquet files...")
+    all_cols_train = pq.ParquetFile(train_path).schema_arrow.names
+    all_cols_test = pq.ParquetFile(test_path).schema_arrow.names
+    
+    target_col = "transition_01"
+    df_schema = pd.read_parquet(train_path, columns=all_cols_train).head(1)
+    numeric_cols = df_schema.select_dtypes(include=['number']).columns.tolist()
+    feature_cols = [col for col in numeric_cols if col.lower() not in {c.lower() for c in EXCLUDE_COLS}]
+    
+    required_cols = [target_col, 'year', 'row', 'col']
+    optional_cols = [col for col in ['x', 'y'] if col in all_cols_train]
+    keep_cols_train = feature_cols + required_cols + optional_cols
+    keep_cols_test = feature_cols + required_cols + [col for col in ['x', 'y'] if col in all_cols_test]
+    
+    print(f"  Selected {len(feature_cols)} feature columns")
+    print(f"  Will load {len(keep_cols_train)} columns from train, {len(keep_cols_test)} from test")
+    del df_schema
+    gc.collect()
+    
+    # -------------------------------------------------------------------------
+    # Phase 1: Training
+    # -------------------------------------------------------------------------
+    (model_path, validation_metrics, train_stats, train_early_time, 
+     val_time, train_time, train_pos, train_neg, n_train_full) = phase1_training(
+        train_path=train_path,
+        params_path=params_path,
+        feature_cols=feature_cols,
+        keep_cols_train=keep_cols_train,
+        best_params=best_params,
+        timestamp=timestamp,
+        model_dir=model_dir,
+        output_dir=output_dir,
+        use_wandb=use_wandb,
+        target_col=target_col,
+    )
+    
+    # -------------------------------------------------------------------------
+    # Phase 2: Testing
+    # -------------------------------------------------------------------------
+    phase2_testing(
+        test_path=test_path,
+        model_path=model_path,
+        feature_cols=feature_cols,
+        keep_cols_test=keep_cols_test,
+        timestamp=timestamp,
+        output_dir=output_dir,
+        use_wandb=use_wandb,
+        target_col=target_col,
+        validation_metrics=validation_metrics,
+        train_stats=train_stats,
+        train_early_time=train_early_time,
+        val_time=val_time,
+        train_time=train_time,
+        train_pos=train_pos,
+        train_neg=train_neg,
+        n_train_full=n_train_full,
+        best_params=best_params,
+        start_time=start_time,
+    )
 
 
 if __name__ == "__main__":
