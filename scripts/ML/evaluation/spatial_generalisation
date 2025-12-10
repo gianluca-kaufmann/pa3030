@@ -17,6 +17,7 @@ Output:  - Region-wise metrics summary (.parquet, .csv)
 
 from __future__ import annotations
 
+import gc
 import os
 import sys
 import time
@@ -118,6 +119,33 @@ def detect_region_column(df: pd.DataFrame) -> Optional[str]:
     """
     for col in REGION_COLUMNS:
         if col in df.columns:
+            return col
+    return None
+
+
+def detect_region_column_from_parquet(parquet_path: Path) -> Optional[str]:
+    """Detect which region column is available in a parquet file without loading full data.
+    
+    Args:
+        parquet_path: Path to parquet file
+    
+    Returns:
+        Column name if found, None otherwise
+    """
+    try:
+        import pyarrow.parquet as pq
+        # Read just the schema without loading data
+        parquet_file = pq.ParquetFile(parquet_path)
+        columns = parquet_file.schema_arrow.names
+    except ImportError:
+        # Fallback: read just 1 row to get column names
+        sample_df = pd.read_parquet(parquet_path, nrows=1)
+        columns = sample_df.columns.tolist()
+        del sample_df
+        gc.collect()
+    
+    for col in REGION_COLUMNS:
+        if col in columns:
             return col
     return None
 
@@ -255,10 +283,10 @@ def main() -> None:
     print(f"Evaluation output: {eval_output_dir}")
     
     # -------------------------------------------------------------------------
-    # Step 1: Find and load scored outputs
+    # Step 1: Find scored output files and detect region column
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("STEP 1: LOAD SCORED OUTPUTS")
+    print("STEP 1: FIND FILES AND DETECT REGION COLUMN")
     print("=" * 70)
     
     rf_file = find_scored_files(output_dir, "rf")
@@ -272,81 +300,96 @@ def main() -> None:
     print(f"\nRF file:   {rf_file.name}")
     print(f"LGBM file: {lgbm_file.name}")
     
-    print("\nLoading RF scored outputs...")
-    load_start = time.time()
-    df_rf = pd.read_parquet(rf_file)
-    print(f"  Loaded {len(df_rf):,} rows in {time.time() - load_start:.1f}s")
+    # Detect region column from parquet files without loading full data
+    print("\nDetecting region column from parquet files...")
+    region_col = detect_region_column_from_parquet(rf_file)
+    if region_col is None:
+        # Try LGBM file as fallback
+        region_col = detect_region_column_from_parquet(lgbm_file)
     
-    print("\nLoading LGBM scored outputs...")
-    load_start = time.time()
-    df_lgbm = pd.read_parquet(lgbm_file)
-    print(f"  Loaded {len(df_lgbm):,} rows in {time.time() - load_start:.1f}s")
-    
-    # Check required columns
-    required_cols = ['year', 'y_true', 'y_pred_proba']
-    for col in required_cols:
-        if col not in df_rf.columns:
-            raise ValueError(f"Required column '{col}' not found in RF scored output")
-        if col not in df_lgbm.columns:
-            raise ValueError(f"Required column '{col}' not found in LGBM scored output")
-    
-    # Detect region column
-    region_col = detect_region_column(df_rf)
+    # Track if we need to create the region column
+    create_region_col = False
     if region_col is None:
         print("\n" + "!" * 70)
         print("WARNING: No region column (region_id/biome/country) found in scored outputs.")
-        print("Creating a dummy 'region_id' column with value 'all' for global evaluation.")
+        print("Will create a dummy 'region_id' column with value 'all' for global evaluation.")
         print("To evaluate by region, add region_id/biome/country columns to scored outputs.")
         print("!" * 70 + "\n")
-        df_rf['region_id'] = 'all'
-        df_lgbm['region_id'] = 'all'
         region_col = 'region_id'
+        create_region_col = True
     else:
-        print(f"\nUsing region column: {region_col}")
+        print(f"Detected region column: {region_col}")
+    
+    # Define columns to load (only necessary ones)
+    required_cols = ['year', 'y_true', 'y_pred_proba']
+    columns_to_load = required_cols.copy()
+    # Only add region_col if it exists in the file (not if we're creating it)
+    if not create_region_col:
+        columns_to_load.append(region_col)
     
     # -------------------------------------------------------------------------
-    # Step 2: Filter to test years
+    # Step 2: Process RF model (load, filter, compute, cleanup)
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("STEP 2: FILTER TO TEST YEARS")
+    print("STEP 2: PROCESS RF MODEL")
     print("=" * 70)
     
+    print("\nLoading RF scored outputs (only necessary columns)...")
+    load_start = time.time()
+    try:
+        df_rf = pd.read_parquet(rf_file, columns=columns_to_load)
+    except Exception as e:
+        # Fallback: if column selection fails, load all and select after
+        print(f"  Warning: Could not load specific columns, loading all: {e}")
+        df_rf = pd.read_parquet(rf_file)
+        df_rf = df_rf[columns_to_load]
+    
+    # Check required columns
+    for col in required_cols:
+        if col not in df_rf.columns:
+            raise ValueError(f"Required column '{col}' not found in RF scored output")
+    
+    # Handle missing region column
+    if region_col not in df_rf.columns:
+        print(f"  Creating dummy '{region_col}' column with value 'all'")
+        df_rf[region_col] = 'all'
+    
+    print(f"  Loaded {len(df_rf):,} rows in {time.time() - load_start:.1f}s")
+    print(f"  Memory usage: {df_rf.memory_usage(deep=True).sum() / 1024**2:.1f} MB")
+    
+    # Filter to test years
+    print("\nFiltering RF to test years...")
     mask_rf = (df_rf['year'] >= TEST_YEAR_MIN) & (df_rf['year'] <= TEST_YEAR_MAX)
-    mask_lgbm = (df_lgbm['year'] >= TEST_YEAR_MIN) & (df_lgbm['year'] <= TEST_YEAR_MAX)
-    
     df_rf_test = df_rf[mask_rf].copy()
-    df_lgbm_test = df_lgbm[mask_lgbm].copy()
-    
-    print(f"\nRF test set:   {len(df_rf_test):,} rows ({TEST_YEAR_MIN}-{TEST_YEAR_MAX})")
-    print(f"LGBM test set: {len(df_lgbm_test):,} rows ({TEST_YEAR_MIN}-{TEST_YEAR_MAX})")
-    
-    # Check year coverage
-    rf_years = sorted(df_rf_test['year'].unique())
-    lgbm_years = sorted(df_lgbm_test['year'].unique())
-    print(f"\nRF years:   {rf_years}")
-    print(f"LGBM years: {lgbm_years}")
-    
-    # Free memory
-    del df_rf, df_lgbm
-    import gc
+    del df_rf  # Free memory immediately
     gc.collect()
     
-    # -------------------------------------------------------------------------
-    # Step 3: Compute region-wise metrics
-    # -------------------------------------------------------------------------
+    print(f"  RF test set: {len(df_rf_test):,} rows ({TEST_YEAR_MIN}-{TEST_YEAR_MAX})")
+    rf_years = sorted(df_rf_test['year'].unique())
+    print(f"  RF years: {rf_years}")
+    
+    # Compute metrics for RF
     print("\n" + "=" * 70)
-    print("STEP 3: COMPUTE REGION-WISE METRICS")
+    print("STEP 3: COMPUTE REGION-WISE METRICS (RF)")
     print("=" * 70)
     
-    def compute_all_regions(df: pd.DataFrame, model_name: str) -> pd.DataFrame:
-        """Compute metrics for all regions in a dataframe."""
-        regions = sorted(df[region_col].unique())
+    def compute_all_regions(df: pd.DataFrame, model_name: str, region_column: str) -> pd.DataFrame:
+        """Compute metrics for all regions in a dataframe using groupby for efficiency.
+        
+        Args:
+            df: DataFrame with region column and metrics columns
+            model_name: Name of the model ('RF' or 'LGBM')
+            region_column: Name of the region column
+        
+        Returns:
+            DataFrame with region-wise metrics
+        """
+        regions = sorted(df[region_column].unique())
         print(f"\nComputing metrics for {len(regions)} regions ({model_name})...")
         
         results = []
-        for region in regions:
-            region_data = df[df[region_col] == region]
-            
+        # Use groupby to iterate through regions efficiently
+        for region, region_data in df.groupby(region_column):
             if len(region_data) == 0:
                 continue
             
@@ -355,7 +398,7 @@ def main() -> None:
             
             metrics = compute_region_metrics(y_true, y_proba, str(region))
             metrics['model'] = model_name
-            metrics[region_col] = region
+            metrics[region_column] = region
             
             results.append(metrics)
             
@@ -365,11 +408,71 @@ def main() -> None:
         
         return pd.DataFrame(results)
     
-    # Compute metrics for both models
-    results_rf = compute_all_regions(df_rf_test, "RF")
-    results_lgbm = compute_all_regions(df_lgbm_test, "LGBM")
+    results_rf = compute_all_regions(df_rf_test, "RF", region_col)
+    
+    # Free RF test data
+    del df_rf_test
+    gc.collect()
+    print("\nRF processing complete. Memory freed.")
+    
+    # -------------------------------------------------------------------------
+    # Step 4: Process LGBM model (load, filter, compute)
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 4: PROCESS LGBM MODEL")
+    print("=" * 70)
+    
+    print("\nLoading LGBM scored outputs (only necessary columns)...")
+    load_start = time.time()
+    try:
+        df_lgbm = pd.read_parquet(lgbm_file, columns=columns_to_load)
+    except Exception as e:
+        # Fallback: if column selection fails, load all and select after
+        print(f"  Warning: Could not load specific columns, loading all: {e}")
+        df_lgbm = pd.read_parquet(lgbm_file)
+        df_lgbm = df_lgbm[columns_to_load]
+    
+    # Check required columns
+    for col in required_cols:
+        if col not in df_lgbm.columns:
+            raise ValueError(f"Required column '{col}' not found in LGBM scored output")
+    
+    # Handle missing region column
+    if region_col not in df_lgbm.columns:
+        print(f"  Creating dummy '{region_col}' column with value 'all'")
+        df_lgbm[region_col] = 'all'
+    
+    print(f"  Loaded {len(df_lgbm):,} rows in {time.time() - load_start:.1f}s")
+    print(f"  Memory usage: {df_lgbm.memory_usage(deep=True).sum() / 1024**2:.1f} MB")
+    
+    # Filter to test years
+    print("\nFiltering LGBM to test years...")
+    mask_lgbm = (df_lgbm['year'] >= TEST_YEAR_MIN) & (df_lgbm['year'] <= TEST_YEAR_MAX)
+    df_lgbm_test = df_lgbm[mask_lgbm].copy()
+    del df_lgbm  # Free memory immediately
+    gc.collect()
+    
+    print(f"  LGBM test set: {len(df_lgbm_test):,} rows ({TEST_YEAR_MIN}-{TEST_YEAR_MAX})")
+    lgbm_years = sorted(df_lgbm_test['year'].unique())
+    print(f"  LGBM years: {lgbm_years}")
+    
+    # Compute metrics for LGBM
+    print("\n" + "=" * 70)
+    print("STEP 5: COMPUTE REGION-WISE METRICS (LGBM)")
+    print("=" * 70)
+    
+    results_lgbm = compute_all_regions(df_lgbm_test, "LGBM", region_col)
+    
+    # Free LGBM test data
+    del df_lgbm_test
+    gc.collect()
+    print("\nLGBM processing complete. Memory freed.")
     
     # Combine results
+    print("\n" + "=" * 70)
+    print("STEP 6: COMBINE RESULTS")
+    print("=" * 70)
+    
     results_all = pd.concat([results_rf, results_lgbm], ignore_index=True)
     
     # Reorder columns
@@ -380,10 +483,10 @@ def main() -> None:
     print(f"\nComputed metrics for {len(results_all)} region-model combinations")
     
     # -------------------------------------------------------------------------
-    # Step 4: Save summary table
+    # Step 7: Save summary table
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("STEP 4: SAVE SUMMARY TABLE")
+    print("STEP 7: SAVE SUMMARY TABLE")
     print("=" * 70)
     
     # Save as parquet
@@ -397,10 +500,10 @@ def main() -> None:
     print(f"Saved to CSV: {csv_path}")
     
     # -------------------------------------------------------------------------
-    # Step 5: Print top/bottom regions
+    # Step 8: Print top/bottom regions
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("STEP 5: TOP/BOTTOM REGIONS")
+    print("STEP 8: TOP/BOTTOM REGIONS")
     print("=" * 70)
     
     # Filter out regions with insufficient data or NaN metrics
@@ -449,11 +552,11 @@ def main() -> None:
                       f"n={row['n_samples']:,}")
     
     # -------------------------------------------------------------------------
-    # Step 6: Log to W&B (optional)
+    # Step 9: Log to W&B (optional)
     # -------------------------------------------------------------------------
     if use_wandb:
         print("\n" + "=" * 70)
-        print("STEP 6: LOG TO W&B")
+        print("STEP 9: LOG TO W&B")
         print("=" * 70)
         
         # Log summary statistics
