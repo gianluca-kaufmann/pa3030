@@ -33,6 +33,7 @@ from typing import Optional, Dict, Any
 import numpy as np
 import pandas as pd
 import wandb
+import pyarrow.parquet as pq
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
@@ -346,9 +347,13 @@ def main() -> None:
     
     # Lazy loading: read column names and schema first
     print(f"\nReading column names from train.parquet...")
-    df_schema = pd.read_parquet(train_path, nrows=0)
-    all_cols_train = df_schema.columns
-    all_cols_test = pd.read_parquet(test_path, nrows=0).columns
+    parquet_file_train = pq.ParquetFile(train_path)
+    all_cols_train = parquet_file_train.schema_arrow.names
+    parquet_file_test = pq.ParquetFile(test_path)
+    all_cols_test = parquet_file_test.schema_arrow.names
+    
+    # Read a small sample to get dtypes (read first row, then drop it)
+    df_schema = pd.read_parquet(train_path, columns=all_cols_train).head(1)
     
     # Build feature columns (all numeric columns except excluded ones)
     target_col = "transition_01"
