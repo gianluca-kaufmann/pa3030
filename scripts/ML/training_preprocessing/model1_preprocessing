@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 
 """
-Sampling script for model1 training/test splits.
+Sampling script for model1 training/validation/test splits.
 
 Rules
 -----
-TRAIN (2000–2017):
+TRAIN_EARLY (2001–2014):
   - Keep all positives (transition_01 = 1)
-  - Sample negatives at 1:20 ratio, stratified by year
+  - Sample hard negatives at 1:100 ratio per year, weighted by exp(-dist_wdpa / k)
+  - Year 2000 excluded to avoid treating existing PAs as transitions
+
+VAL_LATE (2015–2017):
+  - Full risk set (no sampling)
 
 TEST (2018–2024):
-  - Keep full risk set (no sampling)
+  - Full risk set (no sampling)
 """
 
 from __future__ import annotations
@@ -26,13 +30,13 @@ import wandb
 # Configuration
 RANDOM_STATE = 42
 # Split configuration
-TRAIN_EARLY_YEARS = (2000, 2014)   # Sampled train with hard negatives
+TRAIN_EARLY_YEARS = (2001, 2014)   # Sampled train with hard negatives (2000 excluded)
 VAL_LATE_YEARS = (2015, 2017)      # Full validation
 TEST_YEARS = (2018, 2024)          # Full test
 WANDB_PROJECT = "ml-training-preprocessing"
 
 # Hard negative sampling configuration
-NEG_POS_RATIO = 100  # Target ratio of negatives to positives
+NEG_POS_RATIO = 100  # Target ratio of negatives to positives (exact per-year sampling)
 DIST_WDPA_DECAY = 5.0  # Decay constant (km) for exponential weighting: exp(-dist_wdpa / k)
 
 
@@ -164,8 +168,8 @@ def main() -> None:
     escaped_val_late = str(val_late_out).replace("'", "''")
 
     try:
-        # TRAIN_EARLY: positives + hard negatives per year (2000–2014)
-        # Hard negatives are sampled with probability ~ exp(-dist_wdpa / k)
+        # TRAIN_EARLY: positives + hard negatives per year (2001–2014)
+        # Hard negatives sampled exactly at 1:NEG_POS_RATIO per year, weighted by exp(-dist_wdpa / k)
         train_early_sql = f"""
         COPY (
             WITH base AS (
@@ -180,33 +184,29 @@ def main() -> None:
                 FROM base
                 GROUP BY year
             ),
-            -- Compute hard negative weights: exp(-dist_wdpa / k)
-            neg_weights AS (
-                SELECT
-                    year,
-                    SUM(CASE 
-                        WHEN transition_01 = 0 
-                        THEN exp(-COALESCE(dist_wdpa, 100.0) / {DIST_WDPA_DECAY})
-                        ELSE 0 
-                    END) AS total_weight
-                FROM base
-                GROUP BY year
-            ),
             positives AS (
                 SELECT * FROM base WHERE transition_01 = 1
             ),
-            sampled_negs AS (
-                SELECT b.*
+            -- Rank negatives by hard negative weight (higher weight = closer to WDPA = more likely to sample)
+            ranked_negs AS (
+                SELECT
+                    b.*,
+                    yc.pos_count,
+                    yc.neg_count,
+                    exp(-COALESCE(b.dist_wdpa, 100.0) / {DIST_WDPA_DECAY}) AS neg_weight,
+                    -- Add random tie-breaker for deterministic ordering with fixed seed
+                    ROW_NUMBER() OVER (
+                        PARTITION BY b.year 
+                        ORDER BY exp(-COALESCE(b.dist_wdpa, 100.0) / {DIST_WDPA_DECAY}) DESC, random()
+                    ) AS rn
                 FROM base b
                 LEFT JOIN year_counts yc ON b.year = yc.year
-                LEFT JOIN neg_weights nw ON b.year = nw.year
-                WHERE
-                    b.transition_01 = 0
-                    AND random() < LEAST(
-                        1.0,
-                        ({NEG_POS_RATIO} * COALESCE(yc.pos_count, 0)::DOUBLE / NULLIF(COALESCE(nw.total_weight, 0), 0))
-                        * exp(-COALESCE(b.dist_wdpa, 100.0) / {DIST_WDPA_DECAY})
-                    )
+                WHERE b.transition_01 = 0
+            ),
+            sampled_negs AS (
+                SELECT * EXCLUDE (pos_count, neg_count, neg_weight, rn)
+                FROM ranked_negs
+                WHERE rn <= LEAST(neg_count, {NEG_POS_RATIO} * pos_count)
             )
             SELECT * FROM positives
             UNION ALL
@@ -215,9 +215,10 @@ def main() -> None:
         TO '{escaped_train_early}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """
 
-        print(f"\nCreating TRAIN_EARLY split ({TRAIN_EARLY_YEARS[0]}–{TRAIN_EARLY_YEARS[1]}) with 1:{NEG_POS_RATIO} hard negatives...")
+        print(f"\nCreating TRAIN_EARLY split ({TRAIN_EARLY_YEARS[0]}–{TRAIN_EARLY_YEARS[1]}) with exact 1:{NEG_POS_RATIO} hard negatives per year...")
         print(f"  Using exponential weighting: exp(-dist_wdpa / {DIST_WDPA_DECAY})")
-        # Set random seed for reproducible sampling (normalize integer seed to 0-1 range)
+        print(f"  Year 2000 excluded to avoid treating existing PAs as transitions")
+        # Set random seed for reproducible sampling
         seed_value = RANDOM_STATE / 100.0
         con.execute(f"SELECT setseed({seed_value})")
         train_early_start = time.time()
@@ -233,7 +234,7 @@ def main() -> None:
         TO '{escaped_val_late}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """
 
-        print("\nCreating VAL_LATE_FULL split (2015–2017, full risk set)...")
+        print(f"\nCreating VAL_LATE_FULL split ({VAL_LATE_YEARS[0]}–{VAL_LATE_YEARS[1]}, full risk set)...")
         val_late_start = time.time()
         con.execute(val_late_sql)
         print(f"VAL_LATE_FULL written in {time.time() - val_late_start:.1f}s")
@@ -247,15 +248,54 @@ def main() -> None:
         TO '{escaped_test}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """
 
-        print("\nCreating TEST_FULL split (2018–2024, full risk set)...")
+        print(f"\nCreating TEST_FULL split ({TEST_YEARS[0]}–{TEST_YEARS[1]}, full risk set)...")
         test_start = time.time()
         con.execute(test_sql)
         print(f"TEST written in {time.time() - test_start:.1f}s")
 
-        # Log counts
+        # Log counts and check achieved ratios
         log_year_counts(con, train_early_out, "TRAIN_EARLY", use_wandb)
         log_year_counts(con, val_late_out, "VAL_LATE_FULL", use_wandb)
         log_year_counts(con, test_out, "TEST_FULL", use_wandb)
+
+        # Check for years where target ratio was infeasible
+        print("\nChecking achieved neg/pos ratios vs target...")
+        achieved_ratios = con.execute(
+            f"""
+            SELECT
+                year,
+                SUM(transition_01) AS pos_count,
+                SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS neg_count,
+                CASE WHEN SUM(transition_01) > 0 
+                     THEN SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END)::DOUBLE / SUM(transition_01)
+                     ELSE 0 END AS achieved_ratio
+            FROM read_parquet('{escaped_train_early}')
+            GROUP BY year
+            ORDER BY year
+            """
+        ).fetchall()
+        
+        for year, pos, neg, achieved in achieved_ratios:
+            status = "✓" if abs(achieved - NEG_POS_RATIO) < 0.1 else "⚠"
+            print(f"  {status} {year}: achieved {achieved:.1f}:1 (target {NEG_POS_RATIO}:1) | pos={pos:,} neg={neg:,}")
+        
+        # Compute scale_pos_weight from TRAIN_EARLY only
+        train_stats = con.execute(
+            f"""
+            SELECT
+                SUM(transition_01) AS total_pos,
+                SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS total_neg
+            FROM read_parquet('{escaped_train_early}')
+            """
+        ).fetchone()
+        total_pos, total_neg = train_stats
+        scale_pos_weight = total_neg / total_pos if total_pos > 0 else 1.0
+        
+        print(f"\nTRAIN_EARLY class balance:")
+        print(f"  Positives: {total_pos:,}")
+        print(f"  Negatives: {total_neg:,}")
+        print(f"  Ratio (neg/pos): {scale_pos_weight:.2f}")
+        print(f"  scale_pos_weight for LightGBM: {scale_pos_weight:.2f}")
 
         total_train_early = con.execute(
             f"SELECT COUNT(*) FROM read_parquet('{escaped_train_early}')"
@@ -268,6 +308,9 @@ def main() -> None:
             wandb.log(
                 {
                     "train_early/rows": total_train_early,
+                    "train_early/positives": total_pos,
+                    "train_early/negatives": total_neg,
+                    "train_early/scale_pos_weight": scale_pos_weight,
                     "val_late_full/rows": con.execute(
                         f"SELECT COUNT(*) FROM read_parquet('{escaped_val_late}')"
                     ).fetchone()[0],
