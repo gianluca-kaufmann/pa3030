@@ -25,9 +25,15 @@ import wandb
 
 # Configuration
 RANDOM_STATE = 42
-TRAIN_YEARS = (2000, 2017)
-TEST_YEARS = (2018, 2024)
+# Split configuration
+TRAIN_EARLY_YEARS = (2000, 2014)   # Sampled train with hard negatives
+VAL_LATE_YEARS = (2015, 2017)      # Full validation
+TEST_YEARS = (2018, 2024)          # Full test
 WANDB_PROJECT = "ml-training-preprocessing"
+
+# Hard negative sampling configuration
+NEG_POS_RATIO = 100  # Target ratio of negatives to positives
+DIST_WDPA_DECAY = 5.0  # Decay constant (km) for exponential weighting: exp(-dist_wdpa / k)
 
 
 def resolve_input() -> Path:
@@ -85,7 +91,10 @@ def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: s
             SUM(transition_01) AS positives,
             SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS negatives,
             COUNT(*) AS total,
-            CASE WHEN COUNT(*) > 0 THEN SUM(transition_01)::DOUBLE / COUNT(*) ELSE 0 END AS pos_ratio
+            CASE WHEN COUNT(*) > 0 THEN SUM(transition_01)::DOUBLE / COUNT(*) ELSE 0 END AS pos_ratio,
+            CASE WHEN SUM(transition_01) > 0 
+                 THEN SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END)::DOUBLE / SUM(transition_01)
+                 ELSE 0 END AS neg_pos_ratio
         FROM read_parquet('{escaped}')
         GROUP BY year
         ORDER BY year
@@ -93,11 +102,14 @@ def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: s
     ).fetchall()
 
     print(f"\n{label} per-year counts:")
-    for year, pos, neg, total, ratio in rows:
-        print(f"  {year}: total={total:,} pos={pos:,} neg={neg:,} pos_ratio={ratio:.5f}")
+    for year, pos, neg, total, pos_ratio, neg_pos_ratio in rows:
+        print(f"  {year}: total={total:,} pos={pos:,} neg={neg:,} | pos_ratio={pos_ratio:.5f} neg/pos={neg_pos_ratio:.1f}")
 
     if use_wandb:
-        wandb.log({f"{label.lower().replace(' ', '_')}/per_year": [dict(year=y, positives=p, negatives=n, total=t, pos_ratio=r) for y, p, n, t, r in rows]})
+        wandb.log({f"{label.lower().replace(' ', '_')}/per_year": [
+            dict(year=y, positives=p, negatives=n, total=t, pos_ratio=r, neg_pos_ratio=npr) 
+            for y, p, n, t, r, npr in rows
+        ]})
 
 
 def main() -> None:
@@ -119,9 +131,12 @@ def main() -> None:
             name=f"model1_preprocessing_{time.strftime('%Y%m%d_%H%M%S')}",
             config={
                 "random_state": RANDOM_STATE,
-                "train_years": TRAIN_YEARS,
+                "train_early_years": TRAIN_EARLY_YEARS,
+                "val_late_years": VAL_LATE_YEARS,
                 "test_years": TEST_YEARS,
-                "sampling_ratio_neg_per_pos": 20,
+                "neg_pos_ratio": NEG_POS_RATIO,
+                "dist_wdpa_decay": DIST_WDPA_DECAY,
+                "sampling_method": "hard_negatives_exponential",
             },
         )
         use_wandb = True
@@ -131,33 +146,49 @@ def main() -> None:
 
     input_path = resolve_input()
     base_dir = input_path.parent
-    train_out = base_dir / "train.parquet"
-    test_out = base_dir / "test.parquet"
+    train_early_out = base_dir / "train_early_sampled.parquet"
+    val_late_out = base_dir / "val_late_full.parquet"
+    test_out = base_dir / "test_full.parquet"
 
     print(f"\nInput: {input_path}")
-    print(f"Train output: {train_out}")
-    print(f"Test output: {test_out}")
+    print(f"TRAIN_EARLY (sampled) output: {train_early_out}")
+    print(f"VAL_LATE_FULL output: {val_late_out}")
+    print(f"TEST_FULL output: {test_out}")
 
     con = duckdb.connect()
     configure_duckdb(con)
 
     escaped_in = str(input_path).replace("'", "''")
-    escaped_train = str(train_out).replace("'", "''")
+    escaped_train_early = str(train_early_out).replace("'", "''")
     escaped_test = str(test_out).replace("'", "''")
+    escaped_val_late = str(val_late_out).replace("'", "''")
 
     try:
-        # TRAIN: positives + 20x negatives per year
-        train_sql = f"""
+        # TRAIN_EARLY: positives + hard negatives per year (2000–2014)
+        # Hard negatives are sampled with probability ~ exp(-dist_wdpa / k)
+        train_early_sql = f"""
         COPY (
             WITH base AS (
                 SELECT * FROM read_parquet('{escaped_in}')
-                WHERE year BETWEEN {TRAIN_YEARS[0]} AND {TRAIN_YEARS[1]}
+                WHERE year BETWEEN {TRAIN_EARLY_YEARS[0]} AND {TRAIN_EARLY_YEARS[1]}
             ),
             year_counts AS (
                 SELECT
                     year,
                     SUM(transition_01) AS pos_count,
                     SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS neg_count
+                FROM base
+                GROUP BY year
+            ),
+            -- Compute hard negative weights: exp(-dist_wdpa / k)
+            neg_weights AS (
+                SELECT
+                    year,
+                    SUM(CASE 
+                        WHEN transition_01 = 0 
+                        THEN exp(-COALESCE(dist_wdpa, 100.0) / {DIST_WDPA_DECAY})
+                        ELSE 0 
+                    END) AS total_weight
                 FROM base
                 GROUP BY year
             ),
@@ -168,26 +199,46 @@ def main() -> None:
                 SELECT b.*
                 FROM base b
                 LEFT JOIN year_counts yc ON b.year = yc.year
+                LEFT JOIN neg_weights nw ON b.year = nw.year
                 WHERE
                     b.transition_01 = 0
-                    AND random() < LEAST(1.0, 20 * COALESCE(yc.pos_count, 0)::DOUBLE / NULLIF(COALESCE(yc.neg_count, 0), 0))
+                    AND random() < LEAST(
+                        1.0,
+                        ({NEG_POS_RATIO} * COALESCE(yc.pos_count, 0)::DOUBLE / NULLIF(COALESCE(nw.total_weight, 0), 0))
+                        * exp(-COALESCE(b.dist_wdpa, 100.0) / {DIST_WDPA_DECAY})
+                    )
             )
             SELECT * FROM positives
             UNION ALL
             SELECT * FROM sampled_negs
         )
-        TO '{escaped_train}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        TO '{escaped_train_early}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """
 
-        print("\nCreating TRAIN split (2000–2017) with 1:20 stratified negatives...")
+        print(f"\nCreating TRAIN_EARLY split ({TRAIN_EARLY_YEARS[0]}–{TRAIN_EARLY_YEARS[1]}) with 1:{NEG_POS_RATIO} hard negatives...")
+        print(f"  Using exponential weighting: exp(-dist_wdpa / {DIST_WDPA_DECAY})")
         # Set random seed for reproducible sampling (normalize integer seed to 0-1 range)
         seed_value = RANDOM_STATE / 100.0
         con.execute(f"SELECT setseed({seed_value})")
-        train_start = time.time()
-        con.execute(train_sql)
-        print(f"TRAIN written in {time.time() - train_start:.1f}s")
+        train_early_start = time.time()
+        con.execute(train_early_sql)
+        print(f"TRAIN_EARLY written in {time.time() - train_early_start:.1f}s")
 
-        # TEST: full risk set 2018–2024
+        # VAL_LATE_FULL: full risk set 2015–2017
+        val_late_sql = f"""
+        COPY (
+            SELECT * FROM read_parquet('{escaped_in}')
+            WHERE year BETWEEN {VAL_LATE_YEARS[0]} AND {VAL_LATE_YEARS[1]}
+        )
+        TO '{escaped_val_late}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        """
+
+        print("\nCreating VAL_LATE_FULL split (2015–2017, full risk set)...")
+        val_late_start = time.time()
+        con.execute(val_late_sql)
+        print(f"VAL_LATE_FULL written in {time.time() - val_late_start:.1f}s")
+
+        # TEST_FULL: full risk set 2018–2024
         test_sql = f"""
         COPY (
             SELECT * FROM read_parquet('{escaped_in}')
@@ -196,17 +247,18 @@ def main() -> None:
         TO '{escaped_test}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """
 
-        print("\nCreating TEST split (2018–2024, full risk set)...")
+        print("\nCreating TEST_FULL split (2018–2024, full risk set)...")
         test_start = time.time()
         con.execute(test_sql)
         print(f"TEST written in {time.time() - test_start:.1f}s")
 
         # Log counts
-        log_year_counts(con, train_out, "TRAIN", use_wandb)
-        log_year_counts(con, test_out, "TEST", use_wandb)
+        log_year_counts(con, train_early_out, "TRAIN_EARLY", use_wandb)
+        log_year_counts(con, val_late_out, "VAL_LATE_FULL", use_wandb)
+        log_year_counts(con, test_out, "TEST_FULL", use_wandb)
 
-        total_train = con.execute(
-            f"SELECT COUNT(*) FROM read_parquet('{escaped_train}')"
+        total_train_early = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{escaped_train_early}')"
         ).fetchone()[0]
         total_test = con.execute(
             f"SELECT COUNT(*) FROM read_parquet('{escaped_test}')"
@@ -215,8 +267,11 @@ def main() -> None:
         if use_wandb:
             wandb.log(
                 {
-                    "train/rows": total_train,
-                    "test/rows": total_test,
+                    "train_early/rows": total_train_early,
+                    "val_late_full/rows": con.execute(
+                        f"SELECT COUNT(*) FROM read_parquet('{escaped_val_late}')"
+                    ).fetchone()[0],
+                    "test_full/rows": total_test,
                     "timing/total_seconds": time.time() - start_time,
                 }
             )

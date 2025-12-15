@@ -3,15 +3,19 @@
 """LGBM Transition Model (0→1 Prediction)
 
 Purpose: Train a LightGBM model to predict transitions to protected areas (0→1).
-         Uses train.parquet (2000-2017) and test.parquet (2018-2024) with pre-tuned hyperparameters
-         from lgbm_best_params.json. Uses strict temporal split for internal validation:
-         - train_early (≤2014) for training
-         - val_late (2015-2017) for validation
-         - Final model retrained on full train.parquet (2000-2017)
-         - Evaluation on test.parquet (2018-2024)
+         Uses pre-split parquet files created by model1_preprocessing:
+         - train_early_sampled.parquet (2000-2014, negatives sampled 1:20 per positive)
+         - val_late_full.parquet (2015-2017, full risk set)
+         - test_full.parquet (2018-2024, full risk set)
+         Uses strict temporal split for internal validation:
+         - train_early (train_early_sampled) for training
+         - val_late (val_late_full) for validation
+         - Final model retrained on combined train_early_sampled + val_late_full (2000-2017)
+         - Evaluation on test_full (2018-2024)
 
-Input:   - train.parquet (2000-2017)
-         - test.parquet (2018-2024)
+Input:   - train_early_sampled.parquet (2000-2014, sampled)
+         - val_late_full.parquet (2015-2017, full risk set)
+         - test_full.parquet (2018-2024, full risk set)
          - lgbm_best_params.json
 Output:  - Trained model (.pkl)
          - Test predictions (.parquet)
@@ -200,7 +204,9 @@ def load_best_params(params_path: Path) -> tuple[Dict[str, Any], Any]:
     # Merge with fixed params in correct order: FIXED_PARAMS → json_fixed_params → best_params
     final_params = {**FIXED_PARAMS, **json_fixed_params, **best_params}
     
-    # Enforce strict parameter guardrails (override any tuned values)
+    # Enforce strict parameter guardrails (override any tuned values).
+    # Imbalance handling (is_unbalance / scale_pos_weight) is configured later
+    # based on sampled vs full distributions, so we do NOT set it here.
     guardrail_params = {
         "max_depth": 8,
         "num_leaves": 255,
@@ -212,16 +218,12 @@ def load_best_params(params_path: Path) -> tuple[Dict[str, Any], Any]:
         "n_estimators": 3000,
         "reg_alpha": 1.0,
         "reg_lambda": 1.0,
-        "is_unbalance": True,
         "metric": "average_precision",
         "n_jobs": get_n_jobs(),
         "verbose": -1,
     }
     final_params.update(guardrail_params)
-    
-    # Remove scale_pos_weight if present
-    final_params.pop("scale_pos_weight", None)
-    
+
     return final_params, params_data.get('best_cv_score', None)
 
 
@@ -291,6 +293,7 @@ def compute_metrics(y_true: np.ndarray, y_proba: np.ndarray) -> Dict[str, float]
 
 def phase1_training(
     train_path: Path,
+    val_path: Path,
     params_path: Path,
     feature_cols: list,
     keep_cols_train: list,
@@ -300,8 +303,8 @@ def phase1_training(
     output_dir: Path,
     use_wandb: bool,
     target_col: str,
-) -> tuple[Path, Dict[str, Any], Dict[str, Any], float, float, float, float, int, int]:
-    """Phase 1: Training phase - loads only train.parquet, trains model, saves it.
+) -> tuple[Path, Dict[str, Any], Dict[str, Any], float, float, float, float, int, int, Dict[str, Any]]:
+    """Phase 1: Training phase - loads train/val splits, trains model, saves it.
     
     Uses multi-pass loading to prevent memory spikes by ensuring splits never coexist.
     
@@ -317,10 +320,10 @@ def phase1_training(
     # STEP A: Load train_early (year <= 2014)
     # =========================================================================
     print("\n" + "=" * 70)
-    print("STEP A: LOAD TRAIN_EARLY (year <= 2014)")
+    print("STEP A: LOAD TRAIN_EARLY (year <= 2014) FROM train_early_sampled")
     print("=" * 70)
     
-    df_train = load_and_preprocess(train_path, keep_cols_train, target_col, "train.parquet")
+    df_train = load_and_preprocess(train_path, keep_cols_train, target_col, "train_early_sampled.parquet")
     print(f"\nFiltering train_early (year <= {TRAIN_EARLY_YEAR_MAX})...")
     X_train_early, y_train_early, train_early_pos, train_early_neg = extract_split(
         df_train, feature_cols, target_col, 
@@ -334,16 +337,16 @@ def phase1_training(
     # STEP B: Load val_late (2015 <= year <= 2017)
     # =========================================================================
     print("\n" + "=" * 70)
-    print("STEP B: LOAD VAL_LATE (2015 <= year <= 2017)")
+    print("STEP B: LOAD VAL_LATE (2015 <= year <= 2017) FROM val_late_full")
     print("=" * 70)
     
-    df_train = load_and_preprocess(train_path, keep_cols_train, target_col, "train.parquet")
+    df_val = load_and_preprocess(val_path, keep_cols_train, target_col, "val_late_full.parquet")
     print(f"\nFiltering val_late ({VAL_LATE_YEAR_MIN} <= year <= {VAL_LATE_YEAR_MAX})...")
     X_val_late, y_val_late, val_late_pos, val_late_neg = extract_split(
-        df_train, feature_cols, target_col,
+        df_val, feature_cols, target_col,
         lambda y: (y >= VAL_LATE_YEAR_MIN) & (y <= VAL_LATE_YEAR_MAX), "Val late"
     )
-    del df_train
+    del df_val
     gc.collect()
     print("  Memory cleaned up after val_late extraction")
     
@@ -358,10 +361,64 @@ def phase1_training(
     print(f"  train_early (≤{TRAIN_EARLY_YEAR_MAX}): {len(X_train_early):,} rows, {y_train_early.sum():,} positives ({y_train_early.mean()*100:.3f}%)")
     print(f"  val_late ({VAL_LATE_YEAR_MIN}-{VAL_LATE_YEAR_MAX}): {len(X_val_late):,} rows, {y_val_late.sum():,} positives ({y_val_late.mean()*100:.3f}%)")
     
+    # -------------------------------------------------------------------------
+    # Imbalance handling: compute effective scale_pos_weight using sampled
+    # train_early_sampled.parquet (train_early) and full-val_late_full.parquet
+    # (val_late). We disable is_unbalance and use a clamped scale_pos_weight.
+    # -------------------------------------------------------------------------
+    neg_full, pos_full = val_late_neg, val_late_pos
+    neg_sampled, pos_sampled = train_early_neg, train_early_pos
+
+    def _safe_ratio(neg: int, pos: int) -> float:
+        return float("inf") if pos == 0 else neg / pos
+
+    ratio_full = _safe_ratio(neg_full, pos_full)
+    ratio_sampled = _safe_ratio(neg_sampled, pos_sampled)
+
+    if not np.isfinite(ratio_sampled) or ratio_sampled <= 0:
+        spw_raw = 1.0
+    else:
+        spw_raw = ratio_full / ratio_sampled
+
+    # Clamp to a reasonable range
+    spw_clamped = max(5.0, min(200.0, float(spw_raw)))
+
+    print("\nImbalance handling (scale_pos_weight computation):")
+    print(f"  Sampled train_early neg/pos: {ratio_sampled:.3f} "
+          f"({neg_sampled:,} / {pos_sampled:,})")
+    print(f"  Full val_late neg/pos:       {ratio_full:.3f} "
+          f"({neg_full:,} / {pos_full:,})")
+    print(f"  Raw scale_pos_weight:        {spw_raw:.3f}")
+    print(f"  Clamped scale_pos_weight:    {spw_clamped:.3f} (range [5, 200])")
+    print("  Using manual scale_pos_weight and disabling is_unbalance.")
+
+    # Update best_params in-place so downstream consumers (e.g. metrics JSON)
+    # see the final parameters used for training.
+    best_params["is_unbalance"] = False
+    best_params["scale_pos_weight"] = spw_clamped
+
+    imbalance_info: Dict[str, Any] = {
+        "neg_full": int(neg_full),
+        "pos_full": int(pos_full),
+        "neg_sampled": int(neg_sampled),
+        "pos_sampled": int(pos_sampled),
+        "ratio_full": float(ratio_full),
+        "ratio_sampled": float(ratio_sampled),
+        "scale_pos_weight": float(spw_clamped),
+    }
+
+    if use_wandb:
+        wandb.log({
+            "imbalance/neg_pos_ratio_full": float(ratio_full),
+            "imbalance/neg_pos_ratio_sampled": float(ratio_sampled),
+            "imbalance/scale_pos_weight": float(spw_clamped),
+        })
+    
     print(f"\nTraining LightGBM on train_early ({len(X_train_early):,} samples)...")
     
     train_early_start = time.time()
-    lgb_model = LGBMClassifier(**best_params)
+    train_params = best_params.copy()
+    lgb_model = LGBMClassifier(**train_params)
     lgb_model.fit(
         X_train_early,
         y_train_early,
@@ -409,16 +466,22 @@ def phase1_training(
     # STEP D: Load full training data (2000-2017) and train final model
     # =========================================================================
     print("\n" + "=" * 70)
-    print("STEP D: LOAD FULL TRAINING DATA (2000-2017) AND TRAIN FINAL MODEL")
+    print("STEP D: LOAD FULL TRAINING DATA (TRAIN_EARLY + VAL_LATE) AND TRAIN FINAL MODEL")
     print("=" * 70)
     
-    df_train = load_and_preprocess(train_path, keep_cols_train, target_col, "train.parquet")
-    y = (df_train[target_col] > 0).astype(np.int8)
-    X = df_train[feature_cols].copy()
+    # Combine sampled early train and full late validation (2000–2017)
+    df_train_full = load_and_preprocess(train_path, keep_cols_train, target_col, "train_early_sampled.parquet")
+    df_val_full = load_and_preprocess(val_path, keep_cols_train, target_col, "val_late_full.parquet")
+    df_combined = pd.concat([df_train_full, df_val_full], ignore_index=True)
+    del df_train_full, df_val_full
+    gc.collect()
+
+    y = (df_combined[target_col] > 0).astype(np.int8)
+    X = df_combined[feature_cols].copy()
     train_pos, train_neg = int(y.sum()), int((y == 0).sum())
-    train_years = sorted(df_train['year'].unique())
-    n_train_full = len(df_train)
-    del df_train
+    train_years = sorted(df_combined['year'].unique())
+    n_train_full = len(df_combined)
+    del df_combined
     gc.collect()
     
     print(f"\nFull training set distribution:")
@@ -481,7 +544,7 @@ def phase1_training(
     print("\nPhase 1 completed. Memory cleaned up.")
     
     return (model_path, validation_metrics, train_stats, train_early_time, 
-            val_time, train_time, train_pos, train_neg, n_train_full)
+            val_time, train_time, train_pos, train_neg, n_train_full, imbalance_info)
 
 
 def phase2_testing(
@@ -503,6 +566,7 @@ def phase2_testing(
     n_train_full: int,
     best_params: Dict[str, Any],
     start_time: float,
+    imbalance_info: Dict[str, Any],
 ) -> None:
     """Phase 2: Testing phase - loads test.parquet in batches, loads model, evaluates."""
     print("\n" + "=" * 70)
@@ -705,6 +769,17 @@ def phase2_testing(
         },
         "validation_performance": validation_metrics,
         "model_parameters": best_params,
+        "imbalance_handling": {
+            "method": "scale_pos_weight",
+            "is_unbalance": False,
+            "scale_pos_weight": imbalance_info.get("scale_pos_weight"),
+            "neg_pos_ratio_full": imbalance_info.get("ratio_full"),
+            "neg_pos_ratio_sampled": imbalance_info.get("ratio_sampled"),
+            "neg_full": imbalance_info.get("neg_full"),
+            "pos_full": imbalance_info.get("pos_full"),
+            "neg_sampled": imbalance_info.get("neg_sampled"),
+            "pos_sampled": imbalance_info.get("pos_sampled"),
+        },
         "test_performance": test_metrics,
         "feature_importance": feature_importance.head(20).to_dict('records'),
         "timing": {
@@ -779,9 +854,10 @@ def main() -> None:
     # -------------------------------------------------------------------------
     repo_root = Path(__file__).resolve().parents[3]
     
-    # Input paths
-    train_path = resolve_parquet_file("train.parquet")
-    test_path = resolve_parquet_file("test.parquet")
+    # Input paths (pre-split files from model1_preprocessing)
+    train_path = resolve_parquet_file("train_early_sampled.parquet")
+    val_path = resolve_parquet_file("val_late_full.parquet")
+    test_path = resolve_parquet_file("test_full.parquet")
     params_path = resolve_best_params_json()
     
     # Output directories
@@ -818,9 +894,10 @@ def main() -> None:
     print("=" * 70)
     print("LGBM TRANSITION MODEL (0→1 PREDICTION)")
     print("=" * 70)
-    print(f"\nTrain:  {train_path}")
-    print(f"Test:   {test_path}")
-    print(f"Params: {params_path}")
+    print(f"\nTrain (early, sampled): {train_path}")
+    print(f"Val (late, full):       {val_path}")
+    print(f"Test (full):            {test_path}")
+    print(f"Params:                 {params_path}")
     print(f"Output: {output_dir}")
     
     # -------------------------------------------------------------------------
@@ -869,8 +946,9 @@ def main() -> None:
     # Phase 1: Training
     # -------------------------------------------------------------------------
     (model_path, validation_metrics, train_stats, train_early_time, 
-     val_time, train_time, train_pos, train_neg, n_train_full) = phase1_training(
+     val_time, train_time, train_pos, train_neg, n_train_full, imbalance_info) = phase1_training(
         train_path=train_path,
+        val_path=val_path,
         params_path=params_path,
         feature_cols=feature_cols,
         keep_cols_train=keep_cols_train,
@@ -904,6 +982,7 @@ def main() -> None:
         n_train_full=n_train_full,
         best_params=best_params,
         start_time=start_time,
+        imbalance_info=imbalance_info,
     )
 
 

@@ -3,15 +3,19 @@
 """RF Transition Model (0→1 Prediction)
 
 Purpose: Train a Random Forest model to predict transitions to protected areas (0→1).
-         Uses train.parquet (2000-2017) and test.parquet (2018-2024) with pre-tuned hyperparameters
-         from rf_best_params.json. Uses strict temporal split for internal validation:
-         - train_early (≤2014) for training
-         - val_late (2015-2017) for validation
-         - Final model retrained on full train.parquet (2000-2017)
-         - Evaluation on test.parquet (2018-2024)
+         Uses pre-split parquet files created by model1_preprocessing:
+         - train_early_sampled.parquet (2000-2014, negatives sampled 1:20 per positive)
+         - val_late_full.parquet (2015-2017, full risk set)
+         - test_full.parquet (2018-2024, full risk set)
+         Uses strict temporal split for internal validation:
+         - train_early (train_early_sampled) for training
+         - val_late (val_late_full) for validation
+         - Final model retrained on combined train_early_sampled + val_late_full (2000-2017)
+         - Evaluation on test_full (2018-2024)
 
-Input:   - train.parquet (2000-2017)
-         - test.parquet (2018-2024)
+Input:   - train_early_sampled.parquet (2000-2014, sampled)
+         - val_late_full.parquet (2015-2017, full risk set)
+         - test_full.parquet (2018-2024, full risk set)
          - rf_best_params.json
 Output:  - Trained model (.pkl)
          - Test predictions (.parquet)
@@ -346,6 +350,7 @@ def compute_metrics(y_true: np.ndarray, y_proba: np.ndarray) -> Dict[str, float]
 
 def phase1_training(
     train_path: Path,
+    val_path: Path,
     params_path: Path,
     feature_cols: list,
     keep_cols_train: list,
@@ -356,7 +361,7 @@ def phase1_training(
     use_wandb: bool,
     target_col: str,
 ) -> tuple[Path, Dict[str, Any], Dict[str, Any], float, float, float, float, int, int]:
-    """Phase 1: Training phase - loads only train.parquet, trains model, saves it.
+    """Phase 1: Training phase - loads train/val splits, trains model, saves it.
     
     Uses multi-pass loading to prevent memory spikes by ensuring splits never coexist.
     
@@ -372,15 +377,15 @@ def phase1_training(
     # STEP A: Load train_early, train model, then delete train_early
     # =========================================================================
     print("\n" + "=" * 70)
-    print("STEP A: LOAD TRAIN_EARLY, TRAIN MODEL, DELETE TRAIN_EARLY")
+    print("STEP A: LOAD TRAIN_EARLY (year <= 2014) FROM train_early_sampled, TRAIN MODEL, DELETE TRAIN_EARLY")
     print("=" * 70)
     
-    df_train = load_and_preprocess(train_path, keep_cols_train, target_col, "train.parquet")
+    df_train = load_and_preprocess(train_path, keep_cols_train, target_col, "train_early_sampled.parquet")
     print(f"\nFiltering train_early (year <= {TRAIN_EARLY_YEAR_MAX})...")
     X_train_early, y_train_early, train_early_pos, train_early_neg = extract_split(
         df_train, feature_cols, target_col, 
         lambda y: y <= TRAIN_EARLY_YEAR_MAX, "Train early",
-        max_samples=5000000
+        max_samples=None
     )
     del df_train
     gc.collect()
@@ -413,17 +418,17 @@ def phase1_training(
     # STEP B: Load val_late, evaluate, then delete val_late
     # =========================================================================
     print("\n" + "=" * 70)
-    print("STEP B: LOAD VAL_LATE, EVALUATE, DELETE VAL_LATE")
+    print("STEP B: LOAD VAL_LATE (2015 <= year <= 2017) FROM val_late_full, EVALUATE, DELETE VAL_LATE")
     print("=" * 70)
     
-    df_train = load_and_preprocess(train_path, keep_cols_train, target_col, "train.parquet")
+    df_val = load_and_preprocess(val_path, keep_cols_train, target_col, "val_late_full.parquet")
     print(f"\nFiltering val_late ({VAL_LATE_YEAR_MIN} <= year <= {VAL_LATE_YEAR_MAX})...")
     X_val_late, y_val_late, val_late_pos, val_late_neg = extract_split(
-        df_train, feature_cols, target_col,
+        df_val, feature_cols, target_col,
         lambda y: (y >= VAL_LATE_YEAR_MIN) & (y <= VAL_LATE_YEAR_MAX), "Val late",
         max_samples=None
     )
-    del df_train
+    del df_val
     gc.collect()
     print("  Memory cleaned up after val_late extraction")
     
@@ -465,45 +470,17 @@ def phase1_training(
     # STEP D: Load full training data (2000-2017) and train final model
     # =========================================================================
     print("\n" + "=" * 70)
-    print("STEP D: LOAD FULL TRAINING DATA (2000-2017) AND TRAIN FINAL MODEL")
+    print("STEP D: LOAD FULL TRAINING DATA (TRAIN_EARLY + VAL_LATE) AND TRAIN FINAL MODEL")
     print("=" * 70)
     
-    df_train = load_and_preprocess(train_path, keep_cols_train, target_col, "train.parquet")
+    # Combine sampled early train and full late validation (2000–2017)
+    df_train_full = load_and_preprocess(train_path, keep_cols_train, target_col, "train_early_sampled.parquet")
+    df_val_full = load_and_preprocess(val_path, keep_cols_train, target_col, "val_late_full.parquet")
+    df_train = pd.concat([df_train_full, df_val_full], ignore_index=True)
+    del df_train_full, df_val_full
+    gc.collect()
+
     y = (df_train[target_col] > 0).astype(np.int8)
-    
-    # Apply downsampling if needed (max_samples=5000000)
-    max_samples = 5000000
-    if len(df_train) > max_samples:
-        original_len = len(df_train)
-        n_pos = int(y.sum())
-        n_neg_needed = max_samples - n_pos
-        
-        if n_neg_needed < 0:
-            # Edge case: more positives than max_samples, keep all positives
-            print(f"\n  Warning: {n_pos:,} positives exceed max_samples={max_samples:,}, keeping all positives")
-            n_neg_needed = 0
-        
-        # Get indices of positives and negatives
-        pos_idx = df_train.index[y == 1]
-        neg_idx = df_train.index[y == 0]
-        
-        # Keep all positives, sample negatives
-        if n_neg_needed > 0 and len(neg_idx) > 0:
-            n_neg_to_sample = min(n_neg_needed, len(neg_idx))
-            neg_sampled_idx = np.random.RandomState(RANDOM_STATE).choice(
-                neg_idx, size=n_neg_to_sample, replace=False
-            )
-            selected_idx = pos_idx.union(pd.Index(neg_sampled_idx))
-        else:
-            selected_idx = pos_idx
-        
-        # Filter dataframe and shuffle
-        df_train = df_train.loc[selected_idx].copy()
-        df_train = df_train.sample(frac=1, random_state=RANDOM_STATE).reset_index(drop=True)
-        
-        # Re-extract y after downsampling
-        y = (df_train[target_col] > 0).astype(np.int8)
-        print(f"\n  Downsampled from {original_len:,} to {len(df_train):,} samples")
     
     X = df_train[feature_cols].copy()
     train_pos, train_neg = int(y.sum()), int((y == 0).sum())
@@ -856,9 +833,10 @@ def main() -> None:
     # -------------------------------------------------------------------------
     repo_root = Path(__file__).resolve().parents[3]
     
-    # Input paths
-    train_path = resolve_parquet_file("train.parquet")
-    test_path = resolve_parquet_file("test.parquet")
+    # Input paths (pre-split files from model1_preprocessing)
+    train_path = resolve_parquet_file("train_early_sampled.parquet")
+    val_path = resolve_parquet_file("val_late_full.parquet")
+    test_path = resolve_parquet_file("test_full.parquet")
     params_path = resolve_best_params_json()
     
     # Output directories
@@ -895,9 +873,10 @@ def main() -> None:
     print("=" * 70)
     print("RF TRANSITION MODEL (0→1 PREDICTION)")
     print("=" * 70)
-    print(f"\nTrain:  {train_path}")
-    print(f"Test:   {test_path}")
-    print(f"Params: {params_path}")
+    print(f"\nTrain (early, sampled): {train_path}")
+    print(f"Val (late, full):       {val_path}")
+    print(f"Test (full):            {test_path}")
+    print(f"Params:                 {params_path}")
     print(f"Output: {output_dir}")
     
     # -------------------------------------------------------------------------
@@ -948,6 +927,7 @@ def main() -> None:
     (model_path, validation_metrics, train_stats, train_early_time, 
      val_time, train_time, train_pos, train_neg, n_train_full) = phase1_training(
         train_path=train_path,
+        val_path=val_path,
         params_path=params_path,
         feature_cols=feature_cols,
         keep_cols_train=keep_cols_train,
