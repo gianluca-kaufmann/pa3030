@@ -8,10 +8,10 @@ ENV_NAME="${PROJECT_NAME}_env"
 ENV_YML="${SCRIPT_DIR}/environment.yml"
 
 # Sibling directory settings
-SEALS_DIR_NAME="seals_dev"
-SEALS_REPO_URL="https://github.com/jandrewjohnson/seals_dev.git"
+PA3030_DIR_NAME="seals_dev"
+PA3030_REPO_URL="https://github.com/jandrewjohnson/seals_dev.git"
 # Path to ../seals_dev
-SEALS_FULL_PATH="$(dirname "$SCRIPT_DIR")/${SEALS_DIR_NAME}"
+PA3030_FULL_PATH="$(dirname "$SCRIPT_DIR")/${PA3030_DIR_NAME}"
 
 # ANSI Colors for nicer output
 GREEN='\033[0;32m'
@@ -41,17 +41,17 @@ if ! command -v git &> /dev/null; then
 fi
 
 echo "Script directory: $SCRIPT_DIR"
-echo "Sibling Project:  $SEALS_FULL_PATH"
+echo "Sibling Project:  $PA3030_FULL_PATH"
 echo "Conda Env Name:   $ENV_NAME"
 
 # --- 2. Clone Sibling Repo ---
 echo -e "\nStep 1/3: Checking local dependencies..."
 
-if [ -d "$SEALS_FULL_PATH" ]; then
+if [ -d "$PA3030_FULL_PATH" ]; then
     echo -e "  ${GREEN}[OK]${NC} '$SEALS_DIR_NAME' already exists locally."
 else
-    echo -e "  ${YELLOW}[UPDATE]${NC} '$SEALS_DIR_NAME' not found. Cloning from GitHub..."
-    git clone "$SEALS_REPO_URL" "$SEALS_FULL_PATH"
+    echo -e "  ${YELLOW}[UPDATE]${NC} '$PA3030_DIR_NAME' not found. Cloning from GitHub..."
+    git clone "$PA3030_REPO_URL" "$PA3030_FULL_PATH"
     
     if [ $? -ne 0 ]; then
         echo -e "${RED}ERROR: Failed to clone seals_dev.${NC}"
@@ -89,9 +89,9 @@ fi
 echo -e "\nStep 3/3: Configuring VS Code helper..."
 
 # Create .env file for PYTHONPATH
-echo "PYTHONPATH=../$SEALS_DIR_NAME" > .env
+echo "PYTHONPATH=../$PA3030_DIR_NAME" > .env
 
-echo -e "  ${GREEN}[OK]${NC} Created .env file pointing to $SEALS_DIR_NAME"
+echo -e "  ${GREEN}[OK]${NC} Created .env file pointing to $PA3030_DIR_NAME"
 
 # --- Done ---
 echo -e "\n=========================================================="
@@ -105,6 +105,6 @@ echo "2. VS Code / Pylance Setup:"
 echo "   - Open Command Palette (Cmd+Shift+P)"
 echo "   - Type: 'Python: Select Interpreter'"
 echo "   - Select: '$ENV_NAME'"
-echo "   - Pylance will now automatically find 'seals' in ../$SEALS_DIR_NAME"
+echo "   - Pylance will now automatically find 'seals' in ../$PA3030_DIR_NAME"
 echo ""
 echo -e "=========================================================="

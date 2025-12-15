@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 echo.
-echo === SEALS Bonn environment setup (Windows) ===
+echo === Protected areas 30x30 environment setup (Windows) ===
 
 REM ---- 1. CONFIGURATION ----
 REM Determine project folder name
@@ -10,8 +10,8 @@ set ENV_NAME=%PROJECT_NAME%_env
 
 REM Set relative path to the sibling dependency
 REM %~dp0 is the script dir. We want one level up, then seals_dev
-set "SEALS_DIR_NAME=seals_dev"
-set "SEALS_REPO_URL=https://github.com/jandrewjohnson/seals_dev.git"
+set "PA3030_DIR_NAME=pa_dev"
+set "PA3030_REPO_URL=git@github.com:gianluca-kaufmann/master_thesis.git"
 
 REM ---- 2. CHECK TOOLING ----
 REM Find mamba / micromamba
@@ -38,23 +38,23 @@ set "ENV_YML=%SCRIPT_DIR%\environment.yml"
 REM Calculate full path to sibling directory for checking existence
 cd ..
 set "PARENT_DIR=%CD%"
-set "SEALS_FULL_PATH=%PARENT_DIR%\%SEALS_DIR_NAME%"
+set "PA3030_FULL_PATH=%PARENT_DIR%\%PA3030_DIR_NAME%"
 REM Return to script dir
 cd "%SCRIPT_DIR%"
 
 echo Script directory: %SCRIPT_DIR%
-echo Sibling Project:  %SEALS_FULL_PATH%
+echo Sibling Project:  %PA3030_FULL_PATH%
 echo Conda Env Name:   %ENV_NAME%
 
 REM ---- 4. CLONE SIBLING REPO (The "Missing Link") ----
 echo.
 echo Step 1/3: Checking local dependencies...
 
-if exist "%SEALS_FULL_PATH%\" (
-    echo   [OK] '%SEALS_DIR_NAME%' already exists locally.
+if exist "%PA3030_FULL_PATH%\" (
+    echo   [OK] '%PA3030_DIR_NAME%' already exists locally.
 ) else (
-    echo   [UPDATE] '%SEALS_DIR_NAME%' not found. Cloning from GitHub...
-    git clone %SEALS_REPO_URL% "%SEALS_FULL_PATH%"
+    echo   [UPDATE] '%PA3030_DIR_NAME%' not found. Cloning from GitHub...
+    git clone %PA3030_REPO_URL% "%PA3030_FULL_PATH%"
     if errorlevel 1 goto clone_fail
     echo   [OK] Clone successful.
 )
@@ -88,9 +88,9 @@ echo.
 echo Step 3/3: Configuring VS Code helper...
 REM Create a .env file to help VS Code resolve paths even if env isn't active yet
 (
-echo PYTHONPATH=../%SEALS_DIR_NAME%
+echo PYTHONPATH=../%PA3030_DIR_NAME%
 ) > .env
-echo   [OK] Created .env file pointing to %SEALS_DIR_NAME%
+echo   [OK] Created .env file pointing to %PA3030_DIR_NAME%
 
 goto done
 
@@ -107,7 +107,7 @@ echo 2. VS Code / Pylance Setup:
 echo    - Open Command Palette (Ctrl+Shift+P)
 echo    - Type: "Python: Select Interpreter"
 echo    - Select: "%ENV_NAME%"
-echo    - Pylance will now automatically find 'seals' in ../%SEALS_DIR_NAME%
+echo    - Pylance will now automatically find 'seals' in ../%PA3030_DIR_NAME%
 echo.
 echo ==========================================================
 
@@ -125,7 +125,7 @@ exit /b 1
 
 :clone_fail
 echo.
-echo ERROR: Failed to clone seals_dev. Check internet or permissions.
+echo ERROR: Failed to clone pa3030_dev. Check internet or permissions.
 popd
 endlocal
 exit /b 1
