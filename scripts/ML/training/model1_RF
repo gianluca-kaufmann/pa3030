@@ -90,6 +90,19 @@ FIXED_PARAMS = {
     'bootstrap': True,
 }
 
+# Guardrail parameters (enforced to override any tuned values)
+RF_GUARDRAIL_PARAMS = {
+    "n_estimators": 1500,
+    "max_depth": 12,
+    "min_samples_split": 20,
+    "min_samples_leaf": 10,
+    "max_features": "sqrt",
+    "bootstrap": True,
+    "max_samples": 0.2,
+    "class_weight": "balanced_subsample",
+    "verbose": 0,
+}
+
 
 # =============================================================================
 # Utility Functions
@@ -209,8 +222,14 @@ def load_best_params(params_path: Path) -> Dict[str, Any]:
     # Merge with fixed params in correct order: FIXED_PARAMS → json_fixed_params → best_params
     final_params = {**FIXED_PARAMS, **json_fixed_params, **cleaned_params}
     
-    # Force n_jobs override to prevent OOM errors (cap at 8)
-    final_params['n_jobs'] = get_n_jobs()
+    # Enforce guardrails (override any tuned values)
+    final_params.update(RF_GUARDRAIL_PARAMS)
+    final_params["random_state"] = RANDOM_STATE
+    final_params["n_jobs"] = get_n_jobs()
+    
+    # Remove conflicting or irrelevant params if present
+    for key in ["criterion"]:
+        final_params.pop(key, None)
     
     return final_params, params_data.get('best_cv_score', None)
 
