@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""
+Critical Assets visualization for South America.
+
+Inputs:
+- GeoTIFF mask in `data/ready/critical assets/critical_assets_SA_1km.tif`
+
+Process:
+- Loads the critical assets mask, computes coverage statistics, and produces visualisations.
+
+Outputs:
+- PNG figures saved to `outputs/Figures/critical_assets_vis`.
+"""
+
+import numpy as np
+import rasterio
+import matplotlib.pyplot as plt
+from pathlib import Path
+import warnings
+from matplotlib.colors import ListedColormap
+from matplotlib.patches import Patch
+
+warnings.filterwarnings('ignore')
+
+# Paths
+ROOT_DIR = Path(__file__).resolve().parents[2]
+DATA_DIR = ROOT_DIR / "data"
+CRITICAL_ASSETS_FILE = DATA_DIR / "ready" / "critical assets" / "critical_assets_SA_1km.tif"
+OUTPUT_DIR = ROOT_DIR / "outputs" / "Figures" / "critical_assets_vis"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_critical_assets_data():
+    """Load the critical assets raster mask."""
+    print("Loading Critical Assets raster mask...")
+    
+    if not CRITICAL_ASSETS_FILE.exists():
+        print(f"   Error: File not found: {CRITICAL_ASSETS_FILE}")
+        return None
+    
+    try:
+        with rasterio.open(CRITICAL_ASSETS_FILE) as src:
+            data = src.read(1).astype(np.uint8)
+            
+            # Get basic stats
+            total_pixels = data.size
+            critical_pixels = np.sum(data == 1)
+            critical_percentage = (critical_pixels / total_pixels) * 100
+            
+            print(f"   Total pixels: {total_pixels:,}")
+            print(f"   Critical assets pixels: {critical_pixels:,} ({critical_percentage:.2f}%)")
+            
+            data_info = {
+                'data': data,
+                'src_profile': src.profile,
+                'file_path': CRITICAL_ASSETS_FILE,
+                'stats': {
+                    'total_pixels': total_pixels,
+                    'critical_pixels': critical_pixels,
+                    'critical_percentage': critical_percentage
+                }
+            }
+            
+            print(f"   Successfully loaded critical assets data")
+            return data_info
+            
+    except Exception as e:
+        print(f"   Error loading critical assets data: {e}")
+        return None
+
+
+def create_overview_map(data_info):
+    """Create an overview map of critical assets."""
+    if data_info is None:
+        return
+    
+    print("Creating critical assets overview map...")
+    
+    data = data_info['data']
+    stats = data_info['stats']
+    
+    fig, ax = plt.subplots(figsize=(14, 12))
+    
+    # Use red color for critical assets
+    colors = ['white', '#C62828']  # White for 0, Dark Red for 1
+    cmap = ListedColormap(colors)
+    
+    im = ax.imshow(data, cmap=cmap, vmin=0, vmax=1, interpolation='nearest')
+    
+    ax.set_title("Critical Assets - South America", 
+                fontsize=18, fontweight='bold', pad=20)
+    ax.set_axis_off()
+    
+    # Create legend
+    legend_elements = [
+        Patch(facecolor='white', label='No Critical Assets'),
+        Patch(facecolor='#C62828', label='Critical Assets')
+    ]
+    
+    ax.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(0.98, 0.98),
+             fontsize=12, framealpha=0.9)
+    
+    # Add statistics text
+    stats_text = (f"Critical assets pixels: {stats['critical_pixels']:,}\n"
+                 f"Coverage: {stats['critical_percentage']:.2f}%\n"
+                 f"Total pixels: {stats['total_pixels']:,}")
+    
+    ax.text(0.02, 0.02, stats_text, transform=ax.transAxes, 
+           fontsize=12, verticalalignment='bottom',
+           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, pad=5))
+    
+    plt.tight_layout()
+    out_file = OUTPUT_DIR / "critical_assets_overview.png"
+    plt.savefig(out_file, dpi=300, bbox_inches='tight')
+    print(f"   Saved: {out_file.name}")
+    plt.close()
+
+
+def create_statistics_plot(data_info):
+    """Create a bar chart showing critical assets statistics."""
+    if data_info is None:
+        return
+    
+    print("Creating critical assets statistics plot...")
+    
+    stats = data_info['stats']
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    
+    # Plot 1: Pixel counts
+    categories = ['No Critical Assets', 'Critical Assets']
+    pixel_counts = [
+        stats['total_pixels'] - stats['critical_pixels'],
+        stats['critical_pixels']
+    ]
+    colors_bar = ['#E0E0E0', '#C62828']
+    
+    bars1 = ax1.bar(categories, pixel_counts, color=colors_bar, alpha=0.9, 
+                    edgecolor='black', linewidth=1.0)
+    
+    ax1.set_title('Critical Assets Pixel Counts\nSouth America', 
+                 fontsize=14, fontweight='bold', pad=15)
+    ax1.set_ylabel('Number of Pixels', fontsize=12)
+    ax1.set_xlabel('Category', fontsize=12)
+    
+    # Add value labels on bars
+    for bar, count in zip(bars1, pixel_counts):
+        height = bar.get_height()
+        ax1.text(bar.get_x() + bar.get_width()/2., height,
+               f'{count:,}', ha='center', va='bottom', fontweight='bold', fontsize=10)
+    
+    ax1.grid(axis='y', alpha=0.3)
+    plt.setp(ax1.xaxis.get_majorticklabels(), rotation=45, ha='right')
+    
+    # Plot 2: Percentage pie chart
+    percentages = [
+        stats['critical_percentage'],
+        100 - stats['critical_percentage']
+    ]
+    labels = ['Critical Assets', 'No Critical Assets']
+    colors_pie = ['#C62828', '#E0E0E0']
+    
+    wedges, texts, autotexts = ax2.pie(percentages, labels=labels, colors=colors_pie,
+                                       autopct='%1.2f%%', startangle=90,
+                                       textprops={'fontsize': 11, 'fontweight': 'bold'})
+    
+    ax2.set_title('Critical Assets Coverage\nSouth America', 
+                 fontsize=14, fontweight='bold', pad=15)
+    
+    plt.tight_layout()
+    out_file = OUTPUT_DIR / "critical_assets_statistics.png"
+    plt.savefig(out_file, dpi=300, bbox_inches='tight')
+    print(f"   Saved: {out_file.name}")
+    plt.close()
+
+
+def create_density_analysis(data_info):
+    """Create a density/heatmap visualization of critical assets."""
+    if data_info is None:
+        return
+    
+    print("Creating critical assets density analysis...")
+    
+    data = data_info['data']
+    stats = data_info['stats']
+    
+    fig, ax = plt.subplots(figsize=(14, 12))
+    
+    # Use a heatmap-style colormap for density visualization
+    # Show critical assets in red gradient
+    im = ax.imshow(data, cmap='Reds', vmin=0, vmax=1, interpolation='bilinear', alpha=0.8)
+    
+    ax.set_title("Critical Assets Density Map - South America", 
+                fontsize=18, fontweight='bold', pad=20)
+    ax.set_axis_off()
+    
+    # Add colorbar
+    cbar = plt.colorbar(im, ax=ax, shrink=0.6, pad=0.02)
+    cbar.set_label('Critical Assets Presence', rotation=270, labelpad=20, fontsize=12)
+    cbar.set_ticks([0, 1])
+    cbar.set_ticklabels(['None', 'Present'])
+    
+    # Add statistics text
+    stats_text = (f"Critical assets pixels: {stats['critical_pixels']:,}\n"
+                 f"Coverage: {stats['critical_percentage']:.2f}%")
+    
+    ax.text(0.02, 0.02, stats_text, transform=ax.transAxes, 
+           fontsize=12, verticalalignment='bottom',
+           bbox=dict(boxstyle='round', facecolor='white', alpha=0.8, pad=5))
+    
+    plt.tight_layout()
+    out_file = OUTPUT_DIR / "critical_assets_density.png"
+    plt.savefig(out_file, dpi=300, bbox_inches='tight')
+    print(f"   Saved: {out_file.name}")
+    plt.close()
+
+
+def create_summary(data_info):
+    """Print and save basic summary statistics."""
+    if data_info is None:
+        return
+    
+    print("\n" + "=" * 70)
+    print("CRITICAL ASSETS VISUALIZATION SUMMARY")
+    print("=" * 70)
+    print(f"Input file: {CRITICAL_ASSETS_FILE.name}")
+    print(f"Output directory: {OUTPUT_DIR}")
+    
+    stats = data_info['stats']
+    print("\nCoverage Statistics:")
+    print(f"  • Total pixels: {stats['total_pixels']:,}")
+    print(f"  • Critical assets pixels: {stats['critical_pixels']:,}")
+    print(f"  • Coverage: {stats['critical_percentage']:.2f}%")
+    print(f"  • No critical assets pixels: {stats['total_pixels'] - stats['critical_pixels']:,}")
+
+
+def main():
+    print("Critical Assets Visualization — South America")
+    print("=" * 70)
+    
+    data_info = load_critical_assets_data()
+    if data_info is None:
+        print("Failed to load data. Exiting.")
+        return
+    
+    print("\nCreating visualizations...")
+    create_overview_map(data_info)
+    create_statistics_plot(data_info)
+    create_density_analysis(data_info)
+    create_summary(data_info)
+    
+    print("\nVisualization complete!")
+
+
+if __name__ == "__main__":
+    main()
+

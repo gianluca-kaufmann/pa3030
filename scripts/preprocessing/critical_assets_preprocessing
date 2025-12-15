@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""
+Critical Assets Preprocessing
+=============================
+
+Objective:
+    Process critical assets raster files for South America:
+    1. Identify all .tif files for South American countries
+    2. Delete all other files (non-tif or non-South American)
+    3. Merge the remaining South American .tif files
+    4. Reproject and resample to match backbone.tif resolution, CRS, and extent
+
+Inputs:
+    - Multiple country-specific .tif files in `data/ready/critical assets/`
+      with pattern `mask_<country_code>_eck4_2km.tif`
+    - `data/ready/backbone/backbone.tif` (reference grid)
+
+Outputs:
+    - Single merged GeoTIFF: `data/ready/critical assets/critical_assets_SA_1km.tif`
+      matching backbone.tif resolution, CRS, and extent
+
+South American countries (ISO 3-letter codes):
+    - Argentina: arg
+    - Bolivia: bol
+    - Brazil: bra
+    - Chile: chl
+    - Colombia: col
+    - Ecuador: ecu
+    - Guyana: guy
+    - Paraguay: pry
+    - Peru: per
+    - Suriname: sur
+    - Uruguay: ury
+    - Venezuela: ven
+"""
+
+from pathlib import Path
+import warnings
+
+import numpy as np
+import rasterio
+from rasterio.merge import merge
+from rasterio.warp import reproject, Resampling, calculate_default_transform
+from rasterio.enums import Resampling
+
+warnings.filterwarnings("ignore")
+
+
+# ==========
+# Configuration
+# ==========
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DATA_DIR = PROJECT_ROOT / "data"
+CRITICAL_ASSETS_DIR = DATA_DIR / "ready" / "critical assets"
+BACKBONE_PATH = DATA_DIR / "ready" / "backbone" / "backbone.tif"
+OUTPUT_FILE = CRITICAL_ASSETS_DIR / "critical_assets_SA_1km.tif"
+
+# South American country ISO 3-letter codes
+SOUTH_AMERICAN_COUNTRIES = {
+    "arg",  # Argentina
+    "bol",  # Bolivia
+    "bra",  # Brazil
+    "chl",  # Chile
+    "col",  # Colombia
+    "ecu",  # Ecuador
+    "guy",  # Guyana
+    "pry",  # Paraguay
+    "per",  # Peru
+    "sur",  # Suriname
+    "ury",  # Uruguay
+    "ven",  # Venezuela
+}
+
+
+def get_south_american_tif_files():
+    """Find all .tif files for South American countries."""
+    print(f"Searching for South American .tif files in {CRITICAL_ASSETS_DIR}...")
+    
+    if not CRITICAL_ASSETS_DIR.exists():
+        raise FileNotFoundError(f"Directory does not exist: {CRITICAL_ASSETS_DIR}")
+    
+    # Find all .tif files
+    all_tif_files = sorted(CRITICAL_ASSETS_DIR.glob("*.tif"))
+    
+    # Filter for South American countries
+    sa_tif_files = []
+    for tif_file in all_tif_files:
+        # Extract country code from filename (e.g., "mask_arg_eck4_2km.tif" -> "arg")
+        parts = tif_file.stem.split("_")
+        if len(parts) >= 2:
+            country_code = parts[1].lower()
+            if country_code in SOUTH_AMERICAN_COUNTRIES:
+                sa_tif_files.append(tif_file)
+    
+    print(f"   Found {len(sa_tif_files)} South American .tif file(s):")
+    for tif_file in sa_tif_files:
+        print(f"      - {tif_file.name}")
+    
+    return sa_tif_files
+
+
+def delete_non_sa_files(sa_tif_files):
+    """Delete all files that are not South American .tif files."""
+    print(f"\nDeleting non-South American and non-tif files...")
+    
+    # Get all files in the directory
+    all_files = list(CRITICAL_ASSETS_DIR.glob("*"))
+    
+    # Create set of South American .tif file paths for quick lookup
+    sa_tif_paths = {f.resolve() for f in sa_tif_files}
+    
+    deleted_count = 0
+    for file_path in all_files:
+        # Skip directories
+        if file_path.is_dir():
+            continue
+        
+        # Keep South American .tif files
+        if file_path.resolve() in sa_tif_paths:
+            continue
+        
+        # Skip output file if it exists (will be overwritten later)
+        if file_path.resolve() == OUTPUT_FILE.resolve():
+            continue
+        
+        # Delete everything else
+        try:
+            file_path.unlink()
+            print(f"   Deleted: {file_path.name}")
+            deleted_count += 1
+        except Exception as e:
+            print(f"   ERROR: Could not delete {file_path.name}: {e}")
+    
+    print(f"   Deleted {deleted_count} file(s)")
+
+
+def load_backbone_reference():
+    """Load backbone.tif to get reference grid parameters."""
+    if not BACKBONE_PATH.exists():
+        raise FileNotFoundError(
+            f"Backbone reference file not found: {BACKBONE_PATH}\n"
+            "Please ensure backbone.tif exists in data/ready/backbone/"
+        )
+    
+    with rasterio.open(BACKBONE_PATH) as src:
+        ref_profile = src.profile.copy()
+        ref_bounds = src.bounds
+        ref_crs = src.crs
+        ref_transform = src.transform
+        ref_height = src.height
+        ref_width = src.width
+    
+    print(f"\nLoaded backbone reference:")
+    print(f"   CRS: {ref_crs}")
+    print(f"   Resolution: {ref_transform[0]:.0f} m × {abs(ref_transform[4]):.0f} m")
+    print(f"   Size: {ref_width} × {ref_height}")
+    print(f"   Bounds: {ref_bounds}")
+    
+    return ref_profile, ref_bounds, ref_crs, ref_transform, ref_height, ref_width
+
+
+def merge_sa_tiles(sa_tif_files):
+    """Merge all South American .tif files into a single raster."""
+    if not sa_tif_files:
+        raise ValueError("No South American .tif files found to merge")
+    
+    print(f"\nMerging {len(sa_tif_files)} South American tile file(s)...")
+    
+    # Open all tile files
+    tile_sources = []
+    for tif_file in sa_tif_files:
+        try:
+            src = rasterio.open(tif_file)
+            tile_sources.append(src)
+            print(f"   Opened: {tif_file.name}")
+            print(f"      Shape: {src.shape}, Bands: {src.count}, CRS: {src.crs}")
+            print(f"      Bounds: {src.bounds}")
+        except Exception as e:
+            print(f"   ERROR: Could not open {tif_file.name}: {e}")
+            continue
+    
+    if not tile_sources:
+        raise ValueError("No valid tile files could be opened")
+    
+    # Use rasterio's merge function to create mosaic
+    print("\n   Creating mosaic...")
+    mosaic, out_transform = merge(tile_sources, method='first')
+    
+    # Get metadata from first source
+    out_meta = tile_sources[0].meta.copy()
+    out_meta.update({
+        "driver": "GTiff",
+        "height": mosaic.shape[1],
+        "width": mosaic.shape[2],
+        "transform": out_transform,
+        "count": mosaic.shape[0],
+        "dtype": mosaic.dtype,
+        "compress": "lzw",
+        "tiled": True,
+        "blockxsize": 512,
+        "blockysize": 512,
+    })
+    
+    # Close all source files
+    for src in tile_sources:
+        src.close()
+    
+    print(f"   Mosaic created:")
+    print(f"      Shape: {mosaic.shape}")
+    print(f"      Bands: {mosaic.shape[0]}")
+    print(f"      Data type: {mosaic.dtype}")
+    print(f"      CRS: {out_meta['crs']}")
+    print(f"      Valid pixels: {np.sum(~np.isnan(mosaic)):,}")
+    
+    return mosaic, out_meta, out_transform
+
+
+def reproject_to_backbone(mosaic, out_meta, out_transform, ref_profile, ref_transform, ref_height, ref_width):
+    """Reproject merged mosaic to match backbone.tif resolution, CRS, and extent."""
+    print(f"\nReprojecting to match backbone.tif...")
+    
+    ref_crs = ref_profile['crs']
+    src_crs = out_meta['crs']
+    
+    print(f"   Source CRS: {src_crs}")
+    print(f"   Target CRS: {ref_crs}")
+    print(f"   Target size: {ref_width} × {ref_height}")
+    
+    # Create destination array
+    count = mosaic.shape[0]
+    dst = np.full((count, ref_height, ref_width), np.nan, dtype=np.float32)
+    
+    # Reproject each band
+    for b in range(count):
+        src_array = mosaic[b].astype(np.float32)
+        
+        # Handle nodata
+        src_nodata = out_meta.get('nodata', None)
+        if src_nodata is not None:
+            src_array = np.where(src_array == src_nodata, np.nan, src_array)
+        
+        # Reproject
+        reproject(
+            source=src_array,
+            destination=dst[b],
+            src_transform=out_transform,
+            src_crs=src_crs,
+            src_nodata=np.nan,
+            dst_transform=ref_transform,
+            dst_crs=ref_crs,
+            resampling=Resampling.nearest,
+            dst_nodata=np.nan,
+        )
+    
+    # Update metadata
+    out_meta.update({
+        "crs": ref_crs,
+        "transform": ref_transform,
+        "height": ref_height,
+        "width": ref_width,
+    })
+    
+    print(f"   Reprojection complete")
+    print(f"      Valid pixels: {np.sum(~np.isnan(dst)):,}")
+    
+    return dst, out_meta
+
+
+def write_output_raster(data, out_meta):
+    """Write the final merged and reprojected raster to disk."""
+    print(f"\nWriting output raster to {OUTPUT_FILE.name}...")
+    
+    # Ensure output directory exists
+    OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Update metadata for output
+    out_meta.update({
+        "compress": "lzw",
+        "tiled": True,
+        "blockxsize": 512,
+        "blockysize": 512,
+    })
+    
+    # Write the raster
+    with rasterio.open(OUTPUT_FILE, "w", **out_meta) as dst:
+        dst.write(data)
+        
+        print(f"   Successfully wrote {OUTPUT_FILE.name}")
+        print(f"   File size: {OUTPUT_FILE.stat().st_size / (1024**2):.1f} MB")
+        print(f"   Bounds: {dst.bounds}")
+        print(f"   CRS: {dst.crs}")
+        print(f"   Resolution: {dst.res[0]:.0f} m × {dst.res[1]:.0f} m")
+        print(f"   Shape: {dst.shape}")
+
+
+def main():
+    """Main preprocessing function."""
+    print("=" * 60)
+    print("Critical Assets Preprocessing")
+    print("=" * 60)
+    
+    try:
+        # Step 1: Find South American .tif files
+        sa_tif_files = get_south_american_tif_files()
+        
+        if not sa_tif_files:
+            print("\nERROR: No South American .tif files found.")
+            print("Please ensure critical assets .tif files are in:")
+            print(f"   {CRITICAL_ASSETS_DIR}")
+            return
+        
+        # Step 2: Delete non-South American files
+        delete_non_sa_files(sa_tif_files)
+        
+        # Step 3: Load backbone reference
+        ref_profile, ref_bounds, ref_crs, ref_transform, ref_height, ref_width = load_backbone_reference()
+        
+        # Step 4: Check if output already exists
+        if OUTPUT_FILE.exists():
+            print(f"\nWARNING: Output file already exists: {OUTPUT_FILE.name}")
+            response = input("   Overwrite? (y/n): ").strip().lower()
+            if response != 'y':
+                print("   Skipping merge (file already exists)")
+                return
+        
+        # Step 5: Merge South American tiles
+        mosaic, out_meta, out_transform = merge_sa_tiles(sa_tif_files)
+        
+        # Step 6: Reproject to match backbone
+        reprojected_data, final_meta = reproject_to_backbone(
+            mosaic, out_meta, out_transform, ref_profile, ref_transform, ref_height, ref_width
+        )
+        
+        # Step 7: Write output
+        write_output_raster(reprojected_data, final_meta)
+        
+        print("\n" + "=" * 60)
+        print("Preprocessing completed successfully!")
+        print("=" * 60)
+        print(f"\nOutput file: {OUTPUT_FILE}")
+        print("\nThe merged file matches backbone.tif resolution, CRS, and extent.")
+        print("Individual country files have been deleted.")
+        
+    except Exception as e:
+        print(f"\nERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+    
+    return 0
+
+
+if __name__ == "__main__":
+    exit(main())
+

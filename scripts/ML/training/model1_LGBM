@@ -34,6 +34,7 @@ import numpy as np
 import pandas as pd
 import wandb
 import pyarrow.parquet as pq
+import lightgbm as lgb
 from lightgbm import LGBMClassifier
 from sklearn.metrics import roc_auc_score, average_precision_score
 
@@ -181,7 +182,7 @@ def resolve_best_params_json() -> Path:
     return params_path
 
 
-def load_best_params(params_path: Path) -> Dict[str, Any]:
+def load_best_params(params_path: Path) -> tuple[Dict[str, Any], Any]:
     """Load best parameters from JSON and merge with fixed params.
     
     Merge order (later sources override earlier):
@@ -199,8 +200,27 @@ def load_best_params(params_path: Path) -> Dict[str, Any]:
     # Merge with fixed params in correct order: FIXED_PARAMS → json_fixed_params → best_params
     final_params = {**FIXED_PARAMS, **json_fixed_params, **best_params}
     
-    # Ensure n_jobs is set using safe function
-    final_params['n_jobs'] = get_n_jobs()
+    # Enforce strict parameter guardrails (override any tuned values)
+    guardrail_params = {
+        "max_depth": 8,
+        "num_leaves": 255,
+        "min_child_samples": 50,
+        "subsample": 0.7,
+        "subsample_freq": 1,
+        "colsample_bytree": 0.7,
+        "learning_rate": 0.03,
+        "n_estimators": 3000,
+        "reg_alpha": 1.0,
+        "reg_lambda": 1.0,
+        "is_unbalance": True,
+        "metric": "average_precision",
+        "n_jobs": get_n_jobs(),
+        "verbose": -1,
+    }
+    final_params.update(guardrail_params)
+    
+    # Remove scale_pos_weight if present
+    final_params.pop("scale_pos_weight", None)
     
     return final_params, params_data.get('best_cv_score', None)
 
@@ -341,8 +361,14 @@ def phase1_training(
     print(f"\nTraining LightGBM on train_early ({len(X_train_early):,} samples)...")
     
     train_early_start = time.time()
-    model_train_early = LGBMClassifier(**best_params)
-    model_train_early.fit(X_train_early, y_train_early)
+    lgb_model = LGBMClassifier(**best_params)
+    lgb_model.fit(
+        X_train_early,
+        y_train_early,
+        eval_set=[(X_val_late, y_val_late)],
+        eval_metric="average_precision",
+        callbacks=[lgb.early_stopping(100), lgb.log_evaluation(100)],
+    )
     train_early_time = time.time() - train_early_start
     
     print(f"\nTraining completed in {train_early_time:.1f}s ({train_early_time/60:.1f} min)")
@@ -350,7 +376,7 @@ def phase1_training(
     # Evaluate on val_late
     print("\nEvaluating on val_late...")
     val_start = time.time()
-    y_val_proba = model_train_early.predict_proba(X_val_late)[:, 1]
+    y_val_proba = lgb_model.predict_proba(X_val_late)[:, 1]
     val_time = time.time() - val_start
     
     validation_metrics = compute_metrics(y_val_late.values, y_val_proba)
@@ -374,8 +400,8 @@ def phase1_training(
             "val/time_seconds": val_time,
         })
     
-    # Free memory: delete all datasets and models from validation phase
-    del X_train_early, y_train_early, X_val_late, y_val_late, model_train_early
+    # Free memory: delete all datasets from validation phase (keep lgb_model for best_iteration_)
+    del X_train_early, y_train_early, X_val_late, y_val_late
     gc.collect()
     print("\n  Memory cleaned up after validation phase")
     
@@ -418,8 +444,16 @@ def phase1_training(
     
     print(f"\nTraining LightGBM on full training dataset ({len(X):,} samples, 2000-2017)...")
     
+    # Use best_iteration_ from temporal validation model to set n_estimators for final training
+    n_estimators_full = getattr(lgb_model, "best_iteration_", None)
+    if n_estimators_full is None:
+        # Fallback to configured n_estimators if early stopping did not set best_iteration_
+        n_estimators_full = best_params.get("n_estimators", 3000)
+    final_train_params = best_params.copy()
+    final_train_params["n_estimators"] = n_estimators_full
+    
     train_start = time.time()
-    final_model = LGBMClassifier(**best_params)
+    final_model = LGBMClassifier(**final_train_params)
     final_model.fit(X, y)
     train_time = time.time() - train_start
     
@@ -440,8 +474,8 @@ def phase1_training(
             "training/final_train_time_minutes": train_time / 60,
         })
     
-    # Cleanup: delete X, y, model
-    del X, y, final_model
+    # Cleanup: delete X, y, models
+    del X, y, final_model, lgb_model
     gc.collect()
     
     print("\nPhase 1 completed. Memory cleaned up.")

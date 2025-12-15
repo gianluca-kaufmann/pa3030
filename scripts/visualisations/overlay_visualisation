@@ -1,0 +1,602 @@
+#!/usr/bin/env python3
+"""
+Road Infrastructure and WDPA Protected Areas Overlay Visualization for South America.
+
+Inputs:
+- GeoTIFF rasters:
+  - `data/ready/road_infrastructure/roads_sa_1km.tif` (roads)
+  - `data/ready/WDPA/WDPA_SA_1km_<year>.tif` (protected areas, multiple years supported)
+
+Process:
+- Loads both raster datasets, ensures they are aligned, and creates overlay visualizations
+  showing roads on top of protected areas for each available WDPA year.
+
+Outputs:
+- PNG figures saved to `outputs/Figures/overlay_vis`.
+"""
+
+import numpy as np
+import rasterio
+from rasterio.warp import reproject, Resampling
+import matplotlib.pyplot as plt
+from pathlib import Path
+import warnings
+from matplotlib.patches import Patch
+from matplotlib.colors import ListedColormap
+
+warnings.filterwarnings('ignore')
+
+# Paths
+ROOT_DIR = Path(__file__).resolve().parents[2]
+DATA_DIR = ROOT_DIR / "data"
+ROADS_FILE = DATA_DIR / "ready" / "road_infrastructure" / "roads_sa_1km.tif"
+WDPA_DIR = DATA_DIR / "ready" / "WDPA"
+OUTPUT_DIR = ROOT_DIR / "outputs" / "Figures" / "overlay_vis"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Years to process (will skip missing files)
+WDPA_YEARS = [2000, 2024]
+
+
+def load_roads_raster():
+    """Load the roads raster."""
+    if not ROADS_FILE.exists():
+        print(f"   Error: File not found: {ROADS_FILE}")
+        return None
+    
+    try:
+        with rasterio.open(ROADS_FILE) as roads_src:
+            roads_data = roads_src.read(1).astype(np.uint8)
+            roads_profile = roads_src.profile
+            roads_transform = roads_src.transform
+            roads_crs = roads_src.crs
+            roads_bounds = roads_src.bounds
+            
+            print(f"   Roads raster:")
+            print(f"     Shape: {roads_data.shape}")
+            print(f"     CRS: {roads_crs}")
+            print(f"     Bounds: {roads_bounds}")
+            print(f"     Road pixels: {np.sum(roads_data == 1):,}")
+            
+            return {
+                'data': roads_data,
+                'profile': roads_profile,
+                'transform': roads_transform,
+                'crs': roads_crs,
+                'bounds': roads_bounds
+            }
+    except Exception as e:
+        print(f"   Error loading roads raster: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def load_wdpa_data():
+    """Load WDPA rasters for all available years."""
+    print("Loading WDPA protected area data...")
+    
+    wdpa_data_dict = {}
+    
+    for year in WDPA_YEARS:
+        wdpa_file = WDPA_DIR / f"WDPA_SA_1km_{year}.tif"
+        
+        if not wdpa_file.exists():
+            print(f"   Warning: File not found: {wdpa_file.name}, skipping year {year}")
+            continue
+        
+        try:
+            with rasterio.open(wdpa_file) as wdpa_src:
+                wdpa_data = wdpa_src.read(1).astype(np.uint8)
+                wdpa_profile = wdpa_src.profile
+                wdpa_transform = wdpa_src.transform
+                wdpa_crs = wdpa_src.crs
+                wdpa_bounds = wdpa_src.bounds
+                
+                print(f"   WDPA {year}:")
+                print(f"     Shape: {wdpa_data.shape}")
+                print(f"     CRS: {wdpa_crs}")
+                print(f"     Bounds: {wdpa_bounds}")
+                print(f"     Protected pixels: {np.sum(wdpa_data == 1):,}")
+                
+                wdpa_data_dict[year] = {
+                    'data': wdpa_data,
+                    'profile': wdpa_profile,
+                    'transform': wdpa_transform,
+                    'crs': wdpa_crs,
+                    'bounds': wdpa_bounds,
+                    'file_path': wdpa_file
+                }
+        except Exception as e:
+            print(f"   Error loading WDPA {year}: {e}")
+            continue
+    
+    if not wdpa_data_dict:
+        print("   Error: No WDPA data loaded")
+        return None
+    
+    print(f"   Successfully loaded {len(wdpa_data_dict)} WDPA year(s)")
+    return wdpa_data_dict
+
+
+def align_rasters(roads_info, wdpa_info):
+    """Align roads and WDPA rasters (same CRS, bounds, resolution)."""
+    roads_data = roads_info['data']
+    wdpa_data = wdpa_info['data']
+    roads_transform = roads_info['transform']
+    wdpa_transform = wdpa_info['transform']
+    roads_crs = roads_info['crs']
+    wdpa_crs = wdpa_info['crs']
+    
+    # Check if rasters are already aligned
+    if (roads_crs == wdpa_crs and 
+        roads_transform == wdpa_transform and 
+        roads_data.shape == wdpa_data.shape):
+        print("   Rasters are already aligned, using directly.")
+        return roads_data, wdpa_data, wdpa_transform, wdpa_crs, wdpa_info['profile']
+    
+    # Align rasters - reproject roads to match WDPA
+    print("   Aligning rasters (reprojecting roads to match WDPA)...")
+    
+    # Match WDPA's exact dimensions
+    aligned_roads = np.zeros((wdpa_data.shape[0], wdpa_data.shape[1]), dtype=np.uint8)
+    
+    reproject(
+        source=roads_data,
+        destination=aligned_roads,
+        src_transform=roads_transform,
+        src_crs=roads_crs,
+        dst_transform=wdpa_transform,
+        dst_crs=wdpa_crs,
+        resampling=Resampling.nearest
+    )
+    
+    print(f"   Aligned roads shape: {aligned_roads.shape}")
+    print(f"   Aligned road pixels: {np.sum(aligned_roads == 1):,}")
+    
+    return aligned_roads, wdpa_data, wdpa_transform, wdpa_crs, wdpa_info['profile']
+
+
+def create_overlay_map(roads, wdpa, year):
+    """Create an overlay map showing roads on top of protected areas."""
+    print(f"Creating overlay map for year {year}...")
+    
+    # Create composite visualization
+    fig, ax = plt.subplots(figsize=(14, 12))
+    
+    # Create RGB composite with improved colors for better contrast
+    rgb = np.zeros((roads.shape[0], roads.shape[1], 3), dtype=np.float32)
+    
+    # Background (non-protected, non-road areas) - white
+    rgb[:, :, :] = 1.0
+    
+    # WDPA protected areas - vibrant green
+    protected_mask = (wdpa == 1)
+    rgb[protected_mask, 0] = 0.2   # R
+    rgb[protected_mask, 1] = 0.7   # G
+    rgb[protected_mask, 2] = 0.3   # B
+    
+    # Roads - dark red/orange for better visibility
+    roads_mask = (roads == 1)
+    rgb[roads_mask, 0] = 0.8   # R
+    rgb[roads_mask, 1] = 0.3   # G
+    rgb[roads_mask, 2] = 0.1   # B
+    
+    # Areas with both roads and protected areas - purple/brown for distinction
+    both_mask = (protected_mask & roads_mask)
+    rgb[both_mask, 0] = 0.6   # R
+    rgb[both_mask, 1] = 0.4   # G
+    rgb[both_mask, 2] = 0.7   # B
+    
+    ax.imshow(rgb, interpolation='nearest')
+    ax.set_title(f"Road Infrastructure Overlaid on WDPA Protected Areas - South America {year}", 
+                fontsize=16, fontweight='bold', pad=20)
+    ax.set_axis_off()
+    
+    # Create legend with updated colors
+    legend_elements = [
+        Patch(facecolor='#FFFFFF', label='Background', edgecolor='gray', linewidth=1),
+        Patch(facecolor='#33B34A', label='Protected Areas (WDPA)', edgecolor='black', linewidth=1),
+        Patch(facecolor='#CC4D1A', label='Roads', edgecolor='black', linewidth=1),
+        Patch(facecolor='#9966B3', label='Protected Areas + Roads', edgecolor='black', linewidth=1)
+    ]
+    
+    ax.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(0.98, 0.98),
+             fontsize=12, framealpha=0.95, edgecolor='black')
+    
+    # Calculate statistics
+    total_pixels = roads.size
+    protected_pixels = np.sum(wdpa == 1)
+    road_pixels = np.sum(roads == 1)
+    both_pixels = np.sum((wdpa == 1) & (roads == 1))
+    
+    stats_text = (f"Protected areas: {protected_pixels:,} ({protected_pixels/total_pixels*100:.2f}%)\n"
+                 f"Road pixels: {road_pixels:,} ({road_pixels/total_pixels*100:.2f}%)\n"
+                 f"Overlap (both): {both_pixels:,} ({both_pixels/total_pixels*100:.2f}%)\n"
+                 f"Total pixels: {total_pixels:,}")
+    
+    ax.text(0.02, 0.02, stats_text, transform=ax.transAxes, 
+           fontsize=11, verticalalignment='bottom',
+           bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, pad=5))
+    
+    plt.tight_layout()
+    out_file = OUTPUT_DIR / f"roads_wdpa_overlay_{year}.png"
+    plt.savefig(out_file, dpi=300, bbox_inches='tight')
+    print(f"   Saved: {out_file.name}")
+    plt.close()
+
+
+def create_comparison_view(roads, wdpa, year):
+    """Create side-by-side comparison of roads, WDPA, and overlay."""
+    print(f"Creating comparison view for year {year}...")
+    
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle(f"Road Infrastructure and WDPA Protected Areas - South America {year}", 
+                fontsize=16, fontweight='bold')
+    
+    # Plot 1: Roads only - using better colormap
+    ax1 = axes[0]
+    # Create custom colormap: white background, red/orange for roads
+    roads_cmap = ListedColormap(['white', '#CC4D1A'])
+    ax1.imshow(roads, cmap=roads_cmap, vmin=0, vmax=1, interpolation='nearest')
+    ax1.set_title('Road Infrastructure', fontsize=14, fontweight='bold')
+    ax1.set_axis_off()
+    road_pixels = np.sum(roads == 1)
+    ax1.text(0.5, 0.02, f'Road pixels: {road_pixels:,}', 
+            transform=ax1.transAxes, ha='center', fontsize=10,
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor='black'))
+    
+    # Plot 2: WDPA only - using better colormap
+    ax2 = axes[1]
+    wdpa_cmap = ListedColormap(['white', '#33B34A'])
+    ax2.imshow(wdpa, cmap=wdpa_cmap, vmin=0, vmax=1, interpolation='nearest')
+    ax2.set_title('WDPA Protected Areas', fontsize=14, fontweight='bold')
+    ax2.set_axis_off()
+    protected_pixels = np.sum(wdpa == 1)
+    ax2.text(0.5, 0.02, f'Protected pixels: {protected_pixels:,}', 
+            transform=ax2.transAxes, ha='center', fontsize=10,
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor='black'))
+    
+    # Plot 3: Overlay with improved colors
+    ax3 = axes[2]
+    rgb = np.zeros((roads.shape[0], roads.shape[1], 3), dtype=np.float32)
+    rgb[:, :, :] = 1.0  # White background
+    
+    protected_mask = (wdpa == 1)
+    rgb[protected_mask, 0] = 0.2
+    rgb[protected_mask, 1] = 0.7
+    rgb[protected_mask, 2] = 0.3
+    
+    roads_mask = (roads == 1)
+    rgb[roads_mask, 0] = 0.8
+    rgb[roads_mask, 1] = 0.3
+    rgb[roads_mask, 2] = 0.1
+    
+    both_mask = (protected_mask & roads_mask)
+    rgb[both_mask, 0] = 0.6
+    rgb[both_mask, 1] = 0.4
+    rgb[both_mask, 2] = 0.7
+    
+    ax3.imshow(rgb, interpolation='nearest')
+    ax3.set_title('Overlay (Roads + Protected Areas)', fontsize=14, fontweight='bold')
+    ax3.set_axis_off()
+    both_pixels = np.sum(both_mask)
+    ax3.text(0.5, 0.02, f'Overlap pixels: {both_pixels:,}', 
+            transform=ax3.transAxes, ha='center', fontsize=10,
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor='black'))
+    
+    plt.tight_layout()
+    out_file = OUTPUT_DIR / f"roads_wdpa_comparison_{year}.png"
+    plt.savefig(out_file, dpi=300, bbox_inches='tight')
+    print(f"   Saved: {out_file.name}")
+    plt.close()
+
+
+def create_statistics_plot(roads, wdpa, year):
+    """Create statistics visualization of overlap between roads and protected areas."""
+    print(f"Creating statistics plot for year {year}...")
+    
+    total_pixels = roads.size
+    protected_pixels = np.sum(wdpa == 1)
+    road_pixels = np.sum(roads == 1)
+    both_pixels = np.sum((wdpa == 1) & (roads == 1))
+    neither_pixels = total_pixels - protected_pixels - road_pixels + both_pixels
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    fig.suptitle(f'Road Infrastructure and Protected Areas Statistics - South America {year}', 
+                fontsize=16, fontweight='bold')
+    
+    # Plot 1: Venn diagram-like bar chart with improved colors
+    categories = ['Background', 'Protected\nAreas Only', 'Roads\nOnly', 'Overlap\n(Both)']
+    counts = [neither_pixels, protected_pixels - both_pixels, 
+              road_pixels - both_pixels, both_pixels]
+    colors = ['#F5F5F5', '#33B34A', '#CC4D1A', '#9966B3']  # Improved contrast
+    
+    bars1 = ax1.bar(categories, counts, color=colors, alpha=0.9, 
+                    edgecolor='black', linewidth=1.0)
+    ax1.set_title('Pixel Distribution by Category', fontsize=14, fontweight='bold', pad=15)
+    ax1.set_ylabel('Number of Pixels', fontsize=12)
+    ax1.set_xlabel('Category', fontsize=12)
+    
+    # Add value labels on bars
+    for bar, count in zip(bars1, counts):
+        height = bar.get_height()
+        ax1.text(bar.get_x() + bar.get_width()/2., height,
+               f'{count:,}', ha='center', va='bottom', fontweight='bold', fontsize=9)
+    
+    ax1.grid(axis='y', alpha=0.3)
+    
+    # Plot 2: Percentage breakdown
+    percentages = [count / total_pixels * 100 for count in counts]
+    
+    wedges, texts, autotexts = ax2.pie(counts, labels=categories, colors=colors,
+                                       autopct='%1.2f%%', startangle=90,
+                                       textprops={'fontsize': 10, 'fontweight': 'bold'})
+    
+    ax2.set_title('Coverage Percentage Breakdown', fontsize=14, fontweight='bold', pad=15)
+    
+    plt.tight_layout()
+    out_file = OUTPUT_DIR / f"roads_wdpa_statistics_{year}.png"
+    plt.savefig(out_file, dpi=300, bbox_inches='tight')
+    print(f"   Saved: {out_file.name}")
+    plt.close()
+
+
+def create_change_map(all_data_dict, roads_info):
+    """Create a visualization showing WDPA coverage change overlaid with roads."""
+    if len(all_data_dict) < 2:
+        print("   Skipping change map: need at least 2 years for comparison")
+        return
+    
+    print("Creating WDPA change map overlaid with roads...")
+    
+    years = sorted(all_data_dict.keys())
+    year_start = years[0]
+    year_end = years[-1]
+    
+    wdpa_start = all_data_dict[year_start]['wdpa']
+    wdpa_end = all_data_dict[year_end]['wdpa']
+    
+    # Use already-aligned roads from the end year (they're already aligned to WDPA)
+    roads_aligned = all_data_dict[year_end]['roads']
+    
+    # Calculate change: 1 = gained protection, -1 = lost protection, 0 = no change
+    # Values: 0 = no protection in either, 1 = protection in start only (lost), 
+    #         2 = protection in end only (gained), 3 = protection in both (stable)
+    change_map = np.zeros_like(wdpa_start, dtype=np.int8)
+    change_map[wdpa_start == 1] += 1  # Had protection at start
+    change_map[wdpa_end == 1] += 2    # Has protection at end
+    
+    # Create visualization
+    fig, ax = plt.subplots(figsize=(14, 12))
+    
+    rgb = np.zeros((change_map.shape[0], change_map.shape[1], 3), dtype=np.float32)
+    
+    # Background: no protection in either period - white
+    no_protection = (change_map == 0)
+    rgb[no_protection, :] = 1.0
+    
+    # Lost protection (was protected, now not) - light red
+    lost_protection = (change_map == 1)
+    rgb[lost_protection, 0] = 1.0   # R
+    rgb[lost_protection, 1] = 0.7   # G
+    rgb[lost_protection, 2] = 0.7   # B
+    
+    # Gained protection (was not protected, now is) - vibrant green
+    gained_protection = (change_map == 2)
+    rgb[gained_protection, 0] = 0.2  # R
+    rgb[gained_protection, 1] = 0.8  # G
+    rgb[gained_protection, 2] = 0.3  # B
+    
+    # Stable protection (protected in both) - medium green
+    stable_protection = (change_map == 3)
+    rgb[stable_protection, 0] = 0.3  # R
+    rgb[stable_protection, 1] = 0.6  # G
+    rgb[stable_protection, 2] = 0.3  # B
+    
+    # Overlay roads - dark red/orange lines
+    roads_mask = (roads_aligned == 1)
+    rgb[roads_mask, 0] = 0.9   # R
+    rgb[roads_mask, 1] = 0.2   # G
+    rgb[roads_mask, 2] = 0.0   # B
+    
+    ax.imshow(rgb, interpolation='nearest')
+    ax.set_title(f"WDPA Coverage Change ({year_start} to {year_end}) Overlaid with Roads - South America", 
+                fontsize=16, fontweight='bold', pad=20)
+    ax.set_axis_off()
+    
+    # Create legend
+    legend_elements = [
+        Patch(facecolor='#FFFFFF', label='No Protection (Either Period)', edgecolor='gray', linewidth=1),
+        Patch(facecolor='#FFB3B3', label=f'Lost Protection ({year_start} only)', edgecolor='black', linewidth=1),
+        Patch(facecolor='#33CC4D', label=f'Gained Protection ({year_end} only)', edgecolor='black', linewidth=1),
+        Patch(facecolor='#4D994D', label='Stable Protection (Both Periods)', edgecolor='black', linewidth=1),
+        Patch(facecolor='#E63300', label='Roads', edgecolor='black', linewidth=1)
+    ]
+    
+    ax.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(0.98, 0.98),
+             fontsize=11, framealpha=0.95, edgecolor='black')
+    
+    # Calculate statistics
+    total_pixels = change_map.size
+    lost_pixels = np.sum(lost_protection)
+    gained_pixels = np.sum(gained_protection)
+    stable_pixels = np.sum(stable_protection)
+    road_pixels = np.sum(roads_aligned == 1)
+    
+    stats_text = (f"Lost protection: {lost_pixels:,} ({lost_pixels/total_pixels*100:.2f}%)\n"
+                 f"Gained protection: {gained_pixels:,} ({gained_pixels/total_pixels*100:.2f}%)\n"
+                 f"Stable protection: {stable_pixels:,} ({stable_pixels/total_pixels*100:.2f}%)\n"
+                 f"Net change: {gained_pixels - lost_pixels:,} pixels\n"
+                 f"Road pixels: {road_pixels:,} ({road_pixels/total_pixels*100:.2f}%)")
+    
+    ax.text(0.02, 0.02, stats_text, transform=ax.transAxes, 
+           fontsize=11, verticalalignment='bottom',
+           bbox=dict(boxstyle='round', facecolor='white', alpha=0.95, pad=5, edgecolor='black'))
+    
+    plt.tight_layout()
+    out_file = OUTPUT_DIR / f"wdpa_change_map_{year_start}_{year_end}.png"
+    plt.savefig(out_file, dpi=300, bbox_inches='tight')
+    print(f"   Saved: {out_file.name}")
+    plt.close()
+
+
+def create_temporal_comparison(all_data_dict):
+    """Create temporal comparison if multiple years are available."""
+    if len(all_data_dict) < 2:
+        return
+    
+    print("Creating temporal comparison...")
+    
+    years = sorted(all_data_dict.keys())
+    
+    # Extract overlap statistics for each year
+    overlaps = []
+    protected_pixels_list = []
+    road_pixels_list = []
+    
+    for year in years:
+        roads = all_data_dict[year]['roads']
+        wdpa = all_data_dict[year]['wdpa']
+        both_pixels = np.sum((wdpa == 1) & (roads == 1))
+        protected_pixels = np.sum(wdpa == 1)
+        road_pixels = np.sum(roads == 1)
+        
+        overlaps.append(both_pixels)
+        protected_pixels_list.append(protected_pixels)
+        road_pixels_list.append(road_pixels)
+    
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+    fig.suptitle('Road-Pathway Overlap Evolution - South America', 
+                fontsize=16, fontweight='bold')
+    
+    # Plot 1: Protected area pixels over time - improved colors
+    ax1.plot(years, protected_pixels_list, marker='o', linewidth=3, markersize=10,
+             color='#33B34A', label='Protected Area Pixels', markerfacecolor='white', markeredgewidth=2.5)
+    ax1.set_title('Protected Area Coverage Over Time', fontweight='bold', fontsize=14)
+    ax1.set_xlabel('Year', fontsize=12)
+    ax1.set_ylabel('Protected Pixels', fontsize=12)
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(fontsize=12)
+    ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x/1e6:.1f}M'))
+    
+    for year, value in zip(years, protected_pixels_list):
+        ax1.annotate(f'{value/1e6:.1f}M', (year, value), 
+                    textcoords="offset points", xytext=(0,10), ha='center', fontsize=10)
+    
+    # Plot 2: Overlap pixels over time - improved colors
+    ax2.plot(years, overlaps, marker='s', linewidth=3, markersize=10,
+             color='#9966B3', label='Road-Pathway Overlap Pixels', markerfacecolor='white', markeredgewidth=2.5)
+    ax2.set_title('Road-Pathway Overlap Over Time', fontweight='bold', fontsize=14)
+    ax2.set_xlabel('Year', fontsize=12)
+    ax2.set_ylabel('Overlap Pixels', fontsize=12)
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(fontsize=12)
+    ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x/1e6:.2f}M'))
+    
+    for year, value in zip(years, overlaps):
+        ax2.annotate(f'{value/1e6:.2f}M', (year, value), 
+                    textcoords="offset points", xytext=(0,10), ha='center', fontsize=10)
+    
+    plt.tight_layout()
+    out_file = OUTPUT_DIR / "roads_wdpa_temporal_comparison.png"
+    plt.savefig(out_file, dpi=300, bbox_inches='tight')
+    print(f"   Saved: {out_file.name}")
+    plt.close()
+
+
+def create_summary(all_data_dict):
+    """Print and save basic summary statistics."""
+    print("\n" + "=" * 70)
+    print("ROADS-WDPA OVERLAY VISUALIZATION SUMMARY")
+    print("=" * 70)
+    print(f"Roads file: {ROADS_FILE.name}")
+    print(f"WDPA files: {[f'WDPA_SA_1km_{year}.tif' for year in sorted(all_data_dict.keys())]}")
+    print(f"Output directory: {OUTPUT_DIR}")
+    
+    for year in sorted(all_data_dict.keys()):
+        roads = all_data_dict[year]['roads']
+        wdpa = all_data_dict[year]['wdpa']
+        
+        total_pixels = roads.size
+        protected_pixels = np.sum(wdpa == 1)
+        road_pixels = np.sum(roads == 1)
+        both_pixels = np.sum((wdpa == 1) & (roads == 1))
+        neither_pixels = total_pixels - protected_pixels - road_pixels + both_pixels
+        
+        print(f"\n--- Year {year} Coverage Statistics ---")
+        print(f"  • Total pixels: {total_pixels:,}")
+        print(f"  • Protected areas pixels: {protected_pixels:,} ({protected_pixels/total_pixels*100:.2f}%)")
+        print(f"  • Road pixels: {road_pixels:,} ({road_pixels/total_pixels*100:.2f}%)")
+        print(f"  • Overlap (both): {both_pixels:,} ({both_pixels/total_pixels*100:.2f}%)")
+        print(f"  • Background (neither): {neither_pixels:,} ({neither_pixels/total_pixels*100:.2f}%)")
+        
+        if protected_pixels > 0:
+            overlap_pct_protected = (both_pixels / protected_pixels) * 100
+            print(f"  • Roads in protected areas: {both_pixels:,} ({overlap_pct_protected:.2f}% of protected area)")
+
+
+def main():
+    print("Road Infrastructure and WDPA Protected Areas Overlay Visualization")
+    print("=" * 70)
+    
+    # Load roads raster
+    print("\nLoading roads raster...")
+    roads_info = load_roads_raster()
+    if roads_info is None:
+        print("Failed to load roads data. Exiting.")
+        return
+    
+    # Load WDPA rasters
+    print("\nLoading WDPA rasters...")
+    wdpa_data_dict = load_wdpa_data()
+    if wdpa_data_dict is None:
+        print("Failed to load WDPA data. Exiting.")
+        return
+    
+    # Process each WDPA year
+    all_data_dict = {}
+    
+    for year in sorted(wdpa_data_dict.keys()):
+        print(f"\n{'='*70}")
+        print(f"Processing year {year}...")
+        print(f"{'='*70}")
+        
+        wdpa_info = wdpa_data_dict[year]
+        
+        # Align rasters
+        print("\nAligning rasters...")
+        roads_aligned, wdpa_aligned, transform, crs, profile = align_rasters(roads_info, wdpa_info)
+        
+        all_data_dict[year] = {
+            'roads': roads_aligned,
+            'wdpa': wdpa_aligned,
+            'transform': transform,
+            'crs': crs,
+            'profile': profile
+        }
+        
+        # Create visualizations for this year
+        print("\nCreating visualizations...")
+        create_overlay_map(roads_aligned, wdpa_aligned, year)
+        create_comparison_view(roads_aligned, wdpa_aligned, year)
+        create_statistics_plot(roads_aligned, wdpa_aligned, year)
+    
+    # Create temporal comparison if multiple years
+    if len(all_data_dict) > 1:
+        print("\nCreating temporal comparison...")
+        create_temporal_comparison(all_data_dict)
+        
+        # Create change map visualization
+        print("\nCreating change map visualization...")
+        create_change_map(all_data_dict, roads_info)
+    
+    # Create summary
+    create_summary(all_data_dict)
+    
+    print("\nVisualization complete!")
+
+
+if __name__ == "__main__":
+    main()
+
