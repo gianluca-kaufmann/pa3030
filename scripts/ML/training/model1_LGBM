@@ -537,15 +537,20 @@ def main() -> None:
     all_cols_train = pq.ParquetFile(train_path).schema_arrow.names
     all_cols_test = pq.ParquetFile(test_path).schema_arrow.names
     target_col = "transition_01"
-    df_schema = pd.read_parquet(train_path, columns=all_cols_train).head(1)
-    numeric_cols = df_schema.select_dtypes(include=['number']).columns.tolist()
-    feature_cols = [col for col in numeric_cols if col.lower() not in {c.lower() for c in EXCLUDE_COLS}]
+    # Build feature columns from PyArrow schema only (avoid loading full parquet into pandas)
+    schema = pq.ParquetFile(train_path).schema_arrow
+    numeric_cols = [
+        name
+        for name, field in zip(schema.names, schema)
+        if pa.types.is_integer(field.type) or pa.types.is_floating(field.type)
+    ]
+    # Exclude target, coordinates, and year from features (keep year in required_cols)
+    feature_cols = [c for c in numeric_cols if c not in EXCLUDE_COLS and c not in {'year'}]
     required_cols = [target_col, 'year', 'row', 'col']
     optional_cols = [col for col in ['x', 'y'] if col in all_cols_train]
     keep_cols_train = feature_cols + required_cols + optional_cols
     keep_cols_test = feature_cols + required_cols + [col for col in ['x', 'y'] if col in all_cols_test]
     print(f"Selected {len(feature_cols)} features, loading {len(keep_cols_train)} cols from train, {len(keep_cols_test)} from test")
-    del df_schema; gc.collect()
     
     (model_path, validation_metrics, train_stats, train_early_time, val_time, train_time, train_pos, train_neg, n_train_full, imbalance_info) = phase1_training(
         train_path, val_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col)
