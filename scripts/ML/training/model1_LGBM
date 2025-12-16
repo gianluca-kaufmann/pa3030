@@ -1,25 +1,8 @@
 #!/usr/bin/env python3
-
 """LGBM Transition Model (0→1 Prediction)
-
-Purpose: Train a LightGBM model to predict transitions to protected areas (0→1).
-         Uses pre-split parquet files created by model1_preprocessing:
-         - train_early_sampled.parquet (2000-2014, negatives sampled 1:20 per positive)
-         - val_late_full.parquet (2015-2017, full risk set)
-         - test_full.parquet (2018-2024, full risk set)
-         Uses strict temporal split for internal validation:
-         - train_early (train_early_sampled) for training
-         - val_late (val_late_full) for validation
-         - Final model retrained on combined train_early_sampled + val_late_full (2000-2017)
-         - Evaluation on test_full (2018-2024)
-
-Input:   - train_early_sampled.parquet (2000-2014, sampled)
-         - val_late_full.parquet (2015-2017, full risk set)
-         - test_full.parquet (2018-2024, full risk set)
-         - lgbm_best_params.json
-Output:  - Trained model (.pkl)
-         - Test predictions (.parquet)
-         - Evaluation metrics (.json)
+Train LightGBM on pre-split parquet files: train_early_sampled (2000-2014), 
+val_late_full (2015-2017), test_full (2018-2024). Final model trained on 2000-2017,
+evaluated on 2018-2024. Uses isotonic calibration fitted on val_late predictions.
 """
 
 from __future__ import annotations
@@ -41,6 +24,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import lightgbm as lgb
 from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.calibration import CalibratedClassifierCV
 
 
 class Tee:
@@ -48,62 +32,42 @@ class Tee:
     def __init__(self, file_path: Path):
         self.file = open(file_path, 'w', encoding='utf-8')
         self.stdout = sys.stdout
-    
     def write(self, text: str) -> None:
         self.stdout.write(text)
         self.file.write(text)
         self.stdout.flush()
         self.file.flush()
-    
     def flush(self) -> None:
         self.stdout.flush()
         self.file.flush()
-    
     def close(self) -> None:
         self.file.close()
 
 
-# =============================================================================
+class LGBMBoosterWrapper:
+    """Wrapper to make LightGBM Booster sklearn-compatible for calibration."""
+    def __init__(self, booster: lgb.Booster):
+        self.booster = booster
+    
+    def predict_proba(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
+        """Return probabilities in sklearn format [n_samples, 2]."""
+        proba_positive = self.booster.predict(X)
+        proba_positive = np.clip(proba_positive, 0.0, 1.0)  # Ensure valid probabilities
+        proba_negative = 1.0 - proba_positive
+        return np.column_stack([proba_negative, proba_positive])
+
 # Configuration
-# =============================================================================
 RANDOM_STATE = 42
-
-# Columns to exclude from features
-EXCLUDE_COLS = {
-    'transition_01',  # Target variable
-    'WDPA_b1',        # Leakage
-    'WDPA_prev',      # Leakage
-    'x',              # Coordinate
-    'y',              # Coordinate
-    'row',            # Identifier
-    'col',            # Identifier
-    'year',           # Temporal identifier
-}
-
-# Temporal split configuration for internal validation
-TRAIN_EARLY_YEAR_MAX = 2014  # train_early: year <= 2014
-VAL_LATE_YEAR_MIN = 2015     # val_late: 2015-2017
+EXCLUDE_COLS = {'transition_01', 'WDPA_b1', 'WDPA_prev', 'x', 'y', 'row', 'col'}
+TRAIN_EARLY_YEAR_MAX = 2014
+VAL_LATE_YEAR_MIN = 2015
 VAL_LATE_YEAR_MAX = 2017
+FIXED_PARAMS = {'random_state': RANDOM_STATE, 'boosting_type': 'gbdt', 'objective': 'binary', 'verbose': -1}
 
-# Fixed parameters (will be merged with best_params from JSON)
-FIXED_PARAMS = {
-    'random_state': RANDOM_STATE,
-    'boosting_type': 'gbdt',
-    'objective': 'binary',
-    'verbose': -1,
-}
-
-
-# =============================================================================
 # Utility Functions
-# =============================================================================
 
 def get_n_jobs() -> int:
-    """Get safe number of jobs for parallel processing.
-    
-    Returns:
-        Number of CPUs to use, or -1 for all available CPUs.
-    """
+    """Get number of CPUs (-1 for all available)."""
     slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
     if slurm_cpus:
         try:
@@ -138,23 +102,9 @@ def convert_numpy_types(obj: Any) -> Any:
 
 
 def compute_precision_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) -> float:
-    """Compute precision at top k% of predictions.
-    
-    Args:
-        y_true: True labels (0 or 1)
-        y_proba: Predicted probabilities for positive class
-        k: Percentage (e.g., 1 for top 1%, 5 for top 5%)
-    
-    Returns:
-        Precision among top k% predictions
-    """
-    n_samples = len(y_true)
-    n_top_k = max(1, int(n_samples * k / 100))
-    
-    # Get indices of top k% predictions
+    """Compute precision at top k% of predictions."""
+    n_top_k = max(1, int(len(y_true) * k / 100))
     top_k_idx = np.argsort(y_proba)[-n_top_k:]
-    
-    # Calculate precision among top k%
     return y_true[top_k_idx].sum() / n_top_k
 
 
@@ -186,44 +136,32 @@ def resolve_best_params_json() -> Path:
     return params_path
 
 
+def resolve_train_metadata() -> Path:
+    """Locate train_early_metadata.json (prefer $SCRATCH if present)."""
+    repo_root = Path(__file__).resolve().parents[3]
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    candidates = []
+    if scratch_root is not None:
+        candidates.append(scratch_root / "data/ml/train_early_metadata.json")
+    candidates.append(repo_root / "data/ml/train_early_metadata.json")
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    raise FileNotFoundError("train_early_metadata.json not found in expected locations")
+
+
 def load_best_params(params_path: Path) -> tuple[Dict[str, Any], Any]:
-    """Load best parameters from JSON and merge with fixed params.
-    
-    Merge order (later sources override earlier):
-    1. FIXED_PARAMS (from this script)
-    2. json_fixed_params (from JSON file)
-    3. best_params (from JSON file)
-    """
+    """Load and merge parameters: FIXED_PARAMS → json_fixed_params → best_params → guardrails."""
     with open(params_path, 'r') as f:
         params_data = json.load(f)
-    
-    # Extract best_params
-    best_params = params_data.get('best_params', {})
-    json_fixed_params = params_data.get('fixed_params', {})
-    
-    # Merge with fixed params in correct order: FIXED_PARAMS → json_fixed_params → best_params
-    final_params = {**FIXED_PARAMS, **json_fixed_params, **best_params}
-    
-    # Enforce strict parameter guardrails (override any tuned values).
-    # Imbalance handling (is_unbalance / scale_pos_weight) is configured later
-    # based on sampled vs full distributions, so we do NOT set it here.
-    guardrail_params = {
-        "max_depth": 8,
-        "num_leaves": 255,
-        "min_child_samples": 50,
-        "subsample": 0.7,
-        "subsample_freq": 1,
-        "colsample_bytree": 0.7,
-        "learning_rate": 0.03,
-        "n_estimators": 3000,
-        "reg_alpha": 1.0,
-        "reg_lambda": 1.0,
-        "metric": "average_precision",
-        "n_jobs": get_n_jobs(),
-        "verbose": -1,
-    }
+    final_params = {**FIXED_PARAMS, **params_data.get('fixed_params', {}), **params_data.get('best_params', {})}
+    guardrail_params = {"max_depth": 8, "num_leaves": 255, "min_child_samples": 50, "subsample": 0.7,
+                       "subsample_freq": 1, "colsample_bytree": 0.7, "learning_rate": 0.03, "n_estimators": 3000,
+                       "reg_alpha": 1.0, "reg_lambda": 1.0, "metric": "average_precision", "n_jobs": get_n_jobs(), "verbose": -1}
     final_params.update(guardrail_params)
-
     return final_params, params_data.get('best_cv_score', None)
 
 
@@ -237,12 +175,14 @@ def downcast_numeric_dtypes(df: pd.DataFrame) -> None:
 
 def load_and_preprocess(df_path: Path, columns: list, target_col: str, name: str = "") -> pd.DataFrame:
     """Load, downcast, and preprocess DataFrame."""
-    print(f"\nLoading {name or df_path.name} (selected columns only)...")
+    print(f"\nLoading {name or df_path.name}...")
     load_start = time.time()
     df = pd.read_parquet(df_path, columns=columns)
-    print(f"  Loaded {len(df):,} rows in {time.time() - load_start:.1f}s")
-    print("\nDowncasting numeric dtypes...")
+    mem_before = df.memory_usage(deep=True).sum() / 1024**3
+    print(f"  Loaded {len(df):,} rows in {time.time() - load_start:.1f}s ({mem_before:.2f} GB). Downcasting...")
     downcast_numeric_dtypes(df)
+    mem_after = df.memory_usage(deep=True).sum() / 1024**3
+    print(f"  After downcast: {mem_after:.2f} GB (saved {mem_before - mem_after:.2f} GB)")
     gc.collect()
     if target_col not in df.columns:
         raise ValueError(f"Target column '{target_col}' not found")
@@ -251,19 +191,14 @@ def load_and_preprocess(df_path: Path, columns: list, target_col: str, name: str
     return df
 
 
-def extract_split(df: pd.DataFrame, feature_cols: list, target_col: str, 
-                  year_filter, split_name: str) -> tuple:
+def extract_split(df: pd.DataFrame, feature_cols: list, target_col: str, year_filter, split_name: str) -> tuple:
     """Extract X, y and stats from filtered DataFrame."""
     df_split = df[year_filter(df['year'])].copy()
     y = (df_split[target_col] > 0).astype(np.int8)
     X = df_split[feature_cols].copy()
     pos, neg = int(y.sum()), int((y == 0).sum())
     years = sorted(df_split['year'].unique())
-    print(f"\n{split_name} distribution:")
-    print(f"  No transition (0): {neg:>12,}  ({100 - pos/len(y)*100:.3f}%)")
-    print(f"  Transition (0→1):  {pos:>12,}  ({pos/len(y)*100:.3f}%)")
-    print(f"  Class ratio:       1 : {neg / max(pos, 1):.1f}")
-    print(f"  Years: {years[0]}-{years[-1]}")
+    print(f"\n{split_name}: {neg:,} neg ({100-pos/len(y)*100:.3f}%), {pos:,} pos ({pos/len(y)*100:.3f}%), ratio 1:{neg/max(pos,1):.1f}, years {years[0]}-{years[-1]}")
     return X, y, pos, neg
 
 
@@ -273,16 +208,12 @@ def compute_metrics(y_true: np.ndarray, y_proba: np.ndarray) -> Dict[str, float]
     pr_auc = average_precision_score(y_true, y_proba)
     baseline_rate = y_true.mean()
     prec_at_k = {k: compute_precision_at_k(y_true, y_proba, k) for k in [1, 5, 10]}
-    return {
-        "roc_auc": float(roc_auc), "pr_auc": float(pr_auc),
-        "precision_at_1pct": float(prec_at_k[1]),
-        "precision_at_5pct": float(prec_at_k[5]),
-        "precision_at_10pct": float(prec_at_k[10]),
-        "baseline_rate": float(baseline_rate),
-        "lift_at_1pct": float(prec_at_k[1] / baseline_rate) if baseline_rate > 0 else 0,
-        "lift_at_5pct": float(prec_at_k[5] / baseline_rate) if baseline_rate > 0 else 0,
-        "lift_at_10pct": float(prec_at_k[10] / baseline_rate) if baseline_rate > 0 else 0,
-    }
+    return {"roc_auc": float(roc_auc), "pr_auc": float(pr_auc), "precision_at_1pct": float(prec_at_k[1]),
+            "precision_at_5pct": float(prec_at_k[5]), "precision_at_10pct": float(prec_at_k[10]),
+            "baseline_rate": float(baseline_rate),
+            "lift_at_1pct": float(prec_at_k[1] / baseline_rate) if baseline_rate > 0 else 0,
+            "lift_at_5pct": float(prec_at_k[5] / baseline_rate) if baseline_rate > 0 else 0,
+            "lift_at_10pct": float(prec_at_k[10] / baseline_rate) if baseline_rate > 0 else 0}
 
 
 # =============================================================================
@@ -290,750 +221,348 @@ def compute_metrics(y_true: np.ndarray, y_proba: np.ndarray) -> Dict[str, float]
 # =============================================================================
 
 def phase1_training(
-    train_path: Path,
-    val_path: Path,
-    params_path: Path,
-    feature_cols: list,
-    keep_cols_train: list,
-    best_params: Dict[str, Any],
-    timestamp: str,
-    model_dir: Path,
-    output_dir: Path,
-    use_wandb: bool,
-    target_col: str,
+    train_path: Path, val_path: Path, params_path: Path, feature_cols: list, keep_cols_train: list,
+    best_params: Dict[str, Any], timestamp: str, model_dir: Path, output_dir: Path, use_wandb: bool, target_col: str,
 ) -> tuple[Path, Dict[str, Any], Dict[str, Any], float, float, float, float, int, int, Dict[str, Any]]:
-    """Phase 1: Training phase - loads train/val splits, trains model, saves it.
-    
-    Uses multi-pass loading to prevent memory spikes by ensuring splits never coexist.
-    
-    Returns:
-        Tuple of (model_path, validation_metrics, train_stats, train_early_time, 
-                 val_time, train_time, train_pos, train_neg, n_train_full)
-    """
-    print("\n" + "=" * 70)
-    print("PHASE 1: TRAINING (MULTI-PASS LOADING)")
-    print("=" * 70)
-    
-    # =========================================================================
-    # STEP A: Load train_early (year <= 2014)
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("STEP A: LOAD TRAIN_EARLY (year <= 2014) FROM train_early_sampled")
-    print("=" * 70)
-    
+    """Phase 1: Training - loads train/val splits, trains model, saves it."""
+    print("\n" + "="*70 + "\nPHASE 1: TRAINING\n" + "="*70)
+    print("\nSTEP A: LOAD TRAIN_EARLY (≤2014)")
     df_train = load_and_preprocess(train_path, keep_cols_train, target_col, "train_early_sampled.parquet")
-    print(f"\nFiltering train_early (year <= {TRAIN_EARLY_YEAR_MAX})...")
     X_train_early, y_train_early, train_early_pos, train_early_neg = extract_split(
-        df_train, feature_cols, target_col, 
-        lambda y: y <= TRAIN_EARLY_YEAR_MAX, "Train early"
-    )
-    del df_train
-    gc.collect()
-    print("  Memory cleaned up after train_early extraction")
+        df_train, feature_cols, target_col, lambda y: y <= TRAIN_EARLY_YEAR_MAX, "Train early")
+    del df_train; gc.collect()
     
-    # =========================================================================
-    # STEP B: Load val_late (2015 <= year <= 2017)
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("STEP B: LOAD VAL_LATE (2015 <= year <= 2017) FROM val_late_full")
-    print("=" * 70)
-    
+    print("\nSTEP B: LOAD VAL_LATE (2015-2017)")
     df_val = load_and_preprocess(val_path, keep_cols_train, target_col, "val_late_full.parquet")
-    print(f"\nFiltering val_late ({VAL_LATE_YEAR_MIN} <= year <= {VAL_LATE_YEAR_MAX})...")
     X_val_late, y_val_late, val_late_pos, val_late_neg = extract_split(
-        df_val, feature_cols, target_col,
-        lambda y: (y >= VAL_LATE_YEAR_MIN) & (y <= VAL_LATE_YEAR_MAX), "Val late"
-    )
-    del df_val
-    gc.collect()
-    print("  Memory cleaned up after val_late extraction")
+        df_val, feature_cols, target_col, lambda y: (y >= VAL_LATE_YEAR_MIN) & (y <= VAL_LATE_YEAR_MAX), "Val late")
+    del df_val; gc.collect()
     
-    # =========================================================================
-    # STEP C: Train early model, evaluate on val_late, compute metrics
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("STEP C: TRAIN EARLY MODEL AND EVALUATE ON VAL_LATE")
-    print("=" * 70)
+    print(f"\nSTEP C: TRAIN & EVALUATE\nTemporal split: train_early (≤{TRAIN_EARLY_YEAR_MAX}): {len(X_train_early):,} rows, val_late ({VAL_LATE_YEAR_MIN}-{VAL_LATE_YEAR_MAX}): {len(X_val_late):,} rows")
     
-    print(f"\nTemporal split summary:")
-    print(f"  train_early (≤{TRAIN_EARLY_YEAR_MAX}): {len(X_train_early):,} rows, {y_train_early.sum():,} positives ({y_train_early.mean()*100:.3f}%)")
-    print(f"  val_late ({VAL_LATE_YEAR_MIN}-{VAL_LATE_YEAR_MAX}): {len(X_val_late):,} rows, {y_val_late.sum():,} positives ({y_val_late.mean()*100:.3f}%)")
+    # Imbalance handling: load scale_pos_weight from preprocessing metadata
+    metadata_path = resolve_train_metadata()
+    with open(metadata_path, 'r') as f:
+        train_metadata = json.load(f)
+    scale_pos_weight = train_metadata["scale_pos_weight"]
     
-    # -------------------------------------------------------------------------
-    # Imbalance handling:
-    #   - Use full validation distribution (val_late) for neg/pos ratio.
-    #   - Compute scale_pos_weight = sqrt(neg / pos) to soften the weighting.
-    #   - Clamp to a maximum of 10.0 to avoid overly aggressive up-weighting.
-    #   - Keep is_unbalance = False so this manual weight is strictly respected.
-    # -------------------------------------------------------------------------
     neg_full, pos_full = val_late_neg, val_late_pos
     neg_sampled, pos_sampled = train_early_neg, train_early_pos
-    
-    def _safe_ratio(neg: int, pos: int) -> float:
-        return float("inf") if pos == 0 else neg / pos
-    
-    ratio_full = _safe_ratio(neg_full, pos_full)
-    ratio_sampled = _safe_ratio(neg_sampled, pos_sampled)
-    
-    # New softer weighting scheme: sqrt of full neg/pos ratio, capped at 10.0
-    if not np.isfinite(ratio_full) or ratio_full <= 0:
-        spw_raw = 1.0
-    else:
-        spw_raw = float(np.sqrt(ratio_full))
-    
-    spw_clamped = min(10.0, float(spw_raw))
-    
-    print("\nImbalance handling (scale_pos_weight computation):")
-    print(f"  Sampled train_early neg/pos: {ratio_sampled:.3f} "
-          f"({neg_sampled:,} / {pos_sampled:,})")
-    print(f"  Full val_late neg/pos:       {ratio_full:.3f} "
-          f"({neg_full:,} / {pos_full:,})")
-    print(f"  Raw scale_pos_weight (sqrt): {spw_raw:.3f}")
-    print(f"  Clamped scale_pos_weight:    {spw_clamped:.3f} (max 10.0)")
-    print("  Using manual scale_pos_weight and disabling is_unbalance.")
-
-    # Update best_params in-place so downstream consumers (e.g. metrics JSON)
-    # see the final parameters used for training.
+    ratio_full = float("inf") if pos_full == 0 else neg_full / pos_full
+    ratio_sampled = float("inf") if pos_sampled == 0 else neg_sampled / pos_sampled
+    print(f"\nImbalance: sampled ratio {ratio_sampled:.3f}, full ratio {ratio_full:.3f}, scale_pos_weight {scale_pos_weight:.6f} (from preprocessing)")
     best_params["is_unbalance"] = False
-    best_params["scale_pos_weight"] = spw_clamped
-
-    imbalance_info: Dict[str, Any] = {
-        "neg_full": int(neg_full),
-        "pos_full": int(pos_full),
-        "neg_sampled": int(neg_sampled),
-        "pos_sampled": int(pos_sampled),
-        "ratio_full": float(ratio_full),
-        "ratio_sampled": float(ratio_sampled),
-        "scale_pos_weight": float(spw_clamped),
-    }
-
+    best_params["scale_pos_weight"] = scale_pos_weight
+    imbalance_info = {"neg_full": int(neg_full), "pos_full": int(pos_full), "neg_sampled": int(neg_sampled),
+                     "pos_sampled": int(pos_sampled), "ratio_full": float(ratio_full),
+                     "ratio_sampled": float(ratio_sampled), "scale_pos_weight": float(scale_pos_weight)}
     if use_wandb:
-        wandb.log({
-            "imbalance/neg_pos_ratio_full": float(ratio_full),
-            "imbalance/neg_pos_ratio_sampled": float(ratio_sampled),
-            "imbalance/scale_pos_weight": float(spw_clamped),
-        })
+        wandb.log({"imbalance/neg_pos_ratio_full": float(ratio_full), "imbalance/neg_pos_ratio_sampled": float(ratio_sampled),
+                  "imbalance/scale_pos_weight": float(scale_pos_weight)})
     
-    print(f"\nTraining LightGBM on train_early ({len(X_train_early):,} samples)...")
-    
+    print(f"\nTraining on train_early ({len(X_train_early):,} samples)...")
     train_early_start = time.time()
     train_params = best_params.copy()
-    # Remove sklearn-specific parameters that are not used by lgb.train
-    # Use n_estimators as fallback for num_boost_round before removing it
-    num_boost_round_val = train_params.pop("num_boost_round", None)
-    if num_boost_round_val is None:
-        num_boost_round_val = train_params.pop("n_estimators", 3000)
-    train_params.pop("n_estimators", None)  # Remove if still present (shouldn't be, but safe)
-    
-    # Convert to lgb.Dataset for Native API
+    num_boost_round_val = train_params.pop("num_boost_round", train_params.pop("n_estimators", 3000))
+    train_params.pop("n_estimators", None)
     train_dataset = lgb.Dataset(X_train_early, label=y_train_early)
-    # Validation dataset with free_raw_data=False to prevent reloading
     val_dataset = lgb.Dataset(X_val_late, label=y_val_late, free_raw_data=False, reference=train_dataset)
-    
-    # Train with Native API
-    lgb_model = lgb.train(
-        train_params,
-        train_dataset,
-        num_boost_round=num_boost_round_val,
-        valid_sets=[val_dataset],
-        valid_names=["val_late"],
-        callbacks=[lgb.early_stopping(100), lgb.log_evaluation(100)],
-    )
+    lgb_model = lgb.train(train_params, train_dataset, num_boost_round=num_boost_round_val, valid_sets=[val_dataset],
+                         valid_names=["val_late"], callbacks=[lgb.early_stopping(100), lgb.log_evaluation(100)])
     train_early_time = time.time() - train_early_start
-    
-    print(f"\nTraining completed in {train_early_time:.1f}s ({train_early_time/60:.1f} min)")
     best_iteration = lgb_model.best_iteration
-    if best_iteration is not None:
-        print(f"Best iteration from temporal validation: {best_iteration}")
-    else:
-        print("Warning: best_iteration not set; falling back to configured num_boost_round for final training.")
+    print(f"\nTraining done in {train_early_time:.1f}s. Best iteration: {best_iteration if best_iteration else 'N/A'}")
     
-    # Evaluate on val_late (Native API predict returns probabilities for binary classification)
-    print("\nEvaluating on val_late...")
     val_start = time.time()
     y_val_proba = lgb_model.predict(X_val_late, num_iteration=best_iteration if best_iteration else None)
     val_time = time.time() - val_start
-    
     validation_metrics = compute_metrics(y_val_late.values, y_val_proba)
-    print(f"\n" + "-" * 40)
-    print("Validation Set (val_late) Performance:")
-    print("-" * 40)
-    print(f"ROC-AUC: {validation_metrics['roc_auc']:.4f}")
-    print(f"PR-AUC:  {validation_metrics['pr_auc']:.4f}")
-    print(f"Precision @ top 1%:  {validation_metrics['precision_at_1pct']:.4f}")
-    print(f"Precision @ top 5%:  {validation_metrics['precision_at_5pct']:.4f}")
-    print(f"Precision @ top 10%: {validation_metrics['precision_at_10pct']:.4f}")
-    print(f"Baseline rate: {validation_metrics['baseline_rate']:.4f}")
-    print("-" * 40)
+    print(f"\nValidation: ROC-AUC {validation_metrics['roc_auc']:.4f}, PR-AUC {validation_metrics['pr_auc']:.4f}, "
+          f"P@1% {validation_metrics['precision_at_1pct']:.4f}, P@5% {validation_metrics['precision_at_5pct']:.4f}, "
+          f"P@10% {validation_metrics['precision_at_10pct']:.4f}")
     
-    # Log validation metrics to W&B
     if use_wandb:
-        wandb.log({
-            **{f"val/{k}": v for k, v in validation_metrics.items()},
-            "val/n_samples": int(len(y_val_late)),
-            "val/n_positives": int(y_val_late.sum()),
-            "val/time_seconds": val_time,
-        })
+        wandb.log({**{f"val/{k}": v for k, v in validation_metrics.items()}, "val/n_samples": int(len(y_val_late)),
+                  "val/n_positives": int(y_val_late.sum()), "val/time_seconds": val_time})
     
-    # Free memory: delete all datasets from validation phase (keep lgb_model for best_iteration)
-    del X_train_early, y_train_early, X_val_late, y_val_late, train_dataset, val_dataset
-    gc.collect()
-    print("\n  Memory cleaned up after validation phase")
+    del X_train_early, y_train_early, X_val_late, y_val_late, train_dataset, val_dataset; gc.collect()
     
-    # =========================================================================
-    # STEP D: Load full training data (2000-2017) and train final model
-    # =========================================================================
-    print("\n" + "=" * 70)
-    print("STEP D: LOAD FULL TRAINING DATA (TRAIN_EARLY + VAL_LATE) AND TRAIN FINAL MODEL")
-    print("=" * 70)
-    
-    # Combine sampled early train and full late validation (2000–2017)
+    print("\nSTEP D: LOAD & TRAIN FINAL MODEL (2000-2017)")
     df_train_full = load_and_preprocess(train_path, keep_cols_train, target_col, "train_early_sampled.parquet")
     df_val_full = load_and_preprocess(val_path, keep_cols_train, target_col, "val_late_full.parquet")
+    
+    # Extract val_late data for calibration (before combining)
+    df_val_late_for_cal = df_val_full[df_val_full['year'].between(VAL_LATE_YEAR_MIN, VAL_LATE_YEAR_MAX)].copy()
+    y_val_late_for_cal = (df_val_late_for_cal[target_col] > 0).astype(np.int8)
+    X_val_late_for_cal = df_val_late_for_cal[feature_cols].copy()
+    
+    print(f"  Combining train_early ({len(df_train_full):,} rows) + val_late ({len(df_val_full):,} rows)...")
+    combine_start = time.time()
     df_combined = pd.concat([df_train_full, df_val_full], ignore_index=True)
-    del df_train_full, df_val_full
-    gc.collect()  # Strict memory cleanup immediately after concat
-
+    del df_train_full, df_val_full; gc.collect()
+    print(f"  Combined in {time.time() - combine_start:.1f}s. Extracting features...")
+    
     y = (df_combined[target_col] > 0).astype(np.int8)
     X = df_combined[feature_cols].copy()
     train_pos, train_neg = int(y.sum()), int((y == 0).sum())
     train_years = sorted(df_combined['year'].unique())
     n_train_full = len(df_combined)
-    del df_combined
-    gc.collect()  # Strict memory cleanup before creating lgb.Dataset
     
-    print(f"\nFull training set distribution:")
-    print(f"  No transition (0): {train_neg:>12,}  ({100 - train_pos/len(y)*100:.3f}%)")
-    print(f"  Transition (0→1):  {train_pos:>12,}  ({train_pos/len(y)*100:.3f}%)")
-    print(f"  Class ratio:       1 : {train_neg / max(train_pos, 1):.1f}")
-    print(f"  Years: {train_years[0]}-{train_years[-1]}")
+    # Report memory usage before creating LightGBM dataset
+    mem_X = X.memory_usage(deep=True).sum() / 1024**3
+    mem_y = y.memory_usage(deep=True) / 1024**3 if hasattr(y, 'memory_usage') else (y.nbytes / 1024**3)
+    print(f"  Combined dataset memory: X={mem_X:.2f} GB, y={mem_y:.3f} GB, total={mem_X + mem_y:.2f} GB")
     
-    train_stats = {
-        "n_train": n_train_full, "train_positives": train_pos, "train_negatives": train_neg,
-        "train_positive_pct": train_pos/len(y)*100, "train_years": f"{train_years[0]}-{train_years[-1]}",
-    }
-    
-    # Log data statistics to wandb
+    del df_combined; gc.collect()
+    print(f"\nFull training: {train_neg:,} neg, {train_pos:,} pos, ratio 1:{train_neg/max(train_pos,1):.1f}, years {train_years[0]}-{train_years[-1]}")
+    train_stats = {"n_train": n_train_full, "train_positives": train_pos, "train_negatives": train_neg,
+                  "train_positive_pct": train_pos/len(y)*100, "train_years": f"{train_years[0]}-{train_years[-1]}"}
     if use_wandb:
-        wandb.log({
-            "data/n_features": len(feature_cols),
-            "data/n_train": n_train_full,
-            "data/train_positives": train_pos,
-            "data/train_negatives": train_neg,
-            "data/train_positive_pct": train_pos/len(y)*100,
-        })
+        wandb.log({"data/n_features": len(feature_cols), "data/n_train": n_train_full, "data/train_positives": train_pos,
+                  "data/train_negatives": train_neg, "data/train_positive_pct": train_pos/len(y)*100})
     
-    print(f"\nTraining LightGBM on full training dataset ({len(X):,} samples, 2000-2017)...")
-    
-    # Use best_iteration from temporal validation model with 20% buffer
-    if best_iteration is not None:
-        num_boost_round = int(best_iteration * 1.2)
-    else:
-        # Fallback to configured n_estimators if early stopping did not set best_iteration
-        num_boost_round = int(best_params.get("n_estimators", 3000))
-    print(f"Final training num_boost_round (with 20% buffer if applicable): {num_boost_round}")
+    num_boost_round = int(best_iteration * 1.2) if best_iteration else int(best_params.get("n_estimators", 3000))
+    print(f"Training final model ({len(X):,} samples, num_boost_round={num_boost_round})...")
     final_train_params = best_params.copy()
-    # Remove potential sklearn-specific parameters that are not used by lgb.train
     final_train_params.pop("n_estimators", None)
     
+    # Ensure memory-efficient LightGBM settings for large datasets
+    if 'max_bin' not in final_train_params:
+        final_train_params['max_bin'] = 255  # Default is 255, good for memory efficiency
+    
     train_start = time.time()
-    train_dataset = lgb.Dataset(X, label=y)
-    final_model = lgb.train(
-        final_train_params,
-        train_dataset,
-        num_boost_round=num_boost_round,
-        valid_sets=None,
-    )
+    print(f"  Creating LightGBM dataset...")
+    dataset_start = time.time()
+    train_dataset = lgb.Dataset(X, label=y, free_raw_data=False)
+    print(f"  Dataset created in {time.time() - dataset_start:.1f}s. Training...")
+    
+    final_model = lgb.train(final_train_params, train_dataset, num_boost_round=num_boost_round, valid_sets=None)
     train_time = time.time() - train_start
+    print(f"Training done in {train_time:.1f}s ({train_time/60:.1f} min)")
     
-    print(f"\nTraining completed in {train_time:.1f}s ({train_time/60:.1f} min)")
-    
-    # Save model
     model_path = model_dir / f"model1_lgbm_{timestamp}.pkl"
     with open(model_path, 'wb') as f:
         pickle.dump(final_model, f)
-    print(f"\nModel saved to: {model_path}")
+    print(f"Model saved: {model_path}")
     
-    # Log training time
+    # Fit isotonic calibration on val_late predictions
+    print(f"\nSTEP E: FITTING ISOTONIC CALIBRATION ON VAL_LATE")
+    print(f"  Calibrating on {len(X_val_late_for_cal):,} val_late samples...")
+    cal_start = time.time()
+    wrapped_model = LGBMBoosterWrapper(final_model)
+    calibrated_model = CalibratedClassifierCV(wrapped_model, method='isotonic', cv='prefit')
+    calibrated_model.fit(X_val_late_for_cal, y_val_late_for_cal)
+    cal_time = time.time() - cal_start
+    print(f"  Calibration done in {cal_time:.1f}s")
+    
+    calibrated_model_path = model_dir / f"model1_lgbm_calibrated_{timestamp}.pkl"
+    with open(calibrated_model_path, 'wb') as f:
+        pickle.dump(calibrated_model, f)
+    print(f"  Calibrated model saved: {calibrated_model_path}")
+    
+    del X, y, X_val_late_for_cal, y_val_late_for_cal, df_val_late_for_cal, wrapped_model; gc.collect()
+    
     if use_wandb:
-        wandb.log({
-            "training/train_early_time_seconds": train_early_time,
-            "training/train_early_time_minutes": train_early_time / 60,
-            "training/final_train_time_seconds": train_time,
-            "training/final_train_time_minutes": train_time / 60,
-            "training/final_num_boost_round": num_boost_round,
-        })
+        wandb.log({"training/train_early_time_seconds": train_early_time, "training/train_early_time_minutes": train_early_time / 60,
+                  "training/final_train_time_seconds": train_time, "training/final_train_time_minutes": train_time / 60,
+                  "training/final_num_boost_round": num_boost_round,
+                  "calibration/time_seconds": cal_time})
     
-    # Cleanup: delete X, y, final_model (lgb_model already deleted in Step C)
-    del X, y, final_model
-    gc.collect()
-    
-    print("\nPhase 1 completed. Memory cleaned up.")
-    
-    return (model_path, validation_metrics, train_stats, train_early_time, 
-            val_time, train_time, train_pos, train_neg, n_train_full, imbalance_info)
+    print("Phase 1 completed.")
+    return (calibrated_model_path, validation_metrics, train_stats, train_early_time, val_time, train_time, train_pos, train_neg, n_train_full, imbalance_info)
 
 
 def phase2_testing(
-    test_path: Path,
-    model_path: Path,
-    feature_cols: list,
-    keep_cols_test: list,
-    timestamp: str,
-    output_dir: Path,
-    use_wandb: bool,
-    target_col: str,
-    validation_metrics: Dict[str, Any],
-    train_stats: Dict[str, Any],
-    train_early_time: float,
-    val_time: float,
-    train_time: float,
-    train_pos: int,
-    train_neg: int,
-    n_train_full: int,
-    best_params: Dict[str, Any],
-    start_time: float,
-    imbalance_info: Dict[str, Any],
+    test_path: Path, model_path: Path, feature_cols: list, keep_cols_test: list, timestamp: str, output_dir: Path,
+    use_wandb: bool, target_col: str, validation_metrics: Dict[str, Any], train_stats: Dict[str, Any],
+    train_early_time: float, val_time: float, train_time: float, train_pos: int, train_neg: int, n_train_full: int,
+    best_params: Dict[str, Any], start_time: float, imbalance_info: Dict[str, Any],
 ) -> None:
-    """Phase 2: Testing phase - loads test.parquet in batches, loads model, evaluates."""
-    print("\n" + "=" * 70)
-    print("PHASE 2: TESTING (BATCH PROCESSING)")
-    print("=" * 70)
-    
-    # -------------------------------------------------------------------------
-    # Load model
-    # -------------------------------------------------------------------------
-    print(f"\nLoading saved model from: {model_path}")
+    """Phase 2: Testing - loads test in batches, loads calibrated model, evaluates."""
+    print("\n" + "="*70 + "\nPHASE 2: TESTING\n" + "="*70)
+    print(f"\nLoading calibrated model from {model_path}")
     with open(model_path, 'rb') as f:
-        final_model = pickle.load(f)
-    
-    # -------------------------------------------------------------------------
-    # Batch processing for inference (streaming predictions to Parquet)
-    # -------------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("BATCH PROCESSING FOR INFERENCE (STREAMING TO PARQUET)")
-    print("=" * 70)
+        calibrated_model = pickle.load(f)
     
     batch_size = 100_000
-    print(f"\nProcessing test.parquet in batches of {batch_size:,} rows...")
-    
-    # Open parquet file for batch iteration
+    print(f"Processing test in batches of {batch_size:,}...")
     parquet_file = pq.ParquetFile(test_path)
-    
-    # Path for scored outputs (incremental write)
     scored_path = output_dir / f"model1_lgbm_scored_{timestamp}.parquet"
     writer = None
-    
-    # Accumulators for metrics and statistics
-    y_true_all = []  # Accumulate all y_true for metrics
-    y_proba_all = []  # Accumulate all y_proba for metrics
-    test_pos = 0
-    test_neg = 0
+    y_true_all, y_proba_all = [], []
+    test_pos = test_neg = n_test_total = batch_num = 0
     test_years_set = set()
-    n_test_total = 0
-    
     pred_start = time.time()
-    batch_num = 0
     
     try:
-        # Iterate over batches
         for batch in parquet_file.iter_batches(batch_size=batch_size, columns=keep_cols_test):
             batch_num += 1
-            batch_df = batch.to_pandas()
-            
-            # Drop rows with missing target
-            batch_df = batch_df.dropna(subset=[target_col])
+            batch_df = batch.to_pandas().dropna(subset=[target_col])
             if len(batch_df) == 0:
                 continue
-            
-            # Downcast numeric dtypes to reduce memory
             downcast_numeric_dtypes(batch_df)
-            
-            # Extract target and features
             y_batch = (batch_df[target_col] > 0).astype(np.int8)
             X_batch = batch_df[feature_cols].copy()
-            
-            # Make predictions (Native API predict returns probabilities for binary classification)
-            y_proba_batch = final_model.predict(X_batch)
-            
-            # Accumulate for metrics
+            # Calibrated model returns [n_samples, 2] with [neg_prob, pos_prob], extract pos_prob (column 1)
+            y_proba_batch = calibrated_model.predict_proba(X_batch)[:, 1]
             y_true_all.append(y_batch.values)
             y_proba_all.append(y_proba_batch)
             test_pos += int(y_batch.sum())
             test_neg += int((y_batch == 0).sum())
             test_years_set.update(batch_df['year'].unique())
             n_test_total += len(y_batch)
-            
-            # Create lightweight result DataFrame with only necessary columns
-            result_dict = {
-                'row': batch_df['row'].values,
-                'col': batch_df['col'].values,
-                'year': batch_df['year'].values,
-                'y_true': y_batch.values,
-                'y_pred_proba': y_proba_batch,
-            }
-            # Add optional coordinate columns if present
+            result_dict = {'row': batch_df['row'].values, 'col': batch_df['col'].values, 'year': batch_df['year'].values,
+                          'y_true': y_batch.values, 'y_pred_proba': y_proba_batch}
             for col in ['x', 'y']:
                 if col in batch_df.columns:
                     result_dict[col] = batch_df[col].values
-            
             result_df = pd.DataFrame(result_dict)
             result_table = pa.Table.from_pandas(result_df, preserve_index=False)
-            
-            # Initialize writer with schema on first batch
             if writer is None:
                 writer = pq.ParquetWriter(scored_path, result_table.schema)
-                print(f"\nInitialized ParquetWriter for scored outputs at: {scored_path}")
-            
-            # Write batch to disk immediately
+                print(f"Writing to {scored_path}")
             writer.write_table(result_table)
-            
-            # Free memory immediately
-            del batch_df, X_batch, y_batch, y_proba_batch, result_df, result_table
-            gc.collect()
-            
+            del batch_df, X_batch, y_batch, y_proba_batch, result_df, result_table; gc.collect()
             if batch_num % 10 == 0:
-                print(f"  Processed {batch_num} batches ({n_test_total:,} rows so far)...")
+                print(f"  {batch_num} batches, {n_test_total:,} rows")
     finally:
-        # Ensure writer is properly closed
         if writer is not None:
             writer.close()
     
     pred_time = time.time() - pred_start
-    print(f"\n  Completed {batch_num} batches in {pred_time:.1f}s")
-    print(f"  Total rows processed: {n_test_total:,}")
-    print(f"  Scored outputs streamed incrementally to: {scored_path}")
+    print(f"Completed {batch_num} batches in {pred_time:.1f}s, {n_test_total:,} rows")
     
-    # Concatenate y_true and y_proba for metrics
-    print("\nConcatenating prediction arrays for metrics...")
     y_test = np.concatenate(y_true_all)
     y_proba = np.concatenate(y_proba_all)
-    del y_true_all, y_proba_all
-    gc.collect()
-    
+    del y_true_all, y_proba_all; gc.collect()
     test_years = sorted(test_years_set)
+    print(f"\nTest set: {test_neg:,} neg, {test_pos:,} pos, ratio 1:{test_neg/max(test_pos,1):.1f}, years {test_years[0]}-{test_years[-1]}")
     
-    print(f"\nTest set distribution:")
-    print(f"  No transition (0): {test_neg:>12,}  ({100 - test_pos/n_test_total*100:.3f}%)")
-    print(f"  Transition (0→1):  {test_pos:>12,}  ({test_pos/n_test_total*100:.3f}%)")
-    print(f"  Class ratio:       1 : {test_neg / max(test_pos, 1):.1f}")
-    print(f"  Years: {test_years[0]}-{test_years[-1]}")
-    
-    # Log data statistics to wandb
     if use_wandb:
-        wandb.log({
-            "data/n_test": int(n_test_total),
-            "data/test_positives": test_pos,
-            "data/test_negatives": test_neg,
-            "data/test_positive_pct": test_pos/n_test_total*100,
-        })
+        wandb.log({"data/n_test": int(n_test_total), "data/test_positives": test_pos, "data/test_negatives": test_neg,
+                  "data/test_positive_pct": test_pos/n_test_total*100})
     
-    # -------------------------------------------------------------------------
-    # Compute metrics
-    # -------------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("EVALUATE ON TEST SET (2018-2024)")
-    print("=" * 70)
-    
-    print("\nComputing metrics...")
     test_metrics = compute_metrics(y_test, y_proba)
     baseline_rate = test_metrics['baseline_rate']
     prec_at_k = {k: test_metrics[f'precision_at_{k}pct'] for k in [1, 5, 10]}
-    
-    print(f"\n" + "-" * 40)
-    print("Area Under Curve Metrics:")
-    print("-" * 40)
-    print(f"ROC-AUC: {test_metrics['roc_auc']:.4f}")
-    print(f"PR-AUC:  {test_metrics['pr_auc']:.4f}")
-    
-    print(f"\n" + "-" * 40)
-    print("Precision @ Top-K Predictions:")
-    print("-" * 40)
+    print(f"\nTest metrics (using calibrated probabilities): ROC-AUC {test_metrics['roc_auc']:.4f}, PR-AUC {test_metrics['pr_auc']:.4f}")
     for k in [1, 5, 10]:
         n_top_k = max(1, int(len(y_test) * k / 100))
-        n_protected_in_top_k = int(n_top_k * prec_at_k[k])
-        print(f"  Precision @ top {k:>2}%:  {prec_at_k[k]:.4f}  "
-              f"({n_protected_in_top_k:>7,} transitions in top {n_top_k:>9,})")
-    print(f"\n  Baseline (random):    {baseline_rate:.4f}")
-    print("\nLift over baseline:")
-    for k in [1, 5, 10]:
-        print(f"  Top {k:>2}%: {test_metrics[f'lift_at_{k}pct']:.2f}x")
+        n_protected = int(n_top_k * prec_at_k[k])
+        print(f"  P@{k}%: {prec_at_k[k]:.4f} ({n_protected:,}/{n_top_k:,}), lift {test_metrics[f'lift_at_{k}pct']:.2f}x")
     
     if use_wandb:
         wandb.log({**{f"test/{k}": v for k, v in test_metrics.items()}})
     
-    print("\n" + "-" * 40)
-    print("Top 20 Most Important Features:")
-    print("-" * 40)
-    feature_importance = pd.DataFrame({
-        'feature': feature_cols, 'importance': final_model.feature_importance()
-    }).sort_values('importance', ascending=False).head(20)
-    print(feature_importance.to_string(index=False))
+    # Get feature importance from the underlying LightGBM model
+    # The calibrated model wraps the original model, so we need to access it
+    try:
+        underlying_model = calibrated_model.calibrated_classifiers_[0].estimator.booster
+        feature_importance = pd.DataFrame({'feature': feature_cols, 'importance': underlying_model.feature_importance()}).sort_values('importance', ascending=False).head(20)
+        print("\nTop 20 features:\n" + feature_importance.to_string(index=False))
+    except (AttributeError, IndexError) as e:
+        print(f"\nWarning: Could not extract feature importance from calibrated model: {e}")
+        feature_importance = pd.DataFrame({'feature': feature_cols, 'importance': [0] * len(feature_cols)}).head(20)
     
-    # -------------------------------------------------------------------------
-    # Save metrics (predictions already streamed to disk)
-    # -------------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("SAVE METRICS")
-    print("=" * 70)
-    
-    print(f"\nScored outputs were streamed incrementally to: {scored_path}")
-    
-    # Compile metrics
-    metrics = {
-        "metadata": {
-            "timestamp": timestamp,
-            "model": "LightGBM",
-            "task": "transition_01_prediction",
-            "random_state": RANDOM_STATE,
-            "n_features": len(feature_cols),
-            "features": feature_cols,
-        },
-        "data": {
-            "n_train_full": n_train_full,
-            "n_test": int(n_test_total),
-            "train_positives": train_pos,
-            "train_negatives": train_neg,
-            "test_positives": test_pos,
-            "test_negatives": test_neg,
-        },
-        "temporal_split": {
-            "method": "strict_temporal_split",
-            "train_early_max_year": TRAIN_EARLY_YEAR_MAX,
-            "val_late_min_year": VAL_LATE_YEAR_MIN,
-            "val_late_max_year": VAL_LATE_YEAR_MAX,
-        },
-        "validation_performance": validation_metrics,
-        "model_parameters": best_params,
-        "imbalance_handling": {
-            "method": "scale_pos_weight",
-            "is_unbalance": False,
-            "scale_pos_weight": imbalance_info.get("scale_pos_weight"),
-            "neg_pos_ratio_full": imbalance_info.get("ratio_full"),
-            "neg_pos_ratio_sampled": imbalance_info.get("ratio_sampled"),
-            "neg_full": imbalance_info.get("neg_full"),
-            "pos_full": imbalance_info.get("pos_full"),
-            "neg_sampled": imbalance_info.get("neg_sampled"),
-            "pos_sampled": imbalance_info.get("pos_sampled"),
-        },
-        "test_performance": test_metrics,
-        "feature_importance": feature_importance.head(20).to_dict('records'),
-        "timing": {
-            "train_early_seconds": train_early_time,
-            "validation_seconds": val_time,
-            "final_training_seconds": train_time,
-            "prediction_seconds": pred_time,
-            "total_seconds": time.time() - start_time,
-        },
-    }
-    
-    # Convert NumPy types to native Python types
+    metrics = {"metadata": {"timestamp": timestamp, "model": "LightGBM", "task": "transition_01_prediction",
+                           "random_state": RANDOM_STATE, "n_features": len(feature_cols), "features": feature_cols,
+                           "calibration": "isotonic", "calibration_method": "CalibratedClassifierCV with cv='prefit'",
+                           "calibration_data": "val_late (2015-2017)", "test_probabilities": "calibrated"},
+              "data": {"n_train_full": n_train_full, "n_test": int(n_test_total), "train_positives": train_pos,
+                      "train_negatives": train_neg, "test_positives": test_pos, "test_negatives": test_neg},
+              "temporal_split": {"method": "strict_temporal_split", "train_early_max_year": TRAIN_EARLY_YEAR_MAX,
+                                "val_late_min_year": VAL_LATE_YEAR_MIN, "val_late_max_year": VAL_LATE_YEAR_MAX},
+              "validation_performance": validation_metrics, "model_parameters": best_params,
+              "imbalance_handling": {"method": "scale_pos_weight", "is_unbalance": False,
+                                    "scale_pos_weight": imbalance_info.get("scale_pos_weight"),
+                                    "neg_pos_ratio_full": imbalance_info.get("ratio_full"),
+                                    "neg_pos_ratio_sampled": imbalance_info.get("ratio_sampled"),
+                                    "neg_full": imbalance_info.get("neg_full"), "pos_full": imbalance_info.get("pos_full"),
+                                    "neg_sampled": imbalance_info.get("neg_sampled"), "pos_sampled": imbalance_info.get("pos_sampled")},
+              "test_performance": test_metrics, "feature_importance": feature_importance.head(20).to_dict('records'),
+              "timing": {"train_early_seconds": train_early_time, "validation_seconds": val_time,
+                        "final_training_seconds": train_time, "prediction_seconds": pred_time, "total_seconds": time.time() - start_time}}
     metrics = convert_numpy_types(metrics)
-    
-    # Save metrics
     metrics_path = output_dir / f"model1_lgbm_metrics_{timestamp}.json"
     with open(metrics_path, 'w') as f:
         json.dump(metrics, f, indent=2)
-    print(f"Metrics saved to: {metrics_path}")
+    print(f"\nMetrics saved: {metrics_path}")
+    del y_test, y_proba, calibrated_model; gc.collect()
     
-    # Free memory
-    del y_test, y_proba, final_model
-    gc.collect()
-    
-    # -------------------------------------------------------------------------
-    # Summary
-    # -------------------------------------------------------------------------
     total_time = time.time() - start_time
+    print("\n" + "="*70 + "\nSUMMARY\n" + "="*70)
+    print(f"Model: LightGBM (with isotonic calibration), {len(feature_cols)} features\nValidation (≤{TRAIN_EARLY_YEAR_MAX}→{VAL_LATE_YEAR_MIN}-{VAL_LATE_YEAR_MAX}): PR-AUC {validation_metrics['pr_auc']:.4f}, ROC-AUC {validation_metrics['roc_auc']:.4f}")
+    print(f"Test (2018-2024, {n_test_total:,} samples, {test_pos/n_test_total*100:.3f}% pos, calibrated probabilities): ROC-AUC {test_metrics['roc_auc']:.4f}, PR-AUC {test_metrics['pr_auc']:.4f}")
+    print(f"  P@1%: {prec_at_k[1]:.4f} ({test_metrics['lift_at_1pct']:.1f}x), P@5%: {prec_at_k[5]:.4f} ({test_metrics['lift_at_5pct']:.1f}x), P@10%: {prec_at_k[10]:.4f} ({test_metrics['lift_at_10pct']:.1f}x)")
+    print(f"Timings: train_early {train_early_time:.1f}s, val {val_time:.1f}s, final_train {train_time:.1f}s, pred {pred_time:.1f}s, total {total_time:.1f}s ({total_time/60:.1f}m)")
+    print("="*70 + "\nDone.")
     
-    print("\n" + "=" * 70)
-    print("SUMMARY")
-    print("=" * 70)
-    print(f"Model:                       LightGBM")
-    print(f"Parameters:                  {best_params}")
-    print(f"Features used:               {len(feature_cols)}")
-    print(f"\nTemporal Split (Internal Validation):")
-    print(f"  train_early (≤{TRAIN_EARLY_YEAR_MAX}) → val_late ({VAL_LATE_YEAR_MIN}-{VAL_LATE_YEAR_MAX})")
-    print(f"  Validation PR-AUC:         {validation_metrics['pr_auc']:.4f}")
-    print(f"  Validation ROC-AUC:        {validation_metrics['roc_auc']:.4f}")
-    print(f"\nTest Set Performance (2018-2024):")
-    print(f"  Samples:                   {n_test_total:,}")
-    print(f"  Positive rate:             {test_pos/n_test_total*100:.3f}%")
-    print(f"  ROC-AUC:                   {test_metrics['roc_auc']:.4f}")
-    print(f"  PR-AUC:                    {test_metrics['pr_auc']:.4f}")
-    print(f"  Precision @ top 1%:        {prec_at_k[1]:.4f} ({test_metrics['lift_at_1pct']:.1f}x lift)")
-    print(f"  Precision @ top 5%:        {prec_at_k[5]:.4f} ({test_metrics['lift_at_5pct']:.1f}x lift)")
-    print(f"  Precision @ top 10%:       {prec_at_k[10]:.4f} ({test_metrics['lift_at_10pct']:.1f}x lift)")
-    print(f"\nTimings:")
-    print(f"  Train early (≤{TRAIN_EARLY_YEAR_MAX}):     {train_early_time:.1f}s ({train_early_time/60:.1f} min)")
-    print(f"  Validation (2015-2017):    {val_time:.1f}s")
-    print(f"  Final training (2000-2017): {train_time:.1f}s ({train_time/60:.1f} min)")
-    print(f"  Prediction (batch):        {pred_time:.1f}s ({pred_time/60:.1f} min)")
-    print(f"  Total time:                {total_time:.1f}s ({total_time/60:.1f} min)")
-    print("=" * 70)
-    print("Done.")
-    
-    # Log final summary
     if use_wandb:
-        wandb.log({
-            "summary/total_time_seconds": total_time,
-            "summary/total_time_minutes": total_time / 60,
-            "status": "success"
-        })
+        wandb.log({"summary/total_time_seconds": total_time, "summary/total_time_minutes": total_time / 60, "status": "success"})
         wandb.finish()
 
 
 def main() -> None:
     start_time = time.time()
-    
-    # -------------------------------------------------------------------------
-    # Setup paths
-    # -------------------------------------------------------------------------
     repo_root = Path(__file__).resolve().parents[3]
-    
-    # Input paths (pre-split files from model1_preprocessing)
     train_path = resolve_parquet_file("train_early_sampled.parquet")
     val_path = resolve_parquet_file("val_late_full.parquet")
     test_path = resolve_parquet_file("test_full.parquet")
     params_path = resolve_best_params_json()
-    
-    # Output directories
     output_dir = repo_root / "outputs/Results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
-    
     model_dir = repo_root / "data/ml/models"
     model_dir.mkdir(parents=True, exist_ok=True)
-    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
     use_wandb = False
     try:
-        print("Initializing Weights & Biases...")
-        wandb.init(
-            project="ml-training-transitions",
-            entity=os.environ.get("WANDB_ENTITY"),
-            name=f"model1_lgbm_{timestamp}",
-            config={
-                "model": "LightGBM", "task": "transition_01_prediction",
-                "random_state": RANDOM_STATE,
-                "temporal_split": {
-                    "train_early_max_year": TRAIN_EARLY_YEAR_MAX,
-                    "val_late_min_year": VAL_LATE_YEAR_MIN,
-                    "val_late_max_year": VAL_LATE_YEAR_MAX,
-                },
-            },
-        )
+        wandb.init(project="ml-training-transitions", entity=os.environ.get("WANDB_ENTITY"), name=f"model1_lgbm_{timestamp}",
+                  config={"model": "LightGBM", "task": "transition_01_prediction", "random_state": RANDOM_STATE,
+                         "temporal_split": {"train_early_max_year": TRAIN_EARLY_YEAR_MAX, "val_late_min_year": VAL_LATE_YEAR_MIN,
+                                           "val_late_max_year": VAL_LATE_YEAR_MAX}})
         use_wandb = True
-        print("W&B connected\n")
+        print("W&B connected")
     except Exception as err:
-        print(f"W&B initialization failed: {err}\n")
+        print(f"W&B failed: {err}")
     
-    print("=" * 70)
-    print("LGBM TRANSITION MODEL (0→1 PREDICTION)")
-    print("=" * 70)
-    print(f"\nTrain (early, sampled): {train_path}")
-    print(f"Val (late, full):       {val_path}")
-    print(f"Test (full):            {test_path}")
-    print(f"Params:                 {params_path}")
-    print(f"Output: {output_dir}")
-    
-    # -------------------------------------------------------------------------
-    # Step 1: Load best parameters
-    # -------------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("STEP 1: LOAD BEST PARAMETERS")
-    print("=" * 70)
+    print("="*70 + "\nLGBM TRANSITION MODEL\n" + "="*70)
+    print(f"Train: {train_path}\nVal: {val_path}\nTest: {test_path}\nParams: {params_path}\nOutput: {output_dir}")
     
     best_params, best_cv_score = load_best_params(params_path)
-    print(f"\nLoaded parameters from: {params_path}")
-    print(f"\nBest parameters:")
-    for param, value in sorted(best_params.items()):
-        if param != 'verbose':
-            print(f"  {param}: {value}")
-    if best_cv_score is not None:
-        print(f"\nBest CV score (from tuning): {best_cv_score:.4f}")
+    print(f"\nLoaded params from {params_path}")
+    if best_cv_score:
+        print(f"Best CV score: {best_cv_score:.4f}")
     
-    # -------------------------------------------------------------------------
-    # Step 2: Schema checks (lazy loading - read schema only)
-    # -------------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("STEP 2: SCHEMA CHECKS (LAZY LOADING)")
-    print("=" * 70)
-    
-    print(f"\nReading column names from parquet files...")
     all_cols_train = pq.ParquetFile(train_path).schema_arrow.names
     all_cols_test = pq.ParquetFile(test_path).schema_arrow.names
-    
     target_col = "transition_01"
     df_schema = pd.read_parquet(train_path, columns=all_cols_train).head(1)
     numeric_cols = df_schema.select_dtypes(include=['number']).columns.tolist()
     feature_cols = [col for col in numeric_cols if col.lower() not in {c.lower() for c in EXCLUDE_COLS}]
-    
     required_cols = [target_col, 'year', 'row', 'col']
     optional_cols = [col for col in ['x', 'y'] if col in all_cols_train]
     keep_cols_train = feature_cols + required_cols + optional_cols
     keep_cols_test = feature_cols + required_cols + [col for col in ['x', 'y'] if col in all_cols_test]
+    print(f"Selected {len(feature_cols)} features, loading {len(keep_cols_train)} cols from train, {len(keep_cols_test)} from test")
+    del df_schema; gc.collect()
     
-    print(f"  Selected {len(feature_cols)} feature columns")
-    print(f"  Will load {len(keep_cols_train)} columns from train, {len(keep_cols_test)} from test")
-    del df_schema
-    gc.collect()
+    (model_path, validation_metrics, train_stats, train_early_time, val_time, train_time, train_pos, train_neg, n_train_full, imbalance_info) = phase1_training(
+        train_path, val_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col)
     
-    # -------------------------------------------------------------------------
-    # Phase 1: Training
-    # -------------------------------------------------------------------------
-    (model_path, validation_metrics, train_stats, train_early_time, 
-     val_time, train_time, train_pos, train_neg, n_train_full, imbalance_info) = phase1_training(
-        train_path=train_path,
-        val_path=val_path,
-        params_path=params_path,
-        feature_cols=feature_cols,
-        keep_cols_train=keep_cols_train,
-        best_params=best_params,
-        timestamp=timestamp,
-        model_dir=model_dir,
-        output_dir=output_dir,
-        use_wandb=use_wandb,
-        target_col=target_col,
-    )
-    
-    # -------------------------------------------------------------------------
-    # Phase 2: Testing
-    # -------------------------------------------------------------------------
-    phase2_testing(
-        test_path=test_path,
-        model_path=model_path,
-        feature_cols=feature_cols,
-        keep_cols_test=keep_cols_test,
-        timestamp=timestamp,
-        output_dir=output_dir,
-        use_wandb=use_wandb,
-        target_col=target_col,
-        validation_metrics=validation_metrics,
-        train_stats=train_stats,
-        train_early_time=train_early_time,
-        val_time=val_time,
-        train_time=train_time,
-        train_pos=train_pos,
-        train_neg=train_neg,
-        n_train_full=n_train_full,
-        best_params=best_params,
-        start_time=start_time,
-        imbalance_info=imbalance_info,
-    )
+    phase2_testing(test_path, model_path, feature_cols, keep_cols_test, timestamp, output_dir, use_wandb, target_col,
+                  validation_metrics, train_stats, train_early_time, val_time, train_time, train_pos, train_neg, n_train_full,
+                  best_params, start_time, imbalance_info)
 
 
 if __name__ == "__main__":
-    # Set up output file capture
     repo_root = Path(__file__).resolve().parents[3]
     output_dir = repo_root / "outputs/Results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
-    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = output_dir / f"model1_lgbm_{timestamp}.txt"
-    
     tee = Tee(output_file)
     sys.stdout = tee
-    
     try:
         main()
     finally:

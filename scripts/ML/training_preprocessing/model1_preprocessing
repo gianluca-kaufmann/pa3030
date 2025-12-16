@@ -7,18 +7,28 @@ Rules
 -----
 TRAIN_EARLY (2001–2014):
   - Keep all positives (transition_01 = 1)
-  - Sample hard negatives at 1:100 ratio per year, weighted by exp(-dist_wdpa / k)
+  - Sample negatives per year at TARGET_NEG_POS_RATIO (e.g., 400:1)
+  - Negatives split 50/50: hard negatives (closest to WDPA) + random negatives
   - Year 2000 excluded to avoid treating existing PAs as transitions
+  - Result: positive rate ~0.25% (realistic for conservation risk modeling)
 
 VAL_LATE (2015–2017):
   - Full risk set (no sampling)
 
 TEST (2018–2024):
   - Full risk set (no sampling)
+
+Notes
+-----
+- No MAX_TRAIN_ROWS cap to avoid artificially inflating positive rate
+- Target neg/pos ratio maintains realistic class balance similar to val/test
+- Hard negative sampling focuses on areas near protected areas (most informative)
 """
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import sys
 import time
@@ -36,9 +46,9 @@ TEST_YEARS = (2018, 2024)          # Full test
 WANDB_PROJECT = "ml-training-preprocessing"
 
 # Hard negative sampling configuration
-NEG_POS_RATIO = 100  # Target ratio of negatives to positives (exact per-year sampling)
+TARGET_NEG_POS_RATIO = 400  # Target ratio of negatives to positives per year (keeps pos rate ~0.25%)
 DIST_WDPA_DECAY = 5.0  # Decay constant (km) for exponential weighting: exp(-dist_wdpa / k)
-MAX_TRAIN_ROWS = 30_000_000  # Hard cap on TRAIN_EARLY total rows (never caps positives)
+# Note: No MAX_TRAIN_ROWS cap - we control size via TARGET_NEG_POS_RATIO to avoid inflating positive rate
 
 
 def resolve_input() -> Path:
@@ -139,10 +149,9 @@ def main() -> None:
                 "train_early_years": TRAIN_EARLY_YEARS,
                 "val_late_years": VAL_LATE_YEARS,
                 "test_years": TEST_YEARS,
-                "neg_pos_ratio": NEG_POS_RATIO,
+                "target_neg_pos_ratio": TARGET_NEG_POS_RATIO,
                 "dist_wdpa_decay": DIST_WDPA_DECAY,
-                "max_train_rows": MAX_TRAIN_ROWS,
-                "sampling_method": "hard_negatives_exponential_capped",
+                "sampling_method": "per_year_hard_negatives_fixed_ratio",
             },
         )
         use_wandb = True
@@ -171,12 +180,15 @@ def main() -> None:
 
     try:
         # TRAIN_EARLY: positives + hard negatives per year (2001–2014)
-        # Hard negatives sampled exactly at 1:NEG_POS_RATIO per year, weighted by exp(-dist_wdpa / k)
-        # Smart capping: never cap positives, adjust neg/pos ratio if needed to stay under MAX_TRAIN_ROWS
+        # Keep all positives, sample negatives per year at TARGET_NEG_POS_RATIO
+        # 50% hard negatives (close to WDPA), 50% random from remainder
         train_early_sql = f"""
         COPY (
             WITH base AS (
-                SELECT * FROM read_parquet('{escaped_in}')
+                SELECT
+                    *,
+                    year - 2000 AS years_since_2000
+                FROM read_parquet('{escaped_in}')
                 WHERE year BETWEEN {TRAIN_EARLY_YEARS[0]} AND {TRAIN_EARLY_YEARS[1]}
             ),
             year_counts AS (
@@ -187,64 +199,36 @@ def main() -> None:
                 FROM base
                 GROUP BY year
             ),
-            -- Compute global positive count for capping logic
-            global_stats AS (
-                SELECT
-                    SUM(pos_count) AS total_pos,
-                    SUM(neg_count) AS total_neg
-                FROM year_counts
-            ),
-            -- Compute per-year negative budget with smart capping
+            -- Per-year negative budgets: pos_count * TARGET_NEG_POS_RATIO
             neg_budget AS (
                 SELECT
                     yc.year,
                     yc.pos_count,
                     yc.neg_count,
-                    -- Maximum allowed negatives globally
                     LEAST(
-                        gs.total_pos * {NEG_POS_RATIO},
-                        {MAX_TRAIN_ROWS} - gs.total_pos
-                    ) AS max_total_negs,
-                    -- Per-year budget proportional to year's positive count
-                    CAST(
-                        yc.pos_count::DOUBLE / NULLIF(gs.total_pos, 0) * 
-                        LEAST(
-                            gs.total_pos * {NEG_POS_RATIO},
-                            {MAX_TRAIN_ROWS} - gs.total_pos
-                        ) AS BIGINT
-                    ) AS year_neg_budget_raw,
-                    -- Final per-year negative budget cannot exceed available negatives
-                    LEAST(
-                        yc.neg_count,
-                        CAST(
-                            yc.pos_count::DOUBLE / NULLIF(gs.total_pos, 0) * 
-                            LEAST(
-                                gs.total_pos * {NEG_POS_RATIO},
-                                {MAX_TRAIN_ROWS} - gs.total_pos
-                            ) AS BIGINT
-                        )
+                        CAST(ROUND(yc.pos_count * {TARGET_NEG_POS_RATIO}) AS BIGINT),
+                        yc.neg_count
                     ) AS year_neg_budget
                 FROM year_counts yc
-                CROSS JOIN global_stats gs
+                WHERE yc.pos_count > 0 AND yc.neg_count > 0
             ),
             positives AS (
+                -- Keep all positives (no sampling)
                 SELECT * FROM base WHERE transition_01 = 1
             ),
-            -- Prepare negative pool with per-year budgets and a stable random key
+            -- Prepare negative pool with per-year budgets
             neg_candidates AS (
                 SELECT
                     b.*,
                     nb.year_neg_budget,
-                    nb.neg_count,
                     -- Split the yearly negative budget into 50% hard and 50% random
                     CAST(FLOOR(nb.year_neg_budget / 2.0) AS BIGINT) AS hard_budget,
                     nb.year_neg_budget - CAST(FLOOR(nb.year_neg_budget / 2.0) AS BIGINT) AS rand_budget,
                     COALESCE(b.dist_wdpa, 100.0) AS dist_for_rank,
                     random() AS u
                 FROM base b
-                LEFT JOIN neg_budget nb ON b.year = nb.year
+                INNER JOIN neg_budget nb ON b.year = nb.year
                 WHERE b.transition_01 = 0
-                  AND nb.year_neg_budget > 0
             ),
             -- Rank for hard negatives: by distance to WDPA (closest first), tie-broken by u
             ranked_for_hard AS (
@@ -260,7 +244,6 @@ def main() -> None:
             hard_negs AS (
                 SELECT * EXCLUDE (
                     year_neg_budget,
-                    neg_count,
                     hard_budget,
                     rand_budget,
                     dist_for_rank,
@@ -269,17 +252,12 @@ def main() -> None:
                 )
                 FROM ranked_for_hard
                 WHERE dist_rank <= hard_budget
-                  AND hard_budget > 0
             ),
-            -- Serialized selection:
-            --   1) hard_negs as above (distance-ranked)
-            --   2) leftover_pool = negatives that were NOT selected as hard_negs
-            --   3) re-rank randomly only within leftover_pool to fill the random budget exactly
+            -- Leftover pool for random selection (excludes hard negatives)
             leftover_pool AS (
                 SELECT *
                 FROM ranked_for_hard
                 WHERE dist_rank > hard_budget
-                  AND rand_budget > 0
             ),
             ranked_leftover AS (
                 SELECT
@@ -290,11 +268,10 @@ def main() -> None:
                     ) AS leftover_rand_rank
                 FROM leftover_pool
             ),
-            -- Second half of the budget: random negatives drawn only from leftover_pool
+            -- Second half of the budget: random negatives from leftover pool
             random_negs AS (
                 SELECT * EXCLUDE (
                     year_neg_budget,
-                    neg_count,
                     hard_budget,
                     rand_budget,
                     dist_for_rank,
@@ -314,10 +291,9 @@ def main() -> None:
         TO '{escaped_train_early}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """
 
-        print(f"\nCreating TRAIN_EARLY split ({TRAIN_EARLY_YEARS[0]}–{TRAIN_EARLY_YEARS[1]}) with hard negatives...")
-        print(f"  Target neg/pos ratio: {NEG_POS_RATIO}:1 per year")
-        print(f"  Max total rows: {MAX_TRAIN_ROWS:,} (smart capping: never caps positives)")
-        print(f"  Using exponential weighting: exp(-dist_wdpa / {DIST_WDPA_DECAY})")
+        print(f"\nCreating TRAIN_EARLY split ({TRAIN_EARLY_YEARS[0]}–{TRAIN_EARLY_YEARS[1]}) with per-year negative sampling...")
+        print(f"  All positives are kept; negatives sampled at {TARGET_NEG_POS_RATIO}:1 ratio per year")
+        print(f"  Negatives: 50% closest to WDPA (hard), 50% random from remainder")
         print(f"  Year 2000 excluded to avoid treating existing PAs as transitions")
         # Set random seed for reproducible sampling
         seed_value = RANDOM_STATE / 100.0
@@ -329,7 +305,10 @@ def main() -> None:
         # VAL_LATE_FULL: full risk set 2015–2017
         val_late_sql = f"""
         COPY (
-            SELECT * FROM read_parquet('{escaped_in}')
+            SELECT
+                *,
+                year - 2000 AS years_since_2000
+            FROM read_parquet('{escaped_in}')
             WHERE year BETWEEN {VAL_LATE_YEARS[0]} AND {VAL_LATE_YEARS[1]}
         )
         TO '{escaped_val_late}' (FORMAT PARQUET, COMPRESSION ZSTD)
@@ -343,7 +322,10 @@ def main() -> None:
         # TEST_FULL: full risk set 2018–2024
         test_sql = f"""
         COPY (
-            SELECT * FROM read_parquet('{escaped_in}')
+            SELECT
+                *,
+                year - 2000 AS years_since_2000
+            FROM read_parquet('{escaped_in}')
             WHERE year BETWEEN {TEST_YEARS[0]} AND {TEST_YEARS[1]}
         )
         TO '{escaped_test}' (FORMAT PARQUET, COMPRESSION ZSTD)
@@ -359,20 +341,15 @@ def main() -> None:
         log_year_counts(con, val_late_out, "VAL_LATE_FULL", use_wandb)
         log_year_counts(con, test_out, "TEST_FULL", use_wandb)
 
-        # Check total rows and capping status
+        # Check total rows and achieved ratios
         total_train_early_rows = con.execute(
             f"SELECT COUNT(*) FROM read_parquet('{escaped_train_early}')"
         ).fetchone()[0]
         
-        capping_applied = total_train_early_rows >= MAX_TRAIN_ROWS * 0.95  # Within 5% threshold
-        print(f"\nTotal TRAIN_EARLY rows: {total_train_early_rows:,} / {MAX_TRAIN_ROWS:,}")
-        if capping_applied:
-            print("  ⚠ Row limit active - negative sampling was capped")
-        else:
-            print("  ✓ Below row limit - full target ratio achieved")
+        print(f"\nTotal TRAIN_EARLY rows: {total_train_early_rows:,}")
         
-        # Check for years where target ratio was infeasible
-        print("\nChecking achieved neg/pos ratios vs target...")
+        # Check per-year achieved neg/pos ratios vs target
+        print(f"\nChecking achieved neg/pos ratios vs target ({TARGET_NEG_POS_RATIO}:1)...")
         achieved_ratios = con.execute(
             f"""
             SELECT
@@ -389,10 +366,10 @@ def main() -> None:
         ).fetchall()
         
         for year, pos, neg, achieved in achieved_ratios:
-            status = "✓" if abs(achieved - NEG_POS_RATIO) < 0.1 else "⚠"
-            print(f"  {status} {year}: achieved {achieved:.1f}:1 (target {NEG_POS_RATIO}:1) | pos={pos:,} neg={neg:,}")
+            status = "✓" if abs(achieved - TARGET_NEG_POS_RATIO) / TARGET_NEG_POS_RATIO < 0.05 else "⚠"
+            print(f"  {status} {year}: achieved {achieved:.1f}:1 (target {TARGET_NEG_POS_RATIO}:1) | pos={pos:,} neg={neg:,}")
         
-        # Compute scale_pos_weight from TRAIN_EARLY only
+        # Compute scale_pos_weight from TRAIN_EARLY only: sqrt(n_neg / n_pos)
         train_stats = con.execute(
             f"""
             SELECT
@@ -402,13 +379,27 @@ def main() -> None:
             """
         ).fetchone()
         total_pos, total_neg = train_stats
-        scale_pos_weight = total_neg / total_pos if total_pos > 0 else 1.0
+        neg_pos_ratio = total_neg / total_pos if total_pos > 0 else 1.0
+        scale_pos_weight = math.sqrt(neg_pos_ratio) if neg_pos_ratio > 0 else 1.0
         
         print(f"\nTRAIN_EARLY class balance:")
         print(f"  Positives: {total_pos:,}")
         print(f"  Negatives: {total_neg:,}")
-        print(f"  Ratio (neg/pos): {scale_pos_weight:.2f}")
-        print(f"  scale_pos_weight for LightGBM: {scale_pos_weight:.2f}")
+        print(f"  Ratio (neg/pos): {neg_pos_ratio:.2f}")
+        print(f"  scale_pos_weight for LightGBM: {scale_pos_weight:.6f} (sqrt of ratio)")
+        
+        # Save scale_pos_weight to metadata file for use in training
+        metadata_path = base_dir / "train_early_metadata.json"
+        metadata = {
+            "scale_pos_weight": scale_pos_weight,
+            "total_positives": int(total_pos),
+            "total_negatives": int(total_neg),
+            "neg_pos_ratio": float(neg_pos_ratio),
+            "computed_from": "train_early_sampled.parquet"
+        }
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        print(f"  Metadata saved to: {metadata_path}")
 
         total_test = con.execute(
             f"SELECT COUNT(*) FROM read_parquet('{escaped_test}')"
@@ -421,8 +412,8 @@ def main() -> None:
                     "train_early/positives": total_pos,
                     "train_early/negatives": total_neg,
                     "train_early/scale_pos_weight": scale_pos_weight,
-                    "train_early/capping_applied": capping_applied,
-                    "train_early/max_rows": MAX_TRAIN_ROWS,
+                    "train_early/target_neg_pos_ratio": TARGET_NEG_POS_RATIO,
+                    "train_early/achieved_neg_pos_ratio": neg_pos_ratio,
                     "val_late_full/rows": con.execute(
                         f"SELECT COUNT(*) FROM read_parquet('{escaped_val_late}')"
                     ).fetchone()[0],
