@@ -25,6 +25,7 @@ import pyarrow.parquet as pq
 import lightgbm as lgb
 from sklearn.metrics import roc_auc_score, average_precision_score
 from sklearn.calibration import CalibratedClassifierCV
+from sklearn.isotonic import IsotonicRegression
 
 
 class Tee:
@@ -55,6 +56,23 @@ class LGBMBoosterWrapper:
         proba_positive = np.clip(proba_positive, 0.0, 1.0)  # Ensure valid probabilities
         proba_negative = 1.0 - proba_positive
         return np.column_stack([proba_negative, proba_positive])
+
+
+class CalibratedLGBMWrapper:
+    """Wrapper that applies isotonic calibration to LightGBM predictions."""
+    def __init__(self, booster: lgb.Booster, isotonic_reg: IsotonicRegression):
+        self.booster = booster
+        self.isotonic_reg = isotonic_reg
+    
+    def predict_proba(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
+        """Return calibrated probabilities in sklearn format [n_samples, 2]."""
+        proba_positive = self.booster.predict(X)
+        proba_positive = np.clip(proba_positive, 0.0, 1.0)
+        # Apply isotonic calibration
+        proba_positive_cal = self.isotonic_reg.predict(proba_positive)
+        proba_positive_cal = np.clip(proba_positive_cal, 0.0, 1.0)
+        proba_negative_cal = 1.0 - proba_positive_cal
+        return np.column_stack([proba_negative_cal, proba_positive_cal])
 
 # Configuration
 RANDOM_STATE = 42
@@ -559,27 +577,10 @@ def phase1_training(
     report_memory_usage("before calibration fit")
     
     # Fit isotonic regression directly on collected predictions
-    from sklearn.isotonic import IsotonicRegression
     isotonic_reg = IsotonicRegression(out_of_bounds='clip', y_min=0.0, y_max=1.0)
     isotonic_reg.fit(y_pred_cal, y_true_cal)
     
     # Create a wrapper that applies isotonic calibration
-    class CalibratedLGBMWrapper:
-        """Wrapper that applies isotonic calibration to LightGBM predictions."""
-        def __init__(self, booster: lgb.Booster, isotonic_reg: IsotonicRegression):
-            self.booster = booster
-            self.isotonic_reg = isotonic_reg
-        
-        def predict_proba(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
-            """Return calibrated probabilities in sklearn format [n_samples, 2]."""
-            proba_positive = self.booster.predict(X)
-            proba_positive = np.clip(proba_positive, 0.0, 1.0)
-            # Apply isotonic calibration
-            proba_positive_cal = self.isotonic_reg.predict(proba_positive)
-            proba_positive_cal = np.clip(proba_positive_cal, 0.0, 1.0)
-            proba_negative_cal = 1.0 - proba_positive_cal
-            return np.column_stack([proba_negative_cal, proba_positive_cal])
-    
     calibrated_model = CalibratedLGBMWrapper(lgb_model, isotonic_reg)
     cal_time = time.time() - cal_start
     print(f"  Calibration done in {cal_time:.1f}s")

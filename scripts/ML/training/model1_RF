@@ -68,14 +68,45 @@ MAX_SAMPLES_FULL_TRAIN = 5_000_000
 MAX_SAMPLES_FULL_VAL = 2_000_000
 
 def get_n_jobs() -> int:
-    """Get number of CPUs to use, capped at 8."""
+    """Get number of CPUs (-1 for all available, may limit for memory efficiency)."""
     slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+    n_jobs = -1
     if slurm_cpus:
         try:
-            return min(int(slurm_cpus), 8)
+            n_jobs = int(slurm_cpus)
         except ValueError:
-            return -1
-    return -1
+            n_jobs = -1
+    
+    # Check for memory-constrained mode
+    memory_constrained = os.environ.get("MEMORY_CONSTRAINED", "").lower() in ("1", "true", "yes")
+    if memory_constrained and n_jobs < 0:
+        # Limit to fewer cores in memory-constrained environments
+        try:
+            import os as os_module
+            n_jobs = max(1, os_module.cpu_count() // 2)
+            print(f"  [MEMORY_CONSTRAINED mode] Limiting to {n_jobs} cores")
+        except:
+            n_jobs = 4
+    
+    # Cap at 8 for Random Forest to avoid excessive memory usage
+    if n_jobs < 0:
+        n_jobs = min(8, os.cpu_count() if hasattr(os, 'cpu_count') else 8)
+    else:
+        n_jobs = min(n_jobs, 8)
+    
+    return n_jobs
+
+
+def report_memory_usage(label: str = "") -> None:
+    """Report current memory usage."""
+    try:
+        import psutil
+        process = psutil.Process()
+        mem_info = process.memory_info()
+        mem_gb = mem_info.rss / 1024**3
+        print(f"  [Memory {label}] RSS: {mem_gb:.2f} GB")
+    except ImportError:
+        pass  # psutil not available
 
 
 def convert_numpy_types(obj: Any) -> Any:
@@ -159,54 +190,338 @@ def downcast_numeric_dtypes(df: pd.DataFrame) -> None:
         df[col] = df[col].astype('int32', copy=False)
 
 
-def load_and_preprocess(df_path: Path, columns: list, target_col: str, name: str = "") -> pd.DataFrame:
-    """Load, downcast, and preprocess DataFrame."""
-    print(f"Loading {name or df_path.name}...")
-    load_start = time.time()
-    df = pd.read_parquet(df_path, columns=columns)
-    print(f"  {len(df):,} rows in {time.time() - load_start:.1f}s")
-    downcast_numeric_dtypes(df)
-    gc.collect()
-    if target_col not in df.columns:
-        raise ValueError(f"Target column '{target_col}' not found")
-    df.dropna(subset=[target_col], inplace=True)
-    return df
-
-
-def extract_split(df: pd.DataFrame, feature_cols: list, target_col: str, 
-                  year_filter, split_name: str, max_samples: int | None = None) -> tuple:
-    """Extract X, y and stats from filtered DataFrame."""
-    df_split = df[year_filter(df['year'])].copy()
-    y = (df_split[target_col] > 0).astype(np.int8)
+def load_numpy_arrays_two_pass(
+    df_path: Path, 
+    feature_cols: list, 
+    target_col: str, 
+    year_filter, 
+    name: str = "",
+    batch_size: int = 50_000,
+    max_samples: int | None = None
+) -> tuple[np.ndarray, np.ndarray, int, int, list]:
+    """
+    Two-pass NumPy loader: bypasses Pandas to minimize memory overhead.
     
-    if max_samples is not None and len(df_split) > max_samples:
-        original_len = len(df_split)
-        n_pos = int(y.sum())
+    Pass 1: Count rows matching filter (after dropna on target).
+    Pass 2: Pre-allocate float32 arrays and stream data directly into them.
+    If max_samples is provided, performs stratified sampling (keep all positives, sample negatives).
+    
+    Returns:
+        X: Feature matrix (n_samples, n_features) as float32
+        y: Target vector (n_samples,) as int8
+        pos: Number of positive samples
+        neg: Number of negative samples
+        years: Sorted list of unique years
+    """
+    print(f"\nLoading {name or df_path.name} (two-pass NumPy loader)...")
+    load_start = time.time()
+    essential_cols = feature_cols + [target_col, 'year']
+    
+    # Pass 1: Count rows matching filter
+    print(f"  Pass 1: Counting rows matching filter...")
+    parquet_file = pq.ParquetFile(df_path)
+    n_samples = 0
+    years_set = set()
+    pos_count = 0
+    
+    try:
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols):
+            # Convert batch to numpy arrays directly (bypass pandas)
+            batch_table = batch
+            target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+            year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+            
+            # Filter out NaN in target
+            valid_mask = ~np.isnan(target_array)
+            if not valid_mask.any():
+                continue
+            
+            target_valid = target_array[valid_mask]
+            year_valid = year_array[valid_mask]
+            
+            # Apply year filter (works directly on numpy arrays)
+            year_mask = year_filter(year_valid)
+            n_samples += int(year_mask.sum())
+            pos_count += int((target_valid[year_mask] > 0).sum())
+            years_set.update(year_valid[year_mask].tolist())
+            
+            del batch_table, target_array, year_array, target_valid, year_valid, batch
+    finally:
+        del parquet_file
+        gc.collect()
+    
+    print(f"  Found {n_samples:,} samples matching filter ({pos_count:,} positives)")
+    
+    if n_samples == 0:
+        raise ValueError(f"No samples found matching filter in {name or df_path.name}")
+    
+    # Handle max_samples: if needed, we'll collect all data first, then sample
+    # This is less memory-efficient but necessary for stratified sampling
+    needs_sampling = max_samples is not None and n_samples > max_samples
+    if needs_sampling:
+        print(f"  Sampling required: {n_samples:,} > {max_samples:,} - will collect then sample")
+        # We'll collect all matching data, then sample
+        # This requires more memory but ensures proper stratified sampling
+    
+    # Pass 2: Pre-allocate arrays and fill directly
+    if needs_sampling:
+        # For sampling, we need to collect all data first
+        print(f"  Pass 2a: Collecting all matching data for sampling...")
+        collected_X = []
+        collected_y = []
+        
+        parquet_file = pq.ParquetFile(df_path)
+        batch_num = 0
+        
+        try:
+            for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols):
+                batch_num += 1
+                batch_table = batch
+                
+                target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+                year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+                
+                valid_mask = ~np.isnan(target_array)
+                if not valid_mask.any():
+                    del batch_table, target_array, year_array, batch
+                    continue
+                
+                target_valid = target_array[valid_mask]
+                year_valid = year_array[valid_mask]
+                year_mask = year_filter(year_valid)
+                
+                if not year_mask.any():
+                    del batch_table, target_array, year_array, target_valid, year_valid, batch
+                    continue
+                
+                target_filtered = target_valid[year_mask]
+                year_filtered = year_valid[year_mask]
+                
+                feature_arrays = []
+                for col in feature_cols:
+                    col_array = batch_table[col].to_numpy(zero_copy_only=False)
+                    col_valid = col_array[valid_mask]
+                    col_filtered = col_valid[year_mask]
+                    col_float32 = col_filtered.astype(np.float32)
+                    col_float32 = np.nan_to_num(col_float32, nan=0.0, posinf=0.0, neginf=0.0)
+                    feature_arrays.append(col_float32)
+                
+                X_batch = np.column_stack(feature_arrays)
+                y_batch = (target_filtered > 0).astype(np.int8)
+                
+                collected_X.append(X_batch)
+                collected_y.append(y_batch)
+                
+                del batch_table, target_array, year_array, target_valid, year_valid, target_filtered, year_filtered
+                del feature_arrays, X_batch, y_batch, batch
+                gc.collect()
+                
+                if batch_num % 10 == 0:
+                    print(f"  {batch_num} batches collected")
+                    report_memory_usage(f"collect batch {batch_num}")
+        finally:
+            del parquet_file
+            gc.collect()
+        
+        # Concatenate collected data
+        print(f"  Pass 2b: Concatenating collected data...")
+        X_all = np.vstack(collected_X).astype(np.float32)
+        y_all = np.concatenate(collected_y).astype(np.int8)
+        del collected_X, collected_y
+        gc.collect()
+        
+        # Perform stratified sampling
+        print(f"  Pass 2c: Performing stratified sampling...")
+        pos_mask = y_all == 1
+        pos_indices = np.where(pos_mask)[0]
+        neg_indices = np.where(~pos_mask)[0]
+        
+        n_pos = len(pos_indices)
         n_neg_needed = max_samples - n_pos
         if n_neg_needed < 0:
             print(f"  Warning: {n_pos:,} positives exceed max_samples={max_samples:,}, keeping all positives")
             n_neg_needed = 0
-        pos_mask = y == 1
-        pos_idx = df_split.index[pos_mask]
-        neg_idx = df_split.index[~pos_mask]
-        if n_neg_needed > 0 and len(neg_idx) > 0:
-            n_neg_to_sample = min(n_neg_needed, len(neg_idx))
-            neg_sampled_idx = np.random.RandomState(RANDOM_STATE).choice(
-                neg_idx, size=n_neg_to_sample, replace=False
-            )
-            selected_idx = pos_idx.union(pd.Index(neg_sampled_idx))
+        
+        if n_neg_needed > 0 and len(neg_indices) > 0:
+            n_neg_to_sample = min(n_neg_needed, len(neg_indices))
+            rng = np.random.RandomState(RANDOM_STATE)
+            sampled_neg_indices = rng.choice(neg_indices, size=n_neg_to_sample, replace=False)
+            selected_indices = np.concatenate([pos_indices, sampled_neg_indices])
         else:
-            selected_idx = pos_idx
-        df_split = df_split.loc[selected_idx].sample(frac=1, random_state=RANDOM_STATE).reset_index(drop=True)
-        y = (df_split[target_col] > 0).astype(np.int8)
-        print(f"  Downsampled from {original_len:,} to {len(df_split):,} samples")
+            selected_indices = pos_indices
+        
+        # Shuffle
+        rng = np.random.RandomState(RANDOM_STATE)
+        rng.shuffle(selected_indices)
+        
+        # Extract sampled data
+        X = X_all[selected_indices].astype(np.float32)
+        y = y_all[selected_indices].astype(np.int8)
+        del X_all, y_all, pos_indices, neg_indices, selected_indices
+        gc.collect()
+        
+        n_samples = len(X)
+        print(f"  Sampled to {n_samples:,} samples")
+    else:
+        # No sampling needed - use direct streaming approach
+        print(f"  Pass 2: Pre-allocating arrays ({n_samples:,} samples, {len(feature_cols)} features)...")
+        X = np.empty((n_samples, len(feature_cols)), dtype=np.float32)
+        y = np.empty(n_samples, dtype=np.int8)
+        
+        parquet_file = pq.ParquetFile(df_path)
+        idx_offset = 0
+        batch_num = 0
+        
+        try:
+            for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols):
+                batch_num += 1
+                batch_table = batch
+                
+                target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+                year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+                
+                valid_mask = ~np.isnan(target_array)
+                if not valid_mask.any():
+                    del batch_table, target_array, year_array, batch
+                    continue
+                
+                target_valid = target_array[valid_mask]
+                year_valid = year_array[valid_mask]
+                year_mask = year_filter(year_valid)
+                
+                if not year_mask.any():
+                    del batch_table, target_array, year_array, target_valid, year_valid, batch
+                    continue
+                
+                target_filtered = target_valid[year_mask]
+                year_filtered = year_valid[year_mask]
+                
+                feature_arrays = []
+                for col in feature_cols:
+                    col_array = batch_table[col].to_numpy(zero_copy_only=False)
+                    col_valid = col_array[valid_mask]
+                    col_filtered = col_valid[year_mask]
+                    col_float32 = col_filtered.astype(np.float32)
+                    col_float32 = np.nan_to_num(col_float32, nan=0.0, posinf=0.0, neginf=0.0)
+                    feature_arrays.append(col_float32)
+                
+                X_batch = np.column_stack(feature_arrays)
+                y_batch = (target_filtered > 0).astype(np.int8)
+                
+                batch_size_actual = len(y_batch)
+                if idx_offset + batch_size_actual > n_samples:
+                    batch_size_actual = n_samples - idx_offset
+                    X_batch = X_batch[:batch_size_actual]
+                    y_batch = y_batch[:batch_size_actual]
+                
+                X[idx_offset:idx_offset + batch_size_actual, :] = X_batch
+                y[idx_offset:idx_offset + batch_size_actual] = y_batch
+                idx_offset += batch_size_actual
+                
+                if idx_offset >= n_samples:
+                    break
+                
+                del batch_table, target_array, year_array, target_valid, year_valid, target_filtered, year_filtered
+                del feature_arrays, X_batch, y_batch, batch
+                gc.collect()
+                
+                if batch_num % 10 == 0:
+                    print(f"  {batch_num} batches, {idx_offset:,}/{n_samples:,} samples loaded")
+                    report_memory_usage(f"load batch {batch_num}")
+        finally:
+            del parquet_file
+            gc.collect()
+        
+        if idx_offset < n_samples:
+            X = X[:idx_offset]
+            y = y[:idx_offset]
+            n_samples = idx_offset
+    else:
+        # No sampling needed - use direct streaming approach
+        print(f"  Pass 2: Pre-allocating arrays ({n_samples:,} samples, {len(feature_cols)} features)...")
+        X = np.empty((n_samples, len(feature_cols)), dtype=np.float32)
+        y = np.empty(n_samples, dtype=np.int8)
+        
+        parquet_file = pq.ParquetFile(df_path)
+        idx_offset = 0
+        batch_num = 0
+        
+        try:
+            for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols):
+                batch_num += 1
+                batch_table = batch
+                
+                target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+                year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+                
+                valid_mask = ~np.isnan(target_array)
+                if not valid_mask.any():
+                    del batch_table, target_array, year_array, batch
+                    continue
+                
+                target_valid = target_array[valid_mask]
+                year_valid = year_array[valid_mask]
+                year_mask = year_filter(year_valid)
+                
+                if not year_mask.any():
+                    del batch_table, target_array, year_array, target_valid, year_valid, batch
+                    continue
+                
+                target_filtered = target_valid[year_mask]
+                year_filtered = year_valid[year_mask]
+                
+                feature_arrays = []
+                for col in feature_cols:
+                    col_array = batch_table[col].to_numpy(zero_copy_only=False)
+                    col_valid = col_array[valid_mask]
+                    col_filtered = col_valid[year_mask]
+                    col_float32 = col_filtered.astype(np.float32)
+                    col_float32 = np.nan_to_num(col_float32, nan=0.0, posinf=0.0, neginf=0.0)
+                    feature_arrays.append(col_float32)
+                
+                X_batch = np.column_stack(feature_arrays)
+                y_batch = (target_filtered > 0).astype(np.int8)
+                
+                batch_size_actual = len(y_batch)
+                if idx_offset + batch_size_actual > n_samples:
+                    batch_size_actual = n_samples - idx_offset
+                    X_batch = X_batch[:batch_size_actual]
+                    y_batch = y_batch[:batch_size_actual]
+                
+                X[idx_offset:idx_offset + batch_size_actual, :] = X_batch
+                y[idx_offset:idx_offset + batch_size_actual] = y_batch
+                idx_offset += batch_size_actual
+                
+                if idx_offset >= n_samples:
+                    break
+                
+                del batch_table, target_array, year_array, target_valid, year_valid, target_filtered, year_filtered
+                del feature_arrays, X_batch, y_batch, batch
+                gc.collect()
+                
+                if batch_num % 10 == 0:
+                    print(f"  {batch_num} batches, {idx_offset:,}/{n_samples:,} samples loaded")
+                    report_memory_usage(f"load batch {batch_num}")
+        finally:
+            del parquet_file
+            gc.collect()
+        
+        if idx_offset < n_samples:
+            X = X[:idx_offset]
+            y = y[:idx_offset]
+            n_samples = idx_offset
     
-    X = df_split[feature_cols].copy()
+    # Compute stats
     pos = int(y.sum())
-    neg = len(y) - pos
-    years = sorted(df_split['year'].unique())
-    pos_pct = pos / len(y) * 100
-    print(f"{split_name}: {neg:,} neg ({100-pos_pct:.3f}%), {pos:,} pos ({pos_pct:.3f}%), ratio 1:{neg/max(pos,1):.1f}, years {years[0]}-{years[-1]}")
+    neg = int((y == 0).sum())
+    years = sorted(years_set)
+    
+    load_time = time.time() - load_start
+    mem_gb = (X.nbytes + y.nbytes) / 1024**3
+    pos_pct = pos / len(y) * 100 if len(y) > 0 else 0
+    print(f"  Loaded {n_samples:,} rows in {load_time:.1f}s ({mem_gb:.2f} GB)")
+    print(f"  {neg:,} neg ({100-pos_pct:.3f}%), {pos:,} pos ({pos_pct:.3f}%), ratio 1:{neg/max(pos,1):.1f}, years {years[0]}-{years[-1]}")
+    
     return X, y, pos, neg, years
 
 
@@ -250,44 +565,55 @@ def phase1_training(
     print("\n" + "=" * 70)
     print("PHASE 1: TRAINING")
     print("=" * 70)
-    print(f"\nSTEP A: Train on train_early (year <= {TRAIN_EARLY_YEAR_MAX})")
+    report_memory_usage("start of Phase 1")
     
-    df_train = load_and_preprocess(train_path, keep_cols_train, target_col, "train_early_sampled.parquet")
-    X_train_early, y_train_early, train_early_pos, train_early_neg, _ = extract_split(
-        df_train, feature_cols, target_col, 
-        lambda y: y <= TRAIN_EARLY_YEAR_MAX, "Train early",
+    print(f"\nSTEP A: Train on train_early (year <= {TRAIN_EARLY_YEAR_MAX})")
+    X_train_early, y_train_early, train_early_pos, train_early_neg, train_years = load_numpy_arrays_two_pass(
+        train_path, feature_cols, target_col, 
+        lambda y: y <= TRAIN_EARLY_YEAR_MAX, "train_early_sampled.parquet",
         max_samples=None
     )
-    del df_train
-    gc.collect()
+    report_memory_usage("after STEP A")
     
-    rf_model = RandomForestClassifier(**best_params)
-    pipeline = Pipeline([('imputer', SimpleImputer(strategy='median')), ('rf', rf_model)])
-    
+    # Convert to DataFrame for sklearn Pipeline (SimpleImputer expects DataFrame)
+    # But we'll keep it as numpy for memory efficiency - SimpleImputer works with numpy too
     print(f"Training on {len(X_train_early):,} samples...")
     train_early_start = time.time()
-    model_train_early = pipeline.fit(X_train_early, y_train_early)
+    report_memory_usage("before training")
+    
+    # Fit imputer first to get median values
+    imputer = SimpleImputer(strategy='median')
+    X_train_early_imputed = imputer.fit_transform(X_train_early)
+    del X_train_early
+    gc.collect()
+    report_memory_usage("after imputation")
+    
+    rf_model = RandomForestClassifier(**best_params)
+    rf_model.fit(X_train_early_imputed, y_train_early)
     train_early_time = time.time() - train_early_start
     print(f"  Completed in {train_early_time/60:.1f} min")
     
-    del X_train_early, y_train_early
+    # Create pipeline for consistency (though we fit separately)
+    pipeline = Pipeline([('imputer', imputer), ('rf', rf_model)])
+    model_train_early = pipeline
+    
+    del X_train_early_imputed, y_train_early
     gc.collect()
+    report_memory_usage("after STEP A training")
     
     print(f"\nSTEP B: Validate on val_late ({VAL_LATE_YEAR_MIN}-{VAL_LATE_YEAR_MAX})")
-    df_val = load_and_preprocess(val_path, keep_cols_train, target_col, "val_late_full.parquet")
-    X_val_late, y_val_late, val_late_pos, val_late_neg, _ = extract_split(
-        df_val, feature_cols, target_col,
-        lambda y: (y >= VAL_LATE_YEAR_MIN) & (y <= VAL_LATE_YEAR_MAX), "Val late",
+    X_val_late, y_val_late, val_late_pos, val_late_neg, _ = load_numpy_arrays_two_pass(
+        val_path, feature_cols, target_col,
+        lambda y: (y >= VAL_LATE_YEAR_MIN) & (y <= VAL_LATE_YEAR_MAX), "val_late_full.parquet",
         max_samples=None
     )
-    del df_val
-    gc.collect()
+    report_memory_usage("after STEP B")
     
     val_start = time.time()
     y_val_proba = model_train_early.predict_proba(X_val_late)[:, 1]
     val_time = time.time() - val_start
     
-    validation_metrics = compute_metrics(y_val_late.values, y_val_proba)
+    validation_metrics = compute_metrics(y_val_late, y_val_proba)
     print(f"Validation: ROC-AUC {validation_metrics['roc_auc']:.4f}, PR-AUC {validation_metrics['pr_auc']:.4f}, " +
           f"P@1% {validation_metrics['precision_at_1pct']:.4f}, P@5% {validation_metrics['precision_at_5pct']:.4f}, " +
           f"P@10% {validation_metrics['precision_at_10pct']:.4f}")
@@ -302,31 +628,31 @@ def phase1_training(
     
     del X_val_late, y_val_late, model_train_early
     gc.collect()
+    report_memory_usage("after STEP B validation")
     
     print(f"\nSTEP D: Train final model on full data (2000-2017, capped at {MAX_SAMPLES_FULL_TRAIN:,} train + {MAX_SAMPLES_FULL_VAL:,} val)")
     
-    df_train_full = load_and_preprocess(train_path, keep_cols_train, target_col, "train_early_sampled.parquet")
-    X_train_part, y_train_part, train_part_pos, train_part_neg, train_part_years = extract_split(
-        df_train_full, feature_cols, target_col,
-        lambda y: y <= TRAIN_EARLY_YEAR_MAX, "Train part",
+    X_train_part, y_train_part, train_part_pos, train_part_neg, train_part_years = load_numpy_arrays_two_pass(
+        train_path, feature_cols, target_col,
+        lambda y: y <= TRAIN_EARLY_YEAR_MAX, "train_early_sampled.parquet",
         max_samples=MAX_SAMPLES_FULL_TRAIN
     )
-    del df_train_full
-    gc.collect()
+    report_memory_usage("after loading train_part")
     
-    df_val_full = load_and_preprocess(val_path, keep_cols_train, target_col, "val_late_full.parquet")
-    X_val_part, y_val_part, val_part_pos, val_part_neg, val_part_years = extract_split(
-        df_val_full, feature_cols, target_col,
-        lambda y: (y >= VAL_LATE_YEAR_MIN) & (y <= VAL_LATE_YEAR_MAX), "Val part",
+    X_val_part, y_val_part, val_part_pos, val_part_neg, val_part_years = load_numpy_arrays_two_pass(
+        val_path, feature_cols, target_col,
+        lambda y: (y >= VAL_LATE_YEAR_MIN) & (y <= VAL_LATE_YEAR_MAX), "val_late_full.parquet",
         max_samples=MAX_SAMPLES_FULL_VAL
     )
-    del df_val_full
-    gc.collect()
+    report_memory_usage("after loading val_part")
     
-    X = pd.concat([X_train_part, X_val_part], ignore_index=True)
-    y = np.concatenate([y_train_part, y_val_part])
+    # Concatenate using numpy (more memory efficient than pandas)
+    print(f"  Concatenating train and val parts...")
+    X = np.vstack([X_train_part, X_val_part]).astype(np.float32)
+    y = np.concatenate([y_train_part, y_val_part]).astype(np.int8)
     del X_train_part, X_val_part, y_train_part, y_val_part
     gc.collect()
+    report_memory_usage("after concatenation")
     
     train_pos = train_part_pos + val_part_pos
     train_neg = train_part_neg + val_part_neg
@@ -356,9 +682,26 @@ def phase1_training(
     
     print(f"Training on {len(X):,} samples (2000-2017)...")
     train_start = time.time()
-    final_model = pipeline.fit(X, y)
+    report_memory_usage("before final training")
+    
+    # Fit imputer and model
+    imputer_final = SimpleImputer(strategy='median')
+    X_imputed = imputer_final.fit_transform(X)
+    del X
+    gc.collect()
+    report_memory_usage("after final imputation")
+    
+    rf_model_final = RandomForestClassifier(**best_params)
+    rf_model_final.fit(X_imputed, y)
     train_time = time.time() - train_start
     print(f"  Completed in {train_time/60:.1f} min")
+    
+    # Create pipeline
+    final_model = Pipeline([('imputer', imputer_final), ('rf', rf_model_final)])
+    
+    del X_imputed, y
+    gc.collect()
+    report_memory_usage("after final training")
     
     model_path = model_dir / f"model1_rf_{timestamp}.pkl"
     with open(model_path, 'wb') as f:
@@ -373,9 +716,10 @@ def phase1_training(
             "training/final_train_time_minutes": train_time / 60,
         })
     
-    del X, y, final_model
+    del final_model
     gc.collect()
     print("Phase 1 completed.")
+    report_memory_usage("end of Phase 1")
     
     return (model_path, validation_metrics, train_stats, train_early_time, 
             val_time, train_time, train_pos, train_neg, n_train_full)
@@ -393,82 +737,129 @@ def phase2_testing(
     print("\n" + "=" * 70)
     print("PHASE 2: TESTING")
     print("=" * 70)
+    report_memory_usage("start of Phase 2")
     
-    print(f"Loading model from: {model_path}")
+    print(f"\nLoading model from: {model_path}")
     with open(model_path, 'rb') as f:
         final_model = pickle.load(f)
+    report_memory_usage("after loading model")
     
+    # Use smaller batch size to reduce memory pressure
+    batch_size = 50_000
+    print(f"Processing test in batches of {batch_size:,}...")
+    
+    # Pass 1: Count rows (pre-allocate arrays to avoid concatenation memory spike)
+    print(f"  Pass 1: Counting test rows...")
     parquet_file = pq.ParquetFile(test_path)
-    batch_size = 100000
-    scored_path = output_dir / f"model1_rf_scored_{timestamp}.parquet"
-    print(f"Processing test data in {batch_size:,} row batches → {scored_path}")
-    
-    y_true_list = []
-    y_proba_list = []
-    
-    test_pos = 0
-    test_neg = 0
+    n_test_total = 0
     test_years_set = set()
-    total_samples = 0
-    batch_idx = -1
-    parquet_writer = None
     
+    try:
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=[target_col, 'year']):
+            batch_table = batch
+            target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+            year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+            
+            # Filter out NaN in target
+            valid_mask = ~np.isnan(target_array)
+            if valid_mask.any():
+                n_test_total += int(valid_mask.sum())
+                test_years_set.update(year_array[valid_mask].tolist())
+            
+            del batch_table, target_array, year_array, batch
+    finally:
+        del parquet_file
+        gc.collect()
+    
+    print(f"  Found {n_test_total:,} test samples")
+    
+    if n_test_total == 0:
+        raise ValueError("No test samples found")
+    
+    # Pre-allocate arrays
+    print(f"  Pre-allocating arrays for {n_test_total:,} samples...")
+    y_test = np.empty(n_test_total, dtype=np.int8)
+    y_proba = np.empty(n_test_total, dtype=np.float32)
+    report_memory_usage("after pre-allocation")
+    
+    # Pass 2: Process batches and fill pre-allocated arrays
+    parquet_file = pq.ParquetFile(test_path)
+    scored_path = output_dir / f"model1_rf_scored_{timestamp}.parquet"
+    writer = None
+    test_pos = test_neg = batch_num = idx_offset = 0
     pred_start = time.time()
     
-    for batch_idx, batch in enumerate(parquet_file.iter_batches(batch_size=batch_size, columns=keep_cols_test)):
-        df_batch = batch.to_pandas()
-        downcast_numeric_dtypes(df_batch)
-        df_batch.dropna(subset=[target_col], inplace=True)
-        if len(df_batch) == 0:
-            del df_batch
+    try:
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=keep_cols_test):
+            batch_num += 1
+            batch_df = batch.to_pandas().dropna(subset=[target_col])
+            if len(batch_df) == 0:
+                del batch_df, batch
+                gc.collect()
+                continue
+            
+            downcast_numeric_dtypes(batch_df)
+            y_batch = (batch_df[target_col] > 0).astype(np.int8)
+            X_batch = batch_df[feature_cols].copy()
+            
+            # Get predictions
+            y_proba_batch = final_model.predict_proba(X_batch)[:, 1].astype(np.float32)
+            
+            # Fill pre-allocated arrays directly
+            batch_size_actual = len(y_batch)
+            y_test[idx_offset:idx_offset + batch_size_actual] = y_batch.values
+            y_proba[idx_offset:idx_offset + batch_size_actual] = y_proba_batch
+            idx_offset += batch_size_actual
+            
+            test_pos += int(y_batch.sum())
+            test_neg += int((y_batch == 0).sum())
+            
+            result_dict = {
+                'row': batch_df['row'].values, 'col': batch_df['col'].values,
+                'year': batch_df['year'].values, 'y_true': y_batch.values,
+                'y_pred_proba': y_proba_batch,
+            }
+            for col in ['x', 'y']:
+                if col in batch_df.columns:
+                    result_dict[col] = batch_df[col].values
+            
+            result_df = pd.DataFrame(result_dict)
+            result_table = pa.Table.from_pandas(result_df, preserve_index=False)
+            
+            if writer is None:
+                writer = pq.ParquetWriter(scored_path, result_table.schema)
+                print(f"Writing to {scored_path}")
+            
+            writer.write_table(result_table)
+            
+            del batch_df, X_batch, y_batch, y_proba_batch, result_df, result_table, batch
+            # More aggressive garbage collection during batch processing
             gc.collect()
-            continue
-        
-        y_batch = (df_batch[target_col] > 0).astype(np.int8)
-        X_batch = df_batch[feature_cols].copy()
-        test_pos += int(y_batch.sum())
-        test_neg += int((y_batch == 0).sum())
-        test_years_set.update(df_batch['year'].unique())
-        total_samples += len(y_batch)
-        y_proba_batch = final_model.predict_proba(X_batch)[:, 1]
-        y_true_list.append(y_batch.values)
-        y_proba_list.append(y_proba_batch)
-        
-        result_dict = {
-            'row': df_batch['row'].values, 'col': df_batch['col'].values,
-            'year': df_batch['year'].values, 'y_true': y_batch.values,
-            'y_pred_proba': y_proba_batch,
-        }
-        if 'x' in df_batch.columns:
-            result_dict['x'] = df_batch['x'].values
-        if 'y' in df_batch.columns:
-            result_dict['y'] = df_batch['y'].values
-        batch_result = pd.DataFrame(result_dict)
-        batch_table = pa.Table.from_pandas(batch_result)
-        
-        if parquet_writer is None:
-            parquet_writer = pq.ParquetWriter(scored_path, batch_table.schema)
-        parquet_writer.write_table(batch_table)
-        
-        del df_batch, X_batch, y_batch, y_proba_batch, batch_result, batch_table
+            
+            if batch_num % 10 == 0:
+                print(f"  {batch_num} batches, {idx_offset:,}/{n_test_total:,} rows")
+                report_memory_usage(f"batch {batch_num}")
+            elif batch_num % 50 == 0:
+                # Extra cleanup every 50 batches
+                gc.collect()
+    finally:
+        if writer is not None:
+            writer.close()
+        del parquet_file
         gc.collect()
-        if (batch_idx + 1) % 10 == 0:
-            print(f"  Processed {batch_idx + 1} batches ({total_samples:,} samples)...")
     
-    if parquet_writer is not None:
-        parquet_writer.close()
+    if idx_offset != n_test_total:
+        raise ValueError(f"Mismatch: expected {n_test_total:,} samples but processed {idx_offset:,}")
     
     pred_time = time.time() - pred_start
-    print(f"Completed {batch_idx + 1} batches ({total_samples:,} samples) in {pred_time:.1f}s")
-    
-    y_test = np.concatenate(y_true_list)
-    y_proba = np.concatenate(y_proba_list)
-    del y_true_list, y_proba_list
-    gc.collect()
+    print(f"Completed {batch_num} batches in {pred_time:.1f}s, {n_test_total:,} rows")
+    report_memory_usage("after all predictions")
     
     test_years = sorted(test_years_set)
+    del test_years_set
+    gc.collect()
     test_pos_pct = test_pos / len(y_test) * 100
-    print(f"Test set: {test_neg:,} neg, {test_pos:,} pos ({test_pos_pct:.3f}%), years {test_years[0]}-{test_years[-1]}")
+    print(f"\nTest set: {test_neg:,} neg, {test_pos:,} pos ({test_pos_pct:.3f}%), years {test_years[0]}-{test_years[-1]}")
     
     if use_wandb:
         wandb.log({
@@ -614,15 +1005,20 @@ def main() -> None:
     all_cols_train = pq.ParquetFile(train_path).schema_arrow.names
     all_cols_test = pq.ParquetFile(test_path).schema_arrow.names
     target_col = "transition_01"
-    df_schema = pd.read_parquet(train_path, columns=all_cols_train).head(1)
-    numeric_cols = df_schema.select_dtypes(include=['number']).columns.tolist()
-    feature_cols = [col for col in numeric_cols if col.lower() not in {c.lower() for c in EXCLUDE_COLS}]
+    # Build feature columns from PyArrow schema only (avoid loading full parquet into pandas)
+    schema = pq.ParquetFile(train_path).schema_arrow
+    numeric_cols = [
+        name
+        for name, field in zip(schema.names, schema)
+        if pa.types.is_integer(field.type) or pa.types.is_floating(field.type)
+    ]
+    # Exclude target and coordinates from features (year is included as a feature)
+    feature_cols = [c for c in numeric_cols if c not in EXCLUDE_COLS]
     required_cols = [target_col, 'year', 'row', 'col']
     optional_cols = [col for col in ['x', 'y'] if col in all_cols_train]
     keep_cols_train = feature_cols + required_cols + optional_cols
     keep_cols_test = feature_cols + required_cols + [col for col in ['x', 'y'] if col in all_cols_test]
-    print(f"  {len(feature_cols)} features, loading {len(keep_cols_train)} cols from train, {len(keep_cols_test)} from test")
-    del df_schema
+    print(f"Selected {len(feature_cols)} features, loading {len(keep_cols_train)} cols from train, {len(keep_cols_test)} from test")
     gc.collect()
     
     (model_path, validation_metrics, train_stats, train_early_time, 
