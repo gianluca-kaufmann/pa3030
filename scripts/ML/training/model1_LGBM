@@ -198,35 +198,151 @@ def downcast_numeric_dtypes(df: pd.DataFrame) -> None:
         df[col] = df[col].astype('int32', copy=False)
 
 
-def load_and_preprocess(df_path: Path, columns: list, target_col: str, name: str = "") -> pd.DataFrame:
-    """Load, downcast, and preprocess DataFrame."""
-    print(f"\nLoading {name or df_path.name}...")
+def load_numpy_arrays_two_pass(
+    df_path: Path, 
+    feature_cols: list, 
+    target_col: str, 
+    year_filter, 
+    name: str = "",
+    batch_size: int = 50_000
+) -> tuple[np.ndarray, np.ndarray, int, int, list]:
+    """
+    Two-pass NumPy loader: bypasses Pandas to minimize memory overhead.
+    
+    Pass 1: Count rows matching filter (after dropna on target).
+    Pass 2: Pre-allocate float32 arrays and stream data directly into them.
+    
+    Returns:
+        X: Feature matrix (n_samples, n_features) as float32
+        y: Target vector (n_samples,) as int8
+        pos: Number of positive samples
+        neg: Number of negative samples
+        years: Sorted list of unique years
+    """
+    print(f"\nLoading {name or df_path.name} (two-pass NumPy loader)...")
     load_start = time.time()
-    df = pd.read_parquet(df_path, columns=columns)
-    mem_before = df.memory_usage(deep=True).sum() / 1024**3
-    print(f"  Loaded {len(df):,} rows in {time.time() - load_start:.1f}s ({mem_before:.2f} GB). Downcasting...")
-    downcast_numeric_dtypes(df)
-    mem_after = df.memory_usage(deep=True).sum() / 1024**3
-    print(f"  After downcast: {mem_after:.2f} GB (saved {mem_before - mem_after:.2f} GB)")
-    gc.collect()
-    if target_col not in df.columns:
-        raise ValueError(f"Target column '{target_col}' not found")
-    df.dropna(subset=[target_col], inplace=True)
-    print(f"  {len(df):,} rows after dropna")
-    gc.collect()
-    return df
-
-
-def extract_split(df: pd.DataFrame, feature_cols: list, target_col: str, year_filter, split_name: str) -> tuple:
-    """Extract X, y and stats from filtered DataFrame."""
-    mask = year_filter(df['year'])
-    # Avoid creating full copies; work with views where possible
-    y = (df.loc[mask, target_col] > 0).astype(np.int8)
-    X = df.loc[mask, feature_cols]
-    pos, neg = int(y.sum()), int((y == 0).sum())
-    years = sorted(df.loc[mask, 'year'].unique())
-    print(f"\n{split_name}: {neg:,} neg ({100-pos/len(y)*100:.3f}%), {pos:,} pos ({pos/len(y)*100:.3f}%), ratio 1:{neg/max(pos,1):.1f}, years {years[0]}-{years[-1]}")
-    return X, y, pos, neg
+    essential_cols = feature_cols + [target_col, 'year']
+    
+    # Pass 1: Count rows matching filter
+    print(f"  Pass 1: Counting rows matching filter...")
+    parquet_file = pq.ParquetFile(df_path)
+    n_samples = 0
+    years_set = set()
+    
+    try:
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols):
+            # Convert batch to numpy arrays directly (bypass pandas)
+            batch_table = batch
+            target_array = batch_table[target_col].to_numpy()
+            year_array = batch_table['year'].to_numpy()
+            
+            # Filter out NaN in target
+            valid_mask = ~np.isnan(target_array)
+            if not valid_mask.any():
+                continue
+            
+            target_valid = target_array[valid_mask]
+            year_valid = year_array[valid_mask]
+            
+            # Apply year filter (works directly on numpy arrays)
+            year_mask = year_filter(year_valid)
+            n_samples += int(year_mask.sum())
+            years_set.update(year_valid[year_mask].tolist())
+            
+            del batch_table, target_array, year_array, target_valid, year_valid, batch
+    finally:
+        del parquet_file
+        gc.collect()
+    
+    print(f"  Found {n_samples:,} samples matching filter")
+    
+    if n_samples == 0:
+        raise ValueError(f"No samples found matching filter in {name or df_path.name}")
+    
+    # Pass 2: Pre-allocate arrays and fill directly
+    print(f"  Pass 2: Pre-allocating arrays ({n_samples:,} samples, {len(feature_cols)} features)...")
+    X = np.empty((n_samples, len(feature_cols)), dtype=np.float32)
+    y = np.empty(n_samples, dtype=np.int8)
+    
+    parquet_file = pq.ParquetFile(df_path)
+    idx_offset = 0
+    batch_num = 0
+    
+    try:
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols):
+            batch_num += 1
+            batch_table = batch
+            
+            # Extract arrays directly from PyArrow
+            target_array = batch_table[target_col].to_numpy()
+            year_array = batch_table['year'].to_numpy()
+            
+            # Filter out NaN in target
+            valid_mask = ~np.isnan(target_array)
+            if not valid_mask.any():
+                del batch_table, target_array, year_array, batch
+                continue
+            
+            target_valid = target_array[valid_mask]
+            year_valid = year_array[valid_mask]
+            
+            # Apply year filter (works directly on numpy arrays)
+            year_mask = year_filter(year_valid)
+            if not year_mask.any():
+                del batch_table, target_array, year_array, target_valid, year_valid, batch
+                continue
+            
+            # Extract filtered data
+            target_filtered = target_valid[year_mask]
+            year_filtered = year_valid[year_mask]
+            
+            # Extract feature columns
+            feature_arrays = []
+            for col in feature_cols:
+                col_array = batch_table[col].to_numpy()
+                col_valid = col_array[valid_mask]
+                col_filtered = col_valid[year_mask]
+                # Convert to float32, handling NaN
+                col_float32 = col_filtered.astype(np.float32)
+                # Replace NaN with 0.0 (or could use mean, but 0 is safer for memory)
+                col_float32 = np.nan_to_num(col_float32, nan=0.0, posinf=0.0, neginf=0.0)
+                feature_arrays.append(col_float32)
+            
+            # Stack features into matrix
+            X_batch = np.column_stack(feature_arrays)
+            y_batch = (target_filtered > 0).astype(np.int8)
+            
+            # Insert directly into pre-allocated arrays
+            batch_size_actual = len(y_batch)
+            X[idx_offset:idx_offset + batch_size_actual, :] = X_batch
+            y[idx_offset:idx_offset + batch_size_actual] = y_batch
+            idx_offset += batch_size_actual
+            
+            del batch_table, target_array, year_array, target_valid, year_valid, target_filtered, year_filtered
+            del feature_arrays, X_batch, y_batch, batch
+            gc.collect()
+            
+            if batch_num % 10 == 0:
+                print(f"  {batch_num} batches, {idx_offset:,}/{n_samples:,} samples loaded")
+                report_memory_usage(f"load batch {batch_num}")
+    finally:
+        del parquet_file
+        gc.collect()
+    
+    if idx_offset != n_samples:
+        raise ValueError(f"Mismatch: expected {n_samples:,} samples but loaded {idx_offset:,}")
+    
+    # Compute stats
+    pos = int(y.sum())
+    neg = int((y == 0).sum())
+    years = sorted(years_set)
+    
+    load_time = time.time() - load_start
+    mem_gb = (X.nbytes + y.nbytes) / 1024**3
+    print(f"  Loaded {n_samples:,} rows in {load_time:.1f}s ({mem_gb:.2f} GB)")
+    print(f"  {neg:,} neg, {pos:,} pos, ratio 1:{neg/max(pos,1):.1f}, years {years[0]}-{years[-1]}")
+    
+    return X, y, pos, neg, years
 
 
 def compute_metrics(y_true: np.ndarray, y_proba: np.ndarray) -> Dict[str, float]:
@@ -255,13 +371,8 @@ def phase1_training(
     print("\n" + "="*70 + "\nPHASE 1: TRAINING\n" + "="*70)
     report_memory_usage("start of Phase 1")
     print("\nSTEP A: LOAD TRAIN_EARLY (≤2014)")
-    # Only load essential columns for initial training (no x, y coordinates needed)
-    essential_cols = feature_cols + [target_col, 'year', 'row', 'col']
-    df_train = load_and_preprocess(train_path, essential_cols, target_col, "train_early_sampled.parquet")
-    X_train_early, y_train_early, train_early_pos, train_early_neg = extract_split(
-        df_train, feature_cols, target_col, lambda y: y <= TRAIN_EARLY_YEAR_MAX, "Train early")
-    # Collect basic training stats before freeing memory
-    train_years = sorted(df_train['year'].unique())
+    X_train_early, y_train_early, train_early_pos, train_early_neg, train_years = load_numpy_arrays_two_pass(
+        train_path, feature_cols, target_col, lambda y: y <= TRAIN_EARLY_YEAR_MAX, "train_early_sampled.parquet")
     n_train_full = len(y_train_early)
     train_stats = {
         "n_train": n_train_full,
@@ -270,14 +381,12 @@ def phase1_training(
         "train_positive_pct": float(train_early_pos / max(n_train_full, 1) * 100.0),
         "train_years": f"{train_years[0]}-{train_years[-1]}",
     }
-    del df_train; gc.collect()
     report_memory_usage("after STEP A")
     
     print("\nSTEP B: LOAD VAL_LATE (2015-2017)")
-    df_val = load_and_preprocess(val_path, essential_cols, target_col, "val_late_full.parquet")
-    X_val_late, y_val_late, val_late_pos, val_late_neg = extract_split(
-        df_val, feature_cols, target_col, lambda y: (y >= VAL_LATE_YEAR_MIN) & (y <= VAL_LATE_YEAR_MAX), "Val late")
-    del df_val; gc.collect()
+    X_val_late, y_val_late, val_late_pos, val_late_neg, _ = load_numpy_arrays_two_pass(
+        val_path, feature_cols, target_col, lambda y: (y >= VAL_LATE_YEAR_MIN) & (y <= VAL_LATE_YEAR_MAX), "val_late_full.parquet")
+    report_memory_usage("after STEP B")
     
     print(f"\nSTEP C: TRAIN & EVALUATE\nTemporal split: train_early (≤{TRAIN_EARLY_YEAR_MAX}): {len(X_train_early):,} rows, val_late ({VAL_LATE_YEAR_MIN}-{VAL_LATE_YEAR_MAX}): {len(X_val_late):,} rows")
     
@@ -311,6 +420,7 @@ def phase1_training(
     # Add memory-efficient LightGBM parameters
     train_params['force_col_wise'] = True  # More memory efficient for many features
     train_params['max_bin'] = 255  # Reduce memory usage
+    train_params['two_round'] = True  # Reduce peak memory during histogram building
     
     # Create datasets with free_raw_data=True to reduce memory usage
     # Keep validation data in memory for later prediction (don't copy to save memory)
@@ -337,14 +447,14 @@ def phase1_training(
     val_start = time.time()
     y_val_proba = lgb_model.predict(X_val_late, num_iteration=best_iteration if best_iteration else None)
     val_time = time.time() - val_start
-    validation_metrics = compute_metrics(y_val_late.values, y_val_proba)
+    validation_metrics = compute_metrics(y_val_late, y_val_proba)
     print(f"\nValidation: ROC-AUC {validation_metrics['roc_auc']:.4f}, PR-AUC {validation_metrics['pr_auc']:.4f}, "
           f"P@1% {validation_metrics['precision_at_1pct']:.4f}, P@5% {validation_metrics['precision_at_5pct']:.4f}, "
           f"P@10% {validation_metrics['precision_at_10pct']:.4f}")
     
     if use_wandb:
         wandb.log({**{f"val/{k}": v for k, v in validation_metrics.items()}, "val/n_samples": int(len(y_val_late)),
-                  "val/n_positives": int(y_val_late.sum()), "val/time_seconds": val_time})
+                  "val/n_positives": int(np.sum(y_val_late)), "val/time_seconds": val_time})
     
     # Now free validation data and predictions
     del X_val_late, y_val_late, y_val_proba; gc.collect()
@@ -369,17 +479,43 @@ def phase1_training(
     print(f"Model saved: {model_path}")
     gc.collect()
     
-    # Fit isotonic calibration on val_late predictions (batched to avoid OOM)
-    print(f"\nSTEP E: FITTING ISOTONIC CALIBRATION ON VAL_LATE (BATCHED)")
-    print(f"  Streaming val_late in batches to collect predictions for calibration...")
+    # Fit isotonic calibration on val_late predictions (two-pass approach to avoid memory spikes)
+    print(f"\nSTEP E: FITTING ISOTONIC CALIBRATION ON VAL_LATE (TWO-PASS)")
     cal_start = time.time()
     
-    # Stream val_late in batches, collect only y_true and y_pred
     batch_size = 50_000
-    parquet_file = pq.ParquetFile(val_path)
     essential_cols_cal = feature_cols + [target_col, 'year']
-    y_true_cal_list, y_pred_cal_list = [], []
+    
+    # Pass 1: Count rows matching the year filter (very fast, low memory)
+    print(f"  Pass 1: Counting rows matching year filter ({VAL_LATE_YEAR_MIN}-{VAL_LATE_YEAR_MAX})...")
+    parquet_file = pq.ParquetFile(val_path)
+    n_cal_samples = 0
+    try:
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols_cal):
+            batch_df = batch.to_pandas().dropna(subset=[target_col])
+            if len(batch_df) == 0:
+                continue
+            
+            # Filter to 2015-2017 only
+            year_mask = batch_df['year'].between(VAL_LATE_YEAR_MIN, VAL_LATE_YEAR_MAX)
+            n_cal_samples += int(year_mask.sum())
+            del batch_df, batch
+    finally:
+        del parquet_file; gc.collect()
+    
+    print(f"  Found {n_cal_samples:,} samples matching filter")
+    
+    if n_cal_samples == 0:
+        raise ValueError(f"No samples found in val_late for years {VAL_LATE_YEAR_MIN}-{VAL_LATE_YEAR_MAX}")
+    
+    # Pass 2: Pre-allocate arrays and fill directly (avoids concatenation memory spike)
+    print(f"  Pass 2: Pre-allocating arrays and collecting predictions...")
+    y_true_cal = np.empty(n_cal_samples, dtype=np.int8)
+    y_pred_cal = np.empty(n_cal_samples, dtype=np.float32)
+    
+    parquet_file = pq.ParquetFile(val_path)
     cal_batch_num = 0
+    idx_offset = 0
     
     try:
         for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols_cal):
@@ -401,24 +537,23 @@ def phase1_training(
             # Get uncalibrated predictions from the raw model
             y_pred_batch = lgb_model.predict(X_batch, num_iteration=best_iteration if best_iteration else None).astype(np.float32)
             
-            y_true_cal_list.append(y_batch.values)
-            y_pred_cal_list.append(y_pred_batch)
+            # Insert directly into pre-allocated arrays
+            batch_size_actual = len(y_batch)
+            y_true_cal[idx_offset:idx_offset + batch_size_actual] = y_batch.values
+            y_pred_cal[idx_offset:idx_offset + batch_size_actual] = y_pred_batch
+            idx_offset += batch_size_actual
             
-            del batch_df, X_batch, y_batch, batch
+            del batch_df, X_batch, y_batch, y_pred_batch, batch
             gc.collect()
             
             if cal_batch_num % 10 == 0:
-                n_collected = sum(len(arr) for arr in y_true_cal_list)
-                print(f"  {cal_batch_num} batches, {n_collected:,} samples collected")
+                print(f"  {cal_batch_num} batches, {idx_offset:,}/{n_cal_samples:,} samples collected")
                 report_memory_usage(f"calibration batch {cal_batch_num}")
     finally:
         del parquet_file; gc.collect()
     
-    # Concatenate collected arrays
-    print("  Concatenating collected predictions...")
-    y_true_cal = np.concatenate(y_true_cal_list).astype(np.int8)
-    y_pred_cal = np.concatenate(y_pred_cal_list).astype(np.float32)
-    del y_true_cal_list, y_pred_cal_list; gc.collect()
+    if idx_offset != n_cal_samples:
+        raise ValueError(f"Mismatch: expected {n_cal_samples:,} samples but collected {idx_offset:,}")
     
     print(f"  Calibrating on {len(y_true_cal):,} val_late samples...")
     report_memory_usage("before calibration fit")
@@ -486,12 +621,46 @@ def phase2_testing(
     # Use smaller batch size to reduce memory pressure
     batch_size = 50_000
     print(f"Processing test in batches of {batch_size:,}...")
+    
+    # Pass 1: Count rows (pre-allocate arrays to avoid concatenation memory spike)
+    print(f"  Pass 1: Counting test rows...")
+    parquet_file = pq.ParquetFile(test_path)
+    n_test_total = 0
+    test_years_set = set()
+    
+    try:
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=[target_col, 'year']):
+            batch_table = batch
+            target_array = batch_table[target_col].to_numpy()
+            year_array = batch_table['year'].to_numpy()
+            
+            # Filter out NaN in target
+            valid_mask = ~np.isnan(target_array)
+            if valid_mask.any():
+                n_test_total += int(valid_mask.sum())
+                test_years_set.update(year_array[valid_mask].tolist())
+            
+            del batch_table, target_array, year_array, batch
+    finally:
+        del parquet_file
+        gc.collect()
+    
+    print(f"  Found {n_test_total:,} test samples")
+    
+    if n_test_total == 0:
+        raise ValueError("No test samples found")
+    
+    # Pre-allocate arrays
+    print(f"  Pre-allocating arrays for {n_test_total:,} samples...")
+    y_test = np.empty(n_test_total, dtype=np.int8)
+    y_proba = np.empty(n_test_total, dtype=np.float32)
+    report_memory_usage("after pre-allocation")
+    
+    # Pass 2: Process batches and fill pre-allocated arrays
     parquet_file = pq.ParquetFile(test_path)
     scored_path = output_dir / f"model1_lgbm_scored_{timestamp}.parquet"
     writer = None
-    y_true_all, y_proba_all = [], []
-    test_pos = test_neg = n_test_total = batch_num = 0
-    test_years_set = set()
+    test_pos = test_neg = batch_num = idx_offset = 0
     pred_start = time.time()
     
     try:
@@ -505,12 +674,16 @@ def phase2_testing(
             X_batch = batch_df[feature_cols].copy()
             # Calibrated model returns [n_samples, 2] with [neg_prob, pos_prob], extract pos_prob (column 1)
             y_proba_batch = calibrated_model.predict_proba(X_batch)[:, 1].astype(np.float32)
-            y_true_all.append(y_batch.values)
-            y_proba_all.append(y_proba_batch)
+            
+            # Fill pre-allocated arrays directly
+            batch_size_actual = len(y_batch)
+            y_test[idx_offset:idx_offset + batch_size_actual] = y_batch.values
+            y_proba[idx_offset:idx_offset + batch_size_actual] = y_proba_batch
+            idx_offset += batch_size_actual
+            
             test_pos += int(y_batch.sum())
             test_neg += int((y_batch == 0).sum())
-            test_years_set.update(batch_df['year'].unique())
-            n_test_total += len(y_batch)
+            
             result_dict = {'row': batch_df['row'].values, 'col': batch_df['col'].values, 'year': batch_df['year'].values,
                           'y_true': y_batch.values, 'y_pred_proba': y_proba_batch}
             for col in ['x', 'y']:
@@ -526,7 +699,7 @@ def phase2_testing(
             # More aggressive garbage collection during batch processing
             gc.collect()
             if batch_num % 10 == 0:
-                print(f"  {batch_num} batches, {n_test_total:,} rows")
+                print(f"  {batch_num} batches, {idx_offset:,}/{n_test_total:,} rows")
                 report_memory_usage(f"batch {batch_num}")
             elif batch_num % 50 == 0:
                 # Extra cleanup every 50 batches
@@ -536,18 +709,15 @@ def phase2_testing(
             writer.close()
         del parquet_file; gc.collect()
     
+    if idx_offset != n_test_total:
+        raise ValueError(f"Mismatch: expected {n_test_total:,} samples but processed {idx_offset:,}")
+    
     pred_time = time.time() - pred_start
     print(f"Completed {batch_num} batches in {pred_time:.1f}s, {n_test_total:,} rows")
     report_memory_usage("after all predictions")
     
-    # Concatenate predictions with memory-efficient dtypes
-    print("  Concatenating predictions...")
-    y_test = np.concatenate(y_true_all).astype(np.int8)
-    y_proba = np.concatenate(y_proba_all).astype(np.float32)
-    del y_true_all, y_proba_all; gc.collect()
     test_years = sorted(test_years_set)
     del test_years_set; gc.collect()
-    report_memory_usage("after concatenation")
     print(f"\nTest set: {test_neg:,} neg, {test_pos:,} pos, ratio 1:{test_neg/max(test_pos,1):.1f}, years {test_years[0]}-{test_years[-1]}")
     
     if use_wandb:
