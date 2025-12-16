@@ -219,11 +219,12 @@ def load_and_preprocess(df_path: Path, columns: list, target_col: str, name: str
 
 def extract_split(df: pd.DataFrame, feature_cols: list, target_col: str, year_filter, split_name: str) -> tuple:
     """Extract X, y and stats from filtered DataFrame."""
-    df_split = df[year_filter(df['year'])].copy()
-    y = (df_split[target_col] > 0).astype(np.int8)
-    X = df_split[feature_cols].copy()
+    mask = year_filter(df['year'])
+    # Avoid creating full copies; work with views where possible
+    y = (df.loc[mask, target_col] > 0).astype(np.int8)
+    X = df.loc[mask, feature_cols]
     pos, neg = int(y.sum()), int((y == 0).sum())
-    years = sorted(df_split['year'].unique())
+    years = sorted(df.loc[mask, 'year'].unique())
     print(f"\n{split_name}: {neg:,} neg ({100-pos/len(y)*100:.3f}%), {pos:,} pos ({pos/len(y)*100:.3f}%), ratio 1:{neg/max(pos,1):.1f}, years {years[0]}-{years[-1]}")
     return X, y, pos, neg
 
@@ -259,6 +260,16 @@ def phase1_training(
     df_train = load_and_preprocess(train_path, essential_cols, target_col, "train_early_sampled.parquet")
     X_train_early, y_train_early, train_early_pos, train_early_neg = extract_split(
         df_train, feature_cols, target_col, lambda y: y <= TRAIN_EARLY_YEAR_MAX, "Train early")
+    # Collect basic training stats before freeing memory
+    train_years = sorted(df_train['year'].unique())
+    n_train_full = len(y_train_early)
+    train_stats = {
+        "n_train": n_train_full,
+        "train_positives": int(train_early_pos),
+        "train_negatives": int(train_early_neg),
+        "train_positive_pct": float(train_early_pos / max(n_train_full, 1) * 100.0),
+        "train_years": f"{train_years[0]}-{train_years[-1]}",
+    }
     del df_train; gc.collect()
     report_memory_usage("after STEP A")
     
@@ -338,114 +349,103 @@ def phase1_training(
     # Now free validation data and predictions
     del X_val_late, y_val_late, y_val_proba; gc.collect()
     
-    print("\nSTEP D: LOAD & TRAIN FINAL MODEL (2000-2017)")
-    
-    # First, load val_late to extract calibration data
-    print("  Loading val_late for calibration data...")
-    df_val_full = load_and_preprocess(val_path, keep_cols_train, target_col, "val_late_full.parquet")
-    df_val_late_for_cal = df_val_full[df_val_full['year'].between(VAL_LATE_YEAR_MIN, VAL_LATE_YEAR_MAX)].copy()
-    y_val_late_for_cal = (df_val_late_for_cal[target_col] > 0).astype(np.int8)
-    X_val_late_for_cal = df_val_late_for_cal[feature_cols].copy()
-    del df_val_late_for_cal; gc.collect()
-    
-    # Extract val features and targets, then free dataframe
-    val_full_len = len(df_val_full)
-    val_years = df_val_full['year'].unique().tolist()
-    y_val_full = (df_val_full[target_col] > 0).astype(np.int8)
-    X_val_full = df_val_full[feature_cols].copy()
-    del df_val_full; gc.collect()
-    print(f"  Val data extracted: {val_full_len:,} rows, {X_val_full.memory_usage(deep=True).sum() / 1024**3:.2f} GB")
-    
-    # Now load train data
-    print("  Loading train_early...")
-    df_train_full = load_and_preprocess(train_path, keep_cols_train, target_col, "train_early_sampled.parquet")
-    train_full_len = len(df_train_full)
-    train_years = df_train_full['year'].unique().tolist()
-    
-    # Extract train features and targets, then free dataframe immediately
-    y_train_full = (df_train_full[target_col] > 0).astype(np.int8)
-    X_train_full = df_train_full[feature_cols].copy()
-    del df_train_full; gc.collect()
-    print(f"  Train data extracted: {train_full_len:,} rows, {X_train_full.memory_usage(deep=True).sum() / 1024**3:.2f} GB")
-    
-    # Combine years info
-    train_years = sorted(set(train_years + val_years))
-    del val_years; gc.collect()
-    
-    print(f"  Combining train_early ({train_full_len:,} rows) + val_late ({val_full_len:,} rows)...")
-    combine_start = time.time()
-    
-    # Concatenate features and targets
-    X = pd.concat([X_train_full, X_val_full], ignore_index=True)
-    del X_train_full, X_val_full; gc.collect()
-    print(f"  X combined, memory: {X.memory_usage(deep=True).sum() / 1024**3:.2f} GB")
-    
-    y = pd.concat([y_train_full, y_val_full], ignore_index=True)
-    del y_train_full, y_val_full; gc.collect()
-    
-    train_pos, train_neg = int(y.sum()), int((y == 0).sum())
-    n_train_full = len(X)
-    
-    print(f"  Combined in {time.time() - combine_start:.1f}s")
-    
-    # Report memory usage before creating LightGBM dataset
-    mem_X = X.memory_usage(deep=True).sum() / 1024**3
-    mem_y = y.memory_usage(deep=True) / 1024**3 if hasattr(y, 'memory_usage') else (y.nbytes / 1024**3)
-    print(f"  Combined dataset memory: X={mem_X:.2f} GB, y={mem_y:.3f} GB, total={mem_X + mem_y:.2f} GB")
-    print(f"\nFull training: {train_neg:,} neg, {train_pos:,} pos, ratio 1:{train_neg/max(train_pos,1):.1f}, years {train_years[0]}-{train_years[-1]}")
-    train_stats = {"n_train": n_train_full, "train_positives": train_pos, "train_negatives": train_neg,
-                  "train_positive_pct": train_pos/len(y)*100, "train_years": f"{train_years[0]}-{train_years[-1]}"}
+    print("\nSTEP D: FINAL MODEL (TRAIN_EARLY ONLY, NO CONCATENATION)")
+    print("  Skipping concatenation of train + val to avoid OOM.")
+    print("  Using the train_early model (with early stopping on val_late) as the final model.")
+    # For downstream summaries, treat this as the final training time and stats
+    train_time = train_early_time
     if use_wandb:
-        wandb.log({"data/n_features": len(feature_cols), "data/n_train": n_train_full, "data/train_positives": train_pos,
-                  "data/train_negatives": train_neg, "data/train_positive_pct": train_pos/len(y)*100})
-    
-    num_boost_round = int(best_iteration * 1.2) if best_iteration else int(best_params.get("n_estimators", 3000))
-    print(f"Training final model ({len(X):,} samples, num_boost_round={num_boost_round})...")
-    report_memory_usage("before final training")
-    
-    final_train_params = best_params.copy()
-    final_train_params.pop("n_estimators", None)
-    
-    # Ensure memory-efficient LightGBM settings for large datasets
-    final_train_params['max_bin'] = 255  # Reduce memory usage
-    final_train_params['force_col_wise'] = True  # More memory efficient
-    
-    train_start = time.time()
-    print(f"  Creating LightGBM dataset...")
-    dataset_start = time.time()
-    # Use free_raw_data=True to free memory after dataset construction
-    train_dataset = lgb.Dataset(X, label=y, free_raw_data=True)
-    print(f"  Dataset created in {time.time() - dataset_start:.1f}s")
-    report_memory_usage("after dataset creation")
-    
-    # Free X and y after dataset creation
-    del X, y; gc.collect()
-    report_memory_usage("after freeing X, y")
-    
-    print(f"  Training...")
-    
-    final_model = lgb.train(final_train_params, train_dataset, num_boost_round=num_boost_round, valid_sets=None)
-    train_time = time.time() - train_start
-    print(f"Training done in {train_time:.1f}s ({train_time/60:.1f} min)")
-    report_memory_usage("after training")
-    
-    # Free dataset after training
-    del train_dataset; gc.collect()
-    report_memory_usage("after freeing dataset")
+        wandb.log({
+            "data/n_features": len(feature_cols),
+            "data/n_train": train_stats["n_train"],
+            "data/train_positives": train_stats["train_positives"],
+            "data/train_negatives": train_stats["train_negatives"],
+            "data/train_positive_pct": train_stats["train_positive_pct"],
+        })
     
     model_path = model_dir / f"model1_lgbm_{timestamp}.pkl"
     with open(model_path, 'wb') as f:
-        pickle.dump(final_model, f)
+        pickle.dump(lgb_model, f)
     print(f"Model saved: {model_path}")
     gc.collect()
     
-    # Fit isotonic calibration on val_late predictions
-    print(f"\nSTEP E: FITTING ISOTONIC CALIBRATION ON VAL_LATE")
-    print(f"  Calibrating on {len(X_val_late_for_cal):,} val_late samples...")
+    # Fit isotonic calibration on val_late predictions (batched to avoid OOM)
+    print(f"\nSTEP E: FITTING ISOTONIC CALIBRATION ON VAL_LATE (BATCHED)")
+    print(f"  Streaming val_late in batches to collect predictions for calibration...")
     cal_start = time.time()
-    wrapped_model = LGBMBoosterWrapper(final_model)
-    calibrated_model = CalibratedClassifierCV(wrapped_model, method='isotonic', cv='prefit')
-    calibrated_model.fit(X_val_late_for_cal, y_val_late_for_cal)
+    
+    # Stream val_late in batches, collect only y_true and y_pred
+    batch_size = 50_000
+    parquet_file = pq.ParquetFile(val_path)
+    essential_cols_cal = feature_cols + [target_col, 'year']
+    y_true_cal_list, y_pred_cal_list = [], []
+    cal_batch_num = 0
+    
+    try:
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols_cal):
+            cal_batch_num += 1
+            batch_df = batch.to_pandas().dropna(subset=[target_col])
+            if len(batch_df) == 0:
+                continue
+            
+            # Filter to 2015-2017 only
+            year_mask = batch_df['year'].between(VAL_LATE_YEAR_MIN, VAL_LATE_YEAR_MAX)
+            batch_df = batch_df[year_mask]
+            if len(batch_df) == 0:
+                continue
+            
+            downcast_numeric_dtypes(batch_df)
+            y_batch = (batch_df[target_col] > 0).astype(np.int8)
+            X_batch = batch_df[feature_cols]
+            
+            # Get uncalibrated predictions from the raw model
+            y_pred_batch = lgb_model.predict(X_batch, num_iteration=best_iteration if best_iteration else None).astype(np.float32)
+            
+            y_true_cal_list.append(y_batch.values)
+            y_pred_cal_list.append(y_pred_batch)
+            
+            del batch_df, X_batch, y_batch, batch
+            gc.collect()
+            
+            if cal_batch_num % 10 == 0:
+                n_collected = sum(len(arr) for arr in y_true_cal_list)
+                print(f"  {cal_batch_num} batches, {n_collected:,} samples collected")
+                report_memory_usage(f"calibration batch {cal_batch_num}")
+    finally:
+        del parquet_file; gc.collect()
+    
+    # Concatenate collected arrays
+    print("  Concatenating collected predictions...")
+    y_true_cal = np.concatenate(y_true_cal_list).astype(np.int8)
+    y_pred_cal = np.concatenate(y_pred_cal_list).astype(np.float32)
+    del y_true_cal_list, y_pred_cal_list; gc.collect()
+    
+    print(f"  Calibrating on {len(y_true_cal):,} val_late samples...")
+    report_memory_usage("before calibration fit")
+    
+    # Fit isotonic regression directly on collected predictions
+    from sklearn.isotonic import IsotonicRegression
+    isotonic_reg = IsotonicRegression(out_of_bounds='clip', y_min=0.0, y_max=1.0)
+    isotonic_reg.fit(y_pred_cal, y_true_cal)
+    
+    # Create a wrapper that applies isotonic calibration
+    class CalibratedLGBMWrapper:
+        """Wrapper that applies isotonic calibration to LightGBM predictions."""
+        def __init__(self, booster: lgb.Booster, isotonic_reg: IsotonicRegression):
+            self.booster = booster
+            self.isotonic_reg = isotonic_reg
+        
+        def predict_proba(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
+            """Return calibrated probabilities in sklearn format [n_samples, 2]."""
+            proba_positive = self.booster.predict(X)
+            proba_positive = np.clip(proba_positive, 0.0, 1.0)
+            # Apply isotonic calibration
+            proba_positive_cal = self.isotonic_reg.predict(proba_positive)
+            proba_positive_cal = np.clip(proba_positive_cal, 0.0, 1.0)
+            proba_negative_cal = 1.0 - proba_positive_cal
+            return np.column_stack([proba_negative_cal, proba_positive_cal])
+    
+    calibrated_model = CalibratedLGBMWrapper(lgb_model, isotonic_reg)
     cal_time = time.time() - cal_start
     print(f"  Calibration done in {cal_time:.1f}s")
     
@@ -454,16 +454,18 @@ def phase1_training(
         pickle.dump(calibrated_model, f)
     print(f"  Calibrated model saved: {calibrated_model_path}")
     
-    del X_val_late_for_cal, y_val_late_for_cal, wrapped_model; gc.collect()
+    del y_true_cal, y_pred_cal, isotonic_reg; gc.collect()
     report_memory_usage("after calibration")
     
     if use_wandb:
         wandb.log({"training/train_early_time_seconds": train_early_time, "training/train_early_time_minutes": train_early_time / 60,
                   "training/final_train_time_seconds": train_time, "training/final_train_time_minutes": train_time / 60,
-                  "training/final_num_boost_round": num_boost_round,
+                  "training/final_num_boost_round": int(best_iteration) if best_iteration is not None else int(num_boost_round_val),
                   "calibration/time_seconds": cal_time})
     
     print("Phase 1 completed.")
+    train_pos = int(train_early_pos)
+    train_neg = int(train_early_neg)
     return (calibrated_model_path, validation_metrics, train_stats, train_early_time, val_time, train_time, train_pos, train_neg, n_train_full, imbalance_info)
 
 
@@ -567,7 +569,14 @@ def phase2_testing(
     # Get feature importance from the underlying LightGBM model
     # The calibrated model wraps the original model, so we need to access it
     try:
-        underlying_model = calibrated_model.calibrated_classifiers_[0].estimator.booster
+        # Check if it's our custom CalibratedLGBMWrapper
+        if hasattr(calibrated_model, 'booster'):
+            underlying_model = calibrated_model.booster
+        # Fallback for sklearn CalibratedClassifierCV (if used elsewhere)
+        elif hasattr(calibrated_model, 'calibrated_classifiers_'):
+            underlying_model = calibrated_model.calibrated_classifiers_[0].estimator.booster
+        else:
+            raise AttributeError("Unknown calibrated model type")
         feature_importance = pd.DataFrame({'feature': feature_cols, 'importance': underlying_model.feature_importance()}).sort_values('importance', ascending=False).head(20)
         print("\nTop 20 features:\n" + feature_importance.to_string(index=False))
     except (AttributeError, IndexError) as e:
@@ -579,8 +588,8 @@ def phase2_testing(
     
     metrics = {"metadata": {"timestamp": timestamp, "model": "LightGBM", "task": "transition_01_prediction",
                            "random_state": RANDOM_STATE, "n_features": len(feature_cols), "features": feature_cols,
-                           "calibration": "isotonic", "calibration_method": "CalibratedClassifierCV with cv='prefit'",
-                           "calibration_data": "val_late (2015-2017)", "test_probabilities": "calibrated"},
+                           "calibration": "isotonic", "calibration_method": "IsotonicRegression (batched collection)",
+                           "calibration_data": "val_late (2015-2017, streamed in batches)", "test_probabilities": "calibrated"},
               "data": {"n_train_full": n_train_full, "n_test": int(n_test_total), "train_positives": train_pos,
                       "train_negatives": train_neg, "test_positives": test_pos, "test_negatives": test_neg},
               "temporal_split": {"method": "strict_temporal_split", "train_early_max_year": TRAIN_EARLY_YEAR_MAX,
@@ -657,8 +666,8 @@ def main() -> None:
         for name, field in zip(schema.names, schema)
         if pa.types.is_integer(field.type) or pa.types.is_floating(field.type)
     ]
-    # Exclude target, coordinates, and year from features (keep year in required_cols)
-    feature_cols = [c for c in numeric_cols if c not in EXCLUDE_COLS and c not in {'year'}]
+    # Exclude target and coordinates from features (year is included as a feature)
+    feature_cols = [c for c in numeric_cols if c not in EXCLUDE_COLS]
     required_cols = [target_col, 'year', 'row', 'col']
     optional_cols = [col for col in ['x', 'y'] if col in all_cols_train]
     keep_cols_train = feature_cols + required_cols + optional_cols
