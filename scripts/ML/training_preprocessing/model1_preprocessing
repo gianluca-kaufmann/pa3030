@@ -212,6 +212,17 @@ def main() -> None:
                             gs.total_pos * {NEG_POS_RATIO},
                             {MAX_TRAIN_ROWS} - gs.total_pos
                         ) AS BIGINT
+                    ) AS year_neg_budget_raw,
+                    -- Final per-year negative budget cannot exceed available negatives
+                    LEAST(
+                        yc.neg_count,
+                        CAST(
+                            yc.pos_count::DOUBLE / NULLIF(gs.total_pos, 0) * 
+                            LEAST(
+                                gs.total_pos * {NEG_POS_RATIO},
+                                {MAX_TRAIN_ROWS} - gs.total_pos
+                            ) AS BIGINT
+                        )
                     ) AS year_neg_budget
                 FROM year_counts yc
                 CROSS JOIN global_stats gs
@@ -219,30 +230,86 @@ def main() -> None:
             positives AS (
                 SELECT * FROM base WHERE transition_01 = 1
             ),
-            -- Rank negatives by hard negative weight (higher weight = closer to WDPA = more likely to sample)
-            ranked_negs AS (
+            -- Prepare negative pool with per-year budgets and a stable random key
+            neg_candidates AS (
                 SELECT
                     b.*,
                     nb.year_neg_budget,
                     nb.neg_count,
-                    exp(-COALESCE(b.dist_wdpa, 100.0) / {DIST_WDPA_DECAY}) AS neg_weight,
-                    -- Add random tie-breaker for deterministic ordering with fixed seed
-                    ROW_NUMBER() OVER (
-                        PARTITION BY b.year 
-                        ORDER BY exp(-COALESCE(b.dist_wdpa, 100.0) / {DIST_WDPA_DECAY}) DESC, random()
-                    ) AS rn
+                    -- Split the yearly negative budget into 50% hard and 50% random
+                    CAST(FLOOR(nb.year_neg_budget / 2.0) AS BIGINT) AS hard_budget,
+                    nb.year_neg_budget - CAST(FLOOR(nb.year_neg_budget / 2.0) AS BIGINT) AS rand_budget,
+                    COALESCE(b.dist_wdpa, 100.0) AS dist_for_rank,
+                    random() AS u
                 FROM base b
                 LEFT JOIN neg_budget nb ON b.year = nb.year
                 WHERE b.transition_01 = 0
+                  AND nb.year_neg_budget > 0
             ),
-            sampled_negs AS (
-                SELECT * EXCLUDE (year_neg_budget, neg_count, neg_weight, rn)
-                FROM ranked_negs
-                WHERE rn <= LEAST(neg_count, year_neg_budget)
+            -- Rank for hard negatives: by distance to WDPA (closest first), tie-broken by u
+            ranked_for_hard AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY year
+                        ORDER BY dist_for_rank ASC, u
+                    ) AS dist_rank
+                FROM neg_candidates
+            ),
+            -- First half of the budget: hard negatives close to WDPA
+            hard_negs AS (
+                SELECT * EXCLUDE (
+                    year_neg_budget,
+                    neg_count,
+                    hard_budget,
+                    rand_budget,
+                    dist_for_rank,
+                    u,
+                    dist_rank
+                )
+                FROM ranked_for_hard
+                WHERE dist_rank <= hard_budget
+                  AND hard_budget > 0
+            ),
+            -- Serialized selection:
+            --   1) hard_negs as above (distance-ranked)
+            --   2) leftover_pool = negatives that were NOT selected as hard_negs
+            --   3) re-rank randomly only within leftover_pool to fill the random budget exactly
+            leftover_pool AS (
+                SELECT *
+                FROM ranked_for_hard
+                WHERE dist_rank > hard_budget
+                  AND rand_budget > 0
+            ),
+            ranked_leftover AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY year
+                        ORDER BY u
+                    ) AS leftover_rand_rank
+                FROM leftover_pool
+            ),
+            -- Second half of the budget: random negatives drawn only from leftover_pool
+            random_negs AS (
+                SELECT * EXCLUDE (
+                    year_neg_budget,
+                    neg_count,
+                    hard_budget,
+                    rand_budget,
+                    dist_for_rank,
+                    u,
+                    dist_rank,
+                    leftover_rand_rank
+                )
+                FROM ranked_leftover
+                WHERE leftover_rand_rank <= rand_budget
             )
             SELECT * FROM positives
             UNION ALL
-            SELECT * FROM sampled_negs
+            SELECT * FROM hard_negs
+            UNION ALL
+            SELECT * FROM random_negs
         )
         TO '{escaped_train_early}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """

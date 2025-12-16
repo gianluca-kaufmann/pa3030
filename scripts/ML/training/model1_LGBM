@@ -37,9 +37,9 @@ from typing import Dict, Any
 import numpy as np
 import pandas as pd
 import wandb
+import pyarrow as pa
 import pyarrow.parquet as pq
 import lightgbm as lgb
-from lightgbm import LGBMClassifier
 from sklearn.metrics import roc_auc_score, average_precision_score
 
 
@@ -360,34 +360,36 @@ def phase1_training(
     print(f"  val_late ({VAL_LATE_YEAR_MIN}-{VAL_LATE_YEAR_MAX}): {len(X_val_late):,} rows, {y_val_late.sum():,} positives ({y_val_late.mean()*100:.3f}%)")
     
     # -------------------------------------------------------------------------
-    # Imbalance handling: compute effective scale_pos_weight using sampled
-    # train_early_sampled.parquet (train_early) and full-val_late_full.parquet
-    # (val_late). We disable is_unbalance and use a clamped scale_pos_weight.
+    # Imbalance handling:
+    #   - Use full validation distribution (val_late) for neg/pos ratio.
+    #   - Compute scale_pos_weight = sqrt(neg / pos) to soften the weighting.
+    #   - Clamp to a maximum of 10.0 to avoid overly aggressive up-weighting.
+    #   - Keep is_unbalance = False so this manual weight is strictly respected.
     # -------------------------------------------------------------------------
     neg_full, pos_full = val_late_neg, val_late_pos
     neg_sampled, pos_sampled = train_early_neg, train_early_pos
-
+    
     def _safe_ratio(neg: int, pos: int) -> float:
         return float("inf") if pos == 0 else neg / pos
-
+    
     ratio_full = _safe_ratio(neg_full, pos_full)
     ratio_sampled = _safe_ratio(neg_sampled, pos_sampled)
-
-    if not np.isfinite(ratio_sampled) or ratio_sampled <= 0:
+    
+    # New softer weighting scheme: sqrt of full neg/pos ratio, capped at 10.0
+    if not np.isfinite(ratio_full) or ratio_full <= 0:
         spw_raw = 1.0
     else:
-        spw_raw = ratio_full / ratio_sampled
-
-    # Clamp to a reasonable range
-    spw_clamped = max(5.0, min(200.0, float(spw_raw)))
-
+        spw_raw = float(np.sqrt(ratio_full))
+    
+    spw_clamped = min(10.0, float(spw_raw))
+    
     print("\nImbalance handling (scale_pos_weight computation):")
     print(f"  Sampled train_early neg/pos: {ratio_sampled:.3f} "
           f"({neg_sampled:,} / {pos_sampled:,})")
     print(f"  Full val_late neg/pos:       {ratio_full:.3f} "
           f"({neg_full:,} / {pos_full:,})")
-    print(f"  Raw scale_pos_weight:        {spw_raw:.3f}")
-    print(f"  Clamped scale_pos_weight:    {spw_clamped:.3f} (range [5, 200])")
+    print(f"  Raw scale_pos_weight (sqrt): {spw_raw:.3f}")
+    print(f"  Clamped scale_pos_weight:    {spw_clamped:.3f} (max 10.0)")
     print("  Using manual scale_pos_weight and disabling is_unbalance.")
 
     # Update best_params in-place so downstream consumers (e.g. metrics JSON)
@@ -416,22 +418,40 @@ def phase1_training(
     
     train_early_start = time.time()
     train_params = best_params.copy()
-    lgb_model = LGBMClassifier(**train_params)
-    lgb_model.fit(
-        X_train_early,
-        y_train_early,
-        eval_set=[(X_val_late, y_val_late)],
-        eval_metric="average_precision",
+    # Remove sklearn-specific parameters that are not used by lgb.train
+    # Use n_estimators as fallback for num_boost_round before removing it
+    num_boost_round_val = train_params.pop("num_boost_round", None)
+    if num_boost_round_val is None:
+        num_boost_round_val = train_params.pop("n_estimators", 3000)
+    train_params.pop("n_estimators", None)  # Remove if still present (shouldn't be, but safe)
+    
+    # Convert to lgb.Dataset for Native API
+    train_dataset = lgb.Dataset(X_train_early, label=y_train_early)
+    # Validation dataset with free_raw_data=False to prevent reloading
+    val_dataset = lgb.Dataset(X_val_late, label=y_val_late, free_raw_data=False, reference=train_dataset)
+    
+    # Train with Native API
+    lgb_model = lgb.train(
+        train_params,
+        train_dataset,
+        num_boost_round=num_boost_round_val,
+        valid_sets=[val_dataset],
+        valid_names=["val_late"],
         callbacks=[lgb.early_stopping(100), lgb.log_evaluation(100)],
     )
     train_early_time = time.time() - train_early_start
     
     print(f"\nTraining completed in {train_early_time:.1f}s ({train_early_time/60:.1f} min)")
+    best_iteration = lgb_model.best_iteration
+    if best_iteration is not None:
+        print(f"Best iteration from temporal validation: {best_iteration}")
+    else:
+        print("Warning: best_iteration not set; falling back to configured num_boost_round for final training.")
     
-    # Evaluate on val_late
+    # Evaluate on val_late (Native API predict returns probabilities for binary classification)
     print("\nEvaluating on val_late...")
     val_start = time.time()
-    y_val_proba = lgb_model.predict_proba(X_val_late)[:, 1]
+    y_val_proba = lgb_model.predict(X_val_late, num_iteration=best_iteration if best_iteration else None)
     val_time = time.time() - val_start
     
     validation_metrics = compute_metrics(y_val_late.values, y_val_proba)
@@ -455,8 +475,8 @@ def phase1_training(
             "val/time_seconds": val_time,
         })
     
-    # Free memory: delete all datasets from validation phase (keep lgb_model for best_iteration_)
-    del X_train_early, y_train_early, X_val_late, y_val_late
+    # Free memory: delete all datasets from validation phase (keep lgb_model for best_iteration)
+    del X_train_early, y_train_early, X_val_late, y_val_late, train_dataset, val_dataset
     gc.collect()
     print("\n  Memory cleaned up after validation phase")
     
@@ -472,7 +492,7 @@ def phase1_training(
     df_val_full = load_and_preprocess(val_path, keep_cols_train, target_col, "val_late_full.parquet")
     df_combined = pd.concat([df_train_full, df_val_full], ignore_index=True)
     del df_train_full, df_val_full
-    gc.collect()
+    gc.collect()  # Strict memory cleanup immediately after concat
 
     y = (df_combined[target_col] > 0).astype(np.int8)
     X = df_combined[feature_cols].copy()
@@ -480,7 +500,7 @@ def phase1_training(
     train_years = sorted(df_combined['year'].unique())
     n_train_full = len(df_combined)
     del df_combined
-    gc.collect()
+    gc.collect()  # Strict memory cleanup before creating lgb.Dataset
     
     print(f"\nFull training set distribution:")
     print(f"  No transition (0): {train_neg:>12,}  ({100 - train_pos/len(y)*100:.3f}%)")
@@ -505,17 +525,25 @@ def phase1_training(
     
     print(f"\nTraining LightGBM on full training dataset ({len(X):,} samples, 2000-2017)...")
     
-    # Use best_iteration_ from temporal validation model to set n_estimators for final training
-    n_estimators_full = getattr(lgb_model, "best_iteration_", None)
-    if n_estimators_full is None:
-        # Fallback to configured n_estimators if early stopping did not set best_iteration_
-        n_estimators_full = best_params.get("n_estimators", 3000)
+    # Use best_iteration from temporal validation model with 20% buffer
+    if best_iteration is not None:
+        num_boost_round = int(best_iteration * 1.2)
+    else:
+        # Fallback to configured n_estimators if early stopping did not set best_iteration
+        num_boost_round = int(best_params.get("n_estimators", 3000))
+    print(f"Final training num_boost_round (with 20% buffer if applicable): {num_boost_round}")
     final_train_params = best_params.copy()
-    final_train_params["n_estimators"] = n_estimators_full
+    # Remove potential sklearn-specific parameters that are not used by lgb.train
+    final_train_params.pop("n_estimators", None)
     
     train_start = time.time()
-    final_model = LGBMClassifier(**final_train_params)
-    final_model.fit(X, y)
+    train_dataset = lgb.Dataset(X, label=y)
+    final_model = lgb.train(
+        final_train_params,
+        train_dataset,
+        num_boost_round=num_boost_round,
+        valid_sets=None,
+    )
     train_time = time.time() - train_start
     
     print(f"\nTraining completed in {train_time:.1f}s ({train_time/60:.1f} min)")
@@ -533,10 +561,11 @@ def phase1_training(
             "training/train_early_time_minutes": train_early_time / 60,
             "training/final_train_time_seconds": train_time,
             "training/final_train_time_minutes": train_time / 60,
+            "training/final_num_boost_round": num_boost_round,
         })
     
-    # Cleanup: delete X, y, models
-    del X, y, final_model, lgb_model
+    # Cleanup: delete X, y, final_model (lgb_model already deleted in Step C)
+    del X, y, final_model
     gc.collect()
     
     print("\nPhase 1 completed. Memory cleaned up.")
@@ -579,10 +608,10 @@ def phase2_testing(
         final_model = pickle.load(f)
     
     # -------------------------------------------------------------------------
-    # Batch processing for inference
+    # Batch processing for inference (streaming predictions to Parquet)
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("BATCH PROCESSING FOR INFERENCE")
+    print("BATCH PROCESSING FOR INFERENCE (STREAMING TO PARQUET)")
     print("=" * 70)
     
     batch_size = 100_000
@@ -591,8 +620,11 @@ def phase2_testing(
     # Open parquet file for batch iteration
     parquet_file = pq.ParquetFile(test_path)
     
-    # Accumulators for results and statistics
-    scored_results = []  # List of DataFrames with (row, col, year, y_true, y_pred_proba, x, y)
+    # Path for scored outputs (incremental write)
+    scored_path = output_dir / f"model1_lgbm_scored_{timestamp}.parquet"
+    writer = None
+    
+    # Accumulators for metrics and statistics
     y_true_all = []  # Accumulate all y_true for metrics
     y_proba_all = []  # Accumulate all y_proba for metrics
     test_pos = 0
@@ -603,68 +635,77 @@ def phase2_testing(
     pred_start = time.time()
     batch_num = 0
     
-    # Iterate over batches
-    for batch in parquet_file.iter_batches(batch_size=batch_size, columns=keep_cols_test):
-        batch_num += 1
-        batch_df = batch.to_pandas()
-        
-        # Drop rows with missing target
-        batch_df = batch_df.dropna(subset=[target_col])
-        if len(batch_df) == 0:
-            continue
-        
-        # Downcast numeric dtypes to reduce memory
-        downcast_numeric_dtypes(batch_df)
-        
-        # Extract target and features
-        y_batch = (batch_df[target_col] > 0).astype(np.int8)
-        X_batch = batch_df[feature_cols].copy()
-        
-        # Make predictions
-        y_proba_batch = final_model.predict_proba(X_batch)[:, 1]
-        
-        # Accumulate for metrics
-        y_true_all.append(y_batch.values)
-        y_proba_all.append(y_proba_batch)
-        test_pos += int(y_batch.sum())
-        test_neg += int((y_batch == 0).sum())
-        test_years_set.update(batch_df['year'].unique())
-        n_test_total += len(y_batch)
-        
-        # Create lightweight result DataFrame with only necessary columns
-        result_dict = {
-            'row': batch_df['row'].values,
-            'col': batch_df['col'].values,
-            'year': batch_df['year'].values,
-            'y_true': y_batch.values,
-            'y_pred_proba': y_proba_batch,
-        }
-        # Add optional coordinate columns if present
-        for col in ['x', 'y']:
-            if col in batch_df.columns:
-                result_dict[col] = batch_df[col].values
-        
-        scored_results.append(pd.DataFrame(result_dict))
-        
-        # Free memory immediately
-        del batch_df, X_batch, y_batch, y_proba_batch
-        gc.collect()
-        
-        if batch_num % 10 == 0:
-            print(f"  Processed {batch_num} batches ({n_test_total:,} rows so far)...")
+    try:
+        # Iterate over batches
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=keep_cols_test):
+            batch_num += 1
+            batch_df = batch.to_pandas()
+            
+            # Drop rows with missing target
+            batch_df = batch_df.dropna(subset=[target_col])
+            if len(batch_df) == 0:
+                continue
+            
+            # Downcast numeric dtypes to reduce memory
+            downcast_numeric_dtypes(batch_df)
+            
+            # Extract target and features
+            y_batch = (batch_df[target_col] > 0).astype(np.int8)
+            X_batch = batch_df[feature_cols].copy()
+            
+            # Make predictions (Native API predict returns probabilities for binary classification)
+            y_proba_batch = final_model.predict(X_batch)
+            
+            # Accumulate for metrics
+            y_true_all.append(y_batch.values)
+            y_proba_all.append(y_proba_batch)
+            test_pos += int(y_batch.sum())
+            test_neg += int((y_batch == 0).sum())
+            test_years_set.update(batch_df['year'].unique())
+            n_test_total += len(y_batch)
+            
+            # Create lightweight result DataFrame with only necessary columns
+            result_dict = {
+                'row': batch_df['row'].values,
+                'col': batch_df['col'].values,
+                'year': batch_df['year'].values,
+                'y_true': y_batch.values,
+                'y_pred_proba': y_proba_batch,
+            }
+            # Add optional coordinate columns if present
+            for col in ['x', 'y']:
+                if col in batch_df.columns:
+                    result_dict[col] = batch_df[col].values
+            
+            result_df = pd.DataFrame(result_dict)
+            result_table = pa.Table.from_pandas(result_df, preserve_index=False)
+            
+            # Initialize writer with schema on first batch
+            if writer is None:
+                writer = pq.ParquetWriter(scored_path, result_table.schema)
+                print(f"\nInitialized ParquetWriter for scored outputs at: {scored_path}")
+            
+            # Write batch to disk immediately
+            writer.write_table(result_table)
+            
+            # Free memory immediately
+            del batch_df, X_batch, y_batch, y_proba_batch, result_df, result_table
+            gc.collect()
+            
+            if batch_num % 10 == 0:
+                print(f"  Processed {batch_num} batches ({n_test_total:,} rows so far)...")
+    finally:
+        # Ensure writer is properly closed
+        if writer is not None:
+            writer.close()
     
     pred_time = time.time() - pred_start
     print(f"\n  Completed {batch_num} batches in {pred_time:.1f}s")
     print(f"  Total rows processed: {n_test_total:,}")
-    
-    # Concatenate all results into single DataFrame
-    print("\nConcatenating batch results...")
-    scored_df = pd.concat(scored_results, ignore_index=True)
-    del scored_results
-    gc.collect()
-    print(f"  Concatenated DataFrame: {len(scored_df):,} rows")
+    print(f"  Scored outputs streamed incrementally to: {scored_path}")
     
     # Concatenate y_true and y_proba for metrics
+    print("\nConcatenating prediction arrays for metrics...")
     y_test = np.concatenate(y_true_all)
     y_proba = np.concatenate(y_proba_all)
     del y_true_all, y_proba_all
@@ -725,21 +766,18 @@ def phase2_testing(
     print("Top 20 Most Important Features:")
     print("-" * 40)
     feature_importance = pd.DataFrame({
-        'feature': feature_cols, 'importance': final_model.feature_importances_
+        'feature': feature_cols, 'importance': final_model.feature_importance()
     }).sort_values('importance', ascending=False).head(20)
     print(feature_importance.to_string(index=False))
     
     # -------------------------------------------------------------------------
-    # Save predictions and metrics
+    # Save metrics (predictions already streamed to disk)
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("SAVE PREDICTIONS AND METRICS")
+    print("SAVE METRICS")
     print("=" * 70)
     
-    # Save scored outputs
-    scored_path = output_dir / f"model1_lgbm_scored_{timestamp}.parquet"
-    scored_df.to_parquet(scored_path, index=False)
-    print(f"\nScored outputs saved to: {scored_path}")
+    print(f"\nScored outputs were streamed incrementally to: {scored_path}")
     
     # Compile metrics
     metrics = {
@@ -799,7 +837,7 @@ def phase2_testing(
     print(f"Metrics saved to: {metrics_path}")
     
     # Free memory
-    del scored_df, y_test, y_proba, final_model
+    del y_test, y_proba, final_model
     gc.collect()
     
     # -------------------------------------------------------------------------
