@@ -8,6 +8,8 @@ Processing order (per year):
     1. Lag feature: WDPA_prev (1-year lag of WDPA_b1, default 0 for first year)
     2. Spatial features computed on FULL grid (before Risk Set filtering):
        - Distance features: distance to nearest WDPA_prev (t-1) protected pixel [avoids target leakage]
+       - Static distance transforms: overwrite oil_gas_b1, powerplants_b1, road_infrastructure_b1 
+         with distance to nearest feature (replaces binary 0/1 with distance in meters)
        - Decay features: exp(-distance / 10000)
        - Smoothed features: 4x4, 16x16, 64x64 mean for specified variables
     3. Risk Set filter: Keep only rows where WDPA_prev == 0 (pixels not previously protected)
@@ -43,7 +45,8 @@ warnings.filterwarnings('ignore')
 DISTANCE_DECAY_SCALE = 10000
 SMOOTH_VARIABLES = ['NDVI_b1', 'GPW_b1', 'HNTL_b1', 'gdp_b1', 'deforestation_b1', 
                      'wildfire_b1', 'GSN_b1', 'GSN_b2', 'GSN_b3', 'GSN_b4', 'GSN_b5']
-SMOOTH_SIZES = [4, 16, 64]
+SMOOTH_SIZES = [16, 64]
+STATIC_DISTANCE_VARIABLES = ['oil_gas_b1', 'powerplants_b1', 'road_infrastructure_b1']
 
 
 def reconstruct_grid(df: pd.DataFrame, value_col: str) -> Tuple[np.ndarray, int, int, int, int]:
@@ -75,8 +78,46 @@ def compute_distance_features(df: pd.DataFrame) -> pd.DataFrame:
     del wdpa_binary
     
     df['dist_wdpa'] = grid_to_dataframe(distance_grid, df, min_row, min_col)
-    df['dist_wdpa_decay'] = np.exp(-df['dist_wdpa'] / DISTANCE_DECAY_SCALE)
     del distance_grid
+    
+    return df
+
+
+def compute_static_distance_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute distance transforms for static binary features and overwrite original columns.
+    
+    For each static variable (oil_gas_b1, powerplants_b1, road_infrastructure_b1):
+    - Replaces sparse binary 0/1 values with distance to nearest 1 (in meters)
+    - Overwrites the original column (including the 1s themselves, which become 0)
+    - Treats NaN as 0 (no feature present)
+    """
+    logger.info("  Computing distance transforms for static features (oil_gas, powerplants, road_infrastructure)...")
+    
+    for variable in STATIC_DISTANCE_VARIABLES:
+        if variable not in df.columns:
+            logger.warning(f"    Column {variable} not found, skipping...")
+            continue
+        
+        logger.info(f"    Processing {variable}...")
+        
+        # Reconstruct grid from the binary feature
+        feature_grid, min_row, max_row, min_col, max_col = reconstruct_grid(df, variable)
+        
+        # Convert to binary: NaN -> 0, >0 -> 1
+        feature_binary = np.where(np.isnan(feature_grid), 0, feature_grid > 0).astype(np.uint8)
+        del feature_grid
+        
+        # Compute distance transform: distance from each pixel to nearest 1
+        # distance_transform_edt computes distance to nearest non-zero pixel
+        # Since feature_binary has 1s where features are, this gives distance to nearest 1
+        distance_grid = distance_transform_edt(feature_binary) * 1000  # pixels to meters
+        del feature_binary
+        
+        # Overwrite the original column with distance values
+        df[variable] = grid_to_dataframe(distance_grid, df, min_row, min_col)
+        del distance_grid
+        
+        gc.collect()
     
     return df
 
@@ -88,10 +129,10 @@ def compute_smooth_feature(df: pd.DataFrame, variable: str, window_size: int) ->
     grid_filled = np.where(np.isnan(grid), 0, grid)
     del grid
     
-    smoothed = uniform_filter(grid_filled, size=window_size, mode='constant')
+    smoothed = uniform_filter(grid_filled, size=window_size, mode='reflect')
     del grid_filled
     
-    count = uniform_filter(valid_mask.astype(np.float32), size=window_size, mode='constant')
+    count = uniform_filter(valid_mask.astype(np.float32), size=window_size, mode='reflect')
     del valid_mask
     
     smoothed = np.where(count > 0, smoothed, np.nan)
@@ -183,6 +224,7 @@ def process_year(input_path: Path, year: int, temp_dir: Path, is_first_year: boo
     # Step 2: Compute spatial features on FULL grid (before Risk Set filtering)
     logger.info(f"  Computing spatial features on full grid ({n_rows_initial:,} rows)...")
     df_year = compute_distance_features(df_year)
+    df_year = compute_static_distance_features(df_year)
     df_year = compute_all_smooth_features(df_year)
     
     # Step 3: Apply Risk Set filter (keep only WDPA_prev == 0)
@@ -269,6 +311,7 @@ def main() -> None:
             "distance_decay_scale": DISTANCE_DECAY_SCALE,
             "smooth_variables": SMOOTH_VARIABLES,
             "smooth_sizes": SMOOTH_SIZES,
+            "static_distance_variables": STATIC_DISTANCE_VARIABLES,
         }
     )
     

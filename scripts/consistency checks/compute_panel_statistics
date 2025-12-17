@@ -235,10 +235,21 @@ def analyze_panel():
     print(f"Expected rows (pixels × years): {expected_rows:,}")
     print(f"Actual rows: {total_rows:,}")
     
-    # Check balance using per-year row counts only (cheap)
-    year_values = list(rows_per_year.values())
-    is_balanced = (max(year_values) - min(year_values)) / max(year_values) < 0.01 if year_values else True
-    print(f"Balanced across years (by row counts): {'Yes' if is_balanced else 'No'}")
+    # Check if rows_per_year is monotonically decreasing (or constant)
+    sorted_years = sorted(rows_per_year.keys())
+    is_monotonically_decreasing = True
+    if len(sorted_years) > 1:
+        for i in range(1, len(sorted_years)):
+            prev_year = sorted_years[i-1]
+            curr_year = sorted_years[i]
+            if rows_per_year[curr_year] > rows_per_year[prev_year]:
+                is_monotonically_decreasing = False
+                break
+    
+    if is_monotonically_decreasing:
+        print(f"✓ Rows per year is monotonically decreasing (or constant)")
+    else:
+        print(f"⚠️  Rows per year is NOT monotonically decreasing")
     
     # Show duplicate status (within row groups)
     if n_duplicates > 0:
@@ -261,7 +272,7 @@ def analyze_panel():
         "structure/math_perfect": panel_is_perfect,
         "structure/has_within_row_group_duplicates": n_duplicates > 0,
         "structure/num_within_row_group_duplicates": int(n_duplicates),
-        "structure/is_balanced_by_year_rows": is_balanced
+        "structure/is_monotonically_decreasing": is_monotonically_decreasing
     })
     
     # Log per-year row counts
@@ -357,7 +368,7 @@ def analyze_panel():
             'unique_pixels': n_unique_pixels,
             'expected_rows': expected_rows,
             'actual_rows': total_rows,
-            'is_balanced_by_year_rows': is_balanced,
+            'is_monotonically_decreasing': is_monotonically_decreasing,
             'rows_per_year': rows_per_year,
             'has_within_row_group_duplicates': n_duplicates > 0,
             'num_within_row_group_duplicates': int(n_duplicates),

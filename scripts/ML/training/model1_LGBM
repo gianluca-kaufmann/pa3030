@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """LGBM Transition Model (0→1 Prediction)
 Train LightGBM on pre-split parquet files: train_early_sampled (2000-2014), 
-val_late_full (2015-2017), test_full (2018-2024). Final model trained on 2000-2017,
-evaluated on 2018-2024. Uses isotonic calibration fitted on val_late predictions.
+val_late_full (2015-2017), test_full (2018-2024). Final model trained on 2000-2014,
+with early stopping on 2015, evaluated on 2018-2024. Uses isotonic calibration fitted 
+on 2016-2017 predictions.
 """
 
 from __future__ import annotations
@@ -76,10 +77,10 @@ class CalibratedLGBMWrapper:
 
 # Configuration
 RANDOM_STATE = 42
-EXCLUDE_COLS = {'transition_01', 'WDPA_b1', 'WDPA_prev', 'x', 'y', 'row', 'col'}
+EXCLUDE_COLS = {'transition_01', 'WDPA_b1', 'WDPA_prev', 'x', 'y', 'row', 'col', 'year'}
 TRAIN_EARLY_YEAR_MAX = 2014
-VAL_LATE_YEAR_MIN = 2015
-VAL_LATE_YEAR_MAX = 2017
+VAL_STOPPING_YEARS = (2015, 2015)
+VAL_CALIBRATION_YEARS = (2016, 2017)
 FIXED_PARAMS = {'random_state': RANDOM_STATE, 'boosting_type': 'gbdt', 'objective': 'binary', 'verbose': -1}
 
 # Utility Functions
@@ -320,10 +321,8 @@ def load_numpy_arrays_two_pass(
                 col_array = batch_table[col].to_numpy(zero_copy_only=False)
                 col_valid = col_array[valid_mask]
                 col_filtered = col_valid[year_mask]
-                # Convert to float32, handling NaN
+                # Convert to float32 (NaN values preserved for LightGBM to handle)
                 col_float32 = col_filtered.astype(np.float32)
-                # Replace NaN with 0.0 (or could use mean, but 0 is safer for memory)
-                col_float32 = np.nan_to_num(col_float32, nan=0.0, posinf=0.0, neginf=0.0)
                 feature_arrays.append(col_float32)
             
             # Stack features into matrix
@@ -401,12 +400,12 @@ def phase1_training(
     }
     report_memory_usage("after STEP A")
     
-    print("\nSTEP B: LOAD VAL_LATE (2015-2017)")
-    X_val_late, y_val_late, val_late_pos, val_late_neg, _ = load_numpy_arrays_two_pass(
-        val_path, feature_cols, target_col, lambda y: (y >= VAL_LATE_YEAR_MIN) & (y <= VAL_LATE_YEAR_MAX), "val_late_full.parquet")
+    print(f"\nSTEP B: LOAD VAL_STOPPING ({VAL_STOPPING_YEARS[0]})")
+    X_val_stopping, y_val_stopping, val_stopping_pos, val_stopping_neg, _ = load_numpy_arrays_two_pass(
+        val_path, feature_cols, target_col, lambda y: (y >= VAL_STOPPING_YEARS[0]) & (y <= VAL_STOPPING_YEARS[1]), "val_late_full.parquet")
     report_memory_usage("after STEP B")
     
-    print(f"\nSTEP C: TRAIN & EVALUATE\nTemporal split: train_early (≤{TRAIN_EARLY_YEAR_MAX}): {len(X_train_early):,} rows, val_late ({VAL_LATE_YEAR_MIN}-{VAL_LATE_YEAR_MAX}): {len(X_val_late):,} rows")
+    print(f"\nSTEP C: TRAIN & EVALUATE\nTemporal split: train_early (≤{TRAIN_EARLY_YEAR_MAX}): {len(X_train_early):,} rows, val_stopping ({VAL_STOPPING_YEARS[0]}): {len(X_val_stopping):,} rows")
     
     # Imbalance handling: load scale_pos_weight from preprocessing metadata
     metadata_path = resolve_train_metadata()
@@ -414,7 +413,7 @@ def phase1_training(
         train_metadata = json.load(f)
     scale_pos_weight = train_metadata["scale_pos_weight"]
     
-    neg_full, pos_full = val_late_neg, val_late_pos
+    neg_full, pos_full = val_stopping_neg, val_stopping_pos
     neg_sampled, pos_sampled = train_early_neg, train_early_pos
     ratio_full = float("inf") if pos_full == 0 else neg_full / pos_full
     ratio_sampled = float("inf") if pos_sampled == 0 else neg_sampled / pos_sampled
@@ -448,13 +447,13 @@ def phase1_training(
     report_memory_usage("after train dataset creation")
     
     print(f"  Creating validation dataset...")
-    val_dataset = lgb.Dataset(X_val_late, label=y_val_late, free_raw_data=True, reference=train_dataset)
-    # Don't delete X_val_late, y_val_late yet - needed for metrics after training
+    val_dataset = lgb.Dataset(X_val_stopping, label=y_val_stopping, free_raw_data=True, reference=train_dataset)
+    # Don't delete X_val_stopping, y_val_stopping yet - needed for metrics after training
     report_memory_usage("after val dataset creation")
     
     print(f"  Starting training...")
     lgb_model = lgb.train(train_params, train_dataset, num_boost_round=num_boost_round_val, valid_sets=[val_dataset],
-                         valid_names=["val_late"], callbacks=[lgb.early_stopping(100), lgb.log_evaluation(100)])
+                         valid_names=["val_stopping"], callbacks=[lgb.early_stopping(100), lgb.log_evaluation(100)])
     train_early_time = time.time() - train_early_start
     best_iteration = lgb_model.best_iteration
     print(f"\nTraining done in {train_early_time:.1f}s. Best iteration: {best_iteration if best_iteration else 'N/A'}")
@@ -463,23 +462,23 @@ def phase1_training(
     del train_dataset, val_dataset; gc.collect()
     
     val_start = time.time()
-    y_val_proba = lgb_model.predict(X_val_late, num_iteration=best_iteration if best_iteration else None)
+    y_val_proba = lgb_model.predict(X_val_stopping, num_iteration=best_iteration if best_iteration else None)
     val_time = time.time() - val_start
-    validation_metrics = compute_metrics(y_val_late, y_val_proba)
+    validation_metrics = compute_metrics(y_val_stopping, y_val_proba)
     print(f"\nValidation: ROC-AUC {validation_metrics['roc_auc']:.4f}, PR-AUC {validation_metrics['pr_auc']:.4f}, "
           f"P@1% {validation_metrics['precision_at_1pct']:.4f}, P@5% {validation_metrics['precision_at_5pct']:.4f}, "
           f"P@10% {validation_metrics['precision_at_10pct']:.4f}")
     
     if use_wandb:
-        wandb.log({**{f"val/{k}": v for k, v in validation_metrics.items()}, "val/n_samples": int(len(y_val_late)),
-                  "val/n_positives": int(np.sum(y_val_late)), "val/time_seconds": val_time})
+        wandb.log({**{f"val/{k}": v for k, v in validation_metrics.items()}, "val/n_samples": int(len(y_val_stopping)),
+                  "val/n_positives": int(np.sum(y_val_stopping)), "val/time_seconds": val_time})
     
     # Now free validation data and predictions
-    del X_val_late, y_val_late, y_val_proba; gc.collect()
+    del X_val_stopping, y_val_stopping, y_val_proba; gc.collect()
     
     print("\nSTEP D: FINAL MODEL (TRAIN_EARLY ONLY, NO CONCATENATION)")
     print("  Skipping concatenation of train + val to avoid OOM.")
-    print("  Using the train_early model (with early stopping on val_late) as the final model.")
+    print(f"  Using the train_early model (with early stopping on val_stopping {VAL_STOPPING_YEARS[0]}) as the final model.")
     # For downstream summaries, treat this as the final training time and stats
     train_time = train_early_time
     if use_wandb:
@@ -497,15 +496,15 @@ def phase1_training(
     print(f"Model saved: {model_path}")
     gc.collect()
     
-    # Fit isotonic calibration on val_late predictions (two-pass approach to avoid memory spikes)
-    print(f"\nSTEP E: FITTING ISOTONIC CALIBRATION ON VAL_LATE (TWO-PASS)")
+    # Fit isotonic calibration on val_calibration predictions (two-pass approach to avoid memory spikes)
+    print(f"\nSTEP E: FITTING ISOTONIC CALIBRATION ON VAL_CALIBRATION ({VAL_CALIBRATION_YEARS[0]}-{VAL_CALIBRATION_YEARS[1]}) (TWO-PASS)")
     cal_start = time.time()
     
     batch_size = 50_000
     essential_cols_cal = feature_cols + [target_col, 'year']
     
     # Pass 1: Count rows matching the year filter (very fast, low memory)
-    print(f"  Pass 1: Counting rows matching year filter ({VAL_LATE_YEAR_MIN}-{VAL_LATE_YEAR_MAX})...")
+    print(f"  Pass 1: Counting rows matching year filter ({VAL_CALIBRATION_YEARS[0]}-{VAL_CALIBRATION_YEARS[1]})...")
     parquet_file = pq.ParquetFile(val_path)
     n_cal_samples = 0
     try:
@@ -514,8 +513,8 @@ def phase1_training(
             if len(batch_df) == 0:
                 continue
             
-            # Filter to 2015-2017 only
-            year_mask = batch_df['year'].between(VAL_LATE_YEAR_MIN, VAL_LATE_YEAR_MAX)
+            # Filter to calibration years only
+            year_mask = batch_df['year'].between(VAL_CALIBRATION_YEARS[0], VAL_CALIBRATION_YEARS[1])
             n_cal_samples += int(year_mask.sum())
             del batch_df, batch
     finally:
@@ -524,7 +523,7 @@ def phase1_training(
     print(f"  Found {n_cal_samples:,} samples matching filter")
     
     if n_cal_samples == 0:
-        raise ValueError(f"No samples found in val_late for years {VAL_LATE_YEAR_MIN}-{VAL_LATE_YEAR_MAX}")
+        raise ValueError(f"No samples found in val_calibration for years {VAL_CALIBRATION_YEARS[0]}-{VAL_CALIBRATION_YEARS[1]}")
     
     # Pass 2: Pre-allocate arrays and fill directly (avoids concatenation memory spike)
     print(f"  Pass 2: Pre-allocating arrays and collecting predictions...")
@@ -542,8 +541,8 @@ def phase1_training(
             if len(batch_df) == 0:
                 continue
             
-            # Filter to 2015-2017 only
-            year_mask = batch_df['year'].between(VAL_LATE_YEAR_MIN, VAL_LATE_YEAR_MAX)
+            # Filter to calibration years only
+            year_mask = batch_df['year'].between(VAL_CALIBRATION_YEARS[0], VAL_CALIBRATION_YEARS[1])
             batch_df = batch_df[year_mask]
             if len(batch_df) == 0:
                 continue
@@ -573,7 +572,7 @@ def phase1_training(
     if idx_offset != n_cal_samples:
         raise ValueError(f"Mismatch: expected {n_cal_samples:,} samples but collected {idx_offset:,}")
     
-    print(f"  Calibrating on {len(y_true_cal):,} val_late samples...")
+    print(f"  Calibrating on {len(y_true_cal):,} val_calibration samples...")
     report_memory_usage("before calibration fit")
     
     # Fit isotonic regression directly on collected predictions
@@ -760,11 +759,11 @@ def phase2_testing(
     metrics = {"metadata": {"timestamp": timestamp, "model": "LightGBM", "task": "transition_01_prediction",
                            "random_state": RANDOM_STATE, "n_features": len(feature_cols), "features": feature_cols,
                            "calibration": "isotonic", "calibration_method": "IsotonicRegression (batched collection)",
-                           "calibration_data": "val_late (2015-2017, streamed in batches)", "test_probabilities": "calibrated"},
+                           "calibration_data": f"val_calibration ({VAL_CALIBRATION_YEARS[0]}-{VAL_CALIBRATION_YEARS[1]}, streamed in batches)", "test_probabilities": "calibrated"},
               "data": {"n_train_full": n_train_full, "n_test": int(n_test_total), "train_positives": train_pos,
                       "train_negatives": train_neg, "test_positives": test_pos, "test_negatives": test_neg},
               "temporal_split": {"method": "strict_temporal_split", "train_early_max_year": TRAIN_EARLY_YEAR_MAX,
-                                "val_late_min_year": VAL_LATE_YEAR_MIN, "val_late_max_year": VAL_LATE_YEAR_MAX},
+                                "val_stopping_years": list(VAL_STOPPING_YEARS), "val_calibration_years": list(VAL_CALIBRATION_YEARS)},
               "validation_performance": validation_metrics, "model_parameters": best_params,
               "imbalance_handling": {"method": "scale_pos_weight", "is_unbalance": False,
                                     "scale_pos_weight": imbalance_info.get("scale_pos_weight"),
@@ -784,7 +783,7 @@ def phase2_testing(
     
     total_time = time.time() - start_time
     print("\n" + "="*70 + "\nSUMMARY\n" + "="*70)
-    print(f"Model: LightGBM (with isotonic calibration), {len(feature_cols)} features\nValidation (≤{TRAIN_EARLY_YEAR_MAX}→{VAL_LATE_YEAR_MIN}-{VAL_LATE_YEAR_MAX}): PR-AUC {validation_metrics['pr_auc']:.4f}, ROC-AUC {validation_metrics['roc_auc']:.4f}")
+    print(f"Model: LightGBM (with isotonic calibration), {len(feature_cols)} features\nValidation (≤{TRAIN_EARLY_YEAR_MAX}→{VAL_STOPPING_YEARS[0]}): PR-AUC {validation_metrics['pr_auc']:.4f}, ROC-AUC {validation_metrics['roc_auc']:.4f}")
     print(f"Test (2018-2024, {n_test_total:,} samples, {test_pos/n_test_total*100:.3f}% pos, calibrated probabilities): ROC-AUC {test_metrics['roc_auc']:.4f}, PR-AUC {test_metrics['pr_auc']:.4f}")
     print(f"  P@1%: {prec_at_k[1]:.4f} ({test_metrics['lift_at_1pct']:.1f}x), P@5%: {prec_at_k[5]:.4f} ({test_metrics['lift_at_5pct']:.1f}x), P@10%: {prec_at_k[10]:.4f} ({test_metrics['lift_at_10pct']:.1f}x)")
     print(f"Timings: train_early {train_early_time:.1f}s, val {val_time:.1f}s, final_train {train_time:.1f}s, pred {pred_time:.1f}s, total {total_time:.1f}s ({total_time/60:.1f}m)")
@@ -812,8 +811,8 @@ def main() -> None:
     try:
         wandb.init(project="ml-training-transitions", entity=os.environ.get("WANDB_ENTITY"), name=f"model1_lgbm_{timestamp}",
                   config={"model": "LightGBM", "task": "transition_01_prediction", "random_state": RANDOM_STATE,
-                         "temporal_split": {"train_early_max_year": TRAIN_EARLY_YEAR_MAX, "val_late_min_year": VAL_LATE_YEAR_MIN,
-                                           "val_late_max_year": VAL_LATE_YEAR_MAX}})
+                         "temporal_split": {"train_early_max_year": TRAIN_EARLY_YEAR_MAX, "val_stopping_years": list(VAL_STOPPING_YEARS),
+                                           "val_calibration_years": list(VAL_CALIBRATION_YEARS)}})
         use_wandb = True
         print("W&B connected")
     except Exception as err:
