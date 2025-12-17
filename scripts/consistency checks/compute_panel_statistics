@@ -12,6 +12,7 @@ import pyarrow.parquet as pq
 from pathlib import Path
 from datetime import datetime
 from collections import Counter
+import wandb
 
 # Paths
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -65,12 +66,28 @@ def analyze_panel():
     print(f"Columns: {len(columns)}")
     print(f"Row groups: {num_row_groups:,}")
     
+    # Log file metadata to WandB
+    wandb.log({
+        "file/name": str(PANEL_FILE.name),
+        "file/size_gb": round(file_size_gb, 2),
+        "file/total_rows": total_rows,
+        "file/total_columns": len(columns),
+        "file/num_row_groups": num_row_groups
+    })
+    
     # Identify column categories
     meta_cols = ['year', 'x', 'y', 'row', 'col']
     feature_cols = [c for c in columns if c not in meta_cols]
     
     print(f"\nMetadata columns: {meta_cols}")
     print(f"Feature columns: {len(feature_cols)}")
+    
+    # Log column information to WandB
+    wandb.log({
+        "columns/total_columns": len(columns),
+        "columns/metadata_columns": len(meta_cols),
+        "columns/feature_columns": len(feature_cols)
+    })
     
     # ===================================================================
     # STEP 1: Get EXACT structure statistics (year counts, unique pixels)
@@ -244,6 +261,30 @@ def analyze_panel():
     else:
         print(f"⚠️  Panel composition: Pixels vary across years (see details above)")
     
+    # Log structure metrics to WandB
+    wandb.log({
+        "structure/num_years": n_years,
+        "structure/unique_pixels": n_unique_pixels,
+        "structure/expected_rows": expected_rows,
+        "structure/actual_rows": total_rows,
+        "structure/has_duplicates": n_duplicates > 0,
+        "structure/num_duplicates": int(n_duplicates),
+        "structure/panel_composition_balanced": panel_is_balanced,
+        "structure/is_balanced": is_balanced
+    })
+    
+    # Log per-year row counts
+    for year, count in rows_per_year.items():
+        wandb.log({f"structure/rows_per_year/{year}": count})
+    
+    # Log panel composition issues if any
+    if pixels_dropped:
+        for year, count in pixels_dropped.items():
+            wandb.log({f"structure/pixels_dropped/{year}": count})
+    if pixels_added:
+        for year, count in pixels_added.items():
+            wandb.log({f"structure/pixels_added/{year}": count})
+    
     # Show rows per year
     print(f"\nRows per year:")
     for year in sorted(rows_per_year.keys()):
@@ -269,6 +310,18 @@ def analyze_panel():
     else:
         print(f"\nNo missing values found in sample of {sample_rows:,} rows!")
     
+    # Log missing values to WandB
+    wandb.log({
+        "missing_values/columns_with_missing": len(cols_with_missing),
+        "missing_values/sample_rows": sample_rows,
+        "missing_values/sample_fraction": sample_rows / total_rows if total_rows > 0 else 0
+    })
+    
+    # Log top missing value columns
+    for col, count in cols_with_missing[:20]:  # Log top 20
+        pct = 100 * count / sample_rows if sample_rows > 0 else 0
+        wandb.log({f"missing_values/{col}/count": count, f"missing_values/{col}/percent": pct})
+    
     # Numeric columns summary
     print(f"\n" + "=" * 60)
     print("NUMERIC COLUMNS (ESTIMATED from sample)")
@@ -281,6 +334,21 @@ def analyze_panel():
         print(f"  {col}: min={stats['min']:.2f}, max={stats['max']:.2f}, mean={stats['mean']:.2f}")
     if len(numeric_stats) > 5:
         print(f"  ... and {len(numeric_stats) - 5} more")
+    
+    # Log numeric statistics summary to WandB
+    wandb.log({
+        "numeric_statistics/total_numeric_columns": len(numeric_stats)
+    })
+    
+    # Log summary stats for each numeric column (limit to prevent too many metrics)
+    for col, stats in list(numeric_stats.items())[:50]:  # Log first 50 numeric columns
+        wandb.log({
+            f"numeric_statistics/{col}/min": stats['min'],
+            f"numeric_statistics/{col}/max": stats['max'],
+            f"numeric_statistics/{col}/mean": stats['mean'],
+            f"numeric_statistics/{col}/std": stats['std'],
+            f"numeric_statistics/{col}/sample_size": stats['sample_size']
+        })
     
     # Compile results
     results = {
@@ -326,11 +394,43 @@ def analyze_panel():
 
 
 def main():
+    # Initialize WandB
+    print("🔄 Initializing Weights & Biases connection...")
+    
+    # Get credentials from environment variables
+    wandb_api_key = os.environ.get("WANDB_API_KEY")
+    wandb_entity = os.environ.get("WANDB_ENTITY")
+    
+    if not wandb_api_key:
+        print("Warning: WANDB_API_KEY not found in environment variables")
+        print("   Set it with: export WANDB_API_KEY='your-key-here'")
+    
+    if not wandb_entity:
+        print("Warning: WANDB_ENTITY not found in environment variables")
+        print("   Set it with: export WANDB_ENTITY='your-entity-here'")
+    
+    # Initialize wandb
+    wandb.init(
+        project="panel_statistics",
+        entity=wandb_entity,
+        save_code=True,
+        config={
+            "panel_file": str(PANEL_FILE),
+            "output_json": str(OUTPUT_JSON),
+            "sample_row_groups": SAMPLE_ROW_GROUPS,
+            "scratch_mode": "SCRATCH" in os.environ
+        }
+    )
+    print("Weights & Biases connected successfully!")
+    
     start = datetime.now()
+    wandb.log({"status": "started", "start_time": start.isoformat()})
     
     results = analyze_panel()
     
     if results is None:
+        wandb.log({"status": "failed", "error": "file_not_found"})
+        wandb.finish()
         return
     
     # Save results
@@ -339,11 +439,21 @@ def main():
     
     elapsed = (datetime.now() - start).total_seconds()
     
+    # Log final summary
+    wandb.log({
+        "summary/elapsed_seconds": elapsed,
+        "summary/elapsed_minutes": elapsed / 60,
+        "summary/output_file": str(OUTPUT_JSON),
+        "status": "completed"
+    })
+    
     print(f"\n" + "=" * 60)
     print("COMPLETE")
     print("=" * 60)
     print(f"Time: {elapsed:.1f} seconds")
     print(f"Output: {OUTPUT_JSON}")
+    
+    wandb.finish()
 
 
 if __name__ == "__main__":
