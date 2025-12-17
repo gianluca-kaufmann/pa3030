@@ -80,6 +80,19 @@ def analyze_panel():
     meta_table = pf.read(columns=['year', 'row', 'col'])
     meta_df = meta_table.to_pandas()
     
+    # Check for duplicates on ['year', 'row', 'col']
+    print(f"Checking for duplicate (year, row, col) combinations...", flush=True)
+    duplicates = meta_df.duplicated(subset=['year', 'row', 'col'], keep=False)
+    n_duplicates = duplicates.sum()
+    if n_duplicates > 0:
+        print(f"⚠️  WARNING: Found {n_duplicates:,} duplicate (year, row, col) combinations!")
+        duplicate_rows = meta_df[duplicates].sort_values(['year', 'row', 'col'])
+        print(f"   First few duplicates:")
+        for _, row in duplicate_rows.head(5).iterrows():
+            print(f"     Year {row['year']}, row {row['row']}, col {row['col']}")
+    else:
+        print(f"✓ No duplicate (year, row, col) combinations found")
+    
     # Exact year counts
     year_counts = meta_df['year'].value_counts().to_dict()
     unique_years = sorted(year_counts.keys())
@@ -90,6 +103,41 @@ def analyze_panel():
     print(f"Computing unique pixels...", flush=True)
     unique_pixels = meta_df[['row', 'col']].drop_duplicates()
     n_unique_pixels = len(unique_pixels)
+    
+    # Verify panel composition: check if set of (row, col) pairs is identical across all years
+    print(f"Verifying panel composition across years...", flush=True)
+    pixels_by_year = {}
+    for year in unique_years:
+        year_pixels = set(meta_df[meta_df['year'] == year][['row', 'col']].apply(tuple, axis=1))
+        pixels_by_year[year] = year_pixels
+    
+    # Check if all years have the same set of pixels
+    reference_year = unique_years[0]
+    reference_pixels = pixels_by_year[reference_year]
+    panel_is_balanced = True
+    pixels_dropped = {}
+    pixels_added = {}
+    
+    for year in unique_years[1:]:
+        year_pixels = pixels_by_year[year]
+        dropped = reference_pixels - year_pixels
+        added = year_pixels - reference_pixels
+        if dropped or added:
+            panel_is_balanced = False
+            if dropped:
+                pixels_dropped[year] = len(dropped)
+            if added:
+                pixels_added[year] = len(added)
+    
+    if panel_is_balanced:
+        print(f"✓ Panel composition is balanced: all {n_unique_pixels:,} pixels present in every year")
+    else:
+        print(f"⚠️  WARNING: Panel composition is NOT balanced across years!")
+        for year in unique_years[1:]:
+            if year in pixels_dropped or year in pixels_added:
+                dropped_str = f", {pixels_dropped.get(year, 0):,} pixels dropped" if year in pixels_dropped else ""
+                added_str = f", {pixels_added.get(year, 0):,} pixels added" if year in pixels_added else ""
+                print(f"   Year {year}: {len(pixels_by_year[year]):,} pixels{dropped_str}{added_str}")
     
     # Check structure
     expected_rows = n_unique_pixels * n_years
@@ -110,7 +158,8 @@ def analyze_panel():
     
     sample_rows = 0
     missing_counts = {col: 0 for col in columns}
-    numeric_stats = {}
+    # Accumulators for numeric statistics across ALL sampled row groups
+    numeric_accumulators = {}
     
     for idx, rg_idx in enumerate(sample_indices):
         if (idx + 1) % 5 == 0:
@@ -126,22 +175,48 @@ def analyze_panel():
             if col in df.columns:
                 missing_counts[col] += df[col].isnull().sum()
         
-        # Numeric stats (only for first batch to get types)
-        if idx == 0:
-            for col in columns:
-                if col in df.columns and np.issubdtype(df[col].dtype, np.number):
-                    vals = df[col].dropna()
-                    if len(vals) > 0:
-                        numeric_stats[col] = {
-                            'min': float(vals.min()),
-                            'max': float(vals.max()),
-                            'mean': float(vals.mean()),
-                            'std': float(vals.std()) if len(vals) > 1 else 0.0,
-                            'sample_size': len(vals)
-                        }
+        # Numeric stats: update accumulators for every sampled row group
+        for col in columns:
+            if col in df.columns and np.issubdtype(df[col].dtype, np.number):
+                vals = df[col].dropna()
+                if len(vals) == 0:
+                    continue
+                
+                if col not in numeric_accumulators:
+                    numeric_accumulators[col] = {
+                        'count': 0,
+                        'sum': 0.0,
+                        'sum_sq': 0.0,
+                        'min': float('inf'),
+                        'max': float('-inf')
+                    }
+                acc = numeric_accumulators[col]
+                acc['count'] += len(vals)
+                acc['sum'] += float(vals.sum())
+                acc['sum_sq'] += float((vals ** 2).sum())
+                acc['min'] = min(acc['min'], float(vals.min()))
+                acc['max'] = max(acc['max'], float(vals.max()))
         
         del df, table
     
+    # Finalize numeric statistics from accumulators
+    numeric_stats = {}
+    for col, acc in numeric_accumulators.items():
+        count = acc['count']
+        if count == 0:
+            continue
+        mean = acc['sum'] / count
+        # Population variance from sum of squares
+        var = max(acc['sum_sq'] / count - mean**2, 0.0)
+        std = var**0.5
+        numeric_stats[col] = {
+            'min': acc['min'],
+            'max': acc['max'],
+            'mean': mean,
+            'std': std,
+            'sample_size': count
+        }
+
     # Check structure
     print(f"\n" + "=" * 60)
     print("STRUCTURE CHECK (EXACT)")
@@ -156,6 +231,18 @@ def analyze_panel():
     year_values = list(rows_per_year.values())
     is_balanced = (max(year_values) - min(year_values)) / max(year_values) < 0.01 if year_values else True
     print(f"Balanced across years: {'Yes' if is_balanced else 'No'}")
+    
+    # Show duplicate status
+    if n_duplicates > 0:
+        print(f"⚠️  Duplicates found: {n_duplicates:,} duplicate (year, row, col) combinations")
+    else:
+        print(f"✓ No duplicate (year, row, col) combinations")
+    
+    # Show panel composition status
+    if panel_is_balanced:
+        print(f"✓ Panel composition: All pixels present in every year")
+    else:
+        print(f"⚠️  Panel composition: Pixels vary across years (see details above)")
     
     # Show rows per year
     print(f"\nRows per year:")
@@ -220,7 +307,12 @@ def analyze_panel():
             'expected_rows': expected_rows,
             'actual_rows': total_rows,
             'is_balanced': is_balanced,
-            'rows_per_year': rows_per_year
+            'rows_per_year': rows_per_year,
+            'has_duplicates': n_duplicates > 0,
+            'num_duplicates': int(n_duplicates),
+            'panel_composition_balanced': panel_is_balanced,
+            'pixels_dropped_by_year': {int(k): int(v) for k, v in pixels_dropped.items()} if pixels_dropped else {},
+            'pixels_added_by_year': {int(k): int(v) for k, v in pixels_added.items()} if pixels_added else {}
         },
         'missing_values': {
             'sample_rows': sample_rows,
