@@ -14,6 +14,7 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
+import glob
 
 import duckdb
 import matplotlib
@@ -38,15 +39,65 @@ OUTPUT_DIR = ROOT_DIR / "outputs" / "Figures" / "panel_visualisation"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 SCRATCH = os.environ.get("SCRATCH")
-candidate_paths = [
-    Path(os.environ.get("PANEL_FILE", "")),
-    Path(SCRATCH) / "data" / "ml" / "merged_panel_final.parquet" if SCRATCH else None,
-    ROOT_DIR / "data" / "ml" / "merged_panel_final.parquet"
-]
-PANEL_FILE = next((p for p in candidate_paths if p and p.exists()), None)
 
-if not PANEL_FILE:
-    raise FileNotFoundError(f"Parquet not found. Searched: {[str(p) for p in candidate_paths if p]}")
+def _sql_escape_string_literal(value: str) -> str:
+    """Escape a string for use inside single-quoted SQL string literals."""
+    return value.replace("'", "''")
+
+def _resolve_panel_path_spec_to_abs(spec: str) -> str:
+    """
+    Resolve PANEL_FILE spec to an absolute path/pattern relative to repo root.
+
+    - If spec is absolute: keep as-is.
+    - If spec is relative (incl. './...'): interpret relative to ROOT_DIR.
+    """
+    spec = spec.strip()
+    if not spec:
+        return spec
+    p = Path(spec)
+    if p.is_absolute():
+        return str(p)
+    # Interpret relative paths as relative to repo root for reproducibility
+    return str((ROOT_DIR / p).resolve())
+
+def resolve_panel_spec() -> str:
+    """
+    Decide what parquet path/pattern DuckDB should read.
+
+    Supports:
+    - A single file path
+    - A directory (reads '*.parquet' within it)
+    - A glob pattern (e.g. '**/*scored*.parquet')
+    """
+    env_spec = (os.environ.get("PANEL_FILE") or "").strip()
+    if env_spec:
+        abs_spec = _resolve_panel_path_spec_to_abs(env_spec)
+        # If it's a directory, turn into a parquet glob
+        if Path(abs_spec).exists() and Path(abs_spec).is_dir():
+            abs_spec = str(Path(abs_spec) / "*.parquet")
+        # If it looks like a glob, ensure it matches something (best-effort)
+        if any(ch in abs_spec for ch in ["*", "?", "["]):
+            matches = glob.glob(abs_spec, recursive=True)
+            if len(matches) == 0:
+                raise FileNotFoundError(f"PANEL_FILE glob matched 0 files: {abs_spec}")
+        else:
+            if not Path(abs_spec).exists():
+                raise FileNotFoundError(f"PANEL_FILE not found: {abs_spec}")
+        return abs_spec
+
+    # Fallbacks (Euler scratch first, then repo)
+    candidate_paths = [
+        Path(SCRATCH) / "data" / "ml" / "merged_panel_final.parquet" if SCRATCH else None,
+        Path(SCRATCH) / "data" / "ml" / "merged_panel_2000_2024.parquet" if SCRATCH else None,
+        ROOT_DIR / "data" / "ml" / "merged_panel_final.parquet",
+        ROOT_DIR / "data" / "ml" / "merged_panel_2000_2024.parquet",
+    ]
+    panel_file = next((p for p in candidate_paths if p and p.exists()), None)
+    if not panel_file:
+        raise FileNotFoundError(f"Parquet not found. Searched: {[str(p) for p in candidate_paths if p]}")
+    return str(panel_file)
+
+PANEL_SPEC = resolve_panel_spec()
 
 # ==========================================================================================
 # HELPERS
@@ -59,6 +110,16 @@ def q(name: str) -> str:
 def resolve_sample_method() -> str:
     raw = (os.environ.get("PANEL_VIS_SAMPLE_METHOD") or "system").lower()
     return "bernoulli" if "bern" in raw else "system"
+
+def panel_read_expr() -> str:
+    """
+    DuckDB relation expression for the panel parquet(s).
+
+    Key behavior:
+    - Always uses union_by_name=true to prevent schema-mismatch crashes when PANEL_FILE is a glob.
+    """
+    escaped = _sql_escape_string_literal(PANEL_SPEC)
+    return f"read_parquet('{escaped}', union_by_name=true)"
 
 def wb_log(data: dict):
     if wandb and wandb.run: wandb.log(data)
@@ -102,12 +163,12 @@ def plot_temporal_feature_comparison(con, feature: str, years=[2011, 2013, 2015]
     # 1. Get global scale for comparability
     scale_query = f"""
     SELECT min({q(feature)}) as vmin, max({q(feature)}) as vmax 
-    FROM read_parquet('{PANEL_FILE}') 
+    FROM {panel_read_expr()} 
     USING SAMPLE 1% ({method})
     """
     stats = con.execute(scale_query).fetchone()
     # Apply 1/99 clipping logic
-    clip_query = f"SELECT approx_quantile({q(feature)}, 0.01), approx_quantile({q(feature)}, 0.99) FROM read_parquet('{PANEL_FILE}')"
+    clip_query = f"SELECT approx_quantile({q(feature)}, 0.01), approx_quantile({q(feature)}, 0.99) FROM {panel_read_expr()}"
     vmin, vmax = con.execute(clip_query).fetchone()
 
     fig, axes = plt.subplots(1, 3, figsize=(20, 6), sharex=True, sharey=True)
@@ -115,7 +176,7 @@ def plot_temporal_feature_comparison(con, feature: str, years=[2011, 2013, 2015]
     for i, year in enumerate(years):
         df = con.execute(f"""
             SELECT row, col, {q(feature)} as val 
-            FROM read_parquet('{PANEL_FILE}') 
+            FROM {panel_read_expr()} 
             WHERE year = {year} AND {q(feature)} IS NOT NULL
             USING SAMPLE {sample_pct}% ({method}) 
             LIMIT 300000
@@ -149,7 +210,7 @@ def plot_time_series(con, label_col):
     query = f"""
         SELECT year, COUNT(*) AS rows, 
         {f"SUM(CASE WHEN {q(label_col)} = 1 THEN 1 ELSE 0 END)" if label_col else "0"} AS pos
-        FROM read_parquet('{PANEL_FILE}') GROUP BY year ORDER BY year
+        FROM {panel_read_expr()} GROUP BY year ORDER BY year
     """
     df = con.execute(query).df()
     fig, ax1 = plt.subplots(figsize=(12, 6))
@@ -168,8 +229,8 @@ def plot_spatial_map(con, label_col):
     if not label_col: return None
     print("Creating spatial map...")
     # Pull bg and pos separately to ensure context
-    bg = con.execute(f"SELECT row, col FROM read_parquet('{PANEL_FILE}') USING SAMPLE 0.5% LIMIT 200000").df()
-    pos = con.execute(f"SELECT row, col FROM read_parquet('{PANEL_FILE}') WHERE {q(label_col)}=1 USING SAMPLE 5%").df()
+    bg = con.execute(f"SELECT row, col FROM {panel_read_expr()} USING SAMPLE 0.5% LIMIT 200000").df()
+    pos = con.execute(f"SELECT row, col FROM {panel_read_expr()} WHERE {q(label_col)}=1 USING SAMPLE 5%").df()
     
     fig, ax = plt.subplots(figsize=(12, 10))
     ax.scatter(bg['col'], bg['row'], s=0.05, c='lightgray', alpha=0.1, rasterized=True)
@@ -184,13 +245,13 @@ def plot_spatial_map(con, label_col):
 # MAIN EXECUTION
 # ==========================================================================================
 def main():
-    print(f"Starting diagnostics for: {PANEL_FILE.name}")
+    print(f"Starting diagnostics for: {PANEL_SPEC}")
     print(f"Absolute Output: {OUTPUT_DIR.resolve()}")
     
     con = get_con()
     
     # 1. Resolve Label
-    schema = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{PANEL_FILE}') LIMIT 0").df()
+    schema = con.execute(f"DESCRIBE SELECT * FROM {panel_read_expr()} LIMIT 0").df()
     cols = schema['column_name'].tolist()
     label_col = os.environ.get("LABEL_COL") or ("transition_01" if "transition_01" in cols else None)
 
