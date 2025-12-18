@@ -390,12 +390,12 @@ def plot_spatial_map(con: duckdb.DuckDBPyConnection, parquet_path: Path, label_c
     # We therefore push the WHERE into a subquery and sample the subquery.
     query = f"""
     WITH sampled AS (
-        SELECT row, col
+        SELECT sub.row AS row, sub.col AS col
         FROM (
             SELECT row, col
             FROM read_parquet('{escaped_path}')
             WHERE {label_col} = 1
-        )
+        ) AS sub
         USING SAMPLE {sample_pct}% ({sample_method})
     ),
     bounds AS (
@@ -426,12 +426,12 @@ def plot_spatial_map(con: duckdb.DuckDBPyConnection, parquet_path: Path, label_c
 
     bounds_query = f"""
     WITH sampled AS (
-        SELECT row, col
+        SELECT sub.row AS row, sub.col AS col
         FROM (
             SELECT row, col
             FROM read_parquet('{escaped_path}')
             WHERE {label_col} = 1
-        )
+        ) AS sub
         USING SAMPLE {sample_pct}% ({sample_method})
     )
     SELECT COUNT(*) AS n_points, MIN(col) AS min_col, MAX(col) AS max_col, MIN(row) AS min_row, MAX(row) AS max_row
@@ -547,6 +547,8 @@ def plot_class_separation(con: duckdb.DuckDBPyConnection, parquet_path: Path, la
     
     # Filter to only features that exist
     existing_features = [f for f in top_features if f in available_cols]
+    # Guard against accidental inclusion of the label column in features (can create duplicate columns)
+    existing_features = [f for f in existing_features if f != label_col]
     
     if not existing_features:
         print(f"   Warning: None of the requested features found. Available columns: {list(available_cols)[:10]}...")
@@ -559,23 +561,23 @@ def plot_class_separation(con: duckdb.DuckDBPyConnection, parquet_path: Path, la
     
     sample_query = f"""
     (
-        SELECT {feature_list}, {label_col} AS label
+        SELECT {feature_list}, label
         FROM (
             SELECT {feature_list}, {label_col} AS label
             FROM read_parquet('{escaped_path}')
             WHERE {label_col} = 1
-        )
+        ) AS sub
         USING SAMPLE 10% (bernoulli)
         LIMIT {max_pos}
     )
     UNION ALL
     (
-        SELECT {feature_list}, {label_col} AS label
+        SELECT {feature_list}, label
         FROM (
             SELECT {feature_list}, {label_col} AS label
             FROM read_parquet('{escaped_path}')
             WHERE {label_col} = 0
-        )
+        ) AS sub
         USING SAMPLE 10% (bernoulli)
         LIMIT {max_neg}
     )
