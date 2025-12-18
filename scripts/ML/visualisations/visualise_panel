@@ -5,6 +5,13 @@ Panel dataset diagnostic visualizations & Data Integrity Debugger.
 Added Features:
 - Temporal Feature Comparison: Subplots comparing geography of 2011 vs 2013 vs 2015.
 - Robust Data Integrity Scan: Automated detection of row-count crashes.
+
+Usage notes:
+- Sampling method (DuckDB `USING SAMPLE`):
+  - Default: bernoulli
+  - Override: set `PANEL_VIS_SAMPLE_METHOD=system` (or any value not containing 'bern')
+  - Example:
+    - `PANEL_VIS_SAMPLE_METHOD=bernoulli python3 scripts/ML/visualisations/visualise_panel`
 """
 
 import os
@@ -52,6 +59,15 @@ def quote_ident(name: str) -> str:
 
 # Backwards-compatible alias (older code in this file used `q(...)`)
 q = quote_ident
+
+# SQL-expression overrides for specific features (used to sanitize known data issues in plots).
+# Key: feature name as it appears in the parquet schema
+# Value: SQL expression (unaliased) that evaluates to that feature.
+FEATURE_SQL_OVERRIDES: Dict[str, str] = {}
+
+def feature_sql(feature: str) -> str:
+    """Return SQL expression for a feature, applying any configured override."""
+    return FEATURE_SQL_OVERRIDES.get(feature, q(feature))
 
 def _resolve_panel_path_spec_to_abs(spec: str) -> str:
     """
@@ -112,7 +128,8 @@ PANEL_SPEC = resolve_panel_spec()
 # HELPERS
 # ==========================================================================================
 def resolve_sample_method() -> str:
-    raw = (os.environ.get("PANEL_VIS_SAMPLE_METHOD") or "system").lower()
+    # Default to Bernoulli sampling (more stable for approximate sampling across partitions).
+    raw = (os.environ.get("PANEL_VIS_SAMPLE_METHOD") or "bernoulli").lower()
     return "bernoulli" if "bern" in raw else "system"
 
 def resolve_coord_cols(cols: List[str]) -> Tuple[str, str]:
@@ -160,6 +177,80 @@ def panel_read_expr() -> str:
     """
     escaped = _sql_escape_string_literal(PANEL_SPEC)
     return f"read_parquet('{escaped}', union_by_name=true)"
+
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+
+def _configure_dist_wdpa_zero_recode(con, cols: List[str], label_col: Optional[str]) -> None:
+    """
+    Sanity check for dist_wdpa==0 and optionally treat them as missing in plots,
+    but ONLY under WDPA_prev==0 (risk set).
+
+    Behavior (env-configurable):
+    - PANEL_VIS_RECODE_DIST_WDPA_ZERO: 'auto' (default) | 1/true | 0/false
+    - PANEL_VIS_DIST_WDPA_ZERO_ABS_THRESHOLD: default 1000
+    - PANEL_VIS_DIST_WDPA_ZERO_RATIO_THRESHOLD: default 1e-4
+    """
+    if "dist_wdpa" not in cols or "WDPA_prev" not in cols:
+        return
+
+    # Counts
+    n_prev0_total = con.execute(
+        f"SELECT COUNT(*) FROM {panel_read_expr()} WHERE {q('WDPA_prev')} = 0"
+    ).fetchone()[0]
+    n_prev0_dist0 = con.execute(
+        f"SELECT COUNT(*) FROM {panel_read_expr()} WHERE {q('WDPA_prev')} = 0 AND {q('dist_wdpa')} = 0"
+    ).fetchone()[0]
+
+    n_pos_dist0 = None
+    if label_col and label_col in cols:
+        n_pos_total = con.execute(
+            f"SELECT COUNT(*) FROM {panel_read_expr()} WHERE {q(label_col)} = 1"
+        ).fetchone()[0]
+        n_pos_dist0 = con.execute(
+            f"SELECT COUNT(*) FROM {panel_read_expr()} WHERE {q(label_col)} = 1 AND {q('dist_wdpa')} = 0"
+        ).fetchone()[0]
+    else:
+        n_pos_total = None
+
+    ratio_prev0 = float(n_prev0_dist0) / max(int(n_prev0_total), 1)
+    if n_pos_total is not None:
+        ratio_pos = float(n_pos_dist0) / max(int(n_pos_total), 1)
+    else:
+        ratio_pos = None
+
+    print("\nWDPA distance sanity checks:")
+    print(f"  WDPA_prev==0 AND dist_wdpa==0: {n_prev0_dist0:,} / {n_prev0_total:,} ({ratio_prev0:.6%})")
+    if n_pos_total is not None and n_pos_dist0 is not None:
+        print(f"  transition_01==1 AND dist_wdpa==0: {n_pos_dist0:,} / {n_pos_total:,} ({ratio_pos:.6%})")
+
+    # Decide recode
+    mode = (os.environ.get("PANEL_VIS_RECODE_DIST_WDPA_ZERO") or "auto").strip().lower()
+    abs_thresh = int(os.environ.get("PANEL_VIS_DIST_WDPA_ZERO_ABS_THRESHOLD", "1000"))
+    ratio_thresh = float(os.environ.get("PANEL_VIS_DIST_WDPA_ZERO_RATIO_THRESHOLD", "1e-4"))
+
+    if mode in ("1", "true", "yes", "y", "on"):
+        enable = True
+        reason = "forced on by PANEL_VIS_RECODE_DIST_WDPA_ZERO"
+    elif mode in ("0", "false", "no", "n", "off"):
+        enable = False
+        reason = "forced off by PANEL_VIS_RECODE_DIST_WDPA_ZERO"
+    else:
+        enable = (n_prev0_dist0 >= abs_thresh) or (ratio_prev0 >= ratio_thresh)
+        reason = f"auto (abs>={abs_thresh} or ratio>={ratio_thresh})"
+
+    if enable:
+        # Treat dist_wdpa==0 as missing ONLY when WDPA_prev==0.
+        # This avoids turning legitimate zero distances into missing in other parts of the data.
+        FEATURE_SQL_OVERRIDES["dist_wdpa"] = (
+            f"CASE WHEN {q('WDPA_prev')} = 0 THEN NULLIF({q('dist_wdpa')}, 0) ELSE {q('dist_wdpa')} END"
+        )
+        print(f"  -> Applying plot-only recode for dist_wdpa zeros under WDPA_prev==0 ({reason}).")
+    else:
+        print(f"  -> Not recoding dist_wdpa zeros ({reason}).")
 
 def wb_log(data: dict):
     if wandb and wandb.run: wandb.log(data)
@@ -235,14 +326,15 @@ def plot_temporal_feature_comparison(
 
     # 1. Strict global color scale from combined 3-year sample (2nd/98th percentiles)
     year_list = ",".join(str(int(y)) for y in years)
+    feat_expr = feature_sql(feature)
     clip_query = f"""
         SELECT
             approx_quantile(val, 0.02) AS vmin,
             approx_quantile(val, 0.98) AS vmax
         FROM (
-            SELECT {q(feature)} AS val
+            SELECT {feat_expr} AS val
             FROM {panel_read_expr()}
-            WHERE year IN ({year_list}) AND {q(feature)} IS NOT NULL
+            WHERE year IN ({year_list}) AND {feat_expr} IS NOT NULL
             USING SAMPLE {sample_pct}% ({method})
         ) t
     """
@@ -256,9 +348,9 @@ def plot_temporal_feature_comparison(
     year_dfs: Dict[int, pd.DataFrame] = {}
     for i, year in enumerate(years):
         df = con.execute(f"""
-            SELECT {q(cy)} AS y, {q(cx)} AS x, {q(feature)} AS val
+            SELECT {q(cy)} AS y, {q(cx)} AS x, {feat_expr} AS val
             FROM {panel_read_expr()} 
-            WHERE year = {int(year)} AND {q(feature)} IS NOT NULL
+            WHERE year = {int(year)} AND {feat_expr} IS NOT NULL
             USING SAMPLE {sample_pct}% ({method}) 
             LIMIT 300000
         """).df()
@@ -365,7 +457,7 @@ def plot_time_series(con, label_col):
         ax2 = ax1.twinx()
         ax2.bar(df['year'], df['pos'], color='tab:orange', alpha=0.4, label='Positives')
         ax2.set_ylabel('Positives', color='tab:orange')
-    plt.title(f"Temporal Distribution (Highlighting 2012-2014 collapse)")
+    plt.title("Risk set size by year (shrinks as pixels become protected)")
     out = OUTPUT_DIR / "time_series.png"
     plt.savefig(out, dpi=300); plt.close()
     return out
@@ -373,17 +465,40 @@ def plot_time_series(con, label_col):
 def plot_spatial_map(con, label_col):
     if not label_col: return None
     print("Creating spatial map...")
+    method = resolve_sample_method()
     schema = con.execute(f"DESCRIBE SELECT * FROM {panel_read_expr()} LIMIT 0").df()
     cols = schema["column_name"].tolist()
     cx, cy = resolve_coord_cols(cols)
 
+    year_ref = int(os.environ.get("PANEL_VIS_MAP_YEAR", "2024"))
+    pos_year = int(os.environ.get("PANEL_VIS_POS_YEAR", str(year_ref)))
+
     # Pull background from the full risk set to show geographic footprint clearly
+    # IMPORTANT: pin to a single reference year to avoid multi-year duplicates inflating footprint.
     bg = con.execute(
-        f"SELECT {q(cx)} AS x, {q(cy)} AS y FROM {panel_read_expr()} USING SAMPLE 2% (system) LIMIT 600000"
+        f"""
+        SELECT DISTINCT x, y
+        FROM (
+            SELECT {q(cx)} AS x, {q(cy)} AS y
+            FROM {panel_read_expr()}
+            WHERE year = {year_ref}
+            USING SAMPLE 2% ({method})
+            LIMIT 800000
+        ) t
+        """
     ).df()
     # Overlay positives (if any)
     pos = con.execute(
-        f"SELECT {q(cx)} AS x, {q(cy)} AS y FROM {panel_read_expr()} WHERE {q(label_col)}=1 USING SAMPLE 10% (system) LIMIT 300000"
+        f"""
+        SELECT DISTINCT x, y
+        FROM (
+            SELECT {q(cx)} AS x, {q(cy)} AS y
+            FROM {panel_read_expr()}
+            WHERE year = {pos_year} AND {q(label_col)} = 1
+            USING SAMPLE 10% ({method})
+            LIMIT 300000
+        ) t
+        """
     ).df()
     
     fig, ax = plt.subplots(figsize=(12, 10))
@@ -391,7 +506,10 @@ def plot_spatial_map(con, label_col):
     if not pos.empty:
         ax.scatter(pos['x'], pos['y'], s=0.5, c='red', alpha=0.5, rasterized=True)
     ax.set_aspect('equal')
-    ax.set_title(f"Spatial Distribution of Positives ({label_col}=1)")
+    if pos_year == year_ref:
+        ax.set_title(f"Spatial distribution of positives ({label_col}=1), year={year_ref}")
+    else:
+        ax.set_title(f"Spatial distribution of positives ({label_col}=1), bg_year={year_ref}, pos_year={pos_year}")
     out = OUTPUT_DIR / "spatial_map.png"
     plt.savefig(out, dpi=300); plt.close()
     return out
@@ -431,7 +549,8 @@ def _select_top_variance_features(
     # we rank by robust percentile spread instead of variance.
     select_exprs = []
     for c in numeric_cols:
-        val = f"CAST({q(c)} AS DOUBLE)"
+        base_expr = feature_sql(c)
+        val = f"CAST(({base_expr}) AS DOUBLE)"
         # Filter NaN/Inf and extreme magnitudes to keep quantiles stable
         val_clean = f"CASE WHEN {val} IS NOT NULL AND {val} = {val} AND abs({val}) < 1e308 THEN {val} ELSE NULL END"
         select_exprs.append(f"approx_quantile({val_clean}, 0.02) AS {q(c + '__q02')}")
@@ -500,11 +619,12 @@ def plot_class_separation(con, label_col: str, numeric_cols: List[str]):
     axes = axes.ravel()
     for i, feat in enumerate(feats):
         ax = axes[i]
+        feat_expr = feature_sql(feat)
         df = con.execute(
             f"""
-            SELECT {q(label_col)} AS label, {q(feat)} AS val
+            SELECT {q(label_col)} AS label, {feat_expr} AS val
             FROM {panel_read_expr()}
-            WHERE {q(label_col)} IS NOT NULL AND {q(feat)} IS NOT NULL
+            WHERE {q(label_col)} IS NOT NULL AND {feat_expr} IS NOT NULL
             USING SAMPLE {sample_pct}% ({method})
             LIMIT 350000
             """
@@ -585,7 +705,7 @@ def plot_correlation_matrix(con, numeric_cols: List[str], max_features: int = 60
         print("Correlation matrix: insufficient non-flat features found; skipping.")
         return None
 
-    sel = ", ".join(q(c) for c in feats)
+    sel = ", ".join(f"{feature_sql(c)} AS {q(c)}" for c in feats)
     df = con.execute(
         f"""
         SELECT {sel}
@@ -628,6 +748,7 @@ def plot_correlation_matrix(con, numeric_cols: List[str], max_features: int = 60
 def main():
     print(f"Starting diagnostics for: {PANEL_SPEC}")
     print(f"Absolute Output: {OUTPUT_DIR.resolve()}")
+    print(f"Sampling method (PANEL_VIS_SAMPLE_METHOD): {resolve_sample_method()}")
     
     con = get_con()
     
@@ -635,6 +756,9 @@ def main():
     schema = con.execute(f"DESCRIBE SELECT * FROM {panel_read_expr()} LIMIT 0").df()
     cols = schema['column_name'].tolist()
     label_col = os.environ.get("LABEL_COL") or ("transition_01" if "transition_01" in cols else None)
+
+    # 1b. dist_wdpa sanity checks + plot-only recode (optional/auto)
+    _configure_dist_wdpa_zero_recode(con, cols, label_col)
 
     # 2. Start W&B
     use_wandb = bool(int(os.environ.get("PANEL_VIS_WANDB", "0")))

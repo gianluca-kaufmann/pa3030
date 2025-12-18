@@ -55,6 +55,7 @@ class Tee:
 # Configuration
 RANDOM_STATE = 42
 EXCLUDE_COLS = {'transition_01', 'WDPA_b1', 'WDPA_prev', 'x', 'y', 'row', 'col', 'year'}
+MIN_YEAR = int(os.environ.get("TRANSITION_MIN_YEAR", "2001"))  # drop year 2000 by default
 TRAIN_EARLY_YEAR_MAX = 2014
 VAL_LATE_YEAR_MIN = 2015
 VAL_LATE_YEAR_MAX = 2017
@@ -496,7 +497,7 @@ def phase1_training(
     print(f"\nSTEP A: Train on train_early (year <= {TRAIN_EARLY_YEAR_MAX})")
     X_train_early, y_train_early, train_early_pos, train_early_neg, train_years = load_numpy_arrays_two_pass(
         train_path, feature_cols, target_col, 
-        lambda y: y <= TRAIN_EARLY_YEAR_MAX, "train_early_sampled.parquet",
+        lambda y: (y >= MIN_YEAR) & (y <= TRAIN_EARLY_YEAR_MAX), "train_early_sampled.parquet",
         max_samples=None
     )
     report_memory_usage("after STEP A")
@@ -560,7 +561,7 @@ def phase1_training(
     
     X_train_part, y_train_part, train_part_pos, train_part_neg, train_part_years = load_numpy_arrays_two_pass(
         train_path, feature_cols, target_col,
-        lambda y: y <= TRAIN_EARLY_YEAR_MAX, "train_early_sampled.parquet",
+        lambda y: (y >= MIN_YEAR) & (y <= TRAIN_EARLY_YEAR_MAX), "train_early_sampled.parquet",
         max_samples=MAX_SAMPLES_FULL_TRAIN
     )
     report_memory_usage("after loading train_part")

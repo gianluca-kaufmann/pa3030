@@ -78,6 +78,7 @@ class CalibratedLGBMWrapper:
 # Configuration
 RANDOM_STATE = 42
 EXCLUDE_COLS = {'transition_01', 'WDPA_b1', 'WDPA_prev', 'x', 'y', 'row', 'col', 'year'}
+MIN_YEAR = int(os.environ.get("TRANSITION_MIN_YEAR", "2001"))  # drop year 2000 by default
 TRAIN_EARLY_YEAR_MAX = 2014
 VAL_STOPPING_YEARS = (2015, 2015)
 VAL_CALIBRATION_YEARS = (2016, 2017)
@@ -389,7 +390,7 @@ def phase1_training(
     report_memory_usage("start of Phase 1")
     print("\nSTEP A: LOAD TRAIN_EARLY (≤2014)")
     X_train_early, y_train_early, train_early_pos, train_early_neg, train_years = load_numpy_arrays_two_pass(
-        train_path, feature_cols, target_col, lambda y: y <= TRAIN_EARLY_YEAR_MAX, "train_early_sampled.parquet")
+        train_path, feature_cols, target_col, lambda y: (y >= MIN_YEAR) & (y <= TRAIN_EARLY_YEAR_MAX), "train_early_sampled.parquet")
     n_train_full = len(y_train_early)
     train_stats = {
         "n_train": n_train_full,

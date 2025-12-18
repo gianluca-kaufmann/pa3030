@@ -78,6 +78,7 @@ SAMPLE_SIZE = 1_000_000  # ~1M rows
 TRAIN_YEAR_MAX = 2014  # train_idx = year <= 2014
 VAL_YEAR_MIN = 2015    # val_idx = 2015 <= year <= 2017
 VAL_YEAR_MAX = 2017
+MIN_YEAR = int(os.environ.get("TRANSITION_MIN_YEAR", "2001"))  # drop year 2000 by default
 
 # Columns to exclude from features
 EXCLUDE_COLS = {
@@ -292,6 +293,14 @@ def main() -> None:
     dropped = len(df) - len(df_clean)
     if dropped > 0:
         print(f"\nDropped {dropped:,} rows with missing target")
+
+    # Drop year 2000 for transition modeling (avoid treating existing PAs as transitions)
+    if "year" in df_clean.columns:
+        before = len(df_clean)
+        df_clean = df_clean[df_clean["year"] >= MIN_YEAR].copy()
+        removed = before - len(df_clean)
+        if removed > 0:
+            print(f"\nDropped {removed:,} rows with year < {MIN_YEAR} (TRANSITION_MIN_YEAR)")
     
     print(f"\nFinal dataset: {len(df_clean):,} rows")
     
