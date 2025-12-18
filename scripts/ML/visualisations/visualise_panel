@@ -197,19 +197,36 @@ def resolve_label_col(con: duckdb.DuckDBPyConnection, parquet_path: Path) -> Opt
     ).df()
     cols = set(schema_df["column_name"].tolist())
 
+    def _can_bind(col_name: str) -> bool:
+        """
+        Extra safety: even if a column appears in DESCRIBE, ensure DuckDB can bind it.
+        This prevents downstream BinderExceptions in label-based plots.
+        """
+        try:
+            # LIMIT 0 keeps this metadata-only; it should be fast even on huge parquet files.
+            con.execute(f"SELECT {col_name} FROM read_parquet('{escaped_path}') LIMIT 0")
+            return True
+        except Exception as e:
+            print(
+                f"Warning: Detected label column {col_name!r} but DuckDB cannot bind it "
+                f"for this parquet ({type(e).__name__}: {e}). Label-based plots will be skipped."
+            )
+            wb_log({"label/bind_failed": True, "label/bind_failed_col": col_name, "label/bind_failed_err": str(e)})
+            return False
+
     env_label = os.environ.get("LABEL_COL")
     if env_label:
-        if env_label in cols:
+        if env_label in cols and _can_bind(env_label):
             return env_label
         print(
-            f"Warning: LABEL_COL={env_label!r} was provided but is not present in the parquet schema. "
+            f"Warning: LABEL_COL={env_label!r} was provided but is not present (or not bindable) in the parquet schema. "
             "Label-based plots will be skipped unless you set LABEL_COL to an existing column."
         )
         wb_log({"label/env_label_missing": True, "label/env_label": env_label})
         return None
 
     # Project default label (only if actually present)
-    if "transition_01" in cols:
+    if "transition_01" in cols and _can_bind("transition_01"):
         return "transition_01"
 
     # Soft fallback: detect common alternative label column names if present.
@@ -223,7 +240,7 @@ def resolve_label_col(con: duckdb.DuckDBPyConnection, parquet_path: Path) -> Opt
         "WDPA_transition",
     ]
     for cand in fallback_candidates:
-        if cand in cols:
+        if cand in cols and _can_bind(cand):
             print(f"Note: Using detected label column {cand!r} (fallback).")
             wb_log({"label/fallback_used": True, "label/fallback_col": cand})
             return cand
