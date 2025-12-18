@@ -13,13 +13,15 @@ import getpass
 import warnings
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple, Dict
 import glob
 
 import duckdb
 import matplotlib
 matplotlib.use("Agg")  # Headless-safe
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+from matplotlib.ticker import FuncFormatter
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -43,6 +45,13 @@ SCRATCH = os.environ.get("SCRATCH")
 def _sql_escape_string_literal(value: str) -> str:
     """Escape a string for use inside single-quoted SQL string literals."""
     return value.replace("'", "''")
+
+def quote_ident(name: str) -> str:
+    """DuckDB identifier quoting (double quotes)."""
+    return '"' + name.replace('"', '""') + '"'
+
+# Backwards-compatible alias (older code in this file used `q(...)`)
+q = quote_ident
 
 def _resolve_panel_path_spec_to_abs(spec: str) -> str:
     """
@@ -102,14 +111,45 @@ PANEL_SPEC = resolve_panel_spec()
 # ==========================================================================================
 # HELPERS
 # ==========================================================================================
-def q(name: str) -> str:
-    """Standard DuckDB identifier quoting."""
-    # Escape embedded quotes per SQL identifier rules: " -> ""
-    return '"' + name.replace('"', '""') + '"'
-
 def resolve_sample_method() -> str:
     raw = (os.environ.get("PANEL_VIS_SAMPLE_METHOD") or "system").lower()
     return "bernoulli" if "bern" in raw else "system"
+
+def resolve_coord_cols(cols: List[str]) -> Tuple[str, str]:
+    """
+    Choose best-available coordinate columns for plotting.
+
+    Preference order:
+    - x/y
+    - lon/lat
+    - longitude/latitude
+    - easting/northing
+    - col/row (fallback to binned grid indices)
+    """
+    cset = set(cols)
+    for x, y in [("x", "y"), ("lon", "lat"), ("longitude", "latitude"), ("easting", "northing"), ("col", "row")]:
+        if x in cset and y in cset:
+            return x, y
+    # Last resort: keep current behavior (will raise a clearer error later)
+    return "col", "row"
+
+def _neutral_diverging_cmap() -> LinearSegmentedColormap:
+    """Diverging cmap with an explicit neutral midpoint (light gray/white)."""
+    return LinearSegmentedColormap.from_list(
+        "coolwarm_neutral_mid",
+        ["#3b4cc0", "#f2f2f2", "#b40426"],
+        N=256,
+    )
+
+def _is_numeric_duckdb_type(type_str: str) -> bool:
+    """Best-effort numeric type detection from DuckDB DESCRIBE column_type."""
+    t = (type_str or "").upper()
+    numeric_markers = [
+        "TINYINT", "SMALLINT", "INTEGER", "INT", "BIGINT", "HUGEINT",
+        "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT",
+        "FLOAT", "DOUBLE", "REAL", "DECIMAL",
+    ]
+    return any(m in t for m in numeric_markers)
 
 def panel_read_expr() -> str:
     """
@@ -131,6 +171,22 @@ def wb_log_image(key: str, path: Path, caption: str):
         except Exception as e:
             print(f"W&B Image Log Error: {e}")
 
+def wb_log_artifact_pngs(output_dir: Path, artifact_name: Optional[str] = None):
+    """Log all PNGs in output_dir as a W&B Artifact for versioned lineage."""
+    if not (wandb and wandb.run):
+        return
+    pngs = sorted(output_dir.glob("*.png"))
+    if not pngs:
+        return
+    name = artifact_name or f"panel_visualisation_pngs_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    try:
+        art = wandb.Artifact(name=name, type="panel_visualisation")
+        for p in pngs:
+            art.add_file(str(p))
+        wandb.log_artifact(art)
+    except Exception as e:
+        print(f"W&B Artifact Log Error: {e}")
+
 # ==========================================================================================
 # DUCKDB CONFIGURATION
 # ==========================================================================================
@@ -148,43 +204,69 @@ def get_con():
     
     tmp = Path(os.environ.get("SCRATCH", ROOT_DIR)) / "duckdb_temp"
     tmp.mkdir(parents=True, exist_ok=True)
-    con.execute(f"SET temp_directory='{tmp}'")
+    tmp_sql = _sql_escape_string_literal(str(tmp))
+    con.execute(f"SET temp_directory='{tmp_sql}'")
     return con
 
 # ==========================================================================================
 # TEMPORAL FEATURE COMPARISON (DEBUGGER)
 # ==========================================================================================
-def plot_temporal_feature_comparison(con, feature: str, years=[2011, 2013, 2015]):
-    """Compare geography of a feature across 2011 (good), 2013 (crash), and 2015 (good)."""
-    print(f"Creating Temporal Comparison for {feature}...")
-    sample_pct = 2.0
-    method = resolve_sample_method()
-    
-    # 1. Get global scale for comparability
-    scale_query = f"""
-    SELECT min({q(feature)}) as vmin, max({q(feature)}) as vmax 
-    FROM {panel_read_expr()} 
-    USING SAMPLE 1% ({method})
+def plot_temporal_feature_comparison(
+    con,
+    feature: str,
+    years=[2011, 2013, 2015],
+    show_density_diff: Optional[bool] = None,
+):
     """
-    stats = con.execute(scale_query).fetchone()
-    # Apply 1/99 clipping logic
-    clip_query = f"SELECT approx_quantile({q(feature)}, 0.01), approx_quantile({q(feature)}, 0.99) FROM {panel_read_expr()}"
+    Compare geography of a feature across years, with a strict global color scale.
+
+    - Global color scale: 2nd/98th percentiles computed on the combined 3-year sample.
+    - Optional density-difference panel (2011 vs 2013) to highlight spatial loss during collapse.
+    """
+    print(f"Creating Temporal Comparison for {feature}...")
+    sample_pct = float(os.environ.get("PANEL_VIS_TEMPORAL_SAMPLE_PCT", "2.0"))
+    method = resolve_sample_method()
+    show_density_diff = bool(int(os.environ.get("PANEL_VIS_SHOW_DENSITY_DIFF", "1"))) if show_density_diff is None else show_density_diff
+    
+    # 0. Pick coordinates (avoid row/col if x/y or lon/lat exist)
+    schema = con.execute(f"DESCRIBE SELECT * FROM {panel_read_expr()} LIMIT 0").df()
+    cols = schema["column_name"].tolist()
+    cx, cy = resolve_coord_cols(cols)
+
+    # 1. Strict global color scale from combined 3-year sample (2nd/98th percentiles)
+    year_list = ",".join(str(int(y)) for y in years)
+    clip_query = f"""
+        SELECT
+            approx_quantile(val, 0.02) AS vmin,
+            approx_quantile(val, 0.98) AS vmax
+        FROM (
+            SELECT {q(feature)} AS val
+            FROM {panel_read_expr()}
+            WHERE year IN ({year_list}) AND {q(feature)} IS NOT NULL
+            USING SAMPLE {sample_pct}% ({method})
+        ) t
+    """
     vmin, vmax = con.execute(clip_query).fetchone()
 
-    fig, axes = plt.subplots(1, 3, figsize=(20, 6), sharex=True, sharey=True)
+    ncols = 4 if show_density_diff else 3
+    fig, axes = plt.subplots(1, ncols, figsize=(6.5 * ncols, 6), sharex=True, sharey=True)
+    if ncols == 1:
+        axes = [axes]
     
+    year_dfs: Dict[int, pd.DataFrame] = {}
     for i, year in enumerate(years):
         df = con.execute(f"""
-            SELECT row, col, {q(feature)} as val 
+            SELECT {q(cy)} AS y, {q(cx)} AS x, {q(feature)} AS val
             FROM {panel_read_expr()} 
-            WHERE year = {year} AND {q(feature)} IS NOT NULL
+            WHERE year = {int(year)} AND {q(feature)} IS NOT NULL
             USING SAMPLE {sample_pct}% ({method}) 
             LIMIT 300000
         """).df()
+        year_dfs[int(year)] = df
         
         ax = axes[i]
         if not df.empty:
-            sc = ax.scatter(df['col'], df['row'], c=df['val'], s=0.1, 
+            sc = ax.scatter(df['x'], df['y'], c=df['val'], s=0.1,
                             cmap='viridis', vmin=vmin, vmax=vmax, rasterized=True)
             ax.set_title(f"Year {year} (n={len(df):,})", fontsize=12)
         else:
@@ -192,7 +274,70 @@ def plot_temporal_feature_comparison(con, feature: str, years=[2011, 2013, 2015]
             
         ax.set_aspect('equal')
 
-    plt.suptitle(f"Temporal Integrity Check: {feature} (2011 vs 2013 vs 2015)", fontsize=15, fontweight='bold')
+    # 2. Optional density difference (2011 vs 2013)
+    if show_density_diff:
+        ax = axes[-1]
+        if len(years) > 1:
+            y0, y1 = int(years[0]), int(years[1])
+        else:
+            y0 = y1 = int(years[0])
+        # IMPORTANT: density diff should reflect the risk set footprint (not just non-null feature rows)
+        dens_sample_pct = float(os.environ.get("PANEL_VIS_DENSITY_SAMPLE_PCT", str(sample_pct)))
+        a = con.execute(
+            f"""
+            SELECT {q(cy)} AS y, {q(cx)} AS x
+            FROM {panel_read_expr()}
+            WHERE year = {y0}
+            USING SAMPLE {dens_sample_pct}% ({method})
+            LIMIT 500000
+            """
+        ).df()
+        b = con.execute(
+            f"""
+            SELECT {q(cy)} AS y, {q(cx)} AS x
+            FROM {panel_read_expr()}
+            WHERE year = {y1}
+            USING SAMPLE {dens_sample_pct}% ({method})
+            LIMIT 500000
+            """
+        ).df()
+        if a.empty or b.empty:
+            ax.set_title(f"Density diff ({y0} vs {y1}) (EMPTY)", color="red")
+        else:
+            x_all = pd.concat([a["x"], b["x"]], ignore_index=True)
+            y_all = pd.concat([a["y"], b["y"]], ignore_index=True)
+            xmin, xmax = float(x_all.min()), float(x_all.max())
+            ymin, ymax = float(y_all.min()), float(y_all.max())
+
+            bins = int(os.environ.get("PANEL_VIS_DENSITY_BINS", "260"))
+            ha, xe, ye = np.histogram2d(a["x"].to_numpy(), a["y"].to_numpy(), bins=bins, range=[[xmin, xmax], [ymin, ymax]])
+            hb, _, _ = np.histogram2d(b["x"].to_numpy(), b["y"].to_numpy(), bins=[xe, ye])
+
+            da = ha / max(ha.sum(), 1.0)
+            db = hb / max(hb.sum(), 1.0)
+            diff = (da - db).T  # transpose for imshow orientation (y as rows)
+
+            vmax_d = float(np.nanpercentile(np.abs(diff), 99))
+            norm = TwoSlopeNorm(vmin=-vmax_d, vcenter=0.0, vmax=vmax_d)
+            im = ax.imshow(
+                diff,
+                origin="lower",
+                extent=[xmin, xmax, ymin, ymax],
+                cmap=_neutral_diverging_cmap(),
+                norm=norm,
+                interpolation="nearest",
+                rasterized=True,
+            )
+            ax.set_title(f"Density diff: {y0} - {y1}", fontsize=12)
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label("Δ density (normalized)")
+        ax.set_aspect("equal")
+
+    plt.suptitle(
+        f"Temporal Integrity Check: {feature} ({' vs '.join(map(str, years))})",
+        fontsize=15,
+        fontweight='bold',
+    )
     fig.subplots_adjust(right=0.92)
     cbar_ax = fig.add_axes([0.94, 0.15, 0.015, 0.7])
     fig.colorbar(plt.cm.ScalarMappable(norm=plt.Normalize(vmin, vmax), cmap='viridis'), cax=cbar_ax, label=feature)
@@ -228,17 +373,253 @@ def plot_time_series(con, label_col):
 def plot_spatial_map(con, label_col):
     if not label_col: return None
     print("Creating spatial map...")
-    # Pull bg and pos separately to ensure context
-    bg = con.execute(f"SELECT row, col FROM {panel_read_expr()} USING SAMPLE 0.5% LIMIT 200000").df()
-    pos = con.execute(f"SELECT row, col FROM {panel_read_expr()} WHERE {q(label_col)}=1 USING SAMPLE 5%").df()
+    schema = con.execute(f"DESCRIBE SELECT * FROM {panel_read_expr()} LIMIT 0").df()
+    cols = schema["column_name"].tolist()
+    cx, cy = resolve_coord_cols(cols)
+
+    # Pull background from the full risk set to show geographic footprint clearly
+    bg = con.execute(
+        f"SELECT {q(cx)} AS x, {q(cy)} AS y FROM {panel_read_expr()} USING SAMPLE 2% (system) LIMIT 600000"
+    ).df()
+    # Overlay positives (if any)
+    pos = con.execute(
+        f"SELECT {q(cx)} AS x, {q(cy)} AS y FROM {panel_read_expr()} WHERE {q(label_col)}=1 USING SAMPLE 10% (system) LIMIT 300000"
+    ).df()
     
     fig, ax = plt.subplots(figsize=(12, 10))
-    ax.scatter(bg['col'], bg['row'], s=0.05, c='lightgray', alpha=0.1, rasterized=True)
-    ax.scatter(pos['col'], pos['row'], s=0.5, c='red', alpha=0.5, rasterized=True)
+    ax.scatter(bg['x'], bg['y'], s=0.05, c='lightgray', alpha=0.15, rasterized=True)
+    if not pos.empty:
+        ax.scatter(pos['x'], pos['y'], s=0.5, c='red', alpha=0.5, rasterized=True)
     ax.set_aspect('equal')
     ax.set_title(f"Spatial Distribution of Positives ({label_col}=1)")
     out = OUTPUT_DIR / "spatial_map.png"
     plt.savefig(out, dpi=300); plt.close()
+    return out
+
+# ==========================================================================================
+# CLASS SEPARATION + FEATURE SELECTION
+# ==========================================================================================
+def _is_near_flat(var_samp: float, q02: float, q98: float) -> bool:
+    """Exclude exactly-flat or effectively-flat features (e.g., var_samp≈0, tiny percentile spread)."""
+    if q02 is None or q98 is None or np.isnan(q02) or np.isnan(q98):
+        return True
+    if var_samp is not None and (not np.isnan(var_samp)) and var_samp <= 0:
+        return True
+    spread = float(q98) - float(q02)
+    # Scale-aware threshold: require some meaningful spread relative to magnitude
+    scale = max(abs(float(q02)), abs(float(q98)), 1.0)
+    return spread <= (1e-6 * scale)
+
+def _select_top_variance_features(
+    con,
+    numeric_cols: List[str],
+    max_features: int = 4,
+    sample_pct: float = 2.0,
+    method: Optional[str] = None,
+) -> List[str]:
+    """
+    Pick top-variance features, strictly skipping flat/near-flat ones.
+    Returns up to max_features.
+    """
+    if not numeric_cols:
+        return []
+    method = method or resolve_sample_method()
+    sample_pct = float(sample_pct)
+
+    # IMPORTANT: compute all aggregates in a single scan (avoid per-column scans).
+    # NOTE: DuckDB can throw OutOfRange for VARSAMP on extreme-value columns; for robustness
+    # we rank by robust percentile spread instead of variance.
+    select_exprs = []
+    for c in numeric_cols:
+        val = f"CAST({q(c)} AS DOUBLE)"
+        # Filter NaN/Inf and extreme magnitudes to keep quantiles stable
+        val_clean = f"CASE WHEN {val} IS NOT NULL AND {val} = {val} AND abs({val}) < 1e308 THEN {val} ELSE NULL END"
+        select_exprs.append(f"approx_quantile({val_clean}, 0.02) AS {q(c + '__q02')}")
+        select_exprs.append(f"approx_quantile({val_clean}, 0.98) AS {q(c + '__q98')}")
+
+    query = f"""
+        SELECT
+            {", ".join(select_exprs)}
+        FROM {panel_read_expr()}
+        USING SAMPLE {sample_pct}% ({method})
+    """
+    row = con.execute(query).fetchone()
+    if row is None:
+        return []
+    colnames = [d[0] for d in con.description]
+    stats_map = dict(zip(colnames, row))
+
+    records = []
+    for c in numeric_cols:
+        q02 = stats_map.get(c + "__q02")
+        q98 = stats_map.get(c + "__q98")
+        spread = (float(q98) - float(q02)) if (q02 is not None and q98 is not None and not np.isnan(q02) and not np.isnan(q98)) else np.nan
+        records.append({"feature": c, "q02": q02, "q98": q98, "spread_02_98": spread})
+    stats = pd.DataFrame.from_records(records)
+    stats["is_flat"] = stats.apply(lambda r: _is_near_flat(None, r["q02"], r["q98"]), axis=1)
+    stats = stats[~stats["is_flat"]].copy()
+    stats = stats.sort_values("spread_02_98", ascending=False)
+    return stats["feature"].head(max_features).tolist()
+
+def _auto_scale_transform(values: np.ndarray, skew_thresh: float = 2.0):
+    """
+    Decide scaling mode for plotting feature distributions.
+    Returns (mode, forward, inverse, formatter) where mode in {'linear','log1p','symlog'}.
+    """
+    s = pd.Series(values).dropna()
+    if s.empty:
+        return "linear", (lambda x: x), (lambda x: x), None
+    skew = float(s.skew())
+    if abs(skew) < float(skew_thresh):
+        return "linear", (lambda x: x), (lambda x: x), None
+
+    vmin = float(s.min())
+    if vmin >= 0:
+        fwd = np.log1p
+        inv = np.expm1
+        fmt = FuncFormatter(lambda t, pos: f"{inv(t):.3g}")
+        return "log1p", fwd, inv, fmt
+    # Mixed-sign: prefer symlog on axis (keeps units)
+    return "symlog", (lambda x: x), (lambda x: x), None
+
+def plot_class_separation(con, label_col: str, numeric_cols: List[str]):
+    if not label_col:
+        return None
+    print("Creating class separation plot...")
+    method = resolve_sample_method()
+    sample_pct = float(os.environ.get("PANEL_VIS_CLASSSEP_SAMPLE_PCT", "1.0"))
+    skew_thresh = float(os.environ.get("PANEL_VIS_SKEW_THRESH", "2.0"))
+    scale_mode = (os.environ.get("PANEL_VIS_SCALE_MODE") or "auto").lower()
+
+    feats = _select_top_variance_features(con, numeric_cols, max_features=4, sample_pct=sample_pct, method=method)
+    if not feats:
+        print("Class separation: no non-flat numeric features found; skipping.")
+        return None
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    axes = axes.ravel()
+    for i, feat in enumerate(feats):
+        ax = axes[i]
+        df = con.execute(
+            f"""
+            SELECT {q(label_col)} AS label, {q(feat)} AS val
+            FROM {panel_read_expr()}
+            WHERE {q(label_col)} IS NOT NULL AND {q(feat)} IS NOT NULL
+            USING SAMPLE {sample_pct}% ({method})
+            LIMIT 350000
+            """
+        ).df()
+        if df.empty:
+            ax.set_title(f"{feat} (EMPTY)", color="red")
+            continue
+
+        vals = df["val"].to_numpy(dtype=float, copy=False)
+        mode, fwd, inv, fmt = _auto_scale_transform(vals, skew_thresh=skew_thresh) if scale_mode == "auto" else ("linear", (lambda x: x), (lambda x: x), None)
+        df["val_plot"] = fwd(df["val"].astype(float))
+
+        sns.histplot(
+            data=df,
+            x="val_plot",
+            hue="label",
+            stat="density",
+            common_norm=False,
+            element="step",
+            fill=False,
+            bins=60,
+            ax=ax,
+        )
+        title_suffix = f" ({mode})" if mode != "linear" else ""
+        ax.set_title(f"{feat}{title_suffix}")
+        ax.set_ylabel("Density")
+
+        # Keep readable axis labels in original units (especially for log1p)
+        ax.set_xlabel(feat)
+        if mode == "log1p" and fmt is not None:
+            ax.xaxis.set_major_formatter(fmt)
+            ax.set_xlabel(f"{feat} (ticks in original units)")
+        elif mode == "symlog":
+            # symlog keeps original units; only tweak scaling if needed
+            linthresh = float(os.environ.get("PANEL_VIS_SYMLOG_LINTHRESH", "1.0"))
+            ax.set_xscale("symlog", linthresh=linthresh)
+
+    # Hide unused panels if we got <4 features
+    for j in range(len(feats), 4):
+        axes[j].axis("off")
+
+    plt.suptitle("Class Separation (top non-flat variance features)", fontsize=16, fontweight="bold")
+    out = OUTPUT_DIR / "class_separation.png"
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig(out, dpi=300)
+    plt.close()
+    wb_log_image("plots/class_separation", out, "Class separation distributions (top variance non-flat features)")
+    return out
+
+# ==========================================================================================
+# CORRELATION MATRIX
+# ==========================================================================================
+def _cluster_order_features(corr: pd.DataFrame) -> List[str]:
+    """Return feature order using hierarchical clustering on 1-|corr| distance."""
+    try:
+        from scipy.cluster.hierarchy import linkage, leaves_list
+        from scipy.spatial.distance import squareform
+    except Exception:
+        return list(corr.columns)
+
+    c = corr.fillna(0.0).to_numpy()
+    dist = 1.0 - np.abs(c)
+    np.fill_diagonal(dist, 0.0)
+    d = squareform(dist, checks=False)
+    Z = linkage(d, method="average")
+    order = leaves_list(Z)
+    return list(corr.columns[order])
+
+def plot_correlation_matrix(con, numeric_cols: List[str], max_features: int = 60):
+    print("Creating correlation matrix...")
+    method = resolve_sample_method()
+    sample_pct = float(os.environ.get("PANEL_VIS_CORR_SAMPLE_PCT", "0.6"))
+    max_features = int(os.environ.get("PANEL_VIS_CORR_MAX_FEATURES", str(max_features)))
+
+    # Downselect to informative, non-flat features for readability
+    feats = _select_top_variance_features(con, numeric_cols, max_features=max_features, sample_pct=max(sample_pct, 0.5), method=method)
+    if len(feats) < 3:
+        print("Correlation matrix: insufficient non-flat features found; skipping.")
+        return None
+
+    sel = ", ".join(q(c) for c in feats)
+    df = con.execute(
+        f"""
+        SELECT {sel}
+        FROM {panel_read_expr()}
+        USING SAMPLE {sample_pct}% ({method})
+        LIMIT 250000
+        """
+    ).df()
+    if df.empty:
+        return None
+
+    corr = df.corr(numeric_only=True).astype(float)
+    order = _cluster_order_features(corr)
+    corr = corr.loc[order, order]
+
+    fig, ax = plt.subplots(figsize=(13, 11))
+    cmap = _neutral_diverging_cmap()
+    sns.heatmap(
+        corr,
+        cmap=cmap,
+        center=0.0,
+        vmin=-1.0,
+        vmax=1.0,
+        square=True,
+        linewidths=0.0,
+        cbar_kws={"label": "Correlation (Pearson, centered at 0)"},
+        ax=ax,
+    )
+    ax.set_title("Correlation matrix (cluster-reordered)", fontsize=14, fontweight="bold")
+    out = OUTPUT_DIR / "correlation_matrix.png"
+    plt.tight_layout()
+    plt.savefig(out, dpi=300)
+    plt.close()
+    wb_log_image("plots/correlation_matrix", out, "Cluster-reordered correlation matrix (neutral midpoint at 0)")
     return out
 
 # ==========================================================================================
@@ -256,24 +637,48 @@ def main():
     label_col = os.environ.get("LABEL_COL") or ("transition_01" if "transition_01" in cols else None)
 
     # 2. Start W&B
-    if wandb:
-        wandb.init(project="panel_visualisation", name=f"diag_{datetime.now().strftime('%m%d_%H%M')}")
+    use_wandb = bool(int(os.environ.get("PANEL_VIS_WANDB", "0")))
+    if wandb and use_wandb:
+        try:
+            wandb.init(project="panel_visualisation", name=f"diag_{datetime.now().strftime('%m%d_%H%M')}")
+        except Exception as e:
+            print(f"W&B init failed; continuing without W&B. Error: {e}")
+            # Keep wandb imported, but no active run means wb_log_* become no-ops.
 
-    # 3. RUN NEW TEMPORAL COMPARISONS
-    # Find feature with high variance to use for mapping
-    numeric_cols = [c for c in cols if c not in ['year', 'x', 'y', 'row', 'col', label_col]]
+    # 3. Numeric columns for feature-focused plots
+    coord_x, coord_y = resolve_coord_cols(cols)
+    exclude = {'year', coord_x, coord_y, 'row', 'col', 'x', 'y', label_col}
+    numeric_cols = [
+        r["column_name"]
+        for _, r in schema.iterrows()
+        if (r["column_name"] not in exclude) and _is_numeric_duckdb_type(str(r.get("column_type", "")))
+    ]
+
+    # 4. Class separation + correlation structure
+    plot_class_separation(con, label_col, numeric_cols)
+    plot_correlation_matrix(con, numeric_cols)
+
+    # 5. Temporal integrity comparison
     if numeric_cols:
-        target_feat = "elevation_b1" if "elevation_b1" in numeric_cols else numeric_cols[0]
+        if "elevation_b1" in numeric_cols:
+            target_feat = "elevation_b1"
+        else:
+            picked = _select_top_variance_features(con, numeric_cols, max_features=1, sample_pct=0.5, method=resolve_sample_method())
+            target_feat = picked[0] if picked else numeric_cols[0]
         plot_temporal_feature_comparison(con, target_feat)
 
-    # 4. RUN STANDARD PLOTS
+    # 6. Standard plots
     plot_time_series(con, label_col)
     plot_spatial_map(con, label_col)
+
+    # 7. Log outputs as W&B artifacts for lineage
+    wb_log_artifact_pngs(OUTPUT_DIR)
     
     print("="*50)
     print("DIAGNOSTICS COMPLETE")
     print("="*50)
-    if wandb: wandb.finish()
+    if wandb and wandb.run:
+        wandb.finish()
 
 if __name__ == "__main__":
     main()
