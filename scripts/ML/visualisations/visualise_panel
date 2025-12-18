@@ -127,6 +127,34 @@ PANEL_SPEC = resolve_panel_spec()
 # ==========================================================================================
 # HELPERS
 # ==========================================================================================
+def _parse_csv_list(raw: Optional[str]) -> List[str]:
+    """Parse comma-separated env-var lists (trims whitespace, drops empties)."""
+    if raw is None:
+        return []
+    return [x.strip() for x in str(raw).split(",") if x.strip()]
+
+def _parse_csv_int_list(raw: Optional[str]) -> List[int]:
+    """Parse comma-separated env-var lists into ints (raises on invalid entries)."""
+    out: List[int] = []
+    for token in _parse_csv_list(raw):
+        try:
+            out.append(int(token))
+        except Exception as e:
+            raise ValueError(f"Invalid integer in CSV list: {token!r}") from e
+    return out
+
+def resolve_temporal_sample_pcts() -> Tuple[float, float]:
+    """
+    Resolve temporal plot sampling rates.
+
+    Env vars:
+    - PANEL_VIS_TEMPORAL_SAMPLE_PCT: default 2.0
+    - PANEL_VIS_DENSITY_SAMPLE_PCT: default = PANEL_VIS_TEMPORAL_SAMPLE_PCT
+    """
+    temporal = float(os.environ.get("PANEL_VIS_TEMPORAL_SAMPLE_PCT", "2.0"))
+    density = float(os.environ.get("PANEL_VIS_DENSITY_SAMPLE_PCT", str(temporal)))
+    return temporal, density
+
 def resolve_sample_method() -> str:
     # Default to Bernoulli sampling (more stable for approximate sampling across partitions).
     raw = (os.environ.get("PANEL_VIS_SAMPLE_METHOD") or "bernoulli").lower()
@@ -305,7 +333,7 @@ def get_con():
 def plot_temporal_feature_comparison(
     con,
     feature: str,
-    years=[2011, 2013, 2015],
+    years=None,
     show_density_diff: Optional[bool] = None,
 ):
     """
@@ -313,11 +341,16 @@ def plot_temporal_feature_comparison(
 
     - Global color scale: 2nd/98th percentiles computed on the combined 3-year sample.
     - Optional density-difference panel (2011 vs 2013) to highlight spatial loss during collapse.
+    - Optional footprint panels per year (PANEL_VIS_SHOW_FOOTPRINT=1) to diagnose whether
+      missing areas are due to feature NoData (val is NULL) vs missing panel coverage.
     """
     print(f"Creating Temporal Comparison for {feature}...")
-    sample_pct = float(os.environ.get("PANEL_VIS_TEMPORAL_SAMPLE_PCT", "2.0"))
-    method = resolve_sample_method()
+    years = [2011, 2013, 2015] if years is None else list(years)
+    # Always use bernoulli for temporal integrity plots for consistency across runs/partitions.
+    method = "bernoulli"
+    sample_pct, dens_sample_pct = resolve_temporal_sample_pcts()
     show_density_diff = bool(int(os.environ.get("PANEL_VIS_SHOW_DENSITY_DIFF", "1"))) if show_density_diff is None else show_density_diff
+    show_footprint = _parse_bool_env("PANEL_VIS_SHOW_FOOTPRINT", default=False)
     
     # 0. Pick coordinates (avoid row/col if x/y or lon/lat exist)
     schema = con.execute(f"DESCRIBE SELECT * FROM {panel_read_expr()} LIMIT 0").df()
@@ -339,11 +372,49 @@ def plot_temporal_feature_comparison(
         ) t
     """
     vmin, vmax = con.execute(clip_query).fetchone()
+    # Guard against degenerate / invalid color scales (prevents confusing empty plots or crashes).
+    if vmin is None or vmax is None:
+        print(
+            f"WARNING: Temporal comparison for {feature!r} (years={years}) "
+            f"returned vmin/vmax=None (vmin={vmin}, vmax={vmax}); skipping plot."
+        )
+        return
+    try:
+        vmin_f = float(vmin)
+        vmax_f = float(vmax)
+    except Exception as e:
+        print(
+            f"WARNING: Temporal comparison for {feature!r} (years={years}) "
+            f"could not cast vmin/vmax to float (vmin={vmin!r}, vmax={vmax!r}): {e}; skipping plot."
+        )
+        return
+    if (not np.isfinite(vmin_f)) or (not np.isfinite(vmax_f)) or (vmin_f == vmax_f) or (vmin_f > vmax_f):
+        print(
+            f"WARNING: Temporal comparison for {feature!r} (years={years}) has invalid scale "
+            f"(vmin={vmin_f}, vmax={vmax_f}); skipping plot."
+        )
+        return
+    vmin, vmax = vmin_f, vmax_f
 
-    ncols = 4 if show_density_diff else 3
-    fig, axes = plt.subplots(1, ncols, figsize=(6.5 * ncols, 6), sharex=True, sharey=True)
-    if ncols == 1:
-        axes = [axes]
+    n_years = len(list(years))
+    # Layout:
+    # - Default: 1 row with per-year feature maps (+ optional density-diff column).
+    # - With footprint: 2 rows (top=feature, bottom=footprint), with density-diff spanning both rows.
+    ncols = n_years + (1 if show_density_diff else 0)
+    if show_footprint:
+        import matplotlib.gridspec as gridspec
+        fig = plt.figure(figsize=(6.5 * ncols, 10.5))
+        gs = gridspec.GridSpec(2, ncols, figure=fig, wspace=0.05, hspace=0.12)
+        axes_feat = [fig.add_subplot(gs[0, i]) for i in range(n_years)]
+        axes_fp = [fig.add_subplot(gs[1, i], sharex=axes_feat[0], sharey=axes_feat[0]) for i in range(n_years)]
+        ax_dens = fig.add_subplot(gs[:, -1], sharex=axes_feat[0], sharey=axes_feat[0]) if show_density_diff else None
+    else:
+        fig, axes = plt.subplots(1, ncols, figsize=(6.5 * ncols, 6), sharex=True, sharey=True)
+        if ncols == 1:
+            axes = [axes]
+        axes_feat = list(axes[:n_years])
+        axes_fp = []
+        ax_dens = axes[-1] if show_density_diff else None
     
     year_dfs: Dict[int, pd.DataFrame] = {}
     for i, year in enumerate(years):
@@ -356,7 +427,7 @@ def plot_temporal_feature_comparison(
         """).df()
         year_dfs[int(year)] = df
         
-        ax = axes[i]
+        ax = axes_feat[i]
         if not df.empty:
             sc = ax.scatter(df['x'], df['y'], c=df['val'], s=0.1,
                             cmap='viridis', vmin=vmin, vmax=vmax, rasterized=True)
@@ -366,15 +437,36 @@ def plot_temporal_feature_comparison(
             
         ax.set_aspect('equal')
 
+        # Optional footprint panel per year (coverage diagnostic; ignore val entirely)
+        if show_footprint:
+            fp_sample_pct = float(os.environ.get("PANEL_VIS_FOOTPRINT_SAMPLE_PCT", str(sample_pct)))
+            fp = con.execute(
+                f"""
+                SELECT {q(cy)} AS y, {q(cx)} AS x
+                FROM {panel_read_expr()}
+                WHERE year = {int(year)}
+                USING SAMPLE {fp_sample_pct}% ({method})
+                LIMIT 600000
+                """
+            ).df()
+            axf = axes_fp[i]
+            if fp.empty:
+                axf.set_title(f"Footprint {year} (EMPTY)", color="red", fontsize=12)
+            else:
+                axf.scatter(fp["x"], fp["y"], s=0.06, c="lightgray", alpha=0.35, rasterized=True)
+                axf.set_title(f"Footprint {year} (n={len(fp):,})", fontsize=12)
+            axf.set_aspect("equal")
+            axf.set_xlabel("x")
+            axf.set_ylabel("y")
+
     # 2. Optional density difference (2011 vs 2013)
     if show_density_diff:
-        ax = axes[-1]
+        ax = ax_dens
         if len(years) > 1:
             y0, y1 = int(years[0]), int(years[1])
         else:
             y0 = y1 = int(years[0])
         # IMPORTANT: density diff should reflect the risk set footprint (not just non-null feature rows)
-        dens_sample_pct = float(os.environ.get("PANEL_VIS_DENSITY_SAMPLE_PCT", str(sample_pct)))
         a = con.execute(
             f"""
             SELECT {q(cy)} AS y, {q(cx)} AS x
@@ -430,9 +522,17 @@ def plot_temporal_feature_comparison(
         fontsize=15,
         fontweight='bold',
     )
+    # Reserve space for a single shared colorbar for the feature maps.
     fig.subplots_adjust(right=0.92)
-    cbar_ax = fig.add_axes([0.94, 0.15, 0.015, 0.7])
-    fig.colorbar(plt.cm.ScalarMappable(norm=plt.Normalize(vmin, vmax), cmap='viridis'), cax=cbar_ax, label=feature)
+    # Slightly adjust cbar height if we have two rows (footprint)
+    cbar_y0 = 0.12 if show_footprint else 0.15
+    cbar_h = 0.76 if show_footprint else 0.7
+    cbar_ax = fig.add_axes([0.94, cbar_y0, 0.015, cbar_h])
+    fig.colorbar(
+        plt.cm.ScalarMappable(norm=plt.Normalize(vmin, vmax), cmap="viridis"),
+        cax=cbar_ax,
+        label=feature,
+    )
     
     out_path = OUTPUT_DIR / f"integrity_temporal_comparison_{feature}.png"
     plt.savefig(out_path, dpi=300, bbox_inches='tight')
@@ -465,52 +565,98 @@ def plot_time_series(con, label_col):
 def plot_spatial_map(con, label_col):
     if not label_col: return None
     print("Creating spatial map...")
-    method = resolve_sample_method()
+    # Spatial map: force Bernoulli sampling for stability/consistency across partitions.
+    method = "bernoulli"
     schema = con.execute(f"DESCRIBE SELECT * FROM {panel_read_expr()} LIMIT 0").df()
     cols = schema["column_name"].tolist()
     cx, cy = resolve_coord_cols(cols)
 
-    year_ref = int(os.environ.get("PANEL_VIS_MAP_YEAR", "2024"))
-    pos_year = int(os.environ.get("PANEL_VIS_POS_YEAR", str(year_ref)))
+    # Multi-year overview (requested: 2000, 2008, 2020, 2024)
+    map_years_raw = (os.environ.get("PANEL_VIS_MAP_YEARS") or "2024,2020,2008,2000").strip()
+    try:
+        map_years = [int(y.strip()) for y in map_years_raw.split(",") if y.strip()]
+    except Exception:
+        map_years = [2024, 2020, 2008, 2000]
 
-    # Pull background from the full risk set to show geographic footprint clearly
-    # IMPORTANT: pin to a single reference year to avoid multi-year duplicates inflating footprint.
-    bg = con.execute(
-        f"""
-        SELECT DISTINCT x, y
-        FROM (
-            SELECT {q(cx)} AS x, {q(cy)} AS y
-            FROM {panel_read_expr()}
-            WHERE year = {year_ref}
-            USING SAMPLE 2% ({method})
-            LIMIT 800000
-        ) t
-        """
-    ).df()
-    # Overlay positives (if any)
-    pos = con.execute(
-        f"""
-        SELECT DISTINCT x, y
-        FROM (
-            SELECT {q(cx)} AS x, {q(cy)} AS y
-            FROM {panel_read_expr()}
-            WHERE year = {pos_year} AND {q(label_col)} = 1
-            USING SAMPLE 10% ({method})
-            LIMIT 300000
-        ) t
-        """
-    ).df()
-    
-    fig, ax = plt.subplots(figsize=(12, 10))
-    ax.scatter(bg['x'], bg['y'], s=0.05, c='lightgray', alpha=0.15, rasterized=True)
-    if not pos.empty:
-        ax.scatter(pos['x'], pos['y'], s=0.5, c='red', alpha=0.5, rasterized=True)
-    ax.set_aspect('equal')
-    if pos_year == year_ref:
-        ax.set_title(f"Spatial distribution of positives ({label_col}=1), year={year_ref}")
+    # Background mode:
+    # - all (default): use full panel footprint for that year
+    # - risk_set: restrict to WDPA_prev==0 (risk set) for that year
+    bg_mode_raw = (os.environ.get("PANEL_VIS_BG_MODE") or "all").strip().lower()
+    if bg_mode_raw in ("risk_set", "riskset", "risk"):
+        bg_mode = "risk_set"
+    elif bg_mode_raw in ("all", ""):
+        bg_mode = "all"
     else:
-        ax.set_title(f"Spatial distribution of positives ({label_col}=1), bg_year={year_ref}, pos_year={pos_year}")
+        print(f"WARNING: Unknown PANEL_VIS_BG_MODE={bg_mode_raw!r}; defaulting to 'all'.")
+        bg_mode = "all"
+
+    bg_sample_pct = float(os.environ.get("PANEL_VIS_BG_SAMPLE_PCT", "2.0"))
+    pos_sample_pct = float(os.environ.get("PANEL_VIS_POS_SAMPLE_PCT", "10.0"))
+
+    # Optional risk-set predicate (only if WDPA_prev exists)
+    has_wdpa_prev = "WDPA_prev" in set(cols)
+    risk_pred = ""
+    if bg_mode == "risk_set":
+        if has_wdpa_prev:
+            risk_pred = f" AND {q('WDPA_prev')} = 0"
+        else:
+            print("WARNING: PANEL_VIS_BG_MODE=risk_set requested but 'WDPA_prev' not in schema; ignoring risk_set filter.")
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12), sharex=True, sharey=True)
+    axes = axes.ravel()
+    for i, year_ref in enumerate(map_years[:4]):
+        ax = axes[i]
+        pos_year = int(os.environ.get("PANEL_VIS_POS_YEAR", str(year_ref)))
+
+        # Pull background from the panel footprint (optionally restricted to the risk set) to show coverage clearly.
+        bg = con.execute(
+            f"""
+            SELECT DISTINCT x, y
+            FROM (
+                SELECT {q(cx)} AS x, {q(cy)} AS y
+                FROM {panel_read_expr()}
+                WHERE year = {int(year_ref)}{risk_pred}
+                USING SAMPLE {bg_sample_pct}% ({method})
+                LIMIT 800000
+            ) t
+            """
+        ).df()
+        pos = con.execute(
+            f"""
+            SELECT DISTINCT x, y
+            FROM (
+                SELECT {q(cx)} AS x, {q(cy)} AS y
+                FROM {panel_read_expr()}
+                WHERE year = {int(pos_year)} AND {q(label_col)} = 1{risk_pred}
+                USING SAMPLE {pos_sample_pct}% ({method})
+                LIMIT 300000
+            ) t
+            """
+        ).df()
+
+        if not bg.empty:
+            ax.scatter(bg["x"], bg["y"], s=0.05, c="lightgray", alpha=0.15, rasterized=True)
+        if not pos.empty:
+            ax.scatter(pos["x"], pos["y"], s=0.5, c="red", alpha=0.5, rasterized=True)
+        ax.set_aspect("equal")
+        if pos_year == year_ref:
+            ax.set_title(f"Year {year_ref}: positives ({label_col}=1)")
+        else:
+            ax.set_title(f"BG {year_ref}, pos {pos_year}: positives ({label_col}=1)")
+
+    # Hide unused panels if fewer than 4 years were provided
+    for j in range(min(len(map_years), 4), 4):
+        axes[j].axis("off")
+
+    shown_years = map_years[:4]
+    plt.suptitle(
+        f"Spatial positives across years | years={shown_years} | bg_mode={bg_mode} | "
+        f"bg_sample={bg_sample_pct}% pos_sample={pos_sample_pct}% ({method})",
+        fontsize=14,
+        fontweight="bold",
+    )
     out = OUTPUT_DIR / "spatial_map.png"
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
     plt.savefig(out, dpi=300); plt.close()
     return out
 
@@ -749,12 +895,15 @@ def main():
     print(f"Starting diagnostics for: {PANEL_SPEC}")
     print(f"Absolute Output: {OUTPUT_DIR.resolve()}")
     print(f"Sampling method (PANEL_VIS_SAMPLE_METHOD): {resolve_sample_method()}")
+    temp_sample_pct, dens_sample_pct = resolve_temporal_sample_pcts()
+    print(f"Temporal sampling (always bernoulli): PANEL_VIS_TEMPORAL_SAMPLE_PCT={temp_sample_pct}%, PANEL_VIS_DENSITY_SAMPLE_PCT={dens_sample_pct}%")
     
     con = get_con()
     
     # 1. Resolve Label
     schema = con.execute(f"DESCRIBE SELECT * FROM {panel_read_expr()} LIMIT 0").df()
     cols = schema['column_name'].tolist()
+    col_type_map = dict(zip(schema["column_name"].tolist(), schema.get("column_type", [])))
     label_col = os.environ.get("LABEL_COL") or ("transition_01" if "transition_01" in cols else None)
 
     # 1b. dist_wdpa sanity checks + plot-only recode (optional/auto)
@@ -783,13 +932,32 @@ def main():
     plot_correlation_matrix(con, numeric_cols)
 
     # 5. Temporal integrity comparison
-    if numeric_cols:
-        if "elevation_b1" in numeric_cols:
-            target_feat = "elevation_b1"
+    temp_years = _parse_csv_int_list(os.environ.get("PANEL_VIS_TEMP_YEARS") or "2011,2013,2015")
+    temp_features_env = (os.environ.get("PANEL_VIS_TEMP_FEATURES") or "").strip()
+    if temp_features_env:
+        temp_features = _parse_csv_list(temp_features_env)
+    else:
+        # Backwards-compatible fallback: pick a single informative numeric feature
+        if numeric_cols:
+            if "elevation_b1" in numeric_cols:
+                temp_features = ["elevation_b1"]
+            else:
+                picked = _select_top_variance_features(con, numeric_cols, max_features=1, sample_pct=0.5, method=resolve_sample_method())
+                temp_features = [picked[0] if picked else numeric_cols[0]]
         else:
-            picked = _select_top_variance_features(con, numeric_cols, max_features=1, sample_pct=0.5, method=resolve_sample_method())
-            target_feat = picked[0] if picked else numeric_cols[0]
-        plot_temporal_feature_comparison(con, target_feat)
+            temp_features = []
+
+    if temp_features:
+        print(f"Temporal comparisons: years={temp_years}, features={temp_features}")
+    for feat in temp_features:
+        if feat not in cols:
+            print(f"Temporal comparison: skipping missing feature {feat!r} (not in parquet schema).")
+            continue
+        t = str(col_type_map.get(feat, ""))
+        if not _is_numeric_duckdb_type(t):
+            print(f"Temporal comparison: skipping non-numeric feature {feat!r} (duckdb type: {t!r}).")
+            continue
+        plot_temporal_feature_comparison(con, feat, years=temp_years)
 
     # 6. Standard plots
     plot_time_series(con, label_col)

@@ -2,24 +2,40 @@
 
 """Spatial Features Preprocessing Script
 
-Purpose: Add spatial and transition features to the merged panel data with Risk Set filtering.
+Purpose: Add lagged status, spatial-context features, and a transition target to the merged panel data,
+         then apply Risk Set filtering.
 
 Processing order (per year):
-    1. Lag feature: WDPA_prev (1-year lag of WDPA_b1, default 0 for first year)
-    2. Spatial features computed on FULL grid (before Risk Set filtering):
-       - Distance features: distance to nearest WDPA_prev (t-1) protected pixel [avoids target leakage]
-       - Static distance transforms: overwrite oil_gas_b1, powerplants_b1, road_infrastructure_b1 
-         with distance to nearest feature (replaces binary 0/1 with distance in meters)
-       - Decay features: exp(-distance / 10000)
-       - Smoothed features: 4x4, 16x16, 64x64 mean for specified variables
-    3. Risk Set filter: Keep only rows where WDPA_prev == 0 (pixels not previously protected)
-    4. Target variable: transition_01 = WDPA_b1 (simplified since WDPA_prev guaranteed to be 0)
+    1. Lag feature:
+       - Create `WDPA_prev` by joining each (row, col) in year t with `WDPA_b1` from year t-1
+         (first year is set to 0). `WDPA_prev` is stored as `uint8`.
+    2. Spatial features computed on the FULL grid (before Risk Set filtering):
+       - Protected-area distance:
+         - Create `dist_wdpa` as the Euclidean distance (in meters) from each pixel to the nearest
+           pixel with `WDPA_prev > 0` (t-1 protection), using a distance transform. This uses t-1
+           status to avoid using the same-year target in the distance computation.
+       - Static-feature distance transforms (columns are overwritten in-place):
+         - For `oil_gas_b1`, `powerplants_b1`, `road_infrastructure_b1`, build a binary mask
+           (NaN -> 0, >0 -> 1) and apply an Euclidean distance transform multiplied by 1000.
+           The resulting distance values overwrite the original columns (the column names stay the
+           same: `oil_gas_b1`, `powerplants_b1`, `road_infrastructure_b1`).
+       - Smoothed (moving-average) features:
+         - For selected variables (e.g. `NDVI_b1`, `GPW_b1`, `HNTL_b1`, `gdp_b1`, ...),
+           compute uniform-filter smoothing over window sizes 16 and 64, creating new columns like
+           `NDVI_b1_smooth16`, `NDVI_b1_smooth64` (and similarly for the other variables).
+    3. Risk Set filter:
+       - Keep only rows where `WDPA_prev == 0` (pixels not previously protected in t-1).
+    4. Target variable:
+       - Create `transition_01` as `WDPA_b1` for the filtered Risk Set (NaN treated as 0),
+         stored as `uint8`.
 
 Input:  data/ml/merged_panel_2000_2024.parquet (or $SCRATCH path on Euler)
 Output: data/ml/merged_panel_final.parquet (Risk Set only, with transition_01 column)
 
 Processing: Year-by-year for memory efficiency with 500M+ rows.
-Spatial features reflect the full landscape context, then Risk Set filtering reduces output size.
+Spatial features are computed before filtering to reflect the full landscape context, then Risk Set
+filtering reduces the output size. Intermediate per-year outputs are written to a temp directory and
+concatenated into the final parquet.
 """
 
 from __future__ import annotations
