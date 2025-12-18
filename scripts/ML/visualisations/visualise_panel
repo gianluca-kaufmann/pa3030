@@ -341,12 +341,18 @@ def plot_spatial_map(con: duckdb.DuckDBPyConnection, parquet_path: Path, label_c
 
     # Aggregate into bins inside DuckDB (bounded result size: <= grid_size^2 rows)
     # Sample first to reduce scan cost; for exact (no sampling), set PANEL_VIS_SPATIAL_SAMPLE_PCT=100
+    #
+    # DuckDB >=1.4.0: `... USING SAMPLE ... WHERE ...` is a parser error.
+    # We therefore push the WHERE into a subquery and sample the subquery.
     query = f"""
     WITH sampled AS (
         SELECT row, col
-        FROM read_parquet('{escaped_path}')
+        FROM (
+            SELECT row, col
+            FROM read_parquet('{escaped_path}')
+            WHERE {label_col} = 1
+        )
         USING SAMPLE {sample_pct}% ({sample_method})
-        WHERE {label_col} = 1
     ),
     bounds AS (
         SELECT
@@ -377,9 +383,12 @@ def plot_spatial_map(con: duckdb.DuckDBPyConnection, parquet_path: Path, label_c
     bounds_query = f"""
     WITH sampled AS (
         SELECT row, col
-        FROM read_parquet('{escaped_path}')
+        FROM (
+            SELECT row, col
+            FROM read_parquet('{escaped_path}')
+            WHERE {label_col} = 1
+        )
         USING SAMPLE {sample_pct}% ({sample_method})
-        WHERE {label_col} = 1
     )
     SELECT COUNT(*) AS n_points, MIN(col) AS min_col, MAX(col) AS max_col, MIN(row) AS min_row, MAX(row) AS max_row
     FROM sampled
@@ -507,17 +516,23 @@ def plot_class_separation(con: duckdb.DuckDBPyConnection, parquet_path: Path, la
     sample_query = f"""
     (
         SELECT {feature_list}, {label_col} AS label
-        FROM read_parquet('{escaped_path}')
+        FROM (
+            SELECT {feature_list}, {label_col} AS label
+            FROM read_parquet('{escaped_path}')
+            WHERE {label_col} = 1
+        )
         USING SAMPLE 10% (bernoulli)
-        WHERE {label_col} = 1
         LIMIT {max_pos}
     )
     UNION ALL
     (
         SELECT {feature_list}, {label_col} AS label
-        FROM read_parquet('{escaped_path}')
+        FROM (
+            SELECT {feature_list}, {label_col} AS label
+            FROM read_parquet('{escaped_path}')
+            WHERE {label_col} = 0
+        )
         USING SAMPLE 10% (bernoulli)
-        WHERE {label_col} = 0
         LIMIT {max_neg}
     )
     """
