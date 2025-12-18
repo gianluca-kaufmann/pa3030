@@ -403,16 +403,27 @@ def plot_temporal_feature_comparison(
     # Layout:
     # - Default: 1 row with per-year feature maps (+ optional density-diff column).
     # - With footprint: 2 rows (top=feature, bottom=footprint), with density-diff spanning both rows.
+    #
+    # NOTE: This function is designed to support 4+ years (wide panels). We scale
+    # figure width by column count and clamp to a configurable max to avoid
+    # absurdly-wide PNGs.
     ncols = n_years + (1 if show_density_diff else 0)
+    fig_w_per_col = float(os.environ.get("PANEL_VIS_TEMP_FIG_W_PER_COL", "5.5"))
+    fig_w_min = float(os.environ.get("PANEL_VIS_TEMP_FIG_W_MIN", "12.0"))
+    fig_w_max = float(os.environ.get("PANEL_VIS_TEMP_FIG_W_MAX", "40.0"))
+    fig_h = float(os.environ.get("PANEL_VIS_TEMP_FIG_H", "6.0"))
+    fig_h_fp = float(os.environ.get("PANEL_VIS_TEMP_FIG_H_FOOTPRINT", "10.5"))
+    fig_w = min(fig_w_max, max(fig_w_min, fig_w_per_col * float(ncols)))
+
     if show_footprint:
         import matplotlib.gridspec as gridspec
-        fig = plt.figure(figsize=(6.5 * ncols, 10.5))
+        fig = plt.figure(figsize=(fig_w, fig_h_fp))
         gs = gridspec.GridSpec(2, ncols, figure=fig, wspace=0.05, hspace=0.12)
         axes_feat = [fig.add_subplot(gs[0, i]) for i in range(n_years)]
         axes_fp = [fig.add_subplot(gs[1, i], sharex=axes_feat[0], sharey=axes_feat[0]) for i in range(n_years)]
         ax_dens = fig.add_subplot(gs[:, -1], sharex=axes_feat[0], sharey=axes_feat[0]) if show_density_diff else None
     else:
-        fig, axes = plt.subplots(1, ncols, figsize=(6.5 * ncols, 6), sharex=True, sharey=True)
+        fig, axes = plt.subplots(1, ncols, figsize=(fig_w, fig_h), sharex=True, sharey=True)
         if ncols == 1:
             axes = [axes]
         axes_feat = list(axes[:n_years])
@@ -1079,20 +1090,25 @@ def main():
     plot_correlation_matrix(con, numeric_cols)
 
     # 5. Temporal integrity comparison
-    temp_years = _parse_csv_int_list(os.environ.get("PANEL_VIS_TEMP_YEARS") or "2011,2013,2015")
+    #
+    # Defaults are chosen to:
+    # - Exercise a realistic 4-year panel (ensures plotting logic supports wide layouts)
+    # - Cover key “policy exposure / accessibility / nightlights / greenness / extractives” signals
+    default_temp_years = [2001, 2010, 2015, 2024]
+    temp_years = _parse_csv_int_list(
+        os.environ.get("PANEL_VIS_TEMP_YEARS") or ",".join(str(y) for y in default_temp_years)
+    )
+
+    default_temp_features = [
+        "dist_wdpa",
+        "oil_gas_b1",
+        "powerplants_b1",
+        "road_infrastructure_b1",
+        "NDVI_b1_smooth64",
+        "HNTL_b1_smooth64",
+    ]
     temp_features_env = (os.environ.get("PANEL_VIS_TEMP_FEATURES") or "").strip()
-    if temp_features_env:
-        temp_features = _parse_csv_list(temp_features_env)
-    else:
-        # Backwards-compatible fallback: pick a single informative numeric feature
-        if numeric_cols:
-            if "elevation_b1" in numeric_cols:
-                temp_features = ["elevation_b1"]
-            else:
-                picked = _select_top_variance_features(con, numeric_cols, max_features=1, sample_pct=0.5, method=resolve_sample_method())
-                temp_features = [picked[0] if picked else numeric_cols[0]]
-        else:
-            temp_features = []
+    temp_features = _parse_csv_list(temp_features_env) if temp_features_env else list(default_temp_features)
 
     if temp_features:
         print(f"Temporal comparisons: years={temp_years}, features={temp_features}")
