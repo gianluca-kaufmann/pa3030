@@ -18,9 +18,11 @@ import os
 import socket
 import getpass
 import warnings
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
+from collections import defaultdict
 import glob
 
 import duckdb
@@ -351,6 +353,7 @@ def plot_temporal_feature_comparison(
     sample_pct, dens_sample_pct = resolve_temporal_sample_pcts()
     show_density_diff = bool(int(os.environ.get("PANEL_VIS_SHOW_DENSITY_DIFF", "1"))) if show_density_diff is None else show_density_diff
     show_footprint = _parse_bool_env("PANEL_VIS_SHOW_FOOTPRINT", default=False)
+    density_bias_note = ""
     
     # 0. Pick coordinates (avoid row/col if x/y or lon/lat exist)
     schema = con.execute(f"DESCRIBE SELECT * FROM {panel_read_expr()} LIMIT 0").df()
@@ -436,6 +439,10 @@ def plot_temporal_feature_comparison(
             ax.set_title(f"Year {year} (EMPTY)", color='red')
             
         ax.set_aspect('equal')
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_xlabel("")
+        ax.set_ylabel("")
 
         # Optional footprint panel per year (coverage diagnostic; ignore val entirely)
         if show_footprint:
@@ -456,8 +463,10 @@ def plot_temporal_feature_comparison(
                 axf.scatter(fp["x"], fp["y"], s=0.06, c="lightgray", alpha=0.35, rasterized=True)
                 axf.set_title(f"Footprint {year} (n={len(fp):,})", fontsize=12)
             axf.set_aspect("equal")
-            axf.set_xlabel("x")
-            axf.set_ylabel("y")
+            axf.set_xticks([])
+            axf.set_yticks([])
+            axf.set_xlabel("")
+            axf.set_ylabel("")
 
     # 2. Optional density difference (2011 vs 2013)
     if show_density_diff:
@@ -501,6 +510,12 @@ def plot_temporal_feature_comparison(
             db = hb / max(hb.sum(), 1.0)
             diff = (da - db).T  # transpose for imshow orientation (y as rows)
 
+            # For static features like elevation, a large density diff indicates sampling bias across years.
+            tvd = 0.5 * float(np.sum(np.abs(da - db)))
+            tvd_thresh = float(os.environ.get("PANEL_VIS_DENSITY_BIAS_TVD_THRESH", "0.05"))
+            if feature == "elevation_b1" and tvd >= tvd_thresh:
+                density_bias_note = f" | WARNING: density diff suggests sampling bias (TVD={tvd:.3f})"
+
             vmax_d = float(np.nanpercentile(np.abs(diff), 99))
             norm = TwoSlopeNorm(vmin=-vmax_d, vcenter=0.0, vmax=vmax_d)
             im = ax.imshow(
@@ -516,12 +531,15 @@ def plot_temporal_feature_comparison(
             cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
             cbar.set_label("Δ density (normalized)")
         ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_xlabel("")
+        ax.set_ylabel("")
 
-    plt.suptitle(
-        f"Temporal Integrity Check: {feature} ({' vs '.join(map(str, years))})",
-        fontsize=15,
-        fontweight='bold',
-    )
+    title = f"Temporal Integrity Check: {feature} ({' vs '.join(map(str, years))})"
+    if density_bias_note:
+        title += density_bias_note
+    plt.suptitle(title, fontsize=15, fontweight='bold')
     # Reserve space for a single shared colorbar for the feature maps.
     fig.subplots_adjust(right=0.92)
     # Slightly adjust cbar height if we have two rows (footprint)
@@ -553,6 +571,8 @@ def plot_time_series(con, label_col):
     fig, ax1 = plt.subplots(figsize=(12, 6))
     ax1.plot(df['year'], df['rows'], color='tab:blue', marker='o', label='Total Rows')
     ax1.set_ylabel('Risk Set Size', color='tab:blue')
+    ax1.set_ylim(bottom=0)
+    ax1.axvline(2000.5, color="gray", linestyle="--", linewidth=1.0, alpha=0.8)
     if label_col:
         ax2 = ax1.twinx()
         ax2.bar(df['year'], df['pos'], color='tab:orange', alpha=0.4, label='Positives')
@@ -639,6 +659,10 @@ def plot_spatial_map(con, label_col):
         if not pos.empty:
             ax.scatter(pos["x"], pos["y"], s=0.5, c="red", alpha=0.5, rasterized=True)
         ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_xlabel("")
+        ax.set_ylabel("")
         if pos_year == year_ref:
             ax.set_title(f"Year {year_ref}: positives ({label_col}=1)")
         else:
@@ -673,6 +697,126 @@ def _is_near_flat(var_samp: float, q02: float, q98: float) -> bool:
     # Scale-aware threshold: require some meaningful spread relative to magnitude
     scale = max(abs(float(q02)), abs(float(q98)), 1.0)
     return spread <= (1e-6 * scale)
+
+_FEATURE_ROOT_SUFFIX_RE = re.compile(r"(?:_smooth\d+|_b\d+)$")
+
+def _feature_root_name(name: str) -> str:
+    """
+    Root grouping key for feature variants.
+
+    Strips trailing suffixes repeatedly:
+    - '_smooth\\d+' (smoothed variants)
+    - '_b\\d+'      (band variants)
+    """
+    root = str(name)
+    while True:
+        new = _FEATURE_ROOT_SUFFIX_RE.sub("", root)
+        if new == root:
+            return root
+        root = new
+
+def _spread_02_98_map(
+    con,
+    features: List[str],
+    sample_pct: float,
+    method: str,
+) -> Dict[str, float]:
+    """
+    Robust variance proxy per feature: (q98 - q02) on a sampled scan.
+    Returns feature -> spread; missing/invalid spreads map to -inf.
+    """
+    if not features:
+        return {}
+    sample_pct = float(sample_pct)
+    method = str(method)
+
+    select_exprs: List[str] = []
+    for c in features:
+        base_expr = feature_sql(c)
+        val = f"CAST(({base_expr}) AS DOUBLE)"
+        val_clean = f"CASE WHEN {val} IS NOT NULL AND {val} = {val} AND abs({val}) < 1e308 THEN {val} ELSE NULL END"
+        select_exprs.append(f"approx_quantile({val_clean}, 0.02) AS {q(c + '__q02')}")
+        select_exprs.append(f"approx_quantile({val_clean}, 0.98) AS {q(c + '__q98')}")
+
+    query = f"""
+        SELECT
+            {", ".join(select_exprs)}
+        FROM {panel_read_expr()}
+        USING SAMPLE {sample_pct}% ({method})
+    """
+    row = con.execute(query).fetchone()
+    if row is None:
+        return {c: float("-inf") for c in features}
+    colnames = [d[0] for d in con.description]
+    stats_map = dict(zip(colnames, row))
+
+    out: Dict[str, float] = {}
+    for c in features:
+        q02 = stats_map.get(c + "__q02")
+        q98 = stats_map.get(c + "__q98")
+        try:
+            if q02 is None or q98 is None or np.isnan(q02) or np.isnan(q98):
+                out[c] = float("-inf")
+            else:
+                out[c] = float(q98) - float(q02)
+        except Exception:
+            out[c] = float("-inf")
+    return out
+
+def _deduplicate_features(cols: List[str], con=None) -> List[str]:
+    """
+    Deduplicate feature variants for plotting.
+
+    Groups by root name (stripping '_smooth\\d+' and '_b\\d+').
+    Keeps:
+    - The raw/root column if present (exact match), else
+    - The variant with the highest robust spread (q98-q02), estimated on a small sample scan.
+    """
+    cols = [c for c in (cols or []) if c]
+    if not cols:
+        return []
+
+    cols_set = set(cols)
+    groups = defaultdict(list)
+    for c in cols:
+        groups[_feature_root_name(c)].append(c)
+
+    chosen: Dict[str, str] = {}
+    need_spread: List[str] = []
+    for root, cands in groups.items():
+        if root in cols_set:
+            chosen[root] = root
+        elif len(cands) == 1:
+            chosen[root] = cands[0]
+        else:
+            need_spread.extend(cands)
+
+    spread_map: Dict[str, float] = {}
+    if con is not None and need_spread:
+        dedup_sample_pct = float(os.environ.get("PANEL_VIS_DEDUP_SAMPLE_PCT", "0.5"))
+        spread_map = _spread_02_98_map(
+            con,
+            list(dict.fromkeys(need_spread)),
+            sample_pct=dedup_sample_pct,
+            method=resolve_sample_method(),
+        )
+
+    for root, cands in groups.items():
+        if root in chosen:
+            continue
+        if con is None:
+            chosen[root] = sorted(cands)[0]
+        else:
+            chosen[root] = max(cands, key=lambda c: spread_map.get(c, float("-inf")))
+
+    out: List[str] = []
+    seen = set()
+    for c in cols:
+        root = _feature_root_name(c)
+        if chosen.get(root) == c and c not in seen:
+            out.append(c)
+            seen.add(c)
+    return out
 
 def _select_top_variance_features(
     con,
@@ -756,6 +900,8 @@ def plot_class_separation(con, label_col: str, numeric_cols: List[str]):
     skew_thresh = float(os.environ.get("PANEL_VIS_SKEW_THRESH", "2.0"))
     scale_mode = (os.environ.get("PANEL_VIS_SCALE_MODE") or "auto").lower()
 
+    # Prevent redundant plots across smoothed/band variants.
+    numeric_cols = _deduplicate_features(numeric_cols, con=con)
     feats = _select_top_variance_features(con, numeric_cols, max_features=4, sample_pct=sample_pct, method=method)
     if not feats:
         print("Class separation: no non-flat numeric features found; skipping.")
@@ -839,13 +985,14 @@ def _cluster_order_features(corr: pd.DataFrame) -> List[str]:
     order = leaves_list(Z)
     return list(corr.columns[order])
 
-def plot_correlation_matrix(con, numeric_cols: List[str], max_features: int = 60):
+def plot_correlation_matrix(con, numeric_cols: List[str], max_features: int = 30):
     print("Creating correlation matrix...")
     method = resolve_sample_method()
-    sample_pct = float(os.environ.get("PANEL_VIS_CORR_SAMPLE_PCT", "0.6"))
+    sample_pct = float(os.environ.get("PANEL_VIS_CORR_SAMPLE_PCT", "5.0"))
     max_features = int(os.environ.get("PANEL_VIS_CORR_MAX_FEATURES", str(max_features)))
 
     # Downselect to informative, non-flat features for readability
+    numeric_cols = _deduplicate_features(numeric_cols, con=con)
     feats = _select_top_variance_features(con, numeric_cols, max_features=max_features, sample_pct=max(sample_pct, 0.5), method=method)
     if len(feats) < 3:
         print("Correlation matrix: insufficient non-flat features found; skipping.")

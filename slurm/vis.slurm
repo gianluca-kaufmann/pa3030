@@ -37,6 +37,9 @@ source "$VENV_DIR/bin/activate"
 #------------------------------------------------------------------------------
 echo "Starting visualise_panel script..."
 
+# Ensure footprint diagnostics are enabled
+export PANEL_VIS_SHOW_FOOTPRINT=1
+
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
