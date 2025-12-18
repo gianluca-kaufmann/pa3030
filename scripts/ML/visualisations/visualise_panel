@@ -4,24 +4,39 @@ Panel dataset diagnostic visualizations.
 
 Inputs:
 - Parquet panel file: `data/ml/merged_panel_final.parquet`
+  - You can override via environment variable `PANEL_FILE=/path/to/file.parquet`
+- Target/label column:
+  - Auto-detected (`transition_01` when present)
+  - You can override via `LABEL_COL=...`
 
 Process:
 - Uses DuckDB to efficiently query the parquet file without loading full dataset into memory
 - Generates diagnostic plots: time series, spatial maps, class separation, correlation matrix
+- Streams progress and key outputs to Weights & Biases (W&B) when configured
 
 Outputs:
 - PNG figures saved to `outputs/Figures/panel_visualisation/`.
 """
 
 import os
+import socket
+import getpass
 from pathlib import Path
 import warnings
+from datetime import datetime
+from typing import Optional
 
 import duckdb
+import matplotlib
+matplotlib.use("Agg")  # headless-safe (Slurm, CI, and non-GUI runs)
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+try:
+    import wandb
+except Exception:  # pragma: no cover
+    wandb = None
 
 warnings.filterwarnings('ignore')
 
@@ -33,6 +48,8 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # Resolve input file path (prefer $SCRATCH if present)
 SCRATCH_ROOT = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
 candidate_paths = []
+if os.environ.get("PANEL_FILE"):
+    candidate_paths.append(Path(os.environ["PANEL_FILE"]))
 if SCRATCH_ROOT is not None:
     candidate_paths.append(SCRATCH_ROOT / "data" / "ml" / "merged_panel_final.parquet")
 candidate_paths.append(ROOT_DIR / "data" / "ml" / "merged_panel_final.parquet")
@@ -44,7 +61,148 @@ for cand in candidate_paths:
         break
 
 if PANEL_FILE is None:
-    raise FileNotFoundError("merged_panel_final.parquet not found in expected locations")
+    searched = "\n".join([f"  - {p}" for p in candidate_paths])
+    raise FileNotFoundError(
+        "Panel parquet not found in expected locations. Tried:\n"
+        f"{searched}"
+    )
+
+
+def init_wandb(panel_file: Path, output_dir: Path):
+    """
+    Initialize a W&B run for streaming logs and figures.
+
+    Uses environment variables (similar to compute_panel_statistics):
+    - WANDB_API_KEY: API key for non-interactive login (recommended on Slurm/Euler)
+    - WANDB_ENTITY: optional entity/team
+
+    If WANDB_API_KEY is missing, W&B is disabled to avoid interactive prompts.
+    """
+    if wandb is None:
+        print("Note: wandb not installed; skipping W&B logging.")
+        return None
+
+    wandb_api_key = os.environ.get("WANDB_API_KEY")
+    wandb_entity = os.environ.get("WANDB_ENTITY")
+
+    if not wandb_api_key:
+        print("Warning: WANDB_API_KEY not found in environment variables")
+        print("   W&B logging will be DISABLED to avoid interactive login prompts.")
+        mode = "disabled"
+    else:
+        mode = "online"
+        try:
+            wandb.login(key=wandb_api_key, relogin=True)
+        except Exception as e:
+            print(f"Warning: wandb.login failed ({e!r}). Disabling W&B logging.")
+            mode = "disabled"
+
+    if not wandb_entity:
+        print("Warning: WANDB_ENTITY not found in environment variables")
+
+    is_euler = bool(os.environ.get("SCRATCH"))
+    run_name = f"panel_visualise_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    config = {
+        "panel_file": str(panel_file),
+        "output_dir": str(output_dir),
+        "scratch_mode": is_euler,
+        "label_col_env": os.environ.get("LABEL_COL"),
+        "panel_vis/sample_method": os.environ.get("PANEL_VIS_SAMPLE_METHOD"),
+        "panel_vis/spatial_grid_size": int(os.environ.get("PANEL_VIS_SPATIAL_GRID_SIZE", "200")),
+        "panel_vis/spatial_sample_pct": float(os.environ.get("PANEL_VIS_SPATIAL_SAMPLE_PCT", "1.0")),
+        "panel_vis/class_sep_max_pos": int(os.environ.get("PANEL_VIS_CLASS_SEP_MAX_POS", "50000")),
+        "panel_vis/class_sep_neg_ratio": int(os.environ.get("PANEL_VIS_CLASS_SEP_NEG_RATIO", "5")),
+        "panel_vis/features": os.environ.get("PANEL_VIS_FEATURES"),
+        "panel_vis/box_hide_outliers": os.environ.get("PANEL_VIS_BOX_HIDE_OUTLIERS"),
+        "panel_vis/box_scale": os.environ.get("PANEL_VIS_BOX_SCALE"),
+        "panel_vis/box_skew_ratio_thres": os.environ.get("PANEL_VIS_BOX_SKEW_RATIO_THRES"),
+        "panel_vis/box_skew_abs_thres": os.environ.get("PANEL_VIS_BOX_SKEW_ABS_THRES"),
+        "panel_vis/corr_max_cols": int(os.environ.get("PANEL_VIS_CORR_MAX_COLS", "60")),
+        "panel_vis/corr_max_rows": int(os.environ.get("PANEL_VIS_CORR_MAX_ROWS", "200000")),
+        "panel_vis/corr_sample_pct": float(os.environ.get("PANEL_VIS_CORR_SAMPLE_PCT", "0.2")),
+        "slurm/job_id": os.environ.get("SLURM_JOB_ID"),
+        "slurm/cpus_per_task": os.environ.get("SLURM_CPUS_PER_TASK"),
+        "slurm/mem_per_cpu": os.environ.get("SLURM_MEM_PER_CPU"),
+        "host": socket.gethostname(),
+        "user": getpass.getuser(),
+    }
+
+    wandb.init(
+        project="panel_visualisation",
+        entity=wandb_entity,
+        name=run_name,
+        save_code=True,
+        mode=mode,
+        config=config,
+    )
+    if wandb.run is not None:
+        wandb.log({"status": "started", "start_time": datetime.now().isoformat()})
+    return wandb.run
+
+
+def wb_log(data: dict) -> None:
+    """Log to W&B only when a run is active."""
+    if wandb is None or wandb.run is None:
+        return
+    wandb.log(data)
+
+
+def wb_log_image(key: str, image_path: Path, caption: Optional[str] = None) -> None:
+    """Attach a saved image to W&B."""
+    if wandb is None or wandb.run is None:
+        return
+    try:
+        wb_log({key: wandb.Image(str(image_path), caption=caption)})
+    except Exception as e:
+        print(f"Warning: Failed to log image '{key}' to W&B: {e!r}")
+
+
+def resolve_duckdb_sample_method() -> str:
+    """
+    Resolve DuckDB sampling method for `USING SAMPLE ... (method)`.
+
+    Controlled via env var:
+    - PANEL_VIS_SAMPLE_METHOD: "system" (default) or "bernoulli"
+      (case-insensitive; a few common aliases are accepted)
+    """
+    raw = (os.environ.get("PANEL_VIS_SAMPLE_METHOD") or "system").strip().lower()
+    aliases = {
+        "system": "system",
+        "sys": "system",
+        "bernoulli": "bernoulli",
+        "bern": "bernoulli",
+        "ber": "bernoulli",
+    }
+    method = aliases.get(raw)
+    if method is None:
+        print(
+            f"Warning: Unknown PANEL_VIS_SAMPLE_METHOD={raw!r}. "
+            "Falling back to 'system'. Valid: 'system'|'bernoulli'."
+        )
+        method = "system"
+    return method
+
+
+def resolve_label_col(con: duckdb.DuckDBPyConnection, parquet_path: Path) -> Optional[str]:
+    """
+    Resolve the binary label column used for 'designation'/'transition' plots.
+    Preference order:
+    1) $LABEL_COL if set (explicit override)
+    2) transition_01 (default for this project)
+    """
+    env_label = os.environ.get("LABEL_COL")
+    if env_label:
+        return env_label
+
+    escaped_path = str(parquet_path).replace("'", "''")
+    schema_df = con.execute(
+        f"DESCRIBE SELECT * FROM read_parquet('{escaped_path}') LIMIT 0"
+    ).df()
+    cols = set(schema_df["column_name"].tolist())
+    if "transition_01" in cols:
+        return "transition_01"
+    return None
 
 
 def configure_duckdb(con: duckdb.DuckDBPyConnection) -> None:
@@ -66,27 +224,45 @@ def configure_duckdb(con: duckdb.DuckDBPyConnection) -> None:
     con.execute(f"SET memory_limit='{memory_limit_gb}GB'")
 
     temp_dir = os.environ.get("SCRATCH") or (ROOT_DIR / "temp")
+    Path(f"{temp_dir}/duckdb_temp").mkdir(parents=True, exist_ok=True)
     temp_dir_sql = str(temp_dir).replace("'", "''")
     con.execute(f"SET temp_directory='{temp_dir_sql}/duckdb_temp'")
 
     if is_euler:
         con.execute("PRAGMA max_temp_directory_size='200GB'")
 
+    wb_log({
+        "duckdb/threads": num_threads,
+        "duckdb/memory_limit_gb": memory_limit_gb,
+        "duckdb/temp_directory": str(temp_dir),
+        "duckdb/is_euler": is_euler,
+    })
 
-def plot_time_series(con: duckdb.DuckDBPyConnection, parquet_path: Path) -> None:
-    """Create dual-axis time series plot: row count and transition_01 sum per year."""
+def plot_time_series(con: duckdb.DuckDBPyConnection, parquet_path: Path, label_col: Optional[str]) -> Path:
+    """Create time series plot: row count (and positives per year if label_col is available)."""
     print("Creating time series plot...")
+    wb_log({"status": "running/plot_time_series"})
     
     escaped_path = str(parquet_path).replace("'", "''")
-    query = f"""
-    SELECT
-        year,
-        COUNT(*) AS row_count,
-        SUM(transition_01) AS transitions
-    FROM read_parquet('{escaped_path}')
-    GROUP BY year
-    ORDER BY year
-    """
+    if label_col:
+        query = f"""
+        SELECT
+            year,
+            COUNT(*) AS row_count,
+            SUM(CASE WHEN {label_col} = 1 THEN 1 ELSE 0 END) AS transitions
+        FROM read_parquet('{escaped_path}')
+        GROUP BY year
+        ORDER BY year
+        """
+    else:
+        query = f"""
+        SELECT
+            year,
+            COUNT(*) AS row_count
+        FROM read_parquet('{escaped_path}')
+        GROUP BY year
+        ORDER BY year
+        """
     
     df = con.execute(query).df()
     
@@ -100,19 +276,25 @@ def plot_time_series(con: duckdb.DuckDBPyConnection, parquet_path: Path) -> None
     ax1.tick_params(axis='y', labelcolor=color1)
     ax1.grid(True, alpha=0.3)
     
-    # Right axis: transitions (bars)
-    ax2 = ax1.twinx()
-    color2 = 'tab:orange'
-    ax2.set_ylabel('Number of Designations', color=color2, fontsize=12)
-    bars = ax2.bar(df['year'], df['transitions'], color=color2, alpha=0.6, label='Designations')
-    ax2.tick_params(axis='y', labelcolor=color2)
+    ax2 = None
+    if label_col and "transitions" in df.columns:
+        # Right axis: positives (bars)
+        ax2 = ax1.twinx()
+        color2 = 'tab:orange'
+        ax2.set_ylabel(f'Number of Positives ({label_col}=1)', color=color2, fontsize=12)
+        ax2.bar(df['year'], df['transitions'], color=color2, alpha=0.6, label='Positives')
+        ax2.tick_params(axis='y', labelcolor=color2)
     
     # Title
-    plt.title('Panel Dataset: Risk Set Size and Designations Over Time', fontsize=14, fontweight='bold', pad=20)
+    title = 'Panel Dataset: Risk Set Size'
+    if label_col and "transitions" in df.columns:
+        title += f' and Positives Over Time ({label_col})'
+    plt.title(title, fontsize=14, fontweight='bold', pad=20)
     
     # Legends
     ax1.legend(loc='upper left')
-    ax2.legend(loc='upper right')
+    if ax2 is not None:
+        ax2.legend(loc='upper right')
     
     plt.tight_layout()
     
@@ -120,71 +302,190 @@ def plot_time_series(con: duckdb.DuckDBPyConnection, parquet_path: Path) -> None
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
     print(f"   Saved: {output_file.name}")
     plt.close()
+    wb_log({
+        "time_series/years": int(df["year"].nunique()) if "year" in df.columns else None,
+        "time_series/total_rows": int(df["row_count"].sum()) if "row_count" in df.columns else None,
+        "time_series/label_col": label_col,
+        "time_series/total_positives": int(df["transitions"].sum()) if "transitions" in df.columns else None,
+    })
+    if wandb is not None and wandb.run is not None:
+        try:
+            wb_log({"time_series/table": wandb.Table(dataframe=df)})
+        except Exception:
+            pass
+    wb_log_image("plots/time_series", output_file, caption="Risk set size and designations over time")
+    return output_file
 
 
-def plot_spatial_map(con: duckdb.DuckDBPyConnection, parquet_path: Path) -> None:
-    """Create hexbin plot of spatial distribution of designations (transition_01 = 1)."""
-    print("Creating spatial map...")
-    
-    escaped_path = str(parquet_path).replace("'", "''")
-    query = f"""
-    SELECT col, row
-    FROM read_parquet('{escaped_path}')
-    WHERE transition_01 = 1
+def plot_spatial_map(con: duckdb.DuckDBPyConnection, parquet_path: Path, label_col: Optional[str]) -> Optional[Path]:
     """
+    Create a spatial density map of positives (label_col = 1) without materializing all points.
+
+    Implementation notes:
+    - Uses DuckDB to aggregate into a fixed-size grid (default 200x200)
+    - Optionally uses SYSTEM sampling to reduce scan cost on very large Parquet files
+    """
+    print("Creating spatial map...")
+    wb_log({"status": "running/plot_spatial_map"})
+    if not label_col:
+        print("   Warning: No label column detected. Skipping spatial map.")
+        wb_log({"spatial_map/skipped": True})
+        return None
     
-    df = con.execute(query).df()
-    
-    if len(df) == 0:
-        print("   Warning: No rows with transition_01 = 1 found. Skipping spatial map.")
-        return
-    
-    fig, ax = plt.subplots(figsize=(14, 10))
-    
-    # Hexbin plot
-    hb = ax.hexbin(df['col'], df['row'], gridsize=100, cmap='YlOrRd', mincnt=1)
-    
-    ax.set_xlabel('Column', fontsize=12)
-    ax.set_ylabel('Row', fontsize=12)
-    ax.set_title('Spatial Distribution of Designations (transition_01 = 1)', fontsize=14, fontweight='bold', pad=20)
-    
-    # Colorbar
-    cb = plt.colorbar(hb, ax=ax)
-    cb.set_label('Count of Designations', fontsize=12)
-    
+    grid_size = int(os.environ.get("PANEL_VIS_SPATIAL_GRID_SIZE", "200"))
+    sample_pct = float(os.environ.get("PANEL_VIS_SPATIAL_SAMPLE_PCT", "1.0"))
+    sample_pct = max(0.001, min(sample_pct, 100.0))
+    sample_method = resolve_duckdb_sample_method()
+
+    escaped_path = str(parquet_path).replace("'", "''")
+
+    # Aggregate into bins inside DuckDB (bounded result size: <= grid_size^2 rows)
+    # Sample first to reduce scan cost; for exact (no sampling), set PANEL_VIS_SPATIAL_SAMPLE_PCT=100
+    query = f"""
+    WITH sampled AS (
+        SELECT row, col
+        FROM read_parquet('{escaped_path}')
+        USING SAMPLE {sample_pct}% ({sample_method})
+        WHERE {label_col} = 1
+    ),
+    bounds AS (
+        SELECT
+            MIN(col) AS min_col,
+            MAX(col) AS max_col,
+            MIN(row) AS min_row,
+            MAX(row) AS max_row,
+            COUNT(*) AS n_points
+        FROM sampled
+    ),
+    binned AS (
+        SELECT
+            CASE
+                WHEN b.max_col IS NULL OR b.min_col IS NULL OR b.max_col = b.min_col THEN 0
+                ELSE CAST(FLOOR((col - b.min_col) * {grid_size} * 1.0 / (b.max_col - b.min_col + 1)) AS INTEGER)
+            END AS xbin,
+            CASE
+                WHEN b.max_row IS NULL OR b.min_row IS NULL OR b.max_row = b.min_row THEN 0
+                ELSE CAST(FLOOR((row - b.min_row) * {grid_size} * 1.0 / (b.max_row - b.min_row + 1)) AS INTEGER)
+            END AS ybin
+        FROM sampled, bounds b
+    )
+    SELECT xbin, ybin, COUNT(*) AS n
+    FROM binned
+    GROUP BY xbin, ybin
+    """
+
+    bounds_query = f"""
+    WITH sampled AS (
+        SELECT row, col
+        FROM read_parquet('{escaped_path}')
+        USING SAMPLE {sample_pct}% ({sample_method})
+        WHERE {label_col} = 1
+    )
+    SELECT COUNT(*) AS n_points, MIN(col) AS min_col, MAX(col) AS max_col, MIN(row) AS min_row, MAX(row) AS max_row
+    FROM sampled
+    """
+
+    bounds = con.execute(bounds_query).fetchone()
+    n_points = int(bounds[0]) if bounds and bounds[0] is not None else 0
+    if n_points == 0:
+        print(f"   Warning: No sampled rows with {label_col} = 1 found. Skipping spatial map.")
+        wb_log({"spatial_map/num_points_sampled": 0, "spatial_map/skipped": True})
+        return None
+
+    # Use sampled bounds to compute an approximate geographic aspect ratio.
+    # This reduces visual distortion vs forcing a square map.
+    min_col = bounds[1]
+    max_col = bounds[2]
+    min_row = bounds[3]
+    max_row = bounds[4]
+    try:
+        col_span = float(max_col - min_col) if (max_col is not None and min_col is not None) else 0.0
+        row_span = float(max_row - min_row) if (max_row is not None and min_row is not None) else 0.0
+    except Exception:
+        col_span = 0.0
+        row_span = 0.0
+    geo_aspect = (row_span / col_span) if col_span > 0 else 1.0
+
+    df_bins = con.execute(query).df()
+    # Build a dense grid
+    grid = np.zeros((grid_size, grid_size), dtype=np.float32)
+    for xbin, ybin, n in df_bins.itertuples(index=False, name=None):
+        if xbin is None or ybin is None or n is None:
+            continue
+        if 0 <= int(xbin) < grid_size and 0 <= int(ybin) < grid_size:
+            grid[int(ybin), int(xbin)] = float(n)
+
+    fig_w = 14.0
+    fig_h = min(20.0, max(6.0, fig_w * float(geo_aspect)))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    extent = None
+    if min_col is not None and max_col is not None and min_row is not None and max_row is not None:
+        extent = [float(min_col), float(max_col), float(min_row), float(max_row)]
+    im = ax.imshow(grid, origin="lower", cmap="YlOrRd", extent=extent)
+    ax.set_aspect("equal")
+    ax.set_xlabel('Binned Column', fontsize=12)
+    ax.set_ylabel('Binned Row', fontsize=12)
+    ax.set_title(
+        f"Spatial Density of Positives ({label_col}=1) | grid={grid_size} | sample={sample_pct}% ({sample_method}) | aspect≈{geo_aspect:.3f}",
+        fontsize=14,
+        fontweight='bold',
+        pad=20,
+    )
+    cb = plt.colorbar(im, ax=ax)
+    cb.set_label('Count (per bin)', fontsize=12)
     plt.tight_layout()
     
     output_file = OUTPUT_DIR / "spatial_map.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
     print(f"   Saved: {output_file.name}")
     plt.close()
+    wb_log({
+        "spatial_map/grid_size": grid_size,
+        "spatial_map/sample_pct": sample_pct,
+        "spatial_map/sample_method": sample_method,
+        "spatial_map/num_points_sampled": n_points,
+        "spatial_map/nonzero_bins": int(np.count_nonzero(grid)),
+        "spatial_map/geo_aspect": float(geo_aspect),
+        "spatial_map/row_span": float(row_span),
+        "spatial_map/col_span": float(col_span),
+    })
+    wb_log_image("plots/spatial_map", output_file, caption=f"Spatial density of positives ({label_col}=1), binned")
+    return output_file
 
 
-def plot_class_separation(con: duckdb.DuckDBPyConnection, parquet_path: Path) -> None:
-    """Create boxplots for top 4 features, split by transition_01, using balanced sampling."""
+def plot_class_separation(con: duckdb.DuckDBPyConnection, parquet_path: Path, label_col: Optional[str]) -> Optional[Path]:
+    """Create boxplots for top features split by label_col, using balanced sampling."""
     print("Creating class separation boxplots...")
+    wb_log({"status": "running/plot_class_separation"})
+    if not label_col:
+        print("   Warning: No label column detected. Skipping class separation.")
+        wb_log({"class_sep/skipped": True})
+        return None
     
-    # Top 4 features
-    top_features = ['dist_wdpa', 'HNTL_b1', 'NDVI_b1', 'deforestation_b1']
+    # Features (env override)
+    env_features_raw = os.environ.get("PANEL_VIS_FEATURES")
+    if env_features_raw:
+        top_features = [f.strip() for f in env_features_raw.split(",") if f.strip()]
+    else:
+        # Top 4 features (default)
+        top_features = ['dist_wdpa', 'HNTL_b1', 'NDVI_b1', 'deforestation_b1']
+    wb_log({"class_sep/features": top_features, "class_sep/features_env_raw": env_features_raw})
     
     escaped_path = str(parquet_path).replace("'", "''")
     
-    # First, get counts of positives
-    count_query = f"""
-    SELECT 
-        SUM(CASE WHEN transition_01 = 1 THEN 1 ELSE 0 END) AS pos_count,
-        SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS neg_count
-    FROM read_parquet('{escaped_path}')
-    """
-    
-    counts = con.execute(count_query).fetchone()
-    pos_count = counts[0]
-    neg_count = counts[1]
-    
-    # Sample size: all positives + 5x positives of negatives
-    sample_neg = min(pos_count * 5, neg_count)
-    
-    print(f"   Positive samples: {pos_count:,}, Negative samples: {sample_neg:,}")
+    # Strict caps to prevent OOM: we only ever materialize a bounded sample into pandas
+    max_pos = int(os.environ.get("PANEL_VIS_CLASS_SEP_MAX_POS", "50000"))
+    neg_ratio = int(os.environ.get("PANEL_VIS_CLASS_SEP_NEG_RATIO", "5"))
+    max_pos = max(1000, max_pos)
+    neg_ratio = max(1, neg_ratio)
+    max_neg = max_pos * neg_ratio
+
+    print(f"   Sampling up to {max_pos:,} positives and {max_neg:,} negatives (ratio={neg_ratio}x)")
+    wb_log({
+        "class_sep/max_pos": int(max_pos),
+        "class_sep/max_neg": int(max_neg),
+        "class_sep/neg_ratio": int(neg_ratio),
+    })
     
     # Get feature columns - check which ones exist
     schema_query = f"DESCRIBE SELECT * FROM read_parquet('{escaped_path}') LIMIT 0"
@@ -196,29 +497,76 @@ def plot_class_separation(con: duckdb.DuckDBPyConnection, parquet_path: Path) ->
     
     if not existing_features:
         print(f"   Warning: None of the requested features found. Available columns: {list(available_cols)[:10]}...")
+        wb_log({"class_sep/available_feature_cols": len(available_cols)})
         return
+    wb_log({"class_sep/num_features_plotted": int(len(existing_features))})
     
-    # Build query for balanced sample
-    # Use random sampling with ORDER BY RANDOM() LIMIT for negatives
+    # Build query for capped samples (no ORDER BY random() which can explode memory)
     feature_list = ', '.join(existing_features)
     
     sample_query = f"""
     (
-        SELECT {feature_list}, transition_01
+        SELECT {feature_list}, {label_col} AS label
         FROM read_parquet('{escaped_path}')
-        WHERE transition_01 = 1
+        USING SAMPLE 10% (bernoulli)
+        WHERE {label_col} = 1
+        LIMIT {max_pos}
     )
     UNION ALL
     (
-        SELECT {feature_list}, transition_01
+        SELECT {feature_list}, {label_col} AS label
         FROM read_parquet('{escaped_path}')
-        WHERE transition_01 = 0
-        ORDER BY random()
-        LIMIT {sample_neg}
+        USING SAMPLE 10% (bernoulli)
+        WHERE {label_col} = 0
+        LIMIT {max_neg}
     )
     """
     
     df = con.execute(sample_query).df()
+    if df.empty:
+        print("   Warning: Sample query returned 0 rows. Skipping class separation.")
+        wb_log({"class_sep/sample_rows": 0, "class_sep/skipped": True})
+        return None
+    wb_log({
+        "class_sep/sample_rows": int(len(df)),
+        "class_sep/sample_pos_rows": int((df["label"] == 1).sum()) if "label" in df.columns else None,
+        "class_sep/sample_neg_rows": int((df["label"] == 0).sum()) if "label" in df.columns else None,
+    })
+
+    # Plot controls:
+    # - Hide outliers to emphasize IQR separation (default: on).
+    # - Apply log-style scaling when the feature is heavily skewed (default: auto).
+    hide_outliers_raw = (os.environ.get("PANEL_VIS_BOX_HIDE_OUTLIERS") or "1").strip().lower()
+    hide_outliers = hide_outliers_raw not in {"0", "false", "no", "off"}
+    sym = "" if hide_outliers else "b+"
+    showfliers = not hide_outliers
+
+    scale_mode = (os.environ.get("PANEL_VIS_BOX_SCALE") or "auto").strip().lower()
+    # Heavily-skewed heuristic (only used when scale_mode="auto")
+    skew_ratio_thres = float(os.environ.get("PANEL_VIS_BOX_SKEW_RATIO_THRES", "50"))
+    skew_abs_thres = float(os.environ.get("PANEL_VIS_BOX_SKEW_ABS_THRES", "10"))
+
+    wb_log({
+        "class_sep/box_hide_outliers": bool(hide_outliers),
+        "class_sep/box_scale_mode": scale_mode,
+        "class_sep/box_skew_ratio_thres": float(skew_ratio_thres),
+        "class_sep/box_skew_abs_thres": float(skew_abs_thres),
+    })
+
+    def _is_heavily_skewed(s: pd.Series) -> bool:
+        s = s.dropna()
+        if s.empty:
+            return False
+        # Robust proxy: extreme-to-median ratio, plus classic skewness.
+        q = s.quantile([0.5, 0.95, 0.99])
+        q50 = float(q.loc[0.5])
+        q99 = float(q.loc[0.99])
+        ratio = (q99 / q50) if q50 != 0 else (np.inf if q99 != 0 else 0.0)
+        try:
+            skew = float(s.skew())
+        except Exception:
+            skew = 0.0
+        return (ratio >= skew_ratio_thres) or (abs(skew) >= skew_abs_thres)
     
     # Create subplots
     n_features = len(existing_features)
@@ -229,45 +577,122 @@ def plot_class_separation(con: duckdb.DuckDBPyConnection, parquet_path: Path) ->
         ax = axes[idx]
         
         # Prepare data for boxplot
-        pos_data = df[df['transition_01'] == 1][feature].dropna()
-        neg_data = df[df['transition_01'] == 0][feature].dropna()
+        pos_data = df[df['label'] == 1][feature].dropna()
+        neg_data = df[df['label'] == 0][feature].dropna()
+
+        # Optional scaling: hide outliers for IQR-focused separation; apply log-style view when skewed.
+        combined = pd.concat([neg_data, pos_data], axis=0)
+        apply_log_axis = False
+        applied_log1p = False
+        applied_symlog = False
+
+        if scale_mode in {"auto", "linear", "log", "log1p", "symlog"}:
+            should_log = False
+            if scale_mode == "auto":
+                should_log = _is_heavily_skewed(combined)
+            elif scale_mode != "linear":
+                should_log = True
+
+            if should_log:
+                min_val = float(np.nanmin(combined.values)) if len(combined) else np.nan
+                if scale_mode in {"auto", "log"}:
+                    if np.isfinite(min_val) and min_val > 0:
+                        apply_log_axis = True
+                    elif np.isfinite(min_val) and min_val >= 0:
+                        # Safe fallback when zeros are present: log1p transform.
+                        applied_log1p = True
+                    else:
+                        # Contains negatives (e.g., NDVI). Symlog is the safest "log-like" scale.
+                        applied_symlog = True
+                elif scale_mode == "log1p":
+                    if np.isfinite(min_val) and min_val >= 0:
+                        applied_log1p = True
+                elif scale_mode == "symlog":
+                    applied_symlog = True
+
+        if applied_log1p:
+            pos_plot = np.log1p(pos_data.to_numpy(dtype=float))
+            neg_plot = np.log1p(neg_data.to_numpy(dtype=float))
+            ylabel = f"log1p({feature})"
+        else:
+            pos_plot = pos_data.to_numpy(dtype=float)
+            neg_plot = neg_data.to_numpy(dtype=float)
+            ylabel = feature
         
         # Create boxplot
-        box_data = [neg_data, pos_data]
-        bp = ax.boxplot(box_data, labels=['No Designation (0)', 'Designation (1)'], patch_artist=True)
+        box_data = [neg_plot, pos_plot]
+        bp = ax.boxplot(
+            box_data,
+            labels=[f'{label_col}=0', f'{label_col}=1'],
+            patch_artist=True,
+            sym=sym,                # sym="" hides fliers (outliers) to emphasize IQR
+            showfliers=showfliers,  # explicit for newer matplotlib versions
+        )
         
         # Color boxes
         colors = ['lightblue', 'lightcoral']
         for patch, color in zip(bp['boxes'], colors):
             patch.set_facecolor(color)
         
-        ax.set_ylabel(feature, fontsize=11)
-        ax.set_title(f'Class Separation: {feature}', fontsize=12, fontweight='bold')
+        ax.set_ylabel(ylabel, fontsize=11)
+
+        scale_note = ""
+        if apply_log_axis:
+            ax.set_yscale("log")
+            scale_note = " (log)"
+        elif applied_symlog:
+            ax.set_yscale("symlog", linthresh=1e-3)
+            scale_note = " (symlog)"
+        elif applied_log1p:
+            scale_note = " (log1p)"
+
+        ax.set_title(f'Class Separation: {feature}{scale_note}', fontsize=12, fontweight='bold')
         ax.grid(True, alpha=0.3, axis='y')
         
-        # Add sample size annotations (boxplot positions are at 1 and 2)
-        y_max = ax.get_ylim()[1]
-        ax.text(1, y_max * 0.98, f'n={len(neg_data):,}', 
-                ha='center', va='top', fontsize=9, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-        ax.text(2, y_max * 0.98, f'n={len(pos_data):,}', 
-                ha='center', va='top', fontsize=9, bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        # Add sample size annotations (stable across linear/log scales)
+        ax.annotate(
+            f'n={len(neg_data):,}',
+            xy=(1, 0.98),
+            xycoords=('data', 'axes fraction'),
+            ha='center',
+            va='top',
+            fontsize=9,
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
+        )
+        ax.annotate(
+            f'n={len(pos_data):,}',
+            xy=(2, 0.98),
+            xycoords=('data', 'axes fraction'),
+            ha='center',
+            va='top',
+            fontsize=9,
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5),
+        )
+
+        wb_log({
+            f"class_sep/{feature}/hide_outliers": bool(hide_outliers),
+            f"class_sep/{feature}/scale_note": scale_note.strip() if scale_note else "linear",
+        })
     
     # Remove extra subplots if needed
     for idx in range(n_features, len(axes)):
         fig.delaxes(axes[idx])
     
-    plt.suptitle('Class Separation: Top Features by Designation Status', fontsize=14, fontweight='bold', y=0.995)
+    plt.suptitle(f'Class Separation: Top Features by Label ({label_col})', fontsize=14, fontweight='bold', y=0.995)
     plt.tight_layout()
     
     output_file = OUTPUT_DIR / "class_separation.png"
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
     print(f"   Saved: {output_file.name}")
     plt.close()
+    wb_log_image("plots/class_separation", output_file, caption=f"Feature distributions by label ({label_col})")
+    return output_file
 
 
-def plot_correlation_matrix(con: duckdb.DuckDBPyConnection, parquet_path: Path) -> None:
-    """Create correlation matrix heatmap of numeric features on 1% random sample."""
+def plot_correlation_matrix(con: duckdb.DuckDBPyConnection, parquet_path: Path, label_col: Optional[str]) -> Optional[Path]:
+    """Create correlation matrix heatmap on a bounded random sample (caps rows and columns)."""
     print("Creating correlation matrix...")
+    wb_log({"status": "running/plot_correlation_matrix"})
     
     escaped_path = str(parquet_path).replace("'", "''")
     
@@ -277,32 +702,66 @@ def plot_correlation_matrix(con: duckdb.DuckDBPyConnection, parquet_path: Path) 
     
     # Metadata columns to exclude
     exclude_cols = {'year', 'x', 'y', 'row', 'col', 'transition_01'}
+    if label_col:
+        exclude_cols.add(label_col)
     
     # Filter to numeric columns (excluding metadata)
     all_cols = schema_df['column_name'].tolist()
     numeric_cols = [col for col in all_cols if col not in exclude_cols]
-    
-    # Get 1% sample using random() < 0.01
+
+    max_cols = int(os.environ.get("PANEL_VIS_CORR_MAX_COLS", "60"))
+    max_rows = int(os.environ.get("PANEL_VIS_CORR_MAX_ROWS", "200000"))
+    sample_pct = float(os.environ.get("PANEL_VIS_CORR_SAMPLE_PCT", "0.2"))
+    sample_method = resolve_duckdb_sample_method()
+    max_cols = max(5, max_cols)
+    max_rows = max(5000, max_rows)
+    sample_pct = max(0.001, min(sample_pct, 100.0))
+
+    # Cap columns to keep the correlation matrix and pandas frame bounded
+    numeric_cols = numeric_cols[:max_cols]
+    wb_log({
+        "corr/num_numeric_cols_total": int(len(all_cols) - len(exclude_cols)),
+        "corr/num_numeric_cols_used": int(len(numeric_cols)),
+        "corr/max_rows": int(max_rows),
+        "corr/sample_pct": float(sample_pct),
+        "corr/sample_method": sample_method,
+    })
+
+    # Use SYSTEM sampling to avoid scanning the full parquet, then cap rows.
     sample_query = f"""
     SELECT {', '.join(numeric_cols)}
     FROM read_parquet('{escaped_path}')
-    WHERE random() < 0.01
+    USING SAMPLE {sample_pct}% ({sample_method})
+    LIMIT {max_rows}
     """
-    
+
     df = con.execute(sample_query).df()
+    wb_log({"corr/sample_rows": int(len(df))})
+    if df.empty:
+        print("   Warning: Correlation sample is empty. Skipping correlation matrix.")
+        wb_log({"corr/skipped": True})
+        return None
     
     # Calculate correlation matrix
     corr_matrix = df.corr()
+    print("   Masking upper triangle (reducing visual noise)...")
+    wb_log({"corr/mask_upper_triangle": True})
+    mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
     
     # Create heatmap
     fig, ax = plt.subplots(figsize=(16, 14))
     
     # Use a diverging colormap
-    sns.heatmap(corr_matrix, annot=False, cmap='coolwarm', center=0,
+    sns.heatmap(corr_matrix, mask=mask, annot=False, cmap='coolwarm', center=0,
                 square=True, linewidths=0.5, cbar_kws={"shrink": 0.8},
                 fmt='.2f', ax=ax)
     
-    ax.set_title('Feature Correlation Matrix (1% Random Sample)', fontsize=14, fontweight='bold', pad=20)
+    ax.set_title(
+        f'Feature Correlation Matrix ({sample_method} sample {sample_pct}%, limit {max_rows:,} rows, {len(numeric_cols)} cols)',
+        fontsize=14,
+        fontweight='bold',
+        pad=20,
+    )
     
     # Rotate labels for readability
     plt.xticks(rotation=45, ha='right')
@@ -314,6 +773,8 @@ def plot_correlation_matrix(con: duckdb.DuckDBPyConnection, parquet_path: Path) 
     plt.savefig(output_file, dpi=300, bbox_inches='tight')
     print(f"   Saved: {output_file.name}")
     plt.close()
+    wb_log_image("plots/correlation_matrix", output_file, caption="Feature correlation matrix (1% random sample)")
+    return output_file
 
 
 def main():
@@ -324,23 +785,28 @@ def main():
     print(f"Input file: {PANEL_FILE}")
     print(f"Output directory: {OUTPUT_DIR}")
     print()
-    
-    # Initialize DuckDB
-    con = duckdb.connect()
-    configure_duckdb(con)
+
+    run = init_wandb(PANEL_FILE, OUTPUT_DIR)
     
     try:
-        # 1. Time series plot
-        plot_time_series(con, PANEL_FILE)
-        
-        # 2. Spatial map
-        plot_spatial_map(con, PANEL_FILE)
-        
-        # 3. Class separation boxplots
-        plot_class_separation(con, PANEL_FILE)
-        
-        # 4. Correlation matrix
-        plot_correlation_matrix(con, PANEL_FILE)
+        # Initialize DuckDB (always closed correctly)
+        with duckdb.connect() as con:
+            configure_duckdb(con)
+            label_col = resolve_label_col(con, PANEL_FILE)
+            print(f"Label column: {label_col if label_col else 'None (label-based plots will be skipped)'}")
+            wb_log({"label/col": label_col, "label/is_detected": bool(label_col)})
+
+            # 1. Time series plot
+            ts_path = plot_time_series(con, PANEL_FILE, label_col)
+            
+            # 2. Spatial map
+            spatial_path = plot_spatial_map(con, PANEL_FILE, label_col)
+            
+            # 3. Class separation boxplots
+            sep_path = plot_class_separation(con, PANEL_FILE, label_col)
+            
+            # 4. Correlation matrix
+            corr_path = plot_correlation_matrix(con, PANEL_FILE, label_col)
         
         print()
         print("=" * 70)
@@ -352,9 +818,22 @@ def main():
         print("  2. spatial_map.png - Spatial distribution of designations")
         print("  3. class_separation.png - Feature distributions by class")
         print("  4. correlation_matrix.png - Feature correlation matrix")
+
+        wb_log({
+            "status": "completed",
+            "outputs/time_series_path": str(ts_path) if ts_path else None,
+            "outputs/spatial_map_path": str(spatial_path) if spatial_path else None,
+            "outputs/class_separation_path": str(sep_path) if sep_path else None,
+            "outputs/correlation_matrix_path": str(corr_path) if corr_path else None,
+            "outputs/output_dir": str(OUTPUT_DIR),
+        })
         
     finally:
-        con.close()
+        if wandb is not None and run is not None:
+            try:
+                wandb.finish()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
