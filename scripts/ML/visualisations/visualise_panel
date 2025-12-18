@@ -191,17 +191,44 @@ def resolve_label_col(con: duckdb.DuckDBPyConnection, parquet_path: Path) -> Opt
     1) $LABEL_COL if set (explicit override)
     2) transition_01 (default for this project)
     """
-    env_label = os.environ.get("LABEL_COL")
-    if env_label:
-        return env_label
-
     escaped_path = str(parquet_path).replace("'", "''")
     schema_df = con.execute(
         f"DESCRIBE SELECT * FROM read_parquet('{escaped_path}') LIMIT 0"
     ).df()
     cols = set(schema_df["column_name"].tolist())
+
+    env_label = os.environ.get("LABEL_COL")
+    if env_label:
+        if env_label in cols:
+            return env_label
+        print(
+            f"Warning: LABEL_COL={env_label!r} was provided but is not present in the parquet schema. "
+            "Label-based plots will be skipped unless you set LABEL_COL to an existing column."
+        )
+        wb_log({"label/env_label_missing": True, "label/env_label": env_label})
+        return None
+
+    # Project default label (only if actually present)
     if "transition_01" in cols:
         return "transition_01"
+
+    # Soft fallback: detect common alternative label column names if present.
+    # (Avoid expensive data scans; this is purely name-based.)
+    fallback_candidates = [
+        "designation_01",
+        "designation",
+        "label",
+        "target",
+        "WDPA_transition_01",
+        "WDPA_transition",
+    ]
+    for cand in fallback_candidates:
+        if cand in cols:
+            print(f"Note: Using detected label column {cand!r} (fallback).")
+            wb_log({"label/fallback_used": True, "label/fallback_col": cand})
+            return cand
+
+    # No label column found.
     return None
 
 
