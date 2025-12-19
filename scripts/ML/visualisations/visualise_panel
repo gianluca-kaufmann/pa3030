@@ -350,7 +350,6 @@ def plot_temporal_feature_comparison(
     method = "bernoulli"
     sample_pct, dens_sample_pct = resolve_temporal_sample_pcts()
     show_density_diff = bool(int(os.environ.get("PANEL_VIS_SHOW_DENSITY_DIFF", "1"))) if show_density_diff is None else show_density_diff
-    density_bias_note = ""
     
     # 0. Pick coordinates (avoid row/col if x/y or lon/lat exist)
     schema = con.execute(f"DESCRIBE SELECT * FROM {panel_read_expr()} LIMIT 0").df()
@@ -363,7 +362,9 @@ def plot_temporal_feature_comparison(
     clip_query = f"""
         SELECT
             approx_quantile(val, 0.02) AS vmin,
-            approx_quantile(val, 0.98) AS vmax
+            approx_quantile(val, 0.98) AS vmax,
+            MIN(val) AS actual_min,
+            MAX(val) AS actual_max
         FROM (
             SELECT {feat_expr} AS val
             FROM {panel_read_expr()}
@@ -371,7 +372,8 @@ def plot_temporal_feature_comparison(
             USING SAMPLE {sample_pct}% ({method})
         ) t
     """
-    vmin, vmax = con.execute(clip_query).fetchone()
+    result = con.execute(clip_query).fetchone()
+    vmin, vmax, actual_min, actual_max = result
     # Guard against degenerate / invalid color scales (prevents confusing empty plots or crashes).
     if vmin is None or vmax is None:
         print(
@@ -382,19 +384,48 @@ def plot_temporal_feature_comparison(
     try:
         vmin_f = float(vmin)
         vmax_f = float(vmax)
+        actual_min_f = float(actual_min) if actual_min is not None else None
+        actual_max_f = float(actual_max) if actual_max is not None else None
     except Exception as e:
         print(
             f"WARNING: Temporal comparison for {feature!r} (years={years}) "
             f"could not cast vmin/vmax to float (vmin={vmin!r}, vmax={vmax!r}): {e}; skipping plot."
         )
         return
-    if (not np.isfinite(vmin_f)) or (not np.isfinite(vmax_f)) or (vmin_f == vmax_f) or (vmin_f > vmax_f):
+    if (not np.isfinite(vmin_f)) or (not np.isfinite(vmax_f)) or (vmin_f > vmax_f):
         print(
             f"WARNING: Temporal comparison for {feature!r} (years={years}) has invalid scale "
             f"(vmin={vmin_f}, vmax={vmax_f}); skipping plot."
         )
         return
-    vmin, vmax = vmin_f, vmax_f
+    
+    # Handle binary/sparse features where percentiles might be equal
+    # For binary features (e.g., oil_gas_b1, powerplants_b1), use actual min/max if percentiles are flat
+    if vmin_f == vmax_f:
+        if actual_min_f is not None and actual_max_f is not None and actual_min_f != actual_max_f:
+            # Use actual min/max for binary/sparse features
+            vmin, vmax = actual_min_f, actual_max_f
+            print(
+                f"Note: {feature!r} percentiles are flat (vmin=vmax={vmin_f}), "
+                f"using actual range [{actual_min_f}, {actual_max_f}] for visualization."
+            )
+        elif actual_min_f is not None and actual_max_f is not None and actual_min_f == actual_max_f:
+            # Feature is completely flat - create a small range around the value for visualization
+            center = actual_min_f
+            vmin = center - max(abs(center) * 0.01, 0.1) if center != 0 else -0.1
+            vmax = center + max(abs(center) * 0.01, 0.1) if center != 0 else 0.1
+            print(
+                f"Note: {feature!r} is completely flat (all values={center}), "
+                f"using artificial range [{vmin}, {vmax}] for visualization."
+            )
+        else:
+            print(
+                f"WARNING: Temporal comparison for {feature!r} (years={years}) has flat percentiles "
+                f"(vmin=vmax={vmin_f}) and no valid min/max; skipping plot."
+            )
+            return
+    else:
+        vmin, vmax = vmin_f, vmax_f
 
     n_years = len(list(years))
     # Layout: 1 row with per-year feature maps (+ optional density-diff column).
@@ -479,12 +510,6 @@ def plot_temporal_feature_comparison(
             db = hb / max(hb.sum(), 1.0)
             diff = (da - db).T  # transpose for imshow orientation (y as rows)
 
-            # For static features like elevation, a large density diff indicates sampling bias across years.
-            tvd = 0.5 * float(np.sum(np.abs(da - db)))
-            tvd_thresh = float(os.environ.get("PANEL_VIS_DENSITY_BIAS_TVD_THRESH", "0.05"))
-            if feature == "elevation_b1" and tvd >= tvd_thresh:
-                density_bias_note = f" | WARNING: density diff suggests sampling bias (TVD={tvd:.3f})"
-
             vmax_d = float(np.nanpercentile(np.abs(diff), 99))
             norm = TwoSlopeNorm(vmin=-vmax_d, vcenter=0.0, vmax=vmax_d)
             im = ax.imshow(
@@ -506,8 +531,6 @@ def plot_temporal_feature_comparison(
         ax.set_ylabel("")
 
     title = f"Temporal Integrity Check: {feature} ({' vs '.join(map(str, years))})"
-    if density_bias_note:
-        title += density_bias_note
     plt.suptitle(title, fontsize=15, fontweight='bold')
     # Reserve space for a single shared colorbar for the feature maps.
     fig.subplots_adjust(right=0.92)
@@ -1055,6 +1078,7 @@ def main():
         "dist_wdpa",
         "oil_gas_b1",
         "powerplants_b1",
+        "GSN_b1",
         "road_infrastructure_b1",
         "NDVI_b1_smooth64",
         "HNTL_b1_smooth64",
