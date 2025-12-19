@@ -343,8 +343,6 @@ def plot_temporal_feature_comparison(
 
     - Global color scale: 2nd/98th percentiles computed on the combined 3-year sample.
     - Optional density-difference panel (2011 vs 2013) to highlight spatial loss during collapse.
-    - Optional footprint panels per year (PANEL_VIS_SHOW_FOOTPRINT=1) to diagnose whether
-      missing areas are due to feature NoData (val is NULL) vs missing panel coverage.
     """
     print(f"Creating Temporal Comparison for {feature}...")
     years = [2011, 2013, 2015] if years is None else list(years)
@@ -352,7 +350,6 @@ def plot_temporal_feature_comparison(
     method = "bernoulli"
     sample_pct, dens_sample_pct = resolve_temporal_sample_pcts()
     show_density_diff = bool(int(os.environ.get("PANEL_VIS_SHOW_DENSITY_DIFF", "1"))) if show_density_diff is None else show_density_diff
-    show_footprint = _parse_bool_env("PANEL_VIS_SHOW_FOOTPRINT", default=False)
     density_bias_note = ""
     
     # 0. Pick coordinates (avoid row/col if x/y or lon/lat exist)
@@ -400,9 +397,7 @@ def plot_temporal_feature_comparison(
     vmin, vmax = vmin_f, vmax_f
 
     n_years = len(list(years))
-    # Layout:
-    # - Default: 1 row with per-year feature maps (+ optional density-diff column).
-    # - With footprint: 2 rows (top=feature, bottom=footprint), with density-diff spanning both rows.
+    # Layout: 1 row with per-year feature maps (+ optional density-diff column).
     #
     # NOTE: This function is designed to support 4+ years (wide panels). We scale
     # figure width by column count and clamp to a configurable max to avoid
@@ -412,23 +407,13 @@ def plot_temporal_feature_comparison(
     fig_w_min = float(os.environ.get("PANEL_VIS_TEMP_FIG_W_MIN", "12.0"))
     fig_w_max = float(os.environ.get("PANEL_VIS_TEMP_FIG_W_MAX", "40.0"))
     fig_h = float(os.environ.get("PANEL_VIS_TEMP_FIG_H", "6.0"))
-    fig_h_fp = float(os.environ.get("PANEL_VIS_TEMP_FIG_H_FOOTPRINT", "10.5"))
     fig_w = min(fig_w_max, max(fig_w_min, fig_w_per_col * float(ncols)))
 
-    if show_footprint:
-        import matplotlib.gridspec as gridspec
-        fig = plt.figure(figsize=(fig_w, fig_h_fp))
-        gs = gridspec.GridSpec(2, ncols, figure=fig, wspace=0.05, hspace=0.12)
-        axes_feat = [fig.add_subplot(gs[0, i]) for i in range(n_years)]
-        axes_fp = [fig.add_subplot(gs[1, i], sharex=axes_feat[0], sharey=axes_feat[0]) for i in range(n_years)]
-        ax_dens = fig.add_subplot(gs[:, -1], sharex=axes_feat[0], sharey=axes_feat[0]) if show_density_diff else None
-    else:
-        fig, axes = plt.subplots(1, ncols, figsize=(fig_w, fig_h), sharex=True, sharey=True)
-        if ncols == 1:
-            axes = [axes]
-        axes_feat = list(axes[:n_years])
-        axes_fp = []
-        ax_dens = axes[-1] if show_density_diff else None
+    fig, axes = plt.subplots(1, ncols, figsize=(fig_w, fig_h), sharex=True, sharey=True)
+    if ncols == 1:
+        axes = [axes]
+    axes_feat = list(axes[:n_years])
+    ax_dens = axes[-1] if show_density_diff else None
     
     year_dfs: Dict[int, pd.DataFrame] = {}
     for i, year in enumerate(years):
@@ -436,8 +421,7 @@ def plot_temporal_feature_comparison(
             SELECT {q(cy)} AS y, {q(cx)} AS x, {feat_expr} AS val
             FROM {panel_read_expr()} 
             WHERE year = {int(year)} AND {feat_expr} IS NOT NULL
-            USING SAMPLE {sample_pct}% ({method}) 
-            LIMIT 300000
+            USING SAMPLE {sample_pct}% ({method})
         """).df()
         year_dfs[int(year)] = df
         
@@ -455,30 +439,6 @@ def plot_temporal_feature_comparison(
         ax.set_xlabel("")
         ax.set_ylabel("")
 
-        # Optional footprint panel per year (coverage diagnostic; ignore val entirely)
-        if show_footprint:
-            fp_sample_pct = float(os.environ.get("PANEL_VIS_FOOTPRINT_SAMPLE_PCT", str(sample_pct)))
-            fp = con.execute(
-                f"""
-                SELECT {q(cy)} AS y, {q(cx)} AS x
-                FROM {panel_read_expr()}
-                WHERE year = {int(year)}
-                USING SAMPLE {fp_sample_pct}% ({method})
-                LIMIT 600000
-                """
-            ).df()
-            axf = axes_fp[i]
-            if fp.empty:
-                axf.set_title(f"Footprint {year} (EMPTY)", color="red", fontsize=12)
-            else:
-                axf.scatter(fp["x"], fp["y"], s=0.06, c="lightgray", alpha=0.35, rasterized=True)
-                axf.set_title(f"Footprint {year} (n={len(fp):,})", fontsize=12)
-            axf.set_aspect("equal")
-            axf.set_xticks([])
-            axf.set_yticks([])
-            axf.set_xlabel("")
-            axf.set_ylabel("")
-
     # 2. Optional density difference (2011 vs 2013)
     if show_density_diff:
         ax = ax_dens
@@ -493,7 +453,6 @@ def plot_temporal_feature_comparison(
             FROM {panel_read_expr()}
             WHERE year = {y0}
             USING SAMPLE {dens_sample_pct}% ({method})
-            LIMIT 500000
             """
         ).df()
         b = con.execute(
@@ -502,7 +461,6 @@ def plot_temporal_feature_comparison(
             FROM {panel_read_expr()}
             WHERE year = {y1}
             USING SAMPLE {dens_sample_pct}% ({method})
-            LIMIT 500000
             """
         ).df()
         if a.empty or b.empty:
@@ -553,10 +511,7 @@ def plot_temporal_feature_comparison(
     plt.suptitle(title, fontsize=15, fontweight='bold')
     # Reserve space for a single shared colorbar for the feature maps.
     fig.subplots_adjust(right=0.92)
-    # Slightly adjust cbar height if we have two rows (footprint)
-    cbar_y0 = 0.12 if show_footprint else 0.15
-    cbar_h = 0.76 if show_footprint else 0.7
-    cbar_ax = fig.add_axes([0.94, cbar_y0, 0.015, cbar_h])
+    cbar_ax = fig.add_axes([0.94, 0.15, 0.015, 0.7])
     fig.colorbar(
         plt.cm.ScalarMappable(norm=plt.Normalize(vmin, vmax), cmap="viridis"),
         cax=cbar_ax,
@@ -588,6 +543,7 @@ def plot_time_series(con, label_col):
         ax2 = ax1.twinx()
         ax2.bar(df['year'], df['pos'], color='tab:orange', alpha=0.4, label='Positives')
         ax2.set_ylabel('Positives', color='tab:orange')
+        ax2.set_yscale('log')
     plt.title("Risk set size by year (shrinks as pixels become protected)")
     out = OUTPUT_DIR / "time_series.png"
     plt.savefig(out, dpi=300); plt.close()
@@ -648,7 +604,6 @@ def plot_spatial_map(con, label_col):
                 FROM {panel_read_expr()}
                 WHERE year = {int(year_ref)}{risk_pred}
                 USING SAMPLE {bg_sample_pct}% ({method})
-                LIMIT 800000
             ) t
             """
         ).df()
@@ -660,7 +615,6 @@ def plot_spatial_map(con, label_col):
                 FROM {panel_read_expr()}
                 WHERE year = {int(pos_year)} AND {q(label_col)} = 1{risk_pred}
                 USING SAMPLE {pos_sample_pct}% ({method})
-                LIMIT 300000
             ) t
             """
         ).df()
@@ -929,7 +883,6 @@ def plot_class_separation(con, label_col: str, numeric_cols: List[str]):
             FROM {panel_read_expr()}
             WHERE {q(label_col)} IS NOT NULL AND {feat_expr} IS NOT NULL
             USING SAMPLE {sample_pct}% ({method})
-            LIMIT 350000
             """
         ).df()
         if df.empty:
@@ -1015,7 +968,6 @@ def plot_correlation_matrix(con, numeric_cols: List[str], max_features: int = 30
         SELECT {sel}
         FROM {panel_read_expr()}
         USING SAMPLE {sample_pct}% ({method})
-        LIMIT 250000
         """
     ).df()
     if df.empty:
