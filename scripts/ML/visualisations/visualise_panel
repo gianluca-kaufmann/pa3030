@@ -5,6 +5,7 @@ Panel dataset diagnostic visualizations & Data Integrity Debugger.
 Added Features:
 - Temporal Feature Comparison: Subplots comparing geography of 2011 vs 2013 vs 2015.
 - Robust Data Integrity Scan: Automated detection of row-count crashes.
+- Missing Pixel Diagnostic: Intelligent detection and visualization of missing pixels in 2012-2014.
 
 Usage notes:
 - Sampling method (DuckDB `USING SAMPLE`):
@@ -19,6 +20,7 @@ import socket
 import getpass
 import warnings
 import re
+import gc
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict
@@ -557,17 +559,21 @@ def plot_time_series(con, label_col):
         FROM {panel_read_expr()} GROUP BY year ORDER BY year
     """
     df = con.execute(query).df()
+    
+    # Exclude year 2000 to prevent it from overshadowing other years
+    df_filtered = df[df['year'] != 2000].copy()
+    
     fig, ax1 = plt.subplots(figsize=(12, 6))
-    ax1.plot(df['year'], df['rows'], color='tab:blue', marker='o', label='Total Rows')
+    ax1.plot(df_filtered['year'], df_filtered['rows'], color='tab:blue', marker='o', label='Total Rows')
     ax1.set_ylabel('Risk Set Size', color='tab:blue')
     ax1.set_ylim(bottom=0)
-    ax1.axvline(2000.5, color="gray", linestyle="--", linewidth=1.0, alpha=0.8)
     if label_col:
         ax2 = ax1.twinx()
-        ax2.bar(df['year'], df['pos'], color='tab:orange', alpha=0.4, label='Positives')
+        ax2.bar(df_filtered['year'], df_filtered['pos'], color='tab:orange', alpha=0.4, label='Positives')
         ax2.set_ylabel('Positives', color='tab:orange')
-        ax2.set_yscale('log')
-    plt.title("Risk set size by year (shrinks as pixels become protected)")
+        # Use linear scale (log scale removed)
+        ax2.set_ylim(bottom=0)
+    plt.title("Risk set size by year (shrinks as pixels become protected) - Year 2000 excluded")
     out = OUTPUT_DIR / "time_series.png"
     plt.savefig(out, dpi=300); plt.close()
     return out
@@ -954,6 +960,424 @@ def plot_class_separation(con, label_col: str, numeric_cols: List[str]):
     return out
 
 # ==========================================================================================
+# MISSING PIXEL DIAGNOSTIC (2012-2014)
+# ==========================================================================================
+def diagnose_missing_pixels(con, cols: List[str], label_col: Optional[str]):
+    """
+    Intelligent diagnostic for missing pixels in 2012-2014.
+    
+    MEMORY MANAGEMENT:
+    - Uses SQL-based overlap computation (avoids loading full pixel sets into Python)
+    - Aggressive sampling for visualization (default 2%)
+    - Explicit garbage collection after each step
+    - Processes data one year at a time where possible
+    
+    Checks:
+    1. Unique pixel count per year (coverage analysis)
+    2. Year-over-year pixel loss/gain
+    3. Spatial pattern of missingness (visualization) - MEMORY-EFFICIENT
+    4. Risk set vs. full panel coverage
+    5. Feature-specific missingness patterns
+    
+    Environment variables:
+    - PANEL_VIS_OVERLAP_SAMPLE_PCT: Sampling for overlap analysis (default: 2.0%)
+    - PANEL_VIS_MISSING_SAMPLE_PCT: Sampling for spatial visualization (default: 2.0%)
+    """
+    print("\n" + "="*70)
+    print("MISSING PIXEL DIAGNOSTIC (2012-2014)")
+    print("="*70)
+    
+    cx, cy = resolve_coord_cols(cols)
+    has_wdpa_prev = "WDPA_prev" in set(cols)
+    
+    # 1. Count unique pixels per year (full panel)
+    print("\n1. Pixel Coverage by Year (Full Panel):")
+    print("-" * 70)
+    coverage_query = f"""
+        SELECT 
+            year,
+            COUNT(DISTINCT ({q(cx)}, {q(cy)})) AS unique_pixels,
+            COUNT(*) AS total_rows
+        FROM {panel_read_expr()}
+        GROUP BY year
+        ORDER BY year
+    """
+    coverage_df = con.execute(coverage_query).df()
+    
+    if coverage_df.empty:
+        print("WARNING: No data found in panel.")
+        return
+    
+    # Calculate year-over-year changes
+    coverage_df['pixel_change'] = coverage_df['unique_pixels'].diff()
+    coverage_df['pixel_change_pct'] = (coverage_df['pixel_change'] / coverage_df['unique_pixels'].shift(1) * 100).round(2)
+    
+    # Identify baseline year (use median of years outside 2012-2014)
+    baseline_years = coverage_df[~coverage_df['year'].isin([2012, 2013, 2014])]
+    if not baseline_years.empty:
+        baseline_median = baseline_years['unique_pixels'].median()
+    else:
+        baseline_median = coverage_df['unique_pixels'].median()
+    
+    print(f"Baseline (median pixels outside 2012-2014): {baseline_median:,.0f}")
+    print()
+    
+    for _, row in coverage_df.iterrows():
+        year = int(row['year'])
+        pixels = int(row['unique_pixels'])
+        rows = int(row['total_rows'])
+        change = row['pixel_change']
+        change_pct = row['pixel_change_pct']
+        
+        # Flag problematic years
+        is_problematic = year in [2012, 2013, 2014]
+        deviation = ((pixels - baseline_median) / baseline_median * 100) if baseline_median > 0 else 0
+        
+        status = ""
+        if is_problematic and deviation < -5:
+            status = " ⚠️  LOW COVERAGE"
+        elif is_problematic and deviation < -10:
+            status = " 🔴 CRITICAL"
+        
+        change_str = f" ({change:+,.0f}, {change_pct:+.1f}%)" if not pd.isna(change) else ""
+        print(f"  Year {year}: {pixels:>12,} pixels, {rows:>12,} rows{change_str}{status}")
+    
+    # Cleanup after step 1
+    del coverage_df
+    gc.collect()
+    
+    # 2. Risk set coverage (if WDPA_prev exists)
+    if has_wdpa_prev:
+        print("\n2. Risk Set Coverage (WDPA_prev=0) by Year:")
+        print("-" * 70)
+        risk_set_query = f"""
+            SELECT 
+                year,
+                COUNT(DISTINCT ({q(cx)}, {q(cy)})) AS unique_pixels,
+                COUNT(*) AS total_rows
+            FROM {panel_read_expr()}
+            WHERE {q('WDPA_prev')} = 0
+            GROUP BY year
+            ORDER BY year
+        """
+        risk_set_df = con.execute(risk_set_query).df()
+        
+        if not risk_set_df.empty:
+            baseline_risk = risk_set_df[~risk_set_df['year'].isin([2012, 2013, 2014])]
+            baseline_risk_median = baseline_risk['unique_pixels'].median() if not baseline_risk.empty else risk_set_df['unique_pixels'].median()
+            print(f"Baseline (median risk set pixels outside 2012-2014): {baseline_risk_median:,.0f}")
+            print()
+            
+            for _, row in risk_set_df.iterrows():
+                year = int(row['year'])
+                pixels = int(row['unique_pixels'])
+                rows = int(row['total_rows'])
+                
+                is_problematic = year in [2012, 2013, 2014]
+                deviation = ((pixels - baseline_risk_median) / baseline_risk_median * 100) if baseline_risk_median > 0 else 0
+                
+                status = ""
+                if is_problematic and deviation < -5:
+                    status = " ⚠️  LOW COVERAGE"
+                elif is_problematic and deviation < -10:
+                    status = " 🔴 CRITICAL"
+                
+                    print(f"  Year {year}: {pixels:>12,} pixels, {rows:>12,} rows{status}")
+        
+        # Cleanup after step 2
+        del risk_set_df
+        gc.collect()
+    
+    # 3. Year-over-year pixel set overlap analysis (MEMORY-EFFICIENT: SQL-based with sampling)
+    print("\n3. Year-over-Year Pixel Set Overlap (sampled for memory efficiency):")
+    print("-" * 70)
+    problem_years = [2012, 2013, 2014]
+    reference_years = [2011, 2015]  # Years before and after the problem period
+    
+    # Use sampling for overlap analysis to avoid OOM
+    overlap_sample_pct = float(os.environ.get("PANEL_VIS_OVERLAP_SAMPLE_PCT", "2.0"))
+    method = resolve_sample_method()
+    
+    for ref_year in reference_years:
+        if ref_year not in coverage_df['year'].values:
+            continue
+        
+        # Get reference count (full count, not sampled)
+        ref_count_query = f"""
+            SELECT COUNT(DISTINCT ({q(cx)}, {q(cy)})) AS cnt
+            FROM {panel_read_expr()}
+            WHERE year = {ref_year}
+        """
+        ref_count = con.execute(ref_count_query).fetchone()[0]
+        
+        print(f"\n  Reference year {ref_year}: {ref_count:,} unique pixels (full count)")
+        
+        for prob_year in problem_years:
+            if prob_year not in coverage_df['year'].values:
+                continue
+            
+            # Get problem year count (full count)
+            prob_count_query = f"""
+                SELECT COUNT(DISTINCT ({q(cx)}, {q(cy)})) AS cnt
+                FROM {panel_read_expr()}
+                WHERE year = {prob_year}
+            """
+            prob_count = con.execute(prob_count_query).fetchone()[0]
+            
+            # Compute overlap using SQL JOIN on sampled data (memory-efficient)
+            # This avoids loading full pixel sets into Python memory
+            overlap_query = f"""
+                WITH ref_sampled AS (
+                    SELECT DISTINCT {q(cx)} AS x, {q(cy)} AS y
+                    FROM {panel_read_expr()}
+                    WHERE year = {ref_year}
+                    USING SAMPLE {overlap_sample_pct}% ({method})
+                ),
+                prob_sampled AS (
+                    SELECT DISTINCT {q(cx)} AS x, {q(cy)} AS y
+                    FROM {panel_read_expr()}
+                    WHERE year = {prob_year}
+                    USING SAMPLE {overlap_sample_pct}% ({method})
+                ),
+                ref_count AS (
+                    SELECT COUNT(*) AS cnt FROM ref_sampled
+                ),
+                prob_count AS (
+                    SELECT COUNT(*) AS cnt FROM prob_sampled
+                ),
+                overlap_count AS (
+                    SELECT COUNT(*) AS cnt
+                    FROM ref_sampled r
+                    INNER JOIN prob_sampled p ON r.x = p.x AND r.y = p.y
+                )
+                SELECT 
+                    (SELECT cnt FROM ref_count) AS ref_sampled_count,
+                    (SELECT cnt FROM prob_count) AS prob_sampled_count,
+                    (SELECT cnt FROM overlap_count) AS overlap_sampled_count
+            """
+            overlap_result = con.execute(overlap_query).fetchone()
+            
+            if overlap_result and len(overlap_result) >= 3:
+                ref_sampled_count = overlap_result[0] or 0
+                prob_sampled_count = overlap_result[1] or 0
+                overlap_sampled_count = overlap_result[2] or 0
+                
+                # Estimate full counts from sampled ratios
+                if ref_sampled_count > 0:
+                    overlap_est = int((overlap_sampled_count / ref_sampled_count) * ref_count)
+                    missing_est = ref_count - overlap_est
+                    overlap_pct = (overlap_est / ref_count * 100) if ref_count > 0 else 0
+                    missing_pct = (missing_est / ref_count * 100) if ref_count > 0 else 0
+                    
+                    print(f"    Year {prob_year}: {prob_count:>8,} pixels | "
+                          f"Overlap: ~{overlap_est:>8,} ({overlap_pct:>5.1f}%) | "
+                          f"Missing: ~{missing_est:>8,} ({missing_pct:>5.1f}%) [sampled {overlap_sample_pct}%]")
+                else:
+                    print(f"    Year {prob_year}: {prob_count:>8,} pixels | "
+                          f"Overlap: N/A (no sampled reference pixels) | "
+                          f"Missing: N/A [sampled {overlap_sample_pct}%]")
+            else:
+                print(f"    Year {prob_year}: {prob_count:>8,} pixels | "
+                      f"Overlap: N/A (query error) | Missing: N/A")
+            
+            # Force cleanup
+            del overlap_result
+            gc.collect()
+    
+    # 4. Spatial visualization of missing pixels (MEMORY-EFFICIENT: process one year at a time)
+    print("\n4. Generating spatial missingness visualization...")
+    method = "bernoulli"
+    # Use more aggressive sampling for visualization to prevent OOM
+    sample_pct = float(os.environ.get("PANEL_VIS_MISSING_SAMPLE_PCT", "2.0"))
+    
+    # Get reference year pixels (2011) - sampled
+    ref_year = 2011
+    if ref_year in coverage_df['year'].values:
+        # Load reference pixels once (sampled)
+        ref_pixels = con.execute(
+            f"""
+            SELECT DISTINCT {q(cx)} AS x, {q(cy)} AS y
+            FROM {panel_read_expr()}
+            WHERE year = {ref_year}
+            USING SAMPLE {sample_pct}% ({method})
+            """
+        ).df()
+        
+        if not ref_pixels.empty:
+            # Get bounds for consistent axes
+            x_min, x_max = float(ref_pixels['x'].min()), float(ref_pixels['x'].max())
+            y_min, y_max = float(ref_pixels['y'].min()), float(ref_pixels['y'].max())
+            ref_count_vis = len(ref_pixels)
+            
+            # Clear reference pixels from memory after getting bounds
+            del ref_pixels
+            gc.collect()
+            
+            fig, axes = plt.subplots(2, 2, figsize=(16, 14), sharex=True, sharey=True)
+            axes = axes.ravel()
+            
+            for idx, year in enumerate([2011, 2012, 2013, 2014]):
+                ax = axes[idx]
+                
+                # Load year pixels (sampled) - process one at a time
+                year_pixels = con.execute(
+                    f"""
+                    SELECT DISTINCT {q(cx)} AS x, {q(cy)} AS y
+                    FROM {panel_read_expr()}
+                    WHERE year = {year}
+                    USING SAMPLE {sample_pct}% ({method})
+                    """
+                ).df()
+                
+                if not year_pixels.empty:
+                    year_count_vis = len(year_pixels)
+                    
+                    # Re-load reference for comparison (small sampled set)
+                    ref_pixels_vis = con.execute(
+                        f"""
+                        SELECT DISTINCT {q(cx)} AS x, {q(cy)} AS y
+                        FROM {panel_read_expr()}
+                        WHERE year = {ref_year}
+                        USING SAMPLE {sample_pct}% ({method})
+                        """
+                    ).df()
+                    
+                    # Use SQL to compute missing pixels directly (avoids large Python sets)
+                    if not ref_pixels_vis.empty and year != ref_year:
+                        missing_query = f"""
+                            WITH ref_sampled AS (
+                                SELECT DISTINCT {q(cx)} AS x, {q(cy)} AS y
+                                FROM {panel_read_expr()}
+                                WHERE year = {ref_year}
+                                USING SAMPLE {sample_pct}% ({method})
+                            ),
+                            year_sampled AS (
+                                SELECT DISTINCT {q(cx)} AS x, {q(cy)} AS y
+                                FROM {panel_read_expr()}
+                                WHERE year = {year}
+                                USING SAMPLE {sample_pct}% ({method})
+                            )
+                            SELECT r.x, r.y
+                            FROM ref_sampled r
+                            LEFT JOIN year_sampled y ON r.x = y.x AND r.y = y.y
+                            WHERE y.x IS NULL
+                            LIMIT 50000
+                        """
+                        missing_pixels = con.execute(missing_query).df()
+                        missing_count_vis = len(missing_pixels)
+                    else:
+                        missing_pixels = pd.DataFrame(columns=['x', 'y'])
+                        missing_count_vis = 0
+                    
+                    # Plot reference pixels in light gray (small sample)
+                    if not ref_pixels_vis.empty:
+                        ax.scatter(ref_pixels_vis['x'], ref_pixels_vis['y'], s=0.1, c='lightgray', 
+                                  alpha=0.15, rasterized=True, label='Reference (2011)')
+                    
+                    # Plot missing pixels in red (if any)
+                    if not missing_pixels.empty:
+                        ax.scatter(missing_pixels['x'], missing_pixels['y'], s=0.2, c='red', 
+                                  alpha=0.5, rasterized=True, label='Missing')
+                    
+                    # Plot year pixels in blue
+                    ax.scatter(year_pixels['x'], year_pixels['y'], s=0.1, c='blue', 
+                              alpha=0.3, rasterized=True, label=f'Year {year}')
+                    
+                    ax.set_title(f"Year {year} Coverage (sampled {sample_pct}%)\n"
+                               f"Visible: {year_count_vis:,} | Missing vs 2011: {missing_count_vis:,}",
+                               fontsize=11, fontweight='bold')
+                    
+                    # Clear variables immediately after plotting
+                    del year_pixels, ref_pixels_vis, missing_pixels
+                    gc.collect()
+                else:
+                    ax.set_title(f"Year {year} (NO DATA)", color='red', fontsize=11, fontweight='bold')
+                
+                ax.set_xlim(x_min, x_max)
+                ax.set_ylim(y_min, y_max)
+                ax.set_aspect('equal')
+                ax.set_xticks([])
+                ax.set_yticks([])
+                ax.legend(loc='upper right', fontsize=8)
+            
+            plt.suptitle(f"Missing Pixel Spatial Analysis (2012-2014 vs 2011 Reference) [sampled {sample_pct}%]", 
+                        fontsize=14, fontweight='bold')
+            out_path = OUTPUT_DIR / "missing_pixels_spatial.png"
+            plt.tight_layout(rect=[0, 0, 1, 0.96])
+            plt.savefig(out_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            # Force cleanup
+            del fig, axes
+            gc.collect()
+            
+            wb_log_image("diagnostics/missing_pixels_spatial", out_path, 
+                        "Spatial pattern of missing pixels in 2012-2014")
+            print(f"  Saved: {out_path}")
+    
+    # 5. Feature-specific missingness check
+    print("\n5. Feature-Specific Missingness (2012-2014):")
+    print("-" * 70)
+    
+    # Sample a few key features to check
+    key_features = ["dist_wdpa", "HNTL_b1", "NDVI_b1", "oil_gas_b1", "powerplants_b1"]
+    available_features = [f for f in key_features if f in cols]
+    
+    if available_features:
+        for feat in available_features[:5]:  # Limit to 5 features
+            feat_expr = feature_sql(feat)
+            missing_query = f"""
+                SELECT 
+                    year,
+                    COUNT(*) AS total_rows,
+                    COUNT({feat_expr}) AS non_null_rows,
+                    COUNT(*) - COUNT({feat_expr}) AS null_rows,
+                    (COUNT(*) - COUNT({feat_expr})) * 100.0 / COUNT(*) AS null_pct
+                FROM {panel_read_expr()}
+                WHERE year IN (2011, 2012, 2013, 2014, 2015)
+                GROUP BY year
+                ORDER BY year
+            """
+            feat_missing = con.execute(missing_query).df()
+            
+            if not feat_missing.empty:
+                print(f"\n  Feature: {feat}")
+                for _, row in feat_missing.iterrows():
+                    year = int(row['year'])
+                    null_pct = float(row['null_pct'])
+                    null_rows = int(row['null_rows'])
+                    total = int(row['total_rows'])
+                    
+                    is_problematic = year in [2012, 2013, 2014] and null_pct > 10
+                    status = " ⚠️" if is_problematic else ""
+                    
+                    print(f"    Year {year}: {null_pct:>5.1f}% missing ({null_rows:,}/{total:,}){status}")
+            
+            # Cleanup after each feature
+            del feat_missing
+            gc.collect()
+    
+    # 6. Summary and recommendations
+    print("\n" + "="*70)
+    print("DIAGNOSTIC SUMMARY")
+    print("="*70)
+    
+    problem_years_data = coverage_df[coverage_df['year'].isin([2012, 2013, 2014])]
+    if not problem_years_data.empty:
+        max_deviation = ((problem_years_data['unique_pixels'] - baseline_median) / baseline_median * 100).min()
+        
+        if max_deviation < -10:
+            print("🔴 CRITICAL: Significant pixel loss detected in 2012-2014 (>10% below baseline)")
+            print("   Recommendation: Investigate data collection/processing pipeline for these years.")
+        elif max_deviation < -5:
+            print("⚠️  WARNING: Moderate pixel loss detected in 2012-2014 (5-10% below baseline)")
+            print("   Recommendation: Review data sources and temporal coverage for these years.")
+        else:
+            print("✓ No significant pixel loss detected in 2012-2014")
+    
+    print("="*70 + "\n")
+
+# ==========================================================================================
 # CORRELATION MATRIX
 # ==========================================================================================
 def _cluster_order_features(corr: pd.DataFrame) -> List[str]:
@@ -1041,6 +1465,9 @@ def main():
 
     # 1b. dist_wdpa sanity checks + plot-only recode (optional/auto)
     _configure_dist_wdpa_zero_recode(con, cols, label_col)
+    
+    # 1c. Missing pixel diagnostic (2012-2014)
+    diagnose_missing_pixels(con, cols, label_col)
 
     # 2. Start W&B
     use_wandb = bool(int(os.environ.get("PANEL_VIS_WANDB", "0")))
