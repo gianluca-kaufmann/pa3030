@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=spatial_gen
+#SBATCH --job-name=colombia_merge
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/spatial_generalisation_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/spatial_generalisation_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/colombia_merge_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/colombia_merge_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -33,22 +33,22 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the spatial_generalisation script
+# Run the colombia_merge script
 #------------------------------------------------------------------------------
-echo "Starting spatial_generalisation script..."
+echo "Starting colombia_merge script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/evaluation/spatial_generalisation" ] || {
-  echo "ERROR: spatial_generalisation not found"
-  echo "NOTE: spatial_generalisation script is in evaluation/ directory"
-  find scripts -maxdepth 4 -type f -name "spatial_generalisation"
+[ -f "scripts/colombia/colombia_merge" ] || {
+  echo "ERROR: colombia_merge not found"
+  echo "NOTE: colombia_preprocessing script is in colombia/ directory"
+  find scripts -maxdepth 4 -type f -name "colombia_merge"
   exit 1
 }
 # Run the script
-python "scripts/ML/evaluation/spatial_generalisation"
+python "scripts/colombia/colombia_merge"
 
-echo "spatial_generalisation script finished."
+echo "colombia_merge script finished."
 
