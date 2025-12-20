@@ -87,6 +87,10 @@ def configure_duckdb(con: duckdb.DuckDBPyConnection) -> None:
     con.execute(f"SET memory_limit='{memory_limit_gb}GB'")
 
     temp_dir = os.environ.get("SCRATCH") or (Path(__file__).parent / "temp")
+    # Ensure temp directory exists (DuckDB won't create parent directories)
+    if isinstance(temp_dir, str):
+        temp_dir = Path(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
     temp_dir_sql = str(temp_dir).replace("'", "''")
     con.execute(f"SET temp_directory='{temp_dir_sql}/duckdb_temp'")
 
@@ -199,23 +203,28 @@ def main() -> None:
                 GROUP BY year
             ),
             -- Per-year negative budgets: pos_count * TARGET_NEG_POS_RATIO
+            -- Include ALL years, even if pos_count = 0 or neg_count = 0 (budget will be 0)
             neg_budget AS (
                 SELECT
                     yc.year,
                     yc.pos_count,
                     yc.neg_count,
-                    LEAST(
-                        CAST(ROUND(yc.pos_count * {TARGET_NEG_POS_RATIO}) AS BIGINT),
-                        yc.neg_count
-                    ) AS year_neg_budget
+                    CASE 
+                        WHEN yc.pos_count > 0 AND yc.neg_count > 0 THEN
+                            LEAST(
+                                CAST(ROUND(yc.pos_count * {TARGET_NEG_POS_RATIO}) AS BIGINT),
+                                yc.neg_count
+                            )
+                        ELSE 0
+                    END AS year_neg_budget
                 FROM year_counts yc
-                WHERE yc.pos_count > 0 AND yc.neg_count > 0
             ),
             positives AS (
                 -- Keep all positives (no sampling)
                 SELECT * FROM base WHERE transition_01 = 1
             ),
             -- Prepare negative pool with per-year budgets
+            -- Use INNER JOIN - all years are now in neg_budget (even if budget is 0)
             neg_candidates AS (
                 SELECT
                     b.*,
@@ -227,7 +236,7 @@ def main() -> None:
                     random() AS u
                 FROM base b
                 INNER JOIN neg_budget nb ON b.year = nb.year
-                WHERE b.transition_01 = 0
+                WHERE b.transition_01 = 0 AND nb.year_neg_budget > 0
             ),
             -- Rank for hard negatives: by distance to WDPA (closest first), tie-broken by u
             ranked_for_hard AS (

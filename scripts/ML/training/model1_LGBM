@@ -408,17 +408,14 @@ def phase1_training(
     
     print(f"\nSTEP C: TRAIN & EVALUATE\nTemporal split: train_early (≤{TRAIN_EARLY_YEAR_MAX}): {len(X_train_early):,} rows, val_stopping ({VAL_STOPPING_YEARS[0]}): {len(X_val_stopping):,} rows")
     
-    # Imbalance handling: load scale_pos_weight from preprocessing metadata
-    metadata_path = resolve_train_metadata()
-    with open(metadata_path, 'r') as f:
-        train_metadata = json.load(f)
-    scale_pos_weight = train_metadata["scale_pos_weight"]
+    # Imbalance handling: hardcode scale_pos_weight to 150
+    scale_pos_weight = 150
     
     neg_full, pos_full = val_stopping_neg, val_stopping_pos
     neg_sampled, pos_sampled = train_early_neg, train_early_pos
     ratio_full = float("inf") if pos_full == 0 else neg_full / pos_full
     ratio_sampled = float("inf") if pos_sampled == 0 else neg_sampled / pos_sampled
-    print(f"\nImbalance: sampled ratio {ratio_sampled:.3f}, full ratio {ratio_full:.3f}, scale_pos_weight {scale_pos_weight:.6f} (from preprocessing)")
+    print(f"\nImbalance: sampled ratio {ratio_sampled:.3f}, full ratio {ratio_full:.3f}, scale_pos_weight {scale_pos_weight:.6f} (hardcoded)")
     best_params["is_unbalance"] = False
     best_params["scale_pos_weight"] = scale_pos_weight
     imbalance_info = {"neg_full": int(neg_full), "pos_full": int(pos_full), "neg_sampled": int(neg_sampled),
@@ -454,7 +451,7 @@ def phase1_training(
     
     print(f"  Starting training...")
     lgb_model = lgb.train(train_params, train_dataset, num_boost_round=num_boost_round_val, valid_sets=[val_dataset],
-                         valid_names=["val_stopping"], callbacks=[lgb.early_stopping(100), lgb.log_evaluation(100)])
+                         valid_names=["val_stopping"], callbacks=[lgb.early_stopping(500), lgb.log_evaluation(100)])
     train_early_time = time.time() - train_early_start
     best_iteration = lgb_model.best_iteration
     print(f"\nTraining done in {train_early_time:.1f}s. Best iteration: {best_iteration if best_iteration else 'N/A'}")

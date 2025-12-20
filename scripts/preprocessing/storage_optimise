@@ -755,9 +755,7 @@ def discover_rasters(input_root: Path, dataset_filter: Optional[str] = None) -> 
     """
     Discover all rasters in input directory, grouped by dataset.
     
-    Handles special cases:
-    - embeddings/embeddings_YYYY directories are treated as separate datasets
-    - Other directories are treated as single datasets
+    Note: embeddings directory is excluded from optimization.
     
     Returns:
         {dataset_name: [list of tif paths]}
@@ -771,24 +769,9 @@ def discover_rasters(input_root: Path, dataset_filter: Optional[str] = None) -> 
     for subdir in sorted([p for p in input_root.iterdir() if p.is_dir()]):
         dataset = subdir.name
         
-        # Special handling for embeddings directory
+        # Skip embeddings directory entirely (excluded from optimization)
         if dataset == "embeddings":
-            # Look for embeddings_YYYY subdirectories
-            for year_dir in sorted(subdir.iterdir()):
-                if year_dir.is_dir() and year_dir.name.startswith("embeddings_"):
-                    year_dataset = f"embeddings/{year_dir.name}"
-                    
-                    # Apply filter if specified
-                    if dataset_filter and not (
-                        dataset_filter.lower() in year_dataset.lower() or
-                        year_dataset.lower() == dataset_filter.lower()
-                    ):
-                        continue
-                    
-                    tif_files = sorted(year_dir.rglob("*.tif"))
-                    if tif_files:
-                        catalog[year_dataset] = tif_files
-                        log(f"Found {len(tif_files)} files in {year_dataset}")
+            log(f"Skipping embeddings directory (excluded from optimization)")
             continue
         
         # Apply filter if specified
@@ -1104,7 +1087,11 @@ def main():
     log("-" * 60)
     
     for r in results:
-        filename = str(r.input_path.relative_to(INPUT_ROOT))[:48]
+        try:
+            filename = str(r.input_path.relative_to(INPUT_ROOT))
+        except ValueError:
+            filename = str(r.input_path)   # temp split files live outside INPUT_ROOT
+        filename = filename[-48:]          # keep rightmost part for readability
         scaled_str = f"×{r.scale_factor}" if r.scaled else "No"
         ratio_str = f"{r.compression_ratio:.2f}x" if r.compression_ratio > 0 else "-"
         status = "✓" if r.success else "✗"
