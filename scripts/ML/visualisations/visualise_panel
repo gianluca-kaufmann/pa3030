@@ -117,9 +117,7 @@ def resolve_panel_spec() -> str:
     # Fallbacks (Euler scratch first, then repo)
     candidate_paths = [
         Path(SCRATCH) / "data" / "ml" / "merged_panel_final.parquet" if SCRATCH else None,
-        Path(SCRATCH) / "data" / "ml" / "merged_panel_2000_2024.parquet" if SCRATCH else None,
         ROOT_DIR / "data" / "ml" / "merged_panel_final.parquet",
-        ROOT_DIR / "data" / "ml" / "merged_panel_2000_2024.parquet",
     ]
     panel_file = next((p for p in candidate_paths if p and p.exists()), None)
     if not panel_file:
@@ -512,8 +510,10 @@ def plot_temporal_feature_comparison(
             db = hb / max(hb.sum(), 1.0)
             diff = (da - db).T  # transpose for imshow orientation (y as rows)
 
-            vmax_d = float(np.nanpercentile(np.abs(diff), 99))
-            norm = TwoSlopeNorm(vmin=-vmax_d, vcenter=0.0, vmax=vmax_d)
+            # Use fixed symmetric color range for static layers (tolerates tiny fluctuations)
+            # Default: ±1e-4, configurable via env var
+            fixed_range = float(os.environ.get("PANEL_VIS_DENSITY_DIFF_RANGE", "1e-4"))
+            norm = TwoSlopeNorm(vmin=-fixed_range, vcenter=0.0, vmax=fixed_range)
             im = ax.imshow(
                 diff,
                 origin="lower",
@@ -526,6 +526,9 @@ def plot_temporal_feature_comparison(
             ax.set_title(f"Density diff: {y0} - {y1}", fontsize=12)
             cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
             cbar.set_label("Δ density (normalized)")
+            # Add caption explaining static layer differences
+            ax.text(0.5, -0.08, "Static layer – differences reflect sampling & risk-set filtering", 
+                   transform=ax.transAxes, ha='center', fontsize=9, style='italic', color='gray')
         ax.set_aspect("equal")
         ax.set_xticks([])
         ax.set_yticks([])
@@ -587,94 +590,109 @@ def plot_spatial_map(con, label_col):
     cols = schema["column_name"].tolist()
     cx, cy = resolve_coord_cols(cols)
 
-    # Multi-year overview (requested: 2000, 2008, 2020, 2024)
-    map_years_raw = (os.environ.get("PANEL_VIS_MAP_YEARS") or "2024,2020,2008,2000").strip()
-    try:
-        map_years = [int(y.strip()) for y in map_years_raw.split(",") if y.strip()]
-    except Exception:
-        map_years = [2024, 2020, 2008, 2000]
-
-    # Background mode:
-    # - all (default): use full panel footprint for that year
-    # - risk_set: restrict to WDPA_prev==0 (risk set) for that year
-    bg_mode_raw = (os.environ.get("PANEL_VIS_BG_MODE") or "all").strip().lower()
-    if bg_mode_raw in ("risk_set", "riskset", "risk"):
-        bg_mode = "risk_set"
-    elif bg_mode_raw in ("all", ""):
-        bg_mode = "all"
+    # Get all available years from the data (year-complete)
+    years_query = f"""
+        SELECT DISTINCT year
+        FROM {panel_read_expr()}
+        WHERE {q(label_col)} IS NOT NULL
+        ORDER BY year
+    """
+    years_df = con.execute(years_query).df()
+    if years_df.empty:
+        print("WARNING: No years found with label data; skipping spatial map.")
+        return None
+    
+    all_years = sorted(years_df['year'].tolist())
+    # Optional: allow filtering via env var, but default to all years
+    map_years_raw = os.environ.get("PANEL_VIS_MAP_YEARS", "").strip()
+    if map_years_raw:
+        try:
+            requested_years = [int(y.strip()) for y in map_years_raw.split(",") if y.strip()]
+            # Filter to only years that exist in data
+            map_years = [y for y in requested_years if y in all_years]
+            if not map_years:
+                print(f"WARNING: None of requested years {requested_years} found in data; using all years.")
+                map_years = all_years
+        except Exception:
+            map_years = all_years
     else:
-        print(f"WARNING: Unknown PANEL_VIS_BG_MODE={bg_mode_raw!r}; defaulting to 'all'.")
-        bg_mode = "all"
-
-    bg_sample_pct = float(os.environ.get("PANEL_VIS_BG_SAMPLE_PCT", "2.0"))
-    pos_sample_pct = float(os.environ.get("PANEL_VIS_POS_SAMPLE_PCT", "10.0"))
+        map_years = all_years
 
     # Optional risk-set predicate (only if WDPA_prev exists)
     has_wdpa_prev = "WDPA_prev" in set(cols)
+    bg_mode_raw = (os.environ.get("PANEL_VIS_BG_MODE") or "all").strip().lower()
     risk_pred = ""
-    if bg_mode == "risk_set":
-        if has_wdpa_prev:
-            risk_pred = f" AND {q('WDPA_prev')} = 0"
-        else:
-            print("WARNING: PANEL_VIS_BG_MODE=risk_set requested but 'WDPA_prev' not in schema; ignoring risk_set filter.")
+    if bg_mode_raw in ("risk_set", "riskset", "risk") and has_wdpa_prev:
+        risk_pred = f" AND {q('WDPA_prev')} = 0"
+    elif bg_mode_raw in ("risk_set", "riskset", "risk") and not has_wdpa_prev:
+        print("WARNING: PANEL_VIS_BG_MODE=risk_set requested but 'WDPA_prev' not in schema; ignoring risk_set filter.")
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12), sharex=True, sharey=True)
-    axes = axes.ravel()
-    for i, year_ref in enumerate(map_years[:4]):
+    pos_sample_pct = float(os.environ.get("PANEL_VIS_POS_SAMPLE_PCT", "10.0"))
+
+    # Create compact grid layout (one panel per year, no overlay)
+    n_years = len(map_years)
+    if n_years == 0:
+        print("WARNING: No years to plot; skipping spatial map.")
+        return None
+    
+    # Calculate grid dimensions for compact layout
+    ncols = int(np.ceil(np.sqrt(n_years)))
+    nrows = int(np.ceil(n_years / ncols))
+    
+    # Adjust figure size based on number of panels
+    fig_w_per_col = float(os.environ.get("PANEL_VIS_SPATIAL_FIG_W_PER_COL", "4.0"))
+    fig_h_per_row = float(os.environ.get("PANEL_VIS_SPATIAL_FIG_H_PER_ROW", "3.5"))
+    fig_w = min(20.0, max(8.0, fig_w_per_col * ncols))
+    fig_h = min(16.0, max(6.0, fig_h_per_row * nrows))
+    
+    fig, axes = plt.subplots(nrows, ncols, figsize=(fig_w, fig_h), sharex=True, sharey=True)
+    if n_years == 1:
+        axes = [axes]
+    elif nrows == 1:
+        axes = axes if isinstance(axes, np.ndarray) else [axes]
+    else:
+        axes = axes.ravel()
+    
+    for i, year in enumerate(map_years):
         ax = axes[i]
-        pos_year = int(os.environ.get("PANEL_VIS_POS_YEAR", str(year_ref)))
-
-        # Pull background from the panel footprint (optionally restricted to the risk set) to show coverage clearly.
-        bg = con.execute(
-            f"""
-            SELECT DISTINCT x, y
-            FROM (
-                SELECT {q(cx)} AS x, {q(cy)} AS y
-                FROM {panel_read_expr()}
-                WHERE year = {int(year_ref)}{risk_pred}
-                USING SAMPLE {bg_sample_pct}% ({method})
-            ) t
-            """
-        ).df()
+        
+        # Plot only positives for this year (no background overlay to avoid blurriness)
         pos = con.execute(
             f"""
             SELECT DISTINCT x, y
             FROM (
                 SELECT {q(cx)} AS x, {q(cy)} AS y
                 FROM {panel_read_expr()}
-                WHERE year = {int(pos_year)} AND {q(label_col)} = 1{risk_pred}
+                WHERE year = {int(year)} AND {q(label_col)} = 1{risk_pred}
                 USING SAMPLE {pos_sample_pct}% ({method})
             ) t
             """
         ).df()
 
-        if not bg.empty:
-            ax.scatter(bg["x"], bg["y"], s=0.05, c="lightgray", alpha=0.15, rasterized=True)
         if not pos.empty:
-            ax.scatter(pos["x"], pos["y"], s=0.5, c="red", alpha=0.5, rasterized=True)
+            ax.scatter(pos["x"], pos["y"], s=0.5, c="red", alpha=0.6, rasterized=True)
+            ax.set_title(f"Year {year}: {len(pos):,} positives", fontsize=10)
+        else:
+            ax.set_title(f"Year {year}: no positives", fontsize=10, color='gray')
+        
         ax.set_aspect("equal")
         ax.set_xticks([])
         ax.set_yticks([])
         ax.set_xlabel("")
         ax.set_ylabel("")
-        if pos_year == year_ref:
-            ax.set_title(f"Year {year_ref}: positives ({label_col}=1)")
-        else:
-            ax.set_title(f"BG {year_ref}, pos {pos_year}: positives ({label_col}=1)")
 
-    # Hide unused panels if fewer than 4 years were provided
-    for j in range(min(len(map_years), 4), 4):
+    # Hide unused panels
+    for j in range(n_years, len(axes)):
         axes[j].axis("off")
 
-    shown_years = map_years[:4]
     plt.suptitle(
-        f"Spatial positives across years | years={shown_years} | bg_mode={bg_mode} | "
-        f"bg_sample={bg_sample_pct}% pos_sample={pos_sample_pct}% ({method})",
-        fontsize=14,
+        f"Spatial positives by year (year-complete, one panel per year) | "
+        f"years={map_years} | pos_sample={pos_sample_pct}% ({method})",
+        fontsize=12,
         fontweight="bold",
     )
     out = OUTPUT_DIR / "spatial_map.png"
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig(out, dpi=300); plt.close()
     return out
 
@@ -1042,6 +1060,10 @@ def diagnose_missing_pixels(con, cols: List[str], label_col: Optional[str]):
         change_str = f" ({change:+,.0f}, {change_pct:+.1f}%)" if not pd.isna(change) else ""
         print(f"  Year {year}: {pixels:>12,} pixels, {rows:>12,} rows{change_str}{status}")
     
+    # Store data needed for later sections before cleanup
+    available_years = set(coverage_df['year'].values)
+    problem_years_data = coverage_df[coverage_df['year'].isin([2012, 2013, 2014])].copy()
+    
     # Cleanup after step 1
     del coverage_df
     gc.collect()
@@ -1099,7 +1121,7 @@ def diagnose_missing_pixels(con, cols: List[str], label_col: Optional[str]):
     method = resolve_sample_method()
     
     for ref_year in reference_years:
-        if ref_year not in coverage_df['year'].values:
+        if ref_year not in available_years:
             continue
         
         # Get reference count (full count, not sampled)
@@ -1113,7 +1135,7 @@ def diagnose_missing_pixels(con, cols: List[str], label_col: Optional[str]):
         print(f"\n  Reference year {ref_year}: {ref_count:,} unique pixels (full count)")
         
         for prob_year in problem_years:
-            if prob_year not in coverage_df['year'].values:
+            if prob_year not in available_years:
                 continue
             
             # Get problem year count (full count)
@@ -1192,7 +1214,7 @@ def diagnose_missing_pixels(con, cols: List[str], label_col: Optional[str]):
     
     # Get reference year pixels (2011) - sampled
     ref_year = 2011
-    if ref_year in coverage_df['year'].values:
+    if ref_year in available_years:
         # Load reference pixels once (sampled)
         ref_pixels = con.execute(
             f"""
@@ -1361,8 +1383,6 @@ def diagnose_missing_pixels(con, cols: List[str], label_col: Optional[str]):
     print("\n" + "="*70)
     print("DIAGNOSTIC SUMMARY")
     print("="*70)
-    
-    problem_years_data = coverage_df[coverage_df['year'].isin([2012, 2013, 2014])]
     if not problem_years_data.empty:
         max_deviation = ((problem_years_data['unique_pixels'] - baseline_median) / baseline_median * 100).min()
         

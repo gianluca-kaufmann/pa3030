@@ -14,11 +14,11 @@ Processing order (per year):
          - Create `dist_wdpa` as the Euclidean distance (in meters) from each pixel to the nearest
            pixel with `WDPA_prev > 0` (t-1 protection), using a distance transform. This uses t-1
            status to avoid using the same-year target in the distance computation.
-       - Static-feature distance transforms (columns are overwritten in-place):
+       - Static-feature distance transforms (binary columns replaced with distance columns):
          - For `oil_gas_b1`, `powerplants_b1`, `road_infrastructure_b1`, build a binary mask
-           (NaN -> 0, >0 -> 1) and apply an Euclidean distance transform multiplied by 1000.
-           The resulting distance values overwrite the original columns (the column names stay the
-           same: `oil_gas_b1`, `powerplants_b1`, `road_infrastructure_b1`).
+           (NaN -> 0, >0 -> 1) and apply an Euclidean distance transform multiplied by 1000,
+           using the same logic as `dist_wdpa`. The original binary columns are dropped and
+           replaced with distance columns: `dist_oil_gas`, `dist_powerplant`, `dist_road`.
        - Smoothed (moving-average) features:
          - For selected variables (e.g. `NDVI_b1`, `GPW_b1`, `HNTL_b1`, `gdp_b1`, ...),
            compute uniform-filter smoothing over window sizes 16 and 64, creating new columns like
@@ -62,7 +62,12 @@ DISTANCE_DECAY_SCALE = 10000
 SMOOTH_VARIABLES = ['NDVI_b1', 'GPW_b1', 'HNTL_b1', 'gdp_b1', 'deforestation_b1', 
                      'wildfire_b1', 'GSN_b1', 'GSN_b2', 'GSN_b3', 'GSN_b4', 'GSN_b5']
 SMOOTH_SIZES = [16, 64]
-STATIC_DISTANCE_VARIABLES = ['oil_gas_b1', 'powerplants_b1', 'road_infrastructure_b1']
+# Mapping from input column names to output distance column names
+STATIC_DISTANCE_MAPPING = {
+    'road_infrastructure_b1': 'dist_road',
+    'oil_gas_b1': 'dist_oil_gas',
+    'powerplants_b1': 'dist_powerplant'
+}
 
 
 def reconstruct_grid(df: pd.DataFrame, value_col: str) -> Tuple[np.ndarray, int, int, int, int]:
@@ -100,38 +105,46 @@ def compute_distance_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_static_distance_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute distance transforms for static binary features and overwrite original columns.
+    """Compute distance transforms for static binary features using same logic as dist_wdpa.
     
     For each static variable (oil_gas_b1, powerplants_b1, road_infrastructure_b1):
-    - Replaces sparse binary 0/1 values with distance to nearest 1 (in meters)
-    - Overwrites the original column (including the 1s themselves, which become 0)
-    - Treats NaN as 0 (no feature present)
+    - Creates binary mask (NaN -> 0, >0 -> 1) where 1 indicates feature presence
+    - Computes Euclidean distance to nearest feature using distance_transform_edt(1 - binary) 
+      (same pattern as dist_wdpa) multiplied by 1000 (pixels to meters)
+    - Replaces original binary column with distance column using new names:
+      - road_infrastructure_b1 -> dist_road
+      - oil_gas_b1 -> dist_oil_gas
+      - powerplants_b1 -> dist_powerplant
+    - Drops the original binary columns to ensure only distance features remain
     """
     logger.info("  Computing distance transforms for static features (oil_gas, powerplants, road_infrastructure)...")
     
-    for variable in STATIC_DISTANCE_VARIABLES:
-        if variable not in df.columns:
-            logger.warning(f"    Column {variable} not found, skipping...")
+    for input_col, output_col in STATIC_DISTANCE_MAPPING.items():
+        if input_col not in df.columns:
+            logger.warning(f"    Column {input_col} not found, skipping...")
             continue
         
-        logger.info(f"    Processing {variable}...")
+        logger.info(f"    Processing {input_col} -> {output_col}...")
         
         # Reconstruct grid from the binary feature
-        feature_grid, min_row, max_row, min_col, max_col = reconstruct_grid(df, variable)
+        feature_grid, min_row, max_row, min_col, max_col = reconstruct_grid(df, input_col)
         
-        # Convert to binary: NaN -> 0, >0 -> 1
+        # Convert to binary: NaN -> 0, >0 -> 1 (1 where feature exists)
         feature_binary = np.where(np.isnan(feature_grid), 0, feature_grid > 0).astype(np.uint8)
         del feature_grid
         
-        # Compute distance transform: distance from each pixel to nearest 1
-        # distance_transform_edt computes distance to nearest non-zero pixel
-        # Since feature_binary has 1s where features are, this gives distance to nearest 1
-        distance_grid = distance_transform_edt(feature_binary) * 1000  # pixels to meters
+        # Compute distance transform using same logic as dist_wdpa:
+        # distance_transform_edt(1 - binary) gives distance to nearest 0 (feature location)
+        # This is equivalent to distance to nearest feature
+        distance_grid = distance_transform_edt(1 - feature_binary) * 1000  # pixels to meters
         del feature_binary
         
-        # Overwrite the original column with distance values
-        df[variable] = grid_to_dataframe(distance_grid, df, min_row, min_col)
+        # Create new distance column with the new name
+        df[output_col] = grid_to_dataframe(distance_grid, df, min_row, min_col)
         del distance_grid
+        
+        # Drop the original binary column to ensure only distance features remain
+        df = df.drop(columns=[input_col])
         
         gc.collect()
     
@@ -327,7 +340,7 @@ def main() -> None:
             "distance_decay_scale": DISTANCE_DECAY_SCALE,
             "smooth_variables": SMOOTH_VARIABLES,
             "smooth_sizes": SMOOTH_SIZES,
-            "static_distance_variables": STATIC_DISTANCE_VARIABLES,
+            "static_distance_mapping": STATIC_DISTANCE_MAPPING,
         }
     )
     
