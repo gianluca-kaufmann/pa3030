@@ -14,11 +14,12 @@ Processing order (per year):
          - Create `dist_wdpa` as the Euclidean distance (in meters) from each pixel to the nearest
            pixel with `WDPA_prev > 0` (t-1 protection), using a distance transform. This uses t-1
            status to avoid using the same-year target in the distance computation.
-       - Static-feature distance transforms (binary columns replaced with distance columns):
+       - Static-feature distance transforms (computed once on reference footprint, then merged):
          - For `oil_gas_b1`, `powerplants_b1`, `road_infrastructure_b1`, build a binary mask
            (NaN -> 0, >0 -> 1) and apply an Euclidean distance transform multiplied by 1000,
-           using the same logic as `dist_wdpa`. The original binary columns are dropped and
-           replaced with distance columns: `dist_oil_gas`, `dist_powerplant`, `dist_road`.
+           using the same logic as `dist_wdpa`. These are computed once on a reference footprint
+           (default: most recent year) and merged into all years by (row, col). The original binary
+           columns are dropped and replaced with distance columns: `dist_oil_gas`, `dist_powerplant`, `dist_road`.
        - Smoothed (moving-average) features:
          - For selected variables (e.g. `NDVI_b1`, `GPW_b1`, `HNTL_b1`, `gdp_b1`, ...),
            compute uniform-filter smoothing over window sizes 16 and 64, creating new columns like
@@ -104,30 +105,25 @@ def compute_distance_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def compute_static_distance_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute distance transforms for static binary features using same logic as dist_wdpa.
+def compute_static_distance_features_once(df_ref: pd.DataFrame) -> pd.DataFrame:
+    """Compute static distance transforms once on a reference footprint.
     
-    For each static variable (oil_gas_b1, powerplants_b1, road_infrastructure_b1):
-    - Creates binary mask (NaN -> 0, >0 -> 1) where 1 indicates feature presence
-    - Computes Euclidean distance to nearest feature using distance_transform_edt(1 - binary) 
-      (same pattern as dist_wdpa) multiplied by 1000 (pixels to meters)
-    - Replaces original binary column with distance column using new names:
-      - road_infrastructure_b1 -> dist_road
-      - oil_gas_b1 -> dist_oil_gas
-      - powerplants_b1 -> dist_powerplant
-    - Drops the original binary columns to ensure only distance features remain
+    Returns a lookup DataFrame with columns: row, col, dist_road, dist_oil_gas, dist_powerplant.
+    This is computed once and merged into all years to avoid redundant computation.
     """
-    logger.info("  Computing distance transforms for static features (oil_gas, powerplants, road_infrastructure)...")
+    logger.info("  Computing static distance transforms on reference footprint...")
+    
+    lookup_df = df_ref[['row', 'col']].drop_duplicates().copy()
     
     for input_col, output_col in STATIC_DISTANCE_MAPPING.items():
-        if input_col not in df.columns:
+        if input_col not in df_ref.columns:
             logger.warning(f"    Column {input_col} not found, skipping...")
             continue
         
         logger.info(f"    Processing {input_col} -> {output_col}...")
         
         # Reconstruct grid from the binary feature
-        feature_grid, min_row, max_row, min_col, max_col = reconstruct_grid(df, input_col)
+        feature_grid, min_row, max_row, min_col, max_col = reconstruct_grid(df_ref, input_col)
         
         # Convert to binary: NaN -> 0, >0 -> 1 (1 where feature exists)
         feature_binary = np.where(np.isnan(feature_grid), 0, feature_grid > 0).astype(np.uint8)
@@ -139,14 +135,24 @@ def compute_static_distance_features(df: pd.DataFrame) -> pd.DataFrame:
         distance_grid = distance_transform_edt(1 - feature_binary) * 1000  # pixels to meters
         del feature_binary
         
-        # Create new distance column with the new name
-        df[output_col] = grid_to_dataframe(distance_grid, df, min_row, min_col)
+        # Create distance column in lookup
+        lookup_df[output_col] = grid_to_dataframe(distance_grid, lookup_df, min_row, min_col)
         del distance_grid
         
-        # Drop the original binary column to ensure only distance features remain
-        df = df.drop(columns=[input_col])
-        
         gc.collect()
+    
+    return lookup_df
+
+
+def merge_static_distances(df: pd.DataFrame, static_lookup: pd.DataFrame) -> pd.DataFrame:
+    """Merge precomputed static distance features and drop original binary columns."""
+    # Merge static distances
+    df = df.merge(static_lookup, on=['row', 'col'], how='left')
+    
+    # Drop original binary columns if they exist
+    for input_col in STATIC_DISTANCE_MAPPING.keys():
+        if input_col in df.columns:
+            df = df.drop(columns=[input_col])
     
     return df
 
@@ -224,7 +230,7 @@ def compute_lag_feature(input_path: Path, year: int) -> pd.DataFrame:
     return result
 
 
-def process_year(input_path: Path, year: int, temp_dir: Path, is_first_year: bool) -> tuple[Path | None, dict]:
+def process_year(input_path: Path, year: int, temp_dir: Path, is_first_year: bool, static_lookup: pd.DataFrame) -> tuple[Path | None, dict]:
     """Process a single year and return temp file path + metrics."""
     start_time = time.time()
     logger.info(f"\nProcessing year {year}...")
@@ -253,7 +259,7 @@ def process_year(input_path: Path, year: int, temp_dir: Path, is_first_year: boo
     # Step 2: Compute spatial features on FULL grid (before Risk Set filtering)
     logger.info(f"  Computing spatial features on full grid ({n_rows_initial:,} rows)...")
     df_year = compute_distance_features(df_year)
-    df_year = compute_static_distance_features(df_year)
+    df_year = merge_static_distances(df_year, static_lookup)
     df_year = compute_all_smooth_features(df_year)
     
     # Step 3: Apply Risk Set filter (keep only WDPA_prev == 0)
@@ -366,6 +372,44 @@ def main() -> None:
     
     wandb.log({"total_years": len(years), "total_rows": total_rows})
     
+    # Precompute static distance features once on reference footprint
+    logger.info("\n" + "="*80)
+    logger.info("Precomputing static distance features on reference footprint...")
+    logger.info("="*80)
+    
+    # Determine reference year (prefer 2024, fallback to most recent year)
+    ref_year = max(years) if years else None
+    if ref_year is None:
+        raise ValueError("No years found in input data")
+    
+    logger.info(f"Using year {ref_year} as reference footprint for static distances")
+    
+    # Load reference year data (only columns needed for static distance computation)
+    static_cols = ['row', 'col'] + list(STATIC_DISTANCE_MAPPING.keys())
+    df_ref = pd.read_parquet(
+        input_path, 
+        columns=static_cols,
+        filters=[('year', '==', ref_year)],
+        engine='pyarrow'
+    )
+    
+    if df_ref.empty:
+        logger.warning(f"Reference year {ref_year} is empty, trying union of all years...")
+        # Fallback: use union of all years
+        df_ref = pd.read_parquet(
+            input_path,
+            columns=static_cols,
+            engine='pyarrow'
+        )
+        df_ref = df_ref[['row', 'col'] + [c for c in static_cols if c in df_ref.columns]].drop_duplicates(subset=['row', 'col'])
+        logger.info(f"Using union footprint: {len(df_ref):,} unique pixels")
+    
+    # Compute static distances once
+    static_lookup = compute_static_distance_features_once(df_ref)
+    logger.info(f"  ✓ Computed static distances for {len(static_lookup):,} pixels")
+    del df_ref
+    gc.collect()
+    
     # Process year by year
     temp_files = []
     total_rows_initial = 0
@@ -374,7 +418,7 @@ def main() -> None:
     for i, year in enumerate(years):
         try:
             is_first_year = (i == 0)
-            temp_file, metrics = process_year(input_path, year, temp_dir, is_first_year)
+            temp_file, metrics = process_year(input_path, year, temp_dir, is_first_year, static_lookup)
             if temp_file is not None:
                 temp_files.append(temp_file)
                 wandb.log(metrics)
@@ -390,6 +434,10 @@ def main() -> None:
                 temp_dir.rmdir()
             wandb.finish(exit_code=1)
             raise
+    
+    # Clean up static lookup
+    del static_lookup
+    gc.collect()
     
     # Combine all years using streaming
     logger.info("\n" + "="*80)

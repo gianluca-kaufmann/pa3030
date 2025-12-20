@@ -440,6 +440,33 @@ def plot_temporal_feature_comparison(
     fig_h = float(os.environ.get("PANEL_VIS_TEMP_FIG_H", "6.0"))
     fig_w = min(fig_w_max, max(fig_w_min, fig_w_per_col * float(ncols)))
 
+    # Compute global coordinate bounds once from coord-only sample (no feature filter)
+    # This ensures consistent axes across all subplots regardless of feature missingness
+    year_list = ",".join(str(int(y)) for y in years)
+    coord_bounds_query = f"""
+        SELECT 
+            MIN({q(cx)}) AS xmin,
+            MAX({q(cx)}) AS xmax,
+            MIN({q(cy)}) AS ymin,
+            MAX({q(cy)}) AS ymax
+        FROM {panel_read_expr()}
+        WHERE year IN ({year_list})
+        USING SAMPLE {sample_pct}% ({method})
+    """
+    coord_bounds = con.execute(coord_bounds_query).fetchone()
+    if coord_bounds and all(v is not None for v in coord_bounds):
+        xmin_global, xmax_global, ymin_global, ymax_global = [float(v) for v in coord_bounds]
+    else:
+        # Fallback: use a dummy query to get any available bounds
+        fallback_bounds = con.execute(
+            f"SELECT MIN({q(cx)}) AS xmin, MAX({q(cx)}) AS xmax, MIN({q(cy)}) AS ymin, MAX({q(cy)}) AS ymax FROM {panel_read_expr()} USING SAMPLE 0.1% ({method})"
+        ).fetchone()
+        if fallback_bounds and all(v is not None for v in fallback_bounds):
+            xmin_global, xmax_global, ymin_global, ymax_global = [float(v) for v in fallback_bounds]
+        else:
+            # Last resort: don't set limits
+            xmin_global = xmax_global = ymin_global = ymax_global = None
+
     fig, axes = plt.subplots(1, ncols, figsize=(fig_w, fig_h), sharex=True, sharey=True)
     if ncols == 1:
         axes = [axes]
@@ -463,6 +490,12 @@ def plot_temporal_feature_comparison(
             ax.set_title(f"Year {year} (n={len(df):,})", fontsize=12)
         else:
             ax.set_title(f"Year {year} (EMPTY)", color='red')
+        
+        # Apply global coordinate limits to ensure consistent axes
+        if xmin_global is not None and xmax_global is not None:
+            ax.set_xlim(xmin_global, xmax_global)
+        if ymin_global is not None and ymax_global is not None:
+            ax.set_ylim(ymin_global, ymax_global)
             
         ax.set_aspect('equal')
         ax.set_xticks([])
@@ -529,6 +562,21 @@ def plot_temporal_feature_comparison(
             # Add caption explaining static layer differences
             ax.text(0.5, -0.08, "Static layer – differences reflect sampling & risk-set filtering", 
                    transform=ax.transAxes, ha='center', fontsize=9, style='italic', color='gray')
+            # Apply global coordinate limits (use computed bounds or fallback to data bounds)
+            if xmin_global is not None and xmax_global is not None:
+                ax.set_xlim(xmin_global, xmax_global)
+            else:
+                ax.set_xlim(xmin, xmax)
+            if ymin_global is not None and ymax_global is not None:
+                ax.set_ylim(ymin_global, ymax_global)
+            else:
+                ax.set_ylim(ymin, ymax)
+        else:
+            # Even if empty, apply global limits if available
+            if xmin_global is not None and xmax_global is not None:
+                ax.set_xlim(xmin_global, xmax_global)
+            if ymin_global is not None and ymax_global is not None:
+                ax.set_ylim(ymin_global, ymax_global)
         ax.set_aspect("equal")
         ax.set_xticks([])
         ax.set_yticks([])
@@ -659,13 +707,14 @@ def plot_spatial_map(con, label_col):
         # Plot only positives for this year (no background overlay to avoid blurriness)
         pos = con.execute(
             f"""
+            WITH pos AS (
+              SELECT {q(cx)} AS x, {q(cy)} AS y
+              FROM {panel_read_expr()}
+              WHERE year = {int(year)} AND {q(label_col)} = 1{risk_pred}
+            )
             SELECT DISTINCT x, y
-            FROM (
-                SELECT {q(cx)} AS x, {q(cy)} AS y
-                FROM {panel_read_expr()}
-                WHERE year = {int(year)} AND {q(label_col)} = 1{risk_pred}
-                USING SAMPLE {pos_sample_pct}% ({method})
-            ) t
+            FROM pos
+            USING SAMPLE {pos_sample_pct}% (bernoulli)
             """
         ).df()
 
@@ -1523,10 +1572,10 @@ def main():
 
     default_temp_features = [
         "dist_wdpa",
-        "oil_gas_b1",
-        "powerplants_b1",
+        "dist_oil_gas",
+        "dist_powerplant",
+        "dist_road",
         "GSN_b1",
-        "road_infrastructure_b1",
         "NDVI_b1_smooth64",
         "HNTL_b1_smooth64",
     ]
