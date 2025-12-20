@@ -2,7 +2,7 @@
 """
 Storage Optimization Script for GeoTIFF Rasters.
 
-Optimizes GeoTIFFs from data/ready and saves them to data/ml/ready using rasterio + GDAL.
+Optimizes GeoTIFFs from data/ready and saves them to their respective folders in data/ (e.g., data/WDPA, data/HNTL) using rasterio + GDAL.
 
 Strategy:
 
@@ -82,8 +82,8 @@ else:
     PROJECT_ROOT = SCRIPT_DIR.parent.parent
     DATA_ROOT = PROJECT_ROOT / "data"
 
-INPUT_ROOT = DATA_ROOT
-OUTPUT_ROOT = DATA_ROOT / "ml" / "ready"
+INPUT_ROOT = DATA_ROOT / "ready"
+OUTPUT_ROOT = DATA_ROOT
 
 # Datasets that should have multi-band files split into single-band files
 MULTIBAND_SPLIT = {"WorldClim", "GSN"}
@@ -939,9 +939,12 @@ def main():
         dataset_results: List[OptimizationResult] = []
         
         for file_idx, input_path in enumerate(files, start=1):
-            # Construct output path (preserve directory structure)
+            # Construct output path: data/ready/{dataset}/file.tif -> data/{dataset}/file.tif
+            # For embeddings: data/ready/embeddings/embeddings_YYYY/file.tif -> data/embeddings/embeddings_YYYY/file.tif
             rel_path = input_path.relative_to(INPUT_ROOT)
             output_path = OUTPUT_ROOT / rel_path
+            # Ensure output directory exists
+            output_path.parent.mkdir(parents=True, exist_ok=True)
             
             # Extract simple dataset name for processing logic (without embeddings/ prefix)
             simple_dataset = dataset.split('/')[-1] if '/' in dataset else dataset

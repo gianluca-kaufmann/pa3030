@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=LGBM_sample
+#SBATCH --job-name=storage_optimise
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/model1_LGBM_sample_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/model1_LGBM_sample_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/storage_optimise_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/storage_optimise_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -33,21 +33,21 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the model1_LGBM_sample script
+# Run the storage_optimise script
 #------------------------------------------------------------------------------
-echo "Starting LGBM_sample script..."
+echo "Starting storage_optimise script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/training/model1_LGBM_sample" ] || {
-  echo "ERROR: model1_LGBM_sample not found"
-  echo "NOTE: model1_LGBM_sample script is in training/ directory"
-  find scripts -maxdepth 4 -type f -name "model1_LGBM_sample"
+[ -f "scripts/preprocessing/storage_optimise" ] || {
+  echo "ERROR: storage_optimise not found"
+  echo "NOTE: storage_optimise script is in preprocessing/ directory"
+  find scripts -maxdepth 4 -type f -name "storage_optimise"
   exit 1
 }
 # Run the script
-python "scripts/ML/training/model1_LGBM_sample"
+python "scripts/preprocessing/storage_optimise"
 
-echo "model1_LGBM_sample script finished."
+echo "storage_optimise script finished."
