@@ -41,14 +41,14 @@ echo "Starting colombia_merge script..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/colombia/colombia_merge" ] || {
+[ -f "scripts/colombia/merge/colombia_merge" ] || {
   echo "ERROR: colombia_merge not found"
-  echo "NOTE: colombia_preprocessing script is in colombia/ directory"
+  echo "NOTE: colombia_merge script is in colombia/merge/ directory"
   find scripts -maxdepth 4 -type f -name "colombia_merge"
   exit 1
 }
 # Run the script
-python "scripts/colombia/colombia_merge"
+python "scripts/colombia/merge/colombia_merge"
 
 echo "colombia_merge script finished."
 
