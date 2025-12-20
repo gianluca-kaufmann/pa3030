@@ -744,6 +744,248 @@ def plot_spatial_map(con, label_col):
     plt.savefig(out, dpi=300); plt.close()
     return out
 
+def plot_continent_feature_maps(con, cols: List[str], col_type_map: Dict[str, str]):
+    """
+    Create continent-wide maps with a different feature visualized each year.
+    
+    Features are selected from those NOT already used in temporal comparisons:
+    - Avoids: dist_wdpa, dist_oil_gas, dist_powerplant, dist_road, GSN_b1, 
+              NDVI_b1_smooth64, HNTL_b1_smooth64
+    - Prefers: elevation, WorldClim, deforestation, gdp, GPW, landcover, 
+               VIIRS, wildfire, WDPA_b1
+    """
+    print("Creating continent-wide feature maps (one feature per year)...")
+    
+    # Get all available years
+    years_query = f"""
+        SELECT DISTINCT year
+        FROM {panel_read_expr()}
+        ORDER BY year
+    """
+    years_df = con.execute(years_query).df()
+    if years_df.empty:
+        print("WARNING: No years found; skipping continent feature maps.")
+        return None
+    
+    all_years = sorted(years_df['year'].tolist())
+    
+    # Features already used in temporal comparisons (to avoid)
+    excluded_features = {
+        "dist_wdpa", "dist_oil_gas", "dist_powerplant", "dist_road",
+        "GSN_b1", "NDVI_b1_smooth64", "HNTL_b1_smooth64",
+        # Also exclude base versions if smoothed versions are used
+        "NDVI_b1", "HNTL_b1"
+    }
+    
+    # Priority list of features to visualize (in order of preference)
+    # These are features NOT currently visualized in temporal comparisons
+    feature_priority = [
+        "elevation_b1",
+        "GPW_b1",  # Population density
+        "gdp_b1",  # GDP
+        "WorldClim_b1",  # Temperature/annual mean
+        "WorldClim_b12",  # Annual precipitation
+        "deforestation_b1",
+        "landcover_b1",
+        "wildfire_b1",
+        "VIIRS_b1",  # Fire detection
+        "WDPA_b1",  # Protected areas
+        "elevation_b2",
+        "WorldClim_b2",  # Mean diurnal range
+        "WorldClim_b4",  # Temperature seasonality
+        "deforestation_b2",
+        "wildfire_b2",
+    ]
+    
+    # Filter to only features that exist in the dataset and are numeric
+    available_features = []
+    for feat in feature_priority:
+        if feat in cols and feat not in excluded_features:
+            t = str(col_type_map.get(feat, ""))
+            if _is_numeric_duckdb_type(t):
+                available_features.append(feat)
+    
+    # If we don't have enough priority features, add other numeric features
+    if len(available_features) < len(all_years):
+        for col in cols:
+            if col not in excluded_features and col not in available_features:
+                t = str(col_type_map.get(col, ""))
+                if _is_numeric_duckdb_type(t):
+                    # Skip coordinate and metadata columns
+                    if col not in {'year', 'x', 'y', 'row', 'col', 'lon', 'lat', 
+                                   'longitude', 'latitude', 'easting', 'northing',
+                                   'transition_01', 'WDPA_prev'}:
+                        available_features.append(col)
+                        if len(available_features) >= len(all_years):
+                            break
+    
+    if len(available_features) == 0:
+        print("WARNING: No suitable features found for continent maps; skipping.")
+        return None
+    
+    # Assign features to years (cycle if more years than features)
+    year_feature_map = {}
+    for i, year in enumerate(all_years):
+        feat_idx = i % len(available_features)
+        year_feature_map[year] = available_features[feat_idx]
+    
+    print(f"  Mapping {len(all_years)} years to {len(set(year_feature_map.values()))} unique features")
+    
+    # Get coordinate columns
+    cx, cy = resolve_coord_cols(cols)
+    
+    # Sampling configuration
+    method = "bernoulli"
+    sample_pct = float(os.environ.get("PANEL_VIS_CONTINENT_SAMPLE_PCT", "2.0"))
+    
+    # Calculate grid dimensions
+    n_years = len(all_years)
+    ncols = int(np.ceil(np.sqrt(n_years)))
+    nrows = int(np.ceil(n_years / ncols))
+    
+    # Figure size
+    fig_w_per_col = float(os.environ.get("PANEL_VIS_CONTINENT_FIG_W_PER_COL", "4.5"))
+    fig_h_per_row = float(os.environ.get("PANEL_VIS_CONTINENT_FIG_H_PER_ROW", "4.0"))
+    fig_w = min(24.0, max(10.0, fig_w_per_col * ncols))
+    fig_h = min(20.0, max(8.0, fig_h_per_row * nrows))
+    
+    fig, axes = plt.subplots(nrows, ncols, figsize=(fig_w, fig_h), sharex=True, sharey=True)
+    if n_years == 1:
+        axes = [axes]
+    elif nrows == 1:
+        axes = axes if isinstance(axes, np.ndarray) else [axes]
+    else:
+        axes = axes.ravel()
+    
+    # Get global coordinate bounds for consistent axes
+    coord_bounds_query = f"""
+        SELECT 
+            MIN({q(cx)}) AS xmin,
+            MAX({q(cx)}) AS xmax,
+            MIN({q(cy)}) AS ymin,
+            MAX({q(cy)}) AS ymax
+        FROM {panel_read_expr()}
+        USING SAMPLE {sample_pct}% ({method})
+    """
+    coord_bounds = con.execute(coord_bounds_query).fetchone()
+    if coord_bounds and all(v is not None for v in coord_bounds):
+        xmin_global, xmax_global, ymin_global, ymax_global = [float(v) for v in coord_bounds]
+    else:
+        xmin_global = xmax_global = ymin_global = ymax_global = None
+    
+    # Precompute color scales for each unique feature (ensures consistency if same feature appears in multiple years)
+    unique_features = list(set(year_feature_map.values()))
+    feature_scales = {}
+    print(f"  Precomputing color scales for {len(unique_features)} unique features...")
+    for feature in unique_features:
+        feat_expr = feature_sql(feature)
+        # Compute global scale (2nd/98th percentiles across all years for this feature)
+        global_scale_query = f"""
+            SELECT
+                approx_quantile(val, 0.02) AS vmin,
+                approx_quantile(val, 0.98) AS vmax
+            FROM (
+                SELECT {feat_expr} AS val
+                FROM {panel_read_expr()}
+                WHERE {feat_expr} IS NOT NULL
+                USING SAMPLE {sample_pct}% ({method})
+            ) t
+        """
+        scale_result = con.execute(global_scale_query).fetchone()
+        if scale_result and scale_result[0] is not None and scale_result[1] is not None:
+            vmin, vmax = float(scale_result[0]), float(scale_result[1])
+            # Handle flat features
+            if vmin == vmax:
+                actual_range = con.execute(f"""
+                    SELECT MIN({feat_expr}) AS vmin, MAX({feat_expr}) AS vmax
+                    FROM {panel_read_expr()}
+                    WHERE {feat_expr} IS NOT NULL
+                    USING SAMPLE {sample_pct}% ({method})
+                """).fetchone()
+                if actual_range and actual_range[0] is not None and actual_range[1] is not None:
+                    vmin, vmax = float(actual_range[0]), float(actual_range[1])
+                    if vmin == vmax:
+                        vmin, vmax = vmin - 0.1, vmax + 0.1
+            feature_scales[feature] = (vmin, vmax)
+        else:
+            # Will fall back to per-year range if needed
+            feature_scales[feature] = None
+    
+    # Plot each year with its assigned feature
+    for i, year in enumerate(all_years):
+        ax = axes[i]
+        feature = year_feature_map[year]
+        feat_expr = feature_sql(feature)
+        
+        # Get data for this year and feature
+        df = con.execute(f"""
+            SELECT {q(cy)} AS y, {q(cx)} AS x, {feat_expr} AS val
+            FROM {panel_read_expr()} 
+            WHERE year = {int(year)} AND {feat_expr} IS NOT NULL
+            USING SAMPLE {sample_pct}% ({method})
+        """).df()
+        
+        if not df.empty:
+            # Use precomputed scale if available, otherwise fall back to year-specific range
+            scale = feature_scales.get(feature)
+            if scale is not None:
+                vmin, vmax = scale
+            else:
+                # Fallback to data range for this year
+                vmin, vmax = float(df['val'].min()), float(df['val'].max())
+                if vmin == vmax:
+                    vmin, vmax = vmin - 0.1, vmax + 0.1
+            
+            # Plot scatter
+            sc = ax.scatter(df['x'], df['y'], c=df['val'], s=0.1,
+                           cmap='viridis', vmin=vmin, vmax=vmax, rasterized=True)
+            ax.set_title(f"Year {year}: {feature}\n(n={len(df):,})", fontsize=10, fontweight='bold')
+        else:
+            ax.set_title(f"Year {year}: {feature}\n(EMPTY)", color='red', fontsize=10, fontweight='bold')
+        
+        # Apply global coordinate limits
+        if xmin_global is not None and xmax_global is not None:
+            ax.set_xlim(xmin_global, xmax_global)
+        if ymin_global is not None and ymax_global is not None:
+            ax.set_ylim(ymin_global, ymax_global)
+        
+        ax.set_aspect('equal')
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+    
+    # Hide unused panels
+    for j in range(n_years, len(axes)):
+        axes[j].axis("off")
+    
+    plt.suptitle(
+        f"Continent-wide Feature Maps (one feature per year) | "
+        f"sample={sample_pct}% ({method})",
+        fontsize=14,
+        fontweight="bold",
+    )
+    
+    # Add shared colorbar (using viridis for all)
+    fig.subplots_adjust(right=0.92)
+    cbar_ax = fig.add_axes([0.94, 0.15, 0.015, 0.7])
+    # Use a representative scale for the colorbar (will vary by panel, but shows the concept)
+    fig.colorbar(
+        plt.cm.ScalarMappable(norm=plt.Normalize(0, 1), cmap="viridis"),
+        cax=cbar_ax,
+        label="Feature value (varies by panel)",
+    )
+    
+    out = OUTPUT_DIR / "continent_feature_maps.png"
+    plt.tight_layout(rect=[0, 0, 0.92, 0.96])
+    plt.savefig(out, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    wb_log_image("plots/continent_feature_maps", out, 
+                 f"Continent-wide feature maps: {len(set(year_feature_map.values()))} unique features across {len(all_years)} years")
+    print(f"  Saved: {out}")
+    return out
+
 # ==========================================================================================
 # CLASS SEPARATION + FEATURE SELECTION
 # ==========================================================================================
@@ -1596,6 +1838,9 @@ def main():
     # 6. Standard plots
     plot_time_series(con, label_col)
     plot_spatial_map(con, label_col)
+    
+    # 6b. Continent-wide feature maps (one feature per year)
+    plot_continent_feature_maps(con, cols, col_type_map)
 
     # 7. Log outputs as W&B artifacts for lineage
     wb_log_artifact_pngs(OUTPUT_DIR)

@@ -112,6 +112,10 @@ INTEGER_DTYPES = {
     'uint32': ('UInt32', 2),
 }
 
+# Global variables for GDAL command paths (set in main())
+GDAL_TRANSLATE_PATH = "gdal_translate"
+GDALINFO_PATH = "gdalinfo"
+
 
 @dataclass
 class FileStats:
@@ -154,7 +158,7 @@ def get_raster_stats_gdalinfo(path: Path) -> Optional[FileStats]:
     try:
         # Run gdalinfo with statistics
         result = subprocess.run(
-            ["gdalinfo", "-json", "-stats", str(path)],
+            [GDALINFO_PATH, "-json", "-stats", str(path)],
             capture_output=True,
             text=True,
             check=True
@@ -202,7 +206,7 @@ def get_all_band_stats(path: Path) -> List[Tuple[float, float]]:
     """Get min/max for all bands in a raster using gdalinfo."""
     try:
         result = subprocess.run(
-            ["gdalinfo", "-json", "-stats", str(path)],
+            [GDALINFO_PATH, "-json", "-stats", str(path)],
             capture_output=True,
             text=True,
             check=True
@@ -390,7 +394,7 @@ def optimize_to_int16(
         
         # Step 2: Convert to Int16 with optimal compression (CRS preserved from temp file)
         translate_cmd = [
-            "gdal_translate",
+            GDAL_TRANSLATE_PATH,
             "-ot", "Int16",
             "-co", "TILED=YES",
             "-co", "COMPRESS=DEFLATE",
@@ -483,7 +487,7 @@ def optimize_preserve_dtype(
             log(f"  Converting float dtype: {source_dtype} -> {output_dtype}")
         
         translate_cmd = [
-            "gdal_translate",
+            GDAL_TRANSLATE_PATH,
             "-ot", output_dtype,
             "-co", "TILED=YES",
             "-co", "COMPRESS=DEFLATE",
@@ -555,7 +559,7 @@ def optimize_to_float32(
     
     try:
         translate_cmd = [
-            "gdal_translate",
+            GDAL_TRANSLATE_PATH,
             "-ot", "Float32",
             "-co", "TILED=YES",
             "-co", "COMPRESS=DEFLATE",
@@ -868,15 +872,62 @@ def main():
     log("")
     
     # Check GDAL availability
+    global GDAL_TRANSLATE_PATH, GDALINFO_PATH
+    gdal_translate_path = None
     try:
-        result = subprocess.run(["gdal_translate", "--version"], capture_output=True, text=True)
+        result = subprocess.run(["gdal_translate", "--version"], capture_output=True, text=True, check=True)
         log(f"GDAL version: {result.stdout.strip()}")
-    except FileNotFoundError:
-        log("gdal_translate not found. Please install GDAL.", "ERROR")
-        if HAS_WANDB:
-            wandb.log({"status": "failed", "error": "gdal_translate_not_found"})
-            wandb.finish()
-        sys.exit(1)
+        gdal_translate_path = "gdal_translate"
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        # Try to find gdal_translate in common locations
+        common_paths = [
+            "/usr/bin/gdal_translate",
+            "/usr/local/bin/gdal_translate",
+            "/opt/homebrew/bin/gdal_translate",  # macOS Homebrew
+        ]
+        for path in common_paths:
+            if Path(path).exists():
+                try:
+                    result = subprocess.run([path, "--version"], capture_output=True, text=True, check=True)
+                    log(f"GDAL version: {result.stdout.strip()}")
+                    gdal_translate_path = path
+                    break
+                except subprocess.CalledProcessError:
+                    continue
+        
+        if gdal_translate_path is None:
+            log("=" * 60, "ERROR")
+            log("gdal_translate not found. Please install GDAL.", "ERROR")
+            log("", "ERROR")
+            log("On macOS:", "ERROR")
+            log("  brew install gdal", "ERROR")
+            log("", "ERROR")
+            log("On Euler cluster:", "ERROR")
+            log("  Add to your SLURM script:", "ERROR")
+            log("    module load gdal", "ERROR")
+            log("  Or check available modules:", "ERROR")
+            log("    module avail gdal", "ERROR")
+            log("", "ERROR")
+            log("Alternatively, ensure GDAL is installed in your Python environment:", "ERROR")
+            log("  pip install gdal", "ERROR")
+            log("  (Note: GDAL Python bindings may not include command-line tools)", "ERROR")
+            log("=" * 60, "ERROR")
+            if HAS_WANDB:
+                wandb.log({"status": "failed", "error": "gdal_translate_not_found"})
+                wandb.finish()
+            sys.exit(1)
+    
+    # Set global variables for use in optimization functions
+    GDAL_TRANSLATE_PATH = gdal_translate_path
+    # Derive gdalinfo path from gdal_translate path
+    if gdal_translate_path == "gdal_translate":
+        GDALINFO_PATH = "gdalinfo"
+    else:
+        # Replace 'gdal_translate' with 'gdalinfo' in the path
+        GDALINFO_PATH = str(Path(gdal_translate_path).parent / "gdalinfo")
+        # Verify gdalinfo exists at that location, otherwise fall back to "gdalinfo"
+        if not Path(GDALINFO_PATH).exists():
+            GDALINFO_PATH = "gdalinfo"
     
     # Check rasterio availability (replaces gdal_calc.py)
     log(f"rasterio version: {rasterio.__version__}")

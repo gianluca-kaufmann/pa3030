@@ -26,6 +26,18 @@ module load python_cuda/3.11.6
 module load cuda/12.4.1
 module load eth_proxy
 
+# Load GDAL for command-line tools (gdal_translate, gdalinfo)
+# Check available versions with: module avail gdal
+module load gdal 2>/dev/null || {
+    echo "Warning: GDAL module not found. Trying alternative..."
+    # Try alternative module names if available
+    module load gdal/3.8.0 2>/dev/null || {
+        echo "Warning: Could not load GDAL module."
+        echo "GDAL command-line tools may not be available."
+        echo "Check available modules with: module avail gdal"
+    }
+}
+
 #------------------------------------------------------------------------------
 # Activate the Python virtual environment (uav-genAI-opti)
 #------------------------------------------------------------------------------
