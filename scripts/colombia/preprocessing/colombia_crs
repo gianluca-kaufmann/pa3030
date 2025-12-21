@@ -288,26 +288,41 @@ def warp_raster_to_backbone(
                 dtype=ref_profile["dtype"]
             )
             
-            # Determine source CRS (force to EPSG:3857 if it's Pseudo-Mercator)
+            # Determine source CRS
+            # For Pseudo-Mercator/EngineeringCRS/LOCAL_CS sources, force src_crs to match
+            # ref_profile["crs"] so reprojection becomes same-CRS resampling only
+            # (avoids CRS-operation lookup issues)
             src_crs = src.crs
             if src_crs is not None:
                 try:
-                    # Check if it's Pseudo-Mercator variant
+                    # Check if it's Pseudo-Mercator variant (EngineeringCRS, LOCAL_CS, etc.)
                     crs_str = str(src_crs).lower()
                     crs_name = str(src_crs.name).lower() if hasattr(src_crs, 'name') and src_crs.name else ""
+                    crs_type = src_crs.__class__.__name__ if hasattr(src_crs, '__class__') else ""
                     
-                    if ("pseudo" in crs_name or "pseudo" in crs_str or
+                    is_pseudo_mercator = (
+                        "pseudo" in crs_name or 
+                        "pseudo" in crs_str or
                         "3857" in str(src_crs) or
-                        (hasattr(src_crs, '__class__') and 
-                         src_crs.__class__.__name__ == "EngineeringCRS" and
-                         "wgs 84" in crs_name)):
-                        src_crs = get_epsg_3857_crs()
-                except:
-                    pass
+                        crs_type == "EngineeringCRS" or
+                        crs_type == "LOCAL_CS" or
+                        "local" in crs_str or
+                        (crs_type == "EngineeringCRS" and "wgs 84" in crs_name)
+                    )
+                    
+                    if is_pseudo_mercator:
+                        # Force same-CRS resampling by using ref_profile CRS as source CRS
+                        # This avoids CRS-operation lookup and treats it as resampling only
+                        src_crs = ref_profile["crs"]
+                        log_progress(f"    Detected Pseudo-Mercator variant ({crs_type}), using same-CRS resampling")
+                except Exception as e:
+                    # If we can't determine, log but continue
+                    log_progress(f"    Warning: Could not determine CRS type: {e}")
             
-            # If source CRS is None or invalid, assume EPSG:3857
+            # If source CRS is None or invalid, use ref_profile CRS (same-CRS resampling)
             if src_crs is None:
-                src_crs = get_epsg_3857_crs()
+                src_crs = ref_profile["crs"]
+                log_progress(f"    Source CRS is None, using same-CRS resampling")
             
             # Reproject each band
             for b in range(1, count + 1):
