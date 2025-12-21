@@ -3,7 +3,7 @@
 Merge Colombia 1 km rasters into a yearly panel with streaming I/O and low memory use.
 
 Summary:
-- Reads per-dataset rasters from ``data`` (or ``$SCRATCH/data/ml/ready`` on cluster for storage-optimized inputs).
+- Reads per-dataset rasters from ``data`` (or ``$SCRATCH/data`` on cluster for storage-optimized inputs).
 - Processes one year at a time, reusing earlier data when a dataset is missing for a given year.
 - Masks out all pixels where backbone = 0 (outside Colombia) to reduce output size.
 - Streams window batches to a single Parquet panel while cleaning up memory eagerly.
@@ -108,12 +108,11 @@ PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
 # Use $SCRATCH for data if on cluster, otherwise use project root
 if "SCRATCH" in os.environ:
     DATA_ROOT = Path(os.environ["SCRATCH"]) / "data"
-    # On cluster, read from storage-optimized rasters
-    READY_ROOT = DATA_ROOT / "ml" / "ready"
 else:
     DATA_ROOT = PROJECT_ROOT / "data"
-    # Locally, read from original data directory
-    READY_ROOT = DATA_ROOT
+
+# Always use DATA_ROOT directly (optimized GeoTIFFs live under $SCRATCH/data/<dataset>/)
+READY_ROOT = DATA_ROOT
 
 # Datasets that may be Int16-scaled (×100) if using storage-optimized inputs
 # These need to be unscaled (÷100) when reading
@@ -162,7 +161,7 @@ def open_reference_backbone() -> Tuple[Path, rasterio.DatasetReader, np.ndarray]
         print("\nChecked locations:")
         for p in backbone_paths:
             print(f"   - {p} (exists: {p.exists()})")
-        print("\nPlease ensure colombia_GEE.tif exists in data/ready/backbone/")
+        print("\nPlease ensure colombia_GEE.tif exists in data/backbone/")
         sys.exit(1)
     
     src = rasterio.open(backbone_path)
@@ -234,14 +233,33 @@ def detect_year_range(catalog: Dict[str, Dict[Optional[int], List[Path]]]) -> Li
 
 
 def check_alignment(src_path: Path, ref_profile: dict) -> bool:
-    """Check if a raster is already aligned with the reference grid."""
+    """Check if a raster is already aligned with the reference grid.
+    
+    CRS comparison handles EPSG:3857 whether stored as EPSG code or PROJJSON.
+    """
     try:
         with rasterio.open(src_path) as src:
-            return (
-                src.shape == (ref_profile["height"], ref_profile["width"]) and
-                src.crs == ref_profile["crs"] and
-                np.allclose(src.transform, ref_profile["transform"], atol=1e-6)
-            )
+            # Check shape and transform first
+            if not (src.shape == (ref_profile["height"], ref_profile["width"]) and
+                    np.allclose(src.transform, ref_profile["transform"], atol=1e-6)):
+                return False
+            
+            # CRS comparison: handle EPSG:3857 whether stored as EPSG or PROJJSON
+            src_crs = rasterio.crs.CRS.from_user_input(src.crs) if src.crs else None
+            ref_crs = rasterio.crs.CRS.from_user_input(ref_profile["crs"]) if ref_profile["crs"] else None
+            
+            if src_crs is None or ref_crs is None:
+                return src_crs == ref_crs
+            
+            # Check if both are EPSG:3857 (Web Mercator) regardless of storage format
+            src_epsg = src_crs.to_epsg()
+            ref_epsg = ref_crs.to_epsg()
+            
+            if src_epsg is not None and ref_epsg is not None and src_epsg == 3857 and ref_epsg == 3857:
+                return True
+            
+            # For other CRSs, use standard comparison
+            return src_crs == ref_crs
     except Exception:
         return False
 
@@ -355,8 +373,22 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
         )
         
         # Fast path: if already aligned, just read the window directly (MUCH faster)
+        # CRS comparison handles EPSG:3857 whether stored as EPSG code or PROJJSON
+        src_crs = rasterio.crs.CRS.from_user_input(src.crs) if src.crs else None
+        ref_crs = rasterio.crs.CRS.from_user_input(ref_profile["crs"]) if ref_profile["crs"] else None
+        crs_aligned = False
+        if src_crs is not None and ref_crs is not None:
+            src_epsg = src_crs.to_epsg()
+            ref_epsg = ref_crs.to_epsg()
+            if src_epsg is not None and ref_epsg is not None and src_epsg == 3857 and ref_epsg == 3857:
+                crs_aligned = True
+            else:
+                crs_aligned = (src_crs == ref_crs)
+        else:
+            crs_aligned = (src_crs == ref_crs)
+        
         if (src.shape == (ref_profile["height"], ref_profile["width"]) and
-            src.crs == ref_profile["crs"] and
+            crs_aligned and
             np.allclose(src.transform, ref_profile["transform"], atol=1e-6)):
             
             data = src.read(window=window, masked=False).astype(np.float32)
