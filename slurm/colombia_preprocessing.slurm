@@ -17,32 +17,74 @@ mkdir -p "$SCRATCH/outputs"
 mkdir -p "$SCRATCH/outputs/Tables"
 
 #------------------------------------------------------------------------------
-# Load modules
+# Load modules (minimal set, no GIS modules)
 #------------------------------------------------------------------------------
 module purge
+# Explicitly unload any GIS/GDAL/PROJ modules that might be loaded
+module unload gdal 2>/dev/null || true
+module unload proj 2>/dev/null || true
+module unload gis 2>/dev/null || true
+
 module load stack/2024-06
 module load gcc/12.2.0
 module load python_cuda/3.11.6
 module load cuda/12.4.1
 module load eth_proxy
 
-# Load GDAL for command-line tools (gdal_translate, gdalinfo)
-# Check available versions with: module avail gdal
-module load gdal 2>/dev/null || {
-    echo "Warning: GDAL module not found. Trying alternative..."
-    # Try alternative module names if available
-    module load gdal/3.8.0 2>/dev/null || {
-        echo "Warning: Could not load GDAL module."
-        echo "GDAL command-line tools may not be available."
-        echo "Check available modules with: module avail gdal"
-    }
+#------------------------------------------------------------------------------
+# Activate conda environment with conda-forge rasterio/gdal/proj
+#------------------------------------------------------------------------------
+# Set conda environment name (adjust if different)
+CONDA_ENV_NAME="${CONDA_ENV_NAME:-master_thesis}"
+
+# Initialize conda (if not already initialized)
+if [ -z "$CONDA_DEFAULT_ENV" ]; then
+    # Try common conda initialization paths
+    if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+        source "$HOME/miniconda3/etc/profile.d/conda.sh"
+    elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+        source "$HOME/anaconda3/etc/profile.d/conda.sh"
+    elif [ -f "/opt/conda/etc/profile.d/conda.sh" ]; then
+        source "/opt/conda/etc/profile.d/conda.sh"
+    else
+        echo "ERROR: Could not find conda initialization script."
+        echo "Please ensure conda is installed and initialized."
+        exit 1
+    fi
+fi
+
+# Activate conda environment
+echo "Activating conda environment: $CONDA_ENV_NAME"
+conda activate "$CONDA_ENV_NAME" || {
+    echo "ERROR: Failed to activate conda environment: $CONDA_ENV_NAME"
+    echo "Available environments:"
+    conda env list
+    exit 1
 }
 
-#------------------------------------------------------------------------------
-# Activate the Python virtual environment (uav-genAI-opti)
-#------------------------------------------------------------------------------
-VENV_DIR="$HOME/venvs/master_thesis"
-source "$VENV_DIR/bin/activate"
+# Set PROJ_LIB and GDAL_DATA to conda environment paths
+# This ensures we use conda-forge PROJ/GDAL, not system modules
+if [ -n "$CONDA_PREFIX" ]; then
+    export PROJ_LIB="$CONDA_PREFIX/share/proj"
+    export GDAL_DATA="$CONDA_PREFIX/share/gdal"
+    
+    echo "Environment variables set:"
+    echo "  CONDA_PREFIX: $CONDA_PREFIX"
+    echo "  PROJ_LIB: $PROJ_LIB"
+    echo "  GDAL_DATA: $GDAL_DATA"
+    
+    # Verify paths exist
+    if [ ! -d "$PROJ_LIB" ]; then
+        echo "WARNING: PROJ_LIB directory not found: $PROJ_LIB"
+        echo "  This may cause PROJ database errors."
+    fi
+    if [ ! -d "$GDAL_DATA" ]; then
+        echo "WARNING: GDAL_DATA directory not found: $GDAL_DATA"
+    fi
+else
+    echo "ERROR: CONDA_PREFIX not set. Conda environment may not be activated correctly."
+    exit 1
+fi
 
 #------------------------------------------------------------------------------
 # Run the colombia_crs script

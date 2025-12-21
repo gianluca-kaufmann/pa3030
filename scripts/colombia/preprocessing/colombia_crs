@@ -21,11 +21,21 @@ Outputs:
 Usage:
     ./colombia_crs
 
-On Euler, if you get PROJ database errors, use conda-forge GDAL/PROJ:
-    conda install -c conda-forge gdal proj rasterio
+Environment Requirements:
+    - Use a conda-forge environment where rasterio, gdal, and proj all come
+      from the same source (conda-forge) to avoid PROJ database conflicts.
+    - On Euler cluster, the SLURM script (colombia_preprocessing.slurm) will:
+      1. Module purge (unloads system GIS/GDAL/PROJ modules)
+      2. Activate conda environment
+      3. Set PROJ_LIB and GDAL_DATA to conda env paths
+    
+    To create/update conda environment:
+        conda create -n master_thesis -c conda-forge python=3.11 rasterio gdal proj
+        conda activate master_thesis
+        pip install -r requirements.txt  # other dependencies
     
 The script will automatically fall back to WKT/PROJ string methods if
-the EPSG database is unavailable, so it should work even with system PROJ.
+the EPSG database is unavailable, but using conda-forge is strongly recommended.
 """
 
 import sys
@@ -380,6 +390,32 @@ def main():
     log_progress(f"Source: {READY_ROOT}")
     log_progress(f"Output: {FIXED_CRS_ROOT}")
     
+    # Verify environment setup (PROJ_LIB and GDAL_DATA)
+    log_progress("\nVerifying environment setup...")
+    proj_lib = os.environ.get("PROJ_LIB", "")
+    gdal_data = os.environ.get("GDAL_DATA", "")
+    conda_prefix = os.environ.get("CONDA_PREFIX", "")
+    
+    if proj_lib:
+        log_progress(f"  PROJ_LIB: {proj_lib} (exists: {os.path.exists(proj_lib)})")
+    else:
+        log_progress("  WARNING: PROJ_LIB not set. May use system PROJ.")
+    
+    if gdal_data:
+        log_progress(f"  GDAL_DATA: {gdal_data} (exists: {os.path.exists(gdal_data)})")
+    else:
+        log_progress("  WARNING: GDAL_DATA not set. May use system GDAL.")
+    
+    if conda_prefix:
+        log_progress(f"  CONDA_PREFIX: {conda_prefix}")
+        # Check if PROJ_LIB points to conda env
+        if proj_lib and conda_prefix in proj_lib:
+            log_progress("  ✓ PROJ_LIB points to conda environment")
+        elif proj_lib:
+            log_progress("  ⚠ PROJ_LIB does not point to conda environment")
+    else:
+        log_progress("  INFO: CONDA_PREFIX not set (may be using venv or system Python)")
+    
     # Test CRS creation early to catch PROJ database issues
     log_progress("\nTesting CRS creation (checking for PROJ database issues)...")
     try:
@@ -388,6 +424,11 @@ def main():
     except Exception as e:
         log_progress(f"\n  ⚠ CRS creation warning: {e}")
         log_progress("  Script will attempt to continue with fallback methods...")
+        if not proj_lib or not os.path.exists(proj_lib):
+            log_progress("\n  TROUBLESHOOTING:")
+            log_progress("  - Ensure conda environment is activated")
+            log_progress("  - Set PROJ_LIB to conda env's share/proj directory")
+            log_progress("  - Example: export PROJ_LIB=\"$CONDA_PREFIX/share/proj\"")
     
     # Load backbone template
     backbone_src, ref_profile = load_backbone_template()
