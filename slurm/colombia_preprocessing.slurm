@@ -39,16 +39,80 @@ CONDA_ENV_NAME="${CONDA_ENV_NAME:-master_thesis}"
 
 # Initialize conda (if not already initialized)
 if [ -z "$CONDA_DEFAULT_ENV" ]; then
-    # Try common conda initialization paths
-    if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
-        source "$HOME/miniconda3/etc/profile.d/conda.sh"
-    elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
-        source "$HOME/anaconda3/etc/profile.d/conda.sh"
-    elif [ -f "/opt/conda/etc/profile.d/conda.sh" ]; then
-        source "/opt/conda/etc/profile.d/conda.sh"
-    else
-        echo "ERROR: Could not find conda initialization script."
-        echo "Please ensure conda is installed and initialized."
+    # Method 1: Check if conda is already in PATH
+    if command -v conda >/dev/null 2>&1; then
+        echo "Found conda in PATH, initializing..."
+        # Try to initialize using conda's own method
+        eval "$(conda shell.bash hook 2>/dev/null)" || {
+            echo "Warning: conda shell hook failed, trying alternative methods..."
+        }
+    fi
+    
+    # Method 2: Try loading conda as a module (common on HPC systems)
+    if [ -z "$CONDA_DEFAULT_ENV" ] && ! command -v conda >/dev/null 2>&1; then
+        echo "Trying to load conda module..."
+        module load conda 2>/dev/null || module load anaconda3 2>/dev/null || true
+        if command -v conda >/dev/null 2>&1; then
+            eval "$(conda shell.bash hook 2>/dev/null)" || true
+        fi
+    fi
+    
+    # Method 3: Try common conda initialization paths
+    if [ -z "$CONDA_DEFAULT_ENV" ]; then
+        CONDA_INIT_PATHS=(
+            "$HOME/miniconda3/etc/profile.d/conda.sh"
+            "$HOME/anaconda3/etc/profile.d/conda.sh"
+            "$HOME/.conda/etc/profile.d/conda.sh"
+            "/opt/conda/etc/profile.d/conda.sh"
+            "/usr/local/miniconda3/etc/profile.d/conda.sh"
+            "/usr/local/anaconda3/etc/profile.d/conda.sh"
+        )
+        
+        for conda_init in "${CONDA_INIT_PATHS[@]}"; do
+            if [ -f "$conda_init" ]; then
+                echo "Found conda at: $conda_init"
+                source "$conda_init"
+                break
+            fi
+        done
+    fi
+    
+    # Method 4: Try to find conda via which/whereis and derive init script
+    if [ -z "$CONDA_DEFAULT_ENV" ]; then
+        CONDA_BIN=$(which conda 2>/dev/null || command -v conda 2>/dev/null)
+        if [ -n "$CONDA_BIN" ]; then
+            # Derive conda root from binary path
+            CONDA_ROOT=$(dirname "$(dirname "$CONDA_BIN")")
+            CONDA_INIT="$CONDA_ROOT/etc/profile.d/conda.sh"
+            if [ -f "$CONDA_INIT" ]; then
+                echo "Found conda via PATH, initializing from: $CONDA_INIT"
+                source "$CONDA_INIT"
+            fi
+        fi
+    fi
+    
+    # Final check
+    if [ -z "$CONDA_DEFAULT_ENV" ] && ! command -v conda >/dev/null 2>&1; then
+        echo "ERROR: Could not find or initialize conda."
+        echo ""
+        echo "Diagnostic information:"
+        echo "  PATH: $PATH"
+        echo "  HOME: $HOME"
+        echo "  Checking for conda in common locations..."
+        ls -d "$HOME"/miniconda* "$HOME"/anaconda* "$HOME"/.conda 2>/dev/null | head -5 || echo "  No conda directories found in HOME"
+        echo ""
+        echo "Troubleshooting steps:"
+        echo "1. Check if conda is installed: which conda || find $HOME -name conda 2>/dev/null | head -3"
+        echo "2. Try loading conda module: module avail 2>&1 | grep -i conda"
+        echo "3. If conda is installed elsewhere, find it and source the init script:"
+        echo "   source <conda_root>/etc/profile.d/conda.sh"
+        echo "4. Install miniconda if needed:"
+        echo "   wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
+        echo "   bash Miniconda3-latest-Linux-x86_64.sh -b -p $HOME/miniconda3"
+        echo "   source $HOME/miniconda3/etc/profile.d/conda.sh"
+        echo "5. Create conda environment with:"
+        echo "   conda create -n master_thesis -c conda-forge python=3.11 rasterio gdal proj"
+        echo ""
         exit 1
     fi
 fi
