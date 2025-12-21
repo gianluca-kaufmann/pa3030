@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=storage_optimise
-#SBATCH --partition=normal.24h
-#SBATCH --time=24:00:00
+#SBATCH --partition=normal.4h
+#SBATCH --time=04:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
