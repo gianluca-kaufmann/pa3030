@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=compute-panel-statistics
-#SBATCH --partition=normal.24h
+#SBATCH --partition=normal.4h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
