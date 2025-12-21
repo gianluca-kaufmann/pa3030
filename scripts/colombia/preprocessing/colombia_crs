@@ -19,10 +19,13 @@ Outputs:
 - Fixed backbone: data/ready/fixed_crs/backbone/colombia_GEE.tif
 
 Usage:
-    ./fix_crs_to_backbone
+    ./colombia_crs
 
-On Euler, ensure conda-forge GDAL/PROJ is available:
-    conda install -c conda-forge gdal proj
+On Euler, if you get PROJ database errors, use conda-forge GDAL/PROJ:
+    conda install -c conda-forge gdal proj rasterio
+    
+The script will automatically fall back to WKT/PROJ string methods if
+the EPSG database is unavailable, so it should work even with system PROJ.
 """
 
 import sys
@@ -37,6 +40,81 @@ import rasterio
 from rasterio.enums import Resampling
 from rasterio.warp import reproject, calculate_default_transform
 from rasterio.crs import CRS
+
+# EPSG:3857 WKT string (Pseudo-Mercator) - works without PROJ database
+EPSG_3857_WKT = """PROJCS["WGS 84 / Pseudo-Mercator",
+    GEOGCS["WGS 84",
+        DATUM["WGS_1984",
+            SPHEROID["WGS 84",6378137,298.257223563,
+                AUTHORITY["EPSG","7030"]],
+            AUTHORITY["EPSG","6326"]],
+        PRIMEM["Greenwich",0,
+            AUTHORITY["EPSG","8901"]],
+        UNIT["degree",0.0174532925199433,
+            AUTHORITY["EPSG","9122"]],
+        AUTHORITY["EPSG","4326"]],
+    PROJECTION["Mercator_1SP"],
+    PARAMETER["central_meridian",0],
+    PARAMETER["scale_factor",1],
+    PARAMETER["false_easting",0],
+    PARAMETER["false_northing",0],
+    UNIT["metre",1,
+        AUTHORITY["EPSG","9001"]],
+    AXIS["X",EAST],
+    AXIS["Y",NORTH],
+    EXTENSION["PROJ4","+proj=merc +a=6378137 +b=6378137 +lat_ts=0.0 +lon_0=0.0 +x_0=0.0 +y_0=0 +k=1.0 +units=m +nadgrids=@null +wktext +no_defs"],
+    AUTHORITY["EPSG","3857"]]"""
+
+
+def log_progress(message: str, start_time: Optional[float] = None):
+    """Log progress with optional timing."""
+    if start_time:
+        elapsed = time.time() - start_time
+        print(f"[time] {message} ({elapsed:.1f}s)")
+    else:
+        print(f"[info] {message}")
+
+
+def get_epsg_3857_crs():
+    """
+    Get EPSG:3857 CRS object with fallbacks for PROJ database issues.
+    
+    Tries multiple methods:
+    1. CRS.from_epsg(3857) - standard method
+    2. CRS.from_string("EPSG:3857") - string-based
+    3. CRS.from_wkt(EPSG_3857_WKT) - WKT string (works without database)
+    
+    Returns:
+        CRS object for EPSG:3857
+    """
+    # Method 1: Try from_epsg (requires PROJ database)
+    try:
+        return CRS.from_epsg(3857)
+    except Exception as e1:
+        log_progress(f"  Warning: CRS.from_epsg(3857) failed: {e1}")
+        
+        # Method 2: Try from_string
+        try:
+            return CRS.from_string("EPSG:3857")
+        except Exception as e2:
+            log_progress(f"  Warning: CRS.from_string('EPSG:3857') failed: {e2}")
+            
+            # Method 3: Use WKT string (works without PROJ database)
+            try:
+                return CRS.from_wkt(EPSG_3857_WKT)
+            except Exception as e3:
+                log_progress(f"  Warning: CRS.from_wkt() failed: {e3}")
+                
+                # Method 4: Use PROJ string directly
+                try:
+                    return CRS.from_string("+proj=merc +a=6378137 +b=6378137 +lat_ts=0.0 +lon_0=0.0 +x_0=0.0 +y_0=0 +k=1.0 +units=m +nadgrids=@null +wktext +no_defs")
+                except Exception as e4:
+                    log_progress(f"  ERROR: All CRS creation methods failed!")
+                    log_progress(f"    from_epsg: {e1}")
+                    log_progress(f"    from_string: {e2}")
+                    log_progress(f"    from_wkt: {e3}")
+                    log_progress(f"    proj_string: {e4}")
+                    raise RuntimeError("Could not create EPSG:3857 CRS. Please install conda-forge GDAL/PROJ.")
 
 # Determine base path
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -60,15 +138,6 @@ INCLUDE_DATASETS = [
     "elevation", "slope", "oil_gas", "road_infrastructure",
     "GSN", "powerplants", "wildfire",
 ]
-
-
-def log_progress(message: str, start_time: Optional[float] = None):
-    """Log progress with optional timing."""
-    if start_time:
-        elapsed = time.time() - start_time
-        print(f"[time] {message} ({elapsed:.1f}s)")
-    else:
-        print(f"[info] {message}")
 
 
 def load_backbone_template() -> Tuple[rasterio.DatasetReader, dict]:
@@ -100,9 +169,12 @@ def load_backbone_template() -> Tuple[rasterio.DatasetReader, dict]:
     
     backbone_src = rasterio.open(backbone_path)
     
+    # Get EPSG:3857 CRS with fallbacks for PROJ database issues
+    epsg_3857_crs = get_epsg_3857_crs()
+    
     # Create reference profile
     ref_profile = {
-        "crs": CRS.from_epsg(3857),  # Force true EPSG:3857
+        "crs": epsg_3857_crs,  # Force true EPSG:3857
         "transform": backbone_src.transform,
         "width": backbone_src.width,
         "height": backbone_src.height,
@@ -169,7 +241,22 @@ def warp_raster_to_backbone(
     try:
         with rasterio.open(src_path) as src:
             # Check if already matches (fast path)
-            if (src.crs == ref_profile["crs"] and
+            # Use string comparison for CRS to avoid PROJ database issues
+            src_crs_str = str(src.crs) if src.crs else ""
+            ref_crs_str = str(ref_profile["crs"]) if ref_profile["crs"] else ""
+            
+            # Check alignment (shape, transform, and CRS match)
+            crs_match = False
+            try:
+                # Try direct comparison first
+                if src.crs is not None and ref_profile["crs"] is not None:
+                    crs_match = src.crs == ref_profile["crs"]
+            except:
+                # Fallback to string comparison
+                crs_match = ("3857" in src_crs_str and "3857" in ref_crs_str) or \
+                           ("pseudo" in src_crs_str.lower() and "pseudo" in ref_crs_str.lower())
+            
+            if (crs_match and
                 src.width == ref_profile["width"] and
                 src.height == ref_profile["height"] and
                 np.allclose(src.transform, ref_profile["transform"], atol=1e-6)):
@@ -204,13 +291,13 @@ def warp_raster_to_backbone(
                         (hasattr(src_crs, '__class__') and 
                          src_crs.__class__.__name__ == "EngineeringCRS" and
                          "wgs 84" in crs_name)):
-                        src_crs = CRS.from_epsg(3857)
+                        src_crs = get_epsg_3857_crs()
                 except:
                     pass
             
             # If source CRS is None or invalid, assume EPSG:3857
             if src_crs is None:
-                src_crs = CRS.from_epsg(3857)
+                src_crs = get_epsg_3857_crs()
             
             # Reproject each band
             for b in range(1, count + 1):
@@ -257,8 +344,20 @@ def process_backbone(backbone_src: rasterio.DatasetReader, ref_profile: dict) ->
     backbone_path = Path(backbone_src.name)
     dst_path = FIXED_CRS_ROOT / "backbone" / backbone_path.name
     
-    # Check if already correct CRS
-    if (backbone_src.crs == ref_profile["crs"] and
+    # Check if already correct CRS (use string comparison to avoid PROJ database issues)
+    backbone_crs_str = str(backbone_src.crs) if backbone_src.crs else ""
+    ref_crs_str = str(ref_profile["crs"]) if ref_profile["crs"] else ""
+    
+    crs_match = False
+    try:
+        if backbone_src.crs is not None and ref_profile["crs"] is not None:
+            crs_match = backbone_src.crs == ref_profile["crs"]
+    except:
+        # Fallback to string comparison
+        crs_match = ("3857" in backbone_crs_str and "3857" in ref_crs_str) or \
+                   ("pseudo" in backbone_crs_str.lower() and "pseudo" in ref_crs_str.lower())
+    
+    if (crs_match and
         backbone_src.width == ref_profile["width"] and
         backbone_src.height == ref_profile["height"] and
         np.allclose(backbone_src.transform, ref_profile["transform"], atol=1e-6)):
@@ -280,6 +379,15 @@ def main():
     log_progress("="*60)
     log_progress(f"Source: {READY_ROOT}")
     log_progress(f"Output: {FIXED_CRS_ROOT}")
+    
+    # Test CRS creation early to catch PROJ database issues
+    log_progress("\nTesting CRS creation (checking for PROJ database issues)...")
+    try:
+        test_crs = get_epsg_3857_crs()
+        log_progress("  ✓ CRS creation successful")
+    except Exception as e:
+        log_progress(f"\n  ⚠ CRS creation warning: {e}")
+        log_progress("  Script will attempt to continue with fallback methods...")
     
     # Load backbone template
     backbone_src, ref_profile = load_backbone_template()
