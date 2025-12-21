@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+
+"""Colombia Spatial Features Preprocessing Script
+
+Purpose: Add lagged status, spatial-context features, and a transition target to the merged Colombia panel data,
+         then apply Risk Set filtering.
+
+Processing order (per year):
+    1. Lag feature:
+       - Create `WDPA_prev` by joining each (row, col) in year t with `WDPA_b1` from year t-1
+         (first year is set to 0). `WDPA_prev` is stored as `uint8`.
+    2. Spatial features computed on the FULL grid (before Risk Set filtering):
+       - Protected-area distance:
+         - Create `dist_wdpa` as the Euclidean distance (in meters) from each pixel to the nearest
+           pixel with `WDPA_prev > 0` (t-1 protection), using a distance transform. This uses t-1
+           status to avoid using the same-year target in the distance computation.
+       - Static-feature distance transforms (computed once on reference footprint, then merged):
+         - For `oil_gas_b1`, `powerplants_b1`, `road_infrastructure_b1`, build a binary mask
+           (NaN -> 0, >0 -> 1) and apply an Euclidean distance transform multiplied by 1000,
+           using the same logic as `dist_wdpa`. These are computed once on a reference footprint
+           (default: most recent year) and merged into all years by (row, col). The original binary
+           columns are dropped and replaced with distance columns: `dist_oil_gas`, `dist_powerplant`, `dist_road`.
+       - Smoothed (moving-average) features:
+         - For selected variables (e.g. `NDVI_b1`, `GPW_b1`, `HNTL_b1`, `gdp_b1`, ...),
+           compute uniform-filter smoothing over window sizes 16 and 64, creating new columns like
+           `NDVI_b1_smooth16`, `NDVI_b1_smooth64` (and similarly for the other variables).
+    3. Risk Set filter:
+       - Keep only rows where `WDPA_prev == 0` (pixels not previously protected in t-1).
+    4. Target variable:
+       - Create `transition_01` as `WDPA_b1` for the filtered Risk Set (NaN treated as 0),
+         stored as `uint8`.
+
+Input:  outputs/Results/merged_panel_colombia_<start>_<end>.parquet (from colombia_merge script)
+Output: outputs/Results/merged_panel_colombia_final.parquet (Risk Set only, with transition_01 column)
+
+Processing: Year-by-year for memory efficiency. Spatial features are computed before filtering to reflect
+the full landscape context, then Risk Set filtering reduces the output size. Intermediate per-year outputs
+are written to a temp directory and concatenated into the final parquet.
+"""
+
+from __future__ import annotations
+
+import gc
+import logging
+import os
+import time
+import warnings
+from pathlib import Path
+from typing import Tuple
+
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
+import wandb
+from scipy.ndimage import distance_transform_edt, uniform_filter
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger(__name__)
+warnings.filterwarnings('ignore')
+
+DISTANCE_DECAY_SCALE = 10000
+SMOOTH_VARIABLES = ['NDVI_b1', 'GPW_b1', 'HNTL_b1', 'gdp_b1', 'deforestation_b1', 
+                     'wildfire_b1', 'GSN_b1', 'GSN_b2', 'GSN_b3', 'GSN_b4', 'GSN_b5']
+SMOOTH_SIZES = [16, 64]
+# Mapping from input column names to output distance column names
+STATIC_DISTANCE_MAPPING = {
+    'road_infrastructure_b1': 'dist_road',
+    'oil_gas_b1': 'dist_oil_gas',
+    'powerplants_b1': 'dist_powerplant'
+}
+
+
+def reconstruct_grid(df: pd.DataFrame, value_col: str) -> Tuple[np.ndarray, int, int, int, int]:
+    """Reconstruct 2D grid from panel data."""
+    min_row, max_row = df['row'].min(), df['row'].max()
+    min_col, max_col = df['col'].min(), df['col'].max()
+    
+    grid = np.full((max_row - min_row + 1, max_col - min_col + 1), np.nan, dtype=np.float32)
+    grid[(df['row'] - min_row).values, (df['col'] - min_col).values] = df[value_col].values
+    
+    return grid, min_row, max_row, min_col, max_col
+
+
+def grid_to_dataframe(grid: np.ndarray, df: pd.DataFrame, min_row: int, min_col: int) -> pd.Series:
+    """Convert grid back to DataFrame format."""
+    values = grid[(df['row'] - min_row).values, (df['col'] - min_col).values]
+    return pd.Series(values, index=df.index)
+
+
+def compute_distance_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute distance to WDPA and decay features using WDPA_prev (t-1) to avoid target leakage."""
+    logger.info("  Computing distance features from WDPA_prev (t-1)...")
+    
+    wdpa_grid, min_row, max_row, min_col, max_col = reconstruct_grid(df, 'WDPA_prev')
+    wdpa_binary = np.where(np.isnan(wdpa_grid), 0, wdpa_grid > 0).astype(np.uint8)
+    del wdpa_grid
+    
+    distance_grid = distance_transform_edt(1 - wdpa_binary) * 1000  # pixels to meters
+    del wdpa_binary
+    
+    df['dist_wdpa'] = grid_to_dataframe(distance_grid, df, min_row, min_col)
+    del distance_grid
+    
+    return df
+
+
+def compute_static_distance_features_once(df_ref: pd.DataFrame) -> pd.DataFrame:
+    """Compute static distance transforms once on a reference footprint.
+    
+    Returns a lookup DataFrame with columns: row, col, dist_road, dist_oil_gas, dist_powerplant.
+    This is computed once and merged into all years to avoid redundant computation.
+    """
+    logger.info("  Computing static distance transforms on reference footprint...")
+    
+    lookup_df = df_ref[['row', 'col']].drop_duplicates().copy()
+    
+    for input_col, output_col in STATIC_DISTANCE_MAPPING.items():
+        if input_col not in df_ref.columns:
+            logger.warning(f"    Column {input_col} not found, skipping...")
+            continue
+        
+        logger.info(f"    Processing {input_col} -> {output_col}...")
+        
+        # Reconstruct grid from the binary feature
+        feature_grid, min_row, max_row, min_col, max_col = reconstruct_grid(df_ref, input_col)
+        
+        # Convert to binary: NaN -> 0, >0 -> 1 (1 where feature exists)
+        feature_binary = np.where(np.isnan(feature_grid), 0, feature_grid > 0).astype(np.uint8)
+        del feature_grid
+        
+        # Compute distance transform using same logic as dist_wdpa:
+        # distance_transform_edt(1 - binary) gives distance to nearest 0 (feature location)
+        # This is equivalent to distance to nearest feature
+        distance_grid = distance_transform_edt(1 - feature_binary) * 1000  # pixels to meters
+        del feature_binary
+        
+        # Create distance column in lookup
+        lookup_df[output_col] = grid_to_dataframe(distance_grid, lookup_df, min_row, min_col)
+        del distance_grid
+        
+        gc.collect()
+    
+    return lookup_df
+
+
+def merge_static_distances(df: pd.DataFrame, static_lookup: pd.DataFrame) -> pd.DataFrame:
+    """Merge precomputed static distance features and drop original binary columns."""
+    # Merge static distances
+    df = df.merge(static_lookup, on=['row', 'col'], how='left')
+    
+    # Drop original binary columns if they exist
+    for input_col in STATIC_DISTANCE_MAPPING.keys():
+        if input_col in df.columns:
+            df = df.drop(columns=[input_col])
+    
+    return df
+
+
+def compute_smooth_feature(df: pd.DataFrame, variable: str, window_size: int) -> pd.Series:
+    """Compute smoothed feature with given window size."""
+    grid, min_row, max_row, min_col, max_col = reconstruct_grid(df, variable)
+    valid_mask = ~np.isnan(grid)
+    grid_filled = np.where(np.isnan(grid), 0, grid)
+    del grid
+    
+    smoothed = uniform_filter(grid_filled, size=window_size, mode='reflect')
+    del grid_filled
+    
+    count = uniform_filter(valid_mask.astype(np.float32), size=window_size, mode='reflect')
+    del valid_mask
+    
+    smoothed = np.where(count > 0, smoothed, np.nan)
+    del count
+    
+    result = grid_to_dataframe(smoothed, df, min_row, min_col)
+    del smoothed
+    
+    return result
+
+
+def compute_all_smooth_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute all smoothed features."""
+    logger.info("  Computing smoothed features...")
+    
+    for variable in SMOOTH_VARIABLES:
+        if variable not in df.columns:
+            continue
+        for window_size in SMOOTH_SIZES:
+            df[f"{variable}_smooth{window_size}"] = compute_smooth_feature(df, variable, window_size)
+            gc.collect()
+    
+    return df
+
+
+def compute_lag_feature(input_path: Path, year: int) -> pd.DataFrame:
+    """Compute WDPA_prev (1-year lag) for a given year by joining with previous year."""
+    logger.info(f"  Computing lag feature (WDPA_prev) for year {year}...")
+    
+    # Read minimal columns for current year
+    df_curr = pd.read_parquet(
+        input_path, 
+        columns=['row', 'col', 'year'],
+        filters=[('year', '==', year)]
+    )
+    
+    # Read minimal columns for previous year
+    df_prev = pd.read_parquet(
+        input_path,
+        columns=['row', 'col', 'year', 'WDPA_b1'],
+        filters=[('year', '==', year - 1)]
+    )
+    
+    # Rename for join
+    df_prev = df_prev.rename(columns={'WDPA_b1': 'WDPA_prev'})
+    df_prev = df_prev.drop(columns=['year'])
+    
+    # Merge on spatial coordinates
+    df_merged = df_curr.merge(df_prev, on=['row', 'col'], how='left')
+    
+    # Fill missing with 0 (pixels that didn't exist in previous year)
+    df_merged['WDPA_prev'] = df_merged['WDPA_prev'].fillna(0)
+    
+    # Keep only the new column
+    result = df_merged[['row', 'col', 'WDPA_prev']].copy()
+    
+    del df_curr, df_prev, df_merged
+    gc.collect()
+    
+    return result
+
+
+def process_year(input_path: Path, year: int, temp_dir: Path, is_first_year: bool, static_lookup: pd.DataFrame) -> tuple[Path | None, dict]:
+    """Process a single year and return temp file path + metrics."""
+    start_time = time.time()
+    logger.info(f"\nProcessing year {year}...")
+    
+    df_year = pd.read_parquet(input_path, filters=[('year', '==', year)], engine='pyarrow')
+    n_rows_initial = len(df_year)
+    logger.info(f"  Loaded {n_rows_initial:,} rows")
+    
+    if n_rows_initial == 0:
+        return None, {}
+    
+    # Step 1: Add WDPA_prev (1-year lag)
+    if not is_first_year:
+        df_lag = compute_lag_feature(input_path, year)
+        df_year = df_year.merge(df_lag, on=['row', 'col'], how='left')
+        n_nan_prev = df_year['WDPA_prev'].isna().sum()
+        if n_nan_prev > 0:
+            logger.warning(f"  Found {n_nan_prev:,} NaN values in WDPA_prev, filling with 0")
+        df_year['WDPA_prev'] = df_year['WDPA_prev'].fillna(0).astype(np.uint8)
+        del df_lag
+        gc.collect()
+    else:
+        logger.info(f"  First year {year}: setting WDPA_prev = 0")
+        df_year['WDPA_prev'] = np.uint8(0)
+    
+    # Step 2: Compute spatial features on FULL grid (before Risk Set filtering)
+    logger.info(f"  Computing spatial features on full grid ({n_rows_initial:,} rows)...")
+    df_year = compute_distance_features(df_year)
+    df_year = merge_static_distances(df_year, static_lookup)
+    df_year = compute_all_smooth_features(df_year)
+    
+    # Step 3: Apply Risk Set filter (keep only WDPA_prev == 0)
+    df_year = df_year[df_year['WDPA_prev'] == 0].copy()
+    n_rows_filtered = len(df_year)
+    logger.info(f"  Risk Set filter: {n_rows_filtered:,} rows (kept {100*n_rows_filtered/n_rows_initial:.1f}%)")
+    
+    if n_rows_filtered == 0:
+        logger.warning(f"  No rows remaining after Risk Set filter for year {year}")
+        return None, {}
+    
+    # Step 4: Create transition_01 = WDPA_b1 (since WDPA_prev guaranteed to be 0)
+    # Handle NaN values: treat missing WDPA status as not protected (0)
+    wdpa_values = df_year['WDPA_b1'].fillna(0)
+    n_nan = df_year['WDPA_b1'].isna().sum()
+    if n_nan > 0:
+        logger.warning(f"  Found {n_nan:,} NaN values in WDPA_b1, filling with 0")
+    df_year['transition_01'] = wdpa_values.astype(np.uint8)
+    
+    temp_file = temp_dir / f"year_{year}_processed.parquet"
+    df_year.to_parquet(temp_file, engine='pyarrow', compression='snappy', index=False)
+    
+    del df_year
+    gc.collect()
+    
+    elapsed = time.time() - start_time
+    logger.info(f"  ✓ Year {year} complete in {elapsed:.1f}s")
+    
+    return temp_file, {
+        "year": year, 
+        "rows_initial": n_rows_initial,
+        "rows_filtered": n_rows_filtered,
+        "filter_ratio": n_rows_filtered / n_rows_initial,
+        "time_seconds": elapsed
+    }
+
+
+def main() -> None:
+    """Main processing function."""
+    repo_root = Path(__file__).resolve().parents[3]
+    scratch_root = Path(os.environ["SCRATCH"]) if "SCRATCH" in os.environ else None
+
+    # Resolve input path with sensible defaults:
+    #  1) Explicit override via env var COLOMBIA_FEATURES_INPUT_PATH
+    #  2) Common location on $SCRATCH/outputs/Results (from colombia_merge)
+    #  3) Fallback to local repo outputs/Results
+    env_input = os.environ.get("COLOMBIA_FEATURES_INPUT_PATH")
+    if env_input:
+        input_path = Path(env_input)
+    else:
+        # Look for merged_panel_colombia_*.parquet files
+        candidate_dirs = []
+        if scratch_root is not None:
+            candidate_dirs.append(scratch_root / "outputs" / "Results")
+        candidate_dirs.append(repo_root / "outputs" / "Results")
+        
+        input_path = None
+        for cand_dir in candidate_dirs:
+            if cand_dir.exists():
+                # Find any merged_panel_colombia_*.parquet file
+                colombia_files = list(cand_dir.glob("merged_panel_colombia_*.parquet"))
+                if colombia_files:
+                    # Use the most recently modified file if multiple exist
+                    input_path = max(colombia_files, key=lambda p: p.stat().st_mtime)
+                    break
+        
+        if input_path is None:
+            # Default fallback path (will raise error if doesn't exist)
+            if scratch_root is not None:
+                input_path = scratch_root / "outputs" / "Results" / "merged_panel_colombia_2000_2024.parquet"
+            else:
+                input_path = repo_root / "outputs" / "Results" / "merged_panel_colombia_2000_2024.parquet"
+
+    # On clusters, write large outputs to $SCRATCH; locally keep them under the repo
+    if scratch_root is not None:
+        output_dir = scratch_root / "outputs" / "Results"
+    else:
+        output_dir = repo_root / "outputs" / "Results"
+
+    output_path = output_dir / "merged_panel_colombia_final.parquet"
+    temp_dir = output_dir / ".temp_colombia_spatial_features"
+    
+    # Initialize W&B
+    wandb.init(
+        project="thesis-colombia-spatial-features",
+        name="colombia_spatial_features_preprocessing",
+        config={
+            "distance_decay_scale": DISTANCE_DECAY_SCALE,
+            "smooth_variables": SMOOTH_VARIABLES,
+            "smooth_sizes": SMOOTH_SIZES,
+            "static_distance_mapping": STATIC_DISTANCE_MAPPING,
+            "region": "Colombia",
+        }
+    )
+    
+    logger.info("="*80)
+    logger.info("COLOMBIA SPATIAL FEATURES PREPROCESSING")
+    logger.info("="*80)
+    logger.info(f"Input:  {input_path}")
+    logger.info(f"Output: {output_path}")
+    
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+    
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Get metadata
+    logger.info("Reading metadata...")
+    df_sample = pd.read_parquet(input_path, columns=['year'])
+    years = sorted(df_sample['year'].unique())
+    total_rows = len(df_sample)
+    logger.info(f"Years: {years[0]}-{years[-1]} ({len(years)} years), Total rows: {total_rows:,}")
+    del df_sample
+    gc.collect()
+    
+    wandb.log({"total_years": len(years), "total_rows": total_rows})
+    
+    # Precompute static distance features once on reference footprint
+    logger.info("\n" + "="*80)
+    logger.info("Precomputing static distance features on reference footprint...")
+    logger.info("="*80)
+    
+    # Determine reference year (prefer 2024, fallback to most recent year)
+    ref_year = max(years) if years else None
+    if ref_year is None:
+        raise ValueError("No years found in input data")
+    
+    logger.info(f"Using year {ref_year} as reference footprint for static distances")
+    
+    # Load reference year data (only columns needed for static distance computation)
+    static_cols = ['row', 'col'] + list(STATIC_DISTANCE_MAPPING.keys())
+    df_ref = pd.read_parquet(
+        input_path, 
+        columns=static_cols,
+        filters=[('year', '==', ref_year)],
+        engine='pyarrow'
+    )
+    
+    if df_ref.empty:
+        logger.warning(f"Reference year {ref_year} is empty, trying union of all years...")
+        # Fallback: use union of all years
+        df_ref = pd.read_parquet(
+            input_path,
+            columns=static_cols,
+            engine='pyarrow'
+        )
+        df_ref = df_ref[['row', 'col'] + [c for c in static_cols if c in df_ref.columns]].drop_duplicates(subset=['row', 'col'])
+        logger.info(f"Using union footprint: {len(df_ref):,} unique pixels")
+    
+    # Compute static distances once
+    static_lookup = compute_static_distance_features_once(df_ref)
+    logger.info(f"  ✓ Computed static distances for {len(static_lookup):,} pixels")
+    del df_ref
+    gc.collect()
+    
+    # Process year by year
+    temp_files = []
+    total_rows_initial = 0
+    total_rows_filtered = 0
+    
+    for i, year in enumerate(years):
+        try:
+            is_first_year = (i == 0)
+            temp_file, metrics = process_year(input_path, year, temp_dir, is_first_year, static_lookup)
+            if temp_file is not None:
+                temp_files.append(temp_file)
+                wandb.log(metrics)
+                if 'rows_initial' in metrics:
+                    total_rows_initial += metrics['rows_initial']
+                    total_rows_filtered += metrics['rows_filtered']
+        except Exception as e:
+            logger.error(f"Error processing year {year}: {e}")
+            for tf in temp_files:
+                if tf.exists():
+                    tf.unlink()
+            if temp_dir.exists() and not list(temp_dir.iterdir()):
+                temp_dir.rmdir()
+            wandb.finish(exit_code=1)
+            raise
+    
+    # Clean up static lookup
+    del static_lookup
+    gc.collect()
+    
+    # Combine all years using streaming
+    logger.info("\n" + "="*80)
+    logger.info(f"Combining {len(temp_files)} files (streaming)...")
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    writer = None
+    total_rows_written = 0
+    concat_start = time.time()
+    
+    for i, temp_file in enumerate(temp_files):
+        logger.info(f"  [{i+1}/{len(temp_files)}] {temp_file.name}...")
+        table = pq.read_table(temp_file)
+        total_rows_written += len(table)
+        
+        if writer is None:
+            logger.info(f"  Initializing output ({len(table.column_names)} columns)...")
+            writer = pq.ParquetWriter(output_path, table.schema, compression='snappy')
+        
+        writer.write_table(table)
+        del table
+        gc.collect()
+        
+        wandb.log({"concatenation_progress": (i + 1) / len(temp_files)})
+    
+    if writer is None:
+        raise RuntimeError("No data was written!")
+    
+    writer.close()
+    concat_time = time.time() - concat_start
+    logger.info(f"  ✓ Wrote {total_rows_written:,} rows in {concat_time:.1f}s")
+    
+    # Clean up temp files
+    logger.info("\nCleaning up temp files...")
+    for temp_file in temp_files:
+        temp_file.unlink()
+    if temp_dir.exists() and not list(temp_dir.iterdir()):
+        temp_dir.rmdir()
+    
+    # Summary
+    file_size_mb = output_path.stat().st_size / (1024**2)
+    schema = pq.read_schema(output_path)
+    new_cols = [c for c in schema.names if c.startswith('dist_') or '_smooth' in c]
+    filter_ratio = total_rows_filtered / total_rows_initial if total_rows_initial > 0 else 0
+    
+    logger.info("\n" + "="*80)
+    logger.info("SUMMARY")
+    logger.info("="*80)
+    logger.info(f"Initial rows:   {total_rows_initial:,}")
+    logger.info(f"Filtered rows:  {total_rows_filtered:,} ({100*filter_ratio:.1f}% kept)")
+    logger.info(f"Risk Set filter removed: {total_rows_initial - total_rows_filtered:,} already-protected pixels")
+    logger.info(f"New columns: {len(new_cols)}")
+    logger.info(f"File size: {file_size_mb:.1f} MB")
+    logger.info("✓ Processing complete!")
+    
+    wandb.log({
+        "initial_rows": total_rows_initial,
+        "final_rows": total_rows_filtered,
+        "filter_ratio": filter_ratio,
+        "rows_removed": total_rows_initial - total_rows_filtered,
+        "new_columns": len(new_cols),
+        "file_size_mb": file_size_mb,
+        "concatenation_time_seconds": concat_time
+    })
+    wandb.finish()
+
+
+if __name__ == "__main__":
+    main()
+
