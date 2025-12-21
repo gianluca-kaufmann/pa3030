@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=storage_optimise
+#SBATCH --job-name=colombia_crs
 #SBATCH --partition=normal.4h
 #SBATCH --time=04:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/storage_optimise_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/storage_optimise_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/colombia_crs_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/colombia_crs_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -45,21 +45,21 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the storage_optimise script
+# Run the colombia_crs script
 #------------------------------------------------------------------------------
-echo "Starting storage_optimise script..."
+echo "Starting colombia_crs script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/preprocessing/storage_optimise" ] || {
-  echo "ERROR: storage_optimise not found"
-  echo "NOTE: storage_optimise script is in preprocessing/ directory"
-  find scripts -maxdepth 4 -type f -name "storage_optimise"
+[ -f "scripts/colombia/preprocessing/colombia_crs" ] || {
+  echo "ERROR: colombia_crs not found"
+  echo "NOTE: colombia_crs script is in colombia/preprocessing/ directory"
+  find scripts -maxdepth 4 -type f -name "colombia_crs"
   exit 1
 }
 # Run the script
-python "scripts/preprocessing/storage_optimise"
+python "scripts/colombia/preprocessing/colombia_crs"
 
-echo "storage_optimise script finished."
+echo "colombia_crs script finished."
