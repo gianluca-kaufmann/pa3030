@@ -233,6 +233,76 @@ def detect_year_range(catalog: Dict[str, Dict[Optional[int], List[Path]]]) -> Li
     return years
 
 
+def normalize_crs_to_epsg3857(crs) -> Optional[rasterio.crs.CRS]:
+    """
+    Normalize a CRS to EPSG:3857 if it represents Web Mercator / Pseudo-Mercator.
+    Handles both EPSG codes and PROJJSON formats.
+    Returns the normalized CRS or None if not Web Mercator.
+    """
+    if crs is None:
+        return None
+    
+    try:
+        crs_obj = rasterio.crs.CRS.from_user_input(crs) if not isinstance(crs, rasterio.crs.CRS) else crs
+        
+        # Try to get EPSG code directly
+        epsg = crs_obj.to_epsg()
+        if epsg == 3857:
+            return rasterio.crs.CRS.from_epsg(3857)
+        
+        # Check if it's Web Mercator by name or properties (handles PROJJSON)
+        crs_str = str(crs_obj).lower()
+        crs_name = crs_obj.name.lower() if hasattr(crs_obj, 'name') and crs_obj.name else ""
+        combined_str = f"{crs_str} {crs_name}"
+        
+        # Check for Web Mercator / Pseudo-Mercator indicators
+        # "WGS 84 / Pseudo-Mercator" is EPSG:3857
+        if any(indicator in combined_str for indicator in 
+               ['pseudo-mercator', 'pseudo mercator', 'web mercator', '3857', 'epsg:3857']):
+            return rasterio.crs.CRS.from_epsg(3857)
+        
+        # Also check for "WGS 84" + "Mercator" combination (common for EPSG:3857)
+        if 'wgs 84' in combined_str and 'mercator' in combined_str:
+            return rasterio.crs.CRS.from_epsg(3857)
+        
+        return None
+    except Exception:
+        return None
+
+
+def crs_equivalent(crs1, crs2) -> bool:
+    """
+    Check if two CRSs are equivalent, handling EPSG:3857 in different formats.
+    """
+    if crs1 is None or crs2 is None:
+        return crs1 == crs2
+    
+    try:
+        crs1_obj = rasterio.crs.CRS.from_user_input(crs1) if not isinstance(crs1, rasterio.crs.CRS) else crs1
+        crs2_obj = rasterio.crs.CRS.from_user_input(crs2) if not isinstance(crs2, rasterio.crs.CRS) else crs2
+        
+        # Try direct comparison first
+        if crs1_obj == crs2_obj:
+            return True
+        
+        # Normalize both to EPSG:3857 if they represent Web Mercator
+        norm1 = normalize_crs_to_epsg3857(crs1_obj)
+        norm2 = normalize_crs_to_epsg3857(crs2_obj)
+        
+        if norm1 is not None and norm2 is not None:
+            return norm1 == norm2
+        
+        # If one is EPSG:3857 and the other might be, check EPSG codes
+        epsg1 = crs1_obj.to_epsg()
+        epsg2 = crs2_obj.to_epsg()
+        if epsg1 is not None and epsg2 is not None:
+            return epsg1 == epsg2
+        
+        return False
+    except Exception:
+        return False
+
+
 def check_alignment(src_path: Path, ref_profile: dict) -> bool:
     """Check if a raster is already aligned with the reference grid.
     
@@ -246,21 +316,7 @@ def check_alignment(src_path: Path, ref_profile: dict) -> bool:
                 return False
             
             # CRS comparison: handle EPSG:3857 whether stored as EPSG or PROJJSON
-            src_crs = rasterio.crs.CRS.from_user_input(src.crs) if src.crs else None
-            ref_crs = rasterio.crs.CRS.from_user_input(ref_profile["crs"]) if ref_profile["crs"] else None
-            
-            if src_crs is None or ref_crs is None:
-                return src_crs == ref_crs
-            
-            # Check if both are EPSG:3857 (Web Mercator) regardless of storage format
-            src_epsg = src_crs.to_epsg()
-            ref_epsg = ref_crs.to_epsg()
-            
-            if src_epsg is not None and ref_epsg is not None and src_epsg == 3857 and ref_epsg == 3857:
-                return True
-            
-            # For other CRSs, use standard comparison
-            return src_crs == ref_crs
+            return crs_equivalent(src.crs, ref_profile["crs"])
     except Exception:
         return False
 
@@ -290,7 +346,16 @@ def read_reproject_to_ref(path: Path, ref_profile: dict) -> np.ndarray:
         dst_height = ref_profile["height"]
         dst_width = ref_profile["width"]
         dst_transform = ref_profile["transform"]
-        dst_crs = ref_profile["crs"]
+        
+        # Normalize CRSs to avoid coordinate operations errors
+        # If both represent EPSG:3857, normalize to avoid PROJJSON issues
+        src_crs_normalized = normalize_crs_to_epsg3857(src.crs)
+        dst_crs_normalized = normalize_crs_to_epsg3857(ref_profile["crs"])
+        
+        # Use normalized CRS if available, otherwise use original
+        src_crs_for_reproject = src_crs_normalized if src_crs_normalized is not None else src.crs
+        dst_crs = dst_crs_normalized if dst_crs_normalized is not None else ref_profile["crs"]
+        
         count = src.count
         
         # Special handling for nodata=0: read raw array and use temp nodata
@@ -307,7 +372,7 @@ def read_reproject_to_ref(path: Path, ref_profile: dict) -> np.ndarray:
                     source=src_array,
                     destination=dst[b - 1],
                     src_transform=src.transform,
-                    src_crs=src.crs,
+                    src_crs=src_crs_for_reproject,
                     src_nodata=temp_nodata,  # Use temp nodata (nothing in source has this value)
                     dst_transform=dst_transform,
                     dst_crs=dst_crs,
@@ -326,7 +391,7 @@ def read_reproject_to_ref(path: Path, ref_profile: dict) -> np.ndarray:
                     source=rasterio.band(src, b),
                     destination=dst[b - 1],
                     src_transform=src.transform,
-                    src_crs=src.crs,
+                    src_crs=src_crs_for_reproject,
                     src_nodata=src.nodata,
                     dst_transform=dst_transform,
                     dst_crs=dst_crs,
@@ -375,18 +440,7 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
         
         # Fast path: if already aligned, just read the window directly (MUCH faster)
         # CRS comparison handles EPSG:3857 whether stored as EPSG code or PROJJSON
-        src_crs = rasterio.crs.CRS.from_user_input(src.crs) if src.crs else None
-        ref_crs = rasterio.crs.CRS.from_user_input(ref_profile["crs"]) if ref_profile["crs"] else None
-        crs_aligned = False
-        if src_crs is not None and ref_crs is not None:
-            src_epsg = src_crs.to_epsg()
-            ref_epsg = ref_crs.to_epsg()
-            if src_epsg is not None and ref_epsg is not None and src_epsg == 3857 and ref_epsg == 3857:
-                crs_aligned = True
-            else:
-                crs_aligned = (src_crs == ref_crs)
-        else:
-            crs_aligned = (src_crs == ref_crs)
+        crs_aligned = crs_equivalent(src.crs, ref_profile["crs"])
         
         if (src.shape == (ref_profile["height"], ref_profile["width"]) and
             crs_aligned and
@@ -405,7 +459,15 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
         
         # Slow path: reprojection needed
         dst_transform = rasterio.windows.transform(window, ref_profile["transform"])
-        dst_crs = ref_profile["crs"]
+        
+        # Normalize CRSs to avoid coordinate operations errors
+        # If both represent EPSG:3857, normalize to avoid PROJJSON issues
+        src_crs_normalized = normalize_crs_to_epsg3857(src.crs)
+        dst_crs_normalized = normalize_crs_to_epsg3857(ref_profile["crs"])
+        
+        # Use normalized CRS if available, otherwise use original
+        src_crs_for_reproject = src_crs_normalized if src_crs_normalized is not None else src.crs
+        dst_crs = dst_crs_normalized if dst_crs_normalized is not None else ref_profile["crs"]
         
         # Special handling for nodata=0: read full data and create temp array with different nodata
         if src.nodata in [0, 0.0]:
@@ -421,7 +483,7 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
                     source=src_array,
                     destination=dst[b - 1],
                     src_transform=src.transform,
-                    src_crs=src.crs,
+                    src_crs=src_crs_for_reproject,
                     src_nodata=temp_nodata,  # Use temp nodata (nothing in source has this value)
                     dst_transform=dst_transform,
                     dst_crs=dst_crs,
@@ -439,7 +501,7 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
                     source=rasterio.band(src, b),
                     destination=dst[b - 1],
                     src_transform=src.transform,
-                    src_crs=src.crs,
+                    src_crs=src_crs_for_reproject,
                     src_nodata=src.nodata,
                     dst_transform=dst_transform,
                     dst_crs=dst_crs,
