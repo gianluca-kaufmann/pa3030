@@ -142,104 +142,144 @@ def log_progress(message: str, start_time: Optional[float] = None):
         print(f"[info] {message}")
 
 
-def normalize_crs(crs) -> CRS:
+def normalize_crs(crs, debug_filename: Optional[str] = None, _debug_log: dict = {}) -> CRS:
     """
-    Normalize CRS to a standard format, handling PROJ JSON and other formats.
+    Normalize CRS to a standard format, handling PROJ JSON and EngineeringCRS.
     
-    This function handles cases where CRS is in PROJ JSON format or other formats
+    This function handles cases where CRS is in PROJ JSON format, EngineeringCRS, or other formats
     that might not be directly compatible with rasterio reprojection operations.
-    It attempts to convert to EPSG:3857 if the CRS represents "WGS 84 / Pseudo-Mercator".
+    Aggressively converts any Pseudo-Mercator CRS to EPSG:3857.
     
     Args:
         crs: CRS object or string representation
+        debug_filename: Optional filename for debug logging (one-time per session)
         
     Returns:
-        Normalized CRS object
+        Normalized CRS object (EPSG:3857 for Pseudo-Mercator)
     """
     if crs is None:
         return None
     
     try:
-        # First, try to get CRS name/identifier to detect common cases
+        # Get string representation and type information
+        crs_str = ""
         crs_name = None
+        crs_type = None
+        
         if isinstance(crs, CRS):
             try:
+                # Get CRS type (e.g., 'EngineeringCRS', 'GeographicCRS', etc.)
+                if hasattr(crs, '__class__'):
+                    crs_type = crs.__class__.__name__
+                
                 # Try to get the name attribute if available
                 if hasattr(crs, 'name'):
-                    crs_name = str(crs.name).lower()
-                # Try to_string() but catch errors
+                    crs_name = str(crs.name).lower() if crs.name else None
+                
+                # Try to_string() but catch errors (fails for some PROJJSON/EngineeringCRS)
                 try:
                     crs_str = crs.to_string()
                 except:
-                    # If to_string() fails, try to get WKT or other representation
-                    crs_str = str(crs)
+                    # If to_string() fails, try WKT or other representation
+                    try:
+                        crs_str = str(crs)
+                    except:
+                        crs_str = ""
             except:
                 crs_str = str(crs)
         else:
             crs_str = str(crs)
         
-        # Check if it's PROJ JSON format (contains "$schema" or "projjson")
-        is_proj_json = "$schema" in crs_str.lower() or "projjson" in crs_str.lower() or crs_str.strip().startswith("{")
+        # One-time debug logging for first file
+        if debug_filename and "first_crs_debug" not in _debug_log:
+            log_progress(f"\n=== CRS Debug Info (first file: {debug_filename}) ===")
+            log_progress(f"  Original CRS type: {crs_type}")
+            log_progress(f"  Original CRS name: {crs_name}")
+            log_progress(f"  Original CRS string (first 200 chars): {crs_str[:200] if crs_str else 'N/A'}")
+            _debug_log["first_crs_debug"] = True
         
+        # AGGRESSIVE PSEUDO-MERCATOR DETECTION
+        # Check multiple indicators for Pseudo-Mercator / EPSG:3857
+        is_pseudo_mercator = False
+        
+        # Method 1: Check CRS name
+        if crs_name and ("pseudo" in crs_name or "popular visualisation crs" in crs_name):
+            if "mercator" in crs_name or "3857" in crs_name or "wgs 84" in crs_name:
+                is_pseudo_mercator = True
+        
+        # Method 2: Check string representation
+        crs_str_lower = crs_str.lower()
+        if "pseudo-mercator" in crs_str_lower or "pseudo mercator" in crs_str_lower:
+            is_pseudo_mercator = True
+        if "3857" in crs_str:
+            is_pseudo_mercator = True
+        if "popular visualisation crs" in crs_str_lower:
+            is_pseudo_mercator = True
+        
+        # Method 3: Check for EngineeringCRS with WGS 84 in name
+        if crs_type == "EngineeringCRS" or "engineeringcrs" in crs_str_lower:
+            if crs_name and "wgs 84" in crs_name:
+                is_pseudo_mercator = True
+        
+        # Method 4: Check for PROJJSON with Pseudo-Mercator indicators
+        is_proj_json = "$schema" in crs_str_lower or "projjson" in crs_str_lower or crs_str.strip().startswith("{")
         if is_proj_json:
-            # Try to detect if it's WGS 84 / Pseudo-Mercator (EPSG:3857)
-            if "pseudo-mercator" in crs_str.lower() or "3857" in crs_str or (crs_name and "pseudo" in crs_name and "mercator" in crs_name):
-                log_progress("  Normalizing PROJ JSON CRS (WGS 84 / Pseudo-Mercator) to EPSG:3857")
-                return CRS.from_string("EPSG:3857")
-            else:
-                # Try to extract EPSG code from PROJ JSON if present
-                import json
-                try:
-                    crs_dict = json.loads(crs_str)
-                    # Look for EPSG code in various places
-                    if "id" in crs_dict:
-                        id_str = str(crs_dict["id"])
-                        if "EPSG" in id_str.upper():
-                            epsg_code = id_str.split(":")[-1]
-                            return CRS.from_string(f"EPSG:{epsg_code}")
-                    # Check for name that might indicate EPSG:3857
-                    if "name" in crs_dict:
-                        name = str(crs_dict["name"]).lower()
-                        if "pseudo" in name and "mercator" in name:
-                            return CRS.from_string("EPSG:3857")
-                except:
-                    pass
+            # Try to parse JSON and look for indicators
+            import json
+            try:
+                crs_dict = json.loads(crs_str)
+                # Look for EPSG code
+                if "id" in crs_dict:
+                    id_str = str(crs_dict["id"])
+                    if "3857" in id_str or "EPSG" in id_str.upper():
+                        is_pseudo_mercator = True
+                # Check name field
+                if "name" in crs_dict:
+                    name = str(crs_dict["name"]).lower()
+                    if "pseudo" in name or "3857" in name:
+                        is_pseudo_mercator = True
+            except:
+                pass
         
-        # Check CRS name for common patterns
-        if crs_name:
-            if "pseudo" in crs_name and "mercator" in crs_name:
-                return CRS.from_string("EPSG:3857")
+        # If any method detected Pseudo-Mercator, convert to EPSG:3857
+        if is_pseudo_mercator:
+            if debug_filename and "first_crs_debug" in _debug_log and _debug_log["first_crs_debug"]:
+                log_progress(f"  ✓ Detected Pseudo-Mercator, normalizing to EPSG:3857")
+                log_progress("=== End CRS Debug ===\n")
+                _debug_log["first_crs_debug"] = False  # Prevent duplicate logging
+            return CRS.from_epsg(3857)
         
-        # Try to convert to CRS object if it's a string
-        if isinstance(crs_str, str):
-            # If it already looks like an EPSG code, use it directly
-            if crs_str.upper().startswith("EPSG:"):
-                return CRS.from_string(crs_str)
-            # Skip PROJ JSON strings - we've already handled them
-            if not is_proj_json:
-                try:
-                    return CRS.from_string(crs_str)
-                except:
-                    pass
+        # Try to extract explicit EPSG code
+        if isinstance(crs_str, str) and crs_str.upper().startswith("EPSG:"):
+            epsg_code = crs_str.split(":")[-1]
+            if epsg_code.isdigit():
+                return CRS.from_epsg(int(epsg_code))
         
-        # If it's already a CRS object and we got here, try to use it directly
-        # but only if it's not PROJ JSON format
+        # Try to use CRS object directly if valid
         if isinstance(crs, CRS) and not is_proj_json:
-            return crs
+            try:
+                # Test if CRS is usable by checking for to_wkt
+                if hasattr(crs, 'to_wkt'):
+                    crs.to_wkt()
+                    return crs
+            except:
+                pass
         
-        # Fallback: if we can't determine, assume EPSG:3857 for Colombia data
-        # (most Colombia rasters use EPSG:3857)
-        log_progress(f"  Warning: Could not fully normalize CRS, assuming EPSG:3857")
-        return CRS.from_string("EPSG:3857")
+        # Fallback: Colombia data typically uses EPSG:3857
+        if debug_filename and "first_crs_debug" in _debug_log and _debug_log["first_crs_debug"]:
+            log_progress(f"  ⚠ Could not definitively identify CRS, defaulting to EPSG:3857")
+            log_progress("=== End CRS Debug ===\n")
+            _debug_log["first_crs_debug"] = False
+        return CRS.from_epsg(3857)
         
     except Exception as e:
-        # If normalization fails, log warning and try EPSG:3857 as fallback
-        log_progress(f"  Warning: Could not normalize CRS, using EPSG:3857 as fallback: {e}")
-        try:
-            return CRS.from_string("EPSG:3857")
-        except:
-            # Last resort: return None (will be handled by caller)
-            return None
+        # If normalization fails, log warning and use EPSG:3857 as fallback
+        if debug_filename and "first_crs_debug" in _debug_log and _debug_log["first_crs_debug"]:
+            log_progress(f"  ❌ CRS normalization error: {e}")
+            log_progress(f"  Using EPSG:3857 as fallback")
+            log_progress("=== End CRS Debug ===\n")
+            _debug_log["first_crs_debug"] = False
+        return CRS.from_epsg(3857)
 
 
 def open_reference_backbone() -> Tuple[Path, rasterio.DatasetReader, np.ndarray]:
@@ -338,15 +378,23 @@ def check_alignment(src_path: Path, ref_profile: dict) -> bool:
     """Check if a raster is already aligned with the reference grid."""
     try:
         with rasterio.open(src_path) as src:
-            # Normalize CRS for comparison
+            # Normalize CRS for comparison (both should be EPSG:3857 for Colombia)
             src_crs = normalize_crs(src.crs)
             ref_crs = normalize_crs(ref_profile["crs"])
             
-            # Compare CRS using to_string() to avoid PROJ JSON comparison issues
-            crs_match = (
-                src_crs is not None and ref_crs is not None and
-                src_crs.to_string() == ref_crs.to_string()
-            )
+            # Safely compare CRS - both should be valid EPSG:3857
+            if src_crs is None or ref_crs is None:
+                return False
+            
+            # Compare using EPSG codes when possible
+            try:
+                crs_match = src_crs.to_epsg() == ref_crs.to_epsg()
+            except:
+                # Fallback to string comparison
+                try:
+                    crs_match = src_crs.to_string() == ref_crs.to_string()
+                except:
+                    crs_match = False
             
             return (
                 src.shape == (ref_profile["height"], ref_profile["width"]) and
@@ -354,7 +402,7 @@ def check_alignment(src_path: Path, ref_profile: dict) -> bool:
                 np.allclose(src.transform, ref_profile["transform"], atol=1e-6)
             )
     except Exception as e:
-        log_progress(f"  Warning: Alignment check failed: {e}")
+        log_progress(f"  Warning: Alignment check failed for {src_path.name}: {e}")
         return False
 
 
@@ -383,17 +431,14 @@ def read_reproject_to_ref(path: Path, ref_profile: dict) -> np.ndarray:
         dst_height = ref_profile["height"]
         dst_width = ref_profile["width"]
         dst_transform = ref_profile["transform"]
-        # Normalize CRS to handle PROJ JSON format
+        # Normalize CRS to handle PROJ JSON format and EngineeringCRS
         src_crs = normalize_crs(src.crs)
         dst_crs = normalize_crs(ref_profile["crs"])
         
-        # Safety check: if normalization failed, use EPSG:3857 as fallback
-        if src_crs is None:
-            log_progress(f"    Warning: Could not normalize source CRS for {path.name}, using EPSG:3857")
-            src_crs = CRS.from_string("EPSG:3857")
-        if dst_crs is None:
-            log_progress(f"    Warning: Could not normalize reference CRS, using EPSG:3857")
-            dst_crs = CRS.from_string("EPSG:3857")
+        # Both should be valid EPSG:3857 after normalization
+        if src_crs is None or dst_crs is None:
+            log_progress(f"    ERROR: CRS normalization failed for {path.name}")
+            raise ValueError(f"Could not normalize CRS for {path.name}")
         
         count = src.count
         
@@ -454,7 +499,7 @@ def iter_reference_windows(ref_profile: dict, tile_size: int = TILE_SIZE):
 
 
 def read_reproject_window(src_path: Path, ref_profile: dict, window: Window, 
-                          dataset: Optional[str] = None) -> np.ndarray:
+                          dataset: Optional[str] = None, _debug_state: dict = {}) -> np.ndarray:
     """
     Read a source raster and reproject only the given reference window to a float32 array (B, h, w).
     
@@ -478,22 +523,28 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
         )
         
         # Normalize CRS for comparison and reprojection
-        src_crs = normalize_crs(src.crs)
+        # Pass filename for debug logging on first file only
+        debug_filename = src_path.name if "first_file_logged" not in _debug_state else None
+        if debug_filename:
+            _debug_state["first_file_logged"] = True
+        
+        src_crs = normalize_crs(src.crs, debug_filename=debug_filename)
         dst_crs = normalize_crs(ref_profile["crs"])
         
-        # Safety check: if normalization failed, use EPSG:3857 as fallback
-        if src_crs is None:
-            log_progress(f"    Warning: Could not normalize source CRS for {src_path.name}, using EPSG:3857")
-            src_crs = CRS.from_string("EPSG:3857")
-        if dst_crs is None:
-            log_progress(f"    Warning: Could not normalize reference CRS, using EPSG:3857")
-            dst_crs = CRS.from_string("EPSG:3857")
+        # Both should be valid EPSG:3857 after normalization
+        if src_crs is None or dst_crs is None:
+            log_progress(f"    ERROR: CRS normalization failed for {src_path.name}")
+            raise ValueError(f"Could not normalize CRS for {src_path.name}")
         
         # Fast path: if already aligned, just read the window directly (MUCH faster)
-        crs_match = (
-            src_crs is not None and dst_crs is not None and
-            src_crs.to_string() == dst_crs.to_string()
-        )
+        try:
+            crs_match = src_crs.to_epsg() == dst_crs.to_epsg()
+        except:
+            # Fallback to string comparison
+            try:
+                crs_match = src_crs.to_string() == dst_crs.to_string()
+            except:
+                crs_match = False
         if (src.shape == (ref_profile["height"], ref_profile["width"]) and
             crs_match and
             np.allclose(src.transform, ref_profile["transform"], atol=1e-6)):
@@ -871,14 +922,22 @@ def main():
                     continue
             arrays = []
             for p in candidate_paths:
-                arr = read_reproject_window(p, ref_profile, probe_window, dataset=dataset)
-                arrays.append(arr)
+                try:
+                    arr = read_reproject_window(p, ref_profile, probe_window, dataset=dataset)
+                    arrays.append(arr)
+                except Exception as e:
+                    log_progress(f"    Warning: Failed to read {p.name}: {e}")
+                    continue
+            
+            if not arrays:
+                log_progress(f"    Warning: {dataset} - all files failed to read, skipping")
+                continue
             
             band_names = build_band_names(dataset, arrays)
             if band_names:
                 static_band_names.extend(band_names)
                 static_band_counts[dataset] = len(band_names)
-                log_progress(f"    {dataset}: {len(band_names)} bands (static)")
+                log_progress(f"    ✓ {dataset}: {len(band_names)} bands (static)")
         except Exception as e:
             log_progress(f"    Warning: Could not probe static dataset {dataset}: {e}")
             continue
@@ -904,14 +963,22 @@ def main():
             
             arrays = []
             for p in candidate_paths:
-                arr = read_reproject_window(p, ref_profile, probe_window, dataset=dataset)
-                arrays.append(arr)
+                try:
+                    arr = read_reproject_window(p, ref_profile, probe_window, dataset=dataset)
+                    arrays.append(arr)
+                except Exception as e:
+                    log_progress(f"    Warning: Failed to read {p.name}: {e}")
+                    continue
+            
+            if not arrays:
+                log_progress(f"    Warning: {dataset} - all files failed to read, skipping")
+                continue
             
             band_names = build_band_names(dataset, arrays)
             if band_names:
                 yearly_band_names.extend(band_names)
                 yearly_band_counts[dataset] = len(band_names)
-                log_progress(f"    {dataset}: {len(band_names)} bands (yearly)")
+                log_progress(f"    ✓ {dataset}: {len(band_names)} bands (yearly)")
         except Exception as e:
             log_progress(f"    Warning: Could not probe yearly dataset {dataset}: {e}")
             continue
@@ -921,7 +988,19 @@ def main():
     dataset_band_counts = {**static_band_counts, **yearly_band_counts}
     
     if not all_band_names:
-        print("ERROR: Failed to determine band structure.")
+        print("\n" + "="*80)
+        print("ERROR: Failed to determine band structure - no datasets could be read.")
+        print("="*80)
+        print("\nDebugging information:")
+        print(f"  Static datasets attempted: {static_datasets}")
+        print(f"  Yearly datasets attempted: {yearly_datasets}")
+        print(f"  Data root: {READY_ROOT}")
+        print("\nPossible causes:")
+        print("  1. CRS normalization issues with PROJJSON/EngineeringCRS")
+        print("  2. All raster files are corrupted or unreadable")
+        print("  3. Incompatible rasterio version")
+        print("\nPlease check the error messages above for specific file failures.")
+        print("="*80)
         sys.exit(1)
     
     log_progress(f"\nBand structure summary:")
