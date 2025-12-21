@@ -39,48 +39,117 @@ module load eth_proxy
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-master_thesis}"
 
 echo "Bootstrapping conda/micromamba..."
+echo "  HOME: $HOME"
+echo "  Searching for conda/micromamba installations..."
 
 # Try to bootstrap conda or micromamba from common installation locations
 # Priority: micromamba (faster), then miniconda3, then anaconda3
 CONDA_INITIALIZED=false
 
 # Method 1: Try micromamba (if installed)
-if [ -f "$HOME/.local/bin/micromamba" ] || [ -f "$HOME/micromamba/bin/micromamba" ]; then
-    MICROMAMBA_BIN="$HOME/.local/bin/micromamba"
-    [ ! -f "$MICROMAMBA_BIN" ] && MICROMAMBA_BIN="$HOME/micromamba/bin/micromamba"
-    
+MICROMAMBA_PATHS=(
+    "$HOME/.local/bin/micromamba"
+    "$HOME/micromamba/bin/micromamba"
+    "$HOME/.micromamba/bin/micromamba"
+)
+for MICROMAMBA_BIN in "${MICROMAMBA_PATHS[@]}"; do
     if [ -f "$MICROMAMBA_BIN" ]; then
-        echo "Found micromamba at: $MICROMAMBA_BIN"
+        echo "  Found micromamba at: $MICROMAMBA_BIN"
         eval "$($MICROMAMBA_BIN shell hook --shell bash)"
         CONDA_INITIALIZED=true
+        break
     fi
-fi
+done
 
 # Method 2: Try miniconda3 (most common user installation)
-if [ "$CONDA_INITIALIZED" = false ] && [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
-    echo "Found miniconda3, sourcing: $HOME/miniconda3/etc/profile.d/conda.sh"
-    source "$HOME/miniconda3/etc/profile.d/conda.sh"
-    CONDA_INITIALIZED=true
-fi
-
-# Method 3: Try anaconda3
-if [ "$CONDA_INITIALIZED" = false ] && [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
-    echo "Found anaconda3, sourcing: $HOME/anaconda3/etc/profile.d/conda.sh"
-    source "$HOME/anaconda3/etc/profile.d/conda.sh"
-    CONDA_INITIALIZED=true
-fi
-
-# Method 4: Try other common locations
 if [ "$CONDA_INITIALIZED" = false ]; then
-    for conda_root in "$HOME/.conda" "/opt/conda" "/usr/local/miniconda3" "/usr/local/anaconda3"; do
+    MINICONDA_PATHS=(
+        "$HOME/miniconda3"
+        "$HOME/miniconda"
+        "$HOME/.miniconda3"
+    )
+    for conda_root in "${MINICONDA_PATHS[@]}"; do
         conda_init="$conda_root/etc/profile.d/conda.sh"
         if [ -f "$conda_init" ]; then
-            echo "Found conda at: $conda_init"
+            echo "  Found miniconda3 at: $conda_init"
             source "$conda_init"
             CONDA_INITIALIZED=true
             break
         fi
     done
+fi
+
+# Method 3: Try anaconda3
+if [ "$CONDA_INITIALIZED" = false ]; then
+    ANACONDA_PATHS=(
+        "$HOME/anaconda3"
+        "$HOME/anaconda"
+        "$HOME/.anaconda3"
+    )
+    for conda_root in "${ANACONDA_PATHS[@]}"; do
+        conda_init="$conda_root/etc/profile.d/conda.sh"
+        if [ -f "$conda_init" ]; then
+            echo "  Found anaconda3 at: $conda_init"
+            source "$conda_init"
+            CONDA_INITIALIZED=true
+            break
+        fi
+    done
+fi
+
+# Method 4: Try other common locations
+if [ "$CONDA_INITIALIZED" = false ]; then
+    OTHER_PATHS=(
+        "$HOME/.conda"
+        "/opt/conda"
+        "/usr/local/miniconda3"
+        "/usr/local/anaconda3"
+        "/opt/miniconda3"
+        "/opt/anaconda3"
+    )
+    for conda_root in "${OTHER_PATHS[@]}"; do
+        conda_init="$conda_root/etc/profile.d/conda.sh"
+        if [ -f "$conda_init" ]; then
+            echo "  Found conda at: $conda_init"
+            source "$conda_init"
+            CONDA_INITIALIZED=true
+            break
+        fi
+    done
+fi
+
+# Method 5: Try to find conda via find command (slower, but comprehensive)
+if [ "$CONDA_INITIALIZED" = false ]; then
+    echo "  Searching for conda.sh in $HOME (this may take a moment)..."
+    FOUND_CONDA=$(find "$HOME" -maxdepth 4 -name "conda.sh" -path "*/etc/profile.d/conda.sh" 2>/dev/null | head -1)
+    if [ -n "$FOUND_CONDA" ] && [ -f "$FOUND_CONDA" ]; then
+        echo "  Found conda at: $FOUND_CONDA"
+        source "$FOUND_CONDA"
+        CONDA_INITIALIZED=true
+    fi
+fi
+
+# Method 6: Check if conda is available as a module (after module purge, try loading)
+if [ "$CONDA_INITIALIZED" = false ]; then
+    echo "  Checking for conda/anaconda modules..."
+    if module avail conda 2>&1 | grep -q conda; then
+        echo "  Found conda module, loading..."
+        module load conda 2>/dev/null && {
+            if [ -f "$CONDA_PREFIX/etc/profile.d/conda.sh" ]; then
+                source "$CONDA_PREFIX/etc/profile.d/conda.sh"
+                CONDA_INITIALIZED=true
+            fi
+        } || true
+    fi
+    if [ "$CONDA_INITIALIZED" = false ] && module avail anaconda3 2>&1 | grep -q anaconda3; then
+        echo "  Found anaconda3 module, loading..."
+        module load anaconda3 2>/dev/null && {
+            if [ -f "$CONDA_PREFIX/etc/profile.d/conda.sh" ]; then
+                source "$CONDA_PREFIX/etc/profile.d/conda.sh"
+                CONDA_INITIALIZED=true
+            fi
+        } || true
+    fi
 fi
 
 # Verify conda/micromamba is available
@@ -98,18 +167,34 @@ if [ "$CONDA_INITIALIZED" = true ]; then
 else
     echo "ERROR: Could not bootstrap conda or micromamba."
     echo ""
-    echo "Expected locations:"
-    echo "  - $HOME/miniconda3/etc/profile.d/conda.sh"
-    echo "  - $HOME/anaconda3/etc/profile.d/conda.sh"
-    echo "  - $HOME/.local/bin/micromamba (with shell hook)"
+    echo "Diagnostic information:"
+    echo "  HOME: $HOME"
+    echo "  PATH: $PATH"
     echo ""
-    echo "To install miniconda:"
+    echo "Checking what exists in $HOME:"
+    echo "  miniconda3: $([ -d "$HOME/miniconda3" ] && echo "EXISTS" || echo "not found")"
+    echo "  anaconda3: $([ -d "$HOME/anaconda3" ] && echo "EXISTS" || echo "not found")"
+    echo "  .local/bin: $([ -d "$HOME/.local/bin" ] && echo "EXISTS" || echo "not found")"
+    echo "  micromamba: $([ -f "$HOME/.local/bin/micromamba" ] && echo "EXISTS" || echo "not found")"
+    echo ""
+    echo "Checking for any conda-related directories:"
+    ls -d "$HOME"/miniconda* "$HOME"/anaconda* "$HOME"/.conda* "$HOME"/micromamba* 2>/dev/null | head -5 || echo "  None found"
+    echo ""
+    echo "To install miniconda (recommended):"
+    echo "  cd ~"
     echo "  wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
     echo "  bash Miniconda3-latest-Linux-x86_64.sh -b -p $HOME/miniconda3"
+    echo "  source $HOME/miniconda3/etc/profile.d/conda.sh"
+    echo "  conda create -n master_thesis -c conda-forge python=3.11 rasterio gdal proj"
     echo ""
-    echo "To install micromamba:"
+    echo "To install micromamba (alternative, faster):"
+    echo "  mkdir -p $HOME/.local/bin"
+    echo "  cd /tmp"
     echo "  curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xvj bin/micromamba"
     echo "  mv bin/micromamba $HOME/.local/bin/"
+    echo "  chmod +x $HOME/.local/bin/micromamba"
+    echo "  eval \"\$($HOME/.local/bin/micromamba shell hook --shell bash)\""
+    echo "  micromamba create -n master_thesis -c conda-forge python=3.11 rasterio gdal proj"
     echo ""
     exit 1
 fi
