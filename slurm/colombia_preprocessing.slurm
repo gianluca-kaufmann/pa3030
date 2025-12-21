@@ -18,6 +18,7 @@ mkdir -p "$SCRATCH/outputs/Tables"
 
 #------------------------------------------------------------------------------
 # Load modules (minimal set, no GIS modules)
+# Note: module purge may remove conda from PATH, so we bootstrap conda AFTER
 #------------------------------------------------------------------------------
 module purge
 # Explicitly unload any GIS/GDAL/PROJ modules that might be loaded
@@ -32,99 +33,106 @@ module load cuda/12.4.1
 module load eth_proxy
 
 #------------------------------------------------------------------------------
-# Activate conda environment with conda-forge rasterio/gdal/proj
+# Bootstrap conda/micromamba (AFTER module purge to ensure it's available)
 #------------------------------------------------------------------------------
 # Set conda environment name (adjust if different)
 CONDA_ENV_NAME="${CONDA_ENV_NAME:-master_thesis}"
 
-# Initialize conda (if not already initialized)
-if [ -z "$CONDA_DEFAULT_ENV" ]; then
-    # Method 1: Check if conda is already in PATH
-    if command -v conda >/dev/null 2>&1; then
-        echo "Found conda in PATH, initializing..."
-        # Try to initialize using conda's own method
-        eval "$(conda shell.bash hook 2>/dev/null)" || {
-            echo "Warning: conda shell hook failed, trying alternative methods..."
-        }
-    fi
+echo "Bootstrapping conda/micromamba..."
+
+# Try to bootstrap conda or micromamba from common installation locations
+# Priority: micromamba (faster), then miniconda3, then anaconda3
+CONDA_INITIALIZED=false
+
+# Method 1: Try micromamba (if installed)
+if [ -f "$HOME/.local/bin/micromamba" ] || [ -f "$HOME/micromamba/bin/micromamba" ]; then
+    MICROMAMBA_BIN="$HOME/.local/bin/micromamba"
+    [ ! -f "$MICROMAMBA_BIN" ] && MICROMAMBA_BIN="$HOME/micromamba/bin/micromamba"
     
-    # Method 2: Try loading conda as a module (common on HPC systems)
-    if [ -z "$CONDA_DEFAULT_ENV" ] && ! command -v conda >/dev/null 2>&1; then
-        echo "Trying to load conda module..."
-        module load conda 2>/dev/null || module load anaconda3 2>/dev/null || true
-        if command -v conda >/dev/null 2>&1; then
-            eval "$(conda shell.bash hook 2>/dev/null)" || true
-        fi
-    fi
-    
-    # Method 3: Try common conda initialization paths
-    if [ -z "$CONDA_DEFAULT_ENV" ]; then
-        CONDA_INIT_PATHS=(
-            "$HOME/miniconda3/etc/profile.d/conda.sh"
-            "$HOME/anaconda3/etc/profile.d/conda.sh"
-            "$HOME/.conda/etc/profile.d/conda.sh"
-            "/opt/conda/etc/profile.d/conda.sh"
-            "/usr/local/miniconda3/etc/profile.d/conda.sh"
-            "/usr/local/anaconda3/etc/profile.d/conda.sh"
-        )
-        
-        for conda_init in "${CONDA_INIT_PATHS[@]}"; do
-            if [ -f "$conda_init" ]; then
-                echo "Found conda at: $conda_init"
-                source "$conda_init"
-                break
-            fi
-        done
-    fi
-    
-    # Method 4: Try to find conda via which/whereis and derive init script
-    if [ -z "$CONDA_DEFAULT_ENV" ]; then
-        CONDA_BIN=$(which conda 2>/dev/null || command -v conda 2>/dev/null)
-        if [ -n "$CONDA_BIN" ]; then
-            # Derive conda root from binary path
-            CONDA_ROOT=$(dirname "$(dirname "$CONDA_BIN")")
-            CONDA_INIT="$CONDA_ROOT/etc/profile.d/conda.sh"
-            if [ -f "$CONDA_INIT" ]; then
-                echo "Found conda via PATH, initializing from: $CONDA_INIT"
-                source "$CONDA_INIT"
-            fi
-        fi
-    fi
-    
-    # Final check
-    if [ -z "$CONDA_DEFAULT_ENV" ] && ! command -v conda >/dev/null 2>&1; then
-        echo "ERROR: Could not find or initialize conda."
-        echo ""
-        echo "Diagnostic information:"
-        echo "  PATH: $PATH"
-        echo "  HOME: $HOME"
-        echo "  Checking for conda in common locations..."
-        ls -d "$HOME"/miniconda* "$HOME"/anaconda* "$HOME"/.conda 2>/dev/null | head -5 || echo "  No conda directories found in HOME"
-        echo ""
-        echo "Troubleshooting steps:"
-        echo "1. Check if conda is installed: which conda || find $HOME -name conda 2>/dev/null | head -3"
-        echo "2. Try loading conda module: module avail 2>&1 | grep -i conda"
-        echo "3. If conda is installed elsewhere, find it and source the init script:"
-        echo "   source <conda_root>/etc/profile.d/conda.sh"
-        echo "4. Install miniconda if needed:"
-        echo "   wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
-        echo "   bash Miniconda3-latest-Linux-x86_64.sh -b -p $HOME/miniconda3"
-        echo "   source $HOME/miniconda3/etc/profile.d/conda.sh"
-        echo "5. Create conda environment with:"
-        echo "   conda create -n master_thesis -c conda-forge python=3.11 rasterio gdal proj"
-        echo ""
-        exit 1
+    if [ -f "$MICROMAMBA_BIN" ]; then
+        echo "Found micromamba at: $MICROMAMBA_BIN"
+        eval "$($MICROMAMBA_BIN shell hook --shell bash)"
+        CONDA_INITIALIZED=true
     fi
 fi
 
-# Activate conda environment
-echo "Activating conda environment: $CONDA_ENV_NAME"
-conda activate "$CONDA_ENV_NAME" || {
-    echo "ERROR: Failed to activate conda environment: $CONDA_ENV_NAME"
-    echo "Available environments:"
-    conda env list
+# Method 2: Try miniconda3 (most common user installation)
+if [ "$CONDA_INITIALIZED" = false ] && [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+    echo "Found miniconda3, sourcing: $HOME/miniconda3/etc/profile.d/conda.sh"
+    source "$HOME/miniconda3/etc/profile.d/conda.sh"
+    CONDA_INITIALIZED=true
+fi
+
+# Method 3: Try anaconda3
+if [ "$CONDA_INITIALIZED" = false ] && [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+    echo "Found anaconda3, sourcing: $HOME/anaconda3/etc/profile.d/conda.sh"
+    source "$HOME/anaconda3/etc/profile.d/conda.sh"
+    CONDA_INITIALIZED=true
+fi
+
+# Method 4: Try other common locations
+if [ "$CONDA_INITIALIZED" = false ]; then
+    for conda_root in "$HOME/.conda" "/opt/conda" "/usr/local/miniconda3" "/usr/local/anaconda3"; do
+        conda_init="$conda_root/etc/profile.d/conda.sh"
+        if [ -f "$conda_init" ]; then
+            echo "Found conda at: $conda_init"
+            source "$conda_init"
+            CONDA_INITIALIZED=true
+            break
+        fi
+    done
+fi
+
+# Verify conda/micromamba is available
+USE_MICROMAMBA=false
+if [ "$CONDA_INITIALIZED" = true ]; then
+    # Check if we're using micromamba (micromamba shell hook may provide 'conda' alias)
+    if command -v micromamba >/dev/null 2>&1 && ! command -v conda >/dev/null 2>&1; then
+        USE_MICROMAMBA=true
+        echo "Using micromamba for environment management"
+    elif command -v conda >/dev/null 2>&1; then
+        echo "Using conda for environment management"
+    else
+        echo "WARNING: Conda/micromamba initialized but commands not found in PATH"
+    fi
+else
+    echo "ERROR: Could not bootstrap conda or micromamba."
+    echo ""
+    echo "Expected locations:"
+    echo "  - $HOME/miniconda3/etc/profile.d/conda.sh"
+    echo "  - $HOME/anaconda3/etc/profile.d/conda.sh"
+    echo "  - $HOME/.local/bin/micromamba (with shell hook)"
+    echo ""
+    echo "To install miniconda:"
+    echo "  wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"
+    echo "  bash Miniconda3-latest-Linux-x86_64.sh -b -p $HOME/miniconda3"
+    echo ""
+    echo "To install micromamba:"
+    echo "  curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xvj bin/micromamba"
+    echo "  mv bin/micromamba $HOME/.local/bin/"
+    echo ""
     exit 1
-}
+fi
+
+echo "✓ Conda/micromamba initialized successfully"
+
+# Activate conda environment (works for both conda and micromamba)
+echo "Activating conda environment: $CONDA_ENV_NAME"
+if [ "$USE_MICROMAMBA" = true ]; then
+    micromamba activate "$CONDA_ENV_NAME" || {
+        echo "ERROR: Failed to activate micromamba environment: $CONDA_ENV_NAME"
+        echo "Available environments:"
+        micromamba env list
+        exit 1
+    }
+else
+    conda activate "$CONDA_ENV_NAME" || {
+        echo "ERROR: Failed to activate conda environment: $CONDA_ENV_NAME"
+        echo "Available environments:"
+        conda env list
+        exit 1
+    }
+fi
 
 # Set PROJ_LIB and GDAL_DATA to conda environment paths
 # This ensures we use conda-forge PROJ/GDAL, not system modules
