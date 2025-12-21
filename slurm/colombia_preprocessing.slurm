@@ -4,7 +4,7 @@
 #SBATCH --time=15:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem-per-cpu=16G
+#SBATCH --mem-per-cpu=12G
 #SBATCH --output=/cluster/scratch/%u/logs/colombia_crs_%j.out
 #SBATCH --error=/cluster/scratch/%u/logs/colombia_crs_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
@@ -15,6 +15,9 @@ mkdir -p "$SCRATCH/data"
 mkdir -p "$SCRATCH/data/ml"
 mkdir -p "$SCRATCH/outputs"
 mkdir -p "$SCRATCH/outputs/Tables"
+
+# Debug: Print actual job allocation (Partition/ReqMem)
+scontrol show job "$SLURM_JOB_ID" | grep -E "Partition=|ReqMem="
 
 #------------------------------------------------------------------------------
 # Load modules (minimal set, no GIS modules)
