@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+"""
+Embeddings and WDPA Preprocessing
+==================================
+
+Objective:
+    Reproject and resample yearly embeddings and WDPA rasters to align with
+    the backbone reference grid. Ensures all datasets share the same CRS,
+    transform, and dimensions for downstream ML processing.
+
+Inputs:
+    - Reference: `data/ready/backbone/backbone.tif` (defines target grid)
+    - Embeddings: `data/ready/embeddings/SatelliteEmbeddings_SA_1km_<year>_merged.tif` (2018-2024)
+    - WDPA: `data/ready/WDPA/WDPA_SA_1km_<year>.tif` (2018-2024)
+
+Outputs:
+    - Aligned embeddings: `data/ml/embeddings_aligned/<year>.tif` (float32, bilinear resampling)
+    - Aligned WDPA: `data/ml/wdpa_aligned/<year>.tif` (uint8, nearest resampling, nodata=0)
+
+Processing:
+    - Embeddings: bilinear resampling, float32 dtype
+    - WDPA: nearest resampling, uint8 dtype, nodata=0
+    - Strict alignment checks verify CRS, transform, and dimensions match
+"""
+
+import sys
+import logging
+from pathlib import Path
+from typing import Tuple, Dict
+import time
+
+import numpy as np
+import rasterio
+from rasterio.enums import Resampling
+from rasterio.vrt import WarpedVRT
+from rasterio import windows
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+
+# Paths
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+BACKBONE_PATH = PROJECT_ROOT / "data" / "ready" / "backbone" / "backbone.tif"
+EMBEDDINGS_INPUT_DIR = PROJECT_ROOT / "data" / "ready" / "embeddings"
+WDPA_INPUT_DIR = PROJECT_ROOT / "data" / "ready" / "WDPA"
+EMBEDDINGS_OUTPUT_DIR = PROJECT_ROOT / "data" / "ml" / "embeddings_aligned"
+WDPA_OUTPUT_DIR = PROJECT_ROOT / "data" / "ml" / "wdpa_aligned"
+
+YEARS = list(range(2018, 2025))  # 2018-2024
+
+
+def load_reference_profile() -> Dict:
+    """Load the backbone raster profile as the reference grid."""
+    if not BACKBONE_PATH.exists():
+        raise FileNotFoundError(
+            f"Reference backbone raster not found at {BACKBONE_PATH}. "
+            "Run backbone preprocessing first."
+        )
+    
+    with rasterio.open(BACKBONE_PATH) as src:
+        profile = src.profile.copy()
+    
+    logger.info(f"Loaded reference profile from {BACKBONE_PATH.name}")
+    logger.info(f"  CRS: {profile['crs']}")
+    logger.info(f"  Dimensions: {profile['width']} x {profile['height']}")
+    logger.info(f"  Transform: {profile['transform']}")
+    
+    return profile
+
+
+def check_alignment(src_path: Path, ref_profile: Dict) -> Tuple[bool, str]:
+    """
+    Check if a raster is already aligned with the reference grid.
+    Returns (is_aligned, reason).
+    """
+    try:
+        with rasterio.open(src_path) as src:
+            if src.shape != (ref_profile["height"], ref_profile["width"]):
+                return False, f"shape mismatch: {src.shape} vs ({ref_profile['height']}, {ref_profile['width']})"
+            
+            if src.crs != ref_profile["crs"]:
+                return False, f"CRS mismatch: {src.crs} vs {ref_profile['crs']}"
+            
+            if not np.allclose(src.transform, ref_profile["transform"], atol=1e-6):
+                return False, f"transform mismatch: {src.transform} vs {ref_profile['transform']}"
+            
+            return True, "fully aligned"
+    except Exception as e:
+        return False, f"error checking alignment: {e}"
+
+
+def create_output_profile(
+    ref_profile: Dict,
+    dtype: str,
+    count: int,
+    nodata,
+    block_size: int = 512
+) -> Dict:
+    """
+    Create output profile with explicit GTiff settings including block sizes.
+    """
+    profile = ref_profile.copy()
+    profile.update(
+        driver="GTiff",
+        dtype=dtype,
+        count=count,
+        nodata=nodata,
+        compress="lzw",
+        tiled=True,
+        blockxsize=block_size,
+        blockysize=block_size,
+        BIGTIFF="YES"
+    )
+    return profile
+
+
+def reproject_embeddings(
+    src_path: Path,
+    ref_profile: Dict,
+    output_path: Path
+) -> None:
+    """
+    Reproject/resample embeddings raster to reference grid using windowed processing.
+    Uses WarpedVRT for reprojection and bilinear resampling with float32 dtype.
+    Processes data window-by-window to avoid loading full arrays into memory.
+    """
+    logger.info(f"Processing embeddings: {src_path.name}")
+    start_time = time.time()
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    block_size = 512  # Standard block size for windowed processing
+    
+    # Check alignment
+    is_aligned, reason = check_alignment(src_path, ref_profile)
+    
+    with rasterio.open(src_path) as src:
+        count = src.count
+        dst_height = ref_profile["height"]
+        dst_width = ref_profile["width"]
+        
+        # Create output profile
+        output_profile = create_output_profile(
+            ref_profile, "float32", count, np.nan, block_size
+        )
+        
+        # Handle source nodata conversion
+        src_nodata = src.nodata if src.nodata is not None else None
+        
+        if is_aligned:
+            logger.info(f"  Already aligned ({reason}), copying with dtype conversion (windowed)...")
+            # Windowed copy with dtype conversion
+            with rasterio.open(output_path, "w", **output_profile) as dst:
+                # Process in blocks
+                for _, window in dst.block_windows(1):
+                    # Read window from source
+                    src_window_data = src.read(window=window, masked=False).astype(np.float32)
+                    
+                    # Handle nodata conversion
+                    if src_nodata is not None:
+                        src_window_data[src_window_data == src_nodata] = np.nan
+                    
+                    # Write all bands at once
+                    dst.write(src_window_data, window=window)
+        else:
+            logger.info(f"  Not aligned ({reason}), reprojecting with bilinear resampling (windowed)...")
+            
+            # Use WarpedVRT for virtual reprojection
+            with WarpedVRT(
+                src,
+                src_crs=src.crs,
+                src_transform=src.transform,
+                src_nodata=src_nodata,
+                dst_crs=ref_profile["crs"],
+                dst_transform=ref_profile["transform"],
+                dst_width=dst_width,
+                dst_height=dst_height,
+                resampling=Resampling.bilinear,
+                dtype=np.float32,
+                nodata=np.nan,
+            ) as vrt:
+                # Write output window-by-window
+                with rasterio.open(output_path, "w", **output_profile) as dst:
+                    # Process window-by-window (all bands at once)
+                    for _, window in dst.block_windows(1):
+                        # Read all bands from VRT (already reprojected)
+                        window_data = vrt.read(window=window, masked=False).astype(np.float32)
+                        # Write all bands at once
+                        dst.write(window_data, window=window)
+    
+    # Verify alignment
+    is_aligned_after, reason_after = check_alignment(output_path, ref_profile)
+    if not is_aligned_after:
+        raise RuntimeError(f"Alignment check failed after reprojection: {reason_after}")
+    
+    logger.info(f"  Completed in {time.time() - start_time:.1f}s")
+
+
+def reproject_wdpa(
+    src_path: Path,
+    ref_profile: Dict,
+    output_path: Path
+) -> None:
+    """
+    Reproject/resample WDPA raster to reference grid using windowed processing.
+    Uses nearest resampling, uint8 dtype, nodata=0.
+    Processes data window-by-window to avoid loading full arrays into memory.
+    """
+    logger.info(f"Processing WDPA: {src_path.name}")
+    start_time = time.time()
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    block_size = 512  # Standard block size for windowed processing
+    
+    # Check alignment
+    is_aligned, reason = check_alignment(src_path, ref_profile)
+    
+    with rasterio.open(src_path) as src:
+        dst_height = ref_profile["height"]
+        dst_width = ref_profile["width"]
+        src_nodata = src.nodata if src.nodata is not None else 0
+        
+        # Create output profile
+        output_profile = create_output_profile(
+            ref_profile, "uint8", 1, 0, block_size
+        )
+        
+        if is_aligned:
+            logger.info(f"  Already aligned ({reason}), copying with dtype conversion (windowed)...")
+            # Windowed copy with dtype conversion
+            with rasterio.open(output_path, "w", **output_profile) as dst:
+                for _, window in dst.block_windows(1):
+                    # Read window from source
+                    window_data = src.read(1, window=window, masked=False)
+                    
+                    # Convert nodata to 0
+                    if src_nodata is not None and src_nodata != 0:
+                        window_data = np.where(window_data == src_nodata, 0, window_data)
+                    
+                    # Clip to valid uint8 range and convert
+                    window_data = np.clip(window_data, 0, 255).astype(np.uint8)
+                    
+                    # Write to output
+                    dst.write(window_data, 1, window=window)
+        else:
+            logger.info(f"  Not aligned ({reason}), reprojecting with nearest resampling (windowed)...")
+            
+            # Use WarpedVRT for virtual reprojection
+            with WarpedVRT(
+                src,
+                src_crs=src.crs,
+                src_transform=src.transform,
+                src_nodata=src_nodata,
+                dst_crs=ref_profile["crs"],
+                dst_transform=ref_profile["transform"],
+                dst_width=dst_width,
+                dst_height=dst_height,
+                resampling=Resampling.nearest,
+                dtype=np.uint8,
+                nodata=0,
+            ) as vrt:
+                # Write output window-by-window
+                with rasterio.open(output_path, "w", **output_profile) as dst:
+                    for _, window in dst.block_windows(1):
+                        # Read from VRT (already reprojected, nodata=0 handled by VRT)
+                        window_data = vrt.read(1, window=window, masked=False).astype(np.uint8)
+                        
+                        # Ensure values are in valid range
+                        window_data = np.clip(window_data, 0, 255)
+                        
+                        # Write to output
+                        dst.write(window_data, 1, window=window)
+    
+    # Verify alignment
+    is_aligned_after, reason_after = check_alignment(output_path, ref_profile)
+    if not is_aligned_after:
+        raise RuntimeError(f"Alignment check failed after reprojection: {reason_after}")
+    
+    # Verify nodata
+    with rasterio.open(output_path) as dst_check:
+        if dst_check.nodata != 0:
+            raise RuntimeError(f"WDPA output nodata is {dst_check.nodata}, expected 0")
+    
+    logger.info(f"  Completed in {time.time() - start_time:.1f}s")
+
+
+def verify_output(output_path: Path, ref_profile: Dict, expected_dtype: str) -> None:
+    """Verify output raster matches reference profile and expected dtype."""
+    if not output_path.exists():
+        raise FileNotFoundError(f"Output file not created: {output_path}")
+    
+    with rasterio.open(output_path) as dst:
+        if dst.dtype != expected_dtype:
+            raise ValueError(
+                f"Output dtype mismatch: {dst.dtype} != {expected_dtype} "
+                f"for {output_path.name}"
+            )
+        
+        is_aligned, reason = check_alignment(output_path, ref_profile)
+        if not is_aligned:
+            raise RuntimeError(
+                f"Output alignment verification failed: {reason} "
+                f"for {output_path.name}"
+            )
+    
+    logger.info(f"  ✓ Verified: {output_path.name}")
+
+
+def main() -> int:
+    """Main processing function."""
+    logger.info("=" * 70)
+    logger.info("Embeddings and WDPA Preprocessing")
+    logger.info("=" * 70)
+    
+    # Load reference profile
+    try:
+        ref_profile = load_reference_profile()
+    except FileNotFoundError as e:
+        logger.error(str(e))
+        return 1
+    
+    # Process each year
+    processed_embeddings = []
+    processed_wdpa = []
+    failed = []
+    
+    for year in YEARS:
+        logger.info("")
+        logger.info(f"Processing year {year}...")
+        logger.info("-" * 70)
+        
+        # Embeddings
+        embeddings_input = (
+            EMBEDDINGS_INPUT_DIR / f"SatelliteEmbeddings_SA_1km_{year}_merged.tif"
+        )
+        embeddings_output = EMBEDDINGS_OUTPUT_DIR / f"{year}.tif"
+        
+        if not embeddings_input.exists():
+            logger.warning(f"  Embeddings input not found: {embeddings_input.name}")
+            failed.append(f"embeddings_{year}")
+        else:
+            try:
+                reproject_embeddings(embeddings_input, ref_profile, embeddings_output)
+                verify_output(embeddings_output, ref_profile, "float32")
+                processed_embeddings.append(year)
+            except Exception as e:
+                logger.error(f"  Failed to process embeddings for {year}: {e}")
+                failed.append(f"embeddings_{year}")
+        
+        # WDPA
+        wdpa_input = WDPA_INPUT_DIR / f"WDPA_SA_1km_{year}.tif"
+        wdpa_output = WDPA_OUTPUT_DIR / f"{year}.tif"
+        
+        if not wdpa_input.exists():
+            logger.warning(f"  WDPA input not found: {wdpa_input.name}")
+            failed.append(f"wdpa_{year}")
+        else:
+            try:
+                reproject_wdpa(wdpa_input, ref_profile, wdpa_output)
+                verify_output(wdpa_output, ref_profile, "uint8")
+                processed_wdpa.append(year)
+            except Exception as e:
+                logger.error(f"  Failed to process WDPA for {year}: {e}")
+                failed.append(f"wdpa_{year}")
+    
+    # Summary
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("Processing Summary")
+    logger.info("=" * 70)
+    logger.info(f"Successfully processed embeddings: {len(processed_embeddings)} years")
+    logger.info(f"  Years: {processed_embeddings}")
+    logger.info(f"Successfully processed WDPA: {len(processed_wdpa)} years")
+    logger.info(f"  Years: {processed_wdpa}")
+    
+    if failed:
+        logger.warning(f"Failed or missing: {len(failed)} files")
+        logger.warning(f"  Files: {failed}")
+        return 1
+    
+    logger.info("All files processed successfully!")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        logger.exception(f"Unexpected error: {e}")
+        sys.exit(1)
+

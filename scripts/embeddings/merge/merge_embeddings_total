@@ -1,0 +1,863 @@
+#!/usr/bin/env python3
+"""
+Extract satellite embeddings for backbone==1 pixels and write to Parquet format.
+
+Data sources:
+- Consumes yearly merged GeoTIFF mosaics produced by the per-year embedding pipeline. The files are
+  expected under:
+  - ``data/ml/embeddings/SatelliteEmbeddings_SA_1km_<year>_merged.tif`` (storage-optimized, preferred)
+  - ``data/ready/embeddings/SatelliteEmbeddings_SA_1km_<year>_merged.tif`` (from merge_embeddings_tiles)
+  - ``data/embeddings/SatelliteEmbeddings_SA_1km_<year>_merged.tif`` (original fallback)
+- Uses ``data/ready/backbone/backbone.tif`` as the mask (extracts only pixels where backbone==1)
+- Loads aligned WDPA yearly rasters from ``data/ml/wdpa_aligned/WDPA_SA_1km_<year>.tif``
+- For 2017: Aligns ``data/ready/WDPA/WDPA_SA_1km_2017.tif`` to backbone grid if not already aligned
+
+Data location strategy:
+- Resolves the repository root from the script's location so paths remain portable. When the
+  ``SCRATCH`` environment variable is available (e.g., on the Euler cluster) the script transparently
+  switches to ``$SCRATCH/data`` for inputs.
+- Checks locations in priority order: storage-optimized (ml/embeddings), ready (ready/embeddings),
+  original (embeddings).
+
+Temporal scope:
+- Processes embeddings for 2018–2024 (7 years).
+- Processes WDPA for 2017–2024 (8 years, includes 2017 for WDPA_prev computation).
+
+Processing mechanism:
+- Validates that all yearly mosaics and WDPA rasters share the same grid definition as backbone.tif
+- Processes in block windows to minimize memory usage
+- Extracts only pixels where backbone==1
+- For 2017: WDPA only, embeddings set to NULL (for WDPA_prev computation in downstream processing)
+- For 2018-2024: Full data (WDPA + embeddings)
+- Streams data to per-year Parquet shards with columns: row, col, x, y, year, WDPA_b1, emb_01..emb_64
+
+Output artefact:
+- Writes per-year Parquet shards: ``SatelliteEmbeddings_SA_1km_<year>.parquet`` to ``data/ml``
+- Uses DuckDB to merge all per-year shards into a single final Parquet file:
+  ``SatelliteEmbeddings_SA_1km_2018-2024.parquet`` in ``data/ml``
+- Note: 2017 is included in the merged file with NULL embeddings (for WDPA_prev computation)
+"""
+
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+import numpy as np
+import rasterio
+from rasterio.windows import Window
+from rasterio.transform import Affine
+from rasterio.enums import Resampling
+from rasterio.vrt import WarpedVRT
+import pyarrow as pa
+import pyarrow.parquet as pq
+import duckdb
+
+# Paths
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
+
+if "SCRATCH" in os.environ:
+    DATA_ROOT = Path(os.environ["SCRATCH"]) / "data"
+else:
+    DATA_ROOT = PROJECT_ROOT / "data"
+
+# Check multiple possible locations for merged embedding files
+# Priority: 1) ml/embeddings (storage-optimized), 2) ready/embeddings (from merge_embeddings_tiles), 3) embeddings (original)
+ML_EMBEDDINGS_DIR = DATA_ROOT / "ml" / "embeddings"
+READY_EMBEDDINGS_DIR = DATA_ROOT / "ready" / "embeddings"
+ORIG_EMBEDDINGS_DIR = DATA_ROOT / "embeddings"
+
+# Select the best available source
+if ML_EMBEDDINGS_DIR.exists() and any(ML_EMBEDDINGS_DIR.iterdir()):
+    EMBEDDINGS_DIR = ML_EMBEDDINGS_DIR
+    USING_OPTIMIZED = True
+elif READY_EMBEDDINGS_DIR.exists() and any(READY_EMBEDDINGS_DIR.iterdir()):
+    EMBEDDINGS_DIR = READY_EMBEDDINGS_DIR
+    USING_OPTIMIZED = False
+else:
+    EMBEDDINGS_DIR = ORIG_EMBEDDINGS_DIR
+    USING_OPTIMIZED = False
+
+# Backbone path
+BACKBONE_PATH = DATA_ROOT / "ready" / "backbone" / "backbone.tif"
+
+# WDPA aligned directory
+WDPA_ALIGNED_DIR = DATA_ROOT / "ml" / "wdpa_aligned"
+
+# WDPA input directory (for 2017 alignment)
+WDPA_INPUT_DIR = DATA_ROOT / "ready" / "WDPA"
+
+ML_OUTPUT_DIR = PROJECT_ROOT / "data" / "ml"
+
+# Years to merge (embeddings: 2018-2024, WDPA: 2017-2024)
+EMBEDDING_YEARS = [2018, 2019, 2020, 2021, 2022, 2023, 2024]
+WDPA_YEARS = [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024]
+YEARS = EMBEDDING_YEARS  # For backward compatibility in some places
+
+# Block size for windowed processing
+BLOCK_SIZE = 512
+
+# Final output file
+FINAL_OUTPUT_FILE = ML_OUTPUT_DIR / "SatelliteEmbeddings_SA_1km_2018-2024.parquet"
+
+
+def log_progress(message: str, start_time: float = None):
+    """Log progress with optional timing."""
+    if start_time:
+        elapsed = time.time() - start_time
+        print(f"[time] {message} ({elapsed:.1f}s)")
+    else:
+        print(f"[info] {message}")
+
+
+def load_backbone() -> Tuple[rasterio.DatasetReader, np.ndarray, dict]:
+    """Load backbone.tif and return dataset, mask array, and profile."""
+    log_progress("Loading backbone mask...")
+    
+    if not BACKBONE_PATH.exists():
+        print(f"ERROR: Backbone file not found: {BACKBONE_PATH}")
+        print("Please ensure backbone.tif exists in data/ready/backbone/")
+        sys.exit(1)
+    
+    backbone_src = rasterio.open(BACKBONE_PATH)
+    backbone_mask = backbone_src.read(1)
+    backbone_profile = backbone_src.profile.copy()
+    
+    # Verify it's a binary mask
+    unique_values = np.unique(backbone_mask)
+    if not np.all(np.isin(unique_values, [0, 1])):
+        print(f"WARNING: Backbone mask contains unexpected values: {unique_values}")
+    
+    land_pixels = int((backbone_mask == 1).sum())
+    total_pixels = backbone_mask.size
+    log_progress(f"  Backbone dimensions: {backbone_mask.shape[0]} × {backbone_mask.shape[1]}")
+    log_progress(f"  Land pixels (backbone==1): {land_pixels:,} ({100*land_pixels/total_pixels:.2f}%)")
+    
+    return backbone_src, backbone_mask, backbone_profile
+
+
+def find_yearly_files() -> Dict[int, Path]:
+    """Find all yearly merged embedding files."""
+    log_progress("Scanning for yearly merged files...")
+    
+    yearly_files = {}
+    missing_years = []
+    
+    for year in YEARS:
+        merged_file = EMBEDDINGS_DIR / f"SatelliteEmbeddings_SA_1km_{year}_merged.tif"
+        
+        if merged_file.exists():
+            yearly_files[year] = merged_file
+            log_progress(f"  Found {year}: {merged_file.name}")
+        else:
+            missing_years.append(year)
+            log_progress(f"  Missing {year}: {merged_file}")
+    
+    if missing_years:
+        print(f"\nERROR: Missing files for years: {missing_years}")
+        print("Please ensure all yearly merge scripts have been run first.")
+        sys.exit(1)
+    
+    log_progress(f"Found all {len(yearly_files)} yearly files")
+    return yearly_files
+
+
+def align_wdpa_2017(backbone_profile: dict) -> Path:
+    """
+    Align/copy WDPA_SA_1km_2017.tif to data/ml/wdpa_aligned/ using backbone grid.
+    Returns path to aligned file.
+    """
+    log_progress("Aligning WDPA 2017 to backbone grid...")
+    
+    wdpa_2017_input = WDPA_INPUT_DIR / "WDPA_SA_1km_2017.tif"
+    wdpa_2017_output = WDPA_ALIGNED_DIR / "WDPA_SA_1km_2017.tif"
+    
+    if not wdpa_2017_input.exists():
+        print(f"ERROR: WDPA 2017 input file not found: {wdpa_2017_input}")
+        print("Please ensure WDPA_SA_1km_2017.tif exists in data/ready/WDPA/")
+        sys.exit(1)
+    
+    # Create output directory
+    WDPA_ALIGNED_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Check if already aligned
+    if wdpa_2017_output.exists():
+        with rasterio.open(wdpa_2017_output) as dst:
+            if (dst.width == backbone_profile["width"] and 
+                dst.height == backbone_profile["height"] and
+                dst.crs == backbone_profile["crs"] and
+                np.allclose(dst.transform, backbone_profile["transform"], atol=1e-6)):
+                log_progress(f"  WDPA 2017 already aligned: {wdpa_2017_output.name}")
+                return wdpa_2017_output
+    
+    # Align using WarpedVRT (similar to embeddings_preprocessing)
+    block_size = 512
+    output_profile = backbone_profile.copy()
+    output_profile.update(
+        driver="GTiff",
+        dtype="uint8",
+        count=1,
+        nodata=0,
+        compress="lzw",
+        tiled=True,
+        blockxsize=block_size,
+        blockysize=block_size,
+        BIGTIFF="YES"
+    )
+    
+    with rasterio.open(wdpa_2017_input) as src:
+        src_nodata = src.nodata if src.nodata is not None else 0
+        
+        with WarpedVRT(
+            src,
+            src_crs=src.crs,
+            src_transform=src.transform,
+            src_nodata=src_nodata,
+            dst_crs=backbone_profile["crs"],
+            dst_transform=backbone_profile["transform"],
+            dst_width=backbone_profile["width"],
+            dst_height=backbone_profile["height"],
+            resampling=Resampling.nearest,
+            dtype=np.uint8,
+            nodata=0,
+        ) as vrt:
+            with rasterio.open(wdpa_2017_output, "w", **output_profile) as dst:
+                for _, window in dst.block_windows(1):
+                    window_data = vrt.read(1, window=window, masked=False).astype(np.uint8)
+                    window_data = np.clip(window_data, 0, 255)
+                    dst.write(window_data, 1, window=window)
+    
+    log_progress(f"  Aligned WDPA 2017: {wdpa_2017_output.name}")
+    return wdpa_2017_output
+
+
+def find_wdpa_yearly_files(backbone_profile: dict) -> Dict[int, Path]:
+    """Find all yearly WDPA aligned files, aligning 2017 if needed."""
+    log_progress("Scanning for yearly WDPA aligned files...")
+    
+    wdpa_files = {}
+    missing_years = []
+    
+    # Ensure WDPA aligned directory exists
+    WDPA_ALIGNED_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Align 2017 if needed
+    if 2017 in WDPA_YEARS:
+        try:
+            wdpa_2017 = align_wdpa_2017(backbone_profile)
+            wdpa_files[2017] = wdpa_2017
+            log_progress(f"  Found 2017: {wdpa_2017.name}")
+        except Exception as e:
+            print(f"ERROR: Failed to align WDPA 2017: {e}")
+            sys.exit(1)
+    
+    # Check other years
+    for year in WDPA_YEARS:
+        if year == 2017:
+            continue  # Already handled above
+        
+        wdpa_file = WDPA_ALIGNED_DIR / f"WDPA_SA_1km_{year}.tif"
+        
+        if wdpa_file.exists():
+            wdpa_files[year] = wdpa_file
+            log_progress(f"  Found {year}: {wdpa_file.name}")
+        else:
+            missing_years.append(year)
+            log_progress(f"  Missing {year}: {wdpa_file}")
+    
+    if missing_years:
+        print(f"\nERROR: Missing WDPA files for years: {missing_years}")
+        print("Please ensure all WDPA aligned rasters exist in data/ml/wdpa_aligned/")
+        sys.exit(1)
+    
+    log_progress(f"Found all {len(wdpa_files)} yearly WDPA files")
+    return wdpa_files
+
+
+def verify_spatial_alignment(yearly_files: Dict[int, Path], wdpa_files: Dict[int, Path], 
+                            backbone_profile: dict) -> Tuple[Affine, int, int, str, int]:
+    """
+    Verify that all yearly files and WDPA files have identical spatial properties matching backbone.
+    
+    Returns:
+        transform: Common transform
+        width: Common width
+        height: Common height
+        crs: Common CRS
+        bands_per_year: Number of bands per year
+    """
+    log_progress("Verifying spatial alignment with backbone...")
+    
+    ref_transform = backbone_profile["transform"]
+    ref_width = backbone_profile["width"]
+    ref_height = backbone_profile["height"]
+    ref_crs = backbone_profile["crs"]
+    
+    log_progress(f"Backbone reference:")
+    log_progress(f"  Dimensions: {ref_width} × {ref_height}")
+    log_progress(f"  CRS: {ref_crs}")
+    log_progress(f"  Transform: {ref_transform}")
+    
+    # Check first embedding year to get band count (skip 2017 which has no embeddings)
+    first_emb_year = min(EMBEDDING_YEARS)
+    first_file = yearly_files[first_emb_year]
+    with rasterio.open(first_file) as ref:
+        ref_bands = ref.count
+    
+    log_progress(f"  Expected bands per year: {ref_bands}")
+    
+    # Verify all embedding years match backbone
+    all_aligned = True
+    misaligned_years = []
+    
+    log_progress("  Verifying embedding files...")
+    for year in EMBEDDING_YEARS:
+        file_path = yearly_files[year]
+        with rasterio.open(file_path) as src:
+            # Check dimensions
+            if src.width != ref_width or src.height != ref_height:
+                log_progress(f"  Mismatch for {year}: dimensions {src.width}×{src.height} vs {ref_width}×{ref_height}")
+                all_aligned = False
+                misaligned_years.append(year)
+                continue
+            
+            # Check CRS
+            if src.crs != ref_crs:
+                log_progress(f"  Mismatch for {year}: CRS {src.crs} vs {ref_crs}")
+                all_aligned = False
+                misaligned_years.append(year)
+                continue
+            
+            # Check transform
+            if src.transform != ref_transform:
+                log_progress(f"  Mismatch for {year}: transform differs")
+                log_progress(f"      Got: {src.transform}")
+                log_progress(f"      Expected: {ref_transform}")
+                all_aligned = False
+                misaligned_years.append(year)
+                continue
+            
+            # Check number of bands
+            if src.count != ref_bands:
+                log_progress(f"  Warning for {year}: band count {src.count} vs {ref_bands}")
+            
+            log_progress(f"  {year}: perfectly aligned")
+    
+    # Verify all WDPA years match backbone
+    log_progress("  Verifying WDPA files...")
+    wdpa_misaligned_years = []
+    
+    for year in WDPA_YEARS:
+        file_path = wdpa_files[year]
+        with rasterio.open(file_path) as src:
+            # Check dimensions
+            if src.width != ref_width or src.height != ref_height:
+                log_progress(f"  WDPA mismatch for {year}: dimensions {src.width}×{src.height} vs {ref_width}×{ref_height}")
+                all_aligned = False
+                wdpa_misaligned_years.append(year)
+                continue
+            
+            # Check CRS
+            if src.crs != ref_crs:
+                log_progress(f"  WDPA mismatch for {year}: CRS {src.crs} vs {ref_crs}")
+                all_aligned = False
+                wdpa_misaligned_years.append(year)
+                continue
+            
+            # Check transform
+            if src.transform != ref_transform:
+                log_progress(f"  WDPA mismatch for {year}: transform differs")
+                log_progress(f"      Got: {src.transform}")
+                log_progress(f"      Expected: {ref_transform}")
+                all_aligned = False
+                wdpa_misaligned_years.append(year)
+                continue
+            
+            # Check number of bands (should be 1)
+            if src.count != 1:
+                log_progress(f"  Warning for WDPA {year}: band count {src.count} (expected 1)")
+            
+            log_progress(f"  WDPA {year}: perfectly aligned")
+    
+    if not all_aligned:
+        print(f"\nERROR: Spatial alignment verification failed")
+        if misaligned_years:
+            print(f"  Embedding files misaligned for years: {misaligned_years}")
+        if wdpa_misaligned_years:
+            print(f"  WDPA files misaligned for years: {wdpa_misaligned_years}")
+        print("All yearly files must have identical dimensions, CRS, and transform matching backbone.tif.")
+        sys.exit(1)
+    
+    log_progress("All years (embeddings and WDPA) are perfectly aligned with backbone.")
+    return ref_transform, ref_width, ref_height, ref_crs, ref_bands
+
+
+def determine_wdpa_dtype(wdpa_file: Path) -> Tuple[pa.DataType, type]:
+    """
+    Determine the appropriate Arrow/Python data type for WDPA values.
+    
+    Returns:
+        Tuple of (Arrow data type, NumPy data type)
+    """
+    with rasterio.open(wdpa_file) as src:
+        # Sample a representative window to check value range
+        # Use a central window to avoid edge effects
+        sample_size = min(1000, src.width, src.height)
+        row_off = (src.height - sample_size) // 2
+        col_off = (src.width - sample_size) // 2
+        sample_window = Window(col_off, row_off, sample_size, sample_size)
+        sample_data = src.read(1, window=sample_window)
+        
+        # Check if values fit in uint8 range
+        wdpa_min = sample_data.min()
+        wdpa_max = sample_data.max()
+        
+        # Also check the original dtype
+        original_dtype = src.dtypes[0]
+        
+        # If original is uint8 or values fit in uint8, use uint8
+        if original_dtype == 'uint8' or (wdpa_min >= 0 and wdpa_max <= 255):
+            return pa.uint8(), np.uint8
+        else:
+            return pa.int16(), np.int16
+
+
+def window_to_arrow(year: int, window: Window, embeddings: np.ndarray, 
+                   backbone_window: np.ndarray,
+                   wdpa_window: np.ndarray, wdpa_dtype: pa.DataType, 
+                   wdpa_np_dtype: type, transform: Affine, 
+                   has_embeddings: bool = True, num_bands: int = None) -> pa.Table:
+    """
+    Convert a window of embeddings to an Arrow table, filtering by backbone mask.
+    
+    Args:
+        year: Year being processed
+        window: Rasterio window
+        embeddings: Embedding array (bands, height, width) or None for 2017
+        backbone_window: Backbone mask window (height, width)
+        wdpa_window: WDPA window (height, width), single band
+        wdpa_dtype: Arrow data type for WDPA values
+        wdpa_np_dtype: NumPy data type for WDPA values
+        transform: Affine transform for computing x, y coordinates
+        has_embeddings: Whether embeddings are available (False for 2017)
+        num_bands: Number of embedding bands (required if has_embeddings=False)
+    
+    Returns:
+        Arrow table with columns: row, col, x, y, year, WDPA_b1, emb_01..emb_64 (or NULL for 2017)
+    """
+    h = int(window.height)
+    w = int(window.width)
+    
+    if has_embeddings:
+        num_bands = embeddings.shape[0]
+    elif num_bands is None:
+        raise ValueError("num_bands must be provided when has_embeddings=False")
+    
+    # Generate coordinates
+    rows = (np.arange(h, dtype=np.int32) + int(window.row_off)).repeat(w)
+    cols = np.tile(np.arange(w, dtype=np.int32) + int(window.col_off), h)
+    
+    # Compute x, y coordinates from row, col using transform
+    xs = (transform.a * cols + transform.b * rows + transform.c).astype(np.float64)
+    ys = (transform.d * cols + transform.e * rows + transform.f).astype(np.float64)
+    
+    # Flatten WDPA window
+    wdpa_flat = wdpa_window.reshape(-1)
+    
+    # Apply backbone mask: only keep pixels where backbone == 1
+    backbone_flat = backbone_window.reshape(-1)
+    keep = backbone_flat == 1
+    
+    # Skip empty windows (no land pixels)
+    if keep.sum() == 0:
+        # Return empty table with correct schema
+        schema_dict = {
+            "row": pa.int32(),
+            "col": pa.int32(),
+            "x": pa.float64(),
+            "y": pa.float64(),
+            "year": pa.int16(),
+            "WDPA_b1": wdpa_dtype,
+        }
+        for i in range(1, num_bands + 1):
+            schema_dict[f"emb_{i:02d}"] = pa.float32()
+        return pa.table({k: pa.array([], type=v) for k, v in schema_dict.items()})
+    
+    # Build column dictionary
+    cols_dict = {
+        "row": pa.array(rows[keep], type=pa.int32()),
+        "col": pa.array(cols[keep], type=pa.int32()),
+        "x": pa.array(xs[keep], type=pa.float64()),
+        "y": pa.array(ys[keep], type=pa.float64()),
+        "year": pa.array(np.full(keep.sum(), year, dtype=np.int16), type=pa.int16()),
+        "WDPA_b1": pa.array(wdpa_flat[keep].astype(wdpa_np_dtype), type=wdpa_dtype),
+    }
+    
+    # Add embedding columns (emb_01, emb_02, ..., emb_64)
+    if has_embeddings:
+        # Flatten embeddings (num_bands, height, width) -> (num_bands, height*width)
+        flat_embeddings = embeddings.reshape(num_bands, -1)
+        for i in range(num_bands):
+            emb_name = f"emb_{i+1:02d}"
+            cols_dict[emb_name] = pa.array(flat_embeddings[i, keep], type=pa.float32())
+    else:
+        # For 2017, set all embeddings to NULL/NaN
+        for i in range(num_bands):
+            emb_name = f"emb_{i+1:02d}"
+            cols_dict[emb_name] = pa.array(np.full(keep.sum(), np.nan, dtype=np.float32), type=pa.float32())
+    
+    return pa.table(cols_dict)
+
+
+def process_year_to_parquet(year: int, yearly_file: Path, wdpa_file: Path,
+                            backbone_mask: np.ndarray, backbone_profile: dict, 
+                            bands_per_year: int, output_dir: Path, 
+                            transform: Affine) -> Path:
+    """
+    Process a single year's embeddings and WDPA data, write to Parquet shard.
+    
+    Returns:
+        Path to the written Parquet file
+    """
+    log_progress(f"Processing {year}...")
+    year_start = time.time()
+    
+    output_file = output_dir / f"SatelliteEmbeddings_SA_1km_{year}.parquet"
+    width = backbone_profile["width"]
+    height = backbone_profile["height"]
+    
+    # Determine WDPA data type once for the entire year
+    wdpa_dtype, wdpa_np_dtype = determine_wdpa_dtype(wdpa_file)
+    log_progress(f"  WDPA data type: {wdpa_dtype}")
+    
+    # Check if this is 2017 (no embeddings)
+    is_2017 = (year == 2017)
+    has_embeddings = not is_2017
+    
+    # Initialize Parquet writer
+    parquet_writer = None
+    total_rows = 0
+    
+    # Process in blocks
+    num_cols = (width + BLOCK_SIZE - 1) // BLOCK_SIZE
+    num_rows = (height + BLOCK_SIZE - 1) // BLOCK_SIZE
+    total_windows = num_rows * num_cols
+    
+    window_idx = 0
+    if has_embeddings:
+        embeddings_src = rasterio.open(yearly_file)
+    else:
+        embeddings_src = None
+    
+    wdpa_src = rasterio.open(wdpa_file)
+    
+    try:
+        for row_idx in range(num_rows):
+            for col_idx in range(num_cols):
+                window_idx += 1
+                
+                # Calculate window bounds
+                col_off = col_idx * BLOCK_SIZE
+                row_off = row_idx * BLOCK_SIZE
+                win_width = min(BLOCK_SIZE, width - col_off)
+                win_height = min(BLOCK_SIZE, height - row_off)
+                
+                window = Window(col_off, row_off, win_width, win_height)
+                
+                # Extract backbone mask window
+                backbone_window = backbone_mask[
+                    row_off:row_off + win_height,
+                    col_off:col_off + win_width
+                ]
+                
+                # Skip windows with no land pixels
+                if (backbone_window == 1).sum() == 0:
+                    continue
+                
+                # Read embeddings for this window (all bands at once) - skip for 2017
+                if has_embeddings:
+                    embeddings = embeddings_src.read(window=window)  # Shape: (bands, height, width)
+                else:
+                    embeddings = None
+                
+                # Read WDPA for this window (single band)
+                wdpa_window = wdpa_src.read(1, window=window)  # Shape: (height, width)
+                
+                # Convert to Arrow table
+                table = window_to_arrow(year, window, embeddings, backbone_window, 
+                                       wdpa_window, wdpa_dtype, wdpa_np_dtype,
+                                       transform, has_embeddings, bands_per_year)
+                
+                if table.num_rows > 0:
+                    # Initialize writer on first non-empty table
+                    if parquet_writer is None:
+                        parquet_writer = pq.ParquetWriter(
+                            output_file, 
+                            table.schema, 
+                            compression='zstd',
+                            write_statistics=True
+                        )
+                    
+                    parquet_writer.write_table(table)
+                    total_rows += table.num_rows
+                
+                # Progress update
+                if window_idx % 100 == 0:
+                    progress_pct = (window_idx / total_windows) * 100
+                    log_progress(f"    Window {window_idx}/{total_windows} ({progress_pct:.1f}%), rows: {total_rows:,}")
+    finally:
+        if embeddings_src:
+            embeddings_src.close()
+        wdpa_src.close()
+    
+    # Close writer
+    if parquet_writer is not None:
+        parquet_writer.close()
+    
+    # Get file size
+    if output_file.exists():
+        file_size_mb = output_file.stat().st_size / (1024 ** 2)
+        log_progress(f"  {year}: {total_rows:,} rows, {file_size_mb:.1f} MB", year_start)
+    else:
+        log_progress(f"  {year}: No data written (no backbone==1 pixels found)")
+    
+    return output_file
+
+
+def merge_parquet_shards_with_duckdb(year_shards: List[Path], output_file: Path):
+    """
+    Use DuckDB to merge all per-year Parquet shards into a single final Parquet file.
+    """
+    log_progress("Merging per-year Parquet shards with DuckDB...")
+    merge_start = time.time()
+    
+    # Configure DuckDB
+    con = duckdb.connect()
+    
+    # Configure DuckDB settings
+    is_euler = bool(os.environ.get("SCRATCH"))
+    slurm_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", "0"))
+    num_threads = slurm_cpus if slurm_cpus > 0 else (48 if is_euler else 4)
+    
+    slurm_mem_per_cpu_mb = os.environ.get("SLURM_MEM_PER_CPU")
+    if slurm_mem_per_cpu_mb and slurm_cpus:
+        total_mem_mb = int(slurm_mem_per_cpu_mb) * slurm_cpus
+        memory_limit_gb = max(1, total_mem_mb // 1024)
+    else:
+        memory_limit_gb = 128 if is_euler else 16
+    
+    con.execute(f"SET threads={num_threads}")
+    con.execute("SET preserve_insertion_order=false")
+    con.execute(f"SET memory_limit='{memory_limit_gb}GB'")
+    
+    temp_dir = os.environ.get("SCRATCH") or (PROJECT_ROOT / "temp")
+    if isinstance(temp_dir, str):
+        temp_dir = Path(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir_sql = str(temp_dir).replace("'", "''")
+    con.execute(f"SET temp_directory='{temp_dir_sql}/duckdb_temp'")
+    
+    if is_euler:
+        con.execute("PRAGMA max_temp_directory_size='200GB'")
+    
+    log_progress(f"  DuckDB configured: {num_threads} threads, {memory_limit_gb}GB memory")
+    
+    # Build UNION ALL query to merge all shards
+    escaped_paths = [str(p).replace("'", "''") for p in year_shards]
+    
+    # Create a list of SELECT statements
+    select_statements = []
+    for escaped_path in escaped_paths:
+        select_statements.append(f"SELECT * FROM read_parquet('{escaped_path}')")
+    
+    union_query = " UNION ALL ".join(select_statements)
+    
+    # Use COPY to write merged result
+    escaped_output = str(output_file).replace("'", "''")
+    copy_query = f"""
+    COPY (
+        {union_query}
+    ) TO '{escaped_output}' (FORMAT PARQUET, COMPRESSION ZSTD)
+    """
+    
+    log_progress(f"  Merging {len(year_shards)} shards into {output_file.name}...")
+    con.execute(copy_query)
+    
+    # Get statistics
+    total_rows = con.execute(f"SELECT COUNT(*) FROM read_parquet('{escaped_output}')").fetchone()[0]
+    file_size_gb = output_file.stat().st_size / (1024 ** 3)
+    
+    log_progress(f"  Merged file: {total_rows:,} rows, {file_size_gb:.2f} GB", merge_start)
+    
+    con.close()
+
+
+def validate_output(output_path: Path):
+    """Validate the final output Parquet file."""
+    log_progress("Validating output file...")
+    
+    if not output_path.exists():
+        log_progress(f"  ERROR: Output file not found: {output_path}")
+        return
+    
+    # Read with DuckDB for validation
+    con = duckdb.connect()
+    escaped_path = str(output_path).replace("'", "''")
+    
+    # Get row count and year distribution
+    stats = con.execute(f"""
+        SELECT 
+            COUNT(*) AS total_rows,
+            COUNT(DISTINCT year) AS num_years,
+            MIN(year) AS min_year,
+            MAX(year) AS max_year,
+            (SELECT COUNT(*) FROM (SELECT DISTINCT row, col FROM read_parquet('{escaped_path}')) t) AS unique_pixels,
+            SUM(CASE WHEN year = 2017 THEN 1 ELSE 0 END) AS rows_2017
+        FROM read_parquet('{escaped_path}')
+    """).fetchone()
+    
+    total_rows, num_years, min_year, max_year, unique_pixels, rows_2017 = stats
+    
+    log_progress(f"  Total rows: {total_rows:,}")
+    log_progress(f"  Years: {num_years} ({min_year}-{max_year})")
+    log_progress(f"  Unique pixels: {unique_pixels:,}")
+    if rows_2017 > 0:
+        log_progress(f"  Year 2017 rows: {rows_2017:,} (WDPA only, embeddings NULL)")
+    
+    # Get year distribution
+    year_dist = con.execute(f"""
+        SELECT year, COUNT(*) AS rows
+        FROM read_parquet('{escaped_path}')
+        GROUP BY year
+        ORDER BY year
+    """).fetchall()
+    
+    log_progress(f"  Year distribution:")
+    for year, rows in year_dist:
+        log_progress(f"    {year}: {rows:,} rows")
+    
+    # Check column names
+    columns = con.execute(f"""
+        DESCRIBE SELECT * FROM read_parquet('{escaped_path}') LIMIT 0
+    """).fetchall()
+    
+    log_progress(f"  Columns ({len(columns)}):")
+    for col_name, col_type in columns[:10]:  # Show first 10
+        log_progress(f"    {col_name}: {col_type}")
+    if len(columns) > 10:
+        log_progress(f"    ... and {len(columns) - 10} more columns")
+    
+    con.close()
+
+
+def main():
+    """Main merge function."""
+    total_start = time.time()
+    
+    log_progress("=" * 80)
+    log_progress("Satellite Embeddings Extraction to Parquet (2018-2024)")
+    log_progress("=" * 80)
+    
+    # Log data source
+    if EMBEDDINGS_DIR == ML_EMBEDDINGS_DIR:
+        log_progress(f"Using STORAGE-OPTIMIZED embeddings from: {EMBEDDINGS_DIR}")
+    elif EMBEDDINGS_DIR == READY_EMBEDDINGS_DIR:
+        log_progress(f"Using READY embeddings from: {EMBEDDINGS_DIR}")
+    else:
+        log_progress(f"Using ORIGINAL embeddings from: {EMBEDDINGS_DIR}")
+        log_progress("  (Run storage_optimise script to create optimized embeddings)")
+    
+    # Check embeddings directory
+    if not EMBEDDINGS_DIR.exists():
+        print(f"ERROR: Embeddings directory not found: {EMBEDDINGS_DIR}")
+        print(f"  Checked locations:")
+        print(f"    - Storage-optimized: {ML_EMBEDDINGS_DIR} (exists: {ML_EMBEDDINGS_DIR.exists()})")
+        print(f"    - Ready: {READY_EMBEDDINGS_DIR} (exists: {READY_EMBEDDINGS_DIR.exists()})")
+        print(f"    - Original: {ORIG_EMBEDDINGS_DIR} (exists: {ORIG_EMBEDDINGS_DIR.exists()})")
+        sys.exit(1)
+    
+    # Load backbone
+    backbone_src, backbone_mask, backbone_profile = load_backbone()
+    
+    # Find all yearly files (embeddings: 2018-2024)
+    yearly_files = find_yearly_files()
+    
+    # Find all WDPA yearly files (2017-2024, aligns 2017 if needed)
+    wdpa_files = find_wdpa_yearly_files(backbone_profile)
+    
+    # Verify spatial alignment
+    transform, width, height, crs, bands_per_year = verify_spatial_alignment(
+        yearly_files, wdpa_files, backbone_profile
+    )
+    
+    # Close backbone source (we have the mask in memory)
+    backbone_src.close()
+    
+    log_progress(f"\nOutput configuration:")
+    log_progress(f"  Embedding years: {len(EMBEDDING_YEARS)} ({min(EMBEDDING_YEARS)}-{max(EMBEDDING_YEARS)})")
+    log_progress(f"  WDPA years: {len(WDPA_YEARS)} ({min(WDPA_YEARS)}-{max(WDPA_YEARS)})")
+    log_progress(f"  Bands per year: {bands_per_year}")
+    log_progress(f"  Spatial dimensions: {width} × {height}")
+    log_progress(f"  Block size: {BLOCK_SIZE}×{BLOCK_SIZE}")
+    
+    # Ensure output directory exists
+    ML_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Process each year to create Parquet shards
+    year_shards = []
+    
+    # Process 2017 (WDPA only, no embeddings)
+    if 2017 in WDPA_YEARS:
+        log_progress("Processing 2017 (WDPA only, no embeddings)...")
+        shard_path = process_year_to_parquet(
+            2017, None, wdpa_files[2017], backbone_mask, 
+            backbone_profile, bands_per_year, ML_OUTPUT_DIR, transform
+        )
+        if shard_path.exists():
+            year_shards.append(shard_path)
+    
+    # Process embedding years (2018-2024)
+    for year in EMBEDDING_YEARS:
+        shard_path = process_year_to_parquet(
+            year, yearly_files[year], wdpa_files[year], backbone_mask, 
+            backbone_profile, bands_per_year, ML_OUTPUT_DIR, transform
+        )
+        if shard_path.exists():
+            year_shards.append(shard_path)
+    
+    if not year_shards:
+        print("ERROR: No Parquet shards were created. Check that backbone==1 pixels exist.")
+        sys.exit(1)
+    
+    log_progress(f"\nCreated {len(year_shards)} per-year Parquet shards")
+    
+    # Merge all shards into final Parquet file using DuckDB
+    merge_parquet_shards_with_duckdb(year_shards, FINAL_OUTPUT_FILE)
+    
+    # Validate
+    validate_output(FINAL_OUTPUT_FILE)
+    
+    # Summary
+    total_time = time.time() - total_start
+    log_progress("=" * 80)
+    log_progress(f"Extraction completed successfully in {total_time/60:.1f} minutes")
+    log_progress(f"Final output file: {FINAL_OUTPUT_FILE}")
+    log_progress(f"Per-year shards: {len(year_shards)} files")
+    log_progress("=" * 80)
+    
+    # Usage notes
+    print("\nUsage notes:")
+    print(f"   - Final merged file: {FINAL_OUTPUT_FILE.name}")
+    print(f"   - Columns: row, col, x, y, year, WDPA_b1, emb_01..emb_{bands_per_year:02d}")
+    print(f"   - Only pixels where backbone==1 are included")
+    print(f"   - Each row represents one pixel-year observation")
+    print(f"   - WDPA_b1 column contains WDPA values (uint8 or int16)")
+    print(f"   - Year 2017: WDPA only, embeddings set to NULL (for WDPA_prev computation)")
+    print(f"   - Years 2018-2024: Full data (WDPA + embeddings)")
+    print(f"   - Per-year shards are kept for reference in: {ML_OUTPUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()

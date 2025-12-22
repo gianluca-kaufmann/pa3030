@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""
+Embeddings Transition Features Preprocessing
+============================================
+
+Objective:
+    Create transition dataset from embeddings panel data using the same target logic
+    as spatial_features_preprocessing. Filters to risk set (WDPA_prev==0) and creates
+    transition_01 = WDPA_b1 (same-year target).
+
+Inputs:
+    - `data/ml/SatelliteEmbeddings_SA_1km_2017-2024.parquet` (contains WDPA_b1 + embeddings)
+
+    Processing (using DuckDB window functions):
+    1. For each pixel (row, col), compute:
+       - WDPA_prev: LAG(WDPA_b1) OVER (PARTITION BY row, col ORDER BY year)
+         (2017 defaults to 0, 2018 uses 2017's WDPA_b1)
+    2. Filter to risk set: WDPA_prev = 0 (pixels not previously protected at t-1)
+    3. Create target variable:
+       - transition_01 = WDPA_b1 (NaN treated as 0), stored as uint8
+       - This is the same-year target: if unprotected at t-1, did you become protected at t?
+    4. Year range: Input 2017-2024 (2017 included for WDPA_prev), Output 2018-2024 (2017 excluded)
+    5. Create year splits: train (2018-2021), val (2022), test (2023), test_late (2024)
+
+Outputs:
+    - `data/ml/embeddings_transition_panel_2018-2024.parquet` (main dataset)
+    - Class balance summary (printed to stdout)
+    - Precision@K-ready scoring keys (row, col, year columns preserved)
+"""
+
+import sys
+import os
+import logging
+from pathlib import Path
+from typing import Dict, Any
+import time
+
+import duckdb
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# Paths
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
+DATA_ML_DIR = PROJECT_ROOT / "data" / "ml"
+
+INPUT_FILE = DATA_ML_DIR / "SatelliteEmbeddings_SA_1km_2017-2024.parquet"
+OUTPUT_FILE = DATA_ML_DIR / "embeddings_transition_panel_2018-2024.parquet"
+
+# Year splits
+TRAIN_YEARS = [2018, 2019, 2020, 2021]
+VAL_YEARS = [2022]
+TEST_YEARS = [2023]
+TEST_LATE_YEARS = [2024]
+
+# Year range for input (2017-2024, includes 2017 for WDPA_prev computation)
+INPUT_YEARS = list(range(2017, 2025))  # 2017-2024
+# Year range for output (2018-2024, 2017 excluded as it's only for WDPA_prev)
+OUTPUT_YEARS = list(range(2018, 2025))  # 2018-2024
+
+
+def report_memory_usage(label: str = "") -> None:
+    """Report current memory usage."""
+    try:
+        import psutil
+        process = psutil.Process()
+        mem_info = process.memory_info()
+        mem_gb = mem_info.rss / 1024**3
+        logger.info(f"  [Memory {label}] RSS: {mem_gb:.2f} GB")
+    except ImportError:
+        pass  # psutil not available
+
+
+def setup_duckdb() -> duckdb.DuckDBPyConnection:
+    """Configure and return a DuckDB connection."""
+    con = duckdb.connect()
+    
+    # Configure DuckDB settings
+    is_euler = bool(os.environ.get("SCRATCH"))
+    slurm_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", "0"))
+    num_threads = slurm_cpus if slurm_cpus > 0 else (48 if is_euler else 4)
+    
+    slurm_mem_per_cpu_mb = os.environ.get("SLURM_MEM_PER_CPU")
+    if slurm_mem_per_cpu_mb and slurm_cpus:
+        total_mem_mb = int(slurm_mem_per_cpu_mb) * slurm_cpus
+        memory_limit_gb = max(1, total_mem_mb // 1024)
+    else:
+        memory_limit_gb = 128 if is_euler else 16
+    
+    con.execute(f"SET threads={num_threads}")
+    con.execute("SET preserve_insertion_order=false")
+    con.execute(f"SET memory_limit='{memory_limit_gb}GB'")
+    
+    temp_dir = os.environ.get("SCRATCH") or (PROJECT_ROOT / "temp")
+    if isinstance(temp_dir, str):
+        temp_dir = Path(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir_sql = str(temp_dir).replace("'", "''")
+    con.execute(f"SET temp_directory='{temp_dir_sql}/duckdb_temp'")
+    
+    if is_euler:
+        con.execute("PRAGMA max_temp_directory_size='200GB'")
+    
+    logger.info(f"DuckDB configured: {num_threads} threads, {memory_limit_gb}GB memory")
+    
+    return con
+
+
+def validate_input(input_path: Path) -> None:
+    """Validate that input file exists and get basic info."""
+    logger.info(f"Validating input file: {input_path.name}...")
+    start_time = time.time()
+    
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+    
+    # Quick check with DuckDB
+    con = duckdb.connect()
+    escaped_path = str(input_path).replace("'", "''")
+    
+    # Get basic stats
+    stats = con.execute(f"""
+        SELECT 
+            COUNT(*) AS total_rows,
+            COUNT(DISTINCT year) AS num_years,
+            MIN(year) AS min_year,
+            MAX(year) AS max_year,
+            (SELECT COUNT(*) FROM (SELECT DISTINCT row, col FROM read_parquet('{escaped_path}')) t) AS unique_pixels
+        FROM read_parquet('{escaped_path}')
+    """).fetchone()
+    
+    total_rows, num_years, min_year, max_year, unique_pixels = stats
+    
+    elapsed = time.time() - start_time
+    logger.info(f"  Total rows: {total_rows:,}")
+    logger.info(f"  Years: {num_years} ({min_year}-{max_year})")
+    logger.info(f"  Unique pixels: {unique_pixels:,}")
+    logger.info(f"  Validated in {elapsed:.1f}s")
+    
+    con.close()
+    report_memory_usage("after validation")
+
+
+def process_with_duckdb(con: duckdb.DuckDBPyConnection, input_path: Path, output_path: Path) -> None:
+    """
+    Process the dataset using DuckDB window functions and write directly to Parquet.
+    
+    Steps:
+    1. Compute WDPA_prev using LAG window function (first year defaults to 0)
+    2. Filter to risk set (WDPA_prev = 0) - pixels not previously protected at t-1
+    3. Create transition_01 = WDPA_b1 (NaN treated as 0) - same-year target
+    4. Filter to year range (2018-2024)
+    5. Write directly to Parquet using COPY TO
+    """
+    logger.info("Processing with DuckDB window functions...")
+    start_time = time.time()
+    
+    # Ensure output directory exists
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    escaped_input = str(input_path).replace("'", "''")
+    escaped_output = str(output_path).replace("'", "''")
+    
+    # Get column names from input file to dynamically build SELECT list
+    columns = con.execute(f"""
+        DESCRIBE SELECT * FROM read_parquet('{escaped_input}') LIMIT 0
+    """).fetchall()
+    
+    # Extract embedding column names (all columns except row, col, year, WDPA_b1, x, y)
+    exclude_cols = {'row', 'col', 'year', 'WDPA_b1', 'x', 'y'}
+    embedding_cols = [col[0] for col in columns if col[0] not in exclude_cols]
+    embedding_cols_str = ', '.join(embedding_cols)
+    
+    logger.info(f"  Found {len(embedding_cols)} embedding columns")
+    
+    # Build the processing query with window functions using CTEs
+    # Step 1: Compute WDPA_prev using LAG (2017 defaults to 0, 2018 uses 2017's WDPA_b1)
+    # Step 2: Filter to risk set (WDPA_prev = 0) and create transition_01 = WDPA_b1
+    # Step 3: Filter to year range (2018-2024, exclude 2017 which is only for WDPA_prev)
+    processing_query = f"""
+    COPY (
+        WITH with_lag AS (
+            SELECT 
+                *,
+                COALESCE(LAG(WDPA_b1) OVER (PARTITION BY row, col ORDER BY year), 0) AS WDPA_prev
+            FROM read_parquet('{escaped_input}')
+        )
+        SELECT 
+            row,
+            col,
+            year,
+            WDPA_b1,
+            WDPA_prev,
+            -- transition_01 = WDPA_b1 (NULL/NaN treated as 0), same as spatial_features_preprocessing
+            CAST(COALESCE(WDPA_b1, 0) AS UINT8) AS transition_01,
+            {embedding_cols_str}
+        FROM with_lag
+        WHERE 
+            -- Risk set: pixels not previously protected at t-1 (same as spatial_features_preprocessing)
+            WDPA_prev = 0
+            -- Year range: 2018-2024 (exclude 2017 which is only for WDPA_prev computation)
+            AND year BETWEEN 2018 AND 2024
+    ) TO '{escaped_output}' (FORMAT PARQUET, COMPRESSION 'snappy')
+    """
+    
+    logger.info("  Executing processing query...")
+    con.execute(processing_query)
+    
+    elapsed = time.time() - start_time
+    file_size_mb = output_path.stat().st_size / (1024**2)
+    
+    logger.info(f"  Processed and saved in {elapsed:.1f}s")
+    logger.info(f"  File size: {file_size_mb:.1f} MB")
+    
+    # Get column info
+    columns = con.execute(f"""
+        DESCRIBE SELECT * FROM read_parquet('{escaped_output}') LIMIT 0
+    """).fetchall()
+    
+    logger.info(f"  Columns: {len(columns)} total")
+    logger.info(f"  Column names: {', '.join([col[0] for col in columns[:10]])}" + 
+                (f", ... and {len(columns) - 10} more" if len(columns) > 10 else ""))
+    
+    report_memory_usage("after processing")
+
+
+def compute_statistics(con: duckdb.DuckDBPyConnection, output_path: Path) -> Dict[str, Any]:
+    """Compute class balance statistics using DuckDB."""
+    logger.info("Computing class balance statistics...")
+    start_time = time.time()
+    
+    escaped_path = str(output_path).replace("'", "''")
+    
+    # Overall statistics
+    stats = con.execute(f"""
+        SELECT 
+            COUNT(*) AS total_rows,
+            SUM(transition_01) AS positives,
+            COUNT(*) - SUM(transition_01) AS negatives
+        FROM read_parquet('{escaped_path}')
+    """).fetchone()
+    
+    total, positives, negatives = stats
+    positives = int(positives)
+    negatives = int(negatives)
+    total = int(total)
+    
+    balance_info = {
+        'total': total,
+        'positives': positives,
+        'negatives': negatives,
+        'positive_rate': float(positives / total) if total > 0 else 0.0,
+        'negative_rate': float(negatives / total) if total > 0 else 0.0,
+        'imbalance_ratio': float(negatives / positives) if positives > 0 else float('inf')
+    }
+    
+    logger.info(f"  Total samples: {balance_info['total']:,}")
+    logger.info(f"  Positives (transition=1): {balance_info['positives']:,} ({100*balance_info['positive_rate']:.2f}%)")
+    logger.info(f"  Negatives (transition=0): {balance_info['negatives']:,} ({100*balance_info['negative_rate']:.2f}%)")
+    logger.info(f"  Imbalance ratio: {balance_info['imbalance_ratio']:.1f}:1")
+    
+    elapsed = time.time() - start_time
+    logger.info(f"  Computed statistics in {elapsed:.1f}s")
+    
+    return balance_info
+
+
+def compute_year_splits_balance(con: duckdb.DuckDBPyConnection, output_path: Path) -> Dict[str, Any]:
+    """Compute class balance for each year split using DuckDB."""
+    logger.info("Computing class balance by year split...")
+    start_time = time.time()
+    
+    escaped_path = str(output_path).replace("'", "''")
+    
+    splits_info = {}
+    
+    for split_name, years in [('train', TRAIN_YEARS), ('val', VAL_YEARS), ('test', TEST_YEARS), ('test_late', TEST_LATE_YEARS)]:
+        years_list = ','.join(map(str, years))
+        
+        stats = con.execute(f"""
+            SELECT 
+                COUNT(*) AS total_rows,
+                SUM(transition_01) AS positives,
+                COUNT(*) - SUM(transition_01) AS negatives
+            FROM read_parquet('{escaped_path}')
+            WHERE year IN ({years_list})
+        """).fetchone()
+        
+        total, positives, negatives = stats
+        positives = int(positives)
+        negatives = int(negatives)
+        total = int(total)
+        
+        splits_info[split_name] = {
+            'years': years,
+            'total': total,
+            'positives': positives,
+            'negatives': negatives,
+            'positive_rate': float(positives / total) if total > 0 else 0.0,
+            'negative_rate': float(negatives / total) if total > 0 else 0.0,
+            'imbalance_ratio': float(negatives / positives) if positives > 0 else float('inf')
+        }
+        
+        logger.info(f"  {split_name.upper()} ({years[0]}-{years[-1]}): "
+                   f"{splits_info[split_name]['total']:,} samples, "
+                   f"{splits_info[split_name]['positives']:,} pos ({100*splits_info[split_name]['positive_rate']:.2f}%), "
+                   f"ratio {splits_info[split_name]['imbalance_ratio']:.1f}:1")
+    
+    elapsed = time.time() - start_time
+    logger.info(f"  Computed split statistics in {elapsed:.1f}s")
+    
+    return splits_info
+
+
+def verify_output(con: duckdb.DuckDBPyConnection, output_path: Path) -> None:
+    """Verify the output file is readable and has expected structure."""
+    logger.info("Verifying output file...")
+    
+    escaped_path = str(output_path).replace("'", "''")
+    
+    # Get row count and year range
+    stats = con.execute(f"""
+        SELECT 
+            COUNT(*) AS total_rows,
+            MIN(year) AS min_year,
+            MAX(year) AS max_year,
+            COUNT(DISTINCT year) AS num_years
+        FROM read_parquet('{escaped_path}')
+    """).fetchone()
+    
+    total_rows, min_year, max_year, num_years = stats
+    
+    logger.info(f"  ✓ Verified: {total_rows:,} rows")
+    logger.info(f"  ✓ Year range: {min_year}-{max_year} ({num_years} years)")
+    
+    # Check that all rows have WDPA_prev=0 (risk set)
+    risk_check = con.execute(f"""
+        SELECT COUNT(*) 
+        FROM read_parquet('{escaped_path}')
+        WHERE WDPA_prev != 0
+    """).fetchone()[0]
+    
+    if risk_check > 0:
+        logger.warning(f"  ⚠ Warning: {risk_check} rows have WDPA_prev != 0 (should be 0)")
+    else:
+        logger.info(f"  ✓ All rows in risk set (WDPA_prev=0)")
+
+
+def print_summary(balance_info: Dict[str, Any], splits_info: Dict[str, Any]) -> None:
+    """Print a summary of the dataset."""
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info("DATASET SUMMARY")
+    logger.info("=" * 70)
+    logger.info(f"Total samples: {balance_info['total']:,}")
+    logger.info(f"  Positives: {balance_info['positives']:,} ({100*balance_info['positive_rate']:.2f}%)")
+    logger.info(f"  Negatives: {balance_info['negatives']:,} ({100*balance_info['negative_rate']:.2f}%)")
+    logger.info(f"  Imbalance ratio: {balance_info['imbalance_ratio']:.1f}:1")
+    logger.info("")
+    logger.info("Year splits:")
+    for split_name in ['train', 'val', 'test', 'test_late']:
+        if split_name in splits_info:
+            info = splits_info[split_name]
+            logger.info(f"  {split_name.upper()}: {info['total']:,} samples "
+                       f"({info['positives']:,} pos, {100*info['positive_rate']:.2f}%)")
+    logger.info("")
+    logger.info("Precision@K-ready scoring keys: row, col, year columns preserved")
+    logger.info("=" * 70)
+
+
+def main() -> int:
+    """Main processing function."""
+    logger.info("=" * 70)
+    logger.info("Embeddings Transition Features Preprocessing (DuckDB)")
+    logger.info("=" * 70)
+    
+    con = None
+    try:
+        # Step 1: Validate input
+        validate_input(INPUT_FILE)
+        
+        # Step 2: Setup DuckDB
+        con = setup_duckdb()
+        report_memory_usage("after DuckDB setup")
+        
+        # Step 3: Process with DuckDB window functions and write to Parquet
+        process_with_duckdb(con, INPUT_FILE, OUTPUT_FILE)
+        report_memory_usage("after processing")
+        
+        # Step 4: Verify output
+        verify_output(con, OUTPUT_FILE)
+        
+        # Step 5: Compute statistics
+        balance_info = compute_statistics(con, OUTPUT_FILE)
+        splits_info = compute_year_splits_balance(con, OUTPUT_FILE)
+        
+        # Step 6: Print summary
+        print_summary(balance_info, splits_info)
+        
+        logger.info("")
+        logger.info("Processing completed successfully!")
+        return 0
+        
+    except FileNotFoundError as e:
+        logger.error(f"File not found: {e}")
+        return 1
+    except Exception as e:
+        logger.exception(f"Unexpected error: {e}")
+        return 1
+    finally:
+        if con:
+            con.close()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        logger.exception(f"Unexpected error: {e}")
+        sys.exit(1)

@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 
-"""Model1 Hyperparameter Tuning Script
+"""Model1 Random Forest Hyperparameter Tuning Script
 
-Purpose: Perform hyperparameter tuning for Random Forest and LightGBM models
+Purpose: Perform hyperparameter tuning for a Random Forest model
          using a random sample of ~1M rows from train.parquet with a strict
          temporal split (train: year <= 2014, val: 2015 <= year <= 2017).
 
 Input:   `train.parquet`
 Output:  - rf_best_params.json
-         - lgbm_best_params.json
 """
 
 from __future__ import annotations
@@ -25,30 +24,29 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import wandb
-from lightgbm import LGBMClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import RandomizedSearchCV, PredefinedSplit
-from sklearn.metrics import average_precision_score
 from sklearn.pipeline import Pipeline
 
 
 class Tee:
     """Write to both stdout and a file."""
+
     def __init__(self, file_path: Path):
-        self.file = open(file_path, 'w', encoding='utf-8')
+        self.file = open(file_path, "w", encoding="utf-8")
         self.stdout = sys.stdout
-    
+
     def write(self, text: str) -> None:
         self.stdout.write(text)
         self.stdout.flush()
         self.file.write(text)
         self.file.flush()
-    
+
     def flush(self) -> None:
         self.stdout.flush()
         self.file.flush()
-    
+
     def close(self) -> None:
         self.file.close()
 
@@ -56,6 +54,7 @@ class Tee:
 # =============================================================================
 # Utility Functions
 # =============================================================================
+
 
 def get_n_jobs() -> int:
     """Get number of jobs from SLURM_CPUS_PER_TASK, returning -1 on missing/invalid values."""
@@ -76,75 +75,67 @@ SAMPLE_SIZE = 1_000_000  # ~1M rows
 
 # Temporal split configuration
 TRAIN_YEAR_MAX = 2014  # train_idx = year <= 2014
-VAL_YEAR_MIN = 2015    # val_idx = 2015 <= year <= 2017
+VAL_YEAR_MIN = 2015  # val_idx = 2015 <= year <= 2017
 VAL_YEAR_MAX = 2017
 MIN_YEAR = int(os.environ.get("TRANSITION_MIN_YEAR", "2001"))  # drop year 2000 by default
 
 # Columns to exclude from features
 EXCLUDE_COLS = {
-    'transition_01',  # Target variable
-    'WDPA_b1',        # Leakage
-    'WDPA_prev',      # Leakage
-    'x',              # Coordinate
-    'y',              # Coordinate
-    'row',            # Identifier
-    'col',            # Identifier
-    'year',           # Temporal identifier (kept for splitting)
+    "transition_01",  # Target variable
+    "WDPA_b1",  # Leakage
+    "WDPA_prev",  # Leakage
+    "x",  # Coordinate
+    "y",  # Coordinate
+    "row",  # Identifier
+    "col",  # Identifier
+    "year",  # Temporal identifier (kept for splitting)
 }
 
 # RandomizedSearchCV configuration
-N_ITER_RF = 10   
-N_ITER_LGBM = 50 
+N_ITER_RF = 10
 
 # Random Forest parameter grid
 RF_PARAM_GRID = {
-    'rf__n_estimators': [300, 500],
-    'rf__max_depth': [15, 20, None],
-    'rf__max_features': ['sqrt', 'log2', 0.3],
-    'rf__min_samples_leaf': [2, 5, 10], 
+    "rf__n_estimators": [300, 500],
+    "rf__max_depth": [15, 20, None],
+    "rf__max_features": ["sqrt", "log2", 0.3],
+    "rf__min_samples_leaf": [2, 5, 10],
 }
 
-# Random Forest fixed parameters (CORRECTED)
+# Random Forest fixed parameters
 RF_FIXED_PARAMS = {
-    'random_state': RANDOM_STATE,
-    'n_jobs': get_n_jobs(),
-    'verbose': 0,
-    'class_weight': 'balanced_subsample',
-    'bootstrap': True,
+    "random_state": RANDOM_STATE,
+    "n_jobs": get_n_jobs(),
+    "verbose": 0,
+    "class_weight": "balanced_subsample",
+    "bootstrap": True,
 }
 
-# LightGBM parameter grid
-LGBM_PARAM_GRID = {
-    'num_leaves': [31, 63, 127],
-    'max_depth': [-1, 15, 25],
-    'learning_rate': [0.03, 0.05, 0.1], 
-    'min_child_samples': [20, 50, 100],
-    'subsample': [0.7, 0.9],
-    'colsample_bytree': [0.7, 0.9],
-    'scale_pos_weight': [2.0, 5.0, 10.0],
-    'reg_alpha': [0, 0.1, 1.0],
-    'reg_lambda': [0, 0.1, 1.0], 
-}
-
-# LightGBM fixed parameters (CORRECTED)
-LGBM_FIXED_PARAMS = {
-    'random_state': RANDOM_STATE,
-    'n_jobs': get_n_jobs(),
-    'boosting_type': 'gbdt',
-    'objective': 'binary',
-    'verbose': -1,
-    'n_estimators': 500, 
-}
 
 # =============================================================================
 # Utility Functions
 # =============================================================================
 
+
 def convert_numpy_types(obj: Any) -> Any:
     """Recursively convert NumPy types to native Python types for JSON serialization."""
-    if isinstance(obj, (np.integer, np.int_, np.intc, np.intp, np.int8,
-                        np.int16, np.int32, np.int64, np.uint8, np.uint16,
-                        np.uint32, np.uint64)):
+    if isinstance(
+        obj,
+        (
+            np.integer,
+            np.int_,
+            np.intc,
+            np.intp,
+            np.int8,
+            np.int16,
+            np.int32,
+            np.int64,
+            np.uint8,
+            np.uint16,
+            np.uint32,
+            np.uint64,
+        ),
+    ):
         return int(obj)
     elif isinstance(obj, (np.floating, np.float_, np.float16, np.float32, np.float64)):
         return float(obj)
@@ -160,7 +151,7 @@ def convert_numpy_types(obj: Any) -> Any:
         return obj
     else:
         try:
-            if hasattr(obj, 'item'):
+            if hasattr(obj, "item"):
                 return obj.item()
             else:
                 return obj
@@ -170,10 +161,9 @@ def convert_numpy_types(obj: Any) -> Any:
 
 def get_feature_columns(df: pd.DataFrame) -> list:
     """Get valid feature columns, excluding identifiers and leakage columns."""
-    numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
     feature_cols = [
-        col for col in numeric_cols
-        if col.lower() not in {c.lower() for c in EXCLUDE_COLS}
+        col for col in numeric_cols if col.lower() not in {c.lower() for c in EXCLUDE_COLS}
     ]
     return feature_cols
 
@@ -199,19 +189,20 @@ def resolve_train_parquet() -> Path:
 # Main Pipeline
 # =============================================================================
 
+
 def main() -> None:
     start_time = time.time()
-    
+
     # -------------------------------------------------------------------------
     # Setup paths
     # -------------------------------------------------------------------------
     repo_root = Path(__file__).resolve().parents[3]
     script_dir = Path(__file__).resolve().parent
-    
+
     train_path = resolve_train_parquet()
-    
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
+
     # Initialize W&B
     wandb_api_key = os.environ.get("WANDB_API_KEY")
     wandb_entity = os.environ.get("WANDB_ENTITY")
@@ -219,14 +210,14 @@ def main() -> None:
         print("Warning: WANDB_API_KEY not found in environment")
     if not wandb_entity:
         print("Warning: WANDB_ENTITY not found in environment (will use default)")
-    
+
     use_wandb = False
     try:
         print("Initializing Weights & Biases...")
         wandb.init(
-            project="ml-hyperparameter-tuning",
+            project="ml-hyperparameter-tuning-rf",
             entity=wandb_entity,
-            name=f"model1_tuning_{timestamp}",
+            name=f"model1_tuning_rf_{timestamp}",
             config={
                 "random_state": RANDOM_STATE,
                 "sample_size": SAMPLE_SIZE,
@@ -236,58 +227,57 @@ def main() -> None:
                     "val_year_max": VAL_YEAR_MAX,
                 },
                 "n_iter_rf": N_ITER_RF,
-                "n_iter_lgbm": N_ITER_LGBM,
             },
         )
         use_wandb = True
         print("W&B connected\n")
     except Exception as err:
         print(f"W&B initialization failed: {err}\n")
-    
+
     print("=" * 70)
-    print("MODEL1 HYPERPARAMETER TUNING")
+    print("MODEL1 RANDOM FOREST HYPERPARAMETER TUNING")
     print("=" * 70)
     print(f"\nInput:  {train_path}")
     print(f"Output: {script_dir}")
-    
+
     # -------------------------------------------------------------------------
     # Step 1: Load and sample data
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
     print("STEP 1: LOAD AND SAMPLE DATA")
     print("=" * 70)
-    
+
     print(f"\nLoading train.parquet...")
     load_start = time.time()
     df = pd.read_parquet(train_path)
     load_time = time.time() - load_start
     print(f"  Loaded {len(df):,} rows in {load_time:.1f}s")
-    
-    # Randomly sample ~200k rows
+
+    # Randomly sample ~1M rows
     if len(df) > SAMPLE_SIZE:
         print(f"\nRandomly sampling {SAMPLE_SIZE:,} rows...")
         df = df.sample(n=SAMPLE_SIZE, random_state=RANDOM_STATE, replace=False)
         print(f"  Sampled {len(df):,} rows")
     else:
         print(f"\nDataset has {len(df):,} rows (less than {SAMPLE_SIZE:,}), using all rows")
-    
+
     # Downcast numeric dtypes to reduce memory usage
     print("\nDowncasting numeric dtypes (float64→float32, int64→int32)...")
-    float_cols = df.select_dtypes(include=['float64']).columns
+    float_cols = df.select_dtypes(include=["float64"]).columns
     for col in float_cols:
-        df[col] = df[col].astype('float32')
-    
-    int_cols = df.select_dtypes(include=['int64']).columns
+        df[col] = df[col].astype("float32")
+
+    int_cols = df.select_dtypes(include=["int64"]).columns
     for col in int_cols:
-        df[col] = df[col].astype('int32')
+        df[col] = df[col].astype("int32")
     print("  Downcasting completed")
-    
+
     target_col = "transition_01"
-    
+
     # Check target column exists
     if target_col not in df.columns:
         raise ValueError(f"Target column '{target_col}' not found in data")
-    
+
     # Drop rows with missing target
     df_clean = df.dropna(subset=[target_col])
     dropped = len(df) - len(df_clean)
@@ -301,64 +291,64 @@ def main() -> None:
         removed = before - len(df_clean)
         if removed > 0:
             print(f"\nDropped {removed:,} rows with year < {MIN_YEAR} (TRANSITION_MIN_YEAR)")
-    
+
     print(f"\nFinal dataset: {len(df_clean):,} rows")
-    
+
     # Get feature columns
     feature_cols = get_feature_columns(df_clean)
     excluded_cols = sorted(EXCLUDE_COLS & set(df_clean.columns))
-    
+
     print(f"\nUsing {len(feature_cols)} features")
     print(f"Excluded columns ({len(excluded_cols)}): {excluded_cols}")
-    
+
     # Target distribution
     pos = (df_clean[target_col] > 0).sum()
     neg = (df_clean[target_col] == 0).sum()
     pos_pct = pos / len(df_clean) * 100
-    
+
     print(f"\n" + "-" * 40)
     print("Target distribution:")
     print(f"  No transition (0): {neg:>12,}  ({100 - pos_pct:.3f}%)")
     print(f"  Transition (0→1):  {pos:>12,}  ({pos_pct:.3f}%)")
     print(f"  Class ratio:       1 : {neg / max(pos, 1):.1f}")
     print("-" * 40)
-    
+
     # -------------------------------------------------------------------------
     # Step 2: Create temporal split
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
     print("STEP 2: CREATE TEMPORAL SPLIT")
     print("=" * 70)
-    
+
     # Create train and validation indices based on year
-    train_idx = df_clean['year'] <= TRAIN_YEAR_MAX
-    val_idx = (df_clean['year'] >= VAL_YEAR_MIN) & (df_clean['year'] <= VAL_YEAR_MAX)
-    
+    train_idx = df_clean["year"] <= TRAIN_YEAR_MAX
+    val_idx = (df_clean["year"] >= VAL_YEAR_MIN) & (df_clean["year"] <= VAL_YEAR_MAX)
+
     df_train = df_clean[train_idx].copy()
     df_val = df_clean[val_idx].copy()
-    
+
     print(f"\nTemporal split configuration:")
     print(f"  Train: year <= {TRAIN_YEAR_MAX}")
     print(f"  Val:   {VAL_YEAR_MIN} <= year <= {VAL_YEAR_MAX}")
-    
+
     print(f"\nTrain set: {len(df_train):,} rows")
     print(f"Val set:   {len(df_val):,} rows")
-    
+
     # Check years in each split
-    train_years = sorted(df_train['year'].unique())
-    val_years = sorted(df_val['year'].unique())
+    train_years = sorted(df_train["year"].unique())
+    val_years = sorted(df_val["year"].unique())
     print(f"\nTrain years: {train_years}")
     print(f"Val years:   {val_years}")
-    
+
     # Target distribution
     train_pos = (df_train[target_col] > 0).sum()
     train_neg = (df_train[target_col] == 0).sum()
     train_pos_pct = train_pos / len(df_train) * 100
-    
+
     val_pos = (df_val[target_col] > 0).sum()
     val_neg = (df_val[target_col] == 0).sum()
     val_pos_pct = val_pos / len(df_val) * 100
-    
+
     print(f"\n" + "-" * 40)
     print("Train set distribution:")
     print(f"  No transition (0): {train_neg:>12,}  ({100 - train_pos_pct:.3f}%)")
@@ -367,27 +357,27 @@ def main() -> None:
     print(f"  No transition (0): {val_neg:>12,}  ({100 - val_pos_pct:.3f}%)")
     print(f"  Transition (0→1):  {val_pos:>12,}  ({val_pos_pct:.3f}%)")
     print("-" * 40)
-    
+
     # -------------------------------------------------------------------------
     # Step 3: Prepare features and target
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
     print("STEP 3: PREPARE FEATURES AND TARGET")
     print("=" * 70)
-    
+
     # Training set
     y_train = (df_train[target_col] > 0).astype(np.int8)
     X_train = df_train[feature_cols]
-    
+
     # Validation set
     y_val = (df_val[target_col] > 0).astype(np.int8)
     X_val = df_val[feature_cols]
-    
+
     print(f"\nTrain feature matrix shape: {X_train.shape}")
     print(f"Train target shape: {y_train.shape}")
     print(f"Val feature matrix shape: {X_val.shape}")
     print(f"Val target shape: {y_val.shape}")
-    
+
     # Check for missing values
     missing_train = X_train.isnull().sum()
     cols_with_missing = missing_train[missing_train > 0]
@@ -396,238 +386,165 @@ def main() -> None:
         print("  Top 5:")
         for col, count in cols_with_missing.head().items():
             print(f"    {col}: {count:,} ({count/len(X_train)*100:.2f}%)")
-    
+
     # Store sizes for summary
     n_train = len(X_train)
     n_val = len(X_val)
-    
+
     # Combine train and val for RandomizedSearchCV with PredefinedSplit
     # -1 indicates train, 0 indicates test/val
     X_combined = pd.concat([X_train, X_val], ignore_index=True)
     y_combined = np.concatenate([y_train.values, y_val.values])
-    split_indices = np.concatenate([
-        np.full(n_train, -1),  # -1 for train
-        np.zeros(n_val)         # 0 for val/test
-    ])
+    split_indices = np.concatenate(
+        [
+            np.full(n_train, -1),  # -1 for train
+            np.zeros(n_val),  # 0 for val/test
+        ]
+    )
     predefined_split = PredefinedSplit(split_indices)
-    
+
     print(f"\nCombined dataset for CV: {len(X_combined):,} rows")
     print(f"  Train: {n_train:,} rows (indices -1)")
     print(f"  Val:   {n_val:,} rows (indices 0)")
-    
+
     # Free memory (keep combined data for now)
     del df, df_clean, X_train, X_val, y_train, y_val
     gc.collect()
-    
+
     # -------------------------------------------------------------------------
     # Step 4: Random Forest hyperparameter tuning
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
     print("STEP 4: RANDOM FOREST HYPERPARAMETER TUNING")
     print("=" * 70)
-    
-    print(f"\nUsing temporal split: train (year <= {TRAIN_YEAR_MAX}) / val ({VAL_YEAR_MIN} <= year <= {VAL_YEAR_MAX})")
+
+    print(
+        f"\nUsing temporal split: train (year <= {TRAIN_YEAR_MAX}) / "
+        f"val ({VAL_YEAR_MIN} <= year <= {VAL_YEAR_MAX})"
+    )
     print(f"Sampling {N_ITER_RF} parameter combinations with RandomizedSearchCV")
-    
+
     # Create Pipeline with imputer and Random Forest
     rf_model = RandomForestClassifier(**RF_FIXED_PARAMS)
-    pipeline = Pipeline([
-        ('imputer', SimpleImputer(strategy='median')),
-        ('rf', rf_model)
-    ])
-    
+    pipeline = Pipeline(
+        [
+            ("imputer", SimpleImputer(strategy="median")),
+            ("rf", rf_model),
+        ]
+    )
+
     print("\nParameter grid:")
     for param, values in RF_PARAM_GRID.items():
         print(f"  {param}: {values}")
-    
+
     print("\nFixed parameters:")
     for param, value in RF_FIXED_PARAMS.items():
         print(f"  {param}: {value}")
-    
+
     print("\nPipeline: SimpleImputer(strategy='median') → RandomForestClassifier")
-    
+
     # Randomized search with fixed train/val split
     print(f"\nStarting randomized search ({N_ITER_RF} iterations)...")
-    print(f"This may take a while...\n")
-    
+    print("This may take a while...\n")
+
     random_search_rf = RandomizedSearchCV(
         estimator=pipeline,
         param_distributions=RF_PARAM_GRID,
         n_iter=N_ITER_RF,
         cv=predefined_split,  # Use fixed train/val split
-        scoring='average_precision',  # PR-AUC (better for imbalanced data)
+        scoring="average_precision",  # PR-AUC (better for imbalanced data)
         n_jobs=1,  # Avoid nested parallelism
         verbose=2,
         random_state=RANDOM_STATE,
         return_train_score=True,
     )
-    
+
     tune_start_rf = time.time()
     random_search_rf.fit(X_combined, y_combined)
     tune_time_rf = time.time() - tune_start_rf
-    
+
     # best_score_ is the score on the validation set
     best_val_score_rf = random_search_rf.best_score_
-    
-    print(f"\nRandom Forest randomized search completed in {tune_time_rf:.1f}s ({tune_time_rf/60:.1f} min)")
-    print(f"\nBest parameters:")
+
+    print(
+        f"\nRandom Forest randomized search completed in "
+        f"{tune_time_rf:.1f}s ({tune_time_rf/60:.1f} min)"
+    )
+    print("\nBest parameters:")
     for param, value in random_search_rf.best_params_.items():
         print(f"  {param}: {value}")
     print(f"\nBest val score (PR-AUC): {best_val_score_rf:.4f}")
-    
+
     # Log to wandb
     if use_wandb:
-        wandb.log({
-            "rf/best_val_score": float(best_val_score_rf),
-            "rf/tuning_time_seconds": tune_time_rf,
-            "rf/best_params": random_search_rf.best_params_,
-        })
-    
+        wandb.log(
+            {
+                "rf/best_val_score": float(best_val_score_rf),
+                "rf/tuning_time_seconds": tune_time_rf,
+                "rf/best_params": random_search_rf.best_params_,
+            }
+        )
+
     # Save RF best parameters
     rf_best_params = {
-        'best_params': random_search_rf.best_params_,
-        'best_val_score': float(best_val_score_rf),
-        'param_grid': RF_PARAM_GRID,
-        'fixed_params': RF_FIXED_PARAMS,
-        'n_iter': N_ITER_RF,
-        'scoring': 'average_precision',
-        'tuning_time_seconds': tune_time_rf,
-        'split_info': {
-            'train_years': f'year <= {TRAIN_YEAR_MAX}',
-            'val_years': f'{VAL_YEAR_MIN} <= year <= {VAL_YEAR_MAX}',
-            'n_train': int(n_train),
-            'n_val': int(n_val),
+        "best_params": random_search_rf.best_params_,
+        "best_val_score": float(best_val_score_rf),
+        "param_grid": RF_PARAM_GRID,
+        "fixed_params": RF_FIXED_PARAMS,
+        "n_iter": N_ITER_RF,
+        "scoring": "average_precision",
+        "tuning_time_seconds": tune_time_rf,
+        "split_info": {
+            "train_years": f"year <= {TRAIN_YEAR_MAX}",
+            "val_years": f"{VAL_YEAR_MIN} <= year <= {VAL_YEAR_MAX}",
+            "n_train": int(n_train),
+            "n_val": int(n_val),
         },
     }
     rf_best_params = convert_numpy_types(rf_best_params)
-    
+
     rf_output_path = script_dir / "rf_best_params.json"
-    with open(rf_output_path, 'w') as f:
+    with open(rf_output_path, "w") as f:
         json.dump(rf_best_params, f, indent=2)
     print(f"\nRF best parameters saved to: {rf_output_path}")
-    
+
     # Free memory
     del random_search_rf, pipeline, rf_model
     gc.collect()
-    
-    # -------------------------------------------------------------------------
-    # Step 5: LightGBM hyperparameter tuning
-    # -------------------------------------------------------------------------
-    print("\n" + "=" * 70)
-    print("STEP 5: LIGHTGBM HYPERPARAMETER TUNING")
-    print("=" * 70)
-    
-    print(f"\nUsing temporal split: train (year <= {TRAIN_YEAR_MAX}) / val ({VAL_YEAR_MIN} <= year <= {VAL_YEAR_MAX})")
-    print(f"Sampling {N_ITER_LGBM} parameter combinations with RandomizedSearchCV")
-    
-    # Create LightGBM model
-    lgbm_model = LGBMClassifier(**LGBM_FIXED_PARAMS)
-    
-    print("\nParameter grid:")
-    for param, values in LGBM_PARAM_GRID.items():
-        print(f"  {param}: {values}")
-    
-    print("\nFixed parameters:")
-    for param, value in LGBM_FIXED_PARAMS.items():
-        print(f"  {param}: {value}")
-    
-    # Randomized search with fixed train/val split
-    print(f"\nStarting randomized search ({N_ITER_LGBM} iterations)...")
-    print(f"This may take a while...\n")
-    
-    random_search_lgbm = RandomizedSearchCV(
-        estimator=lgbm_model,
-        param_distributions=LGBM_PARAM_GRID,
-        n_iter=N_ITER_LGBM,
-        cv=predefined_split,  # Use fixed train/val split
-        scoring='average_precision',  # PR-AUC (better for imbalanced data)
-        n_jobs=1,  # Avoid nested parallelism
-        verbose=2,
-        random_state=RANDOM_STATE,
-        return_train_score=True,
-    )
-    
-    tune_start_lgbm = time.time()
-    random_search_lgbm.fit(X_combined, y_combined)
-    tune_time_lgbm = time.time() - tune_start_lgbm
-    
-    # best_score_ is the score on the validation set
-    best_val_score_lgbm = random_search_lgbm.best_score_
-    
-    print(f"\nLightGBM randomized search completed in {tune_time_lgbm:.1f}s ({tune_time_lgbm/60:.1f} min)")
-    print(f"\nBest parameters:")
-    for param, value in random_search_lgbm.best_params_.items():
-        print(f"  {param}: {value}")
-    print(f"\nBest val score (PR-AUC): {best_val_score_lgbm:.4f}")
-    
-    # Log to wandb
-    if use_wandb:
-        wandb.log({
-            "lgbm/best_val_score": float(best_val_score_lgbm),
-            "lgbm/tuning_time_seconds": tune_time_lgbm,
-            "lgbm/best_params": random_search_lgbm.best_params_,
-        })
-    
-    # Save LGBM best parameters
-    lgbm_best_params = {
-        'best_params': random_search_lgbm.best_params_,
-        'best_val_score': float(best_val_score_lgbm),
-        'param_grid': LGBM_PARAM_GRID,
-        'fixed_params': LGBM_FIXED_PARAMS,
-        'n_iter': N_ITER_LGBM,
-        'scoring': 'average_precision',
-        'tuning_time_seconds': tune_time_lgbm,
-        'split_info': {
-            'train_years': f'year <= {TRAIN_YEAR_MAX}',
-            'val_years': f'{VAL_YEAR_MIN} <= year <= {VAL_YEAR_MAX}',
-            'n_train': int(n_train),
-            'n_val': int(n_val),
-        },
-    }
-    lgbm_best_params = convert_numpy_types(lgbm_best_params)
-    
-    lgbm_output_path = script_dir / "lgbm_best_params.json"
-    with open(lgbm_output_path, 'w') as f:
-        json.dump(lgbm_best_params, f, indent=2)
-    print(f"\nLGBM best parameters saved to: {lgbm_output_path}")
-    
-    # Free memory
-    del random_search_lgbm, lgbm_model
-    gc.collect()
-    
+
     # -------------------------------------------------------------------------
     # Summary
     # -------------------------------------------------------------------------
     total_time = time.time() - start_time
-    
+
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    print(f"Dataset size (sampled):        {SAMPLE_SIZE:,} rows")
+    print(f"Dataset size (sampled):        {min(SAMPLE_SIZE, len(df)):,} rows")
     print(f"Features:                      {len(feature_cols)}")
-    print(f"\nTemporal split:")
+    print("\nTemporal split:")
     print(f"  Train: year <= {TRAIN_YEAR_MAX}  ({n_train:,} rows)")
     print(f"  Val:   {VAL_YEAR_MIN} <= year <= {VAL_YEAR_MAX}  ({n_val:,} rows)")
-    print(f"\nRandom Forest:")
+    print("\nRandom Forest:")
     print(f"  Best val score (PR-AUC):     {rf_best_params['best_val_score']:.4f}")
-    print(f"  Tuning time:                 {tune_time_rf:.1f}s ({tune_time_rf/60:.1f} min)")
+    print(
+        f"  Tuning time:                 "
+        f"{tune_time_rf:.1f}s ({tune_time_rf/60:.1f} min)"
+    )
     print(f"  Best parameters saved to:    {rf_output_path}")
-    print(f"\nLightGBM:")
-    print(f"  Best val score (PR-AUC):     {lgbm_best_params['best_val_score']:.4f}")
-    print(f"  Tuning time:                 {tune_time_lgbm:.1f}s ({tune_time_lgbm/60:.1f} min)")
-    print(f"  Best parameters saved to:   {lgbm_output_path}")
     print(f"\nTotal time:                    {total_time:.1f}s ({total_time/60:.1f} min)")
     print("=" * 70)
     print("Done.")
-    
+
     if use_wandb:
-        wandb.log({
-            "summary/total_time_seconds": total_time,
-            "summary/total_time_minutes": total_time / 60,
-            "summary/rf_best_val_score": float(rf_best_params['best_val_score']),
-            "summary/lgbm_best_val_score": float(lgbm_best_params['best_val_score']),
-            "status": "success"
-        })
+        wandb.log(
+            {
+                "summary/total_time_seconds": total_time,
+                "summary/total_time_minutes": total_time / 60,
+                "summary/rf_best_val_score": float(rf_best_params["best_val_score"]),
+                "status": "success",
+            }
+        )
         wandb.finish()
 
 
@@ -636,17 +553,19 @@ if __name__ == "__main__":
     repo_root = Path(__file__).resolve().parents[3]
     output_dir = repo_root / "outputs/Results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"model1_tuning_{timestamp}.txt"
-    
+    output_file = output_dir / f"model1_tuning_rf_{timestamp}.txt"
+
     tee = Tee(output_file)
     sys.stdout = tee
-    
+
     try:
         main()
     finally:
         sys.stdout = tee.stdout
         tee.close()
         print(f"\nOutput saved to: {output_file}")
+
+
 

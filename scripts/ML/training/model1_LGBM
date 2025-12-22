@@ -16,7 +16,7 @@ import time
 import pickle
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -170,13 +170,13 @@ def resolve_parquet_file(filename: str) -> Path:
     raise FileNotFoundError(f"{filename} not found in expected locations")
 
 
-def resolve_best_params_json() -> Path:
-    """Locate lgbm_best_params.json (in same directory as this script)."""
+def resolve_best_params_json() -> Optional[Path]:
+    """Locate lgbm_best_params.json (in same directory as this script). Returns None if not found."""
     script_dir = Path(__file__).resolve().parent
     params_path = script_dir / "lgbm_best_params.json"
     
     if not params_path.exists():
-        raise FileNotFoundError(f"lgbm_best_params.json not found at {params_path}")
+        return None
     
     return params_path
 
@@ -198,8 +198,18 @@ def resolve_train_metadata() -> Path:
     raise FileNotFoundError("train_early_metadata.json not found in expected locations")
 
 
-def load_best_params(params_path: Path) -> tuple[Dict[str, Any], Any]:
-    """Load and merge parameters: FIXED_PARAMS → json_fixed_params → best_params → guardrails."""
+def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
+    """Load and merge parameters: FIXED_PARAMS → json_fixed_params → best_params → guardrails.
+    If params_path is None, returns default manual hyperparameters."""
+    if params_path is None:
+        # Use default manual hyperparameters when JSON file is not found
+        print("  lgbm_best_params.json not found, using default manual hyperparameters")
+        guardrail_params = {"max_depth": 8, "num_leaves": 255, "min_child_samples": 50, "subsample": 0.7,
+                           "subsample_freq": 1, "colsample_bytree": 0.7, "learning_rate": 0.03, "n_estimators": 3000,
+                           "reg_alpha": 1.0, "reg_lambda": 1.0, "metric": "average_precision", "n_jobs": get_n_jobs(), "verbose": -1}
+        final_params = {**FIXED_PARAMS, **guardrail_params}
+        return final_params, None
+    
     with open(params_path, 'r') as f:
         params_data = json.load(f)
     final_params = {**FIXED_PARAMS, **params_data.get('fixed_params', {}), **params_data.get('best_params', {})}
@@ -817,12 +827,15 @@ def main() -> None:
         print(f"W&B failed: {err}")
     
     print("="*70 + "\nLGBM TRANSITION MODEL\n" + "="*70)
-    print(f"Train: {train_path}\nVal: {val_path}\nTest: {test_path}\nParams: {params_path}\nOutput: {output_dir}")
+    print(f"Train: {train_path}\nVal: {val_path}\nTest: {test_path}\nParams: {params_path if params_path else 'Using default manual hyperparameters'}\nOutput: {output_dir}")
     
     best_params, best_cv_score = load_best_params(params_path)
-    print(f"\nLoaded params from {params_path}")
-    if best_cv_score:
-        print(f"Best CV score: {best_cv_score:.4f}")
+    if params_path:
+        print(f"\nLoaded params from {params_path}")
+        if best_cv_score:
+            print(f"Best CV score: {best_cv_score:.4f}")
+    else:
+        print(f"\nUsing default manual hyperparameters (lgbm_best_params.json not found)")
     
     all_cols_train = pq.ParquetFile(train_path).schema_arrow.names
     all_cols_test = pq.ParquetFile(test_path).schema_arrow.names
