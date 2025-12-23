@@ -91,14 +91,17 @@ def reproject_colombia_mask(sa_src: rasterio.DatasetReader, sa_profile: dict) ->
         # Otherwise use the source's nodata value
         src_nodata = None if (colombia_src.nodata is None or colombia_src.nodata == 0) else colombia_src.nodata
         
+        # Read Colombia mask band into NumPy array to bypass broken EngineeringCRS
+        colombia_array = colombia_src.read(1)
+        
         # Reproject Colombia mask to SA grid
-        # Use SA backbone CRS for both source and destination
+        # Pass array as source and explicitly use EPSG:3857 to bypass broken EngineeringCRS
         # Use dst_nodata=None to avoid treating 0s as nodata (0 is a valid mask value)
         reproject(
-            source=rasterio.band(colombia_src, 1),
+            source=colombia_array,
             destination=dst,
             src_transform=colombia_src.transform,
-            src_crs=sa_profile["crs"],
+            src_crs=colombia_crs,
             src_nodata=src_nodata,
             dst_transform=sa_profile["transform"],
             dst_crs=sa_profile["crs"],
