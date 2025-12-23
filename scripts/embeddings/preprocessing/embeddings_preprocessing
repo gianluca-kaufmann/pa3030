@@ -11,7 +11,7 @@ Objective:
 Inputs:
     - Reference: `data/ready/backbone/backbone.tif` (defines target grid)
     - Embeddings: `data/ready/embeddings/SatelliteEmbeddings_SA_1km_<year>_merged.tif` (2018-2024)
-    - WDPA: `data/ready/WDPA/WDPA_SA_1km_<year>.tif` (2018-2024)
+    - WDPA: `data/ready/WDPA/WDPA_SA_1km_<year>.tif` (2017-2024)
 
 Outputs:
     - Aligned embeddings: `data/ml/embeddings_aligned/<year>.tif` (float32, bilinear resampling)
@@ -21,13 +21,16 @@ Processing:
     - Embeddings: bilinear resampling, float32 dtype
     - WDPA: nearest resampling, uint8 dtype, nodata=0
     - Strict alignment checks verify CRS, transform, and dimensions match
+    - Parallel processing using all available CPU cores
 """
 
 import sys
 import logging
 from pathlib import Path
-from typing import Tuple, Dict
+from typing import Tuple, Dict, Optional
 import time
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
 import rasterio
@@ -52,7 +55,11 @@ WDPA_INPUT_DIR = PROJECT_ROOT / "data" / "ready" / "WDPA"
 EMBEDDINGS_OUTPUT_DIR = PROJECT_ROOT / "data" / "ml" / "embeddings_aligned"
 WDPA_OUTPUT_DIR = PROJECT_ROOT / "data" / "ml" / "wdpa_aligned"
 
-YEARS = list(range(2018, 2025))  # 2018-2024
+EMBEDDINGS_YEARS = list(range(2018, 2025))  # 2018-2024
+WDPA_YEARS = list(range(2017, 2025))  # 2017-2024
+
+# Number of parallel workers (use all available CPUs by default)
+NUM_WORKERS = multiprocessing.cpu_count()
 
 
 def load_reference_profile() -> Dict:
@@ -181,7 +188,7 @@ def reproject_embeddings(
                 dst_width=dst_width,
                 dst_height=dst_height,
                 resampling=Resampling.bilinear,
-                dtype=np.float32,
+                dtype="float32",
                 nodata=np.nan,
             ) as vrt:
                 # Write output window-by-window
@@ -261,7 +268,7 @@ def reproject_wdpa(
                 dst_width=dst_width,
                 dst_height=dst_height,
                 resampling=Resampling.nearest,
-                dtype=np.uint8,
+                dtype="uint8",
                 nodata=0,
             ) as vrt:
                 # Write output window-by-window
@@ -295,9 +302,11 @@ def verify_output(output_path: Path, ref_profile: Dict, expected_dtype: str) -> 
         raise FileNotFoundError(f"Output file not created: {output_path}")
     
     with rasterio.open(output_path) as dst:
-        if dst.dtype != expected_dtype:
+        # Check dtype of first band (all bands should have same dtype)
+        actual_dtype = str(dst.dtypes[0])
+        if actual_dtype != expected_dtype:
             raise ValueError(
-                f"Output dtype mismatch: {dst.dtype} != {expected_dtype} "
+                f"Output dtype mismatch: {actual_dtype} != {expected_dtype} "
                 f"for {output_path.name}"
             )
         
@@ -309,6 +318,50 @@ def verify_output(output_path: Path, ref_profile: Dict, expected_dtype: str) -> 
             )
     
     logger.info(f"  ✓ Verified: {output_path.name}")
+
+
+def process_embeddings_year(args: Tuple[int, Dict, Path, Path, Path]) -> Tuple[int, bool, Optional[str]]:
+    """
+    Worker function to process embeddings for a single year.
+    Returns (year, success, error_message).
+    """
+    year, ref_profile, embeddings_input_dir, embeddings_output_dir, project_root = args
+    
+    # Re-initialize paths (they need to be picklable)
+    embeddings_input = embeddings_input_dir / f"SatelliteEmbeddings_SA_1km_{year}_merged.tif"
+    embeddings_output = embeddings_output_dir / f"{year}.tif"
+    
+    if not embeddings_input.exists():
+        return (year, False, f"Embeddings input not found: {embeddings_input.name}")
+    
+    try:
+        reproject_embeddings(embeddings_input, ref_profile, embeddings_output)
+        verify_output(embeddings_output, ref_profile, "float32")
+        return (year, True, None)
+    except Exception as e:
+        return (year, False, str(e))
+
+
+def process_wdpa_year(args: Tuple[int, Dict, Path, Path, Path]) -> Tuple[int, bool, Optional[str]]:
+    """
+    Worker function to process WDPA for a single year.
+    Returns (year, success, error_message).
+    """
+    year, ref_profile, wdpa_input_dir, wdpa_output_dir, project_root = args
+    
+    # Re-initialize paths (they need to be picklable)
+    wdpa_input = wdpa_input_dir / f"WDPA_SA_1km_{year}.tif"
+    wdpa_output = wdpa_output_dir / f"{year}.tif"
+    
+    if not wdpa_input.exists():
+        return (year, False, f"WDPA input not found: {wdpa_input.name}")
+    
+    try:
+        reproject_wdpa(wdpa_input, ref_profile, wdpa_output)
+        verify_output(wdpa_output, ref_profile, "uint8")
+        return (year, True, None)
+    except Exception as e:
+        return (year, False, str(e))
 
 
 def main() -> int:
@@ -324,48 +377,72 @@ def main() -> int:
         logger.error(str(e))
         return 1
     
-    # Process each year
+    logger.info(f"Using {NUM_WORKERS} parallel workers")
+    logger.info("")
+    
+    # Process embeddings for 2018-2024 in parallel
+    logger.info("")
+    logger.info(f"Processing embeddings for {len(EMBEDDINGS_YEARS)} years using {NUM_WORKERS} workers...")
+    logger.info("-" * 70)
+    
     processed_embeddings = []
-    processed_wdpa = []
     failed = []
     
-    for year in YEARS:
-        logger.info("")
-        logger.info(f"Processing year {year}...")
-        logger.info("-" * 70)
+    embeddings_args = [
+        (year, ref_profile, EMBEDDINGS_INPUT_DIR, EMBEDDINGS_OUTPUT_DIR, PROJECT_ROOT)
+        for year in EMBEDDINGS_YEARS
+    ]
+    
+    with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        future_to_year = {
+            executor.submit(process_embeddings_year, args): args[0]
+            for args in embeddings_args
+        }
         
-        # Embeddings
-        embeddings_input = (
-            EMBEDDINGS_INPUT_DIR / f"SatelliteEmbeddings_SA_1km_{year}_merged.tif"
-        )
-        embeddings_output = EMBEDDINGS_OUTPUT_DIR / f"{year}.tif"
-        
-        if not embeddings_input.exists():
-            logger.warning(f"  Embeddings input not found: {embeddings_input.name}")
-            failed.append(f"embeddings_{year}")
-        else:
+        for future in as_completed(future_to_year):
+            year = future_to_year[future]
             try:
-                reproject_embeddings(embeddings_input, ref_profile, embeddings_output)
-                verify_output(embeddings_output, ref_profile, "float32")
-                processed_embeddings.append(year)
+                year_result, success, error_msg = future.result()
+                if success:
+                    logger.info(f"  ✓ Completed embeddings for {year_result}")
+                    processed_embeddings.append(year_result)
+                else:
+                    logger.error(f"  ✗ Failed embeddings for {year_result}: {error_msg}")
+                    failed.append(f"embeddings_{year_result}")
             except Exception as e:
-                logger.error(f"  Failed to process embeddings for {year}: {e}")
+                logger.error(f"  ✗ Exception processing embeddings for {year}: {e}")
                 failed.append(f"embeddings_{year}")
+    
+    # Process WDPA for 2017-2024 in parallel
+    logger.info("")
+    logger.info(f"Processing WDPA for {len(WDPA_YEARS)} years using {NUM_WORKERS} workers...")
+    logger.info("-" * 70)
+    
+    processed_wdpa = []
+    
+    wdpa_args = [
+        (year, ref_profile, WDPA_INPUT_DIR, WDPA_OUTPUT_DIR, PROJECT_ROOT)
+        for year in WDPA_YEARS
+    ]
+    
+    with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        future_to_year = {
+            executor.submit(process_wdpa_year, args): args[0]
+            for args in wdpa_args
+        }
         
-        # WDPA
-        wdpa_input = WDPA_INPUT_DIR / f"WDPA_SA_1km_{year}.tif"
-        wdpa_output = WDPA_OUTPUT_DIR / f"{year}.tif"
-        
-        if not wdpa_input.exists():
-            logger.warning(f"  WDPA input not found: {wdpa_input.name}")
-            failed.append(f"wdpa_{year}")
-        else:
+        for future in as_completed(future_to_year):
+            year = future_to_year[future]
             try:
-                reproject_wdpa(wdpa_input, ref_profile, wdpa_output)
-                verify_output(wdpa_output, ref_profile, "uint8")
-                processed_wdpa.append(year)
+                year_result, success, error_msg = future.result()
+                if success:
+                    logger.info(f"  ✓ Completed WDPA for {year_result}")
+                    processed_wdpa.append(year_result)
+                else:
+                    logger.error(f"  ✗ Failed WDPA for {year_result}: {error_msg}")
+                    failed.append(f"wdpa_{year_result}")
             except Exception as e:
-                logger.error(f"  Failed to process WDPA for {year}: {e}")
+                logger.error(f"  ✗ Exception processing WDPA for {year}: {e}")
                 failed.append(f"wdpa_{year}")
     
     # Summary

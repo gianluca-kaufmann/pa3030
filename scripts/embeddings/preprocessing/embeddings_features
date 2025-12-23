@@ -9,18 +9,22 @@ Objective:
     transition_01 = WDPA_b1 (same-year target).
 
 Inputs:
-    - `data/ml/SatelliteEmbeddings_SA_1km_2017-2024.parquet` (contains WDPA_b1 + embeddings)
+    - `data/ml/SatelliteEmbeddings_SA_1km_2017.parquet` (2017 data for WDPA_prev computation)
+    - `data/ml/SatelliteEmbeddings_SA_1km_2018-2024.parquet` (2018-2024 data, contains WDPA_b1 + embeddings)
 
-    Processing (using DuckDB window functions):
-    1. For each pixel (row, col), compute:
+    Processing (using DuckDB window functions on thin table, then join):
+    1. Extract thin table (row, col, year, WDPA_b1) from all input files
+    2. For each pixel (row, col), compute on thin table:
        - WDPA_prev: LAG(WDPA_b1) OVER (PARTITION BY row, col ORDER BY year)
          (2017 defaults to 0, 2018 uses 2017's WDPA_b1)
-    2. Filter to risk set: WDPA_prev = 0 (pixels not previously protected at t-1)
-    3. Create target variable:
+    3. Filter to risk set: WDPA_prev = 0 (pixels not previously protected at t-1)
+    4. Create target variable:
        - transition_01 = WDPA_b1 (NaN treated as 0), stored as uint8
        - This is the same-year target: if unprotected at t-1, did you become protected at t?
-    4. Year range: Input 2017-2024 (2017 included for WDPA_prev), Output 2018-2024 (2017 excluded)
-    5. Create year splits: train (2018-2021), val (2022), test (2023), test_late (2024)
+    5. Filter to year range: 2018-2024 (2017 excluded, only used for WDPA_prev)
+    6. Join embeddings back from original files
+    7. Optionally process per-year and merge (enabled by default for memory efficiency)
+    8. Year splits: train (2018-2021), val (2022), test (2023), test_late (2024)
 
 Outputs:
     - `data/ml/embeddings_transition_panel_2018-2024.parquet` (main dataset)
@@ -32,7 +36,7 @@ import sys
 import os
 import logging
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List
 import time
 
 import duckdb
@@ -50,7 +54,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
 DATA_ML_DIR = PROJECT_ROOT / "data" / "ml"
 
-INPUT_FILE = DATA_ML_DIR / "SatelliteEmbeddings_SA_1km_2017-2024.parquet"
+# Input files: 2017 is separate, 2018-2024 is combined
+INPUT_FILES = [
+    DATA_ML_DIR / "SatelliteEmbeddings_SA_1km_2017.parquet",
+    DATA_ML_DIR / "SatelliteEmbeddings_SA_1km_2018-2024.parquet"
+]
 OUTPUT_FILE = DATA_ML_DIR / "embeddings_transition_panel_2018-2024.parquet"
 
 # Year splits
@@ -81,136 +89,127 @@ def setup_duckdb() -> duckdb.DuckDBPyConnection:
     """Configure and return a DuckDB connection."""
     con = duckdb.connect()
     
-    # Configure DuckDB settings
-    is_euler = bool(os.environ.get("SCRATCH"))
-    slurm_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", "0"))
-    num_threads = slurm_cpus if slurm_cpus > 0 else (48 if is_euler else 4)
+    # Configure DuckDB settings - use 1 thread and 8-12GB memory limit
+    # Allow override via environment variable, default to 10GB (middle of 8-12GB range)
+    memory_limit_gb = int(os.environ.get("DUCKDB_MEMORY_LIMIT_GB", "10"))
+    # Clamp to 8-12GB range
+    memory_limit_gb = max(8, min(12, memory_limit_gb))
     
-    slurm_mem_per_cpu_mb = os.environ.get("SLURM_MEM_PER_CPU")
-    if slurm_mem_per_cpu_mb and slurm_cpus:
-        total_mem_mb = int(slurm_mem_per_cpu_mb) * slurm_cpus
-        memory_limit_gb = max(1, total_mem_mb // 1024)
-    else:
-        memory_limit_gb = 128 if is_euler else 16
-    
-    con.execute(f"SET threads={num_threads}")
+    con.execute("SET threads=1")
     con.execute("SET preserve_insertion_order=false")
     con.execute(f"SET memory_limit='{memory_limit_gb}GB'")
     
+    # Ensure temp directory exists
     temp_dir = os.environ.get("SCRATCH") or (PROJECT_ROOT / "temp")
     if isinstance(temp_dir, str):
         temp_dir = Path(temp_dir)
     temp_dir.mkdir(parents=True, exist_ok=True)
-    temp_dir_sql = str(temp_dir).replace("'", "''")
-    con.execute(f"SET temp_directory='{temp_dir_sql}/duckdb_temp'")
     
-    if is_euler:
-        con.execute("PRAGMA max_temp_directory_size='200GB'")
+    # Create duckdb_temp subdirectory
+    duckdb_temp_dir = temp_dir / "duckdb_temp"
+    duckdb_temp_dir.mkdir(parents=True, exist_ok=True)
     
-    logger.info(f"DuckDB configured: {num_threads} threads, {memory_limit_gb}GB memory")
+    temp_dir_sql = str(duckdb_temp_dir).replace("'", "''")
+    con.execute(f"SET temp_directory='{temp_dir_sql}'")
+    
+    # Set max_temp_directory_size
+    max_temp_size = os.environ.get("DUCKDB_MAX_TEMP_SIZE", "100GB")
+    con.execute(f"PRAGMA max_temp_directory_size='{max_temp_size}'")
+    
+    logger.info(f"DuckDB configured: 1 thread, {memory_limit_gb}GB memory limit")
+    logger.info(f"  Temp directory: {duckdb_temp_dir}")
+    logger.info(f"  Temp directory size limit: {max_temp_size}")
     
     return con
 
 
-def validate_input(input_path: Path) -> None:
-    """Validate that input file exists and get basic info."""
-    logger.info(f"Validating input file: {input_path.name}...")
+def validate_input(input_paths: List[Path]) -> None:
+    """Validate that input files exist and get basic info."""
+    logger.info(f"Validating {len(input_paths)} input file(s)...")
     start_time = time.time()
     
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input file not found: {input_path}")
+    for input_path in input_paths:
+        if not input_path.exists():
+            raise FileNotFoundError(f"Input file not found: {input_path}")
+        logger.info(f"  Found: {input_path.name}")
     
-    # Quick check with DuckDB
+    # Quick check with DuckDB - combine all files
     con = duckdb.connect()
-    escaped_path = str(input_path).replace("'", "''")
+    escaped_paths = [str(p).replace("'", "''") for p in input_paths]
     
-    # Get basic stats
+    # Build UNION ALL query to combine all files
+    union_query = " UNION ALL ".join([f"SELECT * FROM read_parquet('{ep}')" for ep in escaped_paths])
+    
+    # Get basic stats (removed DISTINCT pixel count for performance)
     stats = con.execute(f"""
         SELECT 
             COUNT(*) AS total_rows,
             COUNT(DISTINCT year) AS num_years,
             MIN(year) AS min_year,
-            MAX(year) AS max_year,
-            (SELECT COUNT(*) FROM (SELECT DISTINCT row, col FROM read_parquet('{escaped_path}')) t) AS unique_pixels
-        FROM read_parquet('{escaped_path}')
+            MAX(year) AS max_year
+        FROM ({union_query}) t
     """).fetchone()
     
-    total_rows, num_years, min_year, max_year, unique_pixels = stats
+    total_rows, num_years, min_year, max_year = stats
     
     elapsed = time.time() - start_time
     logger.info(f"  Total rows: {total_rows:,}")
     logger.info(f"  Years: {num_years} ({min_year}-{max_year})")
-    logger.info(f"  Unique pixels: {unique_pixels:,}")
     logger.info(f"  Validated in {elapsed:.1f}s")
     
     con.close()
     report_memory_usage("after validation")
 
 
-def process_with_duckdb(con: duckdb.DuckDBPyConnection, input_path: Path, output_path: Path) -> None:
+def process_with_duckdb(con: duckdb.DuckDBPyConnection, input_paths: List[Path], output_path: Path) -> None:
     """
-    Process the dataset using DuckDB window functions and write directly to Parquet.
+    Process the dataset using DuckDB window functions on thin table, then join embeddings.
     
     Steps:
-    1. Compute WDPA_prev using LAG window function (first year defaults to 0)
-    2. Filter to risk set (WDPA_prev = 0) - pixels not previously protected at t-1
-    3. Create transition_01 = WDPA_b1 (NaN treated as 0) - same-year target
-    4. Filter to year range (2018-2024)
-    5. Write directly to Parquet using COPY TO
+    1. Extract thin table (row, col, year, WDPA_b1) from all input files
+    2. Compute WDPA_prev using LAG window function on thin table (first year defaults to 0)
+    3. Filter to risk set (WDPA_prev = 0) - pixels not previously protected at t-1
+    4. Create transition_01 = WDPA_b1 (NaN treated as 0) - same-year target
+    5. Filter to year range (2018-2024)
+    6. Join embeddings back from original files
+    7. Write to Parquet (optionally per-year, then merge)
     """
-    logger.info("Processing with DuckDB window functions...")
+    logger.info("Processing with DuckDB window functions (thin table + join)...")
     start_time = time.time()
     
     # Ensure output directory exists
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    escaped_input = str(input_path).replace("'", "''")
+    escaped_inputs = [str(p).replace("'", "''") for p in input_paths]
     escaped_output = str(output_path).replace("'", "''")
     
-    # Get column names from input file to dynamically build SELECT list
+    # Build UNION ALL query for thin table (row, col, year, WDPA_b1 only)
+    thin_union_query = " UNION ALL ".join([
+        f"SELECT row, col, year, WDPA_b1 FROM read_parquet('{ep}')" 
+        for ep in escaped_inputs
+    ])
+    
+    # Get embedding column names from first input file (they should be consistent)
     columns = con.execute(f"""
-        DESCRIBE SELECT * FROM read_parquet('{escaped_input}') LIMIT 0
+        DESCRIBE SELECT * FROM read_parquet('{escaped_inputs[0]}') LIMIT 0
     """).fetchall()
     
     # Extract embedding column names (all columns except row, col, year, WDPA_b1, x, y)
     exclude_cols = {'row', 'col', 'year', 'WDPA_b1', 'x', 'y'}
     embedding_cols = [col[0] for col in columns if col[0] not in exclude_cols]
-    embedding_cols_str = ', '.join(embedding_cols)
+    embedding_cols_str = ', '.join([f"e.{col}" for col in embedding_cols])
     
     logger.info(f"  Found {len(embedding_cols)} embedding columns")
     
-    # Build the processing query with window functions using CTEs
-    # Step 1: Compute WDPA_prev using LAG (2017 defaults to 0, 2018 uses 2017's WDPA_b1)
-    # Step 2: Filter to risk set (WDPA_prev = 0) and create transition_01 = WDPA_b1
-    # Step 3: Filter to year range (2018-2024, exclude 2017 which is only for WDPA_prev)
-    processing_query = f"""
-    COPY (
-        WITH with_lag AS (
-            SELECT 
-                *,
-                COALESCE(LAG(WDPA_b1) OVER (PARTITION BY row, col ORDER BY year), 0) AS WDPA_prev
-            FROM read_parquet('{escaped_input}')
-        )
-        SELECT 
-            row,
-            col,
-            year,
-            WDPA_b1,
-            WDPA_prev,
-            -- transition_01 = WDPA_b1 (NULL/NaN treated as 0), same as spatial_features_preprocessing
-            CAST(COALESCE(WDPA_b1, 0) AS UINT8) AS transition_01,
-            {embedding_cols_str}
-        FROM with_lag
-        WHERE 
-            -- Risk set: pixels not previously protected at t-1 (same as spatial_features_preprocessing)
-            WDPA_prev = 0
-            -- Year range: 2018-2024 (exclude 2017 which is only for WDPA_prev computation)
-            AND year BETWEEN 2018 AND 2024
-    ) TO '{escaped_output}' (FORMAT PARQUET, COMPRESSION 'snappy')
-    """
+    # Check if per-year processing is enabled (default: True for memory efficiency)
+    use_per_year = os.environ.get("DUCKDB_PER_YEAR_PROCESSING", "true").lower() == "true"
     
-    logger.info("  Executing processing query...")
-    con.execute(processing_query)
+    if use_per_year:
+        logger.info("  Using per-year processing for memory efficiency...")
+        _process_per_year(con, input_paths, output_path, thin_union_query, embedding_cols, embedding_cols_str)
+    else:
+        logger.info("  Using single-pass processing...")
+        _process_single_pass(con, input_paths, output_path, thin_union_query, embedding_cols, embedding_cols_str)
     
     elapsed = time.time() - start_time
     file_size_mb = output_path.stat().st_size / (1024**2)
@@ -228,6 +227,174 @@ def process_with_duckdb(con: duckdb.DuckDBPyConnection, input_path: Path, output
                 (f", ... and {len(columns) - 10} more" if len(columns) > 10 else ""))
     
     report_memory_usage("after processing")
+
+
+def _process_single_pass(con: duckdb.DuckDBPyConnection, input_paths: List[Path], 
+                         output_path: Path, thin_union_query: str, 
+                         embedding_cols: List[str], embedding_cols_str: str) -> None:
+    """Process all years in a single pass."""
+    escaped_inputs = [str(p).replace("'", "''") for p in input_paths]
+    escaped_output = str(output_path).replace("'", "''")
+    
+    # Build UNION ALL query for embeddings (all columns)
+    embeddings_union_query = " UNION ALL ".join([
+        f"SELECT * FROM read_parquet('{ep}')" for ep in escaped_inputs
+    ])
+    
+    # Process: thin table -> transitions -> join embeddings
+    processing_query = f"""
+    COPY (
+        WITH thin_data AS (
+            {thin_union_query}
+        ),
+        with_lag AS (
+            SELECT 
+                row,
+                col,
+                year,
+                WDPA_b1,
+                COALESCE(LAG(WDPA_b1) OVER (PARTITION BY row, col ORDER BY year), 0) AS WDPA_prev
+            FROM thin_data
+        ),
+        transitions AS (
+            SELECT 
+                row,
+                col,
+                year,
+                WDPA_b1,
+                WDPA_prev,
+                CAST(COALESCE(WDPA_b1, 0) AS UINT8) AS transition_01
+            FROM with_lag
+            WHERE 
+                WDPA_prev = 0
+                AND year BETWEEN 2018 AND 2024
+        ),
+        embeddings AS (
+            {embeddings_union_query}
+        )
+        SELECT 
+            t.row,
+            t.col,
+            t.year,
+            t.WDPA_b1,
+            t.WDPA_prev,
+            t.transition_01,
+            {embedding_cols_str}
+        FROM transitions t
+        INNER JOIN embeddings e
+            ON t.row = e.row 
+            AND t.col = e.col 
+            AND t.year = e.year
+    ) TO '{escaped_output}' (FORMAT PARQUET, COMPRESSION 'snappy')
+    """
+    
+    logger.info("  Executing single-pass processing query...")
+    con.execute(processing_query)
+
+
+def _process_per_year(con: duckdb.DuckDBPyConnection, input_paths: List[Path], 
+                      output_path: Path, thin_union_query: str, 
+                      embedding_cols: List[str], embedding_cols_str: str) -> None:
+    """Process year by year, then merge results."""
+    escaped_inputs = [str(p).replace("'", "''") for p in input_paths]
+    escaped_output = str(output_path).replace("'", "''")
+    
+    # Build UNION ALL query for embeddings (all columns)
+    embeddings_union_query = " UNION ALL ".join([
+        f"SELECT * FROM read_parquet('{ep}')" for ep in escaped_inputs
+    ])
+    
+    # Create temp directory for per-year outputs
+    temp_output_dir = output_path.parent / f"{output_path.stem}_temp"
+    temp_output_dir.mkdir(parents=True, exist_ok=True)
+    
+    year_files = []
+    
+    try:
+        # Process each output year (2018-2024)
+        for year in OUTPUT_YEARS:
+            logger.info(f"  Processing year {year}...")
+            year_output = temp_output_dir / f"year_{year}.parquet"
+            escaped_year_output = str(year_output).replace("'", "''")
+            
+            year_query = f"""
+            COPY (
+                WITH thin_data AS (
+                    {thin_union_query}
+                ),
+                with_lag AS (
+                    SELECT 
+                        row,
+                        col,
+                        year,
+                        WDPA_b1,
+                        COALESCE(LAG(WDPA_b1) OVER (PARTITION BY row, col ORDER BY year), 0) AS WDPA_prev
+                    FROM thin_data
+                ),
+                transitions AS (
+                    SELECT 
+                        row,
+                        col,
+                        year,
+                        WDPA_b1,
+                        WDPA_prev,
+                        CAST(COALESCE(WDPA_b1, 0) AS UINT8) AS transition_01
+                    FROM with_lag
+                    WHERE 
+                        WDPA_prev = 0
+                        AND year = {year}
+                ),
+                embeddings AS (
+                    SELECT * FROM ({embeddings_union_query}) e
+                    WHERE e.year = {year}
+                )
+                SELECT 
+                    t.row,
+                    t.col,
+                    t.year,
+                    t.WDPA_b1,
+                    t.WDPA_prev,
+                    t.transition_01,
+                    {embedding_cols_str}
+                FROM transitions t
+                INNER JOIN embeddings e
+                    ON t.row = e.row 
+                    AND t.col = e.col 
+                    AND t.year = e.year
+            ) TO '{escaped_year_output}' (FORMAT PARQUET, COMPRESSION 'snappy')
+            """
+            
+            con.execute(year_query)
+            year_files.append(year_output)
+            
+            # Report progress
+            if year_output.exists():
+                file_size_mb = year_output.stat().st_size / (1024**2)
+                logger.info(f"    Year {year}: {file_size_mb:.1f} MB")
+        
+        # Merge all year files
+        logger.info("  Merging per-year outputs...")
+        escaped_year_files = [str(f).replace("'", "''") for f in year_files]
+        year_files_union = " UNION ALL ".join([
+            f"SELECT * FROM read_parquet('{ef}')" for ef in escaped_year_files
+        ])
+        
+        merge_query = f"""
+        COPY (
+            {year_files_union}
+        ) TO '{escaped_output}' (FORMAT PARQUET, COMPRESSION 'snappy')
+        """
+        
+        con.execute(merge_query)
+        
+    finally:
+        # Clean up temp files
+        logger.info("  Cleaning up temporary files...")
+        for year_file in year_files:
+            if year_file.exists():
+                year_file.unlink()
+        if temp_output_dir.exists():
+            temp_output_dir.rmdir()
 
 
 def compute_statistics(con: duckdb.DuckDBPyConnection, output_path: Path) -> Dict[str, Any]:
@@ -383,14 +550,14 @@ def main() -> int:
     con = None
     try:
         # Step 1: Validate input
-        validate_input(INPUT_FILE)
+        validate_input(INPUT_FILES)
         
         # Step 2: Setup DuckDB
         con = setup_duckdb()
         report_memory_usage("after DuckDB setup")
         
         # Step 3: Process with DuckDB window functions and write to Parquet
-        process_with_duckdb(con, INPUT_FILE, OUTPUT_FILE)
+        process_with_duckdb(con, INPUT_FILES, OUTPUT_FILE)
         report_memory_usage("after processing")
         
         # Step 4: Verify output

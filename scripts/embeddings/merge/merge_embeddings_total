@@ -3,13 +3,14 @@
 Extract satellite embeddings for backbone==1 pixels and write to Parquet format.
 
 Data sources:
-- Consumes yearly merged GeoTIFF mosaics produced by the per-year embedding pipeline. The files are
-  expected under:
-  - ``data/ml/embeddings/SatelliteEmbeddings_SA_1km_<year>_merged.tif`` (storage-optimized, preferred)
+- Consumes yearly merged GeoTIFF mosaics produced by the per-year embedding pipeline or embeddings_preprocessing. The files are
+  expected under (checked in priority order):
+  - ``data/ml/embeddings_aligned/<year>.tif`` (from embeddings_preprocessing, preferred)
+  - ``data/ml/embeddings/SatelliteEmbeddings_SA_1km_<year>_merged.tif`` (storage-optimized)
   - ``data/ready/embeddings/SatelliteEmbeddings_SA_1km_<year>_merged.tif`` (from merge_embeddings_tiles)
   - ``data/embeddings/SatelliteEmbeddings_SA_1km_<year>_merged.tif`` (original fallback)
 - Uses ``data/ready/backbone/backbone.tif`` as the mask (extracts only pixels where backbone==1)
-- Loads aligned WDPA yearly rasters from ``data/ml/wdpa_aligned/WDPA_SA_1km_<year>.tif``
+- Loads aligned WDPA yearly rasters from ``data/ml/wdpa_aligned/<year>.tif`` (from embeddings_preprocessing, preferred) or ``data/ml/wdpa_aligned/WDPA_SA_1km_<year>.tif`` (fallback)
 - For 2017: Aligns ``data/ready/WDPA/WDPA_SA_1km_2017.tif`` to backbone grid if not already aligned
 
 Data location strategy:
@@ -54,6 +55,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import duckdb
 
+# Configure rasterio/GDAL to handle BigTIFF files properly
+os.environ.setdefault('GDAL_DISABLE_READDIR_ON_OPEN', 'EMPTY_DIR')
+
 # Paths
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent.parent.parent
@@ -64,20 +68,30 @@ else:
     DATA_ROOT = PROJECT_ROOT / "data"
 
 # Check multiple possible locations for merged embedding files
-# Priority: 1) ml/embeddings (storage-optimized), 2) ready/embeddings (from merge_embeddings_tiles), 3) embeddings (original)
+# Priority: 1) ml/embeddings_aligned (from embeddings_preprocessing), 2) ml/embeddings (storage-optimized), 
+#           3) ready/embeddings (from merge_embeddings_tiles), 4) embeddings (original)
+EMBEDDINGS_ALIGNED_DIR = DATA_ROOT / "ml" / "embeddings_aligned"
 ML_EMBEDDINGS_DIR = DATA_ROOT / "ml" / "embeddings"
 READY_EMBEDDINGS_DIR = DATA_ROOT / "ready" / "embeddings"
 ORIG_EMBEDDINGS_DIR = DATA_ROOT / "embeddings"
 
 # Select the best available source
-if ML_EMBEDDINGS_DIR.exists() and any(ML_EMBEDDINGS_DIR.iterdir()):
+# Check for embeddings_aligned first (output from embeddings_preprocessing)
+if EMBEDDINGS_ALIGNED_DIR.exists() and any(EMBEDDINGS_ALIGNED_DIR.iterdir()):
+    EMBEDDINGS_DIR = EMBEDDINGS_ALIGNED_DIR
+    USING_ALIGNED = True
+    USING_OPTIMIZED = False
+elif ML_EMBEDDINGS_DIR.exists() and any(ML_EMBEDDINGS_DIR.iterdir()):
     EMBEDDINGS_DIR = ML_EMBEDDINGS_DIR
+    USING_ALIGNED = False
     USING_OPTIMIZED = True
 elif READY_EMBEDDINGS_DIR.exists() and any(READY_EMBEDDINGS_DIR.iterdir()):
     EMBEDDINGS_DIR = READY_EMBEDDINGS_DIR
+    USING_ALIGNED = False
     USING_OPTIMIZED = False
 else:
     EMBEDDINGS_DIR = ORIG_EMBEDDINGS_DIR
+    USING_ALIGNED = False
     USING_OPTIMIZED = False
 
 # Backbone path
@@ -121,7 +135,7 @@ def load_backbone() -> Tuple[rasterio.DatasetReader, np.ndarray, dict]:
         print("Please ensure backbone.tif exists in data/ready/backbone/")
         sys.exit(1)
     
-    backbone_src = rasterio.open(BACKBONE_PATH)
+    backbone_src = rasterio.open(str(BACKBONE_PATH))
     backbone_mask = backbone_src.read(1)
     backbone_profile = backbone_src.profile.copy()
     
@@ -146,7 +160,12 @@ def find_yearly_files() -> Dict[int, Path]:
     missing_years = []
     
     for year in YEARS:
-        merged_file = EMBEDDINGS_DIR / f"SatelliteEmbeddings_SA_1km_{year}_merged.tif"
+        # Check for aligned files first (from embeddings_preprocessing: <year>.tif)
+        if USING_ALIGNED:
+            merged_file = EMBEDDINGS_DIR / f"{year}.tif"
+        else:
+            # Check for standard naming (SatelliteEmbeddings_SA_1km_<year>_merged.tif)
+            merged_file = EMBEDDINGS_DIR / f"SatelliteEmbeddings_SA_1km_{year}_merged.tif"
         
         if merged_file.exists():
             yearly_files[year] = merged_file
@@ -157,7 +176,10 @@ def find_yearly_files() -> Dict[int, Path]:
     
     if missing_years:
         print(f"\nERROR: Missing files for years: {missing_years}")
-        print("Please ensure all yearly merge scripts have been run first.")
+        if USING_ALIGNED:
+            print("Please ensure embeddings_preprocessing has been run first.")
+        else:
+            print("Please ensure all yearly merge scripts have been run first.")
         sys.exit(1)
     
     log_progress(f"Found all {len(yearly_files)} yearly files")
@@ -168,29 +190,37 @@ def align_wdpa_2017(backbone_profile: dict) -> Path:
     """
     Align/copy WDPA_SA_1km_2017.tif to data/ml/wdpa_aligned/ using backbone grid.
     Returns path to aligned file.
+    Checks for aligned format from embeddings_preprocessing first (<year>.tif).
     """
     log_progress("Aligning WDPA 2017 to backbone grid...")
     
     wdpa_2017_input = WDPA_INPUT_DIR / "WDPA_SA_1km_2017.tif"
-    wdpa_2017_output = WDPA_ALIGNED_DIR / "WDPA_SA_1km_2017.tif"
+    # Check for aligned format first (from embeddings_preprocessing)
+    wdpa_2017_output_aligned = WDPA_ALIGNED_DIR / "2017.tif"
+    # Fallback to standard naming
+    wdpa_2017_output_standard = WDPA_ALIGNED_DIR / "WDPA_SA_1km_2017.tif"
+    
+    # Create output directory
+    WDPA_ALIGNED_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # Check if already aligned (prefer aligned format from embeddings_preprocessing)
+    for wdpa_2017_output in [wdpa_2017_output_aligned, wdpa_2017_output_standard]:
+        if wdpa_2017_output.exists():
+            with rasterio.open(str(wdpa_2017_output)) as dst:
+                if (dst.width == backbone_profile["width"] and 
+                    dst.height == backbone_profile["height"] and
+                    dst.crs == backbone_profile["crs"] and
+                    np.allclose(dst.transform, backbone_profile["transform"], atol=1e-6)):
+                    log_progress(f"  WDPA 2017 already aligned: {wdpa_2017_output.name}")
+                    return wdpa_2017_output
     
     if not wdpa_2017_input.exists():
         print(f"ERROR: WDPA 2017 input file not found: {wdpa_2017_input}")
         print("Please ensure WDPA_SA_1km_2017.tif exists in data/ready/WDPA/")
         sys.exit(1)
     
-    # Create output directory
-    WDPA_ALIGNED_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # Check if already aligned
-    if wdpa_2017_output.exists():
-        with rasterio.open(wdpa_2017_output) as dst:
-            if (dst.width == backbone_profile["width"] and 
-                dst.height == backbone_profile["height"] and
-                dst.crs == backbone_profile["crs"] and
-                np.allclose(dst.transform, backbone_profile["transform"], atol=1e-6)):
-                log_progress(f"  WDPA 2017 already aligned: {wdpa_2017_output.name}")
-                return wdpa_2017_output
+    # Use aligned format (matching embeddings_preprocessing output)
+    wdpa_2017_output = wdpa_2017_output_aligned
     
     # Align using WarpedVRT (similar to embeddings_preprocessing)
     block_size = 512
@@ -207,7 +237,7 @@ def align_wdpa_2017(backbone_profile: dict) -> Path:
         BIGTIFF="YES"
     )
     
-    with rasterio.open(wdpa_2017_input) as src:
+    with rasterio.open(str(wdpa_2017_input)) as src:
         src_nodata = src.nodata if src.nodata is not None else 0
         
         with WarpedVRT(
@@ -220,10 +250,10 @@ def align_wdpa_2017(backbone_profile: dict) -> Path:
             dst_width=backbone_profile["width"],
             dst_height=backbone_profile["height"],
             resampling=Resampling.nearest,
-            dtype=np.uint8,
+            dtype="uint8",
             nodata=0,
         ) as vrt:
-            with rasterio.open(wdpa_2017_output, "w", **output_profile) as dst:
+            with rasterio.open(str(wdpa_2017_output), "w", **output_profile) as dst:
                 for _, window in dst.block_windows(1):
                     window_data = vrt.read(1, window=window, masked=False).astype(np.uint8)
                     window_data = np.clip(window_data, 0, 255)
@@ -258,14 +288,20 @@ def find_wdpa_yearly_files(backbone_profile: dict) -> Dict[int, Path]:
         if year == 2017:
             continue  # Already handled above
         
-        wdpa_file = WDPA_ALIGNED_DIR / f"WDPA_SA_1km_{year}.tif"
+        # Check for aligned files from embeddings_preprocessing first (<year>.tif)
+        wdpa_file_aligned = WDPA_ALIGNED_DIR / f"{year}.tif"
+        # Fallback to standard naming (WDPA_SA_1km_<year>.tif)
+        wdpa_file_standard = WDPA_ALIGNED_DIR / f"WDPA_SA_1km_{year}.tif"
         
-        if wdpa_file.exists():
-            wdpa_files[year] = wdpa_file
-            log_progress(f"  Found {year}: {wdpa_file.name}")
+        if wdpa_file_aligned.exists():
+            wdpa_files[year] = wdpa_file_aligned
+            log_progress(f"  Found {year}: {wdpa_file_aligned.name}")
+        elif wdpa_file_standard.exists():
+            wdpa_files[year] = wdpa_file_standard
+            log_progress(f"  Found {year}: {wdpa_file_standard.name}")
         else:
             missing_years.append(year)
-            log_progress(f"  Missing {year}: {wdpa_file}")
+            log_progress(f"  Missing {year}: {wdpa_file_aligned} or {wdpa_file_standard}")
     
     if missing_years:
         print(f"\nERROR: Missing WDPA files for years: {missing_years}")
@@ -303,8 +339,12 @@ def verify_spatial_alignment(yearly_files: Dict[int, Path], wdpa_files: Dict[int
     # Check first embedding year to get band count (skip 2017 which has no embeddings)
     first_emb_year = min(EMBEDDING_YEARS)
     first_file = yearly_files[first_emb_year]
-    with rasterio.open(first_file) as ref:
-        ref_bands = ref.count
+    try:
+        with rasterio.open(str(first_file), driver='GTiff') as ref:
+            ref_bands = ref.count
+    except Exception as e:
+        log_progress(f"  ERROR: Failed to open {first_file}: {e}")
+        raise
     
     log_progress(f"  Expected bands per year: {ref_bands}")
     
@@ -315,35 +355,50 @@ def verify_spatial_alignment(yearly_files: Dict[int, Path], wdpa_files: Dict[int
     log_progress("  Verifying embedding files...")
     for year in EMBEDDING_YEARS:
         file_path = yearly_files[year]
-        with rasterio.open(file_path) as src:
-            # Check dimensions
-            if src.width != ref_width or src.height != ref_height:
-                log_progress(f"  Mismatch for {year}: dimensions {src.width}×{src.height} vs {ref_width}×{ref_height}")
-                all_aligned = False
-                misaligned_years.append(year)
-                continue
-            
-            # Check CRS
-            if src.crs != ref_crs:
-                log_progress(f"  Mismatch for {year}: CRS {src.crs} vs {ref_crs}")
-                all_aligned = False
-                misaligned_years.append(year)
-                continue
-            
-            # Check transform
-            if src.transform != ref_transform:
-                log_progress(f"  Mismatch for {year}: transform differs")
-                log_progress(f"      Got: {src.transform}")
-                log_progress(f"      Expected: {ref_transform}")
-                all_aligned = False
-                misaligned_years.append(year)
-                continue
-            
-            # Check number of bands
-            if src.count != ref_bands:
-                log_progress(f"  Warning for {year}: band count {src.count} vs {ref_bands}")
-            
-            log_progress(f"  {year}: perfectly aligned")
+        max_retries = 3
+        retry_delay = 0.5
+        
+        for attempt in range(max_retries):
+            try:
+                # Explicitly specify driver for BigTIFF files
+                with rasterio.open(str(file_path), driver='GTiff') as src:
+                    # Check dimensions
+                    if src.width != ref_width or src.height != ref_height:
+                        log_progress(f"  Mismatch for {year}: dimensions {src.width}×{src.height} vs {ref_width}×{ref_height}")
+                        all_aligned = False
+                        misaligned_years.append(year)
+                        break
+                    
+                    # Check CRS
+                    if src.crs != ref_crs:
+                        log_progress(f"  Mismatch for {year}: CRS {src.crs} vs {ref_crs}")
+                        all_aligned = False
+                        misaligned_years.append(year)
+                        break
+                    
+                    # Check transform
+                    if src.transform != ref_transform:
+                        log_progress(f"  Mismatch for {year}: transform differs")
+                        log_progress(f"      Got: {src.transform}")
+                        log_progress(f"      Expected: {ref_transform}")
+                        all_aligned = False
+                        misaligned_years.append(year)
+                        break
+                    
+                    # Check number of bands
+                    if src.count != ref_bands:
+                        log_progress(f"  Warning for {year}: band count {src.count} vs {ref_bands}")
+                    
+                    log_progress(f"  {year}: perfectly aligned")
+                    break  # Success, exit retry loop
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    log_progress(f"  Retry {attempt + 1}/{max_retries} for {year}...")
+                    time.sleep(retry_delay)
+                else:
+                    log_progress(f"  ERROR opening {year} after {max_retries} attempts: {e}")
+                    all_aligned = False
+                    misaligned_years.append(year)
     
     # Verify all WDPA years match backbone
     log_progress("  Verifying WDPA files...")
@@ -351,35 +406,50 @@ def verify_spatial_alignment(yearly_files: Dict[int, Path], wdpa_files: Dict[int
     
     for year in WDPA_YEARS:
         file_path = wdpa_files[year]
-        with rasterio.open(file_path) as src:
-            # Check dimensions
-            if src.width != ref_width or src.height != ref_height:
-                log_progress(f"  WDPA mismatch for {year}: dimensions {src.width}×{src.height} vs {ref_width}×{ref_height}")
-                all_aligned = False
-                wdpa_misaligned_years.append(year)
-                continue
-            
-            # Check CRS
-            if src.crs != ref_crs:
-                log_progress(f"  WDPA mismatch for {year}: CRS {src.crs} vs {ref_crs}")
-                all_aligned = False
-                wdpa_misaligned_years.append(year)
-                continue
-            
-            # Check transform
-            if src.transform != ref_transform:
-                log_progress(f"  WDPA mismatch for {year}: transform differs")
-                log_progress(f"      Got: {src.transform}")
-                log_progress(f"      Expected: {ref_transform}")
-                all_aligned = False
-                wdpa_misaligned_years.append(year)
-                continue
-            
-            # Check number of bands (should be 1)
-            if src.count != 1:
-                log_progress(f"  Warning for WDPA {year}: band count {src.count} (expected 1)")
-            
-            log_progress(f"  WDPA {year}: perfectly aligned")
+        max_retries = 3
+        retry_delay = 0.5
+        
+        for attempt in range(max_retries):
+            try:
+                # Explicitly specify driver for BigTIFF files
+                with rasterio.open(str(file_path), driver='GTiff') as src:
+                    # Check dimensions
+                    if src.width != ref_width or src.height != ref_height:
+                        log_progress(f"  WDPA mismatch for {year}: dimensions {src.width}×{src.height} vs {ref_width}×{ref_height}")
+                        all_aligned = False
+                        wdpa_misaligned_years.append(year)
+                        break
+                    
+                    # Check CRS
+                    if src.crs != ref_crs:
+                        log_progress(f"  WDPA mismatch for {year}: CRS {src.crs} vs {ref_crs}")
+                        all_aligned = False
+                        wdpa_misaligned_years.append(year)
+                        break
+                    
+                    # Check transform
+                    if src.transform != ref_transform:
+                        log_progress(f"  WDPA mismatch for {year}: transform differs")
+                        log_progress(f"      Got: {src.transform}")
+                        log_progress(f"      Expected: {ref_transform}")
+                        all_aligned = False
+                        wdpa_misaligned_years.append(year)
+                        break
+                    
+                    # Check number of bands (should be 1)
+                    if src.count != 1:
+                        log_progress(f"  Warning for WDPA {year}: band count {src.count} (expected 1)")
+                    
+                    log_progress(f"  WDPA {year}: perfectly aligned")
+                    break  # Success, exit retry loop
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    log_progress(f"  Retry {attempt + 1}/{max_retries} for WDPA {year}...")
+                    time.sleep(retry_delay)
+                else:
+                    log_progress(f"  ERROR opening WDPA {year} after {max_retries} attempts: {e}")
+                    all_aligned = False
+                    wdpa_misaligned_years.append(year)
     
     if not all_aligned:
         print(f"\nERROR: Spatial alignment verification failed")
@@ -401,7 +471,7 @@ def determine_wdpa_dtype(wdpa_file: Path) -> Tuple[pa.DataType, type]:
     Returns:
         Tuple of (Arrow data type, NumPy data type)
     """
-    with rasterio.open(wdpa_file) as src:
+    with rasterio.open(str(wdpa_file)) as src:
         # Sample a representative window to check value range
         # Use a central window to avoid edge effects
         sample_size = min(1000, src.width, src.height)
@@ -547,11 +617,11 @@ def process_year_to_parquet(year: int, yearly_file: Path, wdpa_file: Path,
     
     window_idx = 0
     if has_embeddings:
-        embeddings_src = rasterio.open(yearly_file)
+        embeddings_src = rasterio.open(str(yearly_file))
     else:
         embeddings_src = None
     
-    wdpa_src = rasterio.open(wdpa_file)
+    wdpa_src = rasterio.open(str(wdpa_file))
     
     try:
         for row_idx in range(num_rows):
@@ -744,7 +814,9 @@ def validate_output(output_path: Path):
     """).fetchall()
     
     log_progress(f"  Columns ({len(columns)}):")
-    for col_name, col_type in columns[:10]:  # Show first 10
+    for col_info in columns[:10]:  # Show first 10
+        col_name = col_info[0]  # First element is column name
+        col_type = col_info[1]  # Second element is column type
         log_progress(f"    {col_name}: {col_type}")
     if len(columns) > 10:
         log_progress(f"    ... and {len(columns) - 10} more columns")
@@ -761,7 +833,10 @@ def main():
     log_progress("=" * 80)
     
     # Log data source
-    if EMBEDDINGS_DIR == ML_EMBEDDINGS_DIR:
+    if EMBEDDINGS_DIR == EMBEDDINGS_ALIGNED_DIR:
+        log_progress(f"Using ALIGNED embeddings from: {EMBEDDINGS_DIR}")
+        log_progress("  (Output from embeddings_preprocessing)")
+    elif EMBEDDINGS_DIR == ML_EMBEDDINGS_DIR:
         log_progress(f"Using STORAGE-OPTIMIZED embeddings from: {EMBEDDINGS_DIR}")
     elif EMBEDDINGS_DIR == READY_EMBEDDINGS_DIR:
         log_progress(f"Using READY embeddings from: {EMBEDDINGS_DIR}")
@@ -773,6 +848,7 @@ def main():
     if not EMBEDDINGS_DIR.exists():
         print(f"ERROR: Embeddings directory not found: {EMBEDDINGS_DIR}")
         print(f"  Checked locations:")
+        print(f"    - Aligned: {EMBEDDINGS_ALIGNED_DIR} (exists: {EMBEDDINGS_ALIGNED_DIR.exists()})")
         print(f"    - Storage-optimized: {ML_EMBEDDINGS_DIR} (exists: {ML_EMBEDDINGS_DIR.exists()})")
         print(f"    - Ready: {READY_EMBEDDINGS_DIR} (exists: {READY_EMBEDDINGS_DIR.exists()})")
         print(f"    - Original: {ORIG_EMBEDDINGS_DIR} (exists: {ORIG_EMBEDDINGS_DIR.exists()})")
