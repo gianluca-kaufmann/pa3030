@@ -21,6 +21,7 @@ import warnings
 
 import numpy as np
 import rasterio
+from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.warp import reproject
 
@@ -77,6 +78,10 @@ def reproject_colombia_mask(sa_src: rasterio.DatasetReader, sa_profile: dict) ->
     with rasterio.open(COLOMBIA_INPUT_PATH) as colombia_src:
         print(f"  Source: shape={colombia_src.shape}, CRS={colombia_src.crs}")
         
+        # Explicitly override Colombia mask CRS to EPSG:3857 (don't use CRS from file)
+        colombia_crs = CRS.from_epsg(3857)
+        print(f"  Overriding source CRS to EPSG:3857 (file had CRS={colombia_src.crs})")
+        
         # Create destination array with SA grid dimensions
         dst_shape = (sa_profile["height"], sa_profile["width"])
         dst = np.zeros(dst_shape, dtype=np.float32)
@@ -87,12 +92,13 @@ def reproject_colombia_mask(sa_src: rasterio.DatasetReader, sa_profile: dict) ->
         src_nodata = None if (colombia_src.nodata is None or colombia_src.nodata == 0) else colombia_src.nodata
         
         # Reproject Colombia mask to SA grid
+        # Use SA backbone CRS for both source and destination
         # Use dst_nodata=None to avoid treating 0s as nodata (0 is a valid mask value)
         reproject(
             source=rasterio.band(colombia_src, 1),
             destination=dst,
             src_transform=colombia_src.transform,
-            src_crs=colombia_src.crs,
+            src_crs=sa_profile["crs"],
             src_nodata=src_nodata,
             dst_transform=sa_profile["transform"],
             dst_crs=sa_profile["crs"],
