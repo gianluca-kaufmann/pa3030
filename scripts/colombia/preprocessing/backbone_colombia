@@ -65,7 +65,7 @@ def load_sa_backbone() -> tuple[rasterio.DatasetReader, dict]:
     return src, profile
 
 
-def reproject_colombia_mask(sa_src: rasterio.DatasetReader, sa_profile: dict) -> np.ndarray:
+def reproject_colombia_mask(sa_profile: dict, sa_crs: CRS) -> np.ndarray:
     """Reproject Colombia mask onto SA grid."""
     print(f"\nReprojecting {COLOMBIA_INPUT_PATH.name} to SA grid...")
     
@@ -104,7 +104,7 @@ def reproject_colombia_mask(sa_src: rasterio.DatasetReader, sa_profile: dict) ->
             src_crs=colombia_crs,
             src_nodata=src_nodata,
             dst_transform=sa_profile["transform"],
-            dst_crs=sa_profile["crs"],
+            dst_crs=sa_crs,
             resampling=Resampling.nearest,
             dst_nodata=None,  # Don't use 0 as nodata since 0 is a valid mask value
         )
@@ -119,7 +119,7 @@ def reproject_colombia_mask(sa_src: rasterio.DatasetReader, sa_profile: dict) ->
         return colombia_mask_sa
 
 
-def save_colombia_backbone(colombia_mask: np.ndarray, sa_profile: dict, sa_src: rasterio.DatasetReader) -> None:
+def save_colombia_backbone(colombia_mask: np.ndarray, sa_profile: dict, sa_src: rasterio.DatasetReader, sa_crs: CRS) -> None:
     """Save reprojected Colombia mask with SA profile."""
     print(f"\nSaving {COLOMBIA_OUTPUT_PATH.name}...")
     
@@ -140,8 +140,8 @@ def save_colombia_backbone(colombia_mask: np.ndarray, sa_profile: dict, sa_src: 
         assert output_src.shape == sa_src.shape, (
             f"Output shape {output_src.shape} does not match SA backbone shape {sa_src.shape}"
         )
-        assert output_src.crs == sa_src.crs, (
-            f"Output CRS {output_src.crs} does not match SA backbone CRS {sa_src.crs}"
+        assert output_src.crs == sa_crs, (
+            f"Output CRS {output_src.crs} does not match SA CRS {sa_crs}"
         )
         assert np.allclose(output_src.transform, sa_src.transform, atol=1e-6), (
             f"Output transform {output_src.transform} does not match SA backbone transform {sa_src.transform}"
@@ -167,7 +167,7 @@ def create_colombia_sa_grid(colombia_mask: np.ndarray, sa_src: rasterio.DatasetR
     return colombia_sa_grid
 
 
-def save_colombia_sa_grid(colombia_sa_grid: np.ndarray, sa_profile: dict, sa_src: rasterio.DatasetReader) -> None:
+def save_colombia_sa_grid(colombia_sa_grid: np.ndarray, sa_profile: dict, sa_src: rasterio.DatasetReader, sa_crs: CRS) -> None:
     """Save combined Colombia-SA grid mask."""
     print(f"\nSaving {COLOMBIA_SA_GRID_PATH.name}...")
     
@@ -188,8 +188,8 @@ def save_colombia_sa_grid(colombia_sa_grid: np.ndarray, sa_profile: dict, sa_src
         assert output_src.shape == sa_src.shape, (
             f"Output shape {output_src.shape} does not match SA backbone shape {sa_src.shape}"
         )
-        assert output_src.crs == sa_src.crs, (
-            f"Output CRS {output_src.crs} does not match SA backbone CRS {sa_src.crs}"
+        assert output_src.crs == sa_crs, (
+            f"Output CRS {output_src.crs} does not match SA CRS {sa_crs}"
         )
         assert np.allclose(output_src.transform, sa_src.transform, atol=1e-6), (
             f"Output transform {output_src.transform} does not match SA backbone transform {sa_src.transform}"
@@ -211,16 +211,20 @@ def main() -> None:
     # Load SA backbone for reference grid
     sa_src, sa_profile = load_sa_backbone()
     
+    # Define SA CRS and update profile
+    sa_crs = CRS.from_epsg(3857)
+    sa_profile["crs"] = sa_crs
+    
     try:
         # Reproject Colombia mask to SA grid
-        colombia_mask_sa = reproject_colombia_mask(sa_src, sa_profile)
+        colombia_mask_sa = reproject_colombia_mask(sa_profile, sa_crs)
         
         # Save reprojected Colombia mask
-        save_colombia_backbone(colombia_mask_sa, sa_profile, sa_src)
+        save_colombia_backbone(colombia_mask_sa, sa_profile, sa_src, sa_crs)
         
         # Create and save combined mask (optional)
         colombia_sa_grid = create_colombia_sa_grid(colombia_mask_sa, sa_src)
-        save_colombia_sa_grid(colombia_sa_grid, sa_profile, sa_src)
+        save_colombia_sa_grid(colombia_sa_grid, sa_profile, sa_src, sa_crs)
         
         print("\n" + "=" * 60)
         print("Processing complete.")
