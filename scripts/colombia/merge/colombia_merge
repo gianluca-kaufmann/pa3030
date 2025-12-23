@@ -98,7 +98,6 @@ import rasterio
 from rasterio.enums import Resampling
 from rasterio.warp import reproject
 from rasterio.windows import Window
-from rasterio.crs import CRS
 import pyarrow as pa
 import pyarrow.parquet as pq
 import wandb
@@ -141,257 +140,6 @@ def log_progress(message: str, start_time: Optional[float] = None):
         print(f"[time] {message} ({elapsed:.1f}s)")
     else:
         print(f"[info] {message}")
-
-
-def coerce_pseudo_mercator(crs, log_preflight: bool = False, filename: Optional[str] = None) -> CRS:
-    """
-    Coerce Pseudo-Mercator (LOCAL_CS["WGS 84 / Pseudo-Mercator"...]) to EPSG:3857.
-    
-    Returns CRS.from_epsg(3857) if crs is None or if WKT contains "LOCAL_CS" and "Pseudo-Mercator",
-    otherwise returns the original crs unchanged.
-    
-    This avoids CRS operations (warping/transforming) on problematic EngineeringCRS/PROJJSON formats
-    by treating them as EPSG:3857 directly.
-    
-    Args:
-        crs: CRS object or representation to coerce
-        log_preflight: If True, log original CRS WKT snippet and coerced EPSG code
-        filename: Optional filename for logging
-    
-    Returns:
-        Coerced CRS object (EPSG:3857 for Pseudo-Mercator, original otherwise)
-    """
-    if crs is None:
-        coerced = CRS.from_epsg(3857)
-        if log_preflight:
-            log_progress(f"  Preflight CRS: None -> EPSG:3857{f' ({filename})' if filename else ''}")
-        return coerced
-    
-    original_wkt_snippet = None
-    was_pseudo_mercator = False
-    
-    try:
-        # Get WKT representation to check for LOCAL_CS and Pseudo-Mercator
-        crs_wkt = None
-        if isinstance(crs, CRS):
-            try:
-                crs_wkt = crs.to_wkt()
-            except:
-                try:
-                    crs_wkt = str(crs)
-                except:
-                    pass
-        else:
-            crs_wkt = str(crs)
-        
-        if crs_wkt:
-            original_wkt_snippet = crs_wkt[:200] if len(crs_wkt) > 200 else crs_wkt
-            if "LOCAL_CS" in crs_wkt and "Pseudo-Mercator" in crs_wkt:
-                was_pseudo_mercator = True
-                coerced = CRS.from_epsg(3857)
-                if log_preflight:
-                    log_progress(f"  Preflight CRS (coerced): {original_wkt_snippet}... -> EPSG:3857{f' ({filename})' if filename else ''}")
-                return coerced
-    except:
-        pass
-    
-    # Return original CRS if it's already a CRS object, otherwise try to convert
-    if isinstance(crs, CRS):
-        coerced = crs
-    else:
-        try:
-            coerced = CRS(crs)
-        except:
-            coerced = CRS.from_epsg(3857)  # Fallback to EPSG:3857 if conversion fails
-    
-    if log_preflight:
-        try:
-            coerced_epsg = coerced.to_epsg() if coerced else None
-            epsg_str = f"EPSG:{coerced_epsg}" if coerced_epsg else str(coerced)
-        except:
-            epsg_str = str(coerced)
-        wkt_info = f" (WKT: {original_wkt_snippet}...)" if original_wkt_snippet else ""
-        log_progress(f"  Preflight CRS: {wkt_info} -> {epsg_str}{f' ({filename})' if filename else ''}")
-    
-    return coerced
-
-
-def normalize_crs(crs, debug_filename: Optional[str] = None, _debug_log: Optional[dict] = None) -> Optional[CRS]:
-    """
-    Normalize CRS to a standard format, handling PROJ JSON and EngineeringCRS.
-    
-    This function handles cases where CRS is in PROJ JSON format, EngineeringCRS, or other formats
-    that might not be directly compatible with rasterio reprojection operations.
-    Only converts Pseudo-Mercator CRS to EPSG:3857 when clearly detected.
-    Does not default to EPSG:3857 otherwise.
-    
-    Args:
-        crs: CRS object or string representation
-        debug_filename: Optional filename for debug logging (one-time per session)
-        _debug_log: Optional dict for tracking debug state (internal use)
-        
-    Returns:
-        Normalized CRS object, or None if CRS cannot be determined
-    """
-    if _debug_log is None:
-        _debug_log = {}
-    if crs is None:
-        return None
-    
-    try:
-        # Get string representation and type information
-        crs_str = ""
-        crs_name = None
-        crs_type = None
-        
-        if isinstance(crs, CRS):
-            try:
-                # Get CRS type (e.g., 'EngineeringCRS', 'GeographicCRS', etc.)
-                if hasattr(crs, '__class__'):
-                    crs_type = crs.__class__.__name__
-                
-                # Try to get the name attribute if available
-                if hasattr(crs, 'name'):
-                    crs_name = str(crs.name).lower() if crs.name else None
-                
-                # Try to_string() but catch errors (fails for some PROJJSON/EngineeringCRS)
-                try:
-                    crs_str = crs.to_string()
-                except:
-                    # If to_string() fails, try WKT or other representation
-                    try:
-                        crs_str = str(crs)
-                    except:
-                        crs_str = ""
-            except:
-                crs_str = str(crs)
-        else:
-            crs_str = str(crs)
-        
-        # One-time debug logging for first file
-        if debug_filename and "first_crs_debug" not in _debug_log:
-            log_progress(f"\n=== CRS Debug Info (first file: {debug_filename}) ===")
-            log_progress(f"  Original CRS type: {crs_type}")
-            log_progress(f"  Original CRS name: {crs_name}")
-            log_progress(f"  Original CRS string (first 200 chars): {crs_str[:200] if crs_str else 'N/A'}")
-            _debug_log["first_crs_debug"] = True
-        
-        # PSEUDO-MERCATOR DETECTION (only when clearly detected)
-        # Check multiple indicators for Pseudo-Mercator / EPSG:3857
-        is_pseudo_mercator = False
-        
-        # Method 1: Check CRS name
-        if crs_name and ("pseudo" in crs_name or "popular visualisation crs" in crs_name):
-            if "mercator" in crs_name or "3857" in crs_name:
-                is_pseudo_mercator = True
-        
-        # Method 2: Check string representation
-        crs_str_lower = crs_str.lower()
-        if "pseudo-mercator" in crs_str_lower or "pseudo mercator" in crs_str_lower:
-            is_pseudo_mercator = True
-        if "3857" in crs_str and ("epsg" in crs_str_lower or "epsg:3857" in crs_str_lower):
-            is_pseudo_mercator = True
-        if "popular visualisation crs" in crs_str_lower:
-            is_pseudo_mercator = True
-        
-        # Method 3: Check for EngineeringCRS with WGS 84 in name
-        if crs_type == "EngineeringCRS" or "engineeringcrs" in crs_str_lower:
-            if crs_name and "wgs 84" in crs_name and ("pseudo" in crs_name or "mercator" in crs_name):
-                is_pseudo_mercator = True
-        
-        # Method 4: Check for PROJJSON with Pseudo-Mercator indicators
-        is_proj_json = "$schema" in crs_str_lower or "projjson" in crs_str_lower or crs_str.strip().startswith("{")
-        if is_proj_json:
-            # Try to parse JSON and look for indicators
-            import json
-            try:
-                crs_dict = json.loads(crs_str)
-                # Look for EPSG code
-                if "id" in crs_dict:
-                    id_str = str(crs_dict["id"])
-                    if "3857" in id_str and "EPSG" in id_str.upper():
-                        is_pseudo_mercator = True
-                # Check name field
-                if "name" in crs_dict:
-                    name = str(crs_dict["name"]).lower()
-                    if ("pseudo" in name or "3857" in name) and "mercator" in name:
-                        is_pseudo_mercator = True
-            except:
-                pass
-        
-        # If clearly detected as Pseudo-Mercator, convert to EPSG:3857
-        if is_pseudo_mercator:
-            if debug_filename and "first_crs_debug" in _debug_log and _debug_log["first_crs_debug"]:
-                log_progress(f"  Detected Pseudo-Mercator, normalizing to EPSG:3857")
-                log_progress("=== End CRS Debug ===\n")
-                _debug_log["first_crs_debug"] = False  # Prevent duplicate logging
-            return CRS.from_epsg(3857)
-        
-        # Try to extract explicit EPSG code
-        if isinstance(crs_str, str) and crs_str.upper().startswith("EPSG:"):
-            epsg_code = crs_str.split(":")[-1]
-            if epsg_code.isdigit():
-                return CRS.from_epsg(int(epsg_code))
-        
-        # Try to use CRS object directly if valid
-        if isinstance(crs, CRS) and not is_proj_json:
-            try:
-                # Test if CRS is usable by checking for to_wkt
-                if hasattr(crs, 'to_wkt'):
-                    crs.to_wkt()
-                    return crs
-            except:
-                pass
-        
-        # Robust fallback: try to use original CRS object if it's a valid CRS instance
-        # This handles cases where CRS is valid but we couldn't extract EPSG code
-        if isinstance(crs, CRS):
-            try:
-                # Test if CRS is usable by trying to access its properties
-                _ = crs.to_dict() if hasattr(crs, 'to_dict') else None
-                return crs
-            except:
-                # If to_dict fails, try to_wkt as a test
-                try:
-                    _ = crs.to_wkt() if hasattr(crs, 'to_wkt') else None
-                    return crs
-                except:
-                    pass
-        
-        # Last resort: try to create CRS from string representation using constructor
-        if crs_str:
-            try:
-                # Try CRS constructor which can handle various formats
-                return CRS(crs_str)
-            except:
-                try:
-                    # Try WKT format explicitly
-                    if "PROJCS" in crs_str or "GEOGCS" in crs_str or "COMPD_CS" in crs_str:
-                        return CRS.from_wkt(crs_str)
-                except:
-                    pass
-        
-        # If all else fails, return None (should be rare for normal CRSs)
-        if debug_filename and "first_crs_debug" in _debug_log and _debug_log["first_crs_debug"]:
-            log_progress(f"  Could not definitively identify CRS")
-            log_progress("=== End CRS Debug ===\n")
-            _debug_log["first_crs_debug"] = False
-        return None
-        
-    except Exception as e:
-        # Robust fallback: try to return original CRS if it's a valid CRS object
-        if isinstance(crs, CRS):
-            try:
-                return crs
-            except:
-                pass
-        
-        # If normalization fails completely, return None
-        if debug_filename and "first_crs_debug" in _debug_log and _debug_log["first_crs_debug"]:
-            log_progress(f"  CRS normalization error: {e}")
-            log_progress("=== End CRS Debug ===\n")
-            _debug_log["first_crs_debug"] = False
-        return None
 
 
 def open_reference_backbone() -> Tuple[Path, rasterio.DatasetReader, np.ndarray, np.ndarray]:
@@ -472,23 +220,22 @@ def open_reference_backbone() -> Tuple[Path, rasterio.DatasetReader, np.ndarray,
                 f"SA backbone shape {ref_src.shape}"
             )
         
-        # Coerce Pseudo-Mercator to EPSG:3857 for comparison (avoids CRS operations)
-        colombia_crs = coerce_pseudo_mercator(colombia_src.crs)
-        ref_crs = coerce_pseudo_mercator(ref_src.crs)
-        
-        try:
-            crs_match = colombia_crs.to_epsg() == ref_crs.to_epsg()
-        except:
+        # Assert CRS matches (with some tolerance for CRS representation differences)
+        crs_match = (colombia_src.crs == ref_src.crs)
+        if not crs_match:
+            # Try comparing EPSG codes if available
             try:
-                crs_match = colombia_crs.to_string() == ref_crs.to_string()
+                colombia_epsg = colombia_src.crs.to_epsg() if colombia_src.crs else None
+                ref_epsg = ref_src.crs.to_epsg() if ref_src.crs else None
+                crs_match = (colombia_epsg == ref_epsg and colombia_epsg is not None)
             except:
-                crs_match = False
+                pass
         
         if not crs_match:
             ref_src.close()
             raise ValueError(
-                f"colombia_backbone.tif CRS {colombia_crs} does not match "
-                f"SA backbone CRS {ref_crs}"
+                f"colombia_backbone.tif CRS {colombia_src.crs} does not match "
+                f"SA backbone CRS {ref_src.crs}"
             )
         
         # Assert transform matches
@@ -574,36 +321,20 @@ def check_alignment(src_path: Path, ref_profile: dict) -> bool:
     """Check if a raster is already aligned with the reference grid."""
     try:
         with rasterio.open(src_path) as src:
-            # Coerce Pseudo-Mercator to EPSG:3857 for comparison (skip CRS operations)
-            src_crs = coerce_pseudo_mercator(src.crs)
-            ref_crs = coerce_pseudo_mercator(ref_profile["crs"])
-            
-            # Compare using EPSG codes when possible
-            try:
-                crs_match = src_crs.to_epsg() == ref_crs.to_epsg()
-            except:
-                # Fallback to string comparison
-                try:
-                    crs_match = src_crs.to_string() == ref_crs.to_string()
-                except:
-                    crs_match = False
-            
             return (
                 src.shape == (ref_profile["height"], ref_profile["width"]) and
-                crs_match and
+                src.crs == ref_profile["crs"] and
                 np.allclose(src.transform, ref_profile["transform"], atol=1e-6)
             )
-    except Exception as e:
-        log_progress(f"  Warning: Alignment check failed for {src_path.name}: {e}")
+    except Exception:
         return False
 
 
 def read_reproject_to_ref(path: Path, ref_profile: dict) -> np.ndarray:
-    """
-    Read a raster and reproject/resample to the reference profile, returning a float32 array.
+    """Read a raster and reproject/resample to the reference profile, returning a float32 array.
     
-    CRITICAL: Never performs CRS operations on Pseudo-Mercator files.
-    If CRS is LOCAL_CS["WGS 84 / Pseudo-Mercator"], coerces to EPSG:3857 and reads directly if aligned.
+    Special handling: If src.nodata == 0, we read the raw data array and reproject with
+    a different nodata value to preserve legitimate 0 values.
     """
     log_progress(f"  Processing {path.name}...")
     start_time = time.time()
@@ -613,98 +344,63 @@ def read_reproject_to_ref(path: Path, ref_profile: dict) -> np.ndarray:
         log_progress(f"    Already aligned, reading directly...")
         with rasterio.open(path) as src:
             data = src.read(masked=False).astype(np.float32)
-            # Handle nodata values
-            if src.nodata is not None:
+            # Handle nodata values, but NOT if nodata is 0 (common for masks)
+            if src.nodata is not None and src.nodata not in [0, 0.0]:
                 data[data == src.nodata] = np.nan
             log_progress(f"    Read {path.name} ({time.time() - start_time:.1f}s)")
             return data
-    
-    # Before reprojecting, check if this is a Pseudo-Mercator file
-    with rasterio.open(path) as src:
-        is_pseudo_mercator = False
-        if src.crs is not None:
-            try:
-                crs_wkt = str(src.crs) if not isinstance(src.crs, CRS) else src.crs.to_wkt()
-                if "LOCAL_CS" in crs_wkt and "Pseudo-Mercator" in crs_wkt:
-                    is_pseudo_mercator = True
-            except:
-                pass
-        
-        # If Pseudo-Mercator and not aligned, raise error (cannot reproject)
-        if is_pseudo_mercator:
-            raise ValueError(
-                f"Pseudo-Mercator file {path.name} is not aligned with reference grid. "
-                f"Shape: {src.shape} vs {ref_profile['height']}, {ref_profile['width']}, "
-                f"Transform mismatch. Cannot reproject Pseudo-Mercator files."
-            )
     
     log_progress(f"    Reprojecting {path.name}...")
     with rasterio.open(path) as src:
         dst_height = ref_profile["height"]
         dst_width = ref_profile["width"]
         dst_transform = ref_profile["transform"]
-        # Coerce Pseudo-Mercator to EPSG:3857 (avoids CRS operations on EngineeringCRS/PROJJSON)
-        src_crs = coerce_pseudo_mercator(src.crs)
-        dst_crs = coerce_pseudo_mercator(ref_profile["crs"])
-        
+        dst_crs = ref_profile["crs"]
         count = src.count
         
-        # Standard reprojection path
-        dst = np.full((count, dst_height, dst_width), np.nan, dtype=np.float32)
-        
-        for b in range(1, count + 1):
-            reproject(
-                source=rasterio.band(src, b),
-                destination=dst[b - 1],
-                src_transform=src.transform,
-                src_crs=src_crs,
-                src_nodata=src.nodata,
-                dst_transform=dst_transform,
-                dst_crs=dst_crs,
-                resampling=Resampling.nearest,
-                dst_nodata=np.nan,
-            )
+        # Special handling for nodata=0: read raw array and use temp nodata
+        if src.nodata in [0, 0.0]:
+            temp_nodata = -9999.0
+            dst = np.full((count, dst_height, dst_width), temp_nodata, dtype=np.float32)
+            
+            for b in range(1, count + 1):
+                # Read source band as array and convert to float32 to allow temp_nodata
+                src_array = src.read(b, masked=False).astype(np.float32)
+                
+                # Reproject from numpy array
+                reproject(
+                    source=src_array,
+                    destination=dst[b - 1],
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    src_nodata=temp_nodata,  # Use temp nodata (nothing in source has this value)
+                    dst_transform=dst_transform,
+                    dst_crs=dst_crs,
+                    resampling=Resampling.nearest,
+                    dst_nodata=temp_nodata,
+                )
+            
+            # Convert temp nodata to NaN, but preserve zeros
+            dst[dst == temp_nodata] = np.nan
+        else:
+            # Standard path for other nodata values
+            dst = np.full((count, dst_height, dst_width), np.nan, dtype=np.float32)
+            
+            for b in range(1, count + 1):
+                reproject(
+                    source=rasterio.band(src, b),
+                    destination=dst[b - 1],
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    src_nodata=src.nodata,
+                    dst_transform=dst_transform,
+                    dst_crs=dst_crs,
+                    resampling=Resampling.nearest,
+                    dst_nodata=np.nan,
+                )
         
         log_progress(f"    Reprojected {path.name} ({time.time() - start_time:.1f}s)")
-        # Always return (count, height, width) shape for consistency with aligned path
-        return dst
-
-
-def read_window_direct(src_path: Path, window: Window, dataset: Optional[str] = None) -> np.ndarray:
-    """
-    Read a window directly from a raster file without any CRS operations or reprojection.
-    Used for probing band structure.
-    
-    Args:
-        src_path: Path to source raster file
-        window: Window to read
-        dataset: Optional dataset name (for Int16 unscaling detection)
-    
-    Returns:
-        Array of shape (bands, height, width) as float32
-    """
-    with rasterio.open(src_path) as src:
-        count = src.count
-        dst_height = int(window.height)
-        dst_width = int(window.width)
-        
-        # Read window directly
-        data = src.read(window=window, masked=False).astype(np.float32)
-        
-        # Handle nodata values
-        if src.nodata is not None:
-            data[data == src.nodata] = np.nan
-        
-        # Auto-unscale Int16 data if needed
-        needs_unscaling = (
-            dataset is not None and 
-            dataset in INT16_SCALED_DATASETS and
-            src.dtypes[0] in ('int16', 'Int16')
-        )
-        if needs_unscaling:
-            data = data / 100.0
-        
-        return data
+        return dst if count > 1 else dst[0]
 
 
 def iter_reference_windows(ref_profile: dict, tile_size: int = TILE_SIZE):
@@ -719,29 +415,17 @@ def iter_reference_windows(ref_profile: dict, tile_size: int = TILE_SIZE):
 
 
 def read_reproject_window(src_path: Path, ref_profile: dict, window: Window, 
-                          dataset: Optional[str] = None, _debug_state: Optional[dict] = None) -> np.ndarray:
+                          dataset: Optional[str] = None) -> np.ndarray:
     """
     Read a source raster and reproject only the given reference window to a float32 array (B, h, w).
     
-    CRITICAL: Never performs CRS operations (reproject, WarpedVRT, etc.) on Pseudo-Mercator files.
-    If CRS is LOCAL_CS["WGS 84 / Pseudo-Mercator"], coerces to EPSG:3857 and reads directly if aligned.
-    
     Optimization: If already aligned, read window directly without reprojection.
-    Pseudo-Mercator CRS is coerced to EPSG:3857 and treated as aligned if transform/shape match.
+    Special handling: If src.nodata == 0, we preserve legitimate zeros.
     
     Int16 auto-unscaling: If the dataset is in INT16_SCALED_DATASETS and the file dtype is Int16,
     automatically divides by 100 to restore original values. This allows seamless use of storage-optimized
     inputs without manual intervention.
-    
-    Args:
-        src_path: Path to source raster file
-        ref_profile: Reference grid profile
-        window: Window to read
-        dataset: Optional dataset name (for Int16 unscaling detection)
-        _debug_state: Optional dict for tracking debug state (internal use)
     """
-    if _debug_state is None:
-        _debug_state = {}
     with rasterio.open(src_path) as src:
         dst_height = int(window.height)
         dst_width = int(window.width)
@@ -754,86 +438,65 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
             src.dtypes[0] in ('int16', 'Int16')
         )
         
-        # Coerce Pseudo-Mercator to EPSG:3857 (avoids CRS operations on EngineeringCRS/PROJJSON)
-        src_crs = coerce_pseudo_mercator(src.crs)
-        dst_crs = coerce_pseudo_mercator(ref_profile["crs"])
-        
-        # Check if source CRS was Pseudo-Mercator (coerced to EPSG:3857)
-        # If so, we MUST read directly without any reprojection operations
-        is_pseudo_mercator = False
-        if src.crs is not None:
-            try:
-                crs_wkt = str(src.crs) if not isinstance(src.crs, CRS) else src.crs.to_wkt()
-                if "LOCAL_CS" in crs_wkt and "Pseudo-Mercator" in crs_wkt:
-                    is_pseudo_mercator = True
-            except:
-                pass
-        
         # Fast path: if already aligned, just read the window directly (MUCH faster)
-        # This handles Pseudo-Mercator files that are already aligned
-        try:
-            crs_match = src_crs.to_epsg() == dst_crs.to_epsg()
-        except:
-            # Fallback to string comparison
-            try:
-                crs_match = src_crs.to_string() == dst_crs.to_string()
-            except:
-                crs_match = False
-        
-        shape_match = src.shape == (ref_profile["height"], ref_profile["width"])
-        transform_match = np.allclose(src.transform, ref_profile["transform"], atol=1e-6)
-        
-        # If Pseudo-Mercator and aligned, ALWAYS read directly (never reproject)
-        if is_pseudo_mercator and shape_match and transform_match:
+        if (src.shape == (ref_profile["height"], ref_profile["width"]) and
+            src.crs == ref_profile["crs"] and
+            np.allclose(src.transform, ref_profile["transform"], atol=1e-6)):
+            
             data = src.read(window=window, masked=False).astype(np.float32)
-            # Handle nodata values
-            if src.nodata is not None:
+            # Handle nodata values, but NOT if nodata is 0 (common for masks)
+            if src.nodata is not None and src.nodata not in [0, 0.0]:
                 data[data == src.nodata] = np.nan
             
             # Auto-unscale Int16 data (÷100) if detected
             if needs_unscaling:
                 data = data / 100.0
             
-            return data
+            return data if count > 1 else data[np.newaxis, ...]
         
-        # For non-Pseudo-Mercator files, check alignment normally
-        if shape_match and crs_match and transform_match:
-            data = src.read(window=window, masked=False).astype(np.float32)
-            # Handle nodata values
-            if src.nodata is not None:
-                data[data == src.nodata] = np.nan
-            
-            # Auto-unscale Int16 data (÷100) if detected
-            if needs_unscaling:
-                data = data / 100.0
-            
-            return data
-        
-        # Slow path: reprojection needed (only for non-Pseudo-Mercator files)
-        # If we reach here with Pseudo-Mercator, it means alignment failed - this is an error
-        if is_pseudo_mercator:
-            raise ValueError(
-                f"Pseudo-Mercator file {src_path.name} is not aligned with reference grid. "
-                f"Shape: {src.shape} vs {ref_profile['height']}, {ref_profile['width']}, "
-                f"Transform mismatch. Cannot reproject Pseudo-Mercator files."
-            )
-        
+        # Slow path: reprojection needed
         dst_transform = rasterio.windows.transform(window, ref_profile["transform"])
+        dst_crs = ref_profile["crs"]
         
-        # Standard reprojection path (using coerced CRS)
-        dst = np.full((count, dst_height, dst_width), np.nan, dtype=np.float32)
-        for b in range(1, count + 1):
-            reproject(
-                source=rasterio.band(src, b),
-                destination=dst[b - 1],
-                src_transform=src.transform,
-                src_crs=src_crs,
-                src_nodata=src.nodata,
-                dst_transform=dst_transform,
-                dst_crs=dst_crs,
-                resampling=Resampling.nearest,
-                dst_nodata=np.nan,
-            )
+        # Special handling for nodata=0: read full data and create temp array with different nodata
+        if src.nodata in [0, 0.0]:
+            temp_nodata = -9999.0
+            dst = np.full((count, dst_height, dst_width), temp_nodata, dtype=np.float32)
+            
+            for b in range(1, count + 1):
+                # Read source band as array and convert to float32 to allow temp_nodata
+                src_array = src.read(b, masked=False).astype(np.float32)
+                
+                # Reproject from numpy array instead of rasterio band
+                reproject(
+                    source=src_array,
+                    destination=dst[b - 1],
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    src_nodata=temp_nodata,  # Use temp nodata (nothing in source has this value)
+                    dst_transform=dst_transform,
+                    dst_crs=dst_crs,
+                    resampling=Resampling.nearest,
+                    dst_nodata=temp_nodata,
+                )
+            
+            # Convert temp nodata to NaN, but preserve zeros
+            dst[dst == temp_nodata] = np.nan
+        else:
+            # Standard path for other nodata values
+            dst = np.full((count, dst_height, dst_width), np.nan, dtype=np.float32)
+            for b in range(1, count + 1):
+                reproject(
+                    source=rasterio.band(src, b),
+                    destination=dst[b - 1],
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    src_nodata=src.nodata,
+                    dst_transform=dst_transform,
+                    dst_crs=dst_crs,
+                    resampling=Resampling.nearest,
+                    dst_nodata=np.nan,
+                )
         
         # Auto-unscale Int16 data (÷100) if detected
         if needs_unscaling:
@@ -1155,8 +818,8 @@ def main():
     })
 
     # Determine band names using a small probe window to avoid full reads
-    # Probe reads directly from source files without any CRS operations or normalization
-    log_progress("\nDetermining band structure with direct probe reads (no CRS operations)...")
+    log_progress("\nDetermining band structure with probe window...")
+    probe_window = Window(col_off=0, row_off=0, width=min(8, ref_profile["width"]), height=min(8, ref_profile["height"]))
     
     # Probe static datasets first
     static_band_names: List[str] = []
@@ -1177,39 +840,8 @@ def main():
                     continue
             arrays = []
             for p in candidate_paths:
-                try:
-                    # Read directly without any CRS operations or normalization
-                    with rasterio.open(p) as src:
-                        # Use a small window (8x8 or smaller if file is smaller)
-                        probe_h = min(8, src.height)
-                        probe_w = min(8, src.width)
-                        direct_window = Window(col_off=0, row_off=0, width=probe_w, height=probe_h)
-                        
-                        # Read window directly (no CRS operations, no normalization)
-                        data = src.read(window=direct_window, masked=False).astype(np.float32)
-                        
-                        # Handle nodata values
-                        if src.nodata is not None:
-                            data[data == src.nodata] = np.nan
-                        
-                        # Auto-unscale Int16 data if needed
-                        needs_unscaling = (
-                            dataset is not None and 
-                            dataset in INT16_SCALED_DATASETS and
-                            src.dtypes[0] in ('int16', 'Int16')
-                        )
-                        if needs_unscaling:
-                            data = data / 100.0
-                        
-                        arr = data
-                    arrays.append(arr)
-                except Exception as e:
-                    log_progress(f"    Warning: Failed to read {p.name}: {e}")
-                    continue
-            
-            if not arrays:
-                log_progress(f"    Warning: {dataset} - all files failed to read, skipping")
-                continue
+                arr = read_reproject_window(p, ref_profile, probe_window, dataset=dataset)
+                arrays.append(arr)
             
             band_names = build_band_names(dataset, arrays)
             if band_names:
@@ -1241,39 +873,8 @@ def main():
             
             arrays = []
             for p in candidate_paths:
-                try:
-                    # Read directly without any CRS operations or normalization
-                    with rasterio.open(p) as src:
-                        # Use a small window (8x8 or smaller if file is smaller)
-                        probe_h = min(8, src.height)
-                        probe_w = min(8, src.width)
-                        direct_window = Window(col_off=0, row_off=0, width=probe_w, height=probe_h)
-                        
-                        # Read window directly (no CRS operations, no normalization)
-                        data = src.read(window=direct_window, masked=False).astype(np.float32)
-                        
-                        # Handle nodata values
-                        if src.nodata is not None:
-                            data[data == src.nodata] = np.nan
-                        
-                        # Auto-unscale Int16 data if needed
-                        needs_unscaling = (
-                            dataset is not None and 
-                            dataset in INT16_SCALED_DATASETS and
-                            src.dtypes[0] in ('int16', 'Int16')
-                        )
-                        if needs_unscaling:
-                            data = data / 100.0
-                        
-                        arr = data
-                    arrays.append(arr)
-                except Exception as e:
-                    log_progress(f"    Warning: Failed to read {p.name}: {e}")
-                    continue
-            
-            if not arrays:
-                log_progress(f"    Warning: {dataset} - all files failed to read, skipping")
-                continue
+                arr = read_reproject_window(p, ref_profile, probe_window, dataset=dataset)
+                arrays.append(arr)
             
             band_names = build_band_names(dataset, arrays)
             if band_names:
@@ -1289,19 +890,7 @@ def main():
     dataset_band_counts = {**static_band_counts, **yearly_band_counts}
     
     if not all_band_names:
-        print("\n" + "="*80)
-        print("ERROR: Failed to determine band structure - no datasets could be read.")
-        print("="*80)
-        print("\nDebugging information:")
-        print(f"  Static datasets attempted: {static_datasets}")
-        print(f"  Yearly datasets attempted: {yearly_datasets}")
-        print(f"  Data root: {READY_ROOT}")
-        print("\nPossible causes:")
-        print("  1. CRS normalization issues with PROJJSON/EngineeringCRS")
-        print("  2. All raster files are corrupted or unreadable")
-        print("  3. Incompatible rasterio version")
-        print("\nPlease check the error messages above for specific file failures.")
-        print("="*80)
+        print("ERROR: Failed to determine band structure.")
         sys.exit(1)
     
     log_progress(f"\nBand structure summary:")
