@@ -142,6 +142,43 @@ def log_progress(message: str, start_time: Optional[float] = None):
         print(f"[info] {message}")
 
 
+def normalize_crs_to_epsg(crs) -> Optional[int]:
+    """Normalize CRS to EPSG code, treating Pseudo-Mercator variants as 3857.
+    
+    Handles both EPSG:3857 and LOCAL_CS["WGS 84 / Pseudo-Mercator"...] as equivalent.
+    This allows proper comparison of CRS that are semantically identical but have
+    different string representations.
+    
+    Args:
+        crs: rasterio CRS object or None
+        
+    Returns:
+        EPSG code (int) or None if CRS cannot be determined
+    """
+    if crs is None:
+        return None
+    
+    # Try direct EPSG code extraction
+    try:
+        epsg = crs.to_epsg()
+        if epsg is not None:
+            return epsg
+    except:
+        pass
+    
+    # Check for Pseudo-Mercator string patterns
+    try:
+        crs_str = str(crs)
+        if "Pseudo-Mercator" in crs_str or "Popular Visualisation CRS" in crs_str:
+            return 3857
+        if "LOCAL_CS" in crs_str and "WGS 84" in crs_str and "Mercator" in crs_str:
+            return 3857
+    except:
+        pass
+    
+    return None
+
+
 def open_reference_backbone() -> Tuple[Path, rasterio.DatasetReader, np.ndarray, np.ndarray]:
     """Open backbone.tif (SA backbone) as reference grid and load Colombia mask for filtering.
     
@@ -220,22 +257,16 @@ def open_reference_backbone() -> Tuple[Path, rasterio.DatasetReader, np.ndarray,
                 f"SA backbone shape {ref_src.shape}"
             )
         
-        # Assert CRS matches (with some tolerance for CRS representation differences)
-        crs_match = (colombia_src.crs == ref_src.crs)
-        if not crs_match:
-            # Try comparing EPSG codes if available
-            try:
-                colombia_epsg = colombia_src.crs.to_epsg() if colombia_src.crs else None
-                ref_epsg = ref_src.crs.to_epsg() if ref_src.crs else None
-                crs_match = (colombia_epsg == ref_epsg and colombia_epsg is not None)
-            except:
-                pass
+        # Assert CRS matches (with tolerance for CRS representation differences)
+        # Both should be Web Mercator/Pseudo-Mercator (EPSG:3857), but may have different representations
+        colombia_epsg = normalize_crs_to_epsg(colombia_src.crs)
+        ref_epsg = normalize_crs_to_epsg(ref_src.crs)
         
-        if not crs_match:
+        if colombia_epsg != ref_epsg or colombia_epsg is None:
             ref_src.close()
             raise ValueError(
-                f"colombia_backbone.tif CRS {colombia_src.crs} does not match "
-                f"SA backbone CRS {ref_src.crs}"
+                f"colombia_backbone.tif CRS (EPSG:{colombia_epsg}) does not match "
+                f"SA backbone CRS (EPSG:{ref_epsg}). Both should be EPSG:3857 (Web Mercator)."
             )
         
         # Assert transform matches
@@ -318,14 +349,25 @@ def detect_year_range(catalog: Dict[str, Dict[Optional[int], List[Path]]]) -> Li
 
 
 def check_alignment(src_path: Path, ref_profile: dict) -> bool:
-    """Check if a raster is already aligned with the reference grid."""
+    """Check if a raster is already aligned with the reference grid.
+    
+    Handles CRS comparison for Pseudo-Mercator variants (LOCAL_CS vs EPSG:3857).
+    """
     try:
         with rasterio.open(src_path) as src:
-            return (
-                src.shape == (ref_profile["height"], ref_profile["width"]) and
-                src.crs == ref_profile["crs"] and
-                np.allclose(src.transform, ref_profile["transform"], atol=1e-6)
-            )
+            # Check shape and transform
+            shape_match = src.shape == (ref_profile["height"], ref_profile["width"])
+            transform_match = np.allclose(src.transform, ref_profile["transform"], atol=1e-6)
+            
+            if not (shape_match and transform_match):
+                return False
+            
+            # Check CRS with normalization for Pseudo-Mercator variants
+            src_epsg = normalize_crs_to_epsg(src.crs)
+            ref_epsg = normalize_crs_to_epsg(ref_profile["crs"])
+            
+            return src_epsg == ref_epsg and src_epsg is not None
+            
     except Exception:
         return False
 
@@ -421,6 +463,7 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
     
     Optimization: If already aligned, read window directly without reprojection.
     Special handling: If src.nodata == 0, we preserve legitimate zeros.
+    Handles CRS comparison for Pseudo-Mercator variants (LOCAL_CS vs EPSG:3857).
     
     Int16 auto-unscaling: If the dataset is in INT16_SCALED_DATASETS and the file dtype is Int16,
     automatically divides by 100 to restore original values. This allows seamless use of storage-optimized
@@ -438,11 +481,16 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
             src.dtypes[0] in ('int16', 'Int16')
         )
         
+        # Check alignment with CRS normalization for Pseudo-Mercator variants
+        src_epsg = normalize_crs_to_epsg(src.crs)
+        ref_epsg = normalize_crs_to_epsg(ref_profile["crs"])
+        crs_match = (src_epsg == ref_epsg and src_epsg is not None)
+        
+        shape_match = src.shape == (ref_profile["height"], ref_profile["width"])
+        transform_match = np.allclose(src.transform, ref_profile["transform"], atol=1e-6)
+        
         # Fast path: if already aligned, just read the window directly (MUCH faster)
-        if (src.shape == (ref_profile["height"], ref_profile["width"]) and
-            src.crs == ref_profile["crs"] and
-            np.allclose(src.transform, ref_profile["transform"], atol=1e-6)):
-            
+        if shape_match and crs_match and transform_match:
             data = src.read(window=window, masked=False).astype(np.float32)
             # Handle nodata values, but NOT if nodata is 0 (common for masks)
             if src.nodata is not None and src.nodata not in [0, 0.0]:
