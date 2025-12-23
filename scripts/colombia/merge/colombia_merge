@@ -5,13 +5,14 @@ Merge Colombia 1 km rasters into a yearly panel with streaming I/O and low memor
 Summary:
 - Reads per-dataset rasters from ``data`` (or ``$SCRATCH/data/ml/ready`` on cluster for storage-optimized inputs).
 - Processes one year at a time, reusing earlier data when a dataset is missing for a given year.
-- Masks out all pixels where colombia_GEE = 0 (outside Colombia) to reduce output size.
+- Filters pixels using combined mask: (SA backbone == 1) & (Colombia mask == 1).
 - Streams window batches to a single Parquet panel while cleaning up memory eagerly.
 
 Inputs:
 - Year-specific raster folders under ``data/<dataset>`` with filenames containing the year.
 - Static rasters (no year in filename) read once and injected into every year.
-- colombia_GEE.tif (binary mask) that defines the reference grid and Colombia extent.
+- backbone.tif (SA backbone, defines the reference grid, CRS, transform, and extent).
+- colombia_backbone.tif (Colombia mask, must match SA grid CRS, transform, and shape).
 
 Int16 Auto-Unscaling:
 - Automatically detects Int16-scaled data (WorldClim, GSN, powerplants, oil_gas) and unscales (÷100).
@@ -50,11 +51,11 @@ Yearly datasets (year in filename, time-varying):
   forward-fills with HNTL 2020 values.
 
 Outputs:
-- Parquet panel: ``outputs/Results/merged_panel_colombia_<start>_<end>.parquet`` storing coordinates plus all bands (colombia_GEE=1 only).
+- Parquet panel: ``outputs/Results/merged_panel_colombia_<start>_<end>.parquet`` storing coordinates plus all bands (filtered by SA backbone & Colombia mask).
 
 Key choices:
 - Portable path resolution from ``Path(__file__)`` with automatic ``$SCRATCH`` override for HPC runs.
-- Colombia-based masking: only pixels with colombia_GEE=1 are included in the Parquet output.
+- Combined masking: only pixels where (SA backbone == 1) & (Colombia mask == 1) are included in the Parquet output.
 - Dynamic year detection: automatically discovers all available years from the data (no hardcoded range).
 - Automatic dataset classification: separates static (time-invariant) from yearly (time-varying) datasets.
 - Static datasets are loaded once per window and reused across all years, eliminating artificial NA inflation.
@@ -65,7 +66,7 @@ Key choices:
 
 Short overview of what the script does:
 1) Initialize Weights & Biases and resolve paths for data and outputs.
-2) Open colombia_GEE.tif to define the reference grid (shape, CRS, transform) and load the binary mask.
+2) Open backbone.tif (SA backbone) to define the reference grid (shape, CRS, transform). Load SA backbone directly and Colombia mask (asserts it matches the SA grid).
 3) Discover all candidate rasters in data and group them by dataset and year.
 4) Automatically determine the year range from available data (all years with at least one dataset).
 5) Classify datasets into static (time-invariant) and yearly (time-varying) categories.
@@ -79,7 +80,7 @@ Short overview of what the script does:
    - Reproject on-the-fly to match the reference grid if needed.
    - Concatenate dataset arrays into a single band stack for the year.
    - Convert the stack to a long Arrow table (vectorized coords).
-   - Apply colombia_GEE mask to exclude pixels outside Colombia before writing to Parquet.
+   - Apply combined mask (SA backbone & Colombia mask) to filter pixels before writing to Parquet.
    - Append the year's rows to a single Parquet file using a persistent writer.
    - Immediately free memory for arrays and Arrow tables.
 """
@@ -142,21 +143,25 @@ def log_progress(message: str, start_time: Optional[float] = None):
         print(f"[info] {message}")
 
 
-def normalize_crs(crs, debug_filename: Optional[str] = None, _debug_log: dict = {}) -> CRS:
+def normalize_crs(crs, debug_filename: Optional[str] = None, _debug_log: Optional[dict] = None) -> Optional[CRS]:
     """
     Normalize CRS to a standard format, handling PROJ JSON and EngineeringCRS.
     
     This function handles cases where CRS is in PROJ JSON format, EngineeringCRS, or other formats
     that might not be directly compatible with rasterio reprojection operations.
-    Aggressively converts any Pseudo-Mercator CRS to EPSG:3857.
+    Only converts Pseudo-Mercator CRS to EPSG:3857 when clearly detected.
+    Does not default to EPSG:3857 otherwise.
     
     Args:
         crs: CRS object or string representation
         debug_filename: Optional filename for debug logging (one-time per session)
+        _debug_log: Optional dict for tracking debug state (internal use)
         
     Returns:
-        Normalized CRS object (EPSG:3857 for Pseudo-Mercator)
+        Normalized CRS object, or None if CRS cannot be determined
     """
+    if _debug_log is None:
+        _debug_log = {}
     if crs is None:
         return None
     
@@ -198,27 +203,27 @@ def normalize_crs(crs, debug_filename: Optional[str] = None, _debug_log: dict = 
             log_progress(f"  Original CRS string (first 200 chars): {crs_str[:200] if crs_str else 'N/A'}")
             _debug_log["first_crs_debug"] = True
         
-        # AGGRESSIVE PSEUDO-MERCATOR DETECTION
+        # PSEUDO-MERCATOR DETECTION (only when clearly detected)
         # Check multiple indicators for Pseudo-Mercator / EPSG:3857
         is_pseudo_mercator = False
         
         # Method 1: Check CRS name
         if crs_name and ("pseudo" in crs_name or "popular visualisation crs" in crs_name):
-            if "mercator" in crs_name or "3857" in crs_name or "wgs 84" in crs_name:
+            if "mercator" in crs_name or "3857" in crs_name:
                 is_pseudo_mercator = True
         
         # Method 2: Check string representation
         crs_str_lower = crs_str.lower()
         if "pseudo-mercator" in crs_str_lower or "pseudo mercator" in crs_str_lower:
             is_pseudo_mercator = True
-        if "3857" in crs_str:
+        if "3857" in crs_str and ("epsg" in crs_str_lower or "epsg:3857" in crs_str_lower):
             is_pseudo_mercator = True
         if "popular visualisation crs" in crs_str_lower:
             is_pseudo_mercator = True
         
         # Method 3: Check for EngineeringCRS with WGS 84 in name
         if crs_type == "EngineeringCRS" or "engineeringcrs" in crs_str_lower:
-            if crs_name and "wgs 84" in crs_name:
+            if crs_name and "wgs 84" in crs_name and ("pseudo" in crs_name or "mercator" in crs_name):
                 is_pseudo_mercator = True
         
         # Method 4: Check for PROJJSON with Pseudo-Mercator indicators
@@ -231,20 +236,20 @@ def normalize_crs(crs, debug_filename: Optional[str] = None, _debug_log: dict = 
                 # Look for EPSG code
                 if "id" in crs_dict:
                     id_str = str(crs_dict["id"])
-                    if "3857" in id_str or "EPSG" in id_str.upper():
+                    if "3857" in id_str and "EPSG" in id_str.upper():
                         is_pseudo_mercator = True
                 # Check name field
                 if "name" in crs_dict:
                     name = str(crs_dict["name"]).lower()
-                    if "pseudo" in name or "3857" in name:
+                    if ("pseudo" in name or "3857" in name) and "mercator" in name:
                         is_pseudo_mercator = True
             except:
                 pass
         
-        # If any method detected Pseudo-Mercator, convert to EPSG:3857
+        # If clearly detected as Pseudo-Mercator, convert to EPSG:3857
         if is_pseudo_mercator:
             if debug_filename and "first_crs_debug" in _debug_log and _debug_log["first_crs_debug"]:
-                log_progress(f"  ✓ Detected Pseudo-Mercator, normalizing to EPSG:3857")
+                log_progress(f"  Detected Pseudo-Mercator, normalizing to EPSG:3857")
                 log_progress("=== End CRS Debug ===\n")
                 _debug_log["first_crs_debug"] = False  # Prevent duplicate logging
             return CRS.from_epsg(3857)
@@ -265,60 +270,187 @@ def normalize_crs(crs, debug_filename: Optional[str] = None, _debug_log: dict = 
             except:
                 pass
         
-        # Fallback: Colombia data typically uses EPSG:3857
+        # Robust fallback: try to use original CRS object if it's a valid CRS instance
+        # This handles cases where CRS is valid but we couldn't extract EPSG code
+        if isinstance(crs, CRS):
+            try:
+                # Test if CRS is usable by trying to access its properties
+                _ = crs.to_dict() if hasattr(crs, 'to_dict') else None
+                return crs
+            except:
+                # If to_dict fails, try to_wkt as a test
+                try:
+                    _ = crs.to_wkt() if hasattr(crs, 'to_wkt') else None
+                    return crs
+                except:
+                    pass
+        
+        # Last resort: try to create CRS from string representation using constructor
+        if crs_str:
+            try:
+                # Try CRS constructor which can handle various formats
+                return CRS(crs_str)
+            except:
+                try:
+                    # Try WKT format explicitly
+                    if "PROJCS" in crs_str or "GEOGCS" in crs_str or "COMPD_CS" in crs_str:
+                        return CRS.from_wkt(crs_str)
+                except:
+                    pass
+        
+        # If all else fails, return None (should be rare for normal CRSs)
         if debug_filename and "first_crs_debug" in _debug_log and _debug_log["first_crs_debug"]:
-            log_progress(f"  ⚠ Could not definitively identify CRS, defaulting to EPSG:3857")
+            log_progress(f"  Could not definitively identify CRS")
             log_progress("=== End CRS Debug ===\n")
             _debug_log["first_crs_debug"] = False
-        return CRS.from_epsg(3857)
+        return None
         
     except Exception as e:
-        # If normalization fails, log warning and use EPSG:3857 as fallback
+        # Robust fallback: try to return original CRS if it's a valid CRS object
+        if isinstance(crs, CRS):
+            try:
+                return crs
+            except:
+                pass
+        
+        # If normalization fails completely, return None
         if debug_filename and "first_crs_debug" in _debug_log and _debug_log["first_crs_debug"]:
-            log_progress(f"  ❌ CRS normalization error: {e}")
-            log_progress(f"  Using EPSG:3857 as fallback")
+            log_progress(f"  CRS normalization error: {e}")
             log_progress("=== End CRS Debug ===\n")
             _debug_log["first_crs_debug"] = False
-        return CRS.from_epsg(3857)
+        return None
 
 
-def open_reference_backbone() -> Tuple[Path, rasterio.DatasetReader, np.ndarray]:
-    """Open colombia_GEE.tif as reference grid and return path, dataset, and mask array."""
-    log_progress("Loading Colombia reference grid...")
+def open_reference_backbone() -> Tuple[Path, rasterio.DatasetReader, np.ndarray, np.ndarray]:
+    """Open backbone.tif (SA backbone) as reference grid and load Colombia mask for filtering.
     
-    # Search for colombia_GEE.tif
-    backbone_paths = [
-        READY_ROOT / "backbone" / "colombia_GEE.tif",
-        DATA_ROOT / "backbone" / "colombia_GEE.tif",
+    Returns:
+        Tuple of (ref_path, ref_src, sa_backbone_mask, colombia_mask) where:
+        - ref_path: Path to reference grid (backbone.tif)
+        - ref_src: Opened rasterio dataset for reference grid
+        - sa_backbone_mask: SA backbone loaded directly from reference grid (for filtering)
+        - colombia_mask: Colombia mask loaded directly (must match SA grid)
+    """
+    log_progress("Loading SA backbone as reference grid...")
+    
+    # Search for backbone.tif (SA backbone, used as reference grid)
+    ref_paths = [
+        READY_ROOT / "backbone" / "backbone.tif",
+        DATA_ROOT / "backbone" / "backbone.tif",
     ]
     
-    backbone_path = None
-    for p in backbone_paths:
+    ref_path = None
+    for p in ref_paths:
         if p.exists():
-            backbone_path = p
+            ref_path = p
             break
     
-    if backbone_path is None:
-        print("ERROR: colombia_GEE.tif not found.")
+    if ref_path is None:
+        print("ERROR: backbone.tif (SA backbone) not found.")
         print("\nChecked locations:")
-        for p in backbone_paths:
+        for p in ref_paths:
             print(f"   - {p} (exists: {p.exists()})")
-        print("\nPlease ensure colombia_GEE.tif exists in data/ready/backbone/")
+        print("\nPlease ensure backbone.tif exists in data/ready/backbone/")
         sys.exit(1)
     
-    src = rasterio.open(backbone_path)
-    # Read the Colombia mask (1 = Colombia, 0 = outside)
-    backbone_mask = src.read(1)
+    ref_src = rasterio.open(ref_path)
+    ref_profile = ref_src.profile
     
-    land_pixels = int((backbone_mask == 1).sum())
-    total_pixels = backbone_mask.size
+    log_progress(f"Using {ref_path.name} as reference grid")
+    log_progress(f"Reference grid: {ref_src.shape} pixels, CRS: {ref_src.crs}")
     
-    log_progress(f"Using {backbone_path.name} as reference grid")
-    log_progress(f"Reference grid: {src.shape} pixels, CRS: {src.crs}")
-    log_progress(f"Colombia pixels: {land_pixels:,} ({100*land_pixels/total_pixels:.1f}%)")
-    log_progress(f"Masked pixels (outside Colombia): {total_pixels - land_pixels:,}")
+    # Load SA backbone directly from reference grid (no reprojection needed)
+    log_progress("Loading SA backbone mask directly from reference grid...")
+    sa_backbone_data = ref_src.read(1, masked=False).astype(np.uint8)
+    # Binarize SA backbone
+    sa_backbone_mask = (sa_backbone_data > 0.5).astype(np.uint8)
     
-    return backbone_path, src, backbone_mask
+    log_progress(f"  SA backbone pixels: {(sa_backbone_mask == 1).sum():,}")
+    
+    # Load Colombia mask and assert it matches the SA grid
+    log_progress("Loading Colombia backbone mask (must match SA grid)...")
+    colombia_mask_paths = [
+        READY_ROOT / "backbone" / "colombia_backbone.tif",
+        DATA_ROOT / "backbone" / "colombia_backbone.tif",
+    ]
+    
+    colombia_mask_path = None
+    for p in colombia_mask_paths:
+        if p.exists():
+            colombia_mask_path = p
+            break
+    
+    if colombia_mask_path is None:
+        print("ERROR: colombia_backbone.tif not found.")
+        print("\nChecked locations:")
+        for p in colombia_mask_paths:
+            print(f"   - {p} (exists: {p.exists()})")
+        print("\nPlease ensure colombia_backbone.tif exists. Run backbone_colombia script first.")
+        ref_src.close()
+        sys.exit(1)
+    
+    # Load Colombia mask directly and assert it matches SA grid
+    with rasterio.open(colombia_mask_path) as colombia_src:
+        # Assert shape matches
+        if colombia_src.shape != ref_src.shape:
+            ref_src.close()
+            raise ValueError(
+                f"colombia_backbone.tif shape {colombia_src.shape} does not match "
+                f"SA backbone shape {ref_src.shape}"
+            )
+        
+        # Normalize CRS for comparison
+        colombia_crs = normalize_crs(colombia_src.crs)
+        ref_crs = normalize_crs(ref_src.crs)
+        
+        # Assert CRS matches
+        if colombia_crs is None or ref_crs is None:
+            ref_src.close()
+            raise ValueError(
+                f"Could not normalize CRS for comparison. "
+                f"colombia_backbone CRS: {colombia_src.crs}, "
+                f"SA backbone CRS: {ref_src.crs}"
+            )
+        
+        try:
+            crs_match = colombia_crs.to_epsg() == ref_crs.to_epsg()
+        except:
+            try:
+                crs_match = colombia_crs.to_string() == ref_crs.to_string()
+            except:
+                crs_match = False
+        
+        if not crs_match:
+            ref_src.close()
+            raise ValueError(
+                f"colombia_backbone.tif CRS {colombia_crs} does not match "
+                f"SA backbone CRS {ref_crs}"
+            )
+        
+        # Assert transform matches
+        if not np.allclose(colombia_src.transform, ref_src.transform, atol=1e-6):
+            ref_src.close()
+            raise ValueError(
+                f"colombia_backbone.tif transform does not match SA backbone transform"
+            )
+        
+        # Read Colombia mask directly (no reprojection needed)
+        colombia_mask_data = colombia_src.read(1, masked=False).astype(np.uint8)
+        # Binarize Colombia mask
+        colombia_mask = (colombia_mask_data > 0.5).astype(np.uint8)
+    
+    log_progress(f"  Colombia mask pixels: {(colombia_mask == 1).sum():,}")
+    log_progress(f"  Colombia mask matches SA grid (CRS, transform, shape)")
+    
+    # Calculate combined mask statistics
+    combined_mask = (sa_backbone_mask == 1) & (colombia_mask == 1)
+    total_pixels = combined_mask.size
+    keep_pixels = int(combined_mask.sum())
+    
+    log_progress(f"Combined filter: SA backbone & Colombia mask")
+    log_progress(f"  Keep pixels (SA & Colombia): {keep_pixels:,} ({100*keep_pixels/total_pixels:.1f}%)")
+    
+    return ref_path, ref_src, sa_backbone_mask, colombia_mask
 
 
 def discover_raster_catalog() -> Dict[str, Dict[Optional[int], List[Path]]]:
@@ -407,11 +539,7 @@ def check_alignment(src_path: Path, ref_profile: dict) -> bool:
 
 
 def read_reproject_to_ref(path: Path, ref_profile: dict) -> np.ndarray:
-    """Read a raster and reproject/resample to the reference profile, returning a float32 array.
-    
-    Special handling: If src.nodata == 0, we read the raw data array and reproject with
-    a different nodata value to preserve legitimate 0 values.
-    """
+    """Read a raster and reproject/resample to the reference profile, returning a float32 array."""
     log_progress(f"  Processing {path.name}...")
     start_time = time.time()
     
@@ -420,8 +548,8 @@ def read_reproject_to_ref(path: Path, ref_profile: dict) -> np.ndarray:
         log_progress(f"    Already aligned, reading directly...")
         with rasterio.open(path) as src:
             data = src.read(masked=False).astype(np.float32)
-            # Handle nodata values, but NOT if nodata is 0 (common for masks)
-            if src.nodata is not None and src.nodata not in [0, 0.0]:
+            # Handle nodata values
+            if src.nodata is not None:
                 data[data == src.nodata] = np.nan
             log_progress(f"    Read {path.name} ({time.time() - start_time:.1f}s)")
             return data
@@ -435,56 +563,32 @@ def read_reproject_to_ref(path: Path, ref_profile: dict) -> np.ndarray:
         src_crs = normalize_crs(src.crs)
         dst_crs = normalize_crs(ref_profile["crs"])
         
-        # Both should be valid EPSG:3857 after normalization
+        # Both should be valid after normalization
         if src_crs is None or dst_crs is None:
             log_progress(f"    ERROR: CRS normalization failed for {path.name}")
             raise ValueError(f"Could not normalize CRS for {path.name}")
         
         count = src.count
         
-        # Special handling for nodata=0: read raw array and use temp nodata
-        if src.nodata in [0, 0.0]:
-            temp_nodata = -9999.0
-            dst = np.full((count, dst_height, dst_width), temp_nodata, dtype=np.float32)
-            
-            for b in range(1, count + 1):
-                # Read source band as array and convert to float32 to allow temp_nodata
-                src_array = src.read(b, masked=False).astype(np.float32)
-                
-                # Reproject from numpy array
-                reproject(
-                    source=src_array,
-                    destination=dst[b - 1],
-                    src_transform=src.transform,
-                    src_crs=src_crs,
-                    src_nodata=temp_nodata,  # Use temp nodata (nothing in source has this value)
-                    dst_transform=dst_transform,
-                    dst_crs=dst_crs,
-                    resampling=Resampling.nearest,
-                    dst_nodata=temp_nodata,
-                )
-            
-            # Convert temp nodata to NaN, but preserve zeros
-            dst[dst == temp_nodata] = np.nan
-        else:
-            # Standard path for other nodata values
-            dst = np.full((count, dst_height, dst_width), np.nan, dtype=np.float32)
-            
-            for b in range(1, count + 1):
-                reproject(
-                    source=rasterio.band(src, b),
-                    destination=dst[b - 1],
-                    src_transform=src.transform,
-                    src_crs=src_crs,
-                    src_nodata=src.nodata,
-                    dst_transform=dst_transform,
-                    dst_crs=dst_crs,
-                    resampling=Resampling.nearest,
-                    dst_nodata=np.nan,
-                )
+        # Standard reprojection path
+        dst = np.full((count, dst_height, dst_width), np.nan, dtype=np.float32)
+        
+        for b in range(1, count + 1):
+            reproject(
+                source=rasterio.band(src, b),
+                destination=dst[b - 1],
+                src_transform=src.transform,
+                src_crs=src_crs,
+                src_nodata=src.nodata,
+                dst_transform=dst_transform,
+                dst_crs=dst_crs,
+                resampling=Resampling.nearest,
+                dst_nodata=np.nan,
+            )
         
         log_progress(f"    Reprojected {path.name} ({time.time() - start_time:.1f}s)")
-        return dst if count > 1 else dst[0]
+        # Always return (count, height, width) shape for consistency with aligned path
+        return dst
 
 
 def iter_reference_windows(ref_profile: dict, tile_size: int = TILE_SIZE):
@@ -499,17 +603,25 @@ def iter_reference_windows(ref_profile: dict, tile_size: int = TILE_SIZE):
 
 
 def read_reproject_window(src_path: Path, ref_profile: dict, window: Window, 
-                          dataset: Optional[str] = None, _debug_state: dict = {}) -> np.ndarray:
+                          dataset: Optional[str] = None, _debug_state: Optional[dict] = None) -> np.ndarray:
     """
     Read a source raster and reproject only the given reference window to a float32 array (B, h, w).
     
     Optimization: If already aligned, read window directly without reprojection.
-    Special handling: If src.nodata == 0, we preserve legitimate zeros.
     
     Int16 auto-unscaling: If the dataset is in INT16_SCALED_DATASETS and the file dtype is Int16,
     automatically divides by 100 to restore original values. This allows seamless use of storage-optimized
     inputs without manual intervention.
+    
+    Args:
+        src_path: Path to source raster file
+        ref_profile: Reference grid profile
+        window: Window to read
+        dataset: Optional dataset name (for Int16 unscaling detection)
+        _debug_state: Optional dict for tracking debug state (internal use)
     """
+    if _debug_state is None:
+        _debug_state = {}
     with rasterio.open(src_path) as src:
         dst_height = int(window.height)
         dst_width = int(window.width)
@@ -531,7 +643,7 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
         src_crs = normalize_crs(src.crs, debug_filename=debug_filename)
         dst_crs = normalize_crs(ref_profile["crs"])
         
-        # Both should be valid EPSG:3857 after normalization
+        # Both should be valid after normalization
         if src_crs is None or dst_crs is None:
             log_progress(f"    ERROR: CRS normalization failed for {src_path.name}")
             raise ValueError(f"Could not normalize CRS for {src_path.name}")
@@ -550,59 +662,34 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
             np.allclose(src.transform, ref_profile["transform"], atol=1e-6)):
             
             data = src.read(window=window, masked=False).astype(np.float32)
-            # Handle nodata values, but NOT if nodata is 0 (common for masks)
-            if src.nodata is not None and src.nodata not in [0, 0.0]:
+            # Handle nodata values
+            if src.nodata is not None:
                 data[data == src.nodata] = np.nan
             
             # Auto-unscale Int16 data (÷100) if detected
             if needs_unscaling:
                 data = data / 100.0
             
-            return data if count > 1 else data[np.newaxis, ...]
+            return data
         
         # Slow path: reprojection needed
         dst_transform = rasterio.windows.transform(window, ref_profile["transform"])
         # dst_crs already normalized above
         
-        # Special handling for nodata=0: read full data and create temp array with different nodata
-        if src.nodata in [0, 0.0]:
-            temp_nodata = -9999.0
-            dst = np.full((count, dst_height, dst_width), temp_nodata, dtype=np.float32)
-            
-            for b in range(1, count + 1):
-                # Read source band as array and convert to float32 to allow temp_nodata
-                src_array = src.read(b, masked=False).astype(np.float32)
-                
-                # Reproject from numpy array instead of rasterio band
-                reproject(
-                    source=src_array,
-                    destination=dst[b - 1],
-                    src_transform=src.transform,
-                    src_crs=src_crs,
-                    src_nodata=temp_nodata,  # Use temp nodata (nothing in source has this value)
-                    dst_transform=dst_transform,
-                    dst_crs=dst_crs,
-                    resampling=Resampling.nearest,
-                    dst_nodata=temp_nodata,
-                )
-            
-            # Convert temp nodata to NaN, but preserve zeros
-            dst[dst == temp_nodata] = np.nan
-        else:
-            # Standard path for other nodata values
-            dst = np.full((count, dst_height, dst_width), np.nan, dtype=np.float32)
-            for b in range(1, count + 1):
-                reproject(
-                    source=rasterio.band(src, b),
-                    destination=dst[b - 1],
-                    src_transform=src.transform,
-                    src_crs=src_crs,
-                    src_nodata=src.nodata,
-                    dst_transform=dst_transform,
-                    dst_crs=dst_crs,
-                    resampling=Resampling.nearest,
-                    dst_nodata=np.nan,
-                )
+        # Standard reprojection path
+        dst = np.full((count, dst_height, dst_width), np.nan, dtype=np.float32)
+        for b in range(1, count + 1):
+            reproject(
+                source=rasterio.band(src, b),
+                destination=dst[b - 1],
+                src_transform=src.transform,
+                src_crs=src_crs,
+                src_nodata=src.nodata,
+                dst_transform=dst_transform,
+                dst_crs=dst_crs,
+                resampling=Resampling.nearest,
+                dst_nodata=np.nan,
+            )
         
         # Auto-unscale Int16 data (÷100) if detected
         if needs_unscaling:
@@ -612,8 +699,8 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
 
 
 def window_to_arrow(year: int, window: Window, band_stack: np.ndarray, band_names: List[str], 
-                    ref_profile: dict, backbone_window: np.ndarray) -> pa.Table:
-    """Create an Arrow table for a window, filtering by Colombia mask (only colombia_GEE=1 pixels)."""
+                    ref_profile: dict, sa_backbone_window: np.ndarray, colombia_mask_window: np.ndarray) -> pa.Table:
+    """Create an Arrow table for a window, filtering by combined mask (SA backbone & Colombia mask)."""
     h = int(window.height)
     w = int(window.width)
     rows = (np.arange(h, dtype=np.int32) + int(window.row_off)).repeat(w)
@@ -625,11 +712,12 @@ def window_to_arrow(year: int, window: Window, band_stack: np.ndarray, band_name
     # Flatten bands (band_stack is already float32, no need to convert)
     flat_bands = [band_stack[i].reshape(-1) for i in range(band_stack.shape[0])]
 
-    # Apply Colombia mask: only keep pixels where colombia_GEE == 1
-    backbone_flat = backbone_window.reshape(-1)
-    keep = backbone_flat == 1
+    # Apply combined filter: keep pixels where (sa_backbone == 1) & (colombia_mask == 1)
+    sa_backbone_flat = sa_backbone_window.reshape(-1)
+    colombia_mask_flat = colombia_mask_window.reshape(-1)
+    keep = (sa_backbone_flat == 1) & (colombia_mask_flat == 1)
 
-    # Skip empty windows (no land pixels)
+    # Skip empty windows (no pixels to keep)
     if keep.sum() == 0:
         return pa.table({
             "year": pa.array([], type=pa.int16()),
@@ -671,7 +759,7 @@ def build_band_names(dataset: str, arrays: List[np.ndarray]) -> List[str]:
 
 
 def apply_temporal_coverage_rules(band_stack: np.ndarray, band_names: List[str], year: int, 
-                                  log_once: dict = {}) -> None:
+                                  log_once: Optional[dict] = None) -> None:
     """
     Apply temporal coverage rules to enforce dataset-specific valid time ranges.
     Modifies band_stack in-place by setting values to NaN for years outside valid coverage.
@@ -683,8 +771,10 @@ def apply_temporal_coverage_rules(band_stack: np.ndarray, band_names: List[str],
         band_stack: (bands, height, width) array to modify in-place
         band_names: List of band names corresponding to band_stack bands
         year: The year being processed
-        log_once: Mutable dict for tracking which rules have been logged (default: {})
+        log_once: Optional dict for tracking which rules have been logged
     """
+    if log_once is None:
+        log_once = {}
     # Define temporal coverage rules: {band_name: first_valid_year}
     # Currently no temporal coverage rules active (GDP excluded, HNTL handles 2000-2020 natively)
     TEMPORAL_RULES = {}
@@ -756,11 +846,30 @@ def load_dataset_window(
     
     arrays = []
     for p in paths:
-        arr = read_reproject_window(p, ref_profile, window, dataset=dataset)
-        arrays.append(arr)
+        try:
+            arr = read_reproject_window(p, ref_profile, window, dataset=dataset)
+            arrays.append(arr)
+        except Exception as e:
+            # Individual file failure: log warning and skip this file (continue with others)
+            log_progress(f"    Warning: Failed to read {p.name} in window, skipping: {e}")
+            continue
     
-    # If loading failed, create placeholder
+    # If all files failed, return NaN placeholder
     if not arrays:
+        placeholder = np.full((expected_bands, window_height, window_width), np.nan, dtype=np.float32)
+        return [placeholder]
+    
+    # Validate total number of bands produced
+    total_bands = 0
+    for arr in arrays:
+        if arr.ndim == 2:
+            total_bands += 1
+        else:
+            total_bands += arr.shape[0]
+    
+    # If band count doesn't match expected (e.g., due to failed files), return NaN placeholder
+    if total_bands != expected_bands:
+        log_progress(f"    Warning: Band count mismatch (expected {expected_bands}, got {total_bands}), using NaN placeholder")
         placeholder = np.full((expected_bands, window_height, window_width), np.nan, dtype=np.float32)
         return [placeholder]
     
@@ -796,19 +905,20 @@ def main():
     log_progress(f"Using data from: {READY_ROOT}")
     log_progress(f"Int16 auto-unscaling enabled for: {', '.join(INT16_SCALED_DATASETS)}")
     
-    # Setup reference using backbone
-    ref_path, ref_src, backbone_mask = open_reference_backbone()
+    # Setup reference using SA backbone (backbone.tif) and load filtering masks
+    ref_path, ref_src, sa_backbone_mask, colombia_mask = open_reference_backbone()
     ref_profile = ref_src.profile.copy()
     ref_profile.update({
         "count": 1,
-        "dtype": rasterio.float32,
+        "dtype": np.float32,
         "nodata": np.nan,
         "compress": "lzw",
     })
     
-    # Calculate land pixel statistics
-    land_pixels = int((backbone_mask == 1).sum())
-    total_pixels = backbone_mask.size
+    # Calculate combined mask statistics
+    combined_mask = (sa_backbone_mask == 1) & (colombia_mask == 1)
+    keep_pixels = int(combined_mask.sum())
+    total_pixels = combined_mask.size
     
     ref_src.close()  # Close the reference file
     
@@ -845,9 +955,10 @@ def main():
         "reference_grid/height": ref_profile["height"],
         "reference_grid/width": ref_profile["width"],
         "reference_grid/total_pixels": total_pixels,
-        "reference_grid/land_pixels": land_pixels,
-        "reference_grid/land_percentage": 100 * land_pixels / total_pixels,
+        "reference_grid/keep_pixels": keep_pixels,
+        "reference_grid/keep_percentage": 100 * keep_pixels / total_pixels,
         "reference_grid/crs": str(ref_profile["crs"]),
+        "reference_grid/filter": "SA_backbone_and_Colombia_mask",
     })
 
     # Identify datasets to include
@@ -937,7 +1048,7 @@ def main():
             if band_names:
                 static_band_names.extend(band_names)
                 static_band_counts[dataset] = len(band_names)
-                log_progress(f"    ✓ {dataset}: {len(band_names)} bands (static)")
+                log_progress(f"    {dataset}: {len(band_names)} bands (static)")
         except Exception as e:
             log_progress(f"    Warning: Could not probe static dataset {dataset}: {e}")
             continue
@@ -978,7 +1089,7 @@ def main():
             if band_names:
                 yearly_band_names.extend(band_names)
                 yearly_band_counts[dataset] = len(band_names)
-                log_progress(f"    ✓ {dataset}: {len(band_names)} bands (yearly)")
+                log_progress(f"    {dataset}: {len(band_names)} bands (yearly)")
         except Exception as e:
             log_progress(f"    Warning: Could not probe yearly dataset {dataset}: {e}")
             continue
@@ -1040,14 +1151,19 @@ def main():
         window_height = int(w.height)
         window_width = int(w.width)
         
-        # Extract Colombia mask window (same for all years)
-        backbone_window = backbone_mask[
+        # Extract mask windows (same for all years)
+        sa_backbone_window = sa_backbone_mask[
+            int(w.row_off):int(w.row_off + w.height),
+            int(w.col_off):int(w.col_off + w.width)
+        ]
+        colombia_mask_window = colombia_mask[
             int(w.row_off):int(w.row_off + w.height),
             int(w.col_off):int(w.col_off + w.width)
         ]
         
-        # Skip windows with no Colombia pixels
-        if (backbone_window == 1).sum() == 0:
+        # Skip windows with no pixels to keep (SA backbone & Colombia mask)
+        combined_window = (sa_backbone_window == 1) & (colombia_mask_window == 1)
+        if combined_window.sum() == 0:
             continue
         
         # LOAD STATIC DATA ONCE for this window (reused across all years)
@@ -1108,8 +1224,8 @@ def main():
                 # Apply temporal coverage rules (in-place modification)
                 apply_temporal_coverage_rules(band_stack, current_band_names, year)
                 
-                # Parquet streaming with Colombia mask
-                table = window_to_arrow(year, w, band_stack, current_band_names, ref_profile, backbone_window)
+                # Parquet streaming with combined mask (SA backbone & Colombia mask)
+                table = window_to_arrow(year, w, band_stack, current_band_names, ref_profile, sa_backbone_window, colombia_mask_window)
                 if parquet_writer is None:
                     log_progress("  Initializing Parquet writer...")
                     parquet_writer = pq.ParquetWriter(PARQUET_PATH, table.schema, compression='zstd')
@@ -1126,8 +1242,8 @@ def main():
                 traceback.print_exc()
                 continue
         
-        # Clean up static data and Colombia mask window after processing all years
-        del static_window_arrays, backbone_window
+        # Clean up static data and mask windows after processing all years
+        del static_window_arrays, sa_backbone_window, colombia_mask_window
         # Only gc.collect() periodically to reduce overhead
         if window_idx % 50 == 0:
             gc.collect()
