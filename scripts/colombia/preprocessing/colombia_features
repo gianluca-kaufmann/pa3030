@@ -2,6 +2,9 @@
 
 """Colombia Spatial Features Preprocessing Script
 
+Pipeline Stage: This is the second step in the Colombia pipeline, immediately after colombia_merge.
+                Run colombia_merge first to generate the input panel data.
+
 Purpose: Add lagged status, spatial-context features, and a transition target to the merged Colombia panel data,
          then apply Risk Set filtering.
 
@@ -31,6 +34,10 @@ Processing order (per year):
          stored as `uint8`.
 
 Input:  outputs/Results/merged_panel_colombia_<start>_<end>.parquet (from colombia_merge script)
+        - Auto-detected from standard output locations ($SCRATCH/outputs/Results or outputs/Results)
+        - Can be overridden with COLOMBIA_FEATURES_INPUT_PATH environment variable
+        - Requires columns: year, row, col, WDPA_b1 (and other feature columns)
+
 Output: outputs/Results/merged_panel_colombia_final.parquet (Risk Set only, with transition_01 column)
 
 Processing: Year-by-year for memory efficiency. Spatial features are computed before filtering to reflect
@@ -308,8 +315,9 @@ def main() -> None:
     env_input = os.environ.get("COLOMBIA_FEATURES_INPUT_PATH")
     if env_input:
         input_path = Path(env_input)
+        logger.info(f"Using input path from environment variable: {input_path}")
     else:
-        # Look for merged_panel_colombia_*.parquet files
+        # Look for merged_panel_colombia_*.parquet files (output from colombia_merge)
         candidate_dirs = []
         if scratch_root is not None:
             candidate_dirs.append(scratch_root / "outputs" / "Results")
@@ -323,6 +331,9 @@ def main() -> None:
                 if colombia_files:
                     # Use the most recently modified file if multiple exist
                     input_path = max(colombia_files, key=lambda p: p.stat().st_mtime)
+                    logger.info(f"Auto-detected input file: {input_path}")
+                    if len(colombia_files) > 1:
+                        logger.info(f"  Note: Found {len(colombia_files)} colombia files, using most recent")
                     break
         
         if input_path is None:
@@ -331,6 +342,7 @@ def main() -> None:
                 input_path = scratch_root / "outputs" / "Results" / "merged_panel_colombia_2000_2024.parquet"
             else:
                 input_path = repo_root / "outputs" / "Results" / "merged_panel_colombia_2000_2024.parquet"
+            logger.warning(f"No colombia files found, using default fallback: {input_path}")
 
     # On clusters, write large outputs to $SCRATCH; locally keep them under the repo
     if scratch_root is not None:
@@ -351,6 +363,9 @@ def main() -> None:
             "smooth_sizes": SMOOTH_SIZES,
             "static_distance_mapping": STATIC_DISTANCE_MAPPING,
             "region": "Colombia",
+            "pipeline_stage": "spatial_features",
+            "input_from": "colombia_merge",
+            "input_path": str(input_path),
         }
     )
     
@@ -360,17 +375,44 @@ def main() -> None:
     logger.info(f"Input:  {input_path}")
     logger.info(f"Output: {output_path}")
     
+    # Validate input file exists and is readable
     if not input_path.exists():
-        raise FileNotFoundError(f"Input file not found: {input_path}")
+        raise FileNotFoundError(
+            f"Input file not found: {input_path}\n"
+            f"Expected output from colombia_merge script.\n"
+            f"Please run colombia_merge first or set COLOMBIA_FEATURES_INPUT_PATH environment variable."
+        )
+    
+    # Validate input file is not empty and has expected structure
+    try:
+        input_size_mb = input_path.stat().st_size / (1024**2)
+        logger.info(f"Input file size: {input_size_mb:.1f} MB")
+        if input_size_mb < 0.1:
+            raise ValueError(f"Input file is suspiciously small ({input_size_mb:.2f} MB)")
+    except Exception as e:
+        raise RuntimeError(f"Failed to validate input file: {e}")
     
     temp_dir.mkdir(parents=True, exist_ok=True)
     
-    # Get metadata
-    logger.info("Reading metadata...")
+    # Get metadata and validate required columns
+    logger.info("Reading metadata and validating structure...")
+    
+    # Check that all required columns are present
+    schema = pq.read_schema(input_path)
+    required_cols = ['year', 'row', 'col', 'WDPA_b1']
+    missing_cols = [col for col in required_cols if col not in schema.names]
+    if missing_cols:
+        raise ValueError(
+            f"Input file is missing required columns: {missing_cols}\n"
+            f"Available columns: {schema.names}\n"
+            f"Expected output format from colombia_merge script."
+        )
+    
     df_sample = pd.read_parquet(input_path, columns=['year'])
     years = sorted(df_sample['year'].unique())
     total_rows = len(df_sample)
     logger.info(f"Years: {years[0]}-{years[-1]} ({len(years)} years), Total rows: {total_rows:,}")
+    logger.info(f"Validation passed: Input file has correct structure from colombia_merge")
     del df_sample
     gc.collect()
     

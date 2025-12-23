@@ -2,6 +2,9 @@
 """
 Merge Colombia 1 km rasters into a yearly panel with streaming I/O and low memory use.
 
+Pipeline Stage: This is the FIRST step in the Colombia pipeline. After this, run colombia_features
+                to add spatial features and create the final training dataset.
+
 Summary:
 - Reads per-dataset rasters from ``data`` (or ``$SCRATCH/data/ml/ready`` on cluster for storage-optimized inputs).
 - Processes one year at a time, reusing earlier data when a dataset is missing for a given year.
@@ -1113,10 +1116,22 @@ def main():
     total_time = time.time() - total_start_time
     log_progress(f"Merge process completed in {total_time/60:.1f} minutes")
     
+    # Pipeline guidance
+    log_progress("\n" + "="*80)
+    log_progress("NEXT PIPELINE STEP")
+    log_progress("="*80)
+    log_progress("Run colombia_features script to:")
+    log_progress("  - Add spatial features (distance transforms, smoothing)")
+    log_progress("  - Create lagged variables (WDPA_prev)")
+    log_progress("  - Apply Risk Set filtering")
+    log_progress("  - Generate transition_01 target variable")
+    log_progress(f"\nInput for next step: {PARQUET_PATH}")
+    
     wandb.log({
         "summary/total_time_minutes": total_time / 60,
         "summary/total_time_hours": total_time / 3600,
-        "summary/status": "completed"
+        "summary/status": "completed",
+        "summary/next_step": "colombia_features"
     })
     
     wandb.finish()
