@@ -3,32 +3,36 @@
 Multi-temporal satellite embedding visualization (2018-2024).
 
 Inputs:
-- GeoTIFF `SatelliteEmbeddings_SA_1km_2018-2024_multitemporal.tif` located in `data/ready/embeddings`.
+- Parquet file `embeddings_transition_panel_2018-2024.parquet` located in `data/ml`.
 
 Process:
-- Loads the 448-band embedding raster, optionally downsamples for visual clarity, computes PCA composites, and generates annual heatmaps and summaries.
+- Loads embeddings from Parquet format, reshapes to 2D grids per year, computes PCA composites,
+  and generates annual heatmaps and summaries.
 
 Outputs:
 - PNG figures saved to `outputs/Figures/embeddings_vis`.
 """
 
 import numpy as np
-import rasterio
+import pyarrow.parquet as pq
 from pathlib import Path
 import matplotlib.pyplot as plt
-from typing import Tuple, List
+from typing import Tuple, List, Dict
 import matplotlib.gridspec as gridspec
+import pandas as pd
+from scipy.sparse.linalg import svds
 
 # Paths
-ROOT_DIR = Path(__file__).resolve().parents[2]
-EMBED_DIR = ROOT_DIR / "data" / "ready" / "embeddings"
-EMBEDDINGS_FILE = EMBED_DIR / "SatelliteEmbeddings_SA_1km_2018-2024_multitemporal.tif"
+ROOT_DIR = Path(__file__).resolve().parents[3]  # Go up 3 levels: visualisations -> embeddings -> scripts -> root
+ML_DIR = ROOT_DIR / "data" / "ml"
+EMBEDDINGS_FILE = ML_DIR / "embeddings_transition_panel_2018-2024.parquet"
 OUT_DIR = ROOT_DIR / "outputs" / "Figures" / "embeddings_vis"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # Years in the dataset
 YEARS = [2018, 2019, 2020, 2021, 2022, 2023, 2024]
 BANDS_PER_YEAR = 64
+EMB_COLUMNS = [f"emb_{i:02d}" for i in range(1, BANDS_PER_YEAR + 1)]
 
 
 def log_progress(message: str):
@@ -36,80 +40,232 @@ def log_progress(message: str):
     print(message)
 
 
-def load_multitemporal_data(downsample: bool = True, 
-                            target_size: Tuple[int, int] = (2000, 2000)) -> Tuple[np.ndarray, dict]:
+def find_grid_bounds(parquet_file: pq.ParquetFile) -> Tuple[int, int, int, int]:
     """
-    Load the multi-temporal embeddings file.
+    Scan Parquet file to find min/max row and col coordinates without loading all data.
+    """
+    log_progress("  Scanning file to determine grid dimensions...")
+    min_row = np.inf
+    max_row = -np.inf
+    min_col = np.inf
+    max_col = -np.inf
+    
+    # Sample row groups to find bounds (don't need to check all)
+    num_row_groups = parquet_file.metadata.num_row_groups
+    sample_indices = list(range(0, num_row_groups, max(1, num_row_groups // 50)))  # Sample ~50 groups
+    sample_indices.append(num_row_groups - 1)  # Always check last one
+    
+    for i in sample_indices:
+        try:
+            table = parquet_file.read_row_group(i, columns=['row', 'col'])
+            df = table.to_pandas()
+            min_row = min(min_row, df['row'].min())
+            max_row = max(max_row, df['row'].max())
+            min_col = min(min_col, df['col'].min())
+            max_col = max(max_col, df['col'].max())
+        except Exception:
+            continue
+    
+    return int(min_row), int(max_row), int(min_col), int(max_col)
+
+
+def load_parquet_data(max_pixels: int = None) -> Tuple[Dict[int, np.ndarray], Dict]:
+    """
+    Load embeddings from Parquet file and reshape to 2D grids per year.
+    Uses memory-efficient chunked processing to avoid OOM.
+    
+    Args:
+        max_pixels: Optional limit on number of pixels to load (for downsampling)
     
     Returns:
-        data: Array of shape (bands, height, width) = (448, H, W)
+        year_data_dict: Dictionary mapping year -> (64, height, width) array
         metadata: Dictionary with file information
     """
     log_progress(f"Loading: {EMBEDDINGS_FILE.name}")
     
-    with rasterio.open(EMBEDDINGS_FILE) as src:
-        # Get metadata
-        metadata = {
-            'bands': src.count,
-            'shape': src.shape,
-            'crs': src.crs,
-            'bounds': src.bounds,
-            'transform': src.transform,
-            'width': src.width,
-            'height': src.height
-        }
-        
-        log_progress(f"  Dimensions: {src.width} × {src.height}")
-        log_progress(f"  Bands: {src.count}")
-        log_progress(f"  CRS: {src.crs}")
-        
-        # Load data
-        if downsample and (src.width > target_size[0] or src.height > target_size[1]):
-            # Calculate downsample factors
-            scale_x = src.width / target_size[0]
-            scale_y = src.height / target_size[1]
-            scale = max(scale_x, scale_y)
-            
-            new_width = int(src.width / scale)
-            new_height = int(src.height / scale)
-            
-            log_progress(f"  Downsampling to ~{new_width} × {new_height} for visualization...")
-            
-            # Read downsampled data
-            data = src.read(
-                out_shape=(src.count, new_height, new_width),
-                resampling=rasterio.enums.Resampling.average
-            )
-            
-            log_progress(f"  Loaded downsampled data: {data.shape}")
-        else:
-            log_progress(f"  Loading full resolution...")
-            data = src.read()
-            log_progress(f"  Loaded data: {data.shape}")
+    if not EMBEDDINGS_FILE.exists():
+        raise FileNotFoundError(f"Embeddings file not found: {EMBEDDINGS_FILE}")
     
-    return data, metadata
+    # Open Parquet file
+    parquet_file = pq.ParquetFile(EMBEDDINGS_FILE)
+    
+    # Get metadata
+    metadata = {
+        'file': str(EMBEDDINGS_FILE),
+        'num_row_groups': parquet_file.metadata.num_row_groups,
+        'num_rows': parquet_file.metadata.num_rows
+    }
+    
+    log_progress(f"  Row groups: {metadata['num_row_groups']}")
+    log_progress(f"  Total rows: {metadata['num_rows']:,}")
+    
+    # Find grid bounds without loading all data
+    min_row, max_row, min_col, max_col = find_grid_bounds(parquet_file)
+    
+    height = int(max_row - min_row + 1)
+    width = int(max_col - min_col + 1)
+    
+    log_progress(f"  Grid dimensions: {width} × {height}")
+    log_progress(f"  Row range: {min_row} to {max_row}")
+    log_progress(f"  Col range: {min_col} to {max_col}")
+    
+    metadata['height_original'] = height
+    metadata['width_original'] = width
+    metadata['min_row'] = min_row
+    metadata['min_col'] = min_col
+    
+    # Determine if we need to downsample
+    target_height = height
+    target_width = width
+    downsample_factor = 1.0
+    
+    if max_pixels and (height * width > max_pixels):
+        # Calculate downsample factor
+        scale = np.sqrt((height * width) / max_pixels)
+        target_height = int(height / scale)
+        target_width = int(width / scale)
+        downsample_factor = scale
+        log_progress(f"  Will downsample to ~{target_width} × {target_height} for visualization...")
+    
+    # Initialize arrays for each year (use target dimensions if downsampling)
+    year_data_dict = {}
+    for year in YEARS:
+        if downsample_factor > 1.0:
+            year_data_dict[year] = np.full((BANDS_PER_YEAR, target_height, target_width), np.nan, dtype=np.float32)
+        else:
+            year_data_dict[year] = np.full((BANDS_PER_YEAR, height, width), np.nan, dtype=np.float32)
+    
+    # Process row groups incrementally, year by year
+    log_progress("  Processing data in chunks...")
+    columns_to_read = ['row', 'col', 'year'] + EMB_COLUMNS
+    num_row_groups = parquet_file.metadata.num_row_groups
+    
+    # Process in batches to reduce memory pressure (larger batches = fewer passes)
+    batch_size = 200  # Process 200 row groups at a time (increased for speed)
+    
+    for batch_start in range(0, num_row_groups, batch_size):
+        batch_end = min(batch_start + batch_size, num_row_groups)
+        log_progress(f"    Processing row groups {batch_start+1}-{batch_end}/{num_row_groups}...")
+        
+        # Read batch of row groups
+        batch_data = []
+        for i in range(batch_start, batch_end):
+            try:
+                table = parquet_file.read_row_group(i, columns=columns_to_read)
+                df = table.to_pandas()
+                batch_data.append(df)
+            except Exception as e:
+                log_progress(f"      Warning: Failed to read row group {i}: {e}")
+                continue
+        
+        if not batch_data:
+            continue
+        
+        # Combine batch
+        batch_df = pd.concat(batch_data, ignore_index=True)
+        
+        # Process each year in this batch (vectorized)
+        for year in YEARS:
+            year_mask = batch_df['year'] == year
+            if not year_mask.any():
+                continue
+            
+            year_batch = batch_df[year_mask]
+            
+            # Convert row/col to array indices
+            rows = (year_batch['row'] - min_row).astype(np.int32)
+            cols = (year_batch['col'] - min_col).astype(np.int32)
+            
+            # Filter valid indices
+            valid_mask = (rows >= 0) & (rows < height) & (cols >= 0) & (cols < width)
+            if not valid_mask.any():
+                continue
+            
+            year_batch = year_batch[valid_mask]
+            rows = rows[valid_mask].values
+            cols = cols[valid_mask].values
+            
+            # Calculate scale factors if downsampling
+            if downsample_factor > 1.0:
+                row_scale = height / target_height
+                col_scale = width / target_width
+                # Vectorized downsampling
+                r_target = (rows / row_scale).astype(np.int32)
+                c_target = (cols / col_scale).astype(np.int32)
+            else:
+                r_target = rows
+                c_target = cols
+            
+            # Filter to valid target coordinates
+            target_valid = (r_target >= 0) & (r_target < target_height) & (c_target >= 0) & (c_target < target_width)
+            if not target_valid.any():
+                continue
+            
+            year_batch = year_batch[target_valid]
+            r_target = r_target[target_valid]
+            c_target = c_target[target_valid]
+            
+            # Create pixel key column for grouping (use numpy for speed)
+            pixel_keys = r_target * target_width + c_target
+            
+            # Group by pixel and aggregate embeddings using mean (handles duplicates)
+            # Convert to DataFrame for groupby
+            emb_data = year_batch[EMB_COLUMNS].values
+            grouped_df = pd.DataFrame(emb_data, columns=EMB_COLUMNS)
+            grouped_df['_pixel_key'] = pixel_keys
+            
+            grouped = grouped_df.groupby('_pixel_key', as_index=False)[EMB_COLUMNS].mean()
+            
+            # Convert pixel keys back to row/col indices
+            pixel_keys_grouped = grouped['_pixel_key'].values
+            r_indices = pixel_keys_grouped // target_width
+            c_indices = pixel_keys_grouped % target_width
+            
+            # Vectorized assignment using advanced indexing
+            emb_values = grouped[EMB_COLUMNS].values.T  # (64, n_pixels)
+            year_data_dict[year][:, r_indices, c_indices] = emb_values
+        
+        # Clear batch from memory
+        del batch_df, batch_data
+    
+    # Final statistics
+    log_progress("  Finalizing...")
+    for year in YEARS:
+        valid_pixels = np.sum(~np.isnan(year_data_dict[year][0, :, :]))
+        log_progress(f"    {year}: {valid_pixels:,} valid pixels")
+    
+    # Update metadata with final dimensions
+    if downsample_factor > 1.0:
+        metadata['height'] = target_height
+        metadata['width'] = target_width
+        metadata['downsampled'] = True
+        metadata['downsample_factor'] = downsample_factor
+    else:
+        metadata['height'] = height
+        metadata['width'] = width
+        metadata['downsampled'] = False
+    
+    return year_data_dict, metadata
 
 
-def get_year_data(data: np.ndarray, year: int) -> np.ndarray:
+def get_year_data(year_data_dict: Dict[int, np.ndarray], year: int) -> np.ndarray:
     """
-    Extract data for a specific year from multi-temporal array.
+    Extract data for a specific year.
     
     Args:
-        data: Full array (448, H, W)
+        year_data_dict: Dictionary mapping year -> (64, H, W) array
         year: Year to extract (2018-2024)
     
     Returns:
         year_data: Array (64, H, W) for that year
     """
-    year_idx = YEARS.index(year)
-    band_start = year_idx * BANDS_PER_YEAR
-    band_end = band_start + BANDS_PER_YEAR
-    return data[band_start:band_end, :, :]
+    return year_data_dict[year]
 
 
 def compute_pca_rgb(data: np.ndarray, normalize: str = 'zscore') -> np.ndarray:
     """
     Compute PCA and create RGB composite from first 3 components.
+    Uses truncated SVD for faster computation when only 3 components are needed.
     
     Args:
         data: (bands, height, width)
@@ -119,6 +275,7 @@ def compute_pca_rgb(data: np.ndarray, normalize: str = 'zscore') -> np.ndarray:
         rgb: (height, width, 3) RGB image in [0, 1]
     """
     bands, height, width = data.shape
+    n_pixels = height * width
     
     # Reshape: (bands, pixels)
     X = data.reshape(bands, -1)
@@ -150,20 +307,39 @@ def compute_pca_rgb(data: np.ndarray, normalize: str = 'zscore') -> np.ndarray:
     X_mean = np.mean(X, axis=0)
     X_centered = X - X_mean
     
-    # Compute SVD
-    U, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
+    # Use truncated SVD for faster computation (only compute first 3 components)
+    # For large datasets, this is much faster than full SVD
+    if n_pixels > 10000:
+        try:
+            # Use scipy's truncated SVD (much faster for large matrices)
+            U, S, Vt = svds(X_centered.astype(np.float32), k=3, which='LM')
+            # svds returns components in reverse order, so flip
+            U = U[:, ::-1]
+        except:
+            # Fallback to full SVD if truncated fails
+            U, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
+            U = U[:, :3]
+    else:
+        # For smaller datasets, full SVD is fine
+        U, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
+        U = U[:, :3]
     
     # First 3 principal components: U[:, :3]
-    pc = U[:, :3]  # (pixels, 3)
+    pc = U  # (pixels, 3)
     
     # Reshape to image: (height, width, 3)
     rgb = pc.reshape(height, width, 3)
     
-    # Normalize to [0, 1] for each channel
+    # Vectorized normalization to [0, 1] for each channel
     for c in range(3):
         channel = rgb[:, :, c]
-        vmin, vmax = np.percentile(channel[~np.isnan(channel)], [2, 98])
-        rgb[:, :, c] = np.clip((channel - vmin) / (vmax - vmin), 0, 1)
+        valid = ~np.isnan(channel)
+        if np.any(valid):
+            vmin, vmax = np.percentile(channel[valid], [2, 98])
+            if vmax > vmin:
+                rgb[:, :, c] = np.clip((channel - vmin) / (vmax - vmin), 0, 1)
+            else:
+                rgb[:, :, c] = 0.5  # Uniform if no variation
     
     return rgb
 
@@ -185,19 +361,39 @@ def compute_magnitude(data: np.ndarray) -> np.ndarray:
     mag_clean = mag[~np.isnan(mag)]
     if len(mag_clean) > 0:
         vmin, vmax = np.percentile(mag_clean, [2, 98])
-        mag = np.clip((mag - vmin) / (vmax - vmin), 0, 1)
+        if vmax > vmin:
+            mag = np.clip((mag - vmin) / (vmax - vmin), 0, 1)
+        else:
+            mag = np.zeros_like(mag)
     
     return mag
 
 
-def create_year_visualizations(data: np.ndarray) -> None:
+def create_year_visualizations(year_data_dict: Dict[int, np.ndarray], 
+                                pca_cache: Dict[int, np.ndarray] = None,
+                                magnitude_cache: Dict[int, np.ndarray] = None) -> Tuple[Dict[int, np.ndarray], Dict[int, np.ndarray]]:
     """
     Create visualizations for each year.
+    Returns cached PCA and magnitude results for reuse.
     
     For each year, creates:
     - PCA RGB composite (z-score)
     - Magnitude heatmap
+    
+    Args:
+        year_data_dict: Dictionary mapping year -> (64, H, W) array
+        pca_cache: Optional pre-computed PCA cache
+        magnitude_cache: Optional pre-computed magnitude cache
+    
+    Returns:
+        pca_cache: Dictionary mapping year -> RGB array
+        magnitude_cache: Dictionary mapping year -> magnitude array
     """
+    if pca_cache is None:
+        pca_cache = {}
+    if magnitude_cache is None:
+        magnitude_cache = {}
+    
     log_progress("\n" + "=" * 80)
     log_progress("CREATING PER-YEAR VISUALIZATIONS")
     log_progress("=" * 80)
@@ -206,26 +402,40 @@ def create_year_visualizations(data: np.ndarray) -> None:
         log_progress(f"\nProcessing {year}...")
         
         # Extract year data
-        year_data = get_year_data(data, year)
+        year_data = get_year_data(year_data_dict, year)
         
-        # 1. PCA RGB
-        log_progress(f"  Computing PCA RGB...")
-        rgb = compute_pca_rgb(year_data, normalize='zscore')
+        # 1. PCA RGB (compute if not cached)
+        if year not in pca_cache:
+            log_progress(f"  Computing PCA RGB...")
+            pca_cache[year] = compute_pca_rgb(year_data, normalize='zscore')
+        else:
+            log_progress(f"  Using cached PCA RGB...")
+        rgb = pca_cache[year]
         out_file = OUT_DIR / f"embeddings_{year}_pca_rgb.png"
         plt.imsave(out_file, rgb)
         log_progress(f"  Saved: {out_file.name}")
         
-        # 2. Magnitude heatmap
-        log_progress(f"  Computing magnitude...")
-        mag = compute_magnitude(year_data)
+        # 2. Magnitude heatmap (compute if not cached)
+        if year not in magnitude_cache:
+            log_progress(f"  Computing magnitude...")
+            magnitude_cache[year] = compute_magnitude(year_data)
+        else:
+            log_progress(f"  Using cached magnitude...")
+        mag = magnitude_cache[year]
         out_file = OUT_DIR / f"embeddings_{year}_magnitude.png"
         plt.imsave(out_file, mag, cmap='magma')
         log_progress(f"  Saved: {out_file.name}")
+    
+    return pca_cache, magnitude_cache
 
 
-def create_temporal_comparison_grid(data: np.ndarray) -> None:
+def create_temporal_comparison_grid(pca_cache: Dict[int, np.ndarray]) -> None:
     """
     Create a grid showing PCA RGB for all years side-by-side.
+    Uses cached PCA results to avoid recomputation.
+    
+    Args:
+        pca_cache: Dictionary mapping year -> RGB array
     """
     log_progress("\n" + "=" * 80)
     log_progress("CREATING TEMPORAL COMPARISON GRID")
@@ -238,9 +448,8 @@ def create_temporal_comparison_grid(data: np.ndarray) -> None:
     for idx, year in enumerate(YEARS):
         log_progress(f"  Adding {year} to grid...")
         
-        # Get year data and compute PCA
-        year_data = get_year_data(data, year)
-        rgb = compute_pca_rgb(year_data, normalize='zscore')
+        # Use cached PCA result
+        rgb = pca_cache[year]
         
         # Add to subplot
         ax = fig.add_subplot(gs[0, idx])
@@ -256,9 +465,13 @@ def create_temporal_comparison_grid(data: np.ndarray) -> None:
     log_progress(f"Saved: {out_file.name}")
 
 
-def create_magnitude_temporal_grid(data: np.ndarray) -> None:
+def create_magnitude_temporal_grid(magnitude_cache: Dict[int, np.ndarray]) -> None:
     """
     Create a grid showing magnitude for all years side-by-side.
+    Uses cached magnitude results to avoid recomputation.
+    
+    Args:
+        magnitude_cache: Dictionary mapping year -> magnitude array
     """
     log_progress("\n" + "=" * 80)
     log_progress("CREATING MAGNITUDE TEMPORAL COMPARISON")
@@ -271,9 +484,8 @@ def create_magnitude_temporal_grid(data: np.ndarray) -> None:
     for idx, year in enumerate(YEARS):
         log_progress(f"  Adding {year} magnitude to grid...")
         
-        # Get year data and compute magnitude
-        year_data = get_year_data(data, year)
-        mag = compute_magnitude(year_data)
+        # Use cached magnitude result
+        mag = magnitude_cache[year]
         
         # Add to subplot
         ax = fig.add_subplot(gs[0, idx])
@@ -293,35 +505,28 @@ def create_magnitude_temporal_grid(data: np.ndarray) -> None:
     log_progress(f"Saved: {out_file.name}")
 
 
-def print_data_statistics(data: np.ndarray, metadata: dict) -> None:
+def print_data_statistics(year_data_dict: Dict[int, np.ndarray], metadata: dict) -> None:
     """Print statistics about the loaded data."""
     log_progress("\n" + "=" * 80)
     log_progress("DATA STATISTICS")
     log_progress("=" * 80)
     
-    total_bands = data.shape[0]
-    height = data.shape[1]
-    width = data.shape[2]
+    height = metadata.get('height', 0)
+    width = metadata.get('width', 0)
     
-    log_progress(f"Shape: ({total_bands}, {height}, {width})")
+    log_progress(f"Grid dimensions: {width} × {height}")
     log_progress(f"Years: {len(YEARS)} ({min(YEARS)}-{max(YEARS)})")
     log_progress(f"Bands per year: {BANDS_PER_YEAR}")
     
-    # Count valid pixels
+    # Count valid pixels per year
     total_pixels = height * width
-    valid_pixels_per_band = np.sum(~np.isnan(data), axis=(1, 2))
     
-    # Average coverage across all bands
-    avg_coverage = np.mean(valid_pixels_per_band) / total_pixels * 100
-    
-    log_progress(f"Average coverage: {avg_coverage:.2f}%")
-    
-    # Per-year coverage
     log_progress("\nCoverage by year:")
     for year in YEARS:
-        year_data = get_year_data(data, year)
-        year_coverage = np.mean(np.sum(~np.isnan(year_data), axis=(1, 2))) / total_pixels * 100
-        log_progress(f"  {year}: {year_coverage:.2f}%")
+        year_data = get_year_data(year_data_dict, year)
+        valid_pixels = np.sum(~np.isnan(year_data[0, :, :]))
+        coverage = (valid_pixels / total_pixels * 100) if total_pixels > 0 else 0
+        log_progress(f"  {year}: {valid_pixels:,} pixels ({coverage:.2f}%)")
 
 
 def main():
@@ -335,20 +540,20 @@ def main():
     if not EMBEDDINGS_FILE.exists():
         print(f"Error: Embeddings file not found: {EMBEDDINGS_FILE}")
         print()
-        print("Please run the merge script first:")
-        print("   python scripts/merging/merge_embeddings_total")
+        print("Please ensure the embeddings Parquet file exists:")
+        print(f"   {EMBEDDINGS_FILE}")
         return
     
-    # Load data
-    data, metadata = load_multitemporal_data(downsample=True, target_size=(2000, 2000))
+    # Load data (downsample to ~4M pixels for visualization)
+    year_data_dict, metadata = load_parquet_data(max_pixels=4_000_000)
     
     # Print statistics
-    print_data_statistics(data, metadata)
+    print_data_statistics(year_data_dict, metadata)
     
-    # Create visualizations
-    create_year_visualizations(data)
-    create_temporal_comparison_grid(data)
-    create_magnitude_temporal_grid(data)
+    # Create visualizations (caching PCA and magnitude results)
+    pca_cache, magnitude_cache = create_year_visualizations(year_data_dict)
+    create_temporal_comparison_grid(pca_cache)
+    create_magnitude_temporal_grid(magnitude_cache)
     
     # Summary
     print("\n" + "=" * 80)
@@ -367,11 +572,12 @@ def main():
     print(f"   • embeddings_temporal_comparison_grid.png - All years PCA RGB")
     print(f"   • embeddings_magnitude_temporal_grid.png - All years magnitude")
     
-    print("\nHint: TIPS:")
+    print("\nTips:")
     print("   • PCA visualizations show spatial patterns in embedding space")
     print("   • Temporal grids allow visual comparison of changes over time")
     print("   • Magnitude shows overall embedding strength/intensity")
     print("   • Compare years to identify temporal changes in land use/cover")
+    print("   • Note: Only pixels where backbone==1 are included in the dataset")
 
 
 if __name__ == "__main__":

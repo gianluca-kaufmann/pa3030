@@ -1,0 +1,452 @@
+#!/usr/bin/env python3
+"""
+Fast Embeddings panel dataset overview - checks structure and completeness.
+Runs in ~1-5 minutes by reading all metadata columns for exact structure stats,
+then sampling for feature statistics (missing values, numeric ranges).
+"""
+
+import json
+import os
+import numpy as np
+import pyarrow.parquet as pq
+from pathlib import Path
+from datetime import datetime
+from collections import Counter
+import wandb
+
+# Paths
+ROOT_DIR = Path(__file__).resolve().parents[3]
+SCRATCH_ROOT = Path(os.environ["SCRATCH"]) if "SCRATCH" in os.environ else None
+
+# Prefer Embeddings panel file on $SCRATCH (Euler) if available, otherwise fall back to repo path
+candidate_panel_paths = []
+if SCRATCH_ROOT is not None:
+    candidate_panel_paths.append(SCRATCH_ROOT / "data" / "ml" / "embeddings_transition_panel_2018-2024.parquet")
+candidate_panel_paths.append(ROOT_DIR / "data" / "ml" / "embeddings_transition_panel_2018-2024.parquet")
+
+PANEL_FILE = candidate_panel_paths[-1]
+for cand in candidate_panel_paths:
+    if cand.exists():
+        PANEL_FILE = cand
+        break
+
+OUTPUT_JSON = ROOT_DIR / "outputs" / "Tables" / "embeddings_transition_panel_statistics.json"
+OUTPUT_JSON.parent.mkdir(parents=True, exist_ok=True)
+
+# How many row groups to sample for statistics (None = all, but slow)
+SAMPLE_ROW_GROUPS = 20
+
+
+def analyze_panel():
+    """Analyze Embeddings panel dataset structure and completeness."""
+    print("=" * 60)
+    print("EMBEDDINGS PANEL DATASET OVERVIEW")
+    print("=" * 60)
+    
+    if not PANEL_FILE.exists():
+        print(f"ERROR: File not found: {PANEL_FILE}")
+        return None
+    
+    # File info
+    file_size_gb = PANEL_FILE.stat().st_size / (1024**3)
+    print(f"\nFile: {PANEL_FILE.name} ({file_size_gb:.1f} GB)")
+    
+    # Open file and read metadata (instant, no data loading)
+    print("Reading metadata...", flush=True)
+    pf = pq.ParquetFile(PANEL_FILE)
+    meta = pf.metadata
+    schema = pf.schema
+    
+    num_row_groups = meta.num_row_groups
+    total_rows = meta.num_rows
+    columns = [schema[i].name for i in range(len(schema))]
+    column_types = {schema[i].name: str(schema[i].physical_type) for i in range(len(schema))}
+    
+    print(f"Total rows: {total_rows:,}")
+    print(f"Columns: {len(columns)}")
+    print(f"Row groups: {num_row_groups:,}")
+    
+    # Log file metadata to WandB
+    wandb.log({
+        "file/name": str(PANEL_FILE.name),
+        "file/size_gb": round(file_size_gb, 2),
+        "file/total_rows": total_rows,
+        "file/total_columns": len(columns),
+        "file/num_row_groups": num_row_groups
+    })
+    
+    # Identify column categories
+    meta_cols = ['year', 'x', 'y', 'row', 'col']
+    feature_cols = [c for c in columns if c not in meta_cols]
+    
+    print(f"\nMetadata columns: {meta_cols}")
+    print(f"Feature columns: {len(feature_cols)}")
+    
+    # Log column information to WandB
+    wandb.log({
+        "columns/total_columns": len(columns),
+        "columns/metadata_columns": len(meta_cols),
+        "columns/feature_columns": len(feature_cols)
+    })
+    
+    # ===================================================================
+    # STEP 1: Get EXACT structure statistics (year counts, unique pixels)
+    # Stream metadata columns row-group by row-group to keep memory low.
+    # ===================================================================
+    print(f"\nStreaming metadata row groups for exact structure statistics...", flush=True)
+    
+    year_counts_counter = Counter()
+    unique_pixels = set()
+    n_duplicates = 0
+    duplicate_examples = []
+    
+    for rg_idx in range(num_row_groups):
+        if (rg_idx + 1) % 10 == 0 or rg_idx == 0:
+            print(f"  Processed {rg_idx + 1}/{num_row_groups} row groups", flush=True)
+        
+        # Read one row group at a time with only metadata columns
+        table = pf.read_row_group(rg_idx, columns=['year', 'row', 'col'])
+        df = table.to_pandas()
+        
+        # Update year counts
+        year_counts_counter.update(df['year'].tolist())
+        
+        # Update unique pixels
+        unique_pixels.update(zip(df['row'].tolist(), df['col'].tolist()))
+        
+        # Check for duplicates within this row group only
+        dup_mask = df.duplicated(subset=['year', 'row', 'col'], keep=False)
+        n_dup_chunk = int(dup_mask.sum())
+        if n_dup_chunk > 0:
+            n_duplicates += n_dup_chunk
+            if len(duplicate_examples) < 5:
+                dup_rows = (
+                    df.loc[dup_mask, ['year', 'row', 'col']]
+                    .drop_duplicates()
+                    .head(5 - len(duplicate_examples))
+                )
+                duplicate_examples.extend(
+                    list(dup_rows.itertuples(index=False, name=None))
+                )
+        
+        del df, table
+    
+    # Summarize year and pixel structure
+    year_counts = dict(year_counts_counter)
+    unique_years = sorted(year_counts.keys())
+    n_years = len(unique_years)
+    rows_per_year = {int(y): int(c) for y, c in year_counts.items()}
+    n_unique_pixels = len(unique_pixels)
+    
+    # Mathematical structure validation
+    expected_rows = n_unique_pixels * n_years
+    panel_is_perfect = (total_rows == expected_rows)
+    
+    # Duplicate reporting
+    print(f"\nChecking for duplicate (year, row, col) combinations within row groups...", flush=True)
+    if n_duplicates > 0:
+        print(f"⚠️  WARNING: Found at least {n_duplicates:,} duplicate (year, row, col) combinations within row groups!")
+        if duplicate_examples:
+            print(f"   First few duplicate examples:")
+            for year, row, col in duplicate_examples:
+                print(f"     Year {year}, row {row}, col {col}")
+    else:
+        print(f"✓ No within-row-group duplicate (year, row, col) combinations found")
+    
+    print(f"✓ Found {n_years} years, {n_unique_pixels:,} unique pixels, {total_rows:,} total rows")
+    
+    # ===================================================================
+    # STEP 2: Sample row groups for feature statistics (missing values, numeric stats)
+    # These can be estimates - don't need exact counts
+    # ===================================================================
+    n_sample = min(SAMPLE_ROW_GROUPS or num_row_groups, num_row_groups)
+    sample_indices = np.linspace(0, num_row_groups - 1, n_sample, dtype=int)
+    
+    print(f"\nSampling {n_sample} row groups for feature statistics...", flush=True)
+    
+    sample_rows = 0
+    missing_counts = {col: 0 for col in columns}
+    # Accumulators for numeric statistics across ALL sampled row groups
+    numeric_accumulators = {}
+    
+    for idx, rg_idx in enumerate(sample_indices):
+        if (idx + 1) % 5 == 0:
+            print(f"  Progress: {idx + 1}/{n_sample} row groups", flush=True)
+        
+        # Read single row group
+        table = pf.read_row_group(rg_idx, columns=columns)
+        df = table.to_pandas()
+        sample_rows += len(df)
+        
+        # Missing values
+        for col in columns:
+            if col in df.columns:
+                missing_counts[col] += df[col].isnull().sum()
+        
+        # Numeric stats: update accumulators for every sampled row group
+        for col in columns:
+            if col in df.columns and np.issubdtype(df[col].dtype, np.number):
+                vals = df[col].dropna()
+                if len(vals) == 0:
+                    continue
+                
+                if col not in numeric_accumulators:
+                    numeric_accumulators[col] = {
+                        'count': 0,
+                        'sum': 0.0,
+                        'sum_sq': 0.0,
+                        'min': float('inf'),
+                        'max': float('-inf')
+                    }
+                acc = numeric_accumulators[col]
+                acc['count'] += len(vals)
+                acc['sum'] += float(vals.sum())
+                acc['sum_sq'] += float((vals ** 2).sum())
+                acc['min'] = min(acc['min'], float(vals.min()))
+                acc['max'] = max(acc['max'], float(vals.max()))
+        
+        del df, table
+    
+    # Finalize numeric statistics from accumulators
+    numeric_stats = {}
+    for col, acc in numeric_accumulators.items():
+        count = acc['count']
+        if count == 0:
+            continue
+        mean = acc['sum'] / count
+        # Population variance from sum of squares
+        var = max(acc['sum_sq'] / count - mean**2, 0.0)
+        std = var**0.5
+        numeric_stats[col] = {
+            'min': acc['min'],
+            'max': acc['max'],
+            'mean': mean,
+            'std': std,
+            'sample_size': count
+        }
+
+    # Check structure
+    print(f"\n" + "=" * 60)
+    print("STRUCTURE CHECK (EXACT)")
+    print("=" * 60)
+    
+    print(f"\nYears: {n_years} ({min(unique_years)} - {max(unique_years)})")
+    print(f"Unique pixels: {n_unique_pixels:,}")
+    print(f"Expected rows (pixels × years): {expected_rows:,}")
+    print(f"Actual rows: {total_rows:,}")
+    
+    # Check if rows_per_year is monotonically decreasing (or constant)
+    sorted_years = sorted(rows_per_year.keys())
+    is_monotonically_decreasing = True
+    if len(sorted_years) > 1:
+        for i in range(1, len(sorted_years)):
+            prev_year = sorted_years[i-1]
+            curr_year = sorted_years[i]
+            if rows_per_year[curr_year] > rows_per_year[prev_year]:
+                is_monotonically_decreasing = False
+                break
+    
+    if is_monotonically_decreasing:
+        print(f"✓ Rows per year is monotonically decreasing (or constant)")
+    else:
+        print(f"⚠️  Rows per year is NOT monotonically decreasing")
+    
+    # Show duplicate status (within row groups)
+    if n_duplicates > 0:
+        print(f"⚠️  Duplicates found: at least {n_duplicates:,} duplicate (year, row, col) combinations within row groups")
+    else:
+        print(f"✓ No within-row-group duplicate (year, row, col) combinations")
+    
+    # Mathematical panel consistency
+    if panel_is_perfect:
+        print(f"✓ Panel is mathematically perfect: total_rows == unique_pixels × years")
+    else:
+        print(f"⚠️  Panel is NOT mathematically perfect: total_rows != unique_pixels × years")
+    
+    # Log structure metrics to WandB
+    wandb.log({
+        "structure/num_years": n_years,
+        "structure/unique_pixels": n_unique_pixels,
+        "structure/expected_rows": expected_rows,
+        "structure/actual_rows": total_rows,
+        "structure/math_perfect": panel_is_perfect,
+        "structure/has_within_row_group_duplicates": n_duplicates > 0,
+        "structure/num_within_row_group_duplicates": int(n_duplicates),
+        "structure/is_monotonically_decreasing": is_monotonically_decreasing
+    })
+    
+    # Log per-year row counts
+    for year, count in rows_per_year.items():
+        wandb.log({f"structure/rows_per_year/{year}": count})
+    
+    # Show rows per year
+    print(f"\nRows per year:")
+    for year in sorted(rows_per_year.keys()):
+        count = rows_per_year[year]
+        pct = 100 * count / total_rows if total_rows > 0 else 0
+        print(f"  {year}: {count:,} ({pct:.1f}%)")
+    
+    # Missing values summary
+    print(f"\n" + "=" * 60)
+    print(f"MISSING VALUES (ESTIMATED from {n_sample} row groups)")
+    print("=" * 60)
+    
+    cols_with_missing = [(col, count) for col, count in missing_counts.items() if count > 0]
+    if cols_with_missing:
+        cols_with_missing.sort(key=lambda x: -x[1])
+        print(f"\nColumns with missing values: {len(cols_with_missing)}")
+        print(f"Sampled rows: {sample_rows:,} of {total_rows:,}")
+        for col, count in cols_with_missing[:10]:
+            pct = 100 * count / sample_rows if sample_rows > 0 else 0
+            print(f"  {col}: {count:,} ({pct:.1f}% of sample)")
+        if len(cols_with_missing) > 10:
+            print(f"  ... and {len(cols_with_missing) - 10} more")
+    else:
+        print(f"\nNo missing values found in sample of {sample_rows:,} rows!")
+    
+    # Log missing values to WandB
+    wandb.log({
+        "missing_values/columns_with_missing": len(cols_with_missing),
+        "missing_values/sample_rows": sample_rows,
+        "missing_values/sample_fraction": sample_rows / total_rows if total_rows > 0 else 0
+    })
+    
+    # Log top missing value columns
+    for col, count in cols_with_missing[:20]:  # Log top 20
+        pct = 100 * count / sample_rows if sample_rows > 0 else 0
+        wandb.log({f"missing_values/{col}/count": count, f"missing_values/{col}/percent": pct})
+    
+    # Numeric columns summary
+    print(f"\n" + "=" * 60)
+    print("NUMERIC COLUMNS (ESTIMATED from sample)")
+    print("=" * 60)
+    print(f"\nTotal numeric columns: {len(numeric_stats)}")
+    
+    # Show a few examples
+    for col in list(numeric_stats.keys())[:5]:
+        stats = numeric_stats[col]
+        print(f"  {col}: min={stats['min']:.2f}, max={stats['max']:.2f}, mean={stats['mean']:.2f}")
+    if len(numeric_stats) > 5:
+        print(f"  ... and {len(numeric_stats) - 5} more")
+    
+    # Log numeric statistics summary to WandB
+    wandb.log({
+        "numeric_statistics/total_numeric_columns": len(numeric_stats)
+    })
+    
+    # Log summary stats for each numeric column (limit to prevent too many metrics)
+    for col, stats in list(numeric_stats.items())[:50]:  # Log first 50 numeric columns
+        wandb.log({
+            f"numeric_statistics/{col}/min": stats['min'],
+            f"numeric_statistics/{col}/max": stats['max'],
+            f"numeric_statistics/{col}/mean": stats['mean'],
+            f"numeric_statistics/{col}/std": stats['std'],
+            f"numeric_statistics/{col}/sample_size": stats['sample_size']
+        })
+    
+    # Compile results
+    results = {
+        'metadata': {
+            'file': str(PANEL_FILE.name),
+            'file_size_gb': round(file_size_gb, 2),
+            'generated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'total_rows': total_rows,
+            'total_columns': len(columns),
+            'num_row_groups': num_row_groups,
+            'sampled_row_groups': n_sample
+        },
+        'columns': {
+            'all': columns,
+            'metadata': meta_cols,
+            'features': feature_cols,
+            'types': column_types,
+            'numeric_count': len(numeric_stats)
+        },
+        'structure': {
+            'years': unique_years,
+            'num_years': n_years,
+            'unique_pixels': n_unique_pixels,
+            'expected_rows': expected_rows,
+            'actual_rows': total_rows,
+            'is_monotonically_decreasing': is_monotonically_decreasing,
+            'rows_per_year': rows_per_year,
+            'has_within_row_group_duplicates': n_duplicates > 0,
+            'num_within_row_group_duplicates': int(n_duplicates),
+            'math_perfect': panel_is_perfect
+        },
+        'missing_values': {
+            'sample_rows': sample_rows,
+            'columns_with_missing': len(cols_with_missing),
+            'details': {col: int(count) for col, count in cols_with_missing}
+        },
+        'numeric_statistics': numeric_stats
+    }
+    
+    return results
+
+
+def main():
+    # Initialize WandB
+    print("🔄 Initializing Weights & Biases connection...")
+    
+    # Get credentials from environment variables
+    wandb_api_key = os.environ.get("WANDB_API_KEY")
+    wandb_entity = os.environ.get("WANDB_ENTITY")
+    
+    if not wandb_api_key:
+        print("Warning: WANDB_API_KEY not found in environment variables")
+        print("   Set it with: export WANDB_API_KEY='your-key-here'")
+    
+    if not wandb_entity:
+        print("Warning: WANDB_ENTITY not found in environment variables")
+        print("   Set it with: export WANDB_ENTITY='your-entity-here'")
+    
+    # Initialize wandb
+    wandb.init(
+        project="embeddings_panel_statistics",
+        entity=wandb_entity,
+        save_code=True,
+        config={
+            "panel_file": str(PANEL_FILE),
+            "output_json": str(OUTPUT_JSON),
+            "sample_row_groups": SAMPLE_ROW_GROUPS,
+            "scratch_mode": "SCRATCH" in os.environ
+        }
+    )
+    print("Weights & Biases connected successfully!")
+    
+    start = datetime.now()
+    wandb.log({"status": "started", "start_time": start.isoformat()})
+    
+    results = analyze_panel()
+    
+    if results is None:
+        wandb.log({"status": "failed", "error": "file_not_found"})
+        wandb.finish()
+        return
+    
+    # Save results
+    with open(OUTPUT_JSON, 'w') as f:
+        json.dump(results, f, indent=2, default=str)
+    
+    elapsed = (datetime.now() - start).total_seconds()
+    
+    # Log final summary
+    wandb.log({
+        "summary/elapsed_seconds": elapsed,
+        "summary/elapsed_minutes": elapsed / 60,
+        "summary/output_file": str(OUTPUT_JSON),
+        "status": "completed"
+    })
+    
+    print(f"\n" + "=" * 60)
+    print("COMPLETE")
+    print("=" * 60)
+    print(f"Time: {elapsed:.1f} seconds")
+    print(f"Output: {OUTPUT_JSON}")
+    
+    wandb.finish()
+
+
+if __name__ == "__main__":
+    main()

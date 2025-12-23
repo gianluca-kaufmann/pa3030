@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+
+"""
+Temporal split script for modelE training/validation/test splits (embeddings dataset).
+
+Rules
+-----
+TRAIN (2018–2021):
+  - Full risk set (no sampling)
+
+VAL (2022):
+  - Full risk set (no sampling)
+
+TEST (2023–2024):
+  - Full risk set (no sampling)
+
+Notes
+-----
+- Simple temporal split with no sampling
+- All splits use the full dataset for their respective time periods
+- Dataset contains data from 2018-2024 only
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import sys
+import time
+from pathlib import Path
+
+import duckdb
+import wandb
+
+# Configuration
+RANDOM_STATE = 42
+# Split configuration (embeddings dataset contains 2018-2024 only)
+TRAIN_YEARS = (2018, 2021)   # Full train set
+VAL_YEARS = (2022, 2022)     # Full validation
+TEST_YEARS = (2023, 2024)    # Full test
+WANDB_PROJECT = "ml-training-preprocessing"
+
+
+def resolve_input() -> Path:
+    """Locate embeddings_transition_panel_2018-2024.parquet (prefer $SCRATCH if present)."""
+    repo_root = Path(__file__).resolve().parents[4]
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    candidates = []
+    if scratch_root is not None:
+        candidates.append(scratch_root / "data/ml/embeddings_transition_panel_2018-2024.parquet")
+    candidates.append(repo_root / "data/ml/embeddings_transition_panel_2018-2024.parquet")
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    raise FileNotFoundError("embeddings_transition_panel_2018-2024.parquet not found in expected locations")
+
+
+def configure_duckdb(con: duckdb.DuckDBPyConnection) -> None:
+    """Apply sensible local/Euler defaults."""
+    is_euler = bool(os.environ.get("SCRATCH"))
+    slurm_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", "0"))
+    num_threads = slurm_cpus if slurm_cpus > 0 else (48 if is_euler else 4)
+
+    # Match DuckDB memory to Slurm allocation when present
+    slurm_mem_per_cpu_mb = os.environ.get("SLURM_MEM_PER_CPU")
+    if slurm_mem_per_cpu_mb and slurm_cpus:
+        total_mem_mb = int(slurm_mem_per_cpu_mb) * slurm_cpus
+        memory_limit_gb = max(1, total_mem_mb // 1024)
+    else:
+        memory_limit_gb = 128 if is_euler else 16
+
+    con.execute(f"SET threads={num_threads}")
+    con.execute("SET preserve_insertion_order=false")
+    con.execute(f"SET memory_limit='{memory_limit_gb}GB'")
+
+    temp_dir = os.environ.get("SCRATCH") or (Path(__file__).parent / "temp")
+    # Ensure temp directory exists (DuckDB won't create parent directories)
+    if isinstance(temp_dir, str):
+        temp_dir = Path(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir_sql = str(temp_dir).replace("'", "''")
+    con.execute(f"SET temp_directory='{temp_dir_sql}/duckdb_temp'")
+
+    if is_euler:
+        con.execute("PRAGMA max_temp_directory_size='200GB'")
+
+    print(f"DuckDB configured: {num_threads} threads, {memory_limit_gb}GB memory")
+    print(f"Running on: {'Euler cluster' if is_euler else 'local machine'}")
+
+
+def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: str, use_wandb: bool = False) -> None:
+    escaped = str(parquet_path).replace("'", "''")
+    rows = con.execute(
+        f"""
+        SELECT
+            year,
+            SUM(transition_01) AS positives,
+            SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS negatives,
+            COUNT(*) AS total,
+            CASE WHEN COUNT(*) > 0 THEN SUM(transition_01)::DOUBLE / COUNT(*) ELSE 0 END AS pos_ratio,
+            CASE WHEN SUM(transition_01) > 0 
+                 THEN SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END)::DOUBLE / SUM(transition_01)
+                 ELSE 0 END AS neg_pos_ratio
+        FROM read_parquet('{escaped}')
+        GROUP BY year
+        ORDER BY year
+        """
+    ).fetchall()
+
+    print(f"\n{label} per-year counts:")
+    for year, pos, neg, total, pos_ratio, neg_pos_ratio in rows:
+        print(f"  {year}: total={total:,} pos={pos:,} neg={neg:,} | pos_ratio={pos_ratio:.5f} neg/pos={neg_pos_ratio:.1f}")
+
+    if use_wandb:
+        wandb.log({f"{label.lower().replace(' ', '_')}/per_year": [
+            dict(year=y, positives=p, negatives=n, total=t, pos_ratio=r, neg_pos_ratio=npr) 
+            for y, p, n, t, r, npr in rows
+        ]})
+
+
+def main() -> None:
+    start_time = time.time()
+
+    wandb_api_key = os.environ.get("WANDB_API_KEY")
+    wandb_entity = os.environ.get("WANDB_ENTITY")
+    if not wandb_api_key:
+        print("Warning: WANDB_API_KEY not found in environment")
+    if not wandb_entity:
+        print("Warning: WANDB_ENTITY not found in environment (will use default)")
+    
+    use_wandb = False
+    try:
+        print("Initializing Weights & Biases...")
+        wandb.init(
+            project=WANDB_PROJECT,
+            entity=wandb_entity,
+            name=f"modelE_preprocessing_{time.strftime('%Y%m%d_%H%M%S')}",
+            config={
+                "random_state": RANDOM_STATE,
+                "train_years": TRAIN_YEARS,
+                "val_years": VAL_YEARS,
+                "test_years": TEST_YEARS,
+                "sampling_method": "temporal_split_full",
+            },
+        )
+        use_wandb = True
+        print("W&B connected\n")
+    except Exception as err:
+        print(f"W&B initialization failed: {err}\n")
+
+    input_path = resolve_input()
+    base_dir = input_path.parent
+    train_out = base_dir / "train_embeddings.parquet"
+    val_out = base_dir / "val_embeddings.parquet"
+    test_out = base_dir / "test_embeddings.parquet"
+
+    print(f"\nInput: {input_path}")
+    print(f"TRAIN output: {train_out}")
+    print(f"VAL output: {val_out}")
+    print(f"TEST output: {test_out}")
+
+    con = duckdb.connect()
+    configure_duckdb(con)
+
+    escaped_in = str(input_path).replace("'", "''")
+    escaped_train = str(train_out).replace("'", "''")
+    escaped_val = str(val_out).replace("'", "''")
+    escaped_test = str(test_out).replace("'", "''")
+
+    try:
+        # TRAIN: full risk set 2018–2021
+        train_sql = f"""
+        COPY (
+            SELECT
+                *
+            FROM read_parquet('{escaped_in}')
+            WHERE year BETWEEN {TRAIN_YEARS[0]} AND {TRAIN_YEARS[1]}
+        )
+        TO '{escaped_train}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        """
+
+        print(f"\nCreating TRAIN split ({TRAIN_YEARS[0]}–{TRAIN_YEARS[1]}, full risk set)...")
+        train_start = time.time()
+        con.execute(train_sql)
+        print(f"TRAIN written in {time.time() - train_start:.1f}s")
+
+        # VAL: full risk set 2022
+        val_sql = f"""
+        COPY (
+            SELECT
+                *
+            FROM read_parquet('{escaped_in}')
+            WHERE year BETWEEN {VAL_YEARS[0]} AND {VAL_YEARS[1]}
+        )
+        TO '{escaped_val}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        """
+
+        print(f"\nCreating VAL split ({VAL_YEARS[0]}–{VAL_YEARS[1]}, full risk set)...")
+        val_start = time.time()
+        con.execute(val_sql)
+        print(f"VAL written in {time.time() - val_start:.1f}s")
+
+        # TEST: full risk set 2023–2024
+        test_sql = f"""
+        COPY (
+            SELECT
+                *
+            FROM read_parquet('{escaped_in}')
+            WHERE year BETWEEN {TEST_YEARS[0]} AND {TEST_YEARS[1]}
+        )
+        TO '{escaped_test}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        """
+
+        print(f"\nCreating TEST split ({TEST_YEARS[0]}–{TEST_YEARS[1]}, full risk set)...")
+        test_start = time.time()
+        con.execute(test_sql)
+        print(f"TEST written in {time.time() - test_start:.1f}s")
+
+        # Log counts
+        log_year_counts(con, train_out, "TRAIN", use_wandb)
+        log_year_counts(con, val_out, "VAL", use_wandb)
+        log_year_counts(con, test_out, "TEST", use_wandb)
+
+        # Check total rows
+        total_train_rows = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{escaped_train}')"
+        ).fetchone()[0]
+        
+        total_val_rows = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{escaped_val}')"
+        ).fetchone()[0]
+        
+        total_test_rows = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{escaped_test}')"
+        ).fetchone()[0]
+        
+        print(f"\nTotal rows:")
+        print(f"  TRAIN: {total_train_rows:,}")
+        print(f"  VAL: {total_val_rows:,}")
+        print(f"  TEST: {total_test_rows:,}")
+        
+        # Compute scale_pos_weight from TRAIN only: sqrt(n_neg / n_pos)
+        train_stats = con.execute(
+            f"""
+            SELECT
+                SUM(transition_01) AS total_pos,
+                SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS total_neg
+            FROM read_parquet('{escaped_train}')
+            """
+        ).fetchone()
+        total_pos, total_neg = train_stats
+        
+        # Handle None values (when there are no rows)
+        if total_pos is None:
+            total_pos = 0
+        if total_neg is None:
+            total_neg = 0
+            
+        neg_pos_ratio = total_neg / total_pos if total_pos > 0 else 1.0
+        scale_pos_weight = math.sqrt(neg_pos_ratio) if neg_pos_ratio > 0 else 1.0
+        
+        print(f"\nTRAIN class balance:")
+        print(f"  Positives: {total_pos:,}")
+        print(f"  Negatives: {total_neg:,}")
+        print(f"  Ratio (neg/pos): {neg_pos_ratio:.2f}")
+        print(f"  scale_pos_weight for LightGBM: {scale_pos_weight:.6f} (sqrt of ratio)")
+        
+        # Save scale_pos_weight to metadata file for use in training
+        metadata_path = base_dir / "train_embeddings_metadata.json"
+        metadata = {
+            "scale_pos_weight": scale_pos_weight,
+            "total_positives": int(total_pos),
+            "total_negatives": int(total_neg),
+            "neg_pos_ratio": float(neg_pos_ratio),
+            "computed_from": "train_embeddings.parquet"
+        }
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        print(f"  Metadata saved to: {metadata_path}")
+
+        if use_wandb:
+            wandb.log(
+                {
+                    "train/rows": total_train_rows,
+                    "train/positives": total_pos,
+                    "train/negatives": total_neg,
+                    "train/scale_pos_weight": scale_pos_weight,
+                    "train/neg_pos_ratio": neg_pos_ratio,
+                    "val/rows": total_val_rows,
+                    "test/rows": total_test_rows,
+                    "timing/total_seconds": time.time() - start_time,
+                }
+            )
+
+        print("\nDone.")
+
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {e}"
+        print(f"\nERROR: {error_msg}")
+        if use_wandb:
+            wandb.log({"status": "failed", "error": error_msg})
+        raise
+    finally:
+        if use_wandb:
+            wandb.finish()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"\nScript failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
