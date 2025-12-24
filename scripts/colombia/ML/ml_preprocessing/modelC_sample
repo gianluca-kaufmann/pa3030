@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+
+"""
+Sampling script for modelC LightGBM tuning sample (Colombia dataset).
+
+Rules
+-----
+- Keep all positives (transition_01 == 1)
+- Downsample negatives to target ~1:100 ratio per year
+- Preserve per-year balance
+- Year 2000 excluded to avoid treating existing PAs as transitions
+- Output: data/ml/lgbm_tuning_colombia.parquet
+
+Notes
+-----
+- Per-year sampling ensures balanced class distribution across years
+- Random sampling for simplicity (no hard negatives)
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+from pathlib import Path
+
+import duckdb
+
+# Configuration
+RANDOM_STATE = 42
+TARGET_NEG_POS_RATIO = 100  # Target ratio of negatives to positives per year
+MIN_POS_FOR_FULL_QUOTA = 200  # Minimum positives to use full quota logic
+MIN_NEG_PER_YEAR = 50000  # Minimum negative quota when pos >= MIN_POS_FOR_FULL_QUOTA
+SMALL_NEG_QUOTA = 5000  # Minimum negative quota when pos < MIN_POS_FOR_FULL_QUOTA
+
+
+def resolve_input() -> Path:
+    """Locate merged_panel_colombia_final.parquet (prefer $SCRATCH if present)."""
+    repo_root = Path(__file__).resolve().parents[4]
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    candidates = []
+    if scratch_root is not None:
+        candidates.append(scratch_root / "data/ml/merged_panel_colombia_final.parquet")
+    candidates.append(repo_root / "data/ml/merged_panel_colombia_final.parquet")
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    raise FileNotFoundError("merged_panel_colombia_final.parquet not found in expected locations")
+
+
+def configure_duckdb(con: duckdb.DuckDBPyConnection) -> None:
+    """Apply sensible local/Euler defaults."""
+    is_euler = bool(os.environ.get("SCRATCH"))
+    slurm_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", "0"))
+    num_threads = slurm_cpus if slurm_cpus > 0 else (48 if is_euler else 4)
+
+    # Match DuckDB memory to Slurm allocation when present
+    slurm_mem_per_cpu_mb = os.environ.get("SLURM_MEM_PER_CPU")
+    if slurm_mem_per_cpu_mb and slurm_cpus:
+        total_mem_mb = int(slurm_mem_per_cpu_mb) * slurm_cpus
+        memory_limit_gb = max(1, total_mem_mb // 1024)
+    else:
+        memory_limit_gb = 128 if is_euler else 16
+
+    con.execute(f"SET threads={num_threads}")
+    con.execute("SET preserve_insertion_order=false")
+    con.execute(f"SET memory_limit='{memory_limit_gb}GB'")
+
+    temp_dir = os.environ.get("SCRATCH") or (Path(__file__).parent / "temp")
+    # Ensure temp directory exists (DuckDB won't create parent directories)
+    if isinstance(temp_dir, str):
+        temp_dir = Path(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    duckdb_temp_dir = temp_dir / "duckdb_temp"
+    duckdb_temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir_sql = str(duckdb_temp_dir).replace("'", "''")
+    con.execute(f"SET temp_directory='{temp_dir_sql}'")
+
+    if is_euler:
+        con.execute("PRAGMA max_temp_directory_size='200GB'")
+
+    print(f"DuckDB configured: {num_threads} threads, {memory_limit_gb}GB memory")
+    print(f"Running on: {'Euler cluster' if is_euler else 'local machine'}")
+
+
+def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: str) -> None:
+    """Log per-year counts and ratios."""
+    escaped = str(parquet_path).replace("'", "''")
+    rows = con.execute(
+        f"""
+        SELECT
+            year,
+            SUM(transition_01) AS positives,
+            SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS negatives,
+            COUNT(*) AS total,
+            CASE WHEN COUNT(*) > 0 THEN SUM(transition_01)::DOUBLE / COUNT(*) ELSE 0 END AS pos_ratio,
+            CASE WHEN SUM(transition_01) > 0 
+                 THEN SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END)::DOUBLE / SUM(transition_01)
+                 ELSE 0 END AS neg_pos_ratio
+        FROM read_parquet('{escaped}')
+        GROUP BY year
+        ORDER BY year
+        """
+    ).fetchall()
+
+    print(f"\n{label} per-year counts:")
+    for year, pos, neg, total, pos_ratio, neg_pos_ratio in rows:
+        print(f"  {year}: total={total:,} pos={pos:,} neg={neg:,} | pos_ratio={pos_ratio:.5f} neg/pos={neg_pos_ratio:.1f}")
+
+
+def main() -> None:
+    start_time = time.time()
+
+    input_path = resolve_input()
+    base_dir = input_path.parent
+    output_path = base_dir / "lgbm_tuning_colombia.parquet"
+
+    print(f"\nInput: {input_path}")
+    print(f"Output: {output_path}")
+    print(f"Target neg/pos ratio: {TARGET_NEG_POS_RATIO}:1 per year")
+
+    con = duckdb.connect()
+    configure_duckdb(con)
+
+    escaped_in = str(input_path).replace("'", "''")
+    escaped_out = str(output_path).replace("'", "''")
+
+    try:
+        # Sample SQL: Keep all positives, downsample negatives per year to target ratio
+        sample_sql = f"""
+        COPY (
+            WITH base AS (
+                SELECT *
+                FROM read_parquet('{escaped_in}')
+                WHERE year != 2000
+            ),
+            year_counts AS (
+                SELECT
+                    year,
+                    SUM(transition_01) AS pos_count,
+                    SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS neg_count
+                FROM base
+                GROUP BY year
+            ),
+            -- Per-year negative budgets: 
+            --   If pos >= MIN_POS_FOR_FULL_QUOTA: min(neg_count, max(pos * ratio, MIN_NEG_PER_YEAR))
+            --   Else: min(neg_count, max(pos * ratio, SMALL_NEG_QUOTA))
+            neg_budget AS (
+                SELECT
+                    yc.year,
+                    yc.pos_count,
+                    yc.neg_count,
+                    CASE 
+                        WHEN yc.neg_count > 0 THEN
+                            CASE
+                                WHEN yc.pos_count >= {MIN_POS_FOR_FULL_QUOTA} THEN
+                                    -- Full quota logic: min(neg_count, max(pos * ratio, MIN_NEG_PER_YEAR))
+                                    LEAST(
+                                        GREATEST(
+                                            CAST(ROUND(yc.pos_count * {TARGET_NEG_POS_RATIO}) AS BIGINT),
+                                            {MIN_NEG_PER_YEAR}
+                                        ),
+                                        yc.neg_count
+                                    )
+                                ELSE
+                                    -- Proportional quota with minimum when pos < MIN_POS_FOR_FULL_QUOTA
+                                    -- min(neg_count, max(pos * ratio, SMALL_NEG_QUOTA))
+                                    LEAST(
+                                        GREATEST(
+                                            CAST(ROUND(yc.pos_count * {TARGET_NEG_POS_RATIO}) AS BIGINT),
+                                            {SMALL_NEG_QUOTA}
+                                        ),
+                                        yc.neg_count
+                                    )
+                            END
+                        ELSE 0
+                    END AS year_neg_budget
+                FROM year_counts yc
+            ),
+            positives AS (
+                -- Keep all positives (no sampling)
+                SELECT * FROM base WHERE transition_01 = 1
+            ),
+            -- Prepare negative pool with per-year budgets and random ordering
+            neg_candidates AS (
+                SELECT
+                    b.*,
+                    nb.year_neg_budget,
+                    random() AS u
+                FROM base b
+                INNER JOIN neg_budget nb ON b.year = nb.year
+                WHERE b.transition_01 = 0 AND nb.year_neg_budget > 0
+            ),
+            -- Rank negatives randomly within each year
+            ranked_negs AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY year
+                        ORDER BY u
+                    ) AS neg_rank
+                FROM neg_candidates
+            ),
+            -- Sample negatives up to budget per year
+            sampled_negs AS (
+                SELECT * EXCLUDE (
+                    year_neg_budget,
+                    u,
+                    neg_rank
+                )
+                FROM ranked_negs
+                WHERE neg_rank <= year_neg_budget
+            )
+            SELECT * FROM positives
+            UNION ALL
+            SELECT * FROM sampled_negs
+        )
+        TO '{escaped_out}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        """
+
+        print(f"\nCreating LightGBM tuning sample with per-year negative downsampling...")
+        print(f"  All positives kept; negatives sampled per year:")
+        print(f"    If pos >= {MIN_POS_FOR_FULL_QUOTA}: min(neg_count, max(pos * {TARGET_NEG_POS_RATIO}, {MIN_NEG_PER_YEAR:,}))")
+        print(f"    If pos < {MIN_POS_FOR_FULL_QUOTA}: min(neg_count, max(pos * {TARGET_NEG_POS_RATIO}, {SMALL_NEG_QUOTA:,}))")
+        
+        # Set random seed for reproducible sampling
+        seed_value = RANDOM_STATE / 100.0
+        con.execute(f"SELECT setseed({seed_value})")
+        
+        sample_start = time.time()
+        con.execute(sample_sql)
+        print(f"Sample written in {time.time() - sample_start:.1f}s")
+
+        # Log counts and check achieved ratios
+        log_year_counts(con, output_path, "TUNING_SAMPLE")
+
+        # Check total rows
+        total_rows = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{escaped_out}')"
+        ).fetchone()[0]
+        
+        print(f"\nTotal rows: {total_rows:,}")
+        
+        # Check per-year achieved neg/pos ratios vs target
+        print(f"\nChecking achieved neg/pos ratios vs target ({TARGET_NEG_POS_RATIO}:1)...")
+        achieved_ratios = con.execute(
+            f"""
+            SELECT
+                year,
+                SUM(transition_01) AS pos_count,
+                SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS neg_count,
+                CASE WHEN SUM(transition_01) > 0 
+                     THEN SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END)::DOUBLE / SUM(transition_01)
+                     ELSE 0 END AS achieved_ratio
+            FROM read_parquet('{escaped_out}')
+            GROUP BY year
+            ORDER BY year
+            """
+        ).fetchall()
+        
+        for year, pos, neg, achieved in achieved_ratios:
+            status = "✓" if abs(achieved - TARGET_NEG_POS_RATIO) / TARGET_NEG_POS_RATIO < 0.1 else "⚠"
+            print(f"  {status} {year}: achieved {achieved:.1f}:1 (target {TARGET_NEG_POS_RATIO}:1) | pos={pos:,} neg={neg:,}")
+        
+        # Overall statistics
+        overall_stats = con.execute(
+            f"""
+            SELECT
+                SUM(transition_01) AS total_pos,
+                SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS total_neg
+            FROM read_parquet('{escaped_out}')
+            """
+        ).fetchone()
+        total_pos, total_neg = overall_stats
+        neg_pos_ratio = total_neg / total_pos if total_pos > 0 else 1.0
+        
+        print(f"\nOverall class balance:")
+        print(f"  Positives: {total_pos:,}")
+        print(f"  Negatives: {total_neg:,}")
+        print(f"  Ratio (neg/pos): {neg_pos_ratio:.2f}")
+        
+        print(f"\nDone. Total time: {time.time() - start_time:.1f}s")
+
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {e}"
+        print(f"\nERROR: {error_msg}")
+        raise
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"\nScript failed: {e}", file=sys.stderr)
+        sys.exit(1)
+

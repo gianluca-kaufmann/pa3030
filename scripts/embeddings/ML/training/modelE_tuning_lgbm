@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+
+"""ModelE LightGBM Hyperparameter Tuning Script (Embeddings Dataset)
+
+Purpose: Perform comprehensive hyperparameter tuning for a LightGBM model using
+         the embeddings-specific tuning dataset (lgbm_tuning_embeddings.parquet)
+         with per-year sampling and strict temporal split
+         (train: 2018–2022, val: 2023; 2024 reserved for final evaluation).
+
+Input:   `lgbm_tuning_embeddings.parquet`
+Output:  - lgbm_best_params.json
+
+Features:
+- Expanded hyperparameter search space for better optimization
+- More iterations for RandomizedSearchCV
+- Comprehensive parameter ranges covering common best practices
+"""
+
+from __future__ import annotations
+
+import gc
+import json
+import os
+import sys
+import time
+from copy import deepcopy
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import wandb
+from lightgbm import LGBMClassifier
+from sklearn.model_selection import RandomizedSearchCV, PredefinedSplit
+
+# Import early_stopping callback - available in lightgbm 3.3.0+
+try:
+    from lightgbm import early_stopping
+except ImportError:
+    # Fallback for older versions
+    from lightgbm.callbacks import early_stopping
+
+
+class Tee:
+    """Write to both stdout and a file."""
+
+    def __init__(self, file_path: Path):
+        self.file = open(file_path, "w", encoding="utf-8")
+        self.stdout = sys.stdout
+
+    def write(self, text: str) -> None:
+        self.stdout.write(text)
+        self.stdout.flush()
+        self.file.write(text)
+        self.file.flush()
+
+    def flush(self) -> None:
+        self.stdout.flush()
+        self.file.flush()
+
+    def close(self) -> None:
+        self.file.close()
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+
+def get_n_jobs() -> int:
+    """Get number of jobs from SLURM_CPUS_PER_TASK, returning -1 on missing/invalid values."""
+    try:
+        cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+        if cpus is None:
+            return -1
+        return int(cpus)
+    except (ValueError, TypeError):
+        return -1
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+RANDOM_STATE = 42
+
+# Temporal split configuration (embeddings dataset contains 2018-2024 only)
+TRAIN_YEAR_MAX = 2022  # train_idx = year <= 2022 (2018–2022)
+VAL_YEAR_MIN = 2023  # val_idx = 2023 <= year <= 2023 (2023)
+VAL_YEAR_MAX = 2023
+# Note: 2024 is reserved for final evaluation and not used in tuning
+MIN_YEAR = int(os.environ.get("TRANSITION_MIN_YEAR", "2018"))  # embeddings dataset starts at 2018
+
+# Columns to exclude from features
+EXCLUDE_COLS = {
+    "transition_01",  # Target variable
+    "WDPA_b1",  # Leakage
+    "WDPA_prev",  # Leakage
+    "x",  # Coordinate
+    "y",  # Coordinate
+    "row",  # Identifier
+    "col",  # Identifier
+    "year",  # Temporal identifier (kept for splitting)
+}
+
+# RandomizedSearchCV configuration - more iterations for better search
+N_ITER_LGBM = int(os.environ.get("N_ITER_LGBM", "600"))  # Increased to 600 for comprehensive search
+
+# Expanded LightGBM parameter grid for comprehensive search
+LGBM_PARAM_GRID_BASE = {
+    # Tree structure parameters
+    "num_leaves": [15, 31, 63, 127, 255],  # More options, including smaller and larger
+    "max_depth": [-1, 5, 10, 15, 20, 25, 30],  # Wider range including shallower trees
+    "min_child_samples": [10, 20, 30, 50, 100, 200],  # More granular options
+    "min_child_weight": [0.001, 0.01, 0.1, 1.0, 5.0],  # Additional regularization
+    
+    # Learning rate - wider range
+    "learning_rate": [0.005, 0.01, 0.03, 0.05, 0.1, 0.15, 0.2],
+    
+    # Sampling parameters
+    "subsample": [0.6, 0.7, 0.8, 0.9, 0.95, 1.0],  # Including 1.0 (no subsampling)
+    "subsample_freq": [0, 1, 3, 5, 7],  # Frequency of subsampling
+    "colsample_bytree": [0.6, 0.7, 0.8, 0.9, 1.0],  # Including 1.0
+    "colsample_bynode": [0.6, 0.7, 0.8, 0.9, 1.0],  # Additional sampling at node level
+    
+    # Class imbalance handling - wider range
+    "scale_pos_weight": [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0],
+    
+    # Regularization parameters - more granular
+    "reg_alpha": [0.0, 0.01, 0.1, 0.5, 1.0, 2.0, 5.0],  # L1 regularization
+    "reg_lambda": [0.0, 0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0],  # L2 regularization
+    
+    # Additional advanced parameters
+    "min_split_gain": [0.0, 0.1, 0.5, 1.0],  # Minimum gain to split
+    "max_bin": [63, 127, 255, 511],  # Number of bins for feature discretization
+    "path_smooth": [0.0, 0.1, 0.5, 1.0],  # Path smoothing (LightGBM 4.0+)
+}
+
+# LightGBM fixed parameters
+LGBM_FIXED_PARAMS = {
+    "random_state": RANDOM_STATE,
+    "n_jobs": get_n_jobs(),
+    "boosting_type": "gbdt",
+    "objective": "binary",
+    "verbose": -1,
+    # Use a high n_estimators value in combination with early stopping
+    "n_estimators": 3000,  # Increased from 2000 for potentially better convergence
+}
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+
+def convert_numpy_types(obj: Any) -> Any:
+    """Recursively convert NumPy types to native Python types for JSON serialization."""
+    if isinstance(
+        obj,
+        (
+            np.integer,
+            np.int_,
+            np.intc,
+            np.intp,
+            np.int8,
+            np.int16,
+            np.int32,
+            np.int64,
+            np.uint8,
+            np.uint16,
+            np.uint32,
+            np.uint64,
+        ),
+    ):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float_, np.float16, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_numpy_types(item) for item in obj]
+    elif obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    else:
+        try:
+            if hasattr(obj, "item"):
+                return obj.item()
+            else:
+                return obj
+        except (ValueError, TypeError, AttributeError):
+            return str(obj)
+
+
+def filter_supported_params(param_grid: dict) -> dict:
+    """Filter out hyperparameters not supported by the installed LightGBM version.
+    
+    Tests each parameter by attempting to create a minimal model with it.
+    Returns a filtered parameter grid with only supported parameters.
+    """
+    filtered_grid = {}
+    unsupported_params = []
+    
+    # Test each parameter in the grid
+    for param, values in param_grid.items():
+        if not values:
+            continue
+        try:
+            # Create a minimal test model with this parameter
+            # Use the first value from the list to test
+            test_value = values[0]
+            test_model = LGBMClassifier(
+                n_estimators=1,
+                verbose=-1,
+                **{param: test_value}
+            )
+            # If successful, parameter is supported
+            filtered_grid[param] = values
+        except (TypeError, ValueError, AttributeError) as e:
+            # Parameter not supported by this LightGBM version
+            unsupported_params.append(param)
+            # Only print if it's not a common unsupported param to reduce noise
+            if param == "path_smooth":
+                print(f"  Info: Parameter 'path_smooth' not supported (requires LightGBM 4.0+), skipping...")
+    
+    if unsupported_params:
+        if len(unsupported_params) > 1 or (len(unsupported_params) == 1 and unsupported_params[0] != "path_smooth"):
+            print(f"  Removed {len(unsupported_params)} unsupported parameter(s): {', '.join(unsupported_params)}")
+    
+    return filtered_grid
+
+
+def get_feature_columns(df: pd.DataFrame) -> list:
+    """Get valid feature columns, excluding identifiers and leakage columns."""
+    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+    feature_cols = [
+        col for col in numeric_cols if col.lower() not in {c.lower() for c in EXCLUDE_COLS}
+    ]
+    return feature_cols
+
+
+def resolve_tuning_parquet() -> Path:
+    """Locate lgbm_tuning_embeddings.parquet (prefer $SCRATCH if present)."""
+    repo_root = Path(__file__).resolve().parents[4]
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    candidates = []
+    if scratch_root is not None:
+        candidates.append(scratch_root / "data/ml/lgbm_tuning_embeddings.parquet")
+    candidates.append(repo_root / "data/ml/lgbm_tuning_embeddings.parquet")
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    raise FileNotFoundError("lgbm_tuning_embeddings.parquet not found in expected locations")
+
+
+# =============================================================================
+# Main Pipeline
+# =============================================================================
+
+
+def main() -> None:
+    start_time = time.time()
+
+    # -------------------------------------------------------------------------
+    # Setup paths
+    # -------------------------------------------------------------------------
+    repo_root = Path(__file__).resolve().parents[4]
+    script_dir = Path(__file__).resolve().parent
+
+    train_path = resolve_tuning_parquet()
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Initialize W&B
+    wandb_api_key = os.environ.get("WANDB_API_KEY")
+    wandb_entity = os.environ.get("WANDB_ENTITY")
+    if not wandb_api_key:
+        print("Warning: WANDB_API_KEY not found in environment")
+    if not wandb_entity:
+        print("Warning: WANDB_ENTITY not found in environment (will use default)")
+
+    use_wandb = False
+    try:
+        print("Initializing Weights & Biases...")
+        wandb.init(
+            project="ml-hyperparameter-tuning-lgbm-embeddings",
+            entity=wandb_entity,
+            name=f"modelE_tuning_lgbm_{timestamp}",
+            config={
+                "random_state": RANDOM_STATE,
+                "temporal_split": {
+                    "train_year_max": TRAIN_YEAR_MAX,
+                    "val_year_min": VAL_YEAR_MIN,
+                    "val_year_max": VAL_YEAR_MAX,
+                },
+                "n_iter_lgbm": N_ITER_LGBM,
+            },
+        )
+        use_wandb = True
+        print("W&B connected\n")
+    except Exception as err:
+        print(f"W&B initialization failed: {err}\n")
+
+    print("=" * 70)
+    print("MODELE LIGHTGBM HYPERPARAMETER TUNING (EMBEDDINGS DATASET)")
+    print("=" * 70)
+    print(f"\nInput:  {train_path}")
+    print(f"Output: {script_dir}")
+
+    # -------------------------------------------------------------------------
+    # Step 1: Load data
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 1: LOAD DATA")
+    print("=" * 70)
+
+    print(f"\nLoading lgbm_tuning_embeddings.parquet...")
+    load_start = time.time()
+    df = pd.read_parquet(train_path)
+    load_time = time.time() - load_start
+    print(f"  Loaded {len(df):,} rows in {load_time:.1f}s")
+
+    # Downcast numeric dtypes to reduce memory usage
+    print("\nDowncasting numeric dtypes (float64→float32, int64→int32)...")
+    float_cols = df.select_dtypes(include=["float64"]).columns
+    for col in float_cols:
+        df[col] = df[col].astype("float32")
+
+    int_cols = df.select_dtypes(include=["int64"]).columns
+    for col in int_cols:
+        df[col] = df[col].astype("int32")
+    print("  Downcasting completed")
+
+    target_col = "transition_01"
+
+    # Check target column exists
+    if target_col not in df.columns:
+        raise ValueError(f"Target column '{target_col}' not found in data")
+
+    # Drop rows with missing target
+    df_clean = df.dropna(subset=[target_col])
+    dropped = len(df) - len(df_clean)
+    if dropped > 0:
+        print(f"\nDropped {dropped:,} rows with missing target")
+
+    # Filter to minimum year (embeddings dataset starts at 2018)
+    if "year" in df_clean.columns:
+        before = len(df_clean)
+        df_clean = df_clean[df_clean["year"] >= MIN_YEAR].copy()
+        removed = before - len(df_clean)
+        if removed > 0:
+            print(f"\nDropped {removed:,} rows with year < {MIN_YEAR} (TRANSITION_MIN_YEAR)")
+
+    print(f"\nDataset after cleaning: {len(df_clean):,} rows")
+
+    # Get feature columns
+    feature_cols = get_feature_columns(df_clean)
+    excluded_cols = sorted(EXCLUDE_COLS & set(df_clean.columns))
+
+    print(f"\nUsing {len(feature_cols)} features")
+    print(f"Excluded columns ({len(excluded_cols)}): {excluded_cols}")
+
+    # Target distribution
+    pos = (df_clean[target_col] > 0).sum()
+    neg = (df_clean[target_col] == 0).sum()
+    pos_pct = pos / len(df_clean) * 100
+
+    print("\n" + "-" * 40)
+    print("Dataset target distribution:")
+    print(f"  No transition (0): {neg:>12,}  ({100 - pos_pct:.3f}%)")
+    print(f"  Transition (0→1):  {pos:>12,}  ({pos_pct:.3f}%)")
+    print(f"  Class ratio:       1 : {neg / max(pos, 1):.1f}")
+    print("-" * 40)
+
+    # -------------------------------------------------------------------------
+    # Step 2: Create temporal split
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 2: CREATE TEMPORAL SPLIT")
+    print("=" * 70)
+
+    # Create train and validation indices based on year
+    train_idx = df_clean["year"] <= TRAIN_YEAR_MAX
+    val_idx = (df_clean["year"] >= VAL_YEAR_MIN) & (df_clean["year"] <= VAL_YEAR_MAX)
+
+    df_train = df_clean[train_idx].copy()
+    df_val = df_clean[val_idx].copy()
+
+    print(f"\nTemporal split configuration:")
+    print(f"  Train: year <= {TRAIN_YEAR_MAX}")
+    print(f"  Val:   {VAL_YEAR_MIN} <= year <= {VAL_YEAR_MAX}")
+
+    print(f"\nTrain set: {len(df_train):,} rows")
+    print(f"Val set:   {len(df_val):,} rows")
+
+    # Check years in each split
+    train_years = sorted(df_train["year"].unique())
+    val_years = sorted(df_val["year"].unique())
+    print(f"\nTrain years: {train_years}")
+    print(f"Val years:   {val_years}")
+
+    # Target distribution
+    train_pos = (df_train[target_col] > 0).sum()
+    train_neg = (df_train[target_col] == 0).sum()
+    train_pos_pct = train_pos / len(df_train) * 100
+
+    val_pos = (df_val[target_col] > 0).sum()
+    val_neg = (df_val[target_col] == 0).sum()
+    val_pos_pct = val_pos / len(df_val) * 100
+
+    print("\n" + "-" * 40)
+    print("Train set distribution:")
+    print(f"  No transition (0): {train_neg:>12,}  ({100 - train_pos_pct:.3f}%)")
+    print(f"  Transition (0→1):  {train_pos:>12,}  ({train_pos_pct:.3f}%)")
+    print("\nVal set distribution:")
+    print(f"  No transition (0): {val_neg:>12,}  ({100 - val_pos_pct:.3f}%)")
+    print(f"  Transition (0→1):  {val_pos:>12,}  ({val_pos_pct:.3f}%)")
+    print("-" * 40)
+
+    # -------------------------------------------------------------------------
+    # Step 3: Prepare features and target
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 3: PREPARE FEATURES AND TARGET")
+    print("=" * 70)
+
+    # Training set
+    y_train = (df_train[target_col] > 0).astype(np.int8)
+    X_train = df_train[feature_cols]
+
+    # Validation set
+    y_val = (df_val[target_col] > 0).astype(np.int8)
+    X_val = df_val[feature_cols]
+
+    print(f"\nTrain feature matrix shape: {X_train.shape}")
+    print(f"Train target shape: {y_train.shape}")
+    print(f"Val feature matrix shape: {X_val.shape}")
+    print(f"Val target shape: {y_val.shape}")
+
+    # Store sizes for summary (before deleting DataFrames)
+    cleaned_row_count = len(df_clean)
+    n_train = len(X_train)
+    n_val = len(X_val)
+
+    # Free large DataFrames early to reduce peak memory
+    print("\nFreeing large DataFrames to reduce memory usage...")
+    del df_clean, df_train, df_val
+    gc.collect()
+    print("  Memory cleanup completed")
+
+    # Combine train and val for RandomizedSearchCV with PredefinedSplit
+    # -1 indicates train, 0 indicates test/val
+    X_combined = pd.concat([X_train, X_val], ignore_index=True)
+    y_combined = np.concatenate([y_train.values, y_val.values])
+    split_indices = np.concatenate(
+        [
+            np.full(n_train, -1),  # -1 for train
+            np.zeros(n_val),  # 0 for val/test
+        ]
+    )
+    predefined_split = PredefinedSplit(split_indices)
+
+    # Create validation slice references from combined arrays for eval_set
+    # This allows us to free X_val/y_val while keeping references for early stopping
+    X_val_slice = X_combined.iloc[n_train:]
+    y_val_slice = y_combined[n_train:]
+
+    # Free X_train, X_val, y_train, y_val now that we have combined arrays and slices
+    print("\nFreeing individual train/val arrays to reduce memory usage...")
+    del X_train, X_val, y_train, y_val
+    gc.collect()
+    print("  Memory cleanup completed")
+
+    print(f"\nCombined dataset for CV: {len(X_combined):,} rows")
+    print(f"  Train: {n_train:,} rows (indices -1)")
+    print(f"  Val:   {n_val:,} rows (indices 0)")
+
+    # -------------------------------------------------------------------------
+    # Step 4: Prepare parameter grid (including auto scale_pos_weight)
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 4: PREPARE EXPANDED PARAMETER GRID")
+    print("=" * 70)
+
+    # Compute auto scale_pos_weight from train distribution
+    auto_scale_pos_weight = train_neg / max(train_pos, 1)
+    print(f"\nAuto scale_pos_weight (train_neg/train_pos): {auto_scale_pos_weight:.3f}")
+
+    lgbm_param_grid = deepcopy(LGBM_PARAM_GRID_BASE)
+    spw_values = list(lgbm_param_grid["scale_pos_weight"])
+    spw_values.append(float(auto_scale_pos_weight))
+    # Remove potential duplicates while preserving order
+    seen = set()
+    unique_spw_values = []
+    for v in spw_values:
+        if v not in seen:
+            seen.add(v)
+            unique_spw_values.append(v)
+    lgbm_param_grid["scale_pos_weight"] = unique_spw_values
+    
+    # Filter out unsupported parameters for version compatibility
+    print("\nFiltering parameter grid for version compatibility...")
+    lgbm_param_grid = filter_supported_params(lgbm_param_grid)
+
+    # Calculate total parameter combinations (for information) - after filtering
+    total_combinations = 1
+    for param, values in lgbm_param_grid.items():
+        total_combinations *= len(values)
+
+    print("\nExpanded parameter grid:")
+    for param, values in sorted(lgbm_param_grid.items()):
+        print(f"  {param}: {len(values)} options - {values}")
+    
+    print(f"\nTotal possible combinations: {total_combinations:,}")
+    print(f"Searching {N_ITER_LGBM} random combinations ({(N_ITER_LGBM/total_combinations*100):.6f}% of search space)")
+
+    print("\nFixed parameters:")
+    for param, value in LGBM_FIXED_PARAMS.items():
+        print(f"  {param}: {value}")
+
+    # -------------------------------------------------------------------------
+    # Step 5: LightGBM hyperparameter tuning with early stopping
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 5: LIGHTGBM HYPERPARAMETER TUNING")
+    print("=" * 70)
+
+    print(
+        f"\nUsing temporal split: train (year <= {TRAIN_YEAR_MAX}) / "
+        f"val ({VAL_YEAR_MIN} <= year <= {VAL_YEAR_MAX})"
+    )
+    print(f"Sampling {N_ITER_LGBM} parameter combinations with RandomizedSearchCV")
+
+    # Create LightGBM model
+    lgbm_model = LGBMClassifier(**LGBM_FIXED_PARAMS)
+
+    # Randomized search with fixed train/val split
+    print(f"\nStarting randomized search ({N_ITER_LGBM} iterations) with early stopping...")
+    print("This may take a while...\n")
+
+    random_search_lgbm = RandomizedSearchCV(
+        estimator=lgbm_model,
+        param_distributions=lgbm_param_grid,
+        n_iter=N_ITER_LGBM,
+        cv=predefined_split,  # Use fixed train/val split
+        scoring="average_precision",  # PR-AUC (better for imbalanced data)
+        n_jobs=1,  # Avoid nested parallelism
+        verbose=2,
+        random_state=RANDOM_STATE,
+        return_train_score=True,
+    )
+
+    # Early stopping using callback-based approach
+    # eval_set points to validation slice of combined arrays (allows X_val/y_val to be freed)
+    # Create early stopping callback
+    early_stopping_callback = early_stopping(
+        stopping_rounds=100,
+        verbose=False,
+        first_metric_only=True,
+    )
+    
+    fit_params_lgbm = {
+        "eval_set": [(X_val_slice, y_val_slice)],  # Validation slice from combined arrays
+        "eval_metric": "aucpr",  # LightGBM-native PR metric (same as average_precision)
+        "callbacks": [early_stopping_callback],
+    }
+
+    tune_start_lgbm = time.time()
+    random_search_lgbm.fit(X_combined, y_combined, **fit_params_lgbm)
+    tune_time_lgbm = time.time() - tune_start_lgbm
+
+    # best_score_ is the score on the validation set
+    best_val_score_lgbm = random_search_lgbm.best_score_
+
+    print(
+        f"\nLightGBM randomized search completed in "
+        f"{tune_time_lgbm:.1f}s ({tune_time_lgbm/60:.1f} min)"
+    )
+    print("\nBest parameters:")
+    for param, value in sorted(random_search_lgbm.best_params_.items()):
+        print(f"  {param}: {value}")
+    print(f"\nBest val score (PR-AUC): {best_val_score_lgbm:.4f}")
+
+    # Log to wandb
+    if use_wandb:
+        wandb.log(
+            {
+                "lgbm/best_val_score": float(best_val_score_lgbm),
+                "lgbm/tuning_time_seconds": tune_time_lgbm,
+                "lgbm/best_params": random_search_lgbm.best_params_,
+                "lgbm/auto_scale_pos_weight": float(auto_scale_pos_weight),
+                "lgbm/total_param_combinations": total_combinations,
+                "lgbm/search_space_coverage_pct": (N_ITER_LGBM / total_combinations * 100),
+            }
+        )
+
+    # Save LGBM best parameters
+    lgbm_best_params = {
+        "best_params": random_search_lgbm.best_params_,
+        "best_val_score": float(best_val_score_lgbm),
+        "param_grid": lgbm_param_grid,
+        "fixed_params": LGBM_FIXED_PARAMS,
+        "n_iter": N_ITER_LGBM,
+        "scoring": "average_precision",
+        "tuning_time_seconds": tune_time_lgbm,
+        "total_param_combinations": total_combinations,
+        "search_space_coverage_pct": (N_ITER_LGBM / total_combinations * 100),
+        "split_info": {
+            "train_years": f"year <= {TRAIN_YEAR_MAX}",
+            "val_years": f"{VAL_YEAR_MIN} <= year <= {VAL_YEAR_MAX}",
+            "n_train": int(n_train),
+            "n_val": int(n_val),
+            "auto_scale_pos_weight": float(auto_scale_pos_weight),
+        },
+    }
+    lgbm_best_params = convert_numpy_types(lgbm_best_params)
+
+    lgbm_output_path = script_dir / "lgbm_best_params.json"
+    with open(lgbm_output_path, "w") as f:
+        json.dump(lgbm_best_params, f, indent=2)
+    print(f"\nLGBM best parameters saved to: {lgbm_output_path}")
+
+    # Free memory
+    del random_search_lgbm, lgbm_model
+    gc.collect()
+
+    # -------------------------------------------------------------------------
+    # Summary
+    # -------------------------------------------------------------------------
+    total_time = time.time() - start_time
+
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"Dataset size (cleaned):        {cleaned_row_count:,} rows")
+    print(f"Features:                      {len(feature_cols)}")
+    print("\nTemporal split:")
+    print(f"  Train: year <= {TRAIN_YEAR_MAX}  ({n_train:,} rows)")
+    print(f"  Val:   {VAL_YEAR_MIN} <= year <= {VAL_YEAR_MAX}  ({n_val:,} rows)")
+    print("\nLightGBM hyperparameter tuning:")
+    print(f"  Total parameter combinations: {total_combinations:,}")
+    print(f"  Searched combinations:        {N_ITER_LGBM}")
+    print(f"  Search space coverage:        {(N_ITER_LGBM/total_combinations*100):.6f}%")
+    print(f"  Best val score (PR-AUC):      {lgbm_best_params['best_val_score']:.4f}")
+    print(
+        f"  Tuning time:                  "
+        f"{tune_time_lgbm:.1f}s ({tune_time_lgbm/60:.1f} min)"
+    )
+    print(f"  Best parameters saved to:     {lgbm_output_path}")
+    print(f"\nTotal time:                    {total_time:.1f}s ({total_time/60:.1f} min)")
+    print("=" * 70)
+    print("Done.")
+
+    if use_wandb:
+        wandb.log(
+            {
+                "summary/total_time_seconds": total_time,
+                "summary/total_time_minutes": total_time / 60,
+                "summary/lgbm_best_val_score": float(lgbm_best_params["best_val_score"]),
+                "summary/auto_scale_pos_weight": float(auto_scale_pos_weight),
+                "summary/total_param_combinations": total_combinations,
+                "status": "success",
+            }
+        )
+        wandb.finish()
+
+
+if __name__ == "__main__":
+    # Set up output file capture
+    repo_root = Path(__file__).resolve().parents[4]
+    output_dir = repo_root / "outputs/Results/ml_models"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = output_dir / f"modelE_tuning_lgbm_{timestamp}.txt"
+
+    tee = Tee(output_file)
+    sys.stdout = tee
+
+    try:
+        main()
+    finally:
+        sys.stdout = tee.stdout
+        tee.close()
+        print(f"\nOutput saved to: {output_file}")
+
