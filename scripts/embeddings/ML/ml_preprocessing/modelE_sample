@@ -33,6 +33,8 @@ TARGET_NEG_POS_RATIO = 100  # Target ratio of negatives to positives per year
 MIN_POS_FOR_FULL_QUOTA = 200  # Minimum positives to use full quota logic
 MIN_NEG_PER_YEAR = 50000  # Minimum negative quota when pos >= MIN_POS_FOR_FULL_QUOTA
 SMALL_NEG_QUOTA = 5000  # Minimum negative quota when pos < MIN_POS_FOR_FULL_QUOTA
+MAX_NEG_PER_YEAR = 300_000  # Maximum negatives per year (caps per-year quota)
+GLOBAL_MAX_ROWS = 4_000_000  # Maximum total rows; if exceeded, uniformly downsample negatives
 
 
 def resolve_input() -> Path:
@@ -147,8 +149,8 @@ def main() -> None:
                 GROUP BY year
             ),
             -- Per-year negative budgets: 
-            --   If pos >= MIN_POS_FOR_FULL_QUOTA: min(neg_count, max(pos * ratio, MIN_NEG_PER_YEAR))
-            --   Else: min(neg_count, max(pos * ratio, SMALL_NEG_QUOTA))
+            --   If pos >= MIN_POS_FOR_FULL_QUOTA: min(neg_count, max(pos * ratio, MIN_NEG_PER_YEAR), MAX_NEG_PER_YEAR)
+            --   Else: min(neg_count, max(pos * ratio, SMALL_NEG_QUOTA), MAX_NEG_PER_YEAR)
             neg_budget AS (
                 SELECT
                     yc.year,
@@ -156,27 +158,30 @@ def main() -> None:
                     yc.neg_count,
                     CASE 
                         WHEN yc.neg_count > 0 THEN
-                            CASE
-                                WHEN yc.pos_count >= {MIN_POS_FOR_FULL_QUOTA} THEN
-                                    -- Full quota logic: min(neg_count, max(pos * ratio, MIN_NEG_PER_YEAR))
-                                    LEAST(
-                                        GREATEST(
-                                            CAST(ROUND(yc.pos_count * {TARGET_NEG_POS_RATIO}) AS BIGINT),
-                                            {MIN_NEG_PER_YEAR}
-                                        ),
-                                        yc.neg_count
-                                    )
-                                ELSE
-                                    -- Proportional quota with minimum when pos < MIN_POS_FOR_FULL_QUOTA
-                                    -- min(neg_count, max(pos * ratio, SMALL_NEG_QUOTA))
-                                    LEAST(
-                                        GREATEST(
-                                            CAST(ROUND(yc.pos_count * {TARGET_NEG_POS_RATIO}) AS BIGINT),
-                                            {SMALL_NEG_QUOTA}
-                                        ),
-                                        yc.neg_count
-                                    )
-                            END
+                            LEAST(
+                                CASE
+                                    WHEN yc.pos_count >= {MIN_POS_FOR_FULL_QUOTA} THEN
+                                        -- Full quota logic: min(neg_count, max(pos * ratio, MIN_NEG_PER_YEAR))
+                                        LEAST(
+                                            GREATEST(
+                                                CAST(ROUND(yc.pos_count * {TARGET_NEG_POS_RATIO}) AS BIGINT),
+                                                {MIN_NEG_PER_YEAR}
+                                            ),
+                                            yc.neg_count
+                                        )
+                                    ELSE
+                                        -- Proportional quota with minimum when pos < MIN_POS_FOR_FULL_QUOTA
+                                        -- min(neg_count, max(pos * ratio, SMALL_NEG_QUOTA))
+                                        LEAST(
+                                            GREATEST(
+                                                CAST(ROUND(yc.pos_count * {TARGET_NEG_POS_RATIO}) AS BIGINT),
+                                                {SMALL_NEG_QUOTA}
+                                            ),
+                                            yc.neg_count
+                                        )
+                                END,
+                                {MAX_NEG_PER_YEAR}
+                            )
                         ELSE 0
                     END AS year_neg_budget
                 FROM year_counts yc
@@ -224,8 +229,9 @@ def main() -> None:
 
         print(f"\nCreating LightGBM tuning sample with per-year negative downsampling...")
         print(f"  All positives kept; negatives sampled per year:")
-        print(f"    If pos >= {MIN_POS_FOR_FULL_QUOTA}: min(neg_count, max(pos * {TARGET_NEG_POS_RATIO}, {MIN_NEG_PER_YEAR:,}))")
-        print(f"    If pos < {MIN_POS_FOR_FULL_QUOTA}: min(neg_count, max(pos * {TARGET_NEG_POS_RATIO}, {SMALL_NEG_QUOTA:,}))")
+        print(f"    If pos >= {MIN_POS_FOR_FULL_QUOTA}: min(neg_count, max(pos * {TARGET_NEG_POS_RATIO}, {MIN_NEG_PER_YEAR:,}), {MAX_NEG_PER_YEAR:,})")
+        print(f"    If pos < {MIN_POS_FOR_FULL_QUOTA}: min(neg_count, max(pos * {TARGET_NEG_POS_RATIO}, {SMALL_NEG_QUOTA:,}), {MAX_NEG_PER_YEAR:,})")
+        print(f"  Global max rows: {GLOBAL_MAX_ROWS:,} (if exceeded, uniformly downsample negatives)")
         
         # Set random seed for reproducible sampling
         seed_value = RANDOM_STATE / 100.0
@@ -233,17 +239,86 @@ def main() -> None:
         
         sample_start = time.time()
         con.execute(sample_sql)
-        print(f"Sample written in {time.time() - sample_start:.1f}s")
-
-        # Log counts and check achieved ratios
-        log_year_counts(con, output_path, "TUNING_SAMPLE")
-
-        # Check total rows
+        print(f"Initial sample written in {time.time() - sample_start:.1f}s")
+        
+        # Check if we need global downsampling
         total_rows = con.execute(
             f"SELECT COUNT(*) FROM read_parquet('{escaped_out}')"
         ).fetchone()[0]
         
-        print(f"\nTotal rows: {total_rows:,}")
+        if total_rows > GLOBAL_MAX_ROWS:
+            print(f"\nTotal rows ({total_rows:,}) exceed global max ({GLOBAL_MAX_ROWS:,}), downsampling negatives...")
+            
+            # Count positives (we keep all of them)
+            total_pos = con.execute(
+                f"SELECT SUM(transition_01) FROM read_parquet('{escaped_out}')"
+            ).fetchone()[0]
+            
+            target_neg = GLOBAL_MAX_ROWS - total_pos
+            current_neg = total_rows - total_pos
+            
+            print(f"  Positives: {total_pos:,} (keeping all)")
+            print(f"  Current negatives: {current_neg:,}")
+            print(f"  Target negatives: {target_neg:,}")
+            
+            if target_neg < 0:
+                raise ValueError(f"Cannot downsample: positives ({total_pos:,}) exceed global max ({GLOBAL_MAX_ROWS:,})")
+            
+            # Uniformly downsample negatives across all years
+            downsample_sql = f"""
+            COPY (
+                WITH current_data AS (
+                    SELECT * FROM read_parquet('{escaped_out}')
+                ),
+                positives AS (
+                    SELECT * FROM current_data WHERE transition_01 = 1
+                ),
+                negatives AS (
+                    SELECT 
+                        *,
+                        random() AS u
+                    FROM current_data
+                    WHERE transition_01 = 0
+                ),
+                ranked_negs AS (
+                    SELECT
+                        *,
+                        ROW_NUMBER() OVER (ORDER BY u) AS global_rank
+                    FROM negatives
+                ),
+                sampled_negs AS (
+                    SELECT * EXCLUDE (u, global_rank)
+                    FROM ranked_negs
+                    WHERE global_rank <= {target_neg}
+                )
+                SELECT * FROM positives
+                UNION ALL
+                SELECT * FROM sampled_negs
+            )
+            TO '{escaped_out}' (FORMAT PARQUET, COMPRESSION ZSTD)
+            """
+            
+            # Reset seed for consistent downsampling
+            con.execute(f"SELECT setseed({seed_value})")
+            
+            downsample_start = time.time()
+            con.execute(downsample_sql)
+            print(f"Global downsampling completed in {time.time() - downsample_start:.1f}s")
+            
+            final_rows = con.execute(
+                f"SELECT COUNT(*) FROM read_parquet('{escaped_out}')"
+            ).fetchone()[0]
+            print(f"Final total rows: {final_rows:,}")
+
+        # Log counts and check achieved ratios
+        log_year_counts(con, output_path, "TUNING_SAMPLE")
+
+        # Check total rows (may have been modified by global downsampling)
+        total_rows = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{escaped_out}')"
+        ).fetchone()[0]
+        
+        print(f"\nTotal rows: {total_rows:,} (max: {GLOBAL_MAX_ROWS:,})")
         
         # Check per-year achieved neg/pos ratios vs target
         print(f"\nChecking achieved neg/pos ratios vs target ({TARGET_NEG_POS_RATIO}:1)...")
