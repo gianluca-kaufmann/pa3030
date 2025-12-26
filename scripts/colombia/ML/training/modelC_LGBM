@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""LGBM Transition Model for Colombia Dataset (0→1 Prediction)
-Train LightGBM on pre-split parquet files: train_colombia (2000-2014), 
-val_colombia (2015-2017), test_colombia (2018-2024). Final model trained on 2000-2014,
-with early stopping on 2015-2017, evaluated on 2018-2024.
+"""LGBM Transition Model for Colombia Dataset (5-Year Lookahead Prediction)
+Train LightGBM on pre-split parquet files: train_colombia_win5 (2000-2014), 
+val_colombia_win5 (2015-2017), test_colombia_win5 (2018-2019). Final model trained on 2000-2014,
+with early stopping on 2015-2017, evaluated on 2018-2019.
+Target: transition_01_win5 (1 if transition occurs within next 5 years, else 0)
 """
 
 from __future__ import annotations
@@ -47,10 +48,11 @@ class Tee:
 
 # Configuration
 RANDOM_STATE = 42
-EXCLUDE_COLS = {'transition_01', 'WDPA_b1', 'WDPA_prev', 'x', 'y', 'row', 'col', 'year'}
+EXCLUDE_COLS = {'transition_01', 'transition_01_win5', 'WDPA_b1', 'WDPA_prev', 'x', 'y', 'row', 'col', 'year'}
 TRAIN_YEARS = (2000, 2014)   # Train: 2000-2014
 VAL_YEARS = (2015, 2017)     # Val: 2015-2017
-TEST_YEARS = (2018, 2024)    # Test: 2018-2024
+TEST_YEARS = (2018, 2019)    # Test: 2018-2019 (right-censored for 5-year lookahead)
+TARGET_COL = "transition_01_win5"  # 5-year lookahead target
 FIXED_PARAMS = {'random_state': RANDOM_STATE, 'boosting_type': 'gbdt', 'objective': 'binary', 'verbose': -1}
 
 # Utility Functions
@@ -139,6 +141,23 @@ def resolve_parquet_file(filename: str) -> Path:
     raise FileNotFoundError(f"{filename} not found in expected locations")
 
 
+def resolve_metadata_file(filename: str) -> Optional[Path]:
+    """Locate metadata JSON file (prefer $SCRATCH if present)."""
+    repo_root = Path(__file__).resolve().parents[4]
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    candidates = []
+    if scratch_root is not None:
+        candidates.append(scratch_root / f"data/ml/{filename}")
+    candidates.append(repo_root / f"data/ml/{filename}")
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    return None
+
+
 def resolve_best_params_json() -> Optional[Path]:
     """Locate lgbm_best_params.json (in same directory as this script). Returns None if not found."""
     script_dir = Path(__file__).resolve().parent
@@ -152,7 +171,7 @@ def resolve_best_params_json() -> Optional[Path]:
 
 def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
     """Load and merge parameters: FIXED_PARAMS → json_fixed_params → best_params → guardrails (fill missing only).
-    scale_pos_weight is excluded from JSON and will be computed from training data.
+    All parameters from JSON (including scale_pos_weight) are used as-is.
     If params_path is None, returns default manual hyperparameters."""
     if params_path is None:
         # Use default manual hyperparameters when JSON file is not found
@@ -166,11 +185,9 @@ def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
     with open(params_path, 'r') as f:
         params_data = json.load(f)
     
-    # Start with FIXED_PARAMS, then add JSON params (excluding scale_pos_weight)
+    # Start with FIXED_PARAMS, then add JSON params (including scale_pos_weight from JSON)
     json_fixed = params_data.get('fixed_params', {})
     json_best = params_data.get('best_params', {}).copy()
-    # Remove scale_pos_weight from JSON params - it will be computed from training data
-    json_best.pop('scale_pos_weight', None)
     
     final_params = {**FIXED_PARAMS, **json_fixed, **json_best}
     
@@ -184,7 +201,7 @@ def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
         if key not in final_params:
             final_params[key] = value
     
-    return final_params, params_data.get('best_cv_score', None)
+    return final_params, params_data.get('best_val_score', params_data.get('best_cv_score', None))
 
 
 def load_numpy_arrays_two_pass(
@@ -347,7 +364,7 @@ def phase1_training(
     report_memory_usage("start of Phase 1")
     print(f"\nSTEP A: LOAD TRAIN ({TRAIN_YEARS[0]}-{TRAIN_YEARS[1]})")
     X_train, y_train, train_pos, train_neg, train_years = load_numpy_arrays_two_pass(
-        train_path, feature_cols, target_col, "train_colombia.parquet")
+        train_path, feature_cols, target_col, "train_colombia_win5.parquet")
     n_train_full = len(y_train)
     train_stats = {
         "n_train": n_train_full,
@@ -360,23 +377,26 @@ def phase1_training(
     
     print(f"\nSTEP B: LOAD VAL ({VAL_YEARS[0]}-{VAL_YEARS[1]})")
     X_val, y_val, val_pos, val_neg, val_years = load_numpy_arrays_two_pass(
-        val_path, feature_cols, target_col, "val_colombia.parquet")
+        val_path, feature_cols, target_col, "val_colombia_win5.parquet")
     report_memory_usage("after STEP B")
     
     print(f"\nSTEP C: TRAIN & EVALUATE\nTemporal split: train ({TRAIN_YEARS[0]}-{TRAIN_YEARS[1]}): {len(X_train):,} rows, val ({VAL_YEARS[0]}-{VAL_YEARS[1]}): {len(X_val):,} rows")
     
-    # Compute scale_pos_weight from TRAIN only: n_neg / n_pos
+    # Use scale_pos_weight from best_params (loaded from JSON file)
     neg_pos_ratio = train_neg / train_pos if train_pos > 0 else 1.0
-    scale_pos_weight = neg_pos_ratio
+    scale_pos_weight = best_params.get("scale_pos_weight", None)
     
-    print(f"\nImbalance: ratio {neg_pos_ratio:.3f}, scale_pos_weight {scale_pos_weight:.6f} (n_neg/n_pos from TRAIN)")
+    if scale_pos_weight is not None:
+        print(f"\nImbalance: ratio {neg_pos_ratio:.3f}, scale_pos_weight {scale_pos_weight:.6f} (from JSON params)")
+    else:
+        print(f"\nImbalance: ratio {neg_pos_ratio:.3f}, scale_pos_weight not specified in params")
+    
     best_params["is_unbalance"] = False
-    best_params["scale_pos_weight"] = scale_pos_weight
     imbalance_info = {
         "neg": int(train_neg),
         "pos": int(train_pos),
         "ratio": float(neg_pos_ratio),
-        "scale_pos_weight": float(scale_pos_weight)
+        "scale_pos_weight": float(scale_pos_weight) if scale_pos_weight is not None else None
     }
     if use_wandb:
         wandb.log({
@@ -437,7 +457,7 @@ def phase1_training(
     # Now free validation data and predictions
     del X_val, y_val, y_val_proba; gc.collect()
     
-    model_path = model_dir / f"modelC_lgbm_{timestamp}.pkl"
+    model_path = model_dir / f"modelC_lgbm_win5_{timestamp}.pkl"
     with open(model_path, 'wb') as f:
         pickle.dump(lgb_model, f)
     print(f"Model saved: {model_path}")
@@ -516,7 +536,7 @@ def phase2_testing(
     
     # Pass 2: Process batches and fill pre-allocated arrays
     parquet_file = pq.ParquetFile(test_path)
-    scored_path = output_dir / f"modelC_lgbm_scored_{timestamp}.parquet"
+    scored_path = output_dir / f"modelC_lgbm_win5_scored_{timestamp}.parquet"
     writer = None
     test_pos = test_neg = batch_num = idx_offset = 0
     pred_start = time.time()
@@ -654,7 +674,9 @@ def phase2_testing(
         "metadata": {
             "timestamp": timestamp, 
             "model": "LightGBM", 
-            "task": "transition_01_prediction",
+            "task": "transition_01_win5_prediction",
+            "target_column": TARGET_COL,
+            "lookahead_years": 5,
             "random_state": RANDOM_STATE, 
             "n_features": len(feature_cols), 
             "features": feature_cols,
@@ -694,7 +716,7 @@ def phase2_testing(
         }
     }
     metrics = convert_numpy_types(metrics)
-    metrics_path = output_dir / f"modelC_lgbm_metrics_{timestamp}.json"
+    metrics_path = output_dir / f"modelC_lgbm_win5_metrics_{timestamp}.json"
     with open(metrics_path, 'w') as f:
         json.dump(metrics, f, indent=2)
     print(f"\nMetrics saved: {metrics_path}")
@@ -721,10 +743,11 @@ def phase2_testing(
 def main(timestamp: str) -> None:
     start_time = time.time()
     repo_root = Path(__file__).resolve().parents[4]
-    train_path = resolve_parquet_file("train_colombia.parquet")
-    val_path = resolve_parquet_file("val_colombia.parquet")
-    test_path = resolve_parquet_file("test_colombia.parquet")
+    train_path = resolve_parquet_file("train_colombia_win5.parquet")
+    val_path = resolve_parquet_file("val_colombia_win5.parquet")
+    test_path = resolve_parquet_file("test_colombia_win5.parquet")
     params_path = resolve_best_params_json()
+    metadata_path = resolve_metadata_file("train_colombia_win5_metadata.json")
     output_dir = repo_root / "outputs/Results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
     model_dir = repo_root / "data/ml/models"
@@ -736,10 +759,12 @@ def main(timestamp: str) -> None:
             wandb.init(
             project="ml-training-colombia", 
             entity=os.environ.get("WANDB_ENTITY"), 
-            name=f"modelC_lgbm_{timestamp}",
+            name=f"modelC_lgbm_win5_{timestamp}",
             config={
                 "model": "LightGBM", 
-                "task": "transition_01_prediction", 
+                "task": "transition_01_win5_prediction", 
+                "target_column": TARGET_COL,
+                "lookahead_years": 5,
                 "random_state": RANDOM_STATE,
                 "temporal_split": {
                     "train_years": list(TRAIN_YEARS), 
@@ -755,8 +780,20 @@ def main(timestamp: str) -> None:
     else:
         print("W&B not available (module not installed)")
     
-    print("="*70 + "\nLGBM TRANSITION MODEL (COLOMBIA DATASET)\n" + "="*70)
+    print("="*70 + "\nLGBM TRANSITION MODEL (COLOMBIA DATASET - 5-YEAR LOOKAHEAD)\n" + "="*70)
     print(f"Train: {train_path}\nVal: {val_path}\nTest: {test_path}\nParams: {params_path if params_path else 'Using default manual hyperparameters'}\nOutput: {output_dir}")
+    
+    # Load scale_pos_weight from metadata if available
+    scale_pos_weight_from_metadata = None
+    if metadata_path:
+        try:
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+                scale_pos_weight_from_metadata = metadata.get("scale_pos_weight")
+                print(f"\nLoaded metadata from {metadata_path}")
+                print(f"  scale_pos_weight: {scale_pos_weight_from_metadata}")
+        except Exception as e:
+            print(f"\nWarning: Could not load metadata from {metadata_path}: {e}")
     
     best_params, best_cv_score = load_best_params(params_path)
     if params_path:
@@ -766,9 +803,14 @@ def main(timestamp: str) -> None:
     else:
         print(f"\nUsing default manual hyperparameters (lgbm_best_params.json not found)")
     
+    # Override scale_pos_weight with value from metadata if available
+    if scale_pos_weight_from_metadata is not None:
+        best_params["scale_pos_weight"] = scale_pos_weight_from_metadata
+        print(f"Using scale_pos_weight from metadata: {scale_pos_weight_from_metadata:.6f}")
+    
     all_cols_train = pq.ParquetFile(train_path).schema_arrow.names
     all_cols_test = pq.ParquetFile(test_path).schema_arrow.names
-    target_col = "transition_01"
+    target_col = TARGET_COL
     # Build feature columns from PyArrow schema only (avoid loading full parquet into pandas)
     schema = pq.ParquetFile(train_path).schema_arrow
     numeric_cols = [
@@ -783,6 +825,7 @@ def main(timestamp: str) -> None:
     keep_cols_train = feature_cols + required_cols + optional_cols
     keep_cols_test = feature_cols + required_cols + [col for col in ['x', 'y'] if col in all_cols_test]
     print(f"Selected {len(feature_cols)} features, loading {len(keep_cols_train)} cols from train, {len(keep_cols_test)} from test")
+    print(f"Target column: {target_col}")
     
     (model_path, validation_metrics, train_stats, train_time, val_time, train_pos, train_neg, n_train_full, imbalance_info) = phase1_training(
         train_path, val_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col)
@@ -798,7 +841,7 @@ if __name__ == "__main__":
     output_dir = repo_root / "outputs/Results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"modelC_lgbm_{timestamp}.txt"
+    output_file = output_dir / f"modelC_lgbm_win5_{timestamp}.txt"
     tee = Tee(output_file)
     sys.stdout = tee
     try:
