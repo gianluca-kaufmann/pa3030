@@ -5,7 +5,7 @@ Diagnoses data quality issues and temporal shifts between train/val/test periods
 Includes deep investigation of prediction errors and cohort analysis
 
 Input:
-    - Train/Val/Test parquet files from data/ml/ (auto-detected, prefer $SCRATCH if present)
+    - Train/Earlystop/Test parquet files from data/ml/ (auto-detected, prefer $SCRATCH if present)
     - Optional: Scored predictions file from outputs/Results/ml_models/ (auto-detected most recent)
 
 Output:
@@ -96,7 +96,7 @@ OUTPUT_DIR = get_output_dir()
 
 # File paths
 TRAIN_FILE = resolve_parquet_file("train_colombia_win5.parquet")
-VAL_FILE = resolve_parquet_file("val_colombia_win5.parquet")
+EARLYSTOP_FILE = resolve_parquet_file("val_colombia_win5.parquet")
 TEST_FILE = resolve_parquet_file("test_colombia_win5.parquet")
 SCORED_FILE = resolve_scored_file()
 
@@ -104,7 +104,7 @@ print("="*70)
 print("TEMPORAL DISTRIBUTION ANALYSIS (COLOMBIA DATASET)")
 print("="*70)
 print(f"Train: {TRAIN_FILE}")
-print(f"Val:   {VAL_FILE}")
+print(f"Earlystop:   {EARLYSTOP_FILE}")
 print(f"Test:  {TEST_FILE}")
 if SCORED_FILE:
     print(f"Scored: {SCORED_FILE}")
@@ -125,16 +125,16 @@ def load_sample(file, n=100000):
     return df
 
 train_sample = load_sample(TRAIN_FILE)
-val_sample = load_sample(VAL_FILE)
+earlystop_sample = load_sample(EARLYSTOP_FILE)
 test_sample = load_sample(TEST_FILE)
 
 # Get full datasets for target distribution (lightweight)
 train_target = pd.read_parquet(TRAIN_FILE, columns=['transition_01_win5', 'year'])
-val_target = pd.read_parquet(VAL_FILE, columns=['transition_01_win5', 'year'])
+earlystop_target = pd.read_parquet(EARLYSTOP_FILE, columns=['transition_01_win5', 'year'])
 test_target = pd.read_parquet(TEST_FILE, columns=['transition_01_win5', 'year'])
 
 print(f"\nTrain: {len(train_target):,} rows, {train_target['transition_01_win5'].mean():.4%} positive")
-print(f"Val:   {len(val_target):,} rows, {val_target['transition_01_win5'].mean():.4%} positive")
+print(f"Earlystop:   {len(earlystop_target):,} rows, {earlystop_target['transition_01_win5'].mean():.4%} positive")
 print(f"Test:  {len(test_target):,} rows, {test_target['transition_01_win5'].mean():.4%} positive")
 
 # ============================================================================
@@ -146,7 +146,7 @@ fig, axes = plt.subplots(2, 2, figsize=(15, 10))
 
 # 2a. Transition rate by year
 yearly_stats = []
-for name, df in [('Train', train_target), ('Val', val_target), ('Test', test_target)]:
+for name, df in [('Train', train_target), ('Earlystop', earlystop_target), ('Test', test_target)]:
     year_group = df.groupby('year')['transition_01_win5'].agg(['mean', 'count', 'sum'])
     year_group['split'] = name
     yearly_stats.append(year_group.reset_index())
@@ -154,11 +154,11 @@ for name, df in [('Train', train_target), ('Val', val_target), ('Test', test_tar
 yearly_df = pd.concat(yearly_stats)
 
 ax = axes[0, 0]
-for split in ['Train', 'Val', 'Test']:
+for split in ['Train', 'Earlystop', 'Test']:
     data = yearly_df[yearly_df['split'] == split]
     ax.plot(data['year'], data['mean'], marker='o', label=split, linewidth=2)
-ax.axvline(2014.5, color='red', linestyle='--', alpha=0.5, label='Train/Val split')
-ax.axvline(2017.5, color='orange', linestyle='--', alpha=0.5, label='Val/Test split')
+ax.axvline(2014.5, color='red', linestyle='--', alpha=0.5, label='Train/Earlystop split')
+ax.axvline(2017.5, color='orange', linestyle='--', alpha=0.5, label='Earlystop/Test split')
 ax.set_xlabel('Year')
 ax.set_ylabel('Transition Rate')
 ax.set_title('Transition Rate Over Time (5-year lookahead)')
@@ -167,7 +167,7 @@ ax.grid(True, alpha=0.3)
 
 # 2b. Sample counts by year
 ax = axes[0, 1]
-for split in ['Train', 'Val', 'Test']:
+for split in ['Train', 'Earlystop', 'Test']:
     data = yearly_df[yearly_df['split'] == split]
     ax.bar(data['year'], data['count'], alpha=0.6, label=split)
 ax.set_xlabel('Year')
@@ -185,7 +185,7 @@ print("\n[3/9] Analyzing year-by-year patterns with feature statistics...")
 train_full = pd.read_parquet(TRAIN_FILE, 
                              columns=['transition_01_win5', 'year', 'deforestation_b1_smooth64', 
                                      'NDVI_b1_smooth64', 'GPW_b1', 'dist_wdpa'])
-val_full = pd.read_parquet(VAL_FILE,
+earlystop_full = pd.read_parquet(EARLYSTOP_FILE,
                            columns=['transition_01_win5', 'year', 'deforestation_b1_smooth64',
                                    'NDVI_b1_smooth64', 'GPW_b1', 'dist_wdpa'])
 test_full = pd.read_parquet(TEST_FILE,
@@ -195,7 +195,7 @@ test_full = pd.read_parquet(TEST_FILE,
 # Combine for temporal analysis
 all_data = pd.concat([
     train_full.assign(split='Train'),
-    val_full.assign(split='Val'),
+    earlystop_full.assign(split='Earlystop'),
     test_full.assign(split='Test')
 ], ignore_index=True)
 
@@ -233,7 +233,7 @@ available_features = [f for f in top_features if f in train_sample.columns][:6]
 # Distribution comparison for top features
 feature_stats = []
 for feat in available_features:
-    for name, df in [('Train', train_sample), ('Val', val_sample), ('Test', test_sample)]:
+    for name, df in [('Train', train_sample), ('Earlystop', earlystop_sample), ('Test', test_sample)]:
         if feat in df.columns:
             feature_stats.append({
                 'feature': feat,
@@ -249,7 +249,7 @@ feat_df = pd.DataFrame(feature_stats)
 # Plot feature mean shifts
 ax = axes[1, 0]
 pivot_mean = feat_df.pivot(index='feature', columns='split', values='mean')
-pivot_mean = pivot_mean[['Train', 'Val', 'Test']]
+pivot_mean = pivot_mean[['Train', 'Earlystop', 'Test']]
 pivot_mean.plot(kind='bar', ax=ax, width=0.8)
 ax.set_title('Feature Mean Values Across Splits')
 ax.set_xlabel('Feature')
@@ -376,7 +376,7 @@ for idx, feat in enumerate(available_features[:n_features]):
     
     # Plot distributions
     for name, df, color in [('Train', train_sample, 'blue'), 
-                             ('Val', val_sample, 'green'), 
+                             ('Earlystop', earlystop_sample, 'green'), 
                              ('Test', test_sample, 'red')]:
         if feat in df.columns:
             data = df[feat].dropna()
@@ -744,7 +744,7 @@ quality_report = {}
 
 # Check for missing values
 print("\nMissing value rates:")
-for name, df in [('Train', train_sample), ('Val', val_sample), ('Test', test_sample)]:
+for name, df in [('Train', train_sample), ('Earlystop', earlystop_sample), ('Test', test_sample)]:
     missing = df.isna().mean()
     missing_feats = missing[missing > 0].sort_values(ascending=False)
     quality_report[f'{name}_missing'] = missing_feats.to_dict()
@@ -756,7 +756,7 @@ for name, df in [('Train', train_sample), ('Val', val_sample), ('Test', test_sam
 
 # Check for constant features
 print("\nFeatures with near-zero variance:")
-for name, df in [('Train', train_sample), ('Val', val_sample), ('Test', test_sample)]:
+for name, df in [('Train', train_sample), ('Earlystop', earlystop_sample), ('Test', test_sample)]:
     numeric_cols = df.select_dtypes(include=[np.number]).columns
     low_var = []
     for col in numeric_cols:
@@ -770,7 +770,7 @@ for name, df in [('Train', train_sample), ('Val', val_sample), ('Test', test_sam
 
 # Check for extreme outliers
 print("\nFeatures with extreme outliers (>5 std from mean):")
-for name, df in [('Train', train_sample), ('Val', val_sample), ('Test', test_sample)]:
+for name, df in [('Train', train_sample), ('Earlystop', earlystop_sample), ('Test', test_sample)]:
     numeric_cols = df.select_dtypes(include=[np.number]).columns
     outlier_info = {}
     for col in numeric_cols:
@@ -820,12 +820,12 @@ print(ks_df.to_string(index=False))
 summary = {
     'transition_rates': {
         'train': float(train_target['transition_01_win5'].mean()),
-        'val': float(val_target['transition_01_win5'].mean()),
+        'earlystop': float(earlystop_target['transition_01_win5'].mean()),
         'test': float(test_target['transition_01_win5'].mean())
     },
     'sample_sizes': {
         'train': len(train_target),
-        'val': len(val_target),
+        'earlystop': len(earlystop_target),
         'test': len(test_target)
     },
     'distribution_shifts': ks_df.to_dict('records')

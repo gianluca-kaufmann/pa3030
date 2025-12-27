@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
 
 """
-Temporal split script for modelC training/validation/test splits (Colombia dataset)
+Temporal split script for modelC training/earlystop/test splits (Colombia dataset)
 with 5-year lookahead target.
 
 Rules
 -----
-TRAIN (2000–2014):
+TRAIN (2000–2017):
   - Full risk set (no sampling)
+  - Used for final model training
 
-VAL (2015–2017):
+EARLYSTOP (2015–2017):
   - Full risk set (no sampling)
+  - Used only for early stopping during CV, not for evaluation
+  - Note: EARLYSTOP is a subset of TRAIN, but kept as separate file for CV folds
 
 TEST (2018–2019):
   - Full risk set (no sampling)
   - Right-censored at max_year - 5 to ensure 5-year lookahead window
+  - Used for final model evaluation
 
 5-Year Lookahead Target:
   - Compute first_transition_year per (row, col) as min(year) where transition_01==1
@@ -25,14 +29,15 @@ TEST (2018–2019):
 Notes
 -----
 - Simple temporal split with no sampling
-- All splits use the full dataset for their respective time periods
+- TRAIN contains all training data (2000-2017) for final model training
+- EARLYSTOP is a subset of TRAIN (2015-2017), kept as separate file for CV early stopping only
+- TEST is used for final model evaluation (2018-2019)
 - Right-censoring: max_year is computed from data and rows with year > max_year-5 are excluded
 """
 
 from __future__ import annotations
 
 import json
-import math
 import os
 import sys
 import time
@@ -44,8 +49,8 @@ import wandb
 # Configuration
 RANDOM_STATE = 42
 # Split configuration
-TRAIN_YEARS = (2000, 2014)   # Full train set
-VAL_YEARS = (2015, 2017)     # Full validation
+TRAIN_YEARS = (2000, 2017)   # Full train set (matches final model training in modelC_LGBM)
+EARLYSTOP_YEARS = (2015, 2017)     # Full earlystop (for CV early stopping only)
 TEST_YEARS = (2018, 2019)    # Full test (right-censored for 5-year lookahead)
 LOOKAHEAD_YEARS = 5          # Number of years to look ahead for target
 WANDB_PROJECT = "ml-training-preprocessing"
@@ -154,7 +159,7 @@ def main() -> None:
             config={
                 "random_state": RANDOM_STATE,
                 "train_years": TRAIN_YEARS,
-                "val_years": VAL_YEARS,
+                "earlystop_years": EARLYSTOP_YEARS,
                 "test_years": TEST_YEARS,
                 "lookahead_years": LOOKAHEAD_YEARS,
                 "sampling_method": "temporal_split_full_win5",
@@ -171,13 +176,13 @@ def main() -> None:
     # Output paths for win5 files
     merged_win5_out = base_dir / "merged_panel_colombia_final_win5.parquet"
     train_out = base_dir / "train_colombia_win5.parquet"
-    val_out = base_dir / "val_colombia_win5.parquet"
+    earlystop_out = base_dir / "earlystop_colombia_win5.parquet"
     test_out = base_dir / "test_colombia_win5.parquet"
 
     print(f"\nInput: {input_path}")
     print(f"Merged WIN5 output: {merged_win5_out}")
     print(f"TRAIN output: {train_out}")
-    print(f"VAL output: {val_out}")
+    print(f"EARLYSTOP output: {earlystop_out}")
     print(f"TEST output: {test_out}")
 
     con = duckdb.connect()
@@ -186,7 +191,7 @@ def main() -> None:
     escaped_in = str(input_path).replace("'", "''")
     escaped_merged_win5 = str(merged_win5_out).replace("'", "''")
     escaped_train = str(train_out).replace("'", "''")
-    escaped_val = str(val_out).replace("'", "''")
+    escaped_earlystop = str(earlystop_out).replace("'", "''")
     escaped_test = str(test_out).replace("'", "''")
 
     try:
@@ -268,8 +273,8 @@ def main() -> None:
             SELECT
                 SUM(transition_01) AS total_pos_original,
                 SUM(transition_01_win5) AS total_pos_win5,
-                COUNT(DISTINCT CASE WHEN transition_01 = 1 THEN (row, col) END) AS distinct_rc_original,
-                COUNT(DISTINCT CASE WHEN transition_01_win5 = 1 THEN (row, col) END) AS distinct_rc_win5
+                COUNT(DISTINCT CASE WHEN transition_01 = 1 THEN (row::BIGINT<<32) + col END) AS distinct_rc_original,
+                COUNT(DISTINCT CASE WHEN transition_01_win5 = 1 THEN (row::BIGINT<<32) + col END) AS distinct_rc_win5
             FROM read_parquet('{escaped_merged_win5}')
             """
         ).fetchone()
@@ -312,7 +317,7 @@ def main() -> None:
         print("STEP 4: Creating temporal splits")
         print("="*70)
         
-        # TRAIN: full risk set 2000–2014
+        # TRAIN: full risk set 2000–2017
         train_sql = f"""
         COPY (
             SELECT
@@ -328,21 +333,21 @@ def main() -> None:
         con.execute(train_sql)
         print(f"TRAIN written in {time.time() - train_start:.1f}s")
 
-        # VAL: full risk set 2015–2017
-        val_sql = f"""
+        # EARLYSTOP: full risk set 2015–2017 (for early stopping during CV only, not evaluation)
+        earlystop_sql = f"""
         COPY (
             SELECT
                 *
             FROM read_parquet('{escaped_merged_win5}')
-            WHERE year BETWEEN {VAL_YEARS[0]} AND {VAL_YEARS[1]}
+            WHERE year BETWEEN {EARLYSTOP_YEARS[0]} AND {EARLYSTOP_YEARS[1]}
         )
-        TO '{escaped_val}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        TO '{escaped_earlystop}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """
 
-        print(f"\nCreating VAL split ({VAL_YEARS[0]}–{VAL_YEARS[1]}, full risk set)...")
-        val_start = time.time()
-        con.execute(val_sql)
-        print(f"VAL written in {time.time() - val_start:.1f}s")
+        print(f"\nCreating EARLYSTOP split ({EARLYSTOP_YEARS[0]}–{EARLYSTOP_YEARS[1]}, for early stopping during CV only)...")
+        earlystop_start = time.time()
+        con.execute(earlystop_sql)
+        print(f"EARLYSTOP written in {time.time() - earlystop_start:.1f}s")
 
         # TEST: full risk set 2018–2019 (right-censored)
         test_sql = f"""
@@ -366,8 +371,9 @@ def main() -> None:
         print("="*70)
         log_year_counts(con, train_out, "TRAIN", "transition_01", use_wandb)
         log_year_counts(con, train_out, "TRAIN", "transition_01_win5", use_wandb)
-        log_year_counts(con, val_out, "VAL", "transition_01", use_wandb)
-        log_year_counts(con, val_out, "VAL", "transition_01_win5", use_wandb)
+        # EARLYSTOP stats logged for information, but EARLYSTOP is only used for early stopping during CV, not evaluation
+        log_year_counts(con, earlystop_out, "EARLYSTOP", "transition_01", use_wandb)
+        log_year_counts(con, earlystop_out, "EARLYSTOP", "transition_01_win5", use_wandb)
         log_year_counts(con, test_out, "TEST", "transition_01", use_wandb)
         log_year_counts(con, test_out, "TEST", "transition_01_win5", use_wandb)
 
@@ -376,8 +382,8 @@ def main() -> None:
             f"SELECT COUNT(*) FROM read_parquet('{escaped_train}')"
         ).fetchone()[0]
         
-        total_val_rows = con.execute(
-            f"SELECT COUNT(*) FROM read_parquet('{escaped_val}')"
+        total_earlystop_rows = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{escaped_earlystop}')"
         ).fetchone()[0]
         
         total_test_rows = con.execute(
@@ -386,52 +392,14 @@ def main() -> None:
         
         print(f"\nTotal rows:")
         print(f"  TRAIN: {total_train_rows:,}")
-        print(f"  VAL: {total_val_rows:,}")
+        print(f"  EARLYSTOP: {total_earlystop_rows:,}")
         print(f"  TEST: {total_test_rows:,}")
-        
-        # Compute scale_pos_weight from TRAIN only (using transition_01_win5): sqrt(n_neg / n_pos)
-        train_stats = con.execute(
-            f"""
-            SELECT
-                SUM(transition_01_win5) AS total_pos,
-                SUM(CASE WHEN transition_01_win5 = 0 THEN 1 ELSE 0 END) AS total_neg
-            FROM read_parquet('{escaped_train}')
-            """
-        ).fetchone()
-        total_pos, total_neg = train_stats
-        neg_pos_ratio = total_neg / total_pos if total_pos > 0 else 1.0
-        scale_pos_weight = math.sqrt(neg_pos_ratio) if neg_pos_ratio > 0 else 1.0
-        
-        print(f"\nTRAIN class balance (transition_01_win5):")
-        print(f"  Positives: {total_pos:,}")
-        print(f"  Negatives: {total_neg:,}")
-        print(f"  Ratio (neg/pos): {neg_pos_ratio:.2f}")
-        print(f"  scale_pos_weight for LightGBM: {scale_pos_weight:.6f} (sqrt of ratio)")
-        
-        # Save scale_pos_weight to metadata file for use in training
-        metadata_path = base_dir / "train_colombia_win5_metadata.json"
-        metadata = {
-            "scale_pos_weight": scale_pos_weight,
-            "total_positives": int(total_pos),
-            "total_negatives": int(total_neg),
-            "neg_pos_ratio": float(neg_pos_ratio),
-            "lookahead_years": LOOKAHEAD_YEARS,
-            "target_column": "transition_01_win5",
-            "computed_from": "train_colombia_win5.parquet"
-        }
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
-        print(f"  Metadata saved to: {metadata_path}")
 
         if use_wandb:
             wandb.log(
                 {
                     "train/rows": total_train_rows,
-                    "train/positives_win5": total_pos,
-                    "train/negatives_win5": total_neg,
-                    "train/scale_pos_weight": scale_pos_weight,
-                    "train/neg_pos_ratio": neg_pos_ratio,
-                    "val/rows": total_val_rows,
+                    "earlystop/rows": total_earlystop_rows,
                     "test/rows": total_test_rows,
                     "lookahead_years": LOOKAHEAD_YEARS,
                     "cutoff_year": cutoff_year,

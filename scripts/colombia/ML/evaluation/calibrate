@@ -1,0 +1,933 @@
+#!/usr/bin/env python3
+"""Calibration Script for modelC_LGBM
+
+Purpose: Fit isotonic or Platt scaling calibration on CV predictions,
+         apply to test predictions, and save calibrated scores + reliability plot data.
+
+Input:   - CV predictions parquet file (with columns: y_true, y_pred_proba, and optional metadata)
+         - Test predictions parquet file (modelC_lgbm_win5_scored_*.parquet from outputs/Results/ml_models)
+
+Output:  - Calibrated test predictions parquet file
+         - Reliability plot data JSON file (for visualization)
+         - Calibration metadata JSON file
+"""
+
+from __future__ import annotations
+
+import gc
+import json
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, Optional, Tuple, Literal
+
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
+
+
+class Tee:
+    """Write to both stdout and a file."""
+    def __init__(self, file_path: Path):
+        self.file = open(file_path, 'w', encoding='utf-8')
+        self.stdout = sys.stdout
+    
+    def write(self, text: str) -> None:
+        self.stdout.write(text)
+        self.file.write(text)
+        self.file.flush()
+    
+    def flush(self) -> None:
+        self.stdout.flush()
+        self.file.flush()
+    
+    def close(self) -> None:
+        self.file.close()
+
+
+def get_repo_root() -> Path:
+    """Get repository root directory.
+    
+    Checks environment variables first, then searches upward for README.md.
+    """
+    # Check environment variable first
+    env_root = os.environ.get("PROJECT_ROOT") or os.environ.get("REPO_ROOT")
+    if env_root:
+        return Path(env_root).resolve()
+    
+    # Search upward from script location for README.md
+    script_dir = Path(__file__).resolve().parent
+    current = script_dir
+    for _ in range(10):  # Limit search depth
+        if (current / "README.md").exists():
+            return current
+        parent = current.parent
+        if parent == current:  # Reached filesystem root
+            break
+        current = parent
+    
+    # If not found, raise an error
+    raise RuntimeError(
+        f"Repository root not found. Searched upward from {script_dir} for README.md.\n"
+        "Set PROJECT_ROOT or REPO_ROOT environment variable, or ensure README.md exists in repo root."
+    )
+
+
+def resolve_parquet_file(filename: str) -> Optional[Path]:
+    """Locate parquet file (prefer $SCRATCH if present)."""
+    repo_root = get_repo_root()
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    candidates = []
+    if scratch_root is not None:
+        candidates.append(scratch_root / f"data/ml/{filename}")
+    candidates.append(repo_root / f"data/ml/{filename}")
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    return None
+
+
+def find_latest_scored_file(output_dir: Path, pattern: str = "modelC_lgbm_win5_scored_*.parquet") -> Path:
+    """Find the most recent scored parquet file."""
+    files = list(output_dir.glob(pattern))
+    
+    if not files:
+        raise FileNotFoundError(f"No scored files found in {output_dir} matching pattern {pattern}")
+    
+    # Return most recent file (by modification time)
+    latest = max(files, key=lambda p: p.stat().st_mtime)
+    return latest
+
+
+def load_cv_predictions(
+    cv_path: Path, 
+    batch_size: int = 50_000,
+    return_fold_info: bool = False
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Load CV predictions from parquet file using batch-based loading.
+    
+    Expected columns: y_true, y_pred_proba (and optional metadata columns like fold_idx)
+    
+    Args:
+        cv_path: Path to CV predictions parquet file
+        batch_size: Batch size for reading parquet file
+        return_fold_info: If True, also returns fold_idx array if available
+        
+    Returns:
+        Tuple of (y_true, y_pred_proba, fold_idx) arrays, where fold_idx is None if not available
+    """
+    print(f"Loading CV predictions from {cv_path.name}...")
+    
+    required_cols = ['y_true', 'y_pred_proba']
+    
+    # Use pyarrow to read in batches
+    parquet_file = pq.ParquetFile(cv_path)
+    
+    # Verify required columns exist
+    schema_cols = parquet_file.schema_arrow.names
+    for col in required_cols:
+        if col not in schema_cols:
+            raise ValueError(f"Required column '{col}' not found in CV predictions file. Found columns: {schema_cols}")
+    
+    # Check for fold information
+    fold_col = None
+    if 'fold_idx' in schema_cols:
+        fold_col = 'fold_idx'
+    elif 'fold_id' in schema_cols:
+        fold_col = 'fold_id'
+    elif 'fold' in schema_cols:
+        fold_col = 'fold'
+    
+    if fold_col and return_fold_info:
+        required_cols.append(fold_col)
+        print(f"  Found fold column: {fold_col}")
+    elif fold_col:
+        print(f"  Note: Found fold column '{fold_col}' but not loading it (return_fold_info=False)")
+    
+    # Collect data across batches
+    y_true_list = []
+    y_pred_proba_list = []
+    fold_idx_list = [] if (fold_col and return_fold_info) else None
+    
+    try:
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=required_cols):
+            batch_table = batch
+            
+            # Extract arrays directly from PyArrow
+            y_true_batch = batch_table['y_true'].to_numpy(zero_copy_only=False)
+            y_pred_proba_batch = batch_table['y_pred_proba'].to_numpy(zero_copy_only=False)
+            
+            y_true_list.append(y_true_batch)
+            y_pred_proba_list.append(y_pred_proba_batch)
+            
+            if fold_idx_list is not None:
+                fold_idx_batch = batch_table[fold_col].to_numpy(zero_copy_only=False)
+                fold_idx_list.append(fold_idx_batch)
+            
+            del batch_table, batch
+    finally:
+        del parquet_file
+        gc.collect()
+    
+    # Concatenate all batches
+    y_true = np.concatenate(y_true_list, axis=0).astype(np.int32)
+    y_pred_proba = np.concatenate(y_pred_proba_list, axis=0).astype(np.float32)
+    
+    fold_idx = None
+    if fold_idx_list is not None:
+        fold_idx = np.concatenate(fold_idx_list, axis=0)
+    
+    # Remove any NaN or infinite values
+    valid_mask = np.isfinite(y_pred_proba) & (y_pred_proba >= 0) & (y_pred_proba <= 1)
+    if not valid_mask.all():
+        n_invalid = (~valid_mask).sum()
+        error_msg = (
+            f"\nERROR: Found {n_invalid} invalid predictions (NaN or out of [0,1] range) in CV predictions.\n"
+            f"This indicates a problem with the training script. Please investigate the training script\n"
+            f"before trusting the calibration. Stopping execution."
+        )
+        print(error_msg)
+        raise ValueError(error_msg)
+    
+    print(f"  Loaded {len(y_true):,} CV predictions ({y_true.sum():,} positive, {(y_true == 0).sum():,} negative)")
+    if fold_idx is not None:
+        unique_folds = np.unique(fold_idx)
+        print(f"  Found {len(unique_folds)} fold(s): {sorted(unique_folds.tolist())}")
+        for fold_id in unique_folds:
+            fold_mask = fold_idx == fold_id
+            n_fold = fold_mask.sum()
+            print(f"    Fold {fold_id}: {n_fold:,} samples ({100*n_fold/len(y_true):.1f}%)")
+    
+    return y_true, y_pred_proba, fold_idx
+
+
+def load_test_predictions(test_path: Path) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+    """Load test predictions from scored parquet file.
+    
+    Returns:
+        Tuple of (full dataframe, y_true, y_pred_proba) arrays
+    """
+    print(f"Loading test predictions from {test_path.name}...")
+    df = pd.read_parquet(test_path)
+    
+    required_cols = ['y_true', 'y_pred_proba']
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"Required column '{col}' not found in test predictions file. Found columns: {df.columns.tolist()}")
+    
+    y_true = df['y_true'].values.astype(np.int32)
+    y_pred_proba = df['y_pred_proba'].values.astype(np.float32)
+    
+    # Remove any NaN or infinite values
+    valid_mask = np.isfinite(y_pred_proba) & (y_pred_proba >= 0) & (y_pred_proba <= 1)
+    if not valid_mask.all():
+        n_invalid = (~valid_mask).sum()
+        error_msg = (
+            f"\nERROR: Found {n_invalid} invalid predictions (NaN or out of [0,1] range) in test predictions.\n"
+            f"This indicates a problem with the training script. Please investigate the training script\n"
+            f"before trusting the calibration. Stopping execution."
+        )
+        print(error_msg)
+        raise ValueError(error_msg)
+    
+    print(f"  Loaded {len(y_true):,} test predictions ({y_true.sum():,} positive, {(y_true == 0).sum():,} negative)")
+    return df, y_true, y_pred_proba
+
+
+def fit_calibration_per_fold(
+    fold_idx: np.ndarray,
+    y_true: np.ndarray,
+    y_pred_proba: np.ndarray,
+    calibration_method: Literal["isotonic", "platt"]
+) -> Tuple[Any, Dict[str, Any]]:
+    """Fit calibration separately for each fold and return averaged calibrator.
+    
+    This approach is used when CV predictions are NOT guaranteed to be OOF.
+    We fit a calibrator on each fold's predictions, then average them.
+    
+    Args:
+        fold_idx: Array indicating which fold each prediction came from
+        y_true: True labels
+        y_pred_proba: Predicted probabilities
+        calibration_method: Either "isotonic" or "platt"
+        
+    Returns:
+        Tuple of (calibrator, fold_info_dict)
+        Note: For isotonic, we can't easily average, so we fit on pooled data.
+        For Platt, we average the coefficients.
+    """
+    unique_folds = np.unique(fold_idx)
+    n_folds = len(unique_folds)
+    
+    print(f"\nFitting {calibration_method} calibration per fold (n_folds={n_folds})...")
+    
+    if calibration_method == "isotonic":
+        # Isotonic regression cannot be easily averaged across folds
+        # If fold_idx exists, we can't guarantee OOF, so abort
+        raise ValueError(
+            "Isotonic calibration requires guaranteed OOF predictions. "
+            "Cannot use per-fold averaging for isotonic regression. "
+            "Use Platt scaling (--method platt) or ensure CV predictions are OOF with no fold information."
+        )
+        
+    elif calibration_method == "platt":
+        # For Platt scaling, we can average the coefficients
+        # Store tuples (fold_id, coef, intercept, count) to handle skipped folds correctly
+        fold_data = []
+        
+        for fold_id in unique_folds:
+            fold_mask = fold_idx == fold_id
+            y_true_fold = y_true[fold_mask]
+            y_pred_proba_fold = y_pred_proba[fold_mask]
+            
+            if len(y_true_fold) < 10:
+                print(f"  WARNING: Fold {fold_id} has only {len(y_true_fold)} samples, skipping")
+                continue
+            
+            # Fit Platt scaling for this fold
+            calibrator_fold = fit_platt_calibration(y_true_fold, y_pred_proba_fold)
+            
+            # Extract coefficients (logistic regression coefficients)
+            # Platt: P(y=1) = sigmoid(a * logit(p) + b)
+            # where logit(p) = log(p/(1-p))
+            # sklearn's LogisticRegression: P(y=1) = sigmoid(coef[0] * X + intercept)
+            coef = calibrator_fold.coef_[0][0]
+            intercept = calibrator_fold.intercept_[0]
+            
+            fold_data.append((fold_id, coef, intercept, len(y_true_fold)))
+            
+            print(f"  Fold {fold_id}: {len(y_true_fold):,} samples, coef={coef:.4f}, intercept={intercept:.4f}")
+        
+        if not fold_data:
+            raise ValueError("No folds had sufficient samples for calibration")
+        
+        # Average coefficients (weighted by sample size)
+        fold_counts = [count for _, _, _, count in fold_data]
+        weights = np.array(fold_counts) / sum(fold_counts)
+        fold_coefficients = [coef for _, coef, _, _ in fold_data]
+        fold_intercepts = [intercept for _, _, intercept, _ in fold_data]
+        
+        avg_coef = np.average(fold_coefficients, weights=weights)
+        avg_intercept = np.average(fold_intercepts, weights=weights)
+        
+        print(f"\n  Averaged Platt coefficients (weighted by fold size):")
+        print(f"    coef={avg_coef:.4f}, intercept={avg_intercept:.4f}")
+        
+        # Create averaged calibrator
+        averaged_calibrator = LogisticRegression(solver='lbfgs', max_iter=1000)
+        # We need to fit it with two classes, but we'll override the coefficients
+        # Fit on a dummy dataset with two classes first
+        dummy_logits = np.array([[0.0], [1.0]])
+        dummy_y = np.array([0, 1])
+        averaged_calibrator.fit(dummy_logits, dummy_y)
+        # Override coefficients
+        averaged_calibrator.coef_[0][0] = avg_coef
+        averaged_calibrator.intercept_[0] = avg_intercept
+        
+        # Build dicts using only fold_ids from fold_data (skipped folds excluded)
+        fold_info = {
+            "method": "per_fold_averaged_platt",
+            "n_folds": int(n_folds),
+            "n_folds_used": len(fold_data),
+            "folds": sorted(unique_folds.tolist()),
+            "folds_used": sorted([int(fid) for fid, _, _, _ in fold_data]),
+            "fold_coefficients": {int(fid): float(coef) for fid, coef, _, _ in fold_data},
+            "fold_intercepts": {int(fid): float(intercept) for fid, _, intercept, _ in fold_data},
+            "fold_counts": {int(fid): int(count) for fid, _, _, count in fold_data},
+            "averaged_coefficient": float(avg_coef),
+            "averaged_intercept": float(avg_intercept),
+            "weights": [float(w) for w in weights]
+        }
+        
+        return averaged_calibrator, fold_info
+    
+    else:
+        raise ValueError(f"Unknown calibration method: {calibration_method}")
+
+
+def fit_isotonic_calibration(y_true: np.ndarray, y_pred_proba: np.ndarray) -> IsotonicRegression:
+    """Fit isotonic regression for calibration.
+    
+    Args:
+        y_true: True binary labels
+        y_pred_proba: Uncalibrated probabilities
+        
+    Returns:
+        Fitted IsotonicRegression model
+    """
+    print("Fitting isotonic calibration...")
+    calibrator = IsotonicRegression(out_of_bounds='clip')
+    calibrator.fit(y_pred_proba, y_true)
+    return calibrator
+
+
+def fit_platt_calibration(y_true: np.ndarray, y_pred_proba: np.ndarray) -> LogisticRegression:
+    """Fit Platt scaling (logistic regression) for calibration.
+    
+    Args:
+        y_true: True binary labels
+        y_pred_proba: Uncalibrated probabilities
+        
+    Returns:
+        Fitted LogisticRegression model (for Platt scaling)
+    """
+    print("Fitting Platt scaling calibration...")
+    # Platt scaling: fit logistic regression on logit of probabilities
+    # Use clip to avoid log(0) and log(1)
+    y_pred_proba_clipped = np.clip(y_pred_proba, 1e-7, 1 - 1e-7)
+    logits = np.log(y_pred_proba_clipped / (1 - y_pred_proba_clipped))
+    
+    calibrator = LogisticRegression(solver='lbfgs', max_iter=1000)
+    calibrator.fit(logits.reshape(-1, 1), y_true)
+    return calibrator
+
+
+def apply_isotonic_calibration(calibrator: IsotonicRegression, y_pred_proba: np.ndarray) -> np.ndarray:
+    """Apply isotonic calibration to predictions."""
+    return calibrator.transform(y_pred_proba)
+
+
+def apply_platt_calibration(calibrator: LogisticRegression, y_pred_proba: np.ndarray) -> np.ndarray:
+    """Apply Platt scaling to predictions."""
+    # Clip probabilities to avoid log(0) and log(1)
+    y_pred_proba_clipped = np.clip(y_pred_proba, 1e-7, 1 - 1e-7)
+    logits = np.log(y_pred_proba_clipped / (1 - y_pred_proba_clipped))
+    return calibrator.predict_proba(logits.reshape(-1, 1))[:, 1]
+
+
+def compute_reliability_plot_data(
+    y_true: np.ndarray, 
+    y_pred_proba: np.ndarray, 
+    n_bins: int = 10,
+    binning_method: Literal["uniform", "quantile"] = "uniform"
+) -> Dict[str, Any]:
+    """Compute reliability plot data (calibration curve).
+    
+    Args:
+        y_true: True binary labels
+        y_pred_proba: Predicted probabilities
+        n_bins: Number of bins for calibration curve
+        binning_method: "uniform" for equal-width bins, "quantile" for equal-size bins
+        
+    Returns:
+        Dictionary with bin edges, mean predicted prob, fraction of positives, counts
+    """
+    # Clip probabilities to avoid np.digitize returning n_bins for p==1.0
+    y_pred_proba = np.clip(y_pred_proba.copy(), 0.0, 1.0 - 1e-9)
+    
+    if binning_method == "uniform":
+        # Use uniform binning from 0 to 1
+        bin_edges = np.linspace(0, 1, n_bins + 1)
+        bin_indices = np.digitize(y_pred_proba, bin_edges[1:], right=False)
+    elif binning_method == "quantile":
+        # Use quantile binning (equal number of samples per bin)
+        # Compute quantiles to get equal-size bins
+        quantiles = np.linspace(0, 100, n_bins + 1)
+        bin_edges = np.percentile(y_pred_proba, quantiles)
+        # Ensure first and last edges are exactly 0 and 1 for consistency
+        bin_edges[0] = 0.0
+        bin_edges[-1] = 1.0
+        bin_indices = np.digitize(y_pred_proba, bin_edges[1:], right=False)
+    else:
+        raise ValueError(f"Unknown binning_method: {binning_method}. Must be 'uniform' or 'quantile'")
+    
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+    mean_predicted = np.zeros(n_bins)
+    fraction_positives = np.zeros(n_bins)
+    counts = np.zeros(n_bins, dtype=np.int64)
+    
+    for i in range(n_bins):
+        mask = bin_indices == i
+        if mask.sum() > 0:
+            mean_predicted[i] = y_pred_proba[mask].mean()
+            fraction_positives[i] = y_true[mask].mean()
+            counts[i] = mask.sum()
+    
+    return {
+        "binning_method": binning_method,
+        "bin_edges": bin_edges.tolist(),
+        "bin_centers": bin_centers.tolist(),
+        "mean_predicted": mean_predicted.tolist(),
+        "fraction_positives": fraction_positives.tolist(),
+        "counts": counts.tolist(),
+        "n_bins": n_bins
+    }
+
+
+def compute_calibration_metrics(y_true: np.ndarray, y_pred_proba: np.ndarray) -> Dict[str, float]:
+    """Compute calibration metrics (Brier score, ECE, MCE).
+    
+    Args:
+        y_true: True binary labels
+        y_pred_proba: Predicted probabilities
+        
+    Returns:
+        Dictionary with calibration metrics
+    """
+    # Brier score (compute before clipping to use original probabilities)
+    brier_score = np.mean((y_pred_proba - y_true) ** 2)
+    
+    # Clip probabilities to avoid np.digitize returning n_bins for p==1.0
+    y_pred_proba_clipped = np.clip(y_pred_proba.copy(), 0.0, 1.0 - 1e-9)
+    
+    # Expected Calibration Error (ECE) and Maximum Calibration Error (MCE)
+    n_bins = 10
+    bin_edges = np.linspace(0, 1, n_bins + 1)
+    bin_indices = np.digitize(y_pred_proba_clipped, bin_edges[1:], right=False)
+    
+    ece = 0.0
+    mce = 0.0
+    total_samples = len(y_true)
+    
+    for i in range(n_bins):
+        mask = bin_indices == i
+        if mask.sum() > 0:
+            bin_confidence = y_pred_proba_clipped[mask].mean()
+            bin_accuracy = y_true[mask].mean()
+            bin_weight = mask.sum() / total_samples
+            bin_error = abs(bin_confidence - bin_accuracy)
+            ece += bin_weight * bin_error
+            mce = max(mce, bin_error)
+    
+    return {
+        "brier_score": float(brier_score),
+        "expected_calibration_error": float(ece),
+        "maximum_calibration_error": float(mce)
+    }
+
+
+def main(
+    cv_predictions_path: Optional[Path] = None,
+    test_predictions_path: Optional[Path] = None,
+    calibration_method: Literal["isotonic", "platt"] = "isotonic",
+    assume_oof: bool = False
+) -> None:
+    """Main calibration function.
+    
+    Args:
+        cv_predictions_path: Path to CV predictions parquet file. If None, attempts to find latest.
+        test_predictions_path: Path to test predictions parquet file. If None, finds latest.
+        calibration_method: Either "isotonic" or "platt"
+    """
+    repo_root = get_repo_root()
+    output_dir = repo_root / "outputs/Results/ml_models"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    print("=" * 70)
+    print("CALIBRATION: modelC_LGBM")
+    print("=" * 70)
+    print(f"\nCalibration method: {calibration_method}")
+    print(f"Output directory: {output_dir}")
+    
+    # Step 1: Load CV predictions
+    print("\n" + "=" * 70)
+    print("STEP 1: LOAD CV PREDICTIONS")
+    print("=" * 70)
+    
+    if cv_predictions_path is None:
+        # Try to find CV predictions file (could be in data/ml or outputs/Results/ml_models)
+        cv_candidates = [
+            output_dir.glob("modelC_lgbm_win5_cv_predictions_*.parquet"),
+            output_dir.glob("*cv_predictions*.parquet"),
+        ]
+        cv_files = []
+        for pattern in cv_candidates:
+            cv_files.extend(list(pattern))
+        
+        if cv_files:
+            cv_predictions_path = max(cv_files, key=lambda p: p.stat().st_mtime)
+            print(f"\nFound CV predictions file: {cv_predictions_path.name}")
+        else:
+            raise FileNotFoundError(
+                "CV predictions file not found. Please provide cv_predictions_path or ensure "
+                "CV predictions are saved to outputs/Results/ml_models/"
+            )
+    
+    if not cv_predictions_path.exists():
+        raise FileNotFoundError(f"CV predictions file not found: {cv_predictions_path}")
+    
+    try:
+        y_cv_true, y_cv_proba, fold_idx = load_cv_predictions(cv_predictions_path, return_fold_info=True)
+    except Exception as e:
+        print(f"\nERROR: Failed to load CV predictions: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    
+    # Step 1.5: Check OOF requirements
+    print("\n" + "=" * 70)
+    print("STEP 1.5: CHECK OUT-OF-FOLD (OOF) REQUIREMENTS")
+    print("=" * 70)
+    
+    if fold_idx is not None:
+        print(f"\nFold information found ({len(np.unique(fold_idx))} folds).")
+        print("Using per-fold calibration to ensure OOF property.")
+        
+        # For isotonic with fold info: cannot average, so abort
+        if calibration_method == "isotonic":
+            error_msg = (
+                "\nERROR: Isotonic calibration cannot be averaged across folds.\n"
+                "With fold information present, we cannot guarantee OOF without per-fold averaging.\n"
+                "Use --method platt for per-fold calibration, or provide CV predictions without fold info and use --assume-oof."
+            )
+            print(error_msg)
+            raise ValueError(error_msg)
+    else:
+        print("\nNo fold information found in CV predictions file.")
+        if not assume_oof:
+            error_msg = (
+                "\nERROR: Cannot verify OOF property without fold information.\n"
+                "Isotonic calibration on non-OOF data can severely overfit.\n"
+                "If you are certain the CV predictions are OOF, use --assume-oof flag.\n"
+                "Otherwise, ensure CV predictions include fold information for per-fold calibration."
+            )
+            print(error_msg)
+            raise ValueError(error_msg)
+        print("Proceeding with --assume-oof flag (user confirmed OOF property).")
+        
+        # Big warning for isotonic + assume_oof
+        if calibration_method == "isotonic":
+            print("\n" + "!" * 70)
+            print("WARNING: ISOTONIC CALIBRATION WITH --assume-oof FLAG")
+            print("!" * 70)
+            print("\nYou are using isotonic calibration with --assume-oof flag.")
+            print("This is ONLY safe if CV predictions are guaranteed OOF by construction.")
+            print("\nIf CV predictions contain in-sample predictions (rows used for training),")
+            print("isotonic calibration will severely overfit and produce misleading results.")
+            print("\nEnsure your CV predictions file contains only out-of-fold predictions:")
+            print("  - Each row should have exactly one prediction")
+            print("  - That prediction must come from a fold where the row was NOT used for training")
+            print("!" * 70 + "\n")
+    
+    # Step 2: Load test predictions
+    print("\n" + "=" * 70)
+    print("STEP 2: LOAD TEST PREDICTIONS")
+    print("=" * 70)
+    
+    if test_predictions_path is None:
+        try:
+            test_predictions_path = find_latest_scored_file(output_dir)
+            print(f"\nFound latest test predictions file: {test_predictions_path.name}")
+        except FileNotFoundError as e:
+            print(f"\nERROR: {e}")
+            sys.exit(1)
+    
+    if not test_predictions_path.exists():
+        raise FileNotFoundError(f"Test predictions file not found: {test_predictions_path}")
+    
+    try:
+        test_df, y_test_true, y_test_proba = load_test_predictions(test_predictions_path)
+    except Exception as e:
+        print(f"\nERROR: Failed to load test predictions: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    
+    # Step 3: Fit calibration on CV predictions
+    print("\n" + "=" * 70)
+    print(f"STEP 3: FIT {calibration_method.upper()} CALIBRATION ON CV PREDICTIONS")
+    print("=" * 70)
+    
+    fold_info = None
+    try:
+        # If fold_idx exists, always use per-fold calibration
+        if fold_idx is not None:
+            print("\nUsing per-fold calibration...")
+            calibrator, fold_info = fit_calibration_per_fold(
+                fold_idx, y_cv_true, y_cv_proba, calibration_method
+            )
+        else:
+            # No fold info: use pooled calibration (assume_oof flag was checked above)
+            print("\nUsing pooled calibration (OOF assumed via --assume-oof)...")
+            
+            if calibration_method == "isotonic":
+                calibrator = fit_isotonic_calibration(y_cv_true, y_cv_proba)
+            elif calibration_method == "platt":
+                calibrator = fit_platt_calibration(y_cv_true, y_cv_proba)
+            else:
+                raise ValueError(f"Unknown calibration method: {calibration_method}")
+            
+            fold_info = {
+                "method": "pooled",
+                "assume_oof": True,
+                "oof_assumption": "user_asserted" if calibration_method == "isotonic" else None
+            }
+        
+        # Create apply function based on calibration method
+        if calibration_method == "isotonic":
+            apply_calibration = lambda proba: apply_isotonic_calibration(calibrator, proba)
+        elif calibration_method == "platt":
+            apply_calibration = lambda proba: apply_platt_calibration(calibrator, proba)
+        else:
+            raise ValueError(f"Unknown calibration method: {calibration_method}")
+            
+    except Exception as e:
+        print(f"\nERROR: Failed to fit calibration: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    
+    # Evaluate calibration on CV predictions (for reference)
+    print("\nEvaluating calibration on CV predictions...")
+    y_cv_calibrated = apply_calibration(y_cv_proba)
+    cv_calibration_metrics = compute_calibration_metrics(y_cv_true, y_cv_calibrated)
+    cv_uncalibrated_metrics = compute_calibration_metrics(y_cv_true, y_cv_proba)
+    
+    print(f"  CV (uncalibrated): Brier={cv_uncalibrated_metrics['brier_score']:.6f}, "
+          f"ECE={cv_uncalibrated_metrics['expected_calibration_error']:.6f}, "
+          f"MCE={cv_uncalibrated_metrics['maximum_calibration_error']:.6f}")
+    print(f"  CV (calibrated):   Brier={cv_calibration_metrics['brier_score']:.6f}, "
+          f"ECE={cv_calibration_metrics['expected_calibration_error']:.6f}, "
+          f"MCE={cv_calibration_metrics['maximum_calibration_error']:.6f}")
+    
+    # Step 4: Apply calibration to test predictions
+    print("\n" + "=" * 70)
+    print("STEP 4: APPLY CALIBRATION TO TEST PREDICTIONS")
+    print("=" * 70)
+    
+    try:
+        y_test_calibrated = apply_calibration(y_test_proba)
+        print(f"\nApplied calibration to {len(y_test_calibrated):,} test predictions")
+    except Exception as e:
+        print(f"\nERROR: Failed to apply calibration: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    
+    # Compute calibration metrics on test set
+    print("\nComputing calibration metrics on test predictions...")
+    test_uncalibrated_metrics = compute_calibration_metrics(y_test_true, y_test_proba)
+    test_calibrated_metrics = compute_calibration_metrics(y_test_true, y_test_calibrated)
+    
+    print(f"  Test (uncalibrated): Brier={test_uncalibrated_metrics['brier_score']:.6f}, "
+          f"ECE={test_uncalibrated_metrics['expected_calibration_error']:.6f}, "
+          f"MCE={test_uncalibrated_metrics['maximum_calibration_error']:.6f}")
+    print(f"  Test (calibrated):   Brier={test_calibrated_metrics['brier_score']:.6f}, "
+          f"ECE={test_calibrated_metrics['expected_calibration_error']:.6f}, "
+          f"MCE={test_calibrated_metrics['maximum_calibration_error']:.6f}")
+    
+    # Step 5: Compute reliability plot data
+    print("\n" + "=" * 70)
+    print("STEP 5: COMPUTE RELIABILITY PLOT DATA")
+    print("=" * 70)
+    
+    try:
+        # Compute both uniform and quantile binning for thesis plots
+        print("\nComputing reliability plot data with uniform binning...")
+        cv_uncalibrated_plot_uniform = compute_reliability_plot_data(y_cv_true, y_cv_proba, n_bins=10, binning_method="uniform")
+        cv_calibrated_plot_uniform = compute_reliability_plot_data(y_cv_true, y_cv_calibrated, n_bins=10, binning_method="uniform")
+        test_uncalibrated_plot_uniform = compute_reliability_plot_data(y_test_true, y_test_proba, n_bins=10, binning_method="uniform")
+        test_calibrated_plot_uniform = compute_reliability_plot_data(y_test_true, y_test_calibrated, n_bins=10, binning_method="uniform")
+        
+        print("Computing reliability plot data with quantile binning (equal samples per bin)...")
+        cv_uncalibrated_plot_quantile = compute_reliability_plot_data(y_cv_true, y_cv_proba, n_bins=10, binning_method="quantile")
+        cv_calibrated_plot_quantile = compute_reliability_plot_data(y_cv_true, y_cv_calibrated, n_bins=10, binning_method="quantile")
+        test_uncalibrated_plot_quantile = compute_reliability_plot_data(y_test_true, y_test_proba, n_bins=10, binning_method="quantile")
+        test_calibrated_plot_quantile = compute_reliability_plot_data(y_test_true, y_test_calibrated, n_bins=10, binning_method="quantile")
+        
+        print("\nComputed reliability plot data for CV and test sets (both uncalibrated and calibrated, uniform and quantile binning)")
+    except Exception as e:
+        print(f"\nERROR: Failed to compute reliability plot data: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    
+    # Step 6: Save results
+    print("\n" + "=" * 70)
+    print("STEP 6: SAVE RESULTS")
+    print("=" * 70)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Save calibrated test predictions
+    test_df_calibrated = test_df.copy()
+    test_df_calibrated['y_pred_proba_uncalibrated'] = y_test_proba
+    test_df_calibrated['y_pred_proba_calibrated'] = y_test_calibrated
+    test_df_calibrated['y_pred_proba'] = y_test_calibrated  # Replace original with calibrated
+    
+    calibrated_test_path = output_dir / f"modelC_lgbm_win5_scored_calibrated_{calibration_method}_{timestamp}.parquet"
+    try:
+        test_df_calibrated.to_parquet(calibrated_test_path, index=False)
+        print(f"\nCalibrated test predictions saved: {calibrated_test_path.name}")
+    except Exception as e:
+        print(f"\nERROR: Failed to save calibrated test predictions: {e}")
+        sys.exit(1)
+    
+    # Save reliability plot data
+    reliability_plot_path = output_dir / f"modelC_lgbm_win5_reliability_plot_{calibration_method}_{timestamp}.json"
+    reliability_plot_data = {
+        "metadata": {
+            "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "calibration_method": calibration_method,
+            "cv_predictions_file": cv_predictions_path.name,
+            "test_predictions_file": test_predictions_path.name,
+            "fold_info_available": fold_idx is not None,
+            "calibration_strategy": "per_fold" if fold_idx is not None else "pooled",
+            "assume_oof_flag": assume_oof if fold_idx is None else None,
+            "oof_assumption": fold_info.get("oof_assumption") if fold_info else None,
+        },
+        "cv": {
+            "uncalibrated": {
+                "uniform": cv_uncalibrated_plot_uniform,
+                "quantile": cv_uncalibrated_plot_quantile,
+            },
+            "calibrated": {
+                "uniform": cv_calibrated_plot_uniform,
+                "quantile": cv_calibrated_plot_quantile,
+            },
+        },
+        "test": {
+            "uncalibrated": {
+                "uniform": test_uncalibrated_plot_uniform,
+                "quantile": test_uncalibrated_plot_quantile,
+            },
+            "calibrated": {
+                "uniform": test_calibrated_plot_uniform,
+                "quantile": test_calibrated_plot_quantile,
+            },
+        }
+    }
+    
+    try:
+        with open(reliability_plot_path, 'w') as f:
+            json.dump(reliability_plot_data, f, indent=2)
+        print(f"Reliability plot data saved: {reliability_plot_path.name}")
+    except Exception as e:
+        print(f"\nERROR: Failed to save reliability plot data: {e}")
+        sys.exit(1)
+    
+    # Save calibration metadata
+    calibration_metadata_path = output_dir / f"modelC_lgbm_win5_calibration_{calibration_method}_{timestamp}.json"
+    calibration_metadata = {
+        "metadata": {
+            "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "calibration_method": calibration_method,
+            "cv_predictions_file": cv_predictions_path.name,
+            "test_predictions_file": test_predictions_path.name,
+            "calibrated_test_predictions_file": calibrated_test_path.name,
+        },
+        "oof_verification": {
+            "fold_info_available": fold_idx is not None,
+            "calibration_strategy": "per_fold" if fold_idx is not None else "pooled",
+            "assume_oof_flag": assume_oof if fold_idx is None else None,
+            "oof_assumption": fold_info.get("oof_assumption") if fold_info else None,
+            "fold_info": fold_info,
+        },
+        "calibration_metrics": {
+            "cv": {
+                "uncalibrated": cv_uncalibrated_metrics,
+                "calibrated": cv_calibration_metrics,
+            },
+            "test": {
+                "uncalibrated": test_uncalibrated_metrics,
+                "calibrated": test_calibrated_metrics,
+            }
+        },
+        "data_info": {
+            "n_cv": int(len(y_cv_true)),
+            "n_cv_positives": int(y_cv_true.sum()),
+            "n_cv_negatives": int((y_cv_true == 0).sum()),
+            "n_test": int(len(y_test_true)),
+            "n_test_positives": int(y_test_true.sum()),
+            "n_test_negatives": int((y_test_true == 0).sum()),
+        }
+    }
+    
+    try:
+        with open(calibration_metadata_path, 'w') as f:
+            json.dump(calibration_metadata, f, indent=2)
+        print(f"Calibration metadata saved: {calibration_metadata_path.name}")
+    except Exception as e:
+        print(f"\nERROR: Failed to save calibration metadata: {e}")
+        sys.exit(1)
+    
+    # Summary
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"\nCalibration method: {calibration_method}")
+    print(f"CV predictions: {cv_predictions_path.name}")
+    print(f"Test predictions: {test_predictions_path.name}")
+    print(f"\nOOF Verification:")
+    if fold_idx is not None:
+        print(f"  Fold information: Available ({len(np.unique(fold_idx))} folds)")
+        print(f"  Calibration strategy: Per-fold (averaged)")
+    else:
+        print(f"  Fold information: Not available")
+        print(f"  OOF assumed: Yes (via --assume-oof flag)")
+        if fold_info and fold_info.get("oof_assumption") == "user_asserted":
+            print(f"  ⚠ OOF assumption: USER ASSERTED (isotonic calibration - ensure CV predictions are OOF by construction)")
+        print(f"  Calibration strategy: Pooled")
+    print(f"\nTest Calibration Metrics:")
+    print(f"  Uncalibrated: Brier={test_uncalibrated_metrics['brier_score']:.6f}, "
+          f"ECE={test_uncalibrated_metrics['expected_calibration_error']:.6f}")
+    print(f"  Calibrated:   Brier={test_calibrated_metrics['brier_score']:.6f}, "
+          f"ECE={test_calibrated_metrics['expected_calibration_error']:.6f}")
+    print(f"\nOutput files:")
+    print(f"  Calibrated predictions: {calibrated_test_path.name}")
+    print(f"  Reliability plot data: {reliability_plot_path.name}")
+    print(f"  Calibration metadata: {calibration_metadata_path.name}")
+    print("\n" + "=" * 70)
+    print("Done.")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Calibrate model predictions using isotonic or Platt scaling")
+    parser.add_argument(
+        "--cv-predictions",
+        type=Path,
+        default=None,
+        help="Path to CV predictions parquet file (default: find latest in outputs/Results/ml_models)"
+    )
+    parser.add_argument(
+        "--test-predictions",
+        type=Path,
+        default=None,
+        help="Path to test predictions parquet file (default: find latest modelC_lgbm_win5_scored_*.parquet)"
+    )
+    parser.add_argument(
+        "--method",
+        type=str,
+        choices=["isotonic", "platt"],
+        default="isotonic",
+        help="Calibration method: 'isotonic' or 'platt' (default: isotonic)"
+    )
+    parser.add_argument(
+        "--assume-oof",
+        action="store_true",
+        help="Assume CV predictions are OOF when fold information is missing (required for isotonic without fold info)"
+    )
+    
+    args = parser.parse_args()
+    
+    repo_root = get_repo_root()
+    output_dir = repo_root / "outputs/Results/ml_models"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = output_dir / f"calibration_modelC_lgbm_{args.method}_{timestamp}.txt"
+    
+    tee = Tee(output_file)
+    sys.stdout = tee
+    
+    try:
+        main(
+            cv_predictions_path=args.cv_predictions,
+            test_predictions_path=args.test_predictions,
+            calibration_method=args.method,
+            assume_oof=args.assume_oof
+        )
+    finally:
+        sys.stdout = tee.stdout
+        tee.close()
+        print(f"\nOutput saved to: {output_file}")
+

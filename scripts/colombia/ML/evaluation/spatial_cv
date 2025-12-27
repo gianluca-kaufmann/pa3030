@@ -1,0 +1,739 @@
+#!/usr/bin/env python3
+"""Spatial Cross-Validation for modelC_LGBM
+
+Purpose: Perform spatial cross-validation by splitting Colombia into 4 contiguous regions,
+         training on 3 regions and testing on 1 (rotating through all 4).
+         Uses frozen benchmark features and hyperparameters.
+
+Note: Spatial CV with pooled years (not leave-future-years-out).
+      All years 2000-2017 are mixed across folds; temporal ordering is not preserved.
+
+Memory optimizations:
+  - KMeans clustering uses 10% sample for fitting, then assigns clusters in batches
+  - Aggressive memory cleanup after each fold
+  - Efficient batch processing during data loading
+
+Input:   - modelC_lgbm_win5_benchmark_*.json (most recent file from outputs/Results/ml_models)
+         - train_colombia_win5.parquet, val_colombia_win5.parquet (earlystop), test_colombia_win5.parquet
+
+Output:  - Spatial CV results JSON with PR-AUC, P@1%, Lift@1% for each fold
+         - Aggregated metrics across 4 folds
+"""
+
+from __future__ import annotations
+
+import gc
+import json
+import os
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import lightgbm as lgb
+from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+
+
+class Tee:
+    """Write to both stdout and a file."""
+    def __init__(self, file_path: Path):
+        self.file = open(file_path, 'w', encoding='utf-8')
+        self.stdout = sys.stdout
+    
+    def write(self, text: str) -> None:
+        self.stdout.write(text)
+        self.file.write(text)
+        self.file.flush()
+    
+    def flush(self) -> None:
+        self.stdout.flush()
+        self.file.flush()
+    
+    def close(self) -> None:
+        self.file.close()
+
+
+# Configuration
+RANDOM_STATE = 42
+TARGET_COL = "transition_01_win5"
+LOOKAHEAD_YEARS = 5
+WDPA_LAST_YEAR = 2024
+LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS  # 2019
+SPATIAL_CV_YEAR_END = 2017  # Spatial CV uses 2000-2017; 2018-2019 reserved for temporal test
+N_SPATIAL_FOLDS = 4
+KMEANS_SAMPLE_RATE = 0.1  # Sample 10% of coordinates for KMeans fitting
+KMEANS_BATCH_SIZE = 100_000  # Batch size for assigning clusters to full data
+
+
+def resolve_parquet_file(filename: str) -> Path:
+    """Locate parquet file (prefer $SCRATCH if present)."""
+    repo_root = Path(__file__).resolve().parents[4]
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    candidates = []
+    if scratch_root is not None:
+        candidates.append(scratch_root / f"data/ml/{filename}")
+    candidates.append(repo_root / f"data/ml/{filename}")
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    raise FileNotFoundError(f"{filename} not found in expected locations")
+
+
+def find_latest_benchmark_file(output_dir: Path) -> Path:
+    """Find the most recent modelC_lgbm_win5_benchmark JSON file."""
+    pattern = "modelC_lgbm_win5_benchmark_*.json"
+    files = list(output_dir.glob(pattern))
+    
+    if not files:
+        raise FileNotFoundError(f"No benchmark files found in {output_dir} matching pattern {pattern}")
+    
+    # Return most recent file (by modification time)
+    latest = max(files, key=lambda p: p.stat().st_mtime)
+    return latest
+
+
+def load_benchmark_config(benchmark_path: Path, output_dir: Path) -> Tuple[list, Dict[str, Any], int, int]:
+    """Load features and hyperparameters from benchmark JSON.
+    
+    Also extracts avg_best_iteration from the source metrics file to use as num_boost_round.
+    
+    Returns:
+        Tuple of (feature_list, hyperparameters_dict, random_seed, num_boost_round)
+    """
+    with open(benchmark_path, 'r') as f:
+        benchmark = json.load(f)
+    
+    model_config = benchmark.get("model_config", {})
+    features = model_config.get("features", [])
+    hyperparameters = model_config.get("hyperparameters", {}).copy()
+    random_seed = model_config.get("random_seed", RANDOM_STATE)
+    
+    # Ensure random_state is set
+    hyperparameters["random_state"] = random_seed
+    
+    # Extract avg_best_iteration from source metrics file
+    # The benchmark JSON has a reference to the source metrics file in benchmark_metadata.source_metrics_file
+    num_boost_round = None
+    benchmark_metadata = benchmark.get("benchmark_metadata", {})
+    source_metrics_timestamp = benchmark_metadata.get("source_metrics_file", None)
+    
+    if source_metrics_timestamp:
+        # Try to load the source metrics file
+        metrics_file_pattern = f"modelC_lgbm_win5_metrics_{source_metrics_timestamp}.json"
+        metrics_path = output_dir / metrics_file_pattern
+        
+        if metrics_path.exists():
+            try:
+                with open(metrics_path, 'r') as f:
+                    metrics_data = json.load(f)
+                
+                # Try to get avg_best_iteration from cross_validation (cv_info in code)
+                # Check if there's a top-level "cross_validation" that has avg_best_iteration
+                cross_validation = metrics_data.get("cross_validation", {})
+                
+                # The metrics file structure has cross_validation.folds and potentially avg_best_iteration
+                # Check if avg_best_iteration exists directly in cross_validation
+                if isinstance(cross_validation, dict) and "avg_best_iteration" in cross_validation:
+                    num_boost_round = int(cross_validation["avg_best_iteration"])
+                    print(f"  Found avg_best_iteration in metrics file: {num_boost_round}")
+                else:
+                    # Try to compute from folds
+                    folds = cross_validation.get("folds", [])
+                    if folds:
+                        best_iterations = [fold.get("best_iteration") for fold in folds if fold.get("best_iteration") is not None]
+                        if best_iterations:
+                            num_boost_round = int(np.round(np.mean(best_iterations)))
+                            print(f"  Computed avg_best_iteration from folds: {num_boost_round} (mean of {best_iterations})")
+            except Exception as e:
+                print(f"  Warning: Could not load avg_best_iteration from metrics file: {e}")
+    
+    # Fallback: use n_estimators from hyperparameters
+    if num_boost_round is None:
+        num_boost_round = hyperparameters.get("num_boost_round", hyperparameters.get("n_estimators", 3000))
+        print(f"  Warning: Using n_estimators from hyperparameters as fallback: {num_boost_round}")
+    
+    return features, hyperparameters, random_seed, num_boost_round
+
+
+def compute_precision_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) -> float:
+    """Compute precision at top k% of predictions."""
+    n_top_k = max(1, int(len(y_true) * k / 100))
+    top_k_idx = np.argsort(y_proba)[-n_top_k:]
+    return y_true[top_k_idx].sum() / n_top_k
+
+
+def compute_metrics(y_true: np.ndarray, y_proba: np.ndarray) -> Dict[str, float]:
+    """Compute all metrics."""
+    roc_auc = roc_auc_score(y_true, y_proba)
+    pr_auc = average_precision_score(y_true, y_proba)
+    baseline_rate = y_true.mean()
+    prec_at_1 = compute_precision_at_k(y_true, y_proba, 1.0)
+    lift_at_1 = prec_at_1 / baseline_rate if baseline_rate > 0 else 0.0
+    
+    return {
+        "roc_auc": float(roc_auc),
+        "pr_auc": float(pr_auc),
+        "precision_at_1pct": float(prec_at_1),
+        "lift_at_1pct": float(lift_at_1),
+        "baseline_rate": float(baseline_rate)
+    }
+
+
+def compute_year_weights(years: np.ndarray, min_year: int = 2000, max_year: Optional[int] = None, 
+                         min_weight: float = 0.5, max_weight: float = 1.0) -> np.ndarray:
+    """Compute sample weights based on year (linear interpolation)."""
+    if max_year is None:
+        max_year = int(years.max())
+    if max_year == min_year:
+        return np.full(len(years), max_weight, dtype=np.float32)
+    years_normalized = (years - min_year) / (max_year - min_year)
+    years_normalized = np.clip(years_normalized, 0.0, 1.0)
+    weights = min_weight + years_normalized * (max_weight - min_weight)
+    return weights.astype(np.float32)
+
+
+def load_data_with_coords(
+    file_paths: list[Path],
+    feature_cols: list,
+    target_col: str,
+    year_range: Optional[Tuple[int, int]] = None,
+    batch_size: int = 50_000
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int, int]:
+    """Load data with x, y coordinates for spatial splitting.
+    
+    Returns:
+        X, y, years, x_coords, y_coords, pos, neg
+    """
+    print(f"\nLoading data from {len(file_paths)} files...")
+    if year_range:
+        print(f"  Year range: {year_range[0]}-{year_range[1]}")
+    
+    essential_cols = feature_cols + [target_col, 'year', 'x', 'y']
+    
+    # Pass 1: Count rows
+    print("  Pass 1: Counting rows...")
+    n_samples = 0
+    years_set = set()
+    
+    for file_path in file_paths:
+        parquet_file = pq.ParquetFile(file_path)
+        try:
+            for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols):
+                batch_table = batch
+                null_mask = batch_table[target_col].is_null().to_numpy(zero_copy_only=False)
+                valid_mask = ~null_mask
+                if not valid_mask.any():
+                    continue
+                
+                target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+                year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+                
+                target_valid = target_array[valid_mask]
+                year_valid = year_array[valid_mask]
+                
+                if year_range is not None:
+                    year_mask = (year_valid >= year_range[0]) & (year_valid <= year_range[1])
+                    target_valid = target_valid[year_mask]
+                    year_valid = year_valid[year_mask]
+                
+                if len(target_valid) == 0:
+                    continue
+                
+                n_samples += len(target_valid)
+                years_set.update(year_valid.tolist())
+        finally:
+            del parquet_file
+            gc.collect()
+    
+    print(f"  Found {n_samples:,} samples")
+    
+    if n_samples == 0:
+        raise ValueError("No samples found")
+    
+    # Pass 2: Load data
+    print(f"  Pass 2: Loading data ({n_samples:,} samples, {len(feature_cols)} features)...")
+    X = np.empty((n_samples, len(feature_cols)), dtype=np.float32)
+    y = np.empty(n_samples, dtype=np.int8)
+    years = np.empty(n_samples, dtype=np.int32)
+    x_coords = np.empty(n_samples, dtype=np.float32)
+    y_coords = np.empty(n_samples, dtype=np.float32)
+    
+    idx_offset = 0
+    
+    for file_path in file_paths:
+        parquet_file = pq.ParquetFile(file_path)
+        try:
+            for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols):
+                batch_table = batch
+                null_mask = batch_table[target_col].is_null().to_numpy(zero_copy_only=False)
+                valid_mask = ~null_mask
+                if not valid_mask.any():
+                    continue
+                
+                target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+                year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+                x_array = batch_table['x'].to_numpy(zero_copy_only=False)
+                y_array = batch_table['y'].to_numpy(zero_copy_only=False)
+                
+                target_valid = target_array[valid_mask]
+                year_valid = year_array[valid_mask]
+                x_valid = x_array[valid_mask]
+                y_valid = y_array[valid_mask]
+                
+                if year_range is not None:
+                    year_mask = (year_valid >= year_range[0]) & (year_valid <= year_range[1])
+                    target_valid = target_valid[year_mask]
+                    year_valid = year_valid[year_mask]
+                    x_valid = x_valid[year_mask]
+                    y_valid = y_valid[year_mask]
+                    
+                    # Process features more memory-efficiently
+                    feature_arrays = []
+                    for col in feature_cols:
+                        col_array = batch_table[col].to_numpy(zero_copy_only=False)
+                        col_valid = col_array[valid_mask]
+                        col_valid = col_valid[year_mask].astype(np.float32)
+                        feature_arrays.append(col_valid)
+                else:
+                    # Process features more memory-efficiently
+                    feature_arrays = []
+                    for col in feature_cols:
+                        col_array = batch_table[col].to_numpy(zero_copy_only=False)
+                        col_valid = col_array[valid_mask].astype(np.float32)
+                        feature_arrays.append(col_valid)
+                
+                # Stack features and create target
+                X_batch = np.column_stack(feature_arrays)
+                y_batch = (target_valid > 0).astype(np.int8)
+                
+                batch_size_actual = len(y_batch)
+                X[idx_offset:idx_offset + batch_size_actual, :] = X_batch
+                y[idx_offset:idx_offset + batch_size_actual] = y_batch
+                years[idx_offset:idx_offset + batch_size_actual] = year_valid.astype(np.int32)
+                x_coords[idx_offset:idx_offset + batch_size_actual] = x_valid.astype(np.float32)
+                y_coords[idx_offset:idx_offset + batch_size_actual] = y_valid.astype(np.float32)
+                idx_offset += batch_size_actual
+                
+                # Aggressive cleanup
+                del batch_table, target_array, year_array, x_array, y_array
+                del feature_arrays, X_batch, y_batch, target_valid, year_valid, x_valid, y_valid
+                gc.collect()
+        finally:
+            del parquet_file
+            gc.collect()
+    
+    if idx_offset != n_samples:
+        raise ValueError(f"Mismatch: expected {n_samples:,} samples but loaded {idx_offset:,}")
+    
+    pos = int(y.sum())
+    neg = int((y == 0).sum())
+    
+    print(f"  Loaded {n_samples:,} rows: {neg:,} neg, {pos:,} pos")
+    
+    return X, y, years, x_coords, y_coords, pos, neg
+
+
+def create_spatial_folds(x_coords: np.ndarray, y_coords: np.ndarray, n_folds: int = 4, 
+                         sample_rate: float = KMEANS_SAMPLE_RATE, 
+                         batch_size: int = KMEANS_BATCH_SIZE) -> np.ndarray:
+    """Create spatial folds by splitting into contiguous regions.
+    
+    Uses KMeans clustering to create n_folds contiguous regions.
+    Memory-efficient: fits KMeans on a sample, then assigns clusters in batches.
+    Coordinates are standardized before clustering to ensure truly contiguous and round regions.
+    
+    Args:
+        x_coords: X coordinates
+        y_coords: Y coordinates
+        n_folds: Number of folds (regions)
+        sample_rate: Fraction of coordinates to use for KMeans fitting (default 0.1)
+        batch_size: Batch size for assigning clusters to full data
+    
+    Returns:
+        Array of fold assignments (0 to n_folds-1) for each sample
+    """
+    print(f"\nCreating {n_folds} spatial folds using KMeans clustering...")
+    print(f"  Memory-efficient mode: fitting on {sample_rate*100:.1f}% sample, then assigning in batches")
+    print(f"  Standardizing coordinates before clustering for contiguous regions")
+    
+    n_total = len(x_coords)
+    
+    # Stack full coordinates for standardization
+    coords_full = np.column_stack([x_coords, y_coords])
+    
+    # Standardize coordinates using StandardScaler
+    scaler = StandardScaler()
+    coords_scaled = scaler.fit_transform(coords_full)
+    
+    # Step 1: Sample coordinates for KMeans fitting
+    n_sample = max(1, int(n_total * sample_rate))
+    print(f"  Sampling {n_sample:,} coordinates (out of {n_total:,}) for KMeans fitting...")
+    
+    # Use random sampling with fixed seed for reproducibility
+    rng = np.random.RandomState(RANDOM_STATE)
+    sample_indices = rng.choice(n_total, size=n_sample, replace=False)
+    sample_indices = np.sort(sample_indices)  # Sort for better cache locality
+    
+    coords_sample = coords_scaled[sample_indices]
+    
+    # Step 2: Fit KMeans on standardized sample
+    print(f"  Fitting KMeans on {n_sample:,} standardized samples...")
+    kmeans = KMeans(n_clusters=n_folds, random_state=RANDOM_STATE, n_init=10)
+    kmeans.fit(coords_sample)
+    
+    # Clean up sample data
+    del coords_sample, sample_indices
+    gc.collect()
+    
+    # Step 3: Assign clusters to full data in batches (using standardized coordinates)
+    print(f"  Assigning clusters to {n_total:,} samples in batches of {batch_size:,}...")
+    fold_assignments = np.empty(n_total, dtype=np.int32)
+    
+    # Process in batches
+    for start_idx in range(0, n_total, batch_size):
+        end_idx = min(start_idx + batch_size, n_total)
+        batch_coords = coords_scaled[start_idx:end_idx]
+        fold_assignments[start_idx:end_idx] = kmeans.predict(batch_coords)
+        
+        if (start_idx // batch_size) % 10 == 0:
+            print(f"    Processed {end_idx:,} / {n_total:,} samples ({100*end_idx/n_total:.1f}%)")
+    
+    # Clean up
+    del coords_scaled, coords_full
+    gc.collect()
+    
+    # Report fold sizes
+    print(f"\n  Fold assignments complete. Fold statistics:")
+    for fold_idx in range(n_folds):
+        fold_mask = fold_assignments == fold_idx
+        n_samples = fold_mask.sum()
+        x_min, x_max = x_coords[fold_mask].min(), x_coords[fold_mask].max()
+        y_min, y_max = y_coords[fold_mask].min(), y_coords[fold_mask].max()
+        print(f"  Fold {fold_idx + 1}: {n_samples:,} samples ({100*n_samples/n_total:.1f}%), "
+              f"x=[{x_min:.2f}, {x_max:.2f}], y=[{y_min:.2f}, {y_max:.2f}]")
+    
+    return fold_assignments
+
+
+def train_spatial_fold(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    years_train: np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    fold_idx: int,
+    hyperparameters: Dict[str, Any],
+    num_boost_round: int
+) -> Dict[str, Any]:
+    """Train and evaluate a single spatial CV fold.
+    
+    Args:
+        num_boost_round: Fixed number of boosting rounds (from avg_best_iteration)
+    
+    Returns:
+        Dictionary containing fold metrics and metadata
+    """
+    print(f"\n{'='*70}")
+    print(f"SPATIAL FOLD {fold_idx + 1}/{N_SPATIAL_FOLDS}")
+    print(f"{'='*70}")
+    
+    # Save sizes before deleting arrays
+    n_train = len(X_train)
+    n_test = len(X_test)
+    
+    print(f"Train: {n_train:,} samples, Test: {n_test:,} samples")
+    print(f"  Using fixed num_boost_round: {num_boost_round} (from benchmark avg_best_iteration)")
+    
+    # Compute sample weights for training data
+    train_weights = compute_year_weights(years_train, min_year=2000, max_year=years_train.max())
+    print(f"  Training sample weights: min={train_weights.min():.3f}, max={train_weights.max():.3f}, mean={train_weights.mean():.3f}")
+    
+    # Prepare hyperparameters
+    train_params = hyperparameters.copy()
+    # Remove num_boost_round and n_estimators from hyperparameters (we use the fixed value)
+    train_params.pop("num_boost_round", None)
+    train_params.pop("n_estimators", None)
+    train_params["is_unbalance"] = False
+    
+    # Train model
+    print("  Creating datasets...")
+    train_dataset = lgb.Dataset(X_train, label=y_train, weight=train_weights, free_raw_data=True)
+    del X_train, y_train, years_train, train_weights
+    gc.collect()
+    
+    print("  Training...")
+    train_start = time.time()
+    lgb_model = lgb.train(
+        train_params,
+        train_dataset,
+        num_boost_round=num_boost_round,
+        callbacks=[lgb.log_evaluation(100)]
+    )
+    train_time = time.time() - train_start
+    # Since we use fixed num_boost_round (no early stopping), best_iteration will be None or equal to num_boost_round
+    # We use num_boost_round explicitly for consistency
+    best_iteration = num_boost_round
+    
+    del train_dataset
+    gc.collect()
+    
+    # Evaluate on test set
+    print("  Evaluating on test set...")
+    test_start = time.time()
+    y_test_proba = lgb_model.predict(X_test, num_iteration=best_iteration)
+    test_time = time.time() - test_start
+    
+    test_metrics = compute_metrics(y_test, y_test_proba)
+    
+    print(f"\nFold {fold_idx + 1} Test Results:")
+    print(f"  PR-AUC:  {test_metrics['pr_auc']:.4f}")
+    print(f"  P@1%:    {test_metrics['precision_at_1pct']:.4f}")
+    print(f"  Lift@1%: {test_metrics['lift_at_1pct']:.2f}x")
+    
+    # Clean up
+    del X_test, y_test, y_test_proba, lgb_model
+    gc.collect()
+    
+    return {
+        "fold_idx": fold_idx,
+        "n_train": int(n_train),
+        "n_test": int(n_test),
+        "train_time_seconds": train_time,
+        "test_time_seconds": test_time,
+        "best_iteration": int(best_iteration),
+        "metrics": test_metrics
+    }
+
+
+def aggregate_spatial_cv_metrics(cv_results: list[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate metrics across spatial CV folds."""
+    metrics_keys = ["pr_auc", "precision_at_1pct", "lift_at_1pct"]
+    
+    aggregated = {}
+    for key in metrics_keys:
+        values = [fold["metrics"][key] for fold in cv_results]
+        aggregated[f"{key}_mean"] = float(np.mean(values))
+        aggregated[f"{key}_std"] = float(np.std(values))
+        aggregated[f"{key}_values"] = values
+    
+    aggregated["n_train_mean"] = float(np.mean([fold["n_train"] for fold in cv_results]))
+    aggregated["n_test_mean"] = float(np.mean([fold["n_test"] for fold in cv_results]))
+    
+    return aggregated
+
+
+def main() -> None:
+    repo_root = Path(__file__).resolve().parents[4]
+    output_dir = repo_root / "outputs/Results/ml_models"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    print("=" * 70)
+    print("SPATIAL CROSS-VALIDATION: modelC_LGBM")
+    print("Spatial CV with pooled years (not leave-future-years-out)")
+    print("=" * 70)
+    print(f"\nOutput directory: {output_dir}")
+    
+    # Step 1: Find latest benchmark file
+    print("\n" + "=" * 70)
+    print("STEP 1: FIND LATEST BENCHMARK FILE")
+    print("=" * 70)
+    try:
+        benchmark_path = find_latest_benchmark_file(output_dir)
+        print(f"\nFound benchmark file: {benchmark_path.name}")
+    except FileNotFoundError as e:
+        print(f"\nERROR: {e}")
+        sys.exit(1)
+    
+    # Step 2: Load benchmark features and hyperparameters
+    print("\n" + "=" * 70)
+    print("STEP 2: LOAD BENCHMARK CONFIG")
+    print("=" * 70)
+    try:
+        feature_cols, hyperparameters, random_seed, num_boost_round = load_benchmark_config(benchmark_path, output_dir)
+        print(f"\nLoaded benchmark config:")
+        print(f"  Features: {len(feature_cols)}")
+        print(f"  Random seed: {random_seed}")
+        print(f"  Hyperparameters: {len(hyperparameters)} parameters")
+        print(f"  Num boost rounds: {num_boost_round} (from avg_best_iteration)")
+    except Exception as e:
+        print(f"\nERROR: Failed to load benchmark config: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    
+    # Step 3: Load data with coordinates
+    print("\n" + "=" * 70)
+    print("STEP 3: LOAD DATA WITH COORDINATES")
+    print("=" * 70)
+    try:
+        train_path = resolve_parquet_file("train_colombia_win5.parquet")
+        earlystop_path = resolve_parquet_file("val_colombia_win5.parquet")
+        test_path = resolve_parquet_file("test_colombia_win5.parquet")
+        
+        # Load all data (train + earlystop + test) for spatial splitting
+        # Filter to years 2000-2017 for spatial CV; 2018-2019 reserved for final temporal test
+        # NOTE: Spatial CV with pooled years (not leave-future-years-out).
+        #       All years 2000-2017 are mixed across folds; temporal ordering is not preserved.
+        year_range = (2000, SPATIAL_CV_YEAR_END)
+        X, y, years, x_coords, y_coords, pos, neg = load_data_with_coords(
+            [train_path, earlystop_path, test_path],
+            feature_cols,
+            TARGET_COL,
+            year_range=year_range
+        )
+        print(f"\nTotal data: {len(y):,} samples ({neg:,} neg, {pos:,} pos)")
+    except Exception as e:
+        print(f"\nERROR: Failed to load data: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    
+    # Step 4: Create spatial folds
+    print("\n" + "=" * 70)
+    print("STEP 4: CREATE SPATIAL FOLDS")
+    print("=" * 70)
+    try:
+        fold_assignments = create_spatial_folds(x_coords, y_coords, n_folds=N_SPATIAL_FOLDS)
+        # Clean up coordinates after fold assignment (keep for reporting, but can free if needed)
+        # We'll keep them for now as they're used in reporting, but they're relatively small
+    except Exception as e:
+        print(f"\nERROR: Failed to create spatial folds: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    
+    # Step 5: Run spatial cross-validation
+    print("\n" + "=" * 70)
+    print("STEP 5: RUN SPATIAL CROSS-VALIDATION")
+    print("=" * 70)
+    cv_results = []
+    
+    for fold_idx in range(N_SPATIAL_FOLDS):
+        # Split: train on 3 folds, test on 1 fold
+        test_mask = fold_assignments == fold_idx
+        train_mask = ~test_mask
+        
+        # Use views where possible, but copy for safety (LightGBM may modify)
+        # For memory efficiency, we'll create copies but clean up immediately after use
+        X_train = X[train_mask].copy()
+        y_train = y[train_mask].copy()
+        years_train = years[train_mask].copy()
+        
+        X_test = X[test_mask].copy()
+        y_test = y[test_mask].copy()
+        
+        # Free up memory by deleting the masks
+        del test_mask, train_mask
+        gc.collect()
+        
+        fold_result = train_spatial_fold(
+            X_train, y_train, years_train,
+            X_test, y_test,
+            fold_idx, hyperparameters, num_boost_round
+        )
+        cv_results.append(fold_result)
+        
+        # Clean up immediately after each fold
+        del X_train, y_train, years_train, X_test, y_test
+        gc.collect()
+    
+    # Step 6: Aggregate results
+    print("\n" + "=" * 70)
+    print("STEP 6: AGGREGATE RESULTS")
+    print("=" * 70)
+    aggregated = aggregate_spatial_cv_metrics(cv_results)
+    
+    print("\nSpatial Cross-Validation Results (Aggregated across 4 folds):")
+    print(f"  PR-AUC:  {aggregated['pr_auc_mean']:.4f} ± {aggregated['pr_auc_std']:.4f}")
+    print(f"  P@1%:    {aggregated['precision_at_1pct_mean']:.4f} ± {aggregated['precision_at_1pct_std']:.4f}")
+    print(f"  Lift@1%: {aggregated['lift_at_1pct_mean']:.2f} ± {aggregated['lift_at_1pct_std']:.2f}")
+    
+    # Step 7: Save results
+    print("\n" + "=" * 70)
+    print("STEP 7: SAVE RESULTS")
+    print("=" * 70)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    results_path = output_dir / f"modelC_lgbm_win5_spatial_cv_{timestamp}.json"
+    
+    results = {
+        "metadata": {
+            "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "source_benchmark": benchmark_path.name,
+            "model": "LightGBM",
+            "task": "transition_01_win5_prediction",
+            "target_column": TARGET_COL,
+            "lookahead_years": LOOKAHEAD_YEARS,
+            "n_spatial_folds": N_SPATIAL_FOLDS,
+            "spatial_split_method": "KMeans clustering",
+            "cv_type": "Spatial CV with pooled years (not leave-future-years-out)",
+            "temporal_split": "All years 2000-2017 are mixed across folds; temporal ordering is not preserved",
+            "random_seed": random_seed,
+            "year_range": list(year_range),
+            "spatial_cv_year_end": SPATIAL_CV_YEAR_END,
+            "last_label_year": LAST_LABEL_YEAR,
+            "note": "2018-2019 data reserved for final temporal test"
+        },
+        "model_config": {
+            "n_features": len(feature_cols),
+            "features": feature_cols,
+            "hyperparameters": hyperparameters
+        },
+        "data_info": {
+            "n_total": int(len(y)),
+            "n_positives": int(pos),
+            "n_negatives": int(neg)
+        },
+        "folds": cv_results,
+        "aggregated": aggregated
+    }
+    
+    try:
+        with open(results_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"\nResults saved: {results_path}")
+    except Exception as e:
+        print(f"\nERROR: Failed to save results: {e}")
+        sys.exit(1)
+    
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"\nSource benchmark: {benchmark_path.name}")
+    print(f"Results file: {results_path.name}")
+    print(f"\nSpatial Cross-Validation (4 folds):")
+    print(f"  PR-AUC:  {aggregated['pr_auc_mean']:.4f} ± {aggregated['pr_auc_std']:.4f}")
+    print(f"  P@1%:    {aggregated['precision_at_1pct_mean']:.4f} ± {aggregated['precision_at_1pct_std']:.4f}")
+    print(f"  Lift@1%: {aggregated['lift_at_1pct_mean']:.2f} ± {aggregated['lift_at_1pct_std']:.2f}")
+    print("\n" + "=" * 70)
+    print("Done.")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    repo_root = Path(__file__).resolve().parents[4]
+    output_dir = repo_root / "outputs/Results/ml_models"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = output_dir / f"spatial_cv_modelC_lgbm_{timestamp}.txt"
+    
+    tee = Tee(output_file)
+    sys.stdout = tee
+    
+    try:
+        main()
+    finally:
+        sys.stdout = tee.stdout
+        tee.close()
+        print(f"\nOutput saved to: {output_file}")
+
