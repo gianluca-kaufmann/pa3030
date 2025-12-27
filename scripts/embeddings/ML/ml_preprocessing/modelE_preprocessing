@@ -1,24 +1,30 @@
 #!/usr/bin/env python3
 
 """
-Temporal split script for modelE training/validation/test splits (embeddings dataset).
+Temporal split script for modelE training/validation/test splits (embeddings dataset)
+with lookahead window target.
 
 Rules
 -----
-TRAIN (2018–2021):
-  - Full risk set (no sampling)
+Dynamic splits based on WINDOW parameter and right-censoring:
+  - Filter to year <= max_year - WINDOW (right-censoring)
+  - Splits computed from censored dataset (e.g., WINDOW=2: train 2018-2020, val 2021, test 2022)
 
-VAL (2022):
-  - Full risk set (no sampling)
+Lookahead Window Target:
+  - Compute first_transition_year per (row, col) as MIN(year) WHERE transition_01=1
+  - Add transition_01_win{WINDOW}: for each row at year t, set to 1 if first_transition_year exists 
+    AND t < first_transition_year <= t+WINDOW, else 0
+  - Filter to year <= max_year-WINDOW to handle right-censoring
 
-TEST (2023–2024):
-  - Full risk set (no sampling)
+Future Scoring (Optional):
+  - Export years 2023-2024 (or max_year-WINDOW+1 to max_year) with no labels for inference only
 
 Notes
 -----
 - Simple temporal split with no sampling
 - All splits use the full dataset for their respective time periods
 - Dataset contains data from 2018-2024 only
+- Right-censoring ensures we can evaluate 5-year lookahead window
 """
 
 from __future__ import annotations
@@ -35,11 +41,18 @@ import wandb
 
 # Configuration
 RANDOM_STATE = 42
-# Split configuration (embeddings dataset contains 2018-2024 only)
-TRAIN_YEARS = (2018, 2021)   # Full train set
-VAL_YEARS = (2022, 2022)     # Full validation
-TEST_YEARS = (2023, 2024)    # Full test
+# Window configuration
+WINDOW = int(os.environ.get("WINDOW", "2"))  # Lookahead window in years (2 or 3)
+EXPORT_FUTURE_SCORING = os.environ.get("EXPORT_FUTURE_SCORING", "false").lower() in ("true", "1", "yes")
 WANDB_PROJECT = "ml-training-preprocessing"
+
+# Split configuration will be computed dynamically based on WINDOW and max_year
+# For example, with WINDOW=2 and max_year=2024:
+#   cutoff_year = 2024 - 2 = 2022
+#   train: 2018-2020 (3 years)
+#   val: 2021 (1 year)
+#   test: 2022 (1 year)
+#   future_scoring: 2023-2024 (if enabled)
 
 
 def resolve_input() -> Path:
@@ -82,6 +95,9 @@ def configure_duckdb(con: duckdb.DuckDBPyConnection) -> None:
     if isinstance(temp_dir, str):
         temp_dir = Path(temp_dir)
     temp_dir.mkdir(parents=True, exist_ok=True)
+    # Create duckdb_temp subdirectory
+    duckdb_temp_dir = temp_dir / "duckdb_temp"
+    duckdb_temp_dir.mkdir(parents=True, exist_ok=True)
     temp_dir_sql = str(temp_dir).replace("'", "''")
     con.execute(f"SET temp_directory='{temp_dir_sql}/duckdb_temp'")
 
@@ -92,18 +108,18 @@ def configure_duckdb(con: duckdb.DuckDBPyConnection) -> None:
     print(f"Running on: {'Euler cluster' if is_euler else 'local machine'}")
 
 
-def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: str, use_wandb: bool = False) -> None:
+def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: str, target_col: str = "transition_01", use_wandb: bool = False) -> None:
     escaped = str(parquet_path).replace("'", "''")
     rows = con.execute(
         f"""
         SELECT
             year,
-            SUM(transition_01) AS positives,
-            SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS negatives,
+            SUM({target_col}) AS positives,
+            SUM(CASE WHEN {target_col} = 0 THEN 1 ELSE 0 END) AS negatives,
             COUNT(*) AS total,
-            CASE WHEN COUNT(*) > 0 THEN SUM(transition_01)::DOUBLE / COUNT(*) ELSE 0 END AS pos_ratio,
-            CASE WHEN SUM(transition_01) > 0 
-                 THEN SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END)::DOUBLE / SUM(transition_01)
+            CASE WHEN COUNT(*) > 0 THEN SUM({target_col})::DOUBLE / COUNT(*) ELSE 0 END AS pos_ratio,
+            CASE WHEN SUM({target_col}) > 0 
+                 THEN SUM(CASE WHEN {target_col} = 0 THEN 1 ELSE 0 END)::DOUBLE / SUM({target_col})
                  ELSE 0 END AS neg_pos_ratio
         FROM read_parquet('{escaped}')
         GROUP BY year
@@ -111,19 +127,63 @@ def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: s
         """
     ).fetchall()
 
-    print(f"\n{label} per-year counts:")
+    print(f"\n{label} per-year counts (target: {target_col}):")
     for year, pos, neg, total, pos_ratio, neg_pos_ratio in rows:
         print(f"  {year}: total={total:,} pos={pos:,} neg={neg:,} | pos_ratio={pos_ratio:.5f} neg/pos={neg_pos_ratio:.1f}")
 
     if use_wandb:
-        wandb.log({f"{label.lower().replace(' ', '_')}/per_year": [
+        wandb.log({f"{label.lower().replace(' ', '_')}/per_year_{target_col}": [
             dict(year=y, positives=p, negatives=n, total=t, pos_ratio=r, neg_pos_ratio=npr) 
             for y, p, n, t, r, npr in rows
         ]})
 
 
+def compute_dynamic_splits(max_year: int, window: int) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int]]:
+    """Compute train/val/test/future splits based on max_year and window.
+    
+    Returns:
+        (train_years, val_years, test_years, future_years)
+        future_years may be None if no future scoring years available
+    """
+    cutoff_year = max_year - window
+    
+    # Check available years range (assume min_year is 2018 for embeddings)
+    min_year = 2018
+    available_years = list(range(min_year, cutoff_year + 1))
+    
+    if len(available_years) < 4:
+        raise ValueError(f"Not enough years available for splits. Available: {len(available_years)} years (need at least 4)")
+    
+    # Simple split strategy:
+    # - Use roughly 60% for train, 20% for val, 20% for test
+    # - Prefer more recent data for test
+    n_available = len(available_years)
+    n_test = max(1, n_available // 5)  # ~20% for test
+    n_val = max(1, n_available // 5)   # ~20% for val
+    n_train = n_available - n_val - n_test  # Remaining for train
+    
+    test_start = cutoff_year - n_test + 1
+    val_start = test_start - n_val
+    train_start = min_year
+    
+    train_years = (train_start, val_start - 1)
+    val_years = (val_start, test_start - 1)
+    test_years = (test_start, cutoff_year)
+    
+    # Future scoring years (if enabled and available)
+    future_years = None
+    if cutoff_year < max_year:
+        future_years = (cutoff_year + 1, max_year)
+    
+    return train_years, val_years, test_years, future_years
+
+
 def main() -> None:
     start_time = time.time()
+
+    print(f"\nConfiguration:")
+    print(f"  WINDOW: {WINDOW} years")
+    print(f"  EXPORT_FUTURE_SCORING: {EXPORT_FUTURE_SCORING}")
 
     wandb_api_key = os.environ.get("WANDB_API_KEY")
     wandb_entity = os.environ.get("WANDB_ENTITY")
@@ -138,13 +198,12 @@ def main() -> None:
         wandb.init(
             project=WANDB_PROJECT,
             entity=wandb_entity,
-            name=f"modelE_preprocessing_{time.strftime('%Y%m%d_%H%M%S')}",
+            name=f"modelE_preprocessing_win{WINDOW}_{time.strftime('%Y%m%d_%H%M%S')}",
             config={
                 "random_state": RANDOM_STATE,
-                "train_years": TRAIN_YEARS,
-                "val_years": VAL_YEARS,
-                "test_years": TEST_YEARS,
-                "sampling_method": "temporal_split_full",
+                "window": WINDOW,
+                "export_future_scoring": EXPORT_FUTURE_SCORING,
+                "sampling_method": "temporal_split_full_win",
             },
         )
         use_wandb = True
@@ -154,76 +213,249 @@ def main() -> None:
 
     input_path = resolve_input()
     base_dir = input_path.parent
-    train_out = base_dir / "train_embeddings.parquet"
-    val_out = base_dir / "val_embeddings.parquet"
-    test_out = base_dir / "test_embeddings.parquet"
-
+    
+    # Output paths will be determined after computing splits
+    target_col_name = f"transition_01_win{WINDOW}"
+    
     print(f"\nInput: {input_path}")
-    print(f"TRAIN output: {train_out}")
-    print(f"VAL output: {val_out}")
-    print(f"TEST output: {test_out}")
+    print(f"Target column: {target_col_name}")
 
     con = duckdb.connect()
     configure_duckdb(con)
 
     escaped_in = str(input_path).replace("'", "''")
-    escaped_train = str(train_out).replace("'", "''")
-    escaped_val = str(val_out).replace("'", "''")
-    escaped_test = str(test_out).replace("'", "''")
 
     try:
-        # TRAIN: full risk set 2018–2021
+        print("\n" + "="*70)
+        print("STEP 1: Computing first_transition_year per (row, col)")
+        print("="*70)
+        
+        # Step 1: Compute first_transition_year per (row, col)
+        first_transition_sql = f"""
+        CREATE OR REPLACE TEMP TABLE first_transitions AS
+        SELECT
+            row,
+            col,
+            MIN(year) AS first_transition_year
+        FROM read_parquet('{escaped_in}')
+        WHERE transition_01 = 1
+        GROUP BY row, col
+        """
+        
+        step1_start = time.time()
+        con.execute(first_transition_sql)
+        n_transitions = con.execute("SELECT COUNT(*) FROM first_transitions").fetchone()[0]
+        print(f"  Found {n_transitions:,} (row, col) pairs with transitions")
+        print(f"  Completed in {time.time() - step1_start:.1f}s")
+        
+        print("\n" + "="*70)
+        print("STEP 2: Computing max_year and applying right-censoring")
+        print("="*70)
+        
+        # Step 2: Get max_year from data
+        max_year_result = con.execute(f"SELECT MAX(year) FROM read_parquet('{escaped_in}')").fetchone()
+        max_year = max_year_result[0] if max_year_result else 2024
+        cutoff_year = max_year - WINDOW
+        
+        print(f"  Max year in data: {max_year}")
+        print(f"  Cutoff year (max_year - {WINDOW}): {cutoff_year}")
+        print(f"  Filtering to year <= {cutoff_year}")
+        
+        # Compute dynamic splits
+        train_years, val_years, test_years, future_years = compute_dynamic_splits(max_year, WINDOW)
+        
+        print(f"\n  Computed splits:")
+        print(f"    TRAIN: {train_years[0]}-{train_years[1]}")
+        print(f"    VAL: {val_years[0]}-{val_years[1]}")
+        print(f"    TEST: {test_years[0]}-{test_years[1]}")
+        if future_years:
+            print(f"    FUTURE_SCORING: {future_years[0]}-{future_years[1]} (if enabled)")
+        
+        # Set output paths
+        merged_win_out = base_dir / f"embeddings_transition_panel_2018-2024_win{WINDOW}.parquet"
+        train_out = base_dir / f"train_embeddings_win{WINDOW}.parquet"
+        val_out = base_dir / f"val_embeddings_win{WINDOW}.parquet"
+        test_out = base_dir / f"test_embeddings_win{WINDOW}.parquet"
+        future_out = base_dir / f"future_scoring_embeddings_win{WINDOW}.parquet" if future_years and EXPORT_FUTURE_SCORING else None
+        
+        escaped_merged_win = str(merged_win_out).replace("'", "''")
+        escaped_train = str(train_out).replace("'", "''")
+        escaped_val = str(val_out).replace("'", "''")
+        escaped_test = str(test_out).replace("'", "''")
+        escaped_future = str(future_out).replace("'", "''") if future_out else None
+        
+        print("\n" + "="*70)
+        print("STEP 3: Creating merged panel with lookahead target")
+        print("="*70)
+        
+        # Step 3: Create merged panel with transition_01_win{WINDOW}
+        # For each row at year t, set transition_01_win{WINDOW} = 1 if first_transition_year exists 
+        # AND t < first_transition_year <= t+WINDOW, else 0
+        merged_win_sql = f"""
+        COPY (
+            SELECT
+                d.*,
+                CASE 
+                    WHEN ft.first_transition_year IS NOT NULL 
+                         AND d.year < ft.first_transition_year 
+                         AND ft.first_transition_year <= d.year + {WINDOW}
+                    THEN 1
+                    ELSE 0
+                END AS {target_col_name}
+            FROM read_parquet('{escaped_in}') d
+            LEFT JOIN first_transitions ft
+                ON d.row = ft.row AND d.col = ft.col
+            WHERE d.year <= {cutoff_year}
+        )
+        TO '{escaped_merged_win}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        """
+        
+        step3_start = time.time()
+        con.execute(merged_win_sql)
+        print(f"  Merged panel with win{WINDOW} target written in {time.time() - step3_start:.1f}s")
+        
+        # Log counts for merged win
+        log_year_counts(con, merged_win_out, "MERGED_WIN", target_col_name, use_wandb)
+        
+        print("\n" + "="*70)
+        print(f"COMPARISON: transition_01 vs {target_col_name}")
+        print("="*70)
+        
+        # Compare total positives
+        comparison_stats = con.execute(
+            f"""
+            SELECT
+                SUM(transition_01) AS total_pos_original,
+                SUM({target_col_name}) AS total_pos_win,
+                COUNT(DISTINCT CASE WHEN transition_01 = 1 THEN (row, col) END) AS distinct_rc_original,
+                COUNT(DISTINCT CASE WHEN {target_col_name} = 1 THEN (row, col) END) AS distinct_rc_win
+            FROM read_parquet('{escaped_merged_win}')
+            """
+        ).fetchone()
+        
+        total_pos_original, total_pos_win, distinct_rc_original, distinct_rc_win = comparison_stats
+        
+        print(f"\nTotal positives:")
+        print(f"  transition_01:        {total_pos_original:,}")
+        print(f"  {target_col_name}:   {total_pos_win:,}")
+        if total_pos_original > 0:
+            ratio = total_pos_win / total_pos_original
+            print(f"  Ratio (win/original): {ratio:.3f}x")
+            if total_pos_win <= total_pos_original:
+                print(f"  WARNING: win positives ({total_pos_win:,}) <= original ({total_pos_original:,})")
+            else:
+                print(f"  ✓ win has more positives (expected)")
+        
+        print(f"\nDistinct (row,col) with positives:")
+        print(f"  transition_01:        {distinct_rc_original:,}")
+        print(f"  {target_col_name}:   {distinct_rc_win:,}")
+        if distinct_rc_original > 0:
+            ratio_rc = distinct_rc_win / distinct_rc_original
+            print(f"  Ratio (win/original): {ratio_rc:.3f}x")
+            if distinct_rc_win <= distinct_rc_original:
+                print(f"  WARNING: win distinct (row,col) ({distinct_rc_win:,}) <= original ({distinct_rc_original:,})")
+            else:
+                print(f"  ✓ win has more distinct (row,col) with positives (expected)")
+        
+        if use_wandb:
+            wandb.log({
+                "comparison/total_pos_original": int(total_pos_original),
+                "comparison/total_pos_win": int(total_pos_win),
+                "comparison/total_pos_ratio": float(total_pos_win / total_pos_original) if total_pos_original > 0 else 0.0,
+                "comparison/distinct_rc_original": int(distinct_rc_original),
+                "comparison/distinct_rc_win": int(distinct_rc_win),
+                "comparison/distinct_rc_ratio": float(distinct_rc_win / distinct_rc_original) if distinct_rc_original > 0 else 0.0,
+            })
+        
+        print("\n" + "="*70)
+        print("STEP 4: Creating temporal splits")
+        print("="*70)
+        
+        # TRAIN split
         train_sql = f"""
         COPY (
             SELECT
                 *
-            FROM read_parquet('{escaped_in}')
-            WHERE year BETWEEN {TRAIN_YEARS[0]} AND {TRAIN_YEARS[1]}
+            FROM read_parquet('{escaped_merged_win}')
+            WHERE year BETWEEN {train_years[0]} AND {train_years[1]}
         )
         TO '{escaped_train}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """
 
-        print(f"\nCreating TRAIN split ({TRAIN_YEARS[0]}–{TRAIN_YEARS[1]}, full risk set)...")
+        print(f"\nCreating TRAIN split ({train_years[0]}–{train_years[1]}, full risk set)...")
         train_start = time.time()
         con.execute(train_sql)
         print(f"TRAIN written in {time.time() - train_start:.1f}s")
 
-        # VAL: full risk set 2022
+        # VAL split
         val_sql = f"""
         COPY (
             SELECT
                 *
-            FROM read_parquet('{escaped_in}')
-            WHERE year BETWEEN {VAL_YEARS[0]} AND {VAL_YEARS[1]}
+            FROM read_parquet('{escaped_merged_win}')
+            WHERE year BETWEEN {val_years[0]} AND {val_years[1]}
         )
         TO '{escaped_val}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """
 
-        print(f"\nCreating VAL split ({VAL_YEARS[0]}–{VAL_YEARS[1]}, full risk set)...")
+        print(f"\nCreating VAL split ({val_years[0]}–{val_years[1]}, full risk set)...")
         val_start = time.time()
         con.execute(val_sql)
         print(f"VAL written in {time.time() - val_start:.1f}s")
 
-        # TEST: full risk set 2023–2024
+        # TEST split
         test_sql = f"""
         COPY (
             SELECT
                 *
-            FROM read_parquet('{escaped_in}')
-            WHERE year BETWEEN {TEST_YEARS[0]} AND {TEST_YEARS[1]}
+            FROM read_parquet('{escaped_merged_win}')
+            WHERE year BETWEEN {test_years[0]} AND {test_years[1]}
         )
         TO '{escaped_test}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """
 
-        print(f"\nCreating TEST split ({TEST_YEARS[0]}–{TEST_YEARS[1]}, full risk set)...")
+        print(f"\nCreating TEST split ({test_years[0]}–{test_years[1]}, full risk set, right-censored)...")
         test_start = time.time()
         con.execute(test_sql)
         print(f"TEST written in {time.time() - test_start:.1f}s")
+        
+        # Optional: Future scoring export (no labels, for inference only)
+        if future_years and EXPORT_FUTURE_SCORING:
+            print("\n" + "="*70)
+            print("STEP 5: Exporting future scoring data (no labels)")
+            print("="*70)
+            
+            # Export original data for future years (without win target, just features)
+            future_sql = f"""
+            COPY (
+                SELECT
+                    *
+                FROM read_parquet('{escaped_in}')
+                WHERE year BETWEEN {future_years[0]} AND {future_years[1]}
+            )
+            TO '{escaped_future}' (FORMAT PARQUET, COMPRESSION ZSTD)
+            """
+            
+            print(f"\nExporting FUTURE_SCORING ({future_years[0]}–{future_years[1]}, no labels)...")
+            future_start = time.time()
+            con.execute(future_sql)
+            print(f"FUTURE_SCORING written in {time.time() - future_start:.1f}s")
+            
+            future_rows = con.execute(
+                f"SELECT COUNT(*) FROM read_parquet('{escaped_future}')"
+            ).fetchone()[0]
+            print(f"  Total rows: {future_rows:,}")
 
-        # Log counts
-        log_year_counts(con, train_out, "TRAIN", use_wandb)
-        log_year_counts(con, val_out, "VAL", use_wandb)
-        log_year_counts(con, test_out, "TEST", use_wandb)
+        # Log counts for both original and win targets
+        print("\n" + "="*70)
+        print("PER-YEAR STATISTICS")
+        print("="*70)
+        log_year_counts(con, train_out, "TRAIN", "transition_01", use_wandb)
+        log_year_counts(con, train_out, "TRAIN", target_col_name, use_wandb)
+        log_year_counts(con, val_out, "VAL", "transition_01", use_wandb)
+        log_year_counts(con, val_out, "VAL", target_col_name, use_wandb)
+        log_year_counts(con, test_out, "TEST", "transition_01", use_wandb)
+        log_year_counts(con, test_out, "TEST", target_col_name, use_wandb)
 
         # Check total rows
         total_train_rows = con.execute(
@@ -243,12 +475,12 @@ def main() -> None:
         print(f"  VAL: {total_val_rows:,}")
         print(f"  TEST: {total_test_rows:,}")
         
-        # Compute scale_pos_weight from TRAIN only: sqrt(n_neg / n_pos)
+        # Compute scale_pos_weight from TRAIN only (using win target): sqrt(n_neg / n_pos)
         train_stats = con.execute(
             f"""
             SELECT
-                SUM(transition_01) AS total_pos,
-                SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS total_neg
+                SUM({target_col_name}) AS total_pos,
+                SUM(CASE WHEN {target_col_name} = 0 THEN 1 ELSE 0 END) AS total_neg
             FROM read_parquet('{escaped_train}')
             """
         ).fetchone()
@@ -263,38 +495,53 @@ def main() -> None:
         neg_pos_ratio = total_neg / total_pos if total_pos > 0 else 1.0
         scale_pos_weight = math.sqrt(neg_pos_ratio) if neg_pos_ratio > 0 else 1.0
         
-        print(f"\nTRAIN class balance:")
+        print(f"\nTRAIN class balance ({target_col_name}):")
         print(f"  Positives: {total_pos:,}")
         print(f"  Negatives: {total_neg:,}")
         print(f"  Ratio (neg/pos): {neg_pos_ratio:.2f}")
         print(f"  scale_pos_weight for LightGBM: {scale_pos_weight:.6f} (sqrt of ratio)")
         
         # Save scale_pos_weight to metadata file for use in training
-        metadata_path = base_dir / "train_embeddings_metadata.json"
+        metadata_path = base_dir / f"train_embeddings_win{WINDOW}_metadata.json"
         metadata = {
             "scale_pos_weight": scale_pos_weight,
             "total_positives": int(total_pos),
             "total_negatives": int(total_neg),
             "neg_pos_ratio": float(neg_pos_ratio),
-            "computed_from": "train_embeddings.parquet"
+            "window": WINDOW,
+            "target_column": target_col_name,
+            "train_years": list(train_years),
+            "val_years": list(val_years),
+            "test_years": list(test_years),
+            "cutoff_year": cutoff_year,
+            "max_year": max_year,
+            "computed_from": f"train_embeddings_win{WINDOW}.parquet"
         }
         with open(metadata_path, 'w') as f:
             json.dump(metadata, f, indent=2)
         print(f"  Metadata saved to: {metadata_path}")
 
         if use_wandb:
-            wandb.log(
-                {
-                    "train/rows": total_train_rows,
-                    "train/positives": total_pos,
-                    "train/negatives": total_neg,
-                    "train/scale_pos_weight": scale_pos_weight,
-                    "train/neg_pos_ratio": neg_pos_ratio,
-                    "val/rows": total_val_rows,
-                    "test/rows": total_test_rows,
-                    "timing/total_seconds": time.time() - start_time,
-                }
-            )
+            log_dict = {
+                "train/rows": total_train_rows,
+                "train/positives_win": total_pos,
+                "train/negatives_win": total_neg,
+                "train/scale_pos_weight": scale_pos_weight,
+                "train/neg_pos_ratio": neg_pos_ratio,
+                "val/rows": total_val_rows,
+                "test/rows": total_test_rows,
+                "window": WINDOW,
+                "cutoff_year": cutoff_year,
+                "max_year": max_year,
+                "train_years": f"{train_years[0]}-{train_years[1]}",
+                "val_years": f"{val_years[0]}-{val_years[1]}",
+                "test_years": f"{test_years[0]}-{test_years[1]}",
+                "timing/total_seconds": time.time() - start_time,
+            }
+            if future_years and EXPORT_FUTURE_SCORING:
+                log_dict["future_scoring/rows"] = future_rows
+                log_dict["future_scoring/years"] = f"{future_years[0]}-{future_years[1]}"
+            wandb.log(log_dict)
 
         print("\nDone.")
 

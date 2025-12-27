@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""LGBM Transition Model for Embeddings Dataset (0→1 Prediction)
-Train LightGBM on pre-split parquet files: train_embeddings (2018-2021), 
-val_embeddings (2022), test_embeddings (2023-2024). Final model trained on 2018-2021,
-with early stopping on 2022, evaluated on 2023-2024.
+"""LGBM Transition Model for Embeddings Dataset (Lookahead Window Prediction)
+Train LightGBM on pre-split parquet files with lookahead window target.
+Uses train_embeddings_win{WINDOW}, val_embeddings_win{WINDOW}, test_embeddings_win{WINDOW}.
+Target: transition_01_win{WINDOW} (1 if transition occurs within next WINDOW years, else 0)
+WINDOW defaults to 2 (can be set via WINDOW environment variable).
 """
 
 from __future__ import annotations
@@ -47,10 +48,10 @@ class Tee:
 
 # Configuration
 RANDOM_STATE = 42
-EXCLUDE_COLS = {'transition_01', 'WDPA_b1', 'WDPA_prev', 'x', 'y', 'row', 'col', 'year'}
-TRAIN_YEARS = (2018, 2021)   # Train: 2018-2021
-VAL_YEARS = (2022, 2022)     # Val: 2022
-TEST_YEARS = (2023, 2024)    # Test: 2023-2024
+WINDOW = int(os.environ.get("WINDOW", "2"))  # Lookahead window in years (must match preprocessing)
+TARGET_COL = f"transition_01_win{WINDOW}"  # Dynamic target column name
+EXCLUDE_COLS = {'transition_01', TARGET_COL, 'WDPA_b1', 'WDPA_prev', 'x', 'y', 'row', 'col', 'year'}
+# Note: TRAIN_YEARS, VAL_YEARS, TEST_YEARS are now dynamic based on WINDOW and loaded from metadata
 FIXED_PARAMS = {'random_state': RANDOM_STATE, 'boosting_type': 'gbdt', 'objective': 'binary', 'verbose': -1}
 
 # Utility Functions
@@ -150,9 +151,26 @@ def resolve_best_params_json() -> Optional[Path]:
     return params_path
 
 
+def resolve_metadata_file(filename: str) -> Optional[Path]:
+    """Locate metadata JSON file (prefer $SCRATCH if present)."""
+    repo_root = Path(__file__).resolve().parents[4]
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    candidates = []
+    if scratch_root is not None:
+        candidates.append(scratch_root / f"data/ml/{filename}")
+    candidates.append(repo_root / f"data/ml/{filename}")
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    return None
+
+
 def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
     """Load and merge parameters: FIXED_PARAMS → json_fixed_params → best_params → guardrails (fill missing only).
-    scale_pos_weight is excluded from JSON and will be computed from training data.
+    Hyperparameters are taken directly from JSON (including scale_pos_weight if present).
     If params_path is None, returns default manual hyperparameters."""
     if params_path is None:
         # Use default manual hyperparameters when JSON file is not found
@@ -166,11 +184,10 @@ def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
     with open(params_path, 'r') as f:
         params_data = json.load(f)
     
-    # Start with FIXED_PARAMS, then add JSON params (excluding scale_pos_weight)
+    # Start with FIXED_PARAMS, then add JSON params (including scale_pos_weight if present)
     json_fixed = params_data.get('fixed_params', {})
     json_best = params_data.get('best_params', {}).copy()
-    # Remove scale_pos_weight from JSON params - it will be computed from training data
-    json_best.pop('scale_pos_weight', None)
+    # Keep scale_pos_weight from JSON if present (will be used directly, not computed)
     
     final_params = {**FIXED_PARAMS, **json_fixed, **json_best}
     
@@ -232,8 +249,15 @@ def load_numpy_arrays_two_pass(
             target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
             year_array = batch_table['year'].to_numpy(zero_copy_only=False)
             
-            # Filter out NaN in target
-            valid_mask = ~np.isnan(target_array)
+            # Filter out NaN/null in target (handle both integer and float types)
+            if np.issubdtype(target_array.dtype, np.floating):
+                valid_mask = ~np.isnan(target_array)
+            else:
+                # For integer/boolean types, check for nulls using PyArrow null bitmap
+                valid_mask = np.ones(len(target_array), dtype=bool)
+                if batch_table[target_col].null_count > 0:
+                    null_bitmap = batch_table[target_col].is_null().to_numpy()
+                    valid_mask = ~null_bitmap
             if not valid_mask.any():
                 continue
             
@@ -271,8 +295,15 @@ def load_numpy_arrays_two_pass(
             target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
             year_array = batch_table['year'].to_numpy(zero_copy_only=False)
             
-            # Filter out NaN in target
-            valid_mask = ~np.isnan(target_array)
+            # Filter out NaN/null in target (handle both integer and float types)
+            if np.issubdtype(target_array.dtype, np.floating):
+                valid_mask = ~np.isnan(target_array)
+            else:
+                # For integer/boolean types, check for nulls using PyArrow null bitmap
+                valid_mask = np.ones(len(target_array), dtype=bool)
+                if batch_table[target_col].null_count > 0:
+                    null_bitmap = batch_table[target_col].is_null().to_numpy()
+                    valid_mask = ~null_bitmap
             if not valid_mask.any():
                 del batch_table, target_array, year_array, batch
                 continue
@@ -347,13 +378,14 @@ def compute_metrics(y_true: np.ndarray, y_proba: np.ndarray) -> Dict[str, float]
 def phase1_training(
     train_path: Path, val_path: Path, params_path: Optional[Path], feature_cols: list, keep_cols_train: list,
     best_params: Dict[str, Any], timestamp: str, model_dir: Path, output_dir: Path, use_wandb: bool, target_col: str,
+    train_years_range: tuple[int, int], val_years_range: tuple[int, int],
 ) -> tuple[Path, Dict[str, Any], Dict[str, Any], float, float, int, int, int, Dict[str, Any]]:
     """Phase 1: Training - loads train/val splits, trains model, saves it."""
     print("\n" + "="*70 + "\nPHASE 1: TRAINING\n" + "="*70)
     report_memory_usage("start of Phase 1")
-    print(f"\nSTEP A: LOAD TRAIN ({TRAIN_YEARS[0]}-{TRAIN_YEARS[1]})")
+    print(f"\nSTEP A: LOAD TRAIN ({train_years_range[0]}-{train_years_range[1]})")
     X_train, y_train, train_pos, train_neg, train_years = load_numpy_arrays_two_pass(
-        train_path, feature_cols, target_col, "train_embeddings.parquet")
+        train_path, feature_cols, target_col, f"train_embeddings_win{WINDOW}.parquet")
     n_train_full = len(y_train)
     train_stats = {
         "n_train": n_train_full,
@@ -364,20 +396,25 @@ def phase1_training(
     }
     report_memory_usage("after STEP A")
     
-    print(f"\nSTEP B: LOAD VAL ({VAL_YEARS[0]})")
+    print(f"\nSTEP B: LOAD VAL ({val_years_range[0]}-{val_years_range[1]})")
     X_val, y_val, val_pos, val_neg, val_years = load_numpy_arrays_two_pass(
-        val_path, feature_cols, target_col, "val_embeddings.parquet")
+        val_path, feature_cols, target_col, f"val_embeddings_win{WINDOW}.parquet")
     report_memory_usage("after STEP B")
     
-    print(f"\nSTEP C: TRAIN & EVALUATE\nTemporal split: train ({TRAIN_YEARS[0]}-{TRAIN_YEARS[1]}): {len(X_train):,} rows, val ({VAL_YEARS[0]}): {len(X_val):,} rows")
+    print(f"\nSTEP C: TRAIN & EVALUATE\nTemporal split: train ({train_years_range[0]}-{train_years_range[1]}): {len(X_train):,} rows, val ({val_years_range[0]}-{val_years_range[1]}): {len(X_val):,} rows")
     
-    # Compute scale_pos_weight from TRAIN only: n_neg / n_pos
+    # Use scale_pos_weight from best_params if present (from JSON), otherwise compute from TRAIN
     neg_pos_ratio = train_neg / train_pos if train_pos > 0 else 1.0
-    scale_pos_weight = neg_pos_ratio
+    if "scale_pos_weight" in best_params:
+        scale_pos_weight = best_params["scale_pos_weight"]
+        print(f"\nImbalance: ratio {neg_pos_ratio:.3f}, scale_pos_weight {scale_pos_weight:.6f} (from JSON params)")
+    else:
+        # Compute scale_pos_weight from TRAIN only: sqrt(n_neg / n_pos) to match preprocessing
+        scale_pos_weight = np.sqrt(neg_pos_ratio) if neg_pos_ratio > 0 else 1.0
+        print(f"\nImbalance: ratio {neg_pos_ratio:.3f}, scale_pos_weight {scale_pos_weight:.6f} (computed from TRAIN, sqrt of ratio)")
+        best_params["scale_pos_weight"] = scale_pos_weight
     
-    print(f"\nImbalance: ratio {neg_pos_ratio:.3f}, scale_pos_weight {scale_pos_weight:.6f} (n_neg/n_pos from TRAIN)")
     best_params["is_unbalance"] = False
-    best_params["scale_pos_weight"] = scale_pos_weight
     imbalance_info = {
         "neg": int(train_neg),
         "pos": int(train_pos),
@@ -443,7 +480,7 @@ def phase1_training(
     # Now free validation data and predictions
     del X_val, y_val, y_val_proba; gc.collect()
     
-    model_path = model_dir / f"modelE_lgbm_{timestamp}.pkl"
+    model_path = model_dir / f"modelE_lgbm_win{WINDOW}_{timestamp}.pkl"
     with open(model_path, 'wb') as f:
         pickle.dump(lgb_model, f)
     print(f"Model saved: {model_path}")
@@ -469,7 +506,7 @@ def phase2_testing(
     test_path: Path, model_path: Path, feature_cols: list, keep_cols_test: list, timestamp: str, output_dir: Path,
     use_wandb: bool, target_col: str, validation_metrics: Dict[str, Any], train_stats: Dict[str, Any],
     train_time: float, val_time: float, train_pos: int, train_neg: int, n_train_full: int,
-    best_params: Dict[str, Any], start_time: float, imbalance_info: Dict[str, Any],
+    best_params: Dict[str, Any], start_time: float, imbalance_info: Dict[str, Any], test_years_range: tuple[int, int],
 ) -> None:
     """Phase 2: Testing - loads test in batches, loads model, evaluates."""
     print("\n" + "="*70 + "\nPHASE 2: TESTING\n" + "="*70)
@@ -495,8 +532,15 @@ def phase2_testing(
             target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
             year_array = batch_table['year'].to_numpy(zero_copy_only=False)
             
-            # Filter out NaN in target
-            valid_mask = ~np.isnan(target_array)
+            # Filter out NaN/null in target (handle both integer and float types)
+            if np.issubdtype(target_array.dtype, np.floating):
+                valid_mask = ~np.isnan(target_array)
+            else:
+                # For integer/boolean types, check for nulls using PyArrow null bitmap
+                valid_mask = np.ones(len(target_array), dtype=bool)
+                if batch_table[target_col].null_count > 0:
+                    null_bitmap = batch_table[target_col].is_null().to_numpy()
+                    valid_mask = ~null_bitmap
             if valid_mask.any():
                 n_test_total += int(valid_mask.sum())
                 test_years_set.update(year_array[valid_mask].tolist())
@@ -520,9 +564,9 @@ def phase2_testing(
     # Get best iteration from model
     best_iteration = lgb_model.best_iteration
     
-    # Pass 2: Process batches and fill pre-allocated arrays
+    # Pass 2: Process batches and fill pre-allocated arrays (NumPy/Arrow approach, no pandas)
     parquet_file = pq.ParquetFile(test_path)
-    scored_path = output_dir / f"modelE_lgbm_scored_{timestamp}.parquet"
+    scored_path = output_dir / f"modelE_lgbm_win{WINDOW}_scored_{timestamp}.parquet"
     writer = None
     test_pos = test_neg = batch_num = idx_offset = 0
     pred_start = time.time()
@@ -530,36 +574,71 @@ def phase2_testing(
     try:
         for batch in parquet_file.iter_batches(batch_size=batch_size, columns=keep_cols_test):
             batch_num += 1
-            batch_df = batch.to_pandas().dropna(subset=[target_col])
-            if len(batch_df) == 0:
+            batch_table = batch
+            
+            # Extract target array and filter nulls (same approach as Phase 1)
+            target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+            if np.issubdtype(target_array.dtype, np.floating):
+                valid_mask = ~np.isnan(target_array)
+            else:
+                # For integer/boolean types, check for nulls using PyArrow null bitmap
+                valid_mask = np.ones(len(target_array), dtype=bool)
+                if batch_table[target_col].null_count > 0:
+                    null_bitmap = batch_table[target_col].is_null().to_numpy()
+                    valid_mask = ~null_bitmap
+            
+            if not valid_mask.any():
+                del batch_table, target_array, batch
                 continue
-            downcast_numeric_dtypes(batch_df)
-            y_batch = (batch_df[target_col] > 0).astype(np.int8)
-            X_batch = batch_df[feature_cols].copy()
+            
+            # Extract valid target values
+            target_valid = target_array[valid_mask]
+            y_batch = (target_valid > 0).astype(np.int8)
+            
+            # Extract feature columns directly from PyArrow (no pandas)
+            feature_arrays = []
+            for col in feature_cols:
+                col_array = batch_table[col].to_numpy(zero_copy_only=False)
+                col_valid = col_array[valid_mask]
+                # Convert to float32 (NaN values preserved for LightGBM to handle)
+                col_float32 = col_valid.astype(np.float32)
+                feature_arrays.append(col_float32)
+            
+            # Stack features into matrix
+            X_batch = np.column_stack(feature_arrays)
+            
             # Get predictions from model
             y_proba_batch = lgb_model.predict(X_batch, num_iteration=best_iteration if best_iteration else None).astype(np.float32)
             
             # Fill pre-allocated arrays directly
             batch_size_actual = len(y_batch)
-            y_test[idx_offset:idx_offset + batch_size_actual] = y_batch.values
+            y_test[idx_offset:idx_offset + batch_size_actual] = y_batch
             y_proba[idx_offset:idx_offset + batch_size_actual] = y_proba_batch
             idx_offset += batch_size_actual
             
             test_pos += int(y_batch.sum())
             test_neg += int((y_batch == 0).sum())
             
-            result_dict = {'row': batch_df['row'].values, 'col': batch_df['col'].values, 'year': batch_df['year'].values,
-                          'y_true': y_batch.values, 'y_pred_proba': y_proba_batch}
+            # Build result arrays for writing (extract directly from PyArrow)
+            result_arrays = {
+                'row': batch_table['row'].to_numpy(zero_copy_only=False)[valid_mask],
+                'col': batch_table['col'].to_numpy(zero_copy_only=False)[valid_mask],
+                'year': batch_table['year'].to_numpy(zero_copy_only=False)[valid_mask],
+                'y_true': y_batch,
+                'y_pred_proba': y_proba_batch
+            }
             for col in ['x', 'y']:
-                if col in batch_df.columns:
-                    result_dict[col] = batch_df[col].values
-            result_df = pd.DataFrame(result_dict)
-            result_table = pa.Table.from_pandas(result_df, preserve_index=False)
+                if col in keep_cols_test:
+                    result_arrays[col] = batch_table[col].to_numpy(zero_copy_only=False)[valid_mask]
+            
+            # Create PyArrow table directly from arrays (no pandas intermediate)
+            result_table = pa.table(result_arrays)
             if writer is None:
                 writer = pq.ParquetWriter(scored_path, result_table.schema)
                 print(f"Writing to {scored_path}")
             writer.write_table(result_table)
-            del batch_df, X_batch, y_batch, y_proba_batch, result_df, result_table, batch
+            
+            del batch_table, target_array, target_valid, feature_arrays, X_batch, y_batch, y_proba_batch, result_arrays, result_table, batch
             # More aggressive garbage collection during batch processing
             gc.collect()
             if batch_num % 10 == 0:
@@ -622,7 +701,9 @@ def phase2_testing(
         "metadata": {
             "timestamp": timestamp, 
             "model": "LightGBM", 
-            "task": "transition_01_prediction",
+            "task": f"{TARGET_COL}_prediction",
+            "target_column": TARGET_COL,
+            "window": WINDOW,
             "random_state": RANDOM_STATE, 
             "n_features": len(feature_cols), 
             "features": feature_cols,
@@ -637,10 +718,8 @@ def phase2_testing(
             "test_negatives": test_neg
         },
         "temporal_split": {
-            "method": "strict_temporal_split", 
-            "train_years": list(TRAIN_YEARS),
-            "val_years": list(VAL_YEARS), 
-            "test_years": list(TEST_YEARS)
+            "method": "strict_temporal_split_window", 
+            "window": WINDOW,
         },
         "validation_performance": validation_metrics, 
         "model_parameters": best_params,
@@ -662,7 +741,7 @@ def phase2_testing(
         }
     }
     metrics = convert_numpy_types(metrics)
-    metrics_path = output_dir / f"modelE_lgbm_metrics_{timestamp}.json"
+    metrics_path = output_dir / f"modelE_lgbm_win{WINDOW}_metrics_{timestamp}.json"
     with open(metrics_path, 'w') as f:
         json.dump(metrics, f, indent=2)
     print(f"\nMetrics saved: {metrics_path}")
@@ -671,8 +750,8 @@ def phase2_testing(
     total_time = time.time() - start_time
     print("\n" + "="*70 + "\nSUMMARY\n" + "="*70)
     print(f"Model: LightGBM, {len(feature_cols)} features")
-    print(f"Validation ({TRAIN_YEARS[0]}-{TRAIN_YEARS[1]}→{VAL_YEARS[0]}): PR-AUC {validation_metrics['pr_auc']:.4f}, ROC-AUC {validation_metrics['roc_auc']:.4f}")
-    print(f"Test ({TEST_YEARS[0]}-{TEST_YEARS[1]}, {n_test_total:,} samples, {test_pos/n_test_total*100:.3f}% pos): ROC-AUC {test_metrics['roc_auc']:.4f}, PR-AUC {test_metrics['pr_auc']:.4f}")
+    print(f"Validation: PR-AUC {validation_metrics['pr_auc']:.4f}, ROC-AUC {validation_metrics['roc_auc']:.4f}")
+    print(f"Test ({test_years_range[0]}-{test_years_range[1]}, {n_test_total:,} samples, {test_pos/n_test_total*100:.3f}% pos): ROC-AUC {test_metrics['roc_auc']:.4f}, PR-AUC {test_metrics['pr_auc']:.4f}")
     print(f"  P@1%: {prec_at_k[1]:.4f} ({test_metrics['lift_at_1pct']:.1f}x), P@5%: {prec_at_k[5]:.4f} ({test_metrics['lift_at_5pct']:.1f}x), P@10%: {prec_at_k[10]:.4f} ({test_metrics['lift_at_10pct']:.1f}x)")
     print(f"Timings: train {train_time:.1f}s, val {val_time:.1f}s, pred {pred_time:.1f}s, total {total_time:.1f}s ({total_time/60:.1f}m)")
     print("="*70 + "\nDone.")
@@ -689,14 +768,43 @@ def phase2_testing(
 def main(timestamp: str) -> None:
     start_time = time.time()
     repo_root = Path(__file__).resolve().parents[4]
-    train_path = resolve_parquet_file("train_embeddings.parquet")
-    val_path = resolve_parquet_file("val_embeddings.parquet")
-    test_path = resolve_parquet_file("test_embeddings.parquet")
+    train_path = resolve_parquet_file(f"train_embeddings_win{WINDOW}.parquet")
+    val_path = resolve_parquet_file(f"val_embeddings_win{WINDOW}.parquet")
+    test_path = resolve_parquet_file(f"test_embeddings_win{WINDOW}.parquet")
     params_path = resolve_best_params_json()
+    metadata_path = resolve_metadata_file(f"train_embeddings_win{WINDOW}_metadata.json")
     output_dir = repo_root / "outputs/Results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
     model_dir = repo_root / "data/ml/models"
     model_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\nConfiguration:")
+    print(f"  WINDOW: {WINDOW} years")
+    print(f"  Target column: {TARGET_COL}")
+    
+    # Load split years and other metadata
+    train_years_range = None
+    val_years_range = None
+    test_years_range = None
+    if metadata_path:
+        try:
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+                train_years_range = tuple(metadata.get("train_years", [2018, 2020]))
+                val_years_range = tuple(metadata.get("val_years", [2021, 2021]))
+                test_years_range = tuple(metadata.get("test_years", [2022, 2022]))
+                print(f"\nLoaded metadata from {metadata_path}")
+                print(f"  Train years: {train_years_range[0]}-{train_years_range[1]}")
+                print(f"  Val years: {val_years_range[0]}-{val_years_range[1]}")
+                print(f"  Test years: {test_years_range[0]}-{test_years_range[1]}")
+        except Exception as e:
+            print(f"\nWarning: Could not load metadata from {metadata_path}: {e}")
+    
+    # Fallback to defaults if metadata not available
+    if train_years_range is None:
+        train_years_range = (2018, 2020)
+        val_years_range = (2021, 2021)
+        test_years_range = (2022, 2022)
     
     use_wandb = False
     if wandb is not None:
@@ -704,15 +812,17 @@ def main(timestamp: str) -> None:
             wandb.init(
             project="ml-training-embeddings", 
             entity=os.environ.get("WANDB_ENTITY"), 
-            name=f"modelE_lgbm_{timestamp}",
+            name=f"modelE_lgbm_win{WINDOW}_{timestamp}",
             config={
                 "model": "LightGBM", 
-                "task": "transition_01_prediction", 
+                "task": f"{TARGET_COL}_prediction", 
+                "target_column": TARGET_COL,
+                "window": WINDOW,
                 "random_state": RANDOM_STATE,
                 "temporal_split": {
-                    "train_years": list(TRAIN_YEARS), 
-                    "val_years": list(VAL_YEARS),
-                    "test_years": list(TEST_YEARS)
+                    "train_years": list(train_years_range), 
+                    "val_years": list(val_years_range),
+                    "test_years": list(test_years_range)
                 }
             }
             )
@@ -723,7 +833,7 @@ def main(timestamp: str) -> None:
     else:
         print("W&B not available (module not installed)")
     
-    print("="*70 + "\nLGBM TRANSITION MODEL (EMBEDDINGS DATASET)\n" + "="*70)
+    print("="*70 + f"\nLGBM TRANSITION MODEL (EMBEDDINGS DATASET - {WINDOW}-YEAR LOOKAHEAD)\n" + "="*70)
     print(f"Train: {train_path}\nVal: {val_path}\nTest: {test_path}\nParams: {params_path if params_path else 'Using default manual hyperparameters'}\nOutput: {output_dir}")
     
     best_params, best_cv_score = load_best_params(params_path)
@@ -736,13 +846,13 @@ def main(timestamp: str) -> None:
     
     all_cols_train = pq.ParquetFile(train_path).schema_arrow.names
     all_cols_test = pq.ParquetFile(test_path).schema_arrow.names
-    target_col = "transition_01"
+    target_col = TARGET_COL
     # Build feature columns from PyArrow schema only (avoid loading full parquet into pandas)
     schema = pq.ParquetFile(train_path).schema_arrow
     numeric_cols = [
         name
         for name, field in zip(schema.names, schema)
-        if pa.types.is_integer(field.type) or pa.types.is_floating(field.type)
+        if pa.types.is_integer(field.type) or pa.types.is_floating(field.type) or pa.types.is_boolean(field.type)
     ]
     # Exclude target and coordinates from features (year is excluded)
     feature_cols = [c for c in numeric_cols if c not in EXCLUDE_COLS]
@@ -751,14 +861,16 @@ def main(timestamp: str) -> None:
     keep_cols_train = feature_cols + required_cols + optional_cols
     keep_cols_test = feature_cols + required_cols + [col for col in ['x', 'y'] if col in all_cols_test]
     print(f"Selected {len(feature_cols)} features, loading {len(keep_cols_train)} cols from train, {len(keep_cols_test)} from test")
+    print(f"Target column: {target_col}")
     
     (model_path, validation_metrics, train_stats, train_time, val_time, train_pos, train_neg, n_train_full, imbalance_info) = phase1_training(
-        train_path, val_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col)
+        train_path, val_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col,
+        train_years_range, val_years_range)
     
     phase2_testing(
         test_path, model_path, feature_cols, keep_cols_test, timestamp, output_dir, use_wandb, target_col,
         validation_metrics, train_stats, train_time, val_time, train_pos, train_neg, n_train_full,
-        best_params, start_time, imbalance_info)
+        best_params, start_time, imbalance_info, test_years_range)
 
 
 if __name__ == "__main__":
@@ -766,7 +878,7 @@ if __name__ == "__main__":
     output_dir = repo_root / "outputs/Results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"modelE_lgbm_{timestamp}.txt"
+    output_file = output_dir / f"modelE_lgbm_win{WINDOW}_{timestamp}.txt"
     tee = Tee(output_file)
     sys.stdout = tee
     try:

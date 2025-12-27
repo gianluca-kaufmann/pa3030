@@ -1,45 +1,30 @@
 #!/usr/bin/env python3
 """
 Embeddings Transition Features Preprocessing
-============================================
 
-Objective:
-    Create transition dataset from embeddings panel data using the same target logic
-    as spatial_features_preprocessing. Filters to risk set (WDPA_prev==0) and creates
-    transition_01 = WDPA_b1 (same-year target).
+Creates transition dataset from embeddings panel data. Filters to risk set (WDPA_prev==0)
+and creates transition_01 = WDPA_b1 (same-year target). Uses DuckDB with explicit year-1
+joins to compute WDPA_prev and dist_wdpa. Outputs 2018-2024 data with embeddings.
 
 Inputs:
-    - `data/ml/SatelliteEmbeddings_SA_1km_2017.parquet` (2017 data for WDPA_prev computation)
-    - `data/ml/SatelliteEmbeddings_SA_1km_2018-2024.parquet` (2018-2024 data, contains WDPA_b1 + embeddings)
-
-    Processing (using DuckDB window functions on thin table, then join):
-    1. Extract thin table (row, col, year, WDPA_b1) from all input files
-    2. For each pixel (row, col), compute on thin table:
-       - WDPA_prev: LAG(WDPA_b1) OVER (PARTITION BY row, col ORDER BY year)
-         (2017 defaults to 0, 2018 uses 2017's WDPA_b1)
-    3. Filter to risk set: WDPA_prev = 0 (pixels not previously protected at t-1)
-    4. Create target variable:
-       - transition_01 = WDPA_b1 (NaN treated as 0), stored as uint8
-       - This is the same-year target: if unprotected at t-1, did you become protected at t?
-    5. Filter to year range: 2018-2024 (2017 excluded, only used for WDPA_prev)
-    6. Join embeddings back from original files
-    7. Optionally process per-year and merge (enabled by default for memory efficiency)
-    8. Year splits: train (2018-2021), val (2022), test (2023), test_late (2024)
+    - data/ml/SatelliteEmbeddings_SA_1km_2017.parquet (2017 data for WDPA_prev computation)
+    - data/ml/SatelliteEmbeddings_SA_1km_2018-2024.parquet (2018-2024 data with embeddings)
 
 Outputs:
-    - `data/ml/embeddings_transition_panel_2018-2024.parquet` (main dataset)
-    - Class balance summary (printed to stdout)
-    - Precision@K-ready scoring keys (row, col, year columns preserved)
+    - data/ml/embeddings_transition_panel_2018-2024.parquet
 """
 
 import sys
 import os
 import logging
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 import time
 
 import duckdb
+import numpy as np
+import pandas as pd
+from scipy.ndimage import distance_transform_edt
 
 # Configure logging
 logging.basicConfig(
@@ -67,59 +52,158 @@ VAL_YEARS = [2022]
 TEST_YEARS = [2023]
 TEST_LATE_YEARS = [2024]
 
-# Year range for input (2017-2024, includes 2017 for WDPA_prev computation)
-INPUT_YEARS = list(range(2017, 2025))  # 2017-2024
-# Year range for output (2018-2024, 2017 excluded as it's only for WDPA_prev)
-OUTPUT_YEARS = list(range(2018, 2025))  # 2018-2024
+OUTPUT_YEARS = list(range(2018, 2025))  # 2018-2024 (2017 excluded, only used for WDPA_prev)
+
+
+def reconstruct_grid(df: pd.DataFrame, value_col: str, 
+                     extent: Tuple[int, int, int, int] = None) -> Tuple[np.ndarray, int, int, int, int]:
+    """Reconstruct 2D grid from panel data. Fixed extent ensures consistent distance transforms."""
+    if extent is not None:
+        min_row, max_row, min_col, max_col = extent
+    else:
+        min_row, max_row = df['row'].min(), df['row'].max()
+        min_col, max_col = df['col'].min(), df['col'].max()
+    
+    grid = np.full((max_row - min_row + 1, max_col - min_col + 1), np.nan, dtype=np.float32)
+    row_indices = (df['row'] - min_row).values
+    col_indices = (df['col'] - min_col).values
+    valid_mask = (row_indices >= 0) & (row_indices < grid.shape[0]) & (col_indices >= 0) & (col_indices < grid.shape[1])
+    grid[row_indices[valid_mask], col_indices[valid_mask]] = df[value_col].values[valid_mask]
+    return grid, min_row, max_row, min_col, max_col
+
+
+def grid_to_dataframe(grid: np.ndarray, df: pd.DataFrame, min_row: int, min_col: int) -> pd.Series:
+    """Convert grid back to DataFrame format."""
+    values = grid[(df['row'] - min_row).values, (df['col'] - min_col).values]
+    return pd.Series(values, index=df.index)
+
+
+def build_wdpa_prev_cte(thin_union_query: str) -> str:
+    """Build CTE for WDPA_prev using explicit year-1 join (more robust than LAG)."""
+    return f"""
+        thin_data AS (
+            {thin_union_query}
+        ),
+        with_wdpa_prev AS (
+            SELECT 
+                curr.row,
+                curr.col,
+                curr.year,
+                curr.WDPA_b1,
+                COALESCE(prev.WDPA_b1, 0) AS WDPA_prev
+            FROM thin_data curr
+            LEFT JOIN thin_data prev
+                ON curr.row = prev.row
+                AND curr.col = prev.col
+                AND prev.year = curr.year - 1
+        )"""
+
+
+def get_full_spatial_extent(con: duckdb.DuckDBPyConnection, thin_union_query: str) -> Tuple[int, int, int, int]:
+    """Get full spatial extent across all years for consistent distance transforms."""
+    query = f"""
+        WITH thin_data AS (
+            {thin_union_query}
+        )
+        SELECT 
+            MIN(row) AS min_row,
+            MAX(row) AS max_row,
+            MIN(col) AS min_col,
+            MAX(col) AS max_col
+        FROM thin_data
+    """
+    result = con.execute(query).fetchone()
+    return (int(result[0]), int(result[1]), int(result[2]), int(result[3]))
+
+
+def compute_dist_wdpa_for_year(con: duckdb.DuckDBPyConnection, thin_union_query: str, year: int,
+                               extent: Tuple[int, int, int, int]) -> pd.DataFrame:
+    """Compute dist_wdpa for year using WDPA_prev (t-1) on full grid to avoid target leakage.
+    
+    Missing grid cells are excluded from distance transform calculation to avoid bias.
+    Only cells that exist in the input panel are included in the distance computation.
+    """
+    logger.info(f"    Computing dist_wdpa for year {year}...")
+    
+    wdpa_prev_cte = build_wdpa_prev_cte(thin_union_query)
+    df_year = con.execute(f"""
+        WITH {wdpa_prev_cte}
+        SELECT row, col, WDPA_prev
+        FROM with_wdpa_prev
+        WHERE year = {year}
+    """).df()
+    
+    if len(df_year) == 0:
+        logger.warning(f"      No data for year {year}")
+        return pd.DataFrame(columns=['row', 'col', 'dist_wdpa'])
+    
+    wdpa_grid, min_row, max_row, min_col, max_col = reconstruct_grid(df_year, 'WDPA_prev', extent=extent)
+    has_data_mask = ~np.isnan(wdpa_grid)
+    
+    # Create binary grid for distance transform only on valid observed cells:
+    # 0 = protected (WDPA, source for distance calculation)
+    # 1 = unprotected (compute distance to)
+    # Missing cells are excluded entirely - they don't participate in the distance calculation
+    # Strategy: Set missing cells to 1 (obstacles) so they block distance propagation,
+    # but we'll mask them out from the final result so they don't get distance values
+    distance_input_binary = np.ones_like(wdpa_grid, dtype=np.uint8)
+    # Set protected cells as sources (0)
+    protected_mask = has_data_mask & (wdpa_grid > 0)
+    distance_input_binary[protected_mask] = 0
+    # Unprotected valid cells remain 1 (compute distance to)
+    # Missing cells are set to 1 (act as obstacles/barriers) to prevent distance propagation through them
+    # Note: They'll be treated as targets by distance_transform_edt, but we'll exclude them from output
+    
+    # Compute distance transform: distance from protected (0) to unprotected (1)
+    # Missing cells (value 1) will get distance values computed, but we'll mask them out
+    # They act as obstacles, so distances won't propagate through missing regions
+    distance_result = distance_transform_edt(distance_input_binary) * 1000  # pixels to meters
+    
+    # Initialize output grid with NaN - missing cells remain NaN and are excluded
+    distance_grid = np.full_like(wdpa_grid, np.nan, dtype=np.float32)
+    
+    # Only write distances for valid cells that existed in input panel
+    # Protected cells have distance 0
+    distance_grid[protected_mask] = 0.0
+    # Unprotected valid cells get computed distance
+    unprotected_mask = has_data_mask & (wdpa_grid == 0)
+    distance_grid[unprotected_mask] = distance_result[unprotected_mask]
+    # Missing cells remain NaN (explicitly set - they are excluded from both WDPA and non-WDPA space)
+    distance_grid[~has_data_mask] = np.nan
+    
+    del wdpa_grid, has_data_mask, distance_input_binary, distance_result
+    df_year['dist_wdpa'] = grid_to_dataframe(distance_grid, df_year, min_row, min_col)
+    del distance_grid
+    return df_year[['row', 'col', 'dist_wdpa']].copy()
 
 
 def report_memory_usage(label: str = "") -> None:
     """Report current memory usage."""
     try:
         import psutil
-        process = psutil.Process()
-        mem_info = process.memory_info()
-        mem_gb = mem_info.rss / 1024**3
+        mem_gb = psutil.Process().memory_info().rss / 1024**3
         logger.info(f"  [Memory {label}] RSS: {mem_gb:.2f} GB")
     except ImportError:
-        pass  # psutil not available
+        pass
 
 
 def setup_duckdb() -> duckdb.DuckDBPyConnection:
     """Configure and return a DuckDB connection."""
     con = duckdb.connect()
-    
-    # Configure DuckDB settings - use 1 thread and 8-12GB memory limit
-    # Allow override via environment variable, default to 10GB (middle of 8-12GB range)
-    memory_limit_gb = int(os.environ.get("DUCKDB_MEMORY_LIMIT_GB", "10"))
-    # Clamp to 8-12GB range
-    memory_limit_gb = max(8, min(12, memory_limit_gb))
-    
+    memory_limit_gb = max(8, min(12, int(os.environ.get("DUCKDB_MEMORY_LIMIT_GB", "10"))))
     con.execute("SET threads=1")
     con.execute("SET preserve_insertion_order=false")
     con.execute(f"SET memory_limit='{memory_limit_gb}GB'")
     
-    # Ensure temp directory exists
-    temp_dir = os.environ.get("SCRATCH") or (PROJECT_ROOT / "temp")
-    if isinstance(temp_dir, str):
-        temp_dir = Path(temp_dir)
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Create duckdb_temp subdirectory
+    temp_dir = Path(os.environ.get("SCRATCH") or (PROJECT_ROOT / "temp"))
     duckdb_temp_dir = temp_dir / "duckdb_temp"
     duckdb_temp_dir.mkdir(parents=True, exist_ok=True)
-    
     temp_dir_sql = str(duckdb_temp_dir).replace("'", "''")
     con.execute(f"SET temp_directory='{temp_dir_sql}'")
     
-    # Set max_temp_directory_size
     max_temp_size = os.environ.get("DUCKDB_MAX_TEMP_SIZE", "100GB")
     con.execute(f"PRAGMA max_temp_directory_size='{max_temp_size}'")
-    
-    logger.info(f"DuckDB configured: 1 thread, {memory_limit_gb}GB memory limit")
-    logger.info(f"  Temp directory: {duckdb_temp_dir}")
-    logger.info(f"  Temp directory size limit: {max_temp_size}")
-    
+    logger.info(f"DuckDB configured: 1 thread, {memory_limit_gb}GB memory, temp: {duckdb_temp_dir}")
     return con
 
 
@@ -133,266 +217,226 @@ def validate_input(input_paths: List[Path]) -> None:
             raise FileNotFoundError(f"Input file not found: {input_path}")
         logger.info(f"  Found: {input_path.name}")
     
-    # Quick check with DuckDB - combine all files
     con = duckdb.connect()
     escaped_paths = [str(p).replace("'", "''") for p in input_paths]
-    
-    # Build UNION ALL query to combine all files
     union_query = " UNION ALL ".join([f"SELECT * FROM read_parquet('{ep}')" for ep in escaped_paths])
-    
-    # Get basic stats (removed DISTINCT pixel count for performance)
     stats = con.execute(f"""
-        SELECT 
-            COUNT(*) AS total_rows,
-            COUNT(DISTINCT year) AS num_years,
-            MIN(year) AS min_year,
-            MAX(year) AS max_year
+        SELECT COUNT(*) AS total_rows, COUNT(DISTINCT year) AS num_years,
+               MIN(year) AS min_year, MAX(year) AS max_year
         FROM ({union_query}) t
     """).fetchone()
     
     total_rows, num_years, min_year, max_year = stats
-    
     elapsed = time.time() - start_time
-    logger.info(f"  Total rows: {total_rows:,}")
-    logger.info(f"  Years: {num_years} ({min_year}-{max_year})")
-    logger.info(f"  Validated in {elapsed:.1f}s")
-    
+    logger.info(f"  Total rows: {total_rows:,}, Years: {num_years} ({min_year}-{max_year}), Validated in {elapsed:.1f}s")
     con.close()
     report_memory_usage("after validation")
 
 
 def process_with_duckdb(con: duckdb.DuckDBPyConnection, input_paths: List[Path], output_path: Path) -> None:
-    """
-    Process the dataset using DuckDB window functions on thin table, then join embeddings.
-    
-    Steps:
-    1. Extract thin table (row, col, year, WDPA_b1) from all input files
-    2. Compute WDPA_prev using LAG window function on thin table (first year defaults to 0)
-    3. Filter to risk set (WDPA_prev = 0) - pixels not previously protected at t-1
-    4. Create transition_01 = WDPA_b1 (NaN treated as 0) - same-year target
-    5. Filter to year range (2018-2024)
-    6. Join embeddings back from original files
-    7. Write to Parquet (optionally per-year, then merge)
-    """
-    logger.info("Processing with DuckDB window functions (thin table + join)...")
+    """Process dataset using DuckDB: thin table -> WDPA_prev -> dist_wdpa -> join embeddings."""
+    logger.info("Processing with DuckDB...")
     start_time = time.time()
-    
-    # Ensure output directory exists
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
     escaped_inputs = [str(p).replace("'", "''") for p in input_paths]
     escaped_output = str(output_path).replace("'", "''")
-    
-    # Build UNION ALL query for thin table (row, col, year, WDPA_b1 only)
     thin_union_query = " UNION ALL ".join([
-        f"SELECT row, col, year, WDPA_b1 FROM read_parquet('{ep}')" 
-        for ep in escaped_inputs
+        f"SELECT row, col, year, WDPA_b1 FROM read_parquet('{ep}')" for ep in escaped_inputs
     ])
     
-    # Get embedding column names from first input file (they should be consistent)
-    columns = con.execute(f"""
-        DESCRIBE SELECT * FROM read_parquet('{escaped_inputs[0]}') LIMIT 0
-    """).fetchall()
-    
-    # Extract embedding column names (all columns except row, col, year, WDPA_b1, x, y)
+    columns = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{escaped_inputs[1]}') LIMIT 0").fetchall()
     exclude_cols = {'row', 'col', 'year', 'WDPA_b1', 'x', 'y'}
-    embedding_cols = [col[0] for col in columns if col[0] not in exclude_cols]
+    embedding_cols = [col[0] for col in columns if col[0] not in exclude_cols and col[0].startswith('emb_')]
     embedding_cols_str = ', '.join([f"e.{col}" for col in embedding_cols])
     
     logger.info(f"  Found {len(embedding_cols)} embedding columns")
+    full_extent = get_full_spatial_extent(con, thin_union_query)
+    logger.info(f"  Spatial extent: rows {full_extent[0]}-{full_extent[1]}, cols {full_extent[2]}-{full_extent[3]}")
     
-    # Check if per-year processing is enabled (default: True for memory efficiency)
     use_per_year = os.environ.get("DUCKDB_PER_YEAR_PROCESSING", "true").lower() == "true"
-    
     if use_per_year:
-        logger.info("  Using per-year processing for memory efficiency...")
-        _process_per_year(con, input_paths, output_path, thin_union_query, embedding_cols, embedding_cols_str)
+        _process_per_year(con, input_paths, output_path, thin_union_query, embedding_cols, embedding_cols_str, full_extent)
     else:
-        logger.info("  Using single-pass processing...")
-        _process_single_pass(con, input_paths, output_path, thin_union_query, embedding_cols, embedding_cols_str)
+        _process_single_pass(con, input_paths, output_path, thin_union_query, embedding_cols, embedding_cols_str, full_extent)
     
     elapsed = time.time() - start_time
     file_size_mb = output_path.stat().st_size / (1024**2)
-    
-    logger.info(f"  Processed and saved in {elapsed:.1f}s")
-    logger.info(f"  File size: {file_size_mb:.1f} MB")
-    
-    # Get column info
-    columns = con.execute(f"""
-        DESCRIBE SELECT * FROM read_parquet('{escaped_output}') LIMIT 0
-    """).fetchall()
-    
-    logger.info(f"  Columns: {len(columns)} total")
-    logger.info(f"  Column names: {', '.join([col[0] for col in columns[:10]])}" + 
-                (f", ... and {len(columns) - 10} more" if len(columns) > 10 else ""))
-    
+    cols = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{escaped_output}') LIMIT 0").fetchall()
+    col_names = ', '.join([c[0] for c in cols[:10]])
+    logger.info(f"  Processed in {elapsed:.1f}s, {file_size_mb:.1f} MB, {len(cols)} columns ({col_names}{', ...' if len(cols) > 10 else ''})")
     report_memory_usage("after processing")
 
 
 def _process_single_pass(con: duckdb.DuckDBPyConnection, input_paths: List[Path], 
                          output_path: Path, thin_union_query: str, 
-                         embedding_cols: List[str], embedding_cols_str: str) -> None:
+                         embedding_cols: List[str], embedding_cols_str: str,
+                         full_extent: Tuple[int, int, int, int]) -> None:
     """Process all years in a single pass."""
     escaped_inputs = [str(p).replace("'", "''") for p in input_paths]
     escaped_output = str(output_path).replace("'", "''")
+    embeddings_union_query = " UNION ALL ".join([f"SELECT * FROM read_parquet('{ep}')" for ep in escaped_inputs])
+    embedding_not_null_conditions = ' AND '.join([f"e.{col} IS NOT NULL" for col in embedding_cols])
     
-    # Build UNION ALL query for embeddings (all columns)
-    embeddings_union_query = " UNION ALL ".join([
-        f"SELECT * FROM read_parquet('{ep}')" for ep in escaped_inputs
-    ])
+    logger.info("  Computing dist_wdpa for all years...")
+    temp_output_dir = output_path.parent / f"{output_path.stem}_temp"
+    temp_output_dir.mkdir(parents=True, exist_ok=True)
+    dist_wdpa_temp_files = []
     
-    # Process: thin table -> transitions -> join embeddings
-    processing_query = f"""
-    COPY (
-        WITH thin_data AS (
-            {thin_union_query}
-        ),
-        with_lag AS (
-            SELECT 
-                row,
-                col,
-                year,
-                WDPA_b1,
-                COALESCE(LAG(WDPA_b1) OVER (PARTITION BY row, col ORDER BY year), 0) AS WDPA_prev
-            FROM thin_data
-        ),
-        transitions AS (
-            SELECT 
-                row,
-                col,
-                year,
-                WDPA_b1,
-                WDPA_prev,
-                CAST(COALESCE(WDPA_b1, 0) AS UINT8) AS transition_01
-            FROM with_lag
-            WHERE 
-                WDPA_prev = 0
-                AND year BETWEEN 2018 AND 2024
-        ),
-        embeddings AS (
-            {embeddings_union_query}
-        )
-        SELECT 
-            t.row,
-            t.col,
-            t.year,
-            t.WDPA_b1,
-            t.WDPA_prev,
-            t.transition_01,
-            {embedding_cols_str}
-        FROM transitions t
-        INNER JOIN embeddings e
-            ON t.row = e.row 
-            AND t.col = e.col 
-            AND t.year = e.year
-    ) TO '{escaped_output}' (FORMAT PARQUET, COMPRESSION 'snappy')
-    """
+    try:
+        for year in OUTPUT_YEARS:
+            dist_wdpa_df = compute_dist_wdpa_for_year(con, thin_union_query, year, full_extent)
+            dist_wdpa_temp_file = temp_output_dir / f"dist_wdpa_{year}.parquet"
+            dist_wdpa_df.to_parquet(dist_wdpa_temp_file, engine='pyarrow', compression='snappy', index=False)
+            dist_wdpa_temp_files.append(dist_wdpa_temp_file)
+        
+        escaped_dist_wdpa_files = [str(f).replace("'", "''") for f in dist_wdpa_temp_files]
+        dist_wdpa_union_query = " UNION ALL ".join([f"SELECT * FROM read_parquet('{ef}')" for ef in escaped_dist_wdpa_files])
+        
+        wdpa_prev_cte = build_wdpa_prev_cte(thin_union_query)
+        rows_before = con.execute(f"""
+            WITH {wdpa_prev_cte},
+            with_dist AS (
+                SELECT wl.row, wl.col, wl.year, wl.WDPA_b1, wl.WDPA_prev,
+                       CAST(COALESCE(wl.WDPA_b1, 0) AS UINT8) AS transition_01, d.dist_wdpa
+                FROM with_wdpa_prev wl
+                LEFT JOIN ({dist_wdpa_union_query}) d ON wl.row = d.row AND wl.col = d.col
+                WHERE wl.WDPA_prev = 0 AND wl.year BETWEEN 2018 AND 2024
+            ),
+            embeddings AS ({embeddings_union_query}),
+            joined AS (
+                SELECT t.row, t.col, t.year, t.WDPA_b1, t.WDPA_prev, t.transition_01, t.dist_wdpa, {embedding_cols_str}
+                FROM with_dist t
+                INNER JOIN embeddings e ON t.row = e.row AND t.col = e.col AND t.year = e.year
+            )
+            SELECT COUNT(*) FROM joined
+        """).fetchone()[0]
+        logger.info(f"  Rows before embedding NULL filter: {rows_before:,}")
+        
+        con.execute(f"""
+        COPY (
+            WITH {wdpa_prev_cte},
+            with_dist AS (
+                SELECT wl.row, wl.col, wl.year, wl.WDPA_b1, wl.WDPA_prev,
+                       CAST(COALESCE(wl.WDPA_b1, 0) AS UINT8) AS transition_01, d.dist_wdpa
+                FROM with_wdpa_prev wl
+                LEFT JOIN ({dist_wdpa_union_query}) d ON wl.row = d.row AND wl.col = d.col
+                WHERE wl.WDPA_prev = 0 AND wl.year BETWEEN 2018 AND 2024
+            ),
+            embeddings AS ({embeddings_union_query})
+            SELECT t.row, t.col, t.year, t.WDPA_b1, t.WDPA_prev, t.transition_01, t.dist_wdpa, {embedding_cols_str}
+            FROM with_dist t
+            INNER JOIN embeddings e ON t.row = e.row AND t.col = e.col AND t.year = e.year
+            WHERE {embedding_not_null_conditions}
+        ) TO '{escaped_output}' (FORMAT PARQUET, COMPRESSION 'snappy')
+        """)
+        
+        rows_after = con.execute(f"SELECT COUNT(*) FROM read_parquet('{escaped_output}')").fetchone()[0]
+        rows_dropped = rows_before - rows_after
+        percent_dropped = (rows_dropped / rows_before * 100) if rows_before > 0 else 0.0
+        logger.info(f"  Rows after: {rows_after:,}, dropped: {rows_dropped:,} ({percent_dropped:.2f}%)")
     
-    logger.info("  Executing single-pass processing query...")
-    con.execute(processing_query)
+    finally:
+        for f in dist_wdpa_temp_files:
+            if f.exists():
+                f.unlink()
+        if temp_output_dir.exists() and not list(temp_output_dir.iterdir()):
+            temp_output_dir.rmdir()
 
 
 def _process_per_year(con: duckdb.DuckDBPyConnection, input_paths: List[Path], 
                       output_path: Path, thin_union_query: str, 
-                      embedding_cols: List[str], embedding_cols_str: str) -> None:
+                      embedding_cols: List[str], embedding_cols_str: str,
+                      full_extent: Tuple[int, int, int, int]) -> None:
     """Process year by year, then merge results."""
     escaped_inputs = [str(p).replace("'", "''") for p in input_paths]
     escaped_output = str(output_path).replace("'", "''")
+    embeddings_union_query = " UNION ALL ".join([f"SELECT * FROM read_parquet('{ep}')" for ep in escaped_inputs])
+    embedding_not_null_conditions = ' AND '.join([f"e.{col} IS NOT NULL" for col in embedding_cols])
     
-    # Build UNION ALL query for embeddings (all columns)
-    embeddings_union_query = " UNION ALL ".join([
-        f"SELECT * FROM read_parquet('{ep}')" for ep in escaped_inputs
-    ])
-    
-    # Create temp directory for per-year outputs
     temp_output_dir = output_path.parent / f"{output_path.stem}_temp"
     temp_output_dir.mkdir(parents=True, exist_ok=True)
-    
     year_files = []
+    total_rows_before = total_rows_after = 0
     
     try:
-        # Process each output year (2018-2024)
         for year in OUTPUT_YEARS:
             logger.info(f"  Processing year {year}...")
             year_output = temp_output_dir / f"year_{year}.parquet"
             escaped_year_output = str(year_output).replace("'", "''")
             
-            year_query = f"""
-            COPY (
-                WITH thin_data AS (
-                    {thin_union_query}
-                ),
-                with_lag AS (
-                    SELECT 
-                        row,
-                        col,
-                        year,
-                        WDPA_b1,
-                        COALESCE(LAG(WDPA_b1) OVER (PARTITION BY row, col ORDER BY year), 0) AS WDPA_prev
-                    FROM thin_data
-                ),
-                transitions AS (
-                    SELECT 
-                        row,
-                        col,
-                        year,
-                        WDPA_b1,
-                        WDPA_prev,
-                        CAST(COALESCE(WDPA_b1, 0) AS UINT8) AS transition_01
-                    FROM with_lag
-                    WHERE 
-                        WDPA_prev = 0
-                        AND year = {year}
-                ),
-                embeddings AS (
-                    SELECT * FROM ({embeddings_union_query}) e
-                    WHERE e.year = {year}
-                )
-                SELECT 
-                    t.row,
-                    t.col,
-                    t.year,
-                    t.WDPA_b1,
-                    t.WDPA_prev,
-                    t.transition_01,
-                    {embedding_cols_str}
-                FROM transitions t
-                INNER JOIN embeddings e
-                    ON t.row = e.row 
-                    AND t.col = e.col 
-                    AND t.year = e.year
-            ) TO '{escaped_year_output}' (FORMAT PARQUET, COMPRESSION 'snappy')
-            """
+            dist_wdpa_df = compute_dist_wdpa_for_year(con, thin_union_query, year, full_extent)
+            dist_wdpa_temp_file = temp_output_dir / f"dist_wdpa_{year}.parquet"
+            dist_wdpa_df.to_parquet(dist_wdpa_temp_file, engine='pyarrow', compression='snappy', index=False)
+            escaped_dist_wdpa = str(dist_wdpa_temp_file).replace("'", "''")
             
-            con.execute(year_query)
+            wdpa_prev_cte = build_wdpa_prev_cte(thin_union_query)
+            rows_before_year = con.execute(f"""
+                WITH {wdpa_prev_cte},
+                with_dist AS (
+                    SELECT wl.row, wl.col, wl.year, wl.WDPA_b1, wl.WDPA_prev,
+                           CAST(COALESCE(wl.WDPA_b1, 0) AS UINT8) AS transition_01, d.dist_wdpa
+                    FROM with_wdpa_prev wl
+                    LEFT JOIN read_parquet('{escaped_dist_wdpa}') d ON wl.row = d.row AND wl.col = d.col
+                    WHERE wl.WDPA_prev = 0 AND wl.year = {year}
+                ),
+                embeddings AS (SELECT * FROM ({embeddings_union_query}) e WHERE e.year = {year}),
+                joined AS (
+                    SELECT t.row, t.col, t.year, t.WDPA_b1, t.WDPA_prev, t.transition_01, t.dist_wdpa, {embedding_cols_str}
+                    FROM with_dist t
+                    INNER JOIN embeddings e ON t.row = e.row AND t.col = e.col AND t.year = e.year
+                )
+                SELECT COUNT(*) FROM joined
+            """).fetchone()[0]
+            total_rows_before += rows_before_year
+            logger.info(f"    Year {year} - Rows before: {rows_before_year:,}")
+            
+            con.execute(f"""
+            COPY (
+                WITH {wdpa_prev_cte},
+                with_dist AS (
+                    SELECT wl.row, wl.col, wl.year, wl.WDPA_b1, wl.WDPA_prev,
+                           CAST(COALESCE(wl.WDPA_b1, 0) AS UINT8) AS transition_01, d.dist_wdpa
+                    FROM with_wdpa_prev wl
+                    LEFT JOIN read_parquet('{escaped_dist_wdpa}') d ON wl.row = d.row AND wl.col = d.col
+                    WHERE wl.WDPA_prev = 0 AND wl.year = {year}
+                ),
+                embeddings AS (SELECT * FROM ({embeddings_union_query}) e WHERE e.year = {year})
+                SELECT t.row, t.col, t.year, t.WDPA_b1, t.WDPA_prev, t.transition_01, t.dist_wdpa, {embedding_cols_str}
+                FROM with_dist t
+                INNER JOIN embeddings e ON t.row = e.row AND t.col = e.col AND t.year = e.year
+                WHERE {embedding_not_null_conditions}
+            ) TO '{escaped_year_output}' (FORMAT PARQUET, COMPRESSION 'snappy')
+            """)
             year_files.append(year_output)
             
-            # Report progress
             if year_output.exists():
+                rows_after_year = con.execute(f"SELECT COUNT(*) FROM read_parquet('{escaped_year_output}')").fetchone()[0]
+                total_rows_after += rows_after_year
+                rows_dropped_year = rows_before_year - rows_after_year
+                percent_dropped_year = (rows_dropped_year / rows_before_year * 100) if rows_before_year > 0 else 0.0
                 file_size_mb = year_output.stat().st_size / (1024**2)
-                logger.info(f"    Year {year}: {file_size_mb:.1f} MB")
+                logger.info(f"    Year {year} - Rows after: {rows_after_year:,}, dropped: {rows_dropped_year:,} ({percent_dropped_year:.2f}%), {file_size_mb:.1f} MB")
         
-        # Merge all year files
         logger.info("  Merging per-year outputs...")
         escaped_year_files = [str(f).replace("'", "''") for f in year_files]
-        year_files_union = " UNION ALL ".join([
-            f"SELECT * FROM read_parquet('{ef}')" for ef in escaped_year_files
-        ])
+        con.execute(f"""
+        COPY ({' UNION ALL '.join([f"SELECT * FROM read_parquet('{ef}')" for ef in escaped_year_files])})
+        TO '{escaped_output}' (FORMAT PARQUET, COMPRESSION 'snappy')
+        """)
         
-        merge_query = f"""
-        COPY (
-            {year_files_union}
-        ) TO '{escaped_output}' (FORMAT PARQUET, COMPRESSION 'snappy')
-        """
-        
-        con.execute(merge_query)
-        
+        total_rows_dropped = total_rows_before - total_rows_after
+        total_percent_dropped = (total_rows_dropped / total_rows_before * 100) if total_rows_before > 0 else 0.0
+        logger.info(f"  Total rows before: {total_rows_before:,}, after: {total_rows_after:,}, dropped: {total_rows_dropped:,} ({total_percent_dropped:.2f}%)")
+    
     finally:
-        # Clean up temp files
-        logger.info("  Cleaning up temporary files...")
-        for year_file in year_files:
-            if year_file.exists():
-                year_file.unlink()
+        for f in year_files:
+            if f.exists():
+                f.unlink()
+        for year in OUTPUT_YEARS:
+            f = temp_output_dir / f"dist_wdpa_{year}.parquet"
+            if f.exists():
+                f.unlink()
         if temp_output_dir.exists():
             temp_output_dir.rmdir()
 
@@ -401,40 +445,26 @@ def compute_statistics(con: duckdb.DuckDBPyConnection, output_path: Path) -> Dic
     """Compute class balance statistics using DuckDB."""
     logger.info("Computing class balance statistics...")
     start_time = time.time()
-    
     escaped_path = str(output_path).replace("'", "''")
     
-    # Overall statistics
-    stats = con.execute(f"""
-        SELECT 
-            COUNT(*) AS total_rows,
-            SUM(transition_01) AS positives,
-            COUNT(*) - SUM(transition_01) AS negatives
+    total, positives, negatives = con.execute(f"""
+        SELECT COUNT(*) AS total_rows, SUM(transition_01) AS positives,
+               COUNT(*) - SUM(transition_01) AS negatives
         FROM read_parquet('{escaped_path}')
     """).fetchone()
     
-    total, positives, negatives = stats
-    positives = int(positives)
-    negatives = int(negatives)
-    total = int(total)
-    
+    total, positives, negatives = int(total), int(positives), int(negatives)
     balance_info = {
-        'total': total,
-        'positives': positives,
-        'negatives': negatives,
+        'total': total, 'positives': positives, 'negatives': negatives,
         'positive_rate': float(positives / total) if total > 0 else 0.0,
         'negative_rate': float(negatives / total) if total > 0 else 0.0,
         'imbalance_ratio': float(negatives / positives) if positives > 0 else float('inf')
     }
     
-    logger.info(f"  Total samples: {balance_info['total']:,}")
-    logger.info(f"  Positives (transition=1): {balance_info['positives']:,} ({100*balance_info['positive_rate']:.2f}%)")
-    logger.info(f"  Negatives (transition=0): {balance_info['negatives']:,} ({100*balance_info['negative_rate']:.2f}%)")
-    logger.info(f"  Imbalance ratio: {balance_info['imbalance_ratio']:.1f}:1")
-    
-    elapsed = time.time() - start_time
-    logger.info(f"  Computed statistics in {elapsed:.1f}s")
-    
+    logger.info(f"  Total: {balance_info['total']:,}, Positives: {balance_info['positives']:,} ({100*balance_info['positive_rate']:.2f}%), "
+                f"Negatives: {balance_info['negatives']:,} ({100*balance_info['negative_rate']:.2f}%), "
+                f"Ratio: {balance_info['imbalance_ratio']:.1f}:1")
+    logger.info(f"  Computed in {time.time() - start_time:.1f}s")
     return balance_info
 
 
@@ -442,77 +472,46 @@ def compute_year_splits_balance(con: duckdb.DuckDBPyConnection, output_path: Pat
     """Compute class balance for each year split using DuckDB."""
     logger.info("Computing class balance by year split...")
     start_time = time.time()
-    
     escaped_path = str(output_path).replace("'", "''")
-    
     splits_info = {}
     
     for split_name, years in [('train', TRAIN_YEARS), ('val', VAL_YEARS), ('test', TEST_YEARS), ('test_late', TEST_LATE_YEARS)]:
-        years_list = ','.join(map(str, years))
-        
-        stats = con.execute(f"""
-            SELECT 
-                COUNT(*) AS total_rows,
-                SUM(transition_01) AS positives,
-                COUNT(*) - SUM(transition_01) AS negatives
+        total, positives, negatives = con.execute(f"""
+            SELECT COUNT(*) AS total_rows, SUM(transition_01) AS positives,
+                   COUNT(*) - SUM(transition_01) AS negatives
             FROM read_parquet('{escaped_path}')
-            WHERE year IN ({years_list})
+            WHERE year IN ({','.join(map(str, years))})
         """).fetchone()
         
-        total, positives, negatives = stats
-        positives = int(positives)
-        negatives = int(negatives)
-        total = int(total)
-        
+        total, positives, negatives = int(total), int(positives), int(negatives)
         splits_info[split_name] = {
-            'years': years,
-            'total': total,
-            'positives': positives,
-            'negatives': negatives,
+            'years': years, 'total': total, 'positives': positives, 'negatives': negatives,
             'positive_rate': float(positives / total) if total > 0 else 0.0,
             'negative_rate': float(negatives / total) if total > 0 else 0.0,
             'imbalance_ratio': float(negatives / positives) if positives > 0 else float('inf')
         }
         
-        logger.info(f"  {split_name.upper()} ({years[0]}-{years[-1]}): "
-                   f"{splits_info[split_name]['total']:,} samples, "
-                   f"{splits_info[split_name]['positives']:,} pos ({100*splits_info[split_name]['positive_rate']:.2f}%), "
-                   f"ratio {splits_info[split_name]['imbalance_ratio']:.1f}:1")
+        info = splits_info[split_name]
+        logger.info(f"  {split_name.upper()} ({years[0]}-{years[-1]}): {info['total']:,} samples, "
+                   f"{info['positives']:,} pos ({100*info['positive_rate']:.2f}%), ratio {info['imbalance_ratio']:.1f}:1")
     
-    elapsed = time.time() - start_time
-    logger.info(f"  Computed split statistics in {elapsed:.1f}s")
-    
+    logger.info(f"  Computed split statistics in {time.time() - start_time:.1f}s")
     return splits_info
 
 
 def verify_output(con: duckdb.DuckDBPyConnection, output_path: Path) -> None:
     """Verify the output file is readable and has expected structure."""
     logger.info("Verifying output file...")
-    
     escaped_path = str(output_path).replace("'", "''")
     
-    # Get row count and year range
-    stats = con.execute(f"""
-        SELECT 
-            COUNT(*) AS total_rows,
-            MIN(year) AS min_year,
-            MAX(year) AS max_year,
-            COUNT(DISTINCT year) AS num_years
+    total_rows, min_year, max_year, num_years = con.execute(f"""
+        SELECT COUNT(*) AS total_rows, MIN(year) AS min_year, MAX(year) AS max_year, COUNT(DISTINCT year) AS num_years
         FROM read_parquet('{escaped_path}')
     """).fetchone()
     
-    total_rows, min_year, max_year, num_years = stats
+    logger.info(f"  ✓ Verified: {total_rows:,} rows, Year range: {min_year}-{max_year} ({num_years} years)")
     
-    logger.info(f"  ✓ Verified: {total_rows:,} rows")
-    logger.info(f"  ✓ Year range: {min_year}-{max_year} ({num_years} years)")
-    
-    # Check that all rows have WDPA_prev=0 (risk set)
-    risk_check = con.execute(f"""
-        SELECT COUNT(*) 
-        FROM read_parquet('{escaped_path}')
-        WHERE WDPA_prev != 0
-    """).fetchone()[0]
-    
+    risk_check = con.execute(f"SELECT COUNT(*) FROM read_parquet('{escaped_path}') WHERE WDPA_prev != 0").fetchone()[0]
     if risk_check > 0:
         logger.warning(f"  ⚠ Warning: {risk_check} rows have WDPA_prev != 0 (should be 0)")
     else:
@@ -526,17 +525,14 @@ def print_summary(balance_info: Dict[str, Any], splits_info: Dict[str, Any]) -> 
     logger.info("DATASET SUMMARY")
     logger.info("=" * 70)
     logger.info(f"Total samples: {balance_info['total']:,}")
-    logger.info(f"  Positives: {balance_info['positives']:,} ({100*balance_info['positive_rate']:.2f}%)")
-    logger.info(f"  Negatives: {balance_info['negatives']:,} ({100*balance_info['negative_rate']:.2f}%)")
-    logger.info(f"  Imbalance ratio: {balance_info['imbalance_ratio']:.1f}:1")
-    logger.info("")
+    logger.info(f"  Positives: {balance_info['positives']:,} ({100*balance_info['positive_rate']:.2f}%), "
+                f"Negatives: {balance_info['negatives']:,} ({100*balance_info['negative_rate']:.2f}%), "
+                f"Ratio: {balance_info['imbalance_ratio']:.1f}:1")
     logger.info("Year splits:")
     for split_name in ['train', 'val', 'test', 'test_late']:
         if split_name in splits_info:
             info = splits_info[split_name]
-            logger.info(f"  {split_name.upper()}: {info['total']:,} samples "
-                       f"({info['positives']:,} pos, {100*info['positive_rate']:.2f}%)")
-    logger.info("")
+            logger.info(f"  {split_name.upper()}: {info['total']:,} samples ({info['positives']:,} pos, {100*info['positive_rate']:.2f}%)")
     logger.info("Precision@K-ready scoring keys: row, col, year columns preserved")
     logger.info("=" * 70)
 
@@ -549,31 +545,16 @@ def main() -> int:
     
     con = None
     try:
-        # Step 1: Validate input
         validate_input(INPUT_FILES)
-        
-        # Step 2: Setup DuckDB
         con = setup_duckdb()
         report_memory_usage("after DuckDB setup")
-        
-        # Step 3: Process with DuckDB window functions and write to Parquet
         process_with_duckdb(con, INPUT_FILES, OUTPUT_FILE)
         report_memory_usage("after processing")
-        
-        # Step 4: Verify output
         verify_output(con, OUTPUT_FILE)
-        
-        # Step 5: Compute statistics
-        balance_info = compute_statistics(con, OUTPUT_FILE)
-        splits_info = compute_year_splits_balance(con, OUTPUT_FILE)
-        
-        # Step 6: Print summary
-        print_summary(balance_info, splits_info)
-        
+        print_summary(compute_statistics(con, OUTPUT_FILE), compute_year_splits_balance(con, OUTPUT_FILE))
         logger.info("")
         logger.info("Processing completed successfully!")
         return 0
-        
     except FileNotFoundError as e:
         logger.error(f"File not found: {e}")
         return 1
