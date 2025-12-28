@@ -14,7 +14,7 @@ Memory optimizations:
   - Efficient batch processing during data loading
 
 Input:   - modelC_lgbm_win5_benchmark_*.json (most recent file from outputs/Results/ml_models)
-         - train_colombia_win5.parquet, val_colombia_win5.parquet (earlystop), test_colombia_win5.parquet
+         - train_colombia_win5.parquet, earlystop_colombia_win5.parquet, test_colombia_win5.parquet
 
 Output:  - Spatial CV results JSON with PR-AUC, P@1%, Lift@1% for each fold
          - Aggregated metrics across 4 folds
@@ -33,6 +33,10 @@ from typing import Dict, Any, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+try:
+    import wandb
+except ImportError:
+    wandb = None
 import pyarrow as pa
 import pyarrow.parquet as pq
 import lightgbm as lgb
@@ -105,7 +109,8 @@ def find_latest_benchmark_file(output_dir: Path) -> Path:
 def load_benchmark_config(benchmark_path: Path, output_dir: Path) -> Tuple[list, Dict[str, Any], int, int]:
     """Load features and hyperparameters from benchmark JSON.
     
-    Also extracts avg_best_iteration from the source metrics file to use as num_boost_round.
+    Also extracts final_num_boost_round from the source metrics file to use as num_boost_round.
+    This is the value computed using weighted mean × 1.05, then max with fold3_best_iteration.
     
     Returns:
         Tuple of (feature_list, hyperparameters_dict, random_seed, num_boost_round)
@@ -121,8 +126,9 @@ def load_benchmark_config(benchmark_path: Path, output_dir: Path) -> Tuple[list,
     # Ensure random_state is set
     hyperparameters["random_state"] = random_seed
     
-    # Extract avg_best_iteration from source metrics file
+    # Extract final_num_boost_round from source metrics file
     # The benchmark JSON has a reference to the source metrics file in benchmark_metadata.source_metrics_file
+    # final_num_boost_round is computed as: weighted_mean × 1.05, then max with fold3_best_iteration
     num_boost_round = None
     benchmark_metadata = benchmark.get("benchmark_metadata", {})
     source_metrics_timestamp = benchmark_metadata.get("source_metrics_file", None)
@@ -137,25 +143,30 @@ def load_benchmark_config(benchmark_path: Path, output_dir: Path) -> Tuple[list,
                 with open(metrics_path, 'r') as f:
                     metrics_data = json.load(f)
                 
-                # Try to get avg_best_iteration from cross_validation (cv_info in code)
-                # Check if there's a top-level "cross_validation" that has avg_best_iteration
+                # Try to get final_num_boost_round from cross_validation
+                # This is the value used in the actual training (weighted mean × 1.05, then max with fold3)
                 cross_validation = metrics_data.get("cross_validation", {})
                 
-                # The metrics file structure has cross_validation.folds and potentially avg_best_iteration
-                # Check if avg_best_iteration exists directly in cross_validation
-                if isinstance(cross_validation, dict) and "avg_best_iteration" in cross_validation:
-                    num_boost_round = int(cross_validation["avg_best_iteration"])
-                    print(f"  Found avg_best_iteration in metrics file: {num_boost_round}")
-                else:
-                    # Try to compute from folds
-                    folds = cross_validation.get("folds", [])
-                    if folds:
-                        best_iterations = [fold.get("best_iteration") for fold in folds if fold.get("best_iteration") is not None]
-                        if best_iterations:
-                            num_boost_round = int(np.round(np.mean(best_iterations)))
-                            print(f"  Computed avg_best_iteration from folds: {num_boost_round} (mean of {best_iterations})")
+                if isinstance(cross_validation, dict):
+                    # First priority: final_num_boost_round (the actual value used in training)
+                    if "final_num_boost_round" in cross_validation:
+                        num_boost_round = int(cross_validation["final_num_boost_round"])
+                        print(f"  Found final_num_boost_round in metrics file: {num_boost_round}")
+                    # Second priority: chosen_iteration (alias for final_num_boost_round)
+                    elif "chosen_iteration" in cross_validation:
+                        num_boost_round = int(cross_validation["chosen_iteration"])
+                        print(f"  Found chosen_iteration in metrics file: {num_boost_round}")
+                    # Fallback: compute simple average from folds (not ideal, but better than nothing)
+                    else:
+                        folds = cross_validation.get("folds", [])
+                        if folds:
+                            best_iterations = [fold.get("best_iteration") for fold in folds if fold.get("best_iteration") is not None]
+                            if best_iterations:
+                                num_boost_round = int(np.round(np.mean(best_iterations)))
+                                print(f"  Warning: final_num_boost_round not found, computed simple avg from folds: {num_boost_round} (mean of {best_iterations})")
+                                print(f"  Note: This is NOT the same as the training value (which uses weighted mean × 1.05, then max with fold3)")
             except Exception as e:
-                print(f"  Warning: Could not load avg_best_iteration from metrics file: {e}")
+                print(f"  Warning: Could not load final_num_boost_round from metrics file: {e}")
     
     # Fallback: use n_estimators from hyperparameters
     if num_boost_round is None:
@@ -433,12 +444,14 @@ def train_spatial_fold(
     y_test: np.ndarray,
     fold_idx: int,
     hyperparameters: Dict[str, Any],
-    num_boost_round: int
+    num_boost_round: int,
+    feature_names: list,
+    use_wandb: bool = False
 ) -> Dict[str, Any]:
     """Train and evaluate a single spatial CV fold.
     
     Args:
-        num_boost_round: Fixed number of boosting rounds (from avg_best_iteration)
+        num_boost_round: Fixed number of boosting rounds (from final_num_boost_round)
     
     Returns:
         Dictionary containing fold metrics and metadata
@@ -452,7 +465,7 @@ def train_spatial_fold(
     n_test = len(X_test)
     
     print(f"Train: {n_train:,} samples, Test: {n_test:,} samples")
-    print(f"  Using fixed num_boost_round: {num_boost_round} (from benchmark avg_best_iteration)")
+    print(f"  Using fixed num_boost_round: {num_boost_round} (from benchmark final_num_boost_round)")
     
     # Compute sample weights for training data
     train_weights = compute_year_weights(years_train, min_year=2000, max_year=years_train.max())
@@ -467,7 +480,8 @@ def train_spatial_fold(
     
     # Train model
     print("  Creating datasets...")
-    train_dataset = lgb.Dataset(X_train, label=y_train, weight=train_weights, free_raw_data=True)
+    train_dataset = lgb.Dataset(X_train, label=y_train, weight=train_weights, 
+                                feature_name=feature_names, free_raw_data=True)
     del X_train, y_train, years_train, train_weights
     gc.collect()
     
@@ -495,29 +509,154 @@ def train_spatial_fold(
     
     test_metrics = compute_metrics(y_test, y_test_proba)
     
-    print(f"\nFold {fold_idx + 1} Test Results:")
-    print(f"  PR-AUC:  {test_metrics['pr_auc']:.4f}")
-    print(f"  P@1%:    {test_metrics['precision_at_1pct']:.4f}")
-    print(f"  Lift@1%: {test_metrics['lift_at_1pct']:.2f}x")
+    # Compute test set statistics
+    n_test_pos = int(y_test.sum())
+    n_test_neg = int((y_test == 0).sum())
+    test_pos_rate = float(y_test.mean())
     
-    # Clean up
-    del X_test, y_test, y_test_proba, lgb_model
+    # Extract feature importance (gain)
+    feature_importance = lgb_model.feature_importance(importance_type='gain')
+    # Create list of (feature_name, importance) tuples and sort by importance
+    feature_importance_list = list(zip(feature_names, feature_importance.tolist()))
+    feature_importance_list.sort(key=lambda x: x[1], reverse=True)
+    
+    # Get top N features (top 20)
+    top_n = 20
+    top_features = feature_importance_list[:top_n]
+    
+    print(f"\nFold {fold_idx + 1} Test Results:")
+    print(f"  Test set: {n_test:,} samples ({n_test_pos:,} pos, {n_test_neg:,} neg, {test_pos_rate*100:.3f}% pos rate)")
+    print(f"  ROC-AUC:  {test_metrics['roc_auc']:.4f}")
+    print(f"  PR-AUC:   {test_metrics['pr_auc']:.4f}")
+    print(f"  P@1%:     {test_metrics['precision_at_1pct']:.4f}")
+    print(f"  Lift@1%:  {test_metrics['lift_at_1pct']:.2f}x")
+    print(f"\n  Top {top_n} Features (by importance):")
+    for i, (feat_name, importance) in enumerate(top_features, 1):
+        print(f"    {i:2d}. {feat_name:30s} {importance:12.2f}")
+    
+    if use_wandb:
+        wandb.log({
+            f"spatial_fold_{fold_idx + 1}/n_train": int(n_train),
+            f"spatial_fold_{fold_idx + 1}/n_test": int(n_test),
+            f"spatial_fold_{fold_idx + 1}/n_test_pos": n_test_pos,
+            f"spatial_fold_{fold_idx + 1}/n_test_neg": n_test_neg,
+            f"spatial_fold_{fold_idx + 1}/test_pos_rate": test_pos_rate,
+            f"spatial_fold_{fold_idx + 1}/train_time_seconds": train_time,
+            f"spatial_fold_{fold_idx + 1}/test_time_seconds": test_time,
+            f"spatial_fold_{fold_idx + 1}/best_iteration": int(best_iteration),
+            **{f"spatial_fold_{fold_idx + 1}/{k}": v for k, v in test_metrics.items()}
+        })
+    
+    # Return predictions before cleanup (needed for calibration)
+    fold_predictions = {
+        "y_true": y_test.copy(),
+        "y_pred_proba": y_test_proba.copy(),
+        "fold_idx": np.full(len(y_test), fold_idx, dtype=np.int32)
+    }
+    
+    # Clean up model but keep predictions
+    del lgb_model
     gc.collect()
     
     return {
         "fold_idx": fold_idx,
         "n_train": int(n_train),
         "n_test": int(n_test),
+        "n_test_pos": n_test_pos,
+        "n_test_neg": n_test_neg,
+        "test_pos_rate": test_pos_rate,
         "train_time_seconds": train_time,
         "test_time_seconds": test_time,
         "best_iteration": int(best_iteration),
-        "metrics": test_metrics
+        "metrics": test_metrics,
+        "top_features": [{"feature": name, "importance": float(imp)} for name, imp in top_features],
+        "predictions": fold_predictions  # Include predictions for saving
+    }
+
+
+def analyze_label_rarity_noise(cv_results: list[Dict[str, Any]]) -> Dict[str, Any]:
+    """Analyze if labels are rarer/noisier across folds.
+    
+    Compares positive rates across folds to detect high variance.
+    """
+    pos_rates = [fold["test_pos_rate"] for fold in cv_results]
+    pos_rates_mean = float(np.mean(pos_rates))
+    pos_rates_std = float(np.std(pos_rates))
+    pos_rates_cv = pos_rates_std / pos_rates_mean if pos_rates_mean > 0 else 0.0  # Coefficient of variation
+    
+    # Check if any fold has significantly different positive rate
+    # Consider "much rarer" if >2x difference, "much noisier" if CV > 0.3
+    min_pos_rate = float(np.min(pos_rates))
+    max_pos_rate = float(np.max(pos_rates))
+    ratio_max_min = max_pos_rate / min_pos_rate if min_pos_rate > 0 else float('inf')
+    
+    is_rare = ratio_max_min > 2.0
+    is_noisy = pos_rates_cv > 0.3
+    
+    return {
+        "pos_rates": pos_rates,
+        "pos_rate_mean": pos_rates_mean,
+        "pos_rate_std": pos_rates_std,
+        "pos_rate_cv": pos_rates_cv,
+        "pos_rate_min": min_pos_rate,
+        "pos_rate_max": max_pos_rate,
+        "pos_rate_ratio_max_min": ratio_max_min,
+        "is_much_rarer": is_rare,
+        "is_much_noisier": is_noisy
+    }
+
+
+def aggregate_top_features(cv_results: list[Dict[str, Any]], top_n: int = 20) -> Dict[str, Any]:
+    """Aggregate top features across all folds.
+    
+    Returns:
+        Dictionary with feature frequency and average importance across folds
+    """
+    # Collect all features with their importance from each fold
+    feature_importance_dict = {}
+    feature_frequency = {}
+    
+    for fold in cv_results:
+        top_features = fold.get("top_features", [])
+        for feat_info in top_features:
+            feat_name = feat_info["feature"]
+            importance = feat_info["importance"]
+            
+            if feat_name not in feature_importance_dict:
+                feature_importance_dict[feat_name] = []
+                feature_frequency[feat_name] = 0
+            
+            feature_importance_dict[feat_name].append(importance)
+            feature_frequency[feat_name] += 1
+    
+    # Compute average importance per feature
+    feature_avg_importance = {
+        name: float(np.mean(importances))
+        for name, importances in feature_importance_dict.items()
+    }
+    
+    # Sort by (frequency, average importance) - features appearing in more folds and with higher importance rank higher
+    feature_scores = [
+        {
+            "feature": name,
+            "frequency": feature_frequency[name],
+            "avg_importance": feature_avg_importance[name],
+            "score": feature_frequency[name] * feature_avg_importance[name]  # Combined score
+        }
+        for name in feature_importance_dict.keys()
+    ]
+    feature_scores.sort(key=lambda x: (x["frequency"], x["avg_importance"]), reverse=True)
+    
+    return {
+        "top_features_across_folds": feature_scores[:top_n],
+        "feature_frequency": feature_frequency,
+        "feature_avg_importance": feature_avg_importance
     }
 
 
 def aggregate_spatial_cv_metrics(cv_results: list[Dict[str, Any]]) -> Dict[str, Any]:
     """Aggregate metrics across spatial CV folds."""
-    metrics_keys = ["pr_auc", "precision_at_1pct", "lift_at_1pct"]
+    metrics_keys = ["pr_auc", "precision_at_1pct", "lift_at_1pct", "roc_auc"]
     
     aggregated = {}
     for key in metrics_keys:
@@ -529,13 +668,50 @@ def aggregate_spatial_cv_metrics(cv_results: list[Dict[str, Any]]) -> Dict[str, 
     aggregated["n_train_mean"] = float(np.mean([fold["n_train"] for fold in cv_results]))
     aggregated["n_test_mean"] = float(np.mean([fold["n_test"] for fold in cv_results]))
     
+    # Add label rarity/noise analysis
+    label_analysis = analyze_label_rarity_noise(cv_results)
+    aggregated["label_analysis"] = label_analysis
+    
+    # Add top features aggregation
+    top_features_agg = aggregate_top_features(cv_results, top_n=20)
+    aggregated["top_features_aggregated"] = top_features_agg
+    
     return aggregated
 
 
 def main() -> None:
+    start_time = time.time()
     repo_root = Path(__file__).resolve().parents[4]
     output_dir = repo_root / "outputs/Results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Initialize wandb
+    use_wandb = False
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if wandb is not None:
+        try:
+            wandb.init(
+                project="colombia-spatial-cv",
+                entity=os.environ.get("WANDB_ENTITY"),
+                name=f"spatial_cv_modelC_lgbm_{timestamp}",
+                config={
+                    "model": "LightGBM",
+                    "task": "transition_01_win5_prediction",
+                    "target_column": TARGET_COL,
+                    "lookahead_years": LOOKAHEAD_YEARS,
+                    "random_state": RANDOM_STATE,
+                    "n_spatial_folds": N_SPATIAL_FOLDS,
+                    "spatial_split_method": "KMeans clustering",
+                    "cv_type": "Spatial CV with pooled years (not leave-future-years-out)",
+                    "year_range": [2000, SPATIAL_CV_YEAR_END],
+                }
+            )
+            use_wandb = True
+            print("W&B connected")
+        except Exception as err:
+            print(f"W&B failed: {err}")
+    else:
+        print("W&B not available (module not installed)")
     
     print("=" * 70)
     print("SPATIAL CROSS-VALIDATION: modelC_LGBM")
@@ -564,7 +740,14 @@ def main() -> None:
         print(f"  Features: {len(feature_cols)}")
         print(f"  Random seed: {random_seed}")
         print(f"  Hyperparameters: {len(hyperparameters)} parameters")
-        print(f"  Num boost rounds: {num_boost_round} (from avg_best_iteration)")
+        print(f"  Num boost rounds: {num_boost_round} (from final_num_boost_round)")
+        
+        if use_wandb:
+            wandb.config.update({
+                "n_features": len(feature_cols),
+                "num_boost_round": num_boost_round,
+                "source_benchmark": benchmark_path.name,
+            })
     except Exception as e:
         print(f"\nERROR: Failed to load benchmark config: {e}")
         import traceback
@@ -577,7 +760,7 @@ def main() -> None:
     print("=" * 70)
     try:
         train_path = resolve_parquet_file("train_colombia_win5.parquet")
-        earlystop_path = resolve_parquet_file("val_colombia_win5.parquet")
+        earlystop_path = resolve_parquet_file("earlystop_colombia_win5.parquet")
         test_path = resolve_parquet_file("test_colombia_win5.parquet")
         
         # Load all data (train + earlystop + test) for spatial splitting
@@ -592,6 +775,14 @@ def main() -> None:
             year_range=year_range
         )
         print(f"\nTotal data: {len(y):,} samples ({neg:,} neg, {pos:,} pos)")
+        
+        if use_wandb:
+            wandb.log({
+                "data/n_total": int(len(y)),
+                "data/n_positives": int(pos),
+                "data/n_negatives": int(neg),
+                "data/positive_rate": float(pos / len(y)) if len(y) > 0 else 0.0,
+            })
     except Exception as e:
         print(f"\nERROR: Failed to load data: {e}")
         import traceback
@@ -617,6 +808,7 @@ def main() -> None:
     print("STEP 5: RUN SPATIAL CROSS-VALIDATION")
     print("=" * 70)
     cv_results = []
+    all_predictions = []  # Collect predictions from all folds
     
     for fold_idx in range(N_SPATIAL_FOLDS):
         # Split: train on 3 folds, test on 1 fold
@@ -639,13 +831,55 @@ def main() -> None:
         fold_result = train_spatial_fold(
             X_train, y_train, years_train,
             X_test, y_test,
-            fold_idx, hyperparameters, num_boost_round
+            fold_idx, hyperparameters, num_boost_round, feature_cols, use_wandb
         )
-        cv_results.append(fold_result)
+        
+        # Collect predictions before cleanup
+        if "predictions" in fold_result:
+            all_predictions.append(fold_result["predictions"])
+            # Remove predictions from fold_result to avoid bloating JSON
+            fold_result_clean = {k: v for k, v in fold_result.items() if k != "predictions"}
+        else:
+            fold_result_clean = fold_result
+        
+        cv_results.append(fold_result_clean)
         
         # Clean up immediately after each fold
         del X_train, y_train, years_train, X_test, y_test
         gc.collect()
+    
+    # Step 5.5: Save CV predictions for calibration
+    if all_predictions:
+        print("\n" + "=" * 70)
+        print("STEP 5.5: SAVE CV PREDICTIONS")
+        print("=" * 70)
+        try:
+            # Concatenate predictions from all folds
+            y_true_all = np.concatenate([pred["y_true"] for pred in all_predictions])
+            y_pred_proba_all = np.concatenate([pred["y_pred_proba"] for pred in all_predictions])
+            fold_idx_all = np.concatenate([pred["fold_idx"] for pred in all_predictions])
+            
+            # Create DataFrame and save to parquet
+            cv_predictions_df = pd.DataFrame({
+                "y_true": y_true_all,
+                "y_pred_proba": y_pred_proba_all,
+                "fold_idx": fold_idx_all
+            })
+            
+            cv_predictions_path = output_dir / f"modelC_lgbm_win5_cv_predictions_{timestamp}.parquet"
+            cv_predictions_df.to_parquet(cv_predictions_path, index=False, engine="pyarrow")
+            print(f"\nCV predictions saved: {cv_predictions_path.name}")
+            print(f"  Total samples: {len(cv_predictions_df):,}")
+            print(f"  Columns: {list(cv_predictions_df.columns)}")
+            
+            # Clean up
+            del cv_predictions_df, y_true_all, y_pred_proba_all, fold_idx_all, all_predictions
+            gc.collect()
+        except Exception as e:
+            print(f"\nWARNING: Failed to save CV predictions: {e}")
+            import traceback
+            traceback.print_exc()
+            # Don't exit - continue with metrics saving
     
     # Step 6: Aggregate results
     print("\n" + "=" * 70)
@@ -654,15 +888,53 @@ def main() -> None:
     aggregated = aggregate_spatial_cv_metrics(cv_results)
     
     print("\nSpatial Cross-Validation Results (Aggregated across 4 folds):")
+    print(f"  ROC-AUC: {aggregated['roc_auc_mean']:.4f} ± {aggregated['roc_auc_std']:.4f}")
     print(f"  PR-AUC:  {aggregated['pr_auc_mean']:.4f} ± {aggregated['pr_auc_std']:.4f}")
     print(f"  P@1%:    {aggregated['precision_at_1pct_mean']:.4f} ± {aggregated['precision_at_1pct_std']:.4f}")
     print(f"  Lift@1%: {aggregated['lift_at_1pct_mean']:.2f} ± {aggregated['lift_at_1pct_std']:.2f}")
+    
+    # Label rarity/noise analysis
+    label_analysis = aggregated.get("label_analysis", {})
+    if label_analysis:
+        print(f"\nLabel Rarity/Noise Analysis:")
+        print(f"  Positive rates across folds: {[f'{r*100:.3f}%' for r in label_analysis['pos_rates']]}")
+        print(f"  Mean positive rate: {label_analysis['pos_rate_mean']*100:.3f}%")
+        print(f"  Std positive rate: {label_analysis['pos_rate_std']*100:.3f}%")
+        print(f"  Coefficient of variation: {label_analysis['pos_rate_cv']:.3f}")
+        print(f"  Min/Max ratio: {label_analysis['pos_rate_ratio_max_min']:.2f}x")
+        if label_analysis['is_much_rarer']:
+            print(f"  ⚠️  WARNING: Labels are MUCH RARER in some folds (max/min ratio > 2.0)")
+        if label_analysis['is_much_noisier']:
+            print(f"  ⚠️  WARNING: Labels are MUCH NOISIER across folds (CV > 0.3)")
+        if not label_analysis['is_much_rarer'] and not label_analysis['is_much_noisier']:
+            print(f"  ✓ Labels are relatively consistent across folds")
+    
+    # Top features across all folds
+    top_features_agg = aggregated.get("top_features_aggregated", {})
+    if top_features_agg and "top_features_across_folds" in top_features_agg:
+        print(f"\nTop Features Across All Folds (sorted by frequency × importance):")
+        top_features_list = top_features_agg["top_features_across_folds"]
+        for i, feat_info in enumerate(top_features_list[:15], 1):  # Show top 15
+            print(f"  {i:2d}. {feat_info['feature']:30s} "
+                  f"(freq: {feat_info['frequency']}/{N_SPATIAL_FOLDS}, "
+                  f"avg_imp: {feat_info['avg_importance']:.2f})")
+    
+    if use_wandb:
+        wandb.log({
+            "spatial_cv_aggregated/pr_auc_mean": aggregated['pr_auc_mean'],
+            "spatial_cv_aggregated/pr_auc_std": aggregated['pr_auc_std'],
+            "spatial_cv_aggregated/precision_at_1pct_mean": aggregated['precision_at_1pct_mean'],
+            "spatial_cv_aggregated/precision_at_1pct_std": aggregated['precision_at_1pct_std'],
+            "spatial_cv_aggregated/lift_at_1pct_mean": aggregated['lift_at_1pct_mean'],
+            "spatial_cv_aggregated/lift_at_1pct_std": aggregated['lift_at_1pct_std'],
+            "spatial_cv_aggregated/n_train_mean": aggregated['n_train_mean'],
+            "spatial_cv_aggregated/n_test_mean": aggregated['n_test_mean'],
+        })
     
     # Step 7: Save results
     print("\n" + "=" * 70)
     print("STEP 7: SAVE RESULTS")
     print("=" * 70)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     results_path = output_dir / f"modelC_lgbm_win5_spatial_cv_{timestamp}.json"
     
     results = {
@@ -705,18 +977,30 @@ def main() -> None:
         print(f"\nERROR: Failed to save results: {e}")
         sys.exit(1)
     
+    total_time = time.time() - start_time
+    
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
     print(f"\nSource benchmark: {benchmark_path.name}")
     print(f"Results file: {results_path.name}")
     print(f"\nSpatial Cross-Validation (4 folds):")
+    print(f"  ROC-AUC: {aggregated['roc_auc_mean']:.4f} ± {aggregated['roc_auc_std']:.4f}")
     print(f"  PR-AUC:  {aggregated['pr_auc_mean']:.4f} ± {aggregated['pr_auc_std']:.4f}")
     print(f"  P@1%:    {aggregated['precision_at_1pct_mean']:.4f} ± {aggregated['precision_at_1pct_std']:.4f}")
     print(f"  Lift@1%: {aggregated['lift_at_1pct_mean']:.2f} ± {aggregated['lift_at_1pct_std']:.2f}")
+    print(f"\nTotal time: {total_time:.1f}s ({total_time/60:.1f}m)")
     print("\n" + "=" * 70)
     print("Done.")
     print("=" * 70)
+    
+    if use_wandb:
+        wandb.log({
+            "summary/total_time_seconds": total_time,
+            "summary/total_time_minutes": total_time / 60,
+            "status": "success"
+        })
+        wandb.finish()
 
 
 if __name__ == "__main__":

@@ -10,6 +10,8 @@ Input:   - CV predictions parquet file (with columns: y_true, y_pred_proba, and 
 Output:  - Calibrated test predictions parquet file
          - Reliability plot data JSON file (for visualization)
          - Calibration metadata JSON file
+         - Reliability curve plots (PNG images) for CV and test sets (before/after calibration)
+         - Brier score summary text file (before/after calibration metrics)
 """
 
 from __future__ import annotations
@@ -21,6 +23,10 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, Literal
+
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
 
 import numpy as np
 import pandas as pd
@@ -207,22 +213,79 @@ def load_cv_predictions(
     return y_true, y_pred_proba, fold_idx
 
 
-def load_test_predictions(test_path: Path) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
-    """Load test predictions from scored parquet file.
+def load_test_predictions(
+    test_path: Path,
+    batch_size: int = 50_000,
+    load_minimal_cols: bool = True
+) -> Tuple[Optional[pd.DataFrame], np.ndarray, np.ndarray]:
+    """Load test predictions from scored parquet file using batch-based loading.
     
+    Args:
+        test_path: Path to test predictions parquet file
+        batch_size: Batch size for reading parquet file
+        load_minimal_cols: If True, only load required columns (y_true, y_pred_proba).
+                          If False, also load metadata columns needed for saving.
+        
     Returns:
-        Tuple of (full dataframe, y_true, y_pred_proba) arrays
+        Tuple of (dataframe with metadata columns if load_minimal_cols=False else None, y_true, y_pred_proba) arrays
     """
     print(f"Loading test predictions from {test_path.name}...")
-    df = pd.read_parquet(test_path)
     
     required_cols = ['y_true', 'y_pred_proba']
-    for col in required_cols:
-        if col not in df.columns:
-            raise ValueError(f"Required column '{col}' not found in test predictions file. Found columns: {df.columns.tolist()}")
     
-    y_true = df['y_true'].values.astype(np.int32)
-    y_pred_proba = df['y_pred_proba'].values.astype(np.float32)
+    # Use pyarrow to read in batches
+    parquet_file = pq.ParquetFile(test_path)
+    
+    # Verify required columns exist
+    schema_cols = parquet_file.schema_arrow.names
+    for col in required_cols:
+        if col not in schema_cols:
+            raise ValueError(f"Required column '{col}' not found in test predictions file. Found columns: {schema_cols}")
+    
+    # Determine which columns to read
+    if load_minimal_cols:
+        columns_to_read = required_cols
+        df = None
+    else:
+        # Also load metadata columns needed for saving calibrated results
+        # Try to load: row, col, year, x, y, id (if they exist)
+        metadata_cols = []
+        for col in ['row', 'col', 'year', 'x', 'y', 'id']:
+            if col in schema_cols:
+                metadata_cols.append(col)
+        columns_to_read = required_cols + metadata_cols
+        
+        # Collect metadata in lists
+        metadata_dict = {col: [] for col in metadata_cols}
+    
+    # Collect data across batches
+    y_true_list = []
+    y_pred_proba_list = []
+    
+    try:
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns_to_read):
+            batch_table = batch
+            
+            # Extract arrays directly from PyArrow
+            y_true_batch = batch_table['y_true'].to_numpy(zero_copy_only=False)
+            y_pred_proba_batch = batch_table['y_pred_proba'].to_numpy(zero_copy_only=False)
+            
+            y_true_list.append(y_true_batch)
+            y_pred_proba_list.append(y_pred_proba_batch)
+            
+            if not load_minimal_cols:
+                for col in metadata_cols:
+                    col_array = batch_table[col].to_numpy(zero_copy_only=False)
+                    metadata_dict[col].append(col_array)
+            
+            del batch_table, batch
+    finally:
+        del parquet_file
+        gc.collect()
+    
+    # Concatenate all batches
+    y_true = np.concatenate(y_true_list, axis=0).astype(np.int32)
+    y_pred_proba = np.concatenate(y_pred_proba_list, axis=0).astype(np.float32)
     
     # Remove any NaN or infinite values
     valid_mask = np.isfinite(y_pred_proba) & (y_pred_proba >= 0) & (y_pred_proba <= 1)
@@ -237,6 +300,14 @@ def load_test_predictions(test_path: Path) -> Tuple[pd.DataFrame, np.ndarray, np
         raise ValueError(error_msg)
     
     print(f"  Loaded {len(y_true):,} test predictions ({y_true.sum():,} positive, {(y_true == 0).sum():,} negative)")
+    
+    # Build dataframe if needed (only metadata columns, not y_true/y_pred_proba)
+    if not load_minimal_cols:
+        metadata_arrays = {col: np.concatenate(metadata_dict[col], axis=0) for col in metadata_cols}
+        df = pd.DataFrame(metadata_arrays)
+    else:
+        df = None
+    
     return df, y_true, y_pred_proba
 
 
@@ -502,10 +573,151 @@ def compute_calibration_metrics(y_true: np.ndarray, y_pred_proba: np.ndarray) ->
     }
 
 
+def plot_reliability_curve(
+    plot_data: Dict[str, Any],
+    title: str,
+    output_path: Path,
+    brier_uncalibrated: float,
+    brier_calibrated: float,
+    binning_method: str = "uniform",
+    is_uncalibrated: bool = False
+) -> None:
+    """Plot reliability curve (calibration curve) with before/after comparison.
+    
+    Args:
+        plot_data: Dictionary containing reliability plot data (from compute_reliability_plot_data)
+        title: Plot title
+        output_path: Path to save the plot
+        brier_uncalibrated: Brier score before calibration
+        brier_calibrated: Brier score after calibration
+        binning_method: Which binning method to use ("uniform" or "quantile")
+        is_uncalibrated: If True, suppress improvement percentage (set to 0.00%) for uncalibrated plots
+    """
+    fig, ax = plt.subplots(figsize=(8, 8))
+    
+    # Extract data
+    bin_centers = np.array(plot_data["bin_centers"])
+    mean_predicted = np.array(plot_data["mean_predicted"])
+    fraction_positives = np.array(plot_data["fraction_positives"])
+    counts = np.array(plot_data["counts"])
+    
+    # Plot perfect calibration line (diagonal)
+    ax.plot([0, 1], [0, 1], 'k--', linewidth=1.5, alpha=0.5, label='Perfect Calibration')
+    
+    # Plot reliability curve
+    ax.plot(mean_predicted, fraction_positives, 'o-', linewidth=2, markersize=8, 
+            color='#2166ac', label='Calibration Curve', zorder=3)
+    
+    # Add histogram bars in background to show sample distribution
+    ax2 = ax.twinx()
+    ax2.bar(bin_centers, counts, width=0.08, alpha=0.2, color='gray', 
+            label='Sample Count', zorder=1)
+    ax2.set_ylabel('Number of Samples', color='gray', fontsize=10)
+    ax2.tick_params(axis='y', labelcolor='gray')
+    ax2.set_yscale('log')
+    
+    # Formatting
+    ax.set_xlabel('Mean Predicted Probability', fontsize=12, fontweight='bold')
+    ax.set_ylabel('Fraction of Positives', fontsize=12, fontweight='bold')
+    ax.set_title(title, fontsize=14, fontweight='bold', pad=15)
+    ax.grid(True, alpha=0.3, zorder=0)
+    ax.set_xlim([0, 1])
+    ax.set_ylim([0, 1])
+    ax.set_aspect('equal')
+    
+    # Add Brier score text box
+    if is_uncalibrated:
+        # For uncalibrated plots, don't show improvement (or show 0.0%)
+        brier_text = (
+            f'Brier Score: {brier_uncalibrated:.6f}\n'
+            f'Improvement: 0.00%'
+        )
+    else:
+        brier_text = (
+            f'Brier Score (Uncalibrated): {brier_uncalibrated:.6f}\n'
+            f'Brier Score (Calibrated):   {brier_calibrated:.6f}\n'
+            f'Improvement: {((brier_uncalibrated - brier_calibrated) / brier_uncalibrated * 100):.2f}%'
+        )
+    ax.text(0.05, 0.95, brier_text, transform=ax.transAxes, 
+            fontsize=10, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    
+    # Legend
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, loc='lower right', fontsize=10)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"  Reliability curve plot saved: {output_path.name}")
+
+
+def save_brier_score_summary(
+    output_path: Path,
+    cv_uncalibrated_metrics: Dict[str, float],
+    cv_calibration_metrics: Dict[str, float],
+    test_uncalibrated_metrics: Dict[str, float],
+    test_calibrated_metrics: Dict[str, float],
+    calibration_method: str
+) -> None:
+    """Save Brier score summary to a text file.
+    
+    Args:
+        output_path: Path to save the summary file
+        cv_uncalibrated_metrics: CV metrics before calibration
+        cv_calibration_metrics: CV metrics after calibration
+        test_uncalibrated_metrics: Test metrics before calibration
+        test_calibrated_metrics: Test metrics after calibration
+        calibration_method: Calibration method used
+    """
+    with open(output_path, 'w') as f:
+        f.write("=" * 70 + "\n")
+        f.write("BRIER SCORE SUMMARY - CALIBRATION RESULTS\n")
+        f.write("=" * 70 + "\n\n")
+        f.write(f"Calibration Method: {calibration_method}\n")
+        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        
+        f.write("-" * 70 + "\n")
+        f.write("CROSS-VALIDATION SET\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"Brier Score (Uncalibrated): {cv_uncalibrated_metrics['brier_score']:.8f}\n")
+        f.write(f"Brier Score (Calibrated):   {cv_calibration_metrics['brier_score']:.8f}\n")
+        improvement_cv = ((cv_uncalibrated_metrics['brier_score'] - cv_calibration_metrics['brier_score']) 
+                          / cv_uncalibrated_metrics['brier_score'] * 100)
+        f.write(f"Improvement: {improvement_cv:.4f}%\n\n")
+        
+        f.write(f"ECE (Uncalibrated): {cv_uncalibrated_metrics['expected_calibration_error']:.8f}\n")
+        f.write(f"ECE (Calibrated):   {cv_calibration_metrics['expected_calibration_error']:.8f}\n")
+        ece_improvement_cv = ((cv_uncalibrated_metrics['expected_calibration_error'] - cv_calibration_metrics['expected_calibration_error']) 
+                             / cv_uncalibrated_metrics['expected_calibration_error'] * 100)
+        f.write(f"ECE Improvement: {ece_improvement_cv:.4f}%\n\n")
+        
+        f.write("-" * 70 + "\n")
+        f.write("TEST SET\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"Brier Score (Uncalibrated): {test_uncalibrated_metrics['brier_score']:.8f}\n")
+        f.write(f"Brier Score (Calibrated):   {test_calibrated_metrics['brier_score']:.8f}\n")
+        improvement_test = ((test_uncalibrated_metrics['brier_score'] - test_calibrated_metrics['brier_score']) 
+                           / test_uncalibrated_metrics['brier_score'] * 100)
+        f.write(f"Improvement: {improvement_test:.4f}%\n\n")
+        
+        f.write(f"ECE (Uncalibrated): {test_uncalibrated_metrics['expected_calibration_error']:.8f}\n")
+        f.write(f"ECE (Calibrated):   {test_calibrated_metrics['expected_calibration_error']:.8f}\n")
+        ece_improvement_test = ((test_uncalibrated_metrics['expected_calibration_error'] - test_calibrated_metrics['expected_calibration_error']) 
+                               / test_uncalibrated_metrics['expected_calibration_error'] * 100)
+        f.write(f"ECE Improvement: {ece_improvement_test:.4f}%\n\n")
+        
+        f.write("=" * 70 + "\n")
+    
+    print(f"Brier score summary saved: {output_path.name}")
+
+
 def main(
     cv_predictions_path: Optional[Path] = None,
     test_predictions_path: Optional[Path] = None,
-    calibration_method: Literal["isotonic", "platt"] = "isotonic",
+    calibration_method: Literal["isotonic", "platt"] = "platt",
     assume_oof: bool = False
 ) -> None:
     """Main calibration function.
@@ -560,7 +772,7 @@ def main(
         traceback.print_exc()
         sys.exit(1)
     
-    # Step 1.5: Check OOF requirements
+    # Step 1.5: Check OOF requirements and enforce calibration method
     print("\n" + "=" * 70)
     print("STEP 1.5: CHECK OUT-OF-FOLD (OOF) REQUIREMENTS")
     print("=" * 70)
@@ -569,30 +781,32 @@ def main(
         print(f"\nFold information found ({len(np.unique(fold_idx))} folds).")
         print("Using per-fold calibration to ensure OOF property.")
         
-        # For isotonic with fold info: cannot average, so abort
+        # Automatically force Platt scaling when fold info exists
         if calibration_method == "isotonic":
-            error_msg = (
-                "\nERROR: Isotonic calibration cannot be averaged across folds.\n"
-                "With fold information present, we cannot guarantee OOF without per-fold averaging.\n"
-                "Use --method platt for per-fold calibration, or provide CV predictions without fold info and use --assume-oof."
-            )
-            print(error_msg)
-            raise ValueError(error_msg)
+            print("\n" + "!" * 70)
+            print("WARNING: Isotonic calibration cannot be averaged across folds.")
+            print("!" * 70)
+            print(f"\nCalibration method was set to '{calibration_method}', but fold information is present.")
+            print("Isotonic calibration requires guaranteed OOF predictions and cannot be averaged across folds.")
+            print("Automatically switching to Platt scaling (--method platt) for per-fold calibration.")
+            print("!" * 70 + "\n")
+            calibration_method = "platt"
     else:
         print("\nNo fold information found in CV predictions file.")
-        if not assume_oof:
-            error_msg = (
-                "\nERROR: Cannot verify OOF property without fold information.\n"
-                "Isotonic calibration on non-OOF data can severely overfit.\n"
-                "If you are certain the CV predictions are OOF, use --assume-oof flag.\n"
-                "Otherwise, ensure CV predictions include fold information for per-fold calibration."
-            )
-            print(error_msg)
-            raise ValueError(error_msg)
-        print("Proceeding with --assume-oof flag (user confirmed OOF property).")
-        
-        # Big warning for isotonic + assume_oof
+        # Isotonic is only allowed when no fold info exists AND --assume-oof is set
         if calibration_method == "isotonic":
+            if not assume_oof:
+                error_msg = (
+                    "\nERROR: Cannot verify OOF property without fold information.\n"
+                    "Isotonic calibration on non-OOF data can severely overfit.\n"
+                    "If you are certain the CV predictions are OOF, use --assume-oof flag.\n"
+                    "Otherwise, ensure CV predictions include fold information for per-fold calibration."
+                )
+                print(error_msg)
+                raise ValueError(error_msg)
+            
+            # Big warning for isotonic + assume_oof
+            print("Proceeding with --assume-oof flag (user confirmed OOF property).")
             print("\n" + "!" * 70)
             print("WARNING: ISOTONIC CALIBRATION WITH --assume-oof FLAG")
             print("!" * 70)
@@ -604,6 +818,12 @@ def main(
             print("  - Each row should have exactly one prediction")
             print("  - That prediction must come from a fold where the row was NOT used for training")
             print("!" * 70 + "\n")
+        else:
+            # Platt scaling doesn't require --assume-oof, but warn if it's set
+            if assume_oof:
+                print("Proceeding with --assume-oof flag (using pooled calibration).")
+            else:
+                print("Proceeding with pooled calibration (no fold information available).")
     
     # Step 2: Load test predictions
     print("\n" + "=" * 70)
@@ -622,7 +842,8 @@ def main(
         raise FileNotFoundError(f"Test predictions file not found: {test_predictions_path}")
     
     try:
-        test_df, y_test_true, y_test_proba = load_test_predictions(test_predictions_path)
+        # First load only required columns for calibration (memory efficient)
+        _, y_test_true, y_test_proba = load_test_predictions(test_predictions_path, load_minimal_cols=True)
     except Exception as e:
         print(f"\nERROR: Failed to load test predictions: {e}")
         import traceback
@@ -643,8 +864,11 @@ def main(
                 fold_idx, y_cv_true, y_cv_proba, calibration_method
             )
         else:
-            # No fold info: use pooled calibration (assume_oof flag was checked above)
-            print("\nUsing pooled calibration (OOF assumed via --assume-oof)...")
+            # No fold info: use pooled calibration
+            if assume_oof:
+                print("\nUsing pooled calibration (OOF assumed via --assume-oof)...")
+            else:
+                print("\nUsing pooled calibration (no fold information available)...")
             
             if calibration_method == "isotonic":
                 calibrator = fit_isotonic_calibration(y_cv_true, y_cv_proba)
@@ -655,8 +879,8 @@ def main(
             
             fold_info = {
                 "method": "pooled",
-                "assume_oof": True,
-                "oof_assumption": "user_asserted" if calibration_method == "isotonic" else None
+                "assume_oof": assume_oof,
+                "oof_assumption": "user_asserted" if (calibration_method == "isotonic" and assume_oof) else None
             }
         
         # Create apply function based on calibration method
@@ -738,23 +962,123 @@ def main(
         traceback.print_exc()
         sys.exit(1)
     
+    # Step 5.5: Create reliability curve plots
+    print("\n" + "=" * 70)
+    print("STEP 5.5: CREATE RELIABILITY CURVE PLOTS")
+    print("=" * 70)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    figures_dir = repo_root / "outputs/Figures"
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        # Plot test set reliability curves (most important for evaluation)
+        print("\nCreating reliability curve plots for test set...")
+        
+        # Test set - uncalibrated
+        test_uncalibrated_plot_path = figures_dir / f"reliability_curve_test_uncalibrated_{calibration_method}_{timestamp}.png"
+        plot_reliability_curve(
+            test_uncalibrated_plot_uniform,
+            f"Reliability Curve - Test Set (Uncalibrated)\n{calibration_method.upper()} Calibration",
+            test_uncalibrated_plot_path,
+            test_uncalibrated_metrics['brier_score'],
+            test_uncalibrated_metrics['brier_score'],  # Same for uncalibrated
+            binning_method="uniform",
+            is_uncalibrated=True
+        )
+        
+        # Test set - calibrated
+        test_calibrated_plot_path = figures_dir / f"reliability_curve_test_calibrated_{calibration_method}_{timestamp}.png"
+        plot_reliability_curve(
+            test_calibrated_plot_uniform,
+            f"Reliability Curve - Test Set (Calibrated)\n{calibration_method.upper()} Calibration",
+            test_calibrated_plot_path,
+            test_uncalibrated_metrics['brier_score'],
+            test_calibrated_metrics['brier_score'],
+            binning_method="uniform",
+            is_uncalibrated=False
+        )
+        
+        # CV set - uncalibrated
+        cv_uncalibrated_plot_path = figures_dir / f"reliability_curve_cv_uncalibrated_{calibration_method}_{timestamp}.png"
+        plot_reliability_curve(
+            cv_uncalibrated_plot_uniform,
+            f"Reliability Curve - CV Set (Uncalibrated)\n{calibration_method.upper()} Calibration",
+            cv_uncalibrated_plot_path,
+            cv_uncalibrated_metrics['brier_score'],
+            cv_uncalibrated_metrics['brier_score'],  # Same for uncalibrated
+            binning_method="uniform",
+            is_uncalibrated=True
+        )
+        
+        # CV set - calibrated
+        cv_calibrated_plot_path = figures_dir / f"reliability_curve_cv_calibrated_{calibration_method}_{timestamp}.png"
+        plot_reliability_curve(
+            cv_calibrated_plot_uniform,
+            f"Reliability Curve - CV Set (Calibrated)\n{calibration_method.upper()} Calibration",
+            cv_calibrated_plot_path,
+            cv_uncalibrated_metrics['brier_score'],
+            cv_calibration_metrics['brier_score'],
+            binning_method="uniform",
+            is_uncalibrated=False
+        )
+        
+        print("\nCreated reliability curve plots for CV and test sets (both uncalibrated and calibrated)")
+    except Exception as e:
+        print(f"\nERROR: Failed to create reliability curve plots: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    
     # Step 6: Save results
     print("\n" + "=" * 70)
     print("STEP 6: SAVE RESULTS")
     print("=" * 70)
     
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # Save calibrated test predictions (minimal parquet with only essential columns)
+    print("\nLoading metadata columns for saving calibrated predictions...")
+    try:
+        test_df_metadata, _, _ = load_test_predictions(test_predictions_path, load_minimal_cols=False)
+    except Exception as e:
+        print(f"\nERROR: Failed to load metadata columns for saving: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
     
-    # Save calibrated test predictions
-    test_df_calibrated = test_df.copy()
-    test_df_calibrated['y_pred_proba_uncalibrated'] = y_test_proba
-    test_df_calibrated['y_pred_proba_calibrated'] = y_test_calibrated
-    test_df_calibrated['y_pred_proba'] = y_test_calibrated  # Replace original with calibrated
+    # Build minimal dataframe with essential columns only
+    # Try to include: id (if exists), row, col, x, y, year, y_true, y_pred_proba_uncalibrated, y_pred_proba_calibrated
+    minimal_cols = []
+    col_mapping = {
+        'id': 'id',
+        'row': 'row',
+        'col': 'col',
+        'x': 'x',
+        'y': 'y',
+        'year': 'year'
+    }
+    
+    for col_name, col_key in col_mapping.items():
+        if col_key in test_df_metadata.columns:
+            minimal_cols.append(col_key)
+    
+    # Create minimal dataframe
+    if minimal_cols:
+        test_df_minimal = test_df_metadata[minimal_cols].copy()
+    else:
+        # Fallback: create empty dataframe with just index if no metadata columns found
+        test_df_minimal = pd.DataFrame(index=range(len(y_test_true)))
+    
+    # Add required columns
+    test_df_minimal['y_true'] = y_test_true
+    test_df_minimal['y_pred_proba_uncalibrated'] = y_test_proba
+    test_df_minimal['y_pred_proba_calibrated'] = y_test_calibrated
+    test_df_minimal['y_pred_proba'] = y_test_calibrated  # Replace original with calibrated (for compatibility)
     
     calibrated_test_path = output_dir / f"modelC_lgbm_win5_scored_calibrated_{calibration_method}_{timestamp}.parquet"
     try:
-        test_df_calibrated.to_parquet(calibrated_test_path, index=False)
+        test_df_minimal.to_parquet(calibrated_test_path, index=False)
         print(f"\nCalibrated test predictions saved: {calibrated_test_path.name}")
+        print(f"  Saved {len(test_df_minimal.columns)} columns: {', '.join(test_df_minimal.columns.tolist())}")
     except Exception as e:
         print(f"\nERROR: Failed to save calibrated test predictions: {e}")
         sys.exit(1)
@@ -847,6 +1171,21 @@ def main(
         print(f"\nERROR: Failed to save calibration metadata: {e}")
         sys.exit(1)
     
+    # Save Brier score summary
+    brier_summary_path = output_dir / f"modelC_lgbm_win5_brier_summary_{calibration_method}_{timestamp}.txt"
+    try:
+        save_brier_score_summary(
+            brier_summary_path,
+            cv_uncalibrated_metrics,
+            cv_calibration_metrics,
+            test_uncalibrated_metrics,
+            test_calibrated_metrics,
+            calibration_method
+        )
+    except Exception as e:
+        print(f"\nERROR: Failed to save Brier score summary: {e}")
+        sys.exit(1)
+    
     # Summary
     print("\n" + "=" * 70)
     print("SUMMARY")
@@ -860,9 +1199,12 @@ def main(
         print(f"  Calibration strategy: Per-fold (averaged)")
     else:
         print(f"  Fold information: Not available")
-        print(f"  OOF assumed: Yes (via --assume-oof flag)")
-        if fold_info and fold_info.get("oof_assumption") == "user_asserted":
-            print(f"  ⚠ OOF assumption: USER ASSERTED (isotonic calibration - ensure CV predictions are OOF by construction)")
+        if assume_oof:
+            print(f"  OOF assumed: Yes (via --assume-oof flag)")
+            if fold_info and fold_info.get("oof_assumption") == "user_asserted":
+                print(f"  ⚠ OOF assumption: USER ASSERTED (isotonic calibration - ensure CV predictions are OOF by construction)")
+        else:
+            print(f"  OOF assumed: No (using pooled calibration without OOF guarantee)")
         print(f"  Calibration strategy: Pooled")
     print(f"\nTest Calibration Metrics:")
     print(f"  Uncalibrated: Brier={test_uncalibrated_metrics['brier_score']:.6f}, "
@@ -873,6 +1215,12 @@ def main(
     print(f"  Calibrated predictions: {calibrated_test_path.name}")
     print(f"  Reliability plot data: {reliability_plot_path.name}")
     print(f"  Calibration metadata: {calibration_metadata_path.name}")
+    print(f"  Brier score summary: {brier_summary_path.name}")
+    print(f"\nReliability curve plots:")
+    print(f"  Test (uncalibrated): {test_uncalibrated_plot_path.name}")
+    print(f"  Test (calibrated):   {test_calibrated_plot_path.name}")
+    print(f"  CV (uncalibrated):   {cv_uncalibrated_plot_path.name}")
+    print(f"  CV (calibrated):     {cv_calibrated_plot_path.name}")
     print("\n" + "=" * 70)
     print("Done.")
     print("=" * 70)
@@ -898,8 +1246,8 @@ if __name__ == "__main__":
         "--method",
         type=str,
         choices=["isotonic", "platt"],
-        default="isotonic",
-        help="Calibration method: 'isotonic' or 'platt' (default: isotonic)"
+        default="platt",
+        help="Calibration method: 'isotonic' or 'platt' (default: platt)"
     )
     parser.add_argument(
         "--assume-oof",

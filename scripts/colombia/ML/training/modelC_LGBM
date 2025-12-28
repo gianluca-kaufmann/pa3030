@@ -17,6 +17,7 @@ Features:
 
 from __future__ import annotations
 
+import argparse
 import gc
 import json
 import os
@@ -601,6 +602,25 @@ def compute_metrics(y_true: np.ndarray, y_proba: np.ndarray) -> Dict[str, float]
 # Main Pipeline
 # =============================================================================
 
+def check_year_overlap(train_years: tuple[int, int], eval_years: tuple[int, int], eval_name: str) -> bool:
+    """
+    Check if evaluation years overlap with training years.
+    Returns True if there's overlap, False otherwise.
+    """
+    train_start, train_end = train_years
+    eval_start, eval_end = eval_years
+    
+    # Check for overlap: eval years should be strictly after training years
+    if eval_start <= train_end:
+        print(f"\n{'!'*70}")
+        print(f"WARNING: {eval_name} years ({eval_start}-{eval_end}) OVERLAP with training years ({train_start}-{train_end})!")
+        print(f"  Evaluation years must be strictly after training years to avoid data leakage.")
+        print(f"  SKIPPING {eval_name} evaluation for this fold.")
+        print(f"{'!'*70}\n")
+        return True
+    return False
+
+
 def train_single_cv_fold(
     train_paths: list[Path],
     earlystop_paths: list[Path],
@@ -614,6 +634,7 @@ def train_single_cv_fold(
 ) -> Dict[str, Any]:
     """
     Train and evaluate a single CV fold.
+    Earlystop is used ONLY for early stopping, NOT for metric reporting.
     
     Returns:
         Dictionary containing fold metrics and metadata
@@ -623,6 +644,18 @@ def train_single_cv_fold(
     print(f"Train: {train_years[0]}-{train_years[1]} → Earlystop: {earlystop_years[0]}-{earlystop_years[1]}")
     print(f"{'='*70}")
     
+    # Check for year overlap
+    earlystop_year_range = (earlystop_years[0], min(earlystop_years[1], LAST_LABEL_YEAR))
+    if check_year_overlap(train_years, earlystop_year_range, f"Fold {fold_idx+1} Earlystop"):
+        # Skip this fold if overlap detected
+        return {
+            "fold_idx": fold_idx,
+            "train_years": list(train_years),
+            "earlystop_years": list(earlystop_years),
+            "skipped": True,
+            "skip_reason": "year_overlap",
+        }
+    
     # Load train data
     X_train, y_train, train_years_array, train_pos, train_neg, train_years_list = load_numpy_arrays_from_multiple_files(
         train_paths, feature_cols, target_col, f"Fold {fold_idx+1} Train", year_range=train_years
@@ -630,13 +663,13 @@ def train_single_cv_fold(
     n_train_samples = len(X_train)
     
     # Load earlystop data (filter to LAST_LABEL_YEAR to avoid right-censored labels)
-    earlystop_year_range = (earlystop_years[0], min(earlystop_years[1], LAST_LABEL_YEAR))
     X_earlystop, y_earlystop, earlystop_years_array, earlystop_pos, earlystop_neg, earlystop_years_list = load_numpy_arrays_from_multiple_files(
         earlystop_paths, feature_cols, target_col, f"Fold {fold_idx+1} Earlystop", year_range=earlystop_year_range
     )
     n_earlystop_samples = len(X_earlystop)
     
     print(f"\nFold {fold_idx+1}: Train {n_train_samples:,} samples, Earlystop {n_earlystop_samples:,} samples (earlystop years {earlystop_year_range[0]}-{earlystop_year_range[1]}, capped at LAST_LABEL_YEAR={LAST_LABEL_YEAR})")
+    print(f"  NOTE: Earlystop used ONLY for early stopping, NOT for metric reporting.")
     
     # Compute sample weights for training data (time-based weighting)
     # Weight range: 2000 (weight 0.5) to train_years[1] (weight 1.0)
@@ -673,13 +706,9 @@ def train_single_cv_fold(
     
     del train_dataset, earlystop_dataset; gc.collect()
     
-    # Compute metrics on earlystop set for reporting (not for final evaluation)
-    print(f"  Computing metrics on earlystop set (for reporting only)...")
-    y_proba_earlystop = lgb_model.predict(X_earlystop, num_iteration=best_iteration if best_iteration else None).astype(np.float32)
-    earlystop_metrics = compute_metrics(y_earlystop, y_proba_earlystop)
-    
-    print(f"  Earlystop metrics (fold {fold_idx+1}): ROC-AUC {earlystop_metrics['roc_auc']:.4f}, PR-AUC {earlystop_metrics['pr_auc']:.4f}")
-    print(f"    P@1%: {earlystop_metrics['precision_at_1pct']:.4f}, P@5%: {earlystop_metrics['precision_at_5pct']:.4f}, P@10%: {earlystop_metrics['precision_at_10pct']:.4f}")
+    # NO METRICS COMPUTED ON EARLYSTOP - earlystop is used ONLY for early stopping
+    # Clean up earlystop data immediately after training
+    del X_earlystop, y_earlystop, earlystop_years_array, lgb_model; gc.collect()
     
     if use_wandb:
         wandb.log({
@@ -687,11 +716,7 @@ def train_single_cv_fold(
             f"cv_fold_{fold_idx+1}/n_earlystop": int(n_earlystop_samples),
             f"cv_fold_{fold_idx+1}/train_time_seconds": train_time,
             f"cv_fold_{fold_idx+1}/best_iteration": int(best_iteration) if best_iteration is not None else None,
-            **{f"cv_fold_{fold_idx+1}/earlystop_{k}": v for k, v in earlystop_metrics.items()}
         })
-    
-    # Clean up
-    del X_earlystop, y_earlystop, y_proba_earlystop, earlystop_years_array, lgb_model; gc.collect()
     
     return {
         "fold_idx": fold_idx,
@@ -705,30 +730,27 @@ def train_single_cv_fold(
         "earlystop_negatives": int(earlystop_neg),
         "train_time_seconds": train_time,
         "best_iteration": int(best_iteration) if best_iteration is not None else None,
-        "earlystop_metrics": earlystop_metrics,
     }
 
 
 def aggregate_cv_metrics(cv_results: list[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Aggregate metrics across CV folds.
-    Earlystop metrics are computed for reporting only (not for final evaluation).
+    Only aggregates training metadata (no validation/earlystop metrics).
     """
     aggregated = {}
     
-    # Aggregate sample sizes
-    aggregated["n_train_mean"] = float(np.mean([fold.get("n_train_samples", fold["train_positives"] + fold["train_negatives"]) for fold in cv_results]))
-    aggregated["n_earlystop_mean"] = float(np.mean([fold.get("n_earlystop_samples", fold["earlystop_positives"] + fold["earlystop_negatives"]) for fold in cv_results]))
+    # Filter out skipped folds
+    valid_folds = [fold for fold in cv_results if not fold.get("skipped", False)]
     
-    # Aggregate earlystop metrics (for reporting only)
-    earlystop_metrics_list = [fold.get("earlystop_metrics", {}) for fold in cv_results if fold.get("earlystop_metrics")]
-    if earlystop_metrics_list:
-        metric_keys = earlystop_metrics_list[0].keys()
-        for key in metric_keys:
-            values = [m[key] for m in earlystop_metrics_list if key in m]
-            if values:
-                aggregated[f"earlystop_{key}_mean"] = float(np.mean(values))
-                aggregated[f"earlystop_{key}_std"] = float(np.std(values))
+    if not valid_folds:
+        return aggregated
+    
+    # Aggregate sample sizes
+    aggregated["n_train_mean"] = float(np.mean([fold.get("n_train_samples", fold.get("train_positives", 0) + fold.get("train_negatives", 0)) for fold in valid_folds]))
+    aggregated["n_earlystop_mean"] = float(np.mean([fold.get("n_earlystop_samples", fold.get("earlystop_positives", 0) + fold.get("earlystop_negatives", 0)) for fold in valid_folds]))
+    
+    # NO earlystop metrics aggregated - earlystop is used ONLY for early stopping
     
     return aggregated
 
@@ -736,6 +758,7 @@ def aggregate_cv_metrics(cv_results: list[Dict[str, Any]]) -> Dict[str, Any]:
 def phase1_training(
     train_path: Path, earlystop_path: Path, params_path: Optional[Path], feature_cols: list, keep_cols_train: list,
     best_params: Dict[str, Any], timestamp: str, model_dir: Path, output_dir: Path, use_wandb: bool, target_col: str,
+    cv_mode: str = "full",
 ) -> tuple[Path, Dict[str, Any], Dict[str, Any], float, float, int, int, int, Dict[str, Any], Dict[str, Any]]:
     """
     Phase 1: Training with temporal cross-validation.
@@ -754,63 +777,118 @@ def phase1_training(
     # STEP A: TEMPORAL CROSS-VALIDATION
     # =============================================================================
     print("\n" + "="*70 + "\nSTEP A: TEMPORAL CROSS-VALIDATION\n" + "="*70)
-    
-    # For CV, we need data from both train and earlystop files (2000-2017)
-    # Each fold will filter the appropriate year ranges
-    cv_train_paths = [train_path, earlystop_path]  # Both files contain data needed for CV
-    cv_earlystop_paths = [train_path, earlystop_path]    # Same, we filter by year_range
+    print(f"CV Mode: {cv_mode}")
     
     cv_results = []
-    for fold_idx, (train_years, earlystop_years) in enumerate(CV_FOLDS):
-        fold_result = train_single_cv_fold(
-            cv_train_paths, cv_earlystop_paths, feature_cols, target_col,
-            train_years, earlystop_years, fold_idx, best_params, use_wandb
-        )
-        cv_results.append(fold_result)
-        gc.collect()
     
-    # Aggregate CV metrics (no metrics computed on earlystop sets)
-    cv_aggregated = aggregate_cv_metrics(cv_results)
-    
-    # Calculate average best_iteration from CV folds for final model
-    best_iterations = [fold["best_iteration"] for fold in cv_results if fold["best_iteration"] is not None]
-    if best_iterations:
-        avg_best_iteration = int(np.round(np.mean(best_iterations)))
-        print(f"\nCV best_iterations: {best_iterations}")
-        print(f"Average best_iteration (for final model): {avg_best_iteration}")
+    if cv_mode == "none":
+        print("  Skipping CV (cv_mode=none)")
+        # Use default best_iteration from params
+        chosen_iteration = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
+        print(f"  Using default best_iteration from params: {chosen_iteration}")
+        cv_aggregated = {}
+        best_iterations = []
+        train_rows_per_fold = []
+        fold3_best_iteration = None
+        cv_results = []
     else:
-        # Fallback: use default if no best_iteration found
-        avg_best_iteration = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
-        print(f"\nWarning: No best_iteration found in CV folds, using default: {avg_best_iteration}")
+        # For CV, we need data from both train and earlystop files (2000-2017)
+        # Each fold will filter the appropriate year ranges
+        cv_train_paths = [train_path, earlystop_path]  # Both files contain data needed for CV
+        cv_earlystop_paths = [train_path, earlystop_path]    # Same, we filter by year_range
+        
+        # Determine which folds to run
+        if cv_mode == "fold3":
+            folds_to_run = [2]  # Only fold 3 (0-indexed: 2)
+            print(f"  Running only fold 3 (2000-2014 -> 2015-2017)")
+        elif cv_mode == "full":
+            folds_to_run = list(range(len(CV_FOLDS)))  # All folds
+            print(f"  Running all {len(CV_FOLDS)} folds")
+        else:
+            raise ValueError(f"Invalid cv_mode: {cv_mode}. Must be one of: full, fold3, none")
+        
+        for fold_idx in folds_to_run:
+            train_years, earlystop_years = CV_FOLDS[fold_idx]
+            fold_result = train_single_cv_fold(
+                cv_train_paths, cv_earlystop_paths, feature_cols, target_col,
+                train_years, earlystop_years, fold_idx, best_params, use_wandb
+            )
+            cv_results.append(fold_result)
+            gc.collect()
+        
+        # Aggregate CV metrics (no metrics computed on earlystop sets)
+        cv_aggregated = aggregate_cv_metrics(cv_results)
+        
+        # Extract best_iterations and train_rows for each fold (skip folds that were skipped due to overlap)
+        best_iterations = [fold["best_iteration"] for fold in cv_results if fold.get("best_iteration") is not None and not fold.get("skipped", False)]
+        train_rows_per_fold = [fold["n_train_samples"] for fold in cv_results if not fold.get("skipped", False)]
+        
+        # Extract fold3's best_iteration (fold index 2) - skip if fold was skipped
+        fold3_best_iteration = None
+        for fold_result in cv_results:
+            if (fold_result.get("fold_idx") == 2 and 
+                fold_result.get("best_iteration") is not None and 
+                not fold_result.get("skipped", False)):
+                fold3_best_iteration = fold_result["best_iteration"]
+                break
+        
+        # Calculate chosen_iteration based on cv_mode
+        if cv_mode == "full":
+            if best_iterations and train_rows_per_fold:
+                # Weighted average: sum(iter_i * n_i) / sum(n_i) * 1.05
+                weighted_sum = sum(iter_i * n_i for iter_i, n_i in zip(best_iterations, train_rows_per_fold))
+                total_rows = sum(train_rows_per_fold)
+                chosen_iteration = int(np.round(weighted_sum / total_rows * 1.05))
+                print(f"\nCV best_iterations: {best_iterations}")
+                print(f"CV train_rows_per_fold: {train_rows_per_fold}")
+                print(f"Weighted average (before 1.05x): {weighted_sum / total_rows:.2f}")
+                print(f"Chosen iteration (weighted avg * 1.05): {chosen_iteration}")
+                
+                # Apply max constraint with fold3_best_iteration
+                if fold3_best_iteration is not None:
+                    chosen_iteration = max(chosen_iteration, fold3_best_iteration)
+                    print(f"After max with fold3_best_iteration ({fold3_best_iteration}): {chosen_iteration}")
+            else:
+                # Fallback: use default if no best_iteration found (e.g., all folds skipped)
+                skipped_count = len([f for f in cv_results if f.get("skipped", False)])
+                if skipped_count > 0:
+                    print(f"\nWarning: {skipped_count} fold(s) skipped due to year overlap. No best_iteration found in remaining folds.")
+                else:
+                    print(f"\nWarning: No best_iteration found in CV folds.")
+                chosen_iteration = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
+                print(f"  Using default iteration from params: {chosen_iteration}")
+        elif cv_mode == "fold3":
+            if fold3_best_iteration is not None:
+                chosen_iteration = fold3_best_iteration
+                print(f"\nUsing fold3_best_iteration: {chosen_iteration}")
+            else:
+                # Fallback: use default if fold3 best_iteration not found (e.g., fold3 was skipped)
+                fold3_result = next((f for f in cv_results if f.get("fold_idx") == 2), None)
+                if fold3_result and fold3_result.get("skipped", False):
+                    print(f"\nWarning: Fold 3 was skipped due to year overlap. fold3_best_iteration not available.")
+                else:
+                    print(f"\nWarning: fold3_best_iteration not found.")
+                chosen_iteration = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
+                print(f"  Using default iteration from params: {chosen_iteration}")
+        else:
+            # Fallback for any other mode
+            chosen_iteration = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
+            print(f"\nWarning: Unknown cv_mode, using default: {chosen_iteration}")
     
     print("\n" + "="*70)
     print("TEMPORAL CV RESULTS (Aggregated)")
     print("="*70)
-    print(f"Average best_iteration: {avg_best_iteration}")
+    print(f"CV Mode: {cv_mode}")
+    if cv_mode != "none":
+        print(f"Chosen iteration (for final model): {chosen_iteration}")
+        # Report number of skipped folds
+        skipped_folds = [fold for fold in cv_results if fold.get("skipped", False)]
+        if skipped_folds:
+            print(f"  WARNING: {len(skipped_folds)} fold(s) skipped due to year overlap")
+    else:
+        print(f"Chosen iteration (from params): {chosen_iteration}")
     
-    # Display aggregated earlystop metrics (for reporting only)
-    if any(k.startswith("earlystop_") and k.endswith("_mean") for k in cv_aggregated.keys()):
-        print(f"\nEarlystop Metrics (for reporting only, not for final evaluation):")
-        roc_auc_mean = cv_aggregated.get("earlystop_roc_auc_mean")
-        roc_auc_std = cv_aggregated.get("earlystop_roc_auc_std")
-        pr_auc_mean = cv_aggregated.get("earlystop_pr_auc_mean")
-        pr_auc_std = cv_aggregated.get("earlystop_pr_auc_std")
-        if roc_auc_mean is not None:
-            print(f"  ROC-AUC: {roc_auc_mean:.4f} ± {roc_auc_std:.4f}" if roc_auc_std is not None else f"  ROC-AUC: {roc_auc_mean:.4f}")
-        if pr_auc_mean is not None:
-            print(f"  PR-AUC: {pr_auc_mean:.4f} ± {pr_auc_std:.4f}" if pr_auc_std is not None else f"  PR-AUC: {pr_auc_mean:.4f}")
-        prec_1_mean = cv_aggregated.get("earlystop_precision_at_1pct_mean")
-        prec_1_std = cv_aggregated.get("earlystop_precision_at_1pct_std")
-        prec_5_mean = cv_aggregated.get("earlystop_precision_at_5pct_mean")
-        prec_5_std = cv_aggregated.get("earlystop_precision_at_5pct_std")
-        prec_10_mean = cv_aggregated.get("earlystop_precision_at_10pct_mean")
-        prec_10_std = cv_aggregated.get("earlystop_precision_at_10pct_std")
-        if prec_1_mean is not None:
-            print(f"  P@1%: {prec_1_mean:.4f} ± {prec_1_std:.4f}" if prec_1_std is not None else f"  P@1%: {prec_1_mean:.4f}")
-        if prec_5_mean is not None:
-            print(f"  P@5%: {prec_5_mean:.4f} ± {prec_5_std:.4f}" if prec_5_std is not None else f"  P@5%: {prec_5_mean:.4f}")
-        if prec_10_mean is not None:
-            print(f"  P@10%: {prec_10_mean:.4f} ± {prec_10_std:.4f}" if prec_10_std is not None else f"  P@10%: {prec_10_mean:.4f}")
+    # NO earlystop metrics displayed - earlystop is used ONLY for early stopping, not for evaluation
     
     print("="*70)
     
@@ -844,7 +922,7 @@ def phase1_training(
     report_memory_usage("after loading final data")
     
     print(f"\nFinal model training: train ({TRAIN_YEARS[0]}-{EARLYSTOP_YEARS[1]}): {len(X_train_full):,} rows")
-    print(f"  Using fixed number of iterations: {avg_best_iteration} (average from CV folds, no early stopping)")
+    print(f"Final training: no earlystop/val; num_boost_round fixed from CV to avoid leakage.")
     
     # Compute sample weights for training data (time-based weighting)
     # Weight range: 2000 (weight 0.5) to EARLYSTOP_YEARS[1] (weight 1.0)
@@ -884,15 +962,15 @@ def phase1_training(
     del X_train_full, y_train_full, train_years_array_full, train_weights; gc.collect()
     report_memory_usage("after train dataset creation")
     
-    print(f"  Starting training (no early stopping, fixed {avg_best_iteration} iterations)...")
+    print(f"  Starting training with num_boost_round={chosen_iteration} (fixed from CV, no validation set/early stopping)...")
     lgb_model = lgb.train(
         train_params,
         train_dataset,
-        num_boost_round=avg_best_iteration,
+        num_boost_round=chosen_iteration,
         callbacks=[lgb.log_evaluation(100)]
     )
     train_time = time.time() - train_start
-    print(f"\nTraining done in {train_time:.1f}s. Used {avg_best_iteration} iterations (average from CV folds)")
+    print(f"\nTraining done in {train_time:.1f}s. Used {chosen_iteration} iterations (chosen based on CV)")
     
     del train_dataset; gc.collect()
     
@@ -913,15 +991,20 @@ def phase1_training(
             "final_model/data/train_positive_pct": train_stats["train_positive_pct"],
             "final_model/training/train_time_seconds": train_time,
             "final_model/training/train_time_minutes": train_time / 60,
-            "final_model/training/final_num_boost_round": avg_best_iteration,
-            "final_model/training/cv_avg_best_iteration": avg_best_iteration,
+            "final_model/training/final_num_boost_round": chosen_iteration,
+            "final_model/training/chosen_iteration": chosen_iteration,
         })
     
     print("Phase 1 completed.")
     cv_info = {
+        "cv_mode": cv_mode,
         "folds": cv_results,
         "aggregated": cv_aggregated,
-        "avg_best_iteration": avg_best_iteration
+        "cv_best_iterations": best_iterations,
+        "cv_train_rows_per_fold": train_rows_per_fold,
+        "fold3_best_iteration": int(fold3_best_iteration) if fold3_best_iteration is not None else None,
+        "final_num_boost_round": chosen_iteration,
+        "chosen_iteration": chosen_iteration  # Alias for backward compatibility
     }
     # Return None for earlystop_metrics - earlystop is not used for evaluation
     return (model_path, None, train_stats, train_time, earlystop_time, train_pos_full, train_neg_full, n_train_full, imbalance_info, cv_info)
@@ -936,6 +1019,17 @@ def phase2_testing(
     """Phase 2: Testing - loads test in batches, loads model, evaluates."""
     print("\n" + "="*70 + "\nPHASE 2: TESTING\n" + "="*70)
     report_memory_usage("start of Phase 2")
+    
+    # Check for year overlap between training and test
+    final_train_years = (TRAIN_YEARS[0], EARLYSTOP_YEARS[1])  # Full training period: 2000-2017
+    test_year_range = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))
+    
+    if check_year_overlap(final_train_years, test_year_range, "Test"):
+        print("\n" + "="*70)
+        print("ERROR: Cannot proceed with testing due to year overlap.")
+        print("="*70)
+        raise ValueError("Test years overlap with training years. Cannot evaluate.")
+    
     print(f"\nLoading model from {model_path}")
     with open(model_path, 'rb') as f:
         lgb_model = pickle.load(f)
@@ -944,8 +1038,6 @@ def phase2_testing(
     # Use smaller batch size to reduce memory pressure
     batch_size = 50_000
     
-    # Filter test data to LAST_LABEL_YEAR to avoid right-censored labels
-    test_year_range = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))
     print(f"Processing test in batches of {batch_size:,}...")
     print(f"Test year range: {test_year_range[0]}-{test_year_range[1]} (capped at LAST_LABEL_YEAR={LAST_LABEL_YEAR})")
     
@@ -987,13 +1079,13 @@ def phase2_testing(
     y_proba = np.empty(n_test_total, dtype=np.float32)
     report_memory_usage("after pre-allocation")
     
-    # Get best iteration from CV info (average from CV folds)
-    # Since final model doesn't use early stopping, we use the average from CV
-    best_iteration = cv_info.get("avg_best_iteration", None)
+    # Get best iteration from CV info (chosen iteration from CV)
+    # Since final model doesn't use early stopping, we use the chosen iteration from CV
+    best_iteration = cv_info.get("final_num_boost_round", cv_info.get("chosen_iteration", None))
     if best_iteration is None:
         # Fallback: use model's num_trees if cv_info doesn't have it
         best_iteration = getattr(lgb_model, 'num_trees', None)
-    print(f"  Using {best_iteration} iterations for predictions (from CV average)")
+    print(f"  Using {best_iteration} iterations for predictions (chosen from CV)")
     
     # Pass 2: Process batches and fill pre-allocated arrays
     print(f"  Pass 2: Processing test batches (year_range={test_year_range})...")
@@ -1151,7 +1243,8 @@ def phase2_testing(
             "random_state": RANDOM_STATE, 
             "n_features": len(feature_cols), 
             "features": feature_cols,
-            "test_probabilities": "uncalibrated"
+            "test_probabilities": "uncalibrated",
+            "cv_mode": cv_info.get("cv_mode", "full")
         },
         "data": {
             "n_train_full": n_train_full, 
@@ -1192,21 +1285,21 @@ def phase2_testing(
     del lgb_model; gc.collect()
     
     total_time = time.time() - start_time
-    cv_agg = cv_info["aggregated"]
+    cv_mode = cv_info.get("cv_mode", "full")
     print("\n" + "="*70 + "\nSUMMARY\n" + "="*70)
     print(f"Model: LightGBM, {len(feature_cols)} features")
-    print(f"\nTemporal Cross-Validation (Average across {len(CV_FOLDS)} folds):")
-    print(f"  Average best_iteration: {cv_info.get('avg_best_iteration', 'N/A')}")
+    print(f"\nTemporal Cross-Validation (CV Mode: {cv_mode}):")
+    if cv_mode != "none":
+        n_folds_run = len([f for f in cv_info.get("folds", []) if not f.get("skipped", False)])
+        n_folds_skipped = len([f for f in cv_info.get("folds", []) if f.get("skipped", False)])
+        print(f"  Folds run: {n_folds_run}")
+        if n_folds_skipped > 0:
+            print(f"  Folds skipped (year overlap): {n_folds_skipped}")
+    print(f"  Final num_boost_round (chosen): {cv_info.get('final_num_boost_round', 'N/A')}")
+    if cv_info.get('fold3_best_iteration') is not None:
+        print(f"  Fold3 best_iteration: {cv_info.get('fold3_best_iteration')}")
     
-    # Display aggregated earlystop metrics (for reporting only)
-    roc_auc_mean = cv_agg.get("earlystop_roc_auc_mean")
-    roc_auc_std = cv_agg.get("earlystop_roc_auc_std")
-    pr_auc_mean = cv_agg.get("earlystop_pr_auc_mean")
-    pr_auc_std = cv_agg.get("earlystop_pr_auc_std")
-    if roc_auc_mean is not None:
-        print(f"  Earlystop (for reporting only): ROC-AUC {roc_auc_mean:.4f} ± {roc_auc_std:.4f}" if roc_auc_std is not None else f"  Earlystop (for reporting only): ROC-AUC {roc_auc_mean:.4f}")
-        if pr_auc_mean is not None:
-            print(f"    PR-AUC {pr_auc_mean:.4f} ± {pr_auc_std:.4f}" if pr_auc_std is not None else f"    PR-AUC {pr_auc_mean:.4f}")
+    # NO earlystop/validation metrics displayed - only CV metadata and test metrics
     
     print(f"\nTest ({TEST_YEARS[0]}-{TEST_YEARS[1]}, {n_test_total:,} samples, {test_pos/n_test_total*100:.3f}% pos): ROC-AUC {test_metrics['roc_auc']:.4f}, PR-AUC {test_metrics['pr_auc']:.4f}")
     print(f"  P@1%: {prec_at_k[1]:.4f} ({test_metrics['lift_at_1pct']:.1f}x), P@5%: {prec_at_k[5]:.4f} ({test_metrics['lift_at_5pct']:.1f}x), P@10%: {prec_at_k[10]:.4f} ({test_metrics['lift_at_10pct']:.1f}x)")
@@ -1222,7 +1315,7 @@ def phase2_testing(
         wandb.finish()
 
 
-def main(timestamp: str) -> None:
+def main(timestamp: str, cv_mode: str = "full") -> None:
     start_time = time.time()
     repo_root = Path(__file__).resolve().parents[4]
     train_path = resolve_parquet_file("train_colombia_win5.parquet")
@@ -1265,6 +1358,7 @@ def main(timestamp: str) -> None:
     print("="*70 + "\nLGBM TRANSITION MODEL (COLOMBIA DATASET - 5-YEAR LOOKAHEAD)\n" + "="*70)
     print(f"Train: {train_path}\nEarlystop: {earlystop_path}\nTest: {test_path}\nParams: {params_path if params_path else 'Using default manual hyperparameters'}\nOutput: {output_dir}")
     print(f"\nConfiguration:")
+    print(f"  CV Mode: {cv_mode}")
     print(f"  WDPA_LAST_YEAR: {WDPA_LAST_YEAR}")
     print(f"  LOOKAHEAD_YEARS: {LOOKAHEAD_YEARS}")
     print(f"  LAST_LABEL_YEAR: {LAST_LABEL_YEAR} (WDPA_LAST_YEAR - LOOKAHEAD_YEARS)")
@@ -1315,7 +1409,7 @@ def main(timestamp: str) -> None:
     print(f"Target column: {target_col}")
     
     (model_path, earlystop_metrics, train_stats, train_time, earlystop_time, train_pos, train_neg, n_train_full, imbalance_info, cv_info) = phase1_training(
-        train_path, earlystop_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col)
+        train_path, earlystop_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col, cv_mode)
     
     phase2_testing(
         test_path, model_path, feature_cols, keep_cols_test, timestamp, output_dir, use_wandb, target_col,
@@ -1324,6 +1418,16 @@ def main(timestamp: str) -> None:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="LGBM Transition Model for Colombia Dataset (5-Year Lookahead Prediction)")
+    parser.add_argument(
+        "--cv-mode",
+        type=str,
+        choices=["full", "fold3", "none"],
+        default="full",
+        help="Cross-validation mode: 'full' (run all 3 folds), 'fold3' (run only fold 3 for fast dev), 'none' (skip CV)"
+    )
+    args = parser.parse_args()
+    
     repo_root = Path(__file__).resolve().parents[4]
     output_dir = repo_root / "outputs/Results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1332,7 +1436,7 @@ if __name__ == "__main__":
     tee = Tee(output_file)
     sys.stdout = tee
     try:
-        main(timestamp)
+        main(timestamp, cv_mode=args.cv_mode)
     finally:
         sys.stdout = tee.stdout
         tee.close()

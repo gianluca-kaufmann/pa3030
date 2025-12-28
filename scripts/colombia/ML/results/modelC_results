@@ -1,0 +1,596 @@
+#!/usr/bin/env python3
+"""Results Reporting Script for modelC_LGBM
+
+Purpose: Generate comprehensive results report from modelC_LGBM predictions:
+         - Metrics table (CSV + LaTeX)
+         - Precision-Recall curve (PNG + PDF) with baseline prevalence
+         - Risk map showing Colombia boundary, top-1% predicted pixels, and observed positives
+
+Input:   - modelC_lgbm_win5_metrics_*.json
+         - modelC_lgbm_win5_scored_*.parquet
+
+Output:  - outputs/Results/ml_models/reporting/
+           - modelC_metrics_table.csv
+           - modelC_metrics_table.tex
+           - modelC_pr_curve.png
+           - modelC_pr_curve.pdf
+           - modelC_risk_map_top1pct.png
+           - modelC_risk_map_top1pct.pdf
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Dict, Any, Optional
+
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
+from sklearn.metrics import precision_recall_curve, average_precision_score
+import geopandas as gpd
+from shapely.geometry import Point
+
+
+def get_repo_root() -> Path:
+    """Get repository root directory.
+    
+    Checks environment variables first, then searches upward for README.md.
+    """
+    # Check environment variable first
+    env_root = os.environ.get("PROJECT_ROOT") or os.environ.get("REPO_ROOT")
+    if env_root:
+        return Path(env_root).resolve()
+    
+    # Search upward from script location for README.md
+    script_dir = Path(__file__).resolve().parent
+    current = script_dir
+    for _ in range(10):  # Limit search depth
+        if (current / "README.md").exists():
+            return current
+        parent = current.parent
+        if parent == current:  # Reached filesystem root
+            break
+        current = parent
+    
+    # If not found, raise an error
+    raise RuntimeError(
+        f"Repository root not found. Searched upward from {script_dir} for README.md.\n"
+        "Set PROJECT_ROOT or REPO_ROOT environment variable, or ensure README.md exists in repo root."
+    )
+
+
+def load_metrics_json(metrics_path: Path) -> Dict[str, Any]:
+    """Load metrics JSON file."""
+    with open(metrics_path, 'r') as f:
+        return json.load(f)
+
+
+def load_scored_parquet(parquet_path: Path) -> pd.DataFrame:
+    """Load scored parquet file with only needed columns using pyarrow.
+    
+    Reads only: y_true, y_pred_proba, x, y (with column name resolution)
+    """
+    print(f"Reading parquet file: {parquet_path}")
+    pfile = pq.ParquetFile(parquet_path)
+    
+    # Read schema to get available columns
+    schema = pfile.schema
+    available_columns = [schema.field(i).name for i in range(len(schema))]
+    print(f"  Available columns: {available_columns}")
+    
+    # Map required logical fields with fallbacks
+    field_mappings = {
+        'y_true': ['y_true', 'transition_01_win5', 'transition_01'],
+        'y_pred_proba': ['y_pred_proba', 'pred_proba', 'score', 'p_pred', 'proba'],
+        'x': ['x', 'lon', 'longitude'],
+        'y': ['y', 'lat', 'latitude']
+    }
+    
+    # Resolve column names
+    resolved_columns = {}
+    missing_fields = []
+    
+    for logical_name, candidates in field_mappings.items():
+        found = None
+        for candidate in candidates:
+            if candidate in available_columns:
+                found = candidate
+                break
+        if found:
+            resolved_columns[logical_name] = found
+            print(f"  Resolved '{logical_name}' -> '{found}'")
+        else:
+            missing_fields.append((logical_name, candidates))
+    
+    # Check for missing fields
+    if missing_fields:
+        error_msg = "ERROR: Required columns not found in parquet file.\n\n"
+        error_msg += "Missing fields:\n"
+        for logical_name, candidates in missing_fields:
+            error_msg += f"  - {logical_name} (tried: {', '.join(candidates)})\n"
+        error_msg += f"\nAvailable columns: {', '.join(available_columns)}\n"
+        error_msg += "\nPlease ensure the parquet file contains one of the expected column names."
+        raise ValueError(error_msg)
+    
+    # Read all row groups with resolved column names
+    columns_to_read = list(resolved_columns.values())
+    all_data = []
+    num_row_groups = pfile.metadata.num_row_groups
+    print(f"  Reading {num_row_groups} row groups...")
+    
+    for rg_idx in range(num_row_groups):
+        table = pfile.read_row_group(rg_idx, columns=columns_to_read)
+        df = table.to_pandas()
+        all_data.append(df)
+    
+    result = pd.concat(all_data, ignore_index=True)
+    
+    # Rename columns to standard names
+    rename_dict = {v: k for k, v in resolved_columns.items()}
+    result = result.rename(columns=rename_dict)
+    
+    print(f"  Loaded {len(result):,} rows")
+    print(f"  Final columns: {list(result.columns)}")
+    
+    return result
+
+
+def validate_coordinates(df: pd.DataFrame) -> None:
+    """Validate that x/y coordinates look like Colombia lon/lat.
+    
+    Checks that x in [-85,-65] and y in [-5,15] for at least 99% of rows.
+    """
+    print("\nValidating coordinates...")
+    
+    # Sample if too large (for performance)
+    n_rows = len(df)
+    if n_rows > 100000:
+        print(f"  Sampling 100,000 rows from {n_rows:,} for validation...")
+        sample_df = df.sample(n=100000, random_state=42)
+    else:
+        sample_df = df
+    
+    # Check longitude (x) range: Colombia is roughly [-85, -65]
+    x_valid = (sample_df['x'] >= -85) & (sample_df['x'] <= -65)
+    x_valid_pct = x_valid.sum() / len(sample_df) * 100
+    
+    # Check latitude (y) range: Colombia is roughly [-5, 15]
+    y_valid = (sample_df['y'] >= -5) & (sample_df['y'] <= 15)
+    y_valid_pct = y_valid.sum() / len(sample_df) * 100
+    
+    print(f"  x (lon) in [-85, -65]: {x_valid_pct:.2f}%")
+    print(f"  y (lat) in [-5, 15]: {y_valid_pct:.2f}%")
+    
+    # Both must be valid for at least 99% of rows
+    both_valid = x_valid & y_valid
+    both_valid_pct = both_valid.sum() / len(sample_df) * 100
+    
+    if both_valid_pct < 99.0:
+        x_range = (df['x'].min(), df['x'].max())
+        y_range = (df['y'].min(), df['y'].max())
+        error_msg = (
+            f"ERROR: x/y coordinates do not look like Colombia lon/lat.\n\n"
+            f"Expected: x in [-85, -65], y in [-5, 15]\n"
+            f"Found: x in [{x_range[0]:.2f}, {x_range[1]:.2f}], "
+            f"y in [{y_range[0]:.2f}, {y_range[1]:.2f}]\n"
+            f"Only {both_valid_pct:.2f}% of coordinates are in expected ranges.\n\n"
+            f"Please provide correct columns or reproject coordinates to EPSG:4326."
+        )
+        raise ValueError(error_msg)
+    
+    print(f"  ✓ Coordinate validation passed ({both_valid_pct:.2f}% in expected ranges)")
+
+
+def create_metrics_table(metrics_data: Dict[str, Any], output_dir: Path) -> None:
+    """Create metrics table in CSV and LaTeX formats."""
+    print("\n" + "=" * 70)
+    print("CREATING METRICS TABLE")
+    print("=" * 70)
+    
+    test_perf = metrics_data.get("test_performance", {})
+    
+    # Extract metrics
+    metrics_dict = {
+        "Metric": [
+            "ROC AUC",
+            "PR AUC",
+            "Precision @ 1%",
+            "Precision @ 5%",
+            "Precision @ 10%",
+            "Baseline Rate",
+            "Lift @ 1%",
+            "Lift @ 5%",
+            "Lift @ 10%"
+        ],
+        "Value": [
+            test_perf.get("roc_auc", np.nan),
+            test_perf.get("pr_auc", np.nan),
+            test_perf.get("precision_at_1pct", np.nan),
+            test_perf.get("precision_at_5pct", np.nan),
+            test_perf.get("precision_at_10pct", np.nan),
+            test_perf.get("baseline_rate", np.nan),
+            test_perf.get("lift_at_1pct", np.nan),
+            test_perf.get("lift_at_5pct", np.nan),
+            test_perf.get("lift_at_10pct", np.nan)
+        ]
+    }
+    
+    df = pd.DataFrame(metrics_dict)
+    
+    # Format values for display
+    def format_value(val):
+        if pd.isna(val):
+            return "N/A"
+        if isinstance(val, (int, float)):
+            if abs(val) < 0.01:
+                return f"{val:.6f}"
+            elif abs(val) < 1:
+                return f"{val:.4f}"
+            elif abs(val) < 100:
+                return f"{val:.2f}"
+            else:
+                return f"{val:.1f}"
+        return str(val)
+    
+    df['Value'] = df['Value'].apply(format_value)
+    
+    # Save CSV
+    csv_path = output_dir / "modelC_metrics_table.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"\nSaved CSV: {csv_path}")
+    
+    # Create LaTeX table
+    latex_path = output_dir / "modelC_metrics_table.tex"
+    with open(latex_path, 'w') as f:
+        f.write("\\begin{table}[h]\n")
+        f.write("\\centering\n")
+        f.write("\\begin{tabular}{lr}\n")
+        f.write("\\toprule\n")
+        f.write("Metric & Value \\\\\n")
+        f.write("\\midrule\n")
+        
+        for _, row in df.iterrows():
+            metric = row['Metric'].replace('@', '@')
+            value = row['Value']
+            # Escape special LaTeX characters
+            metric = metric.replace('_', '\\_')
+            f.write(f"{metric} & {value} \\\\\n")
+        
+        f.write("\\bottomrule\n")
+        f.write("\\end{tabular}\n")
+        f.write("\\caption{Model C Performance Metrics}\n")
+        f.write("\\label{tab:modelc_metrics}\n")
+        f.write("\\end{table}\n")
+    
+    print(f"Saved LaTeX: {latex_path}")
+
+
+def create_pr_curve(df: pd.DataFrame, metrics_data: Dict[str, Any], output_dir: Path) -> None:
+    """Create Precision-Recall curve with baseline prevalence."""
+    print("\n" + "=" * 70)
+    print("CREATING PRECISION-RECALL CURVE")
+    print("=" * 70)
+    
+    y_true = df['y_true'].values
+    y_pred_proba = df['y_pred_proba'].values
+    
+    # Compute PR curve
+    precision, recall, thresholds = precision_recall_curve(y_true, y_pred_proba)
+    pr_auc = average_precision_score(y_true, y_pred_proba)
+    
+    # Get baseline prevalence
+    baseline_rate = metrics_data.get("test_performance", {}).get("baseline_rate", np.mean(y_true))
+    
+    print(f"  PR AUC: {pr_auc:.4f}")
+    print(f"  Baseline prevalence: {baseline_rate:.6f}")
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(8, 6))
+    
+    # Plot PR curve
+    ax.plot(recall, precision, linewidth=2, label=f'Model (AP = {pr_auc:.4f})')
+    
+    # Plot baseline (horizontal line at baseline rate)
+    ax.axhline(y=baseline_rate, color='r', linestyle='--', linewidth=2, 
+               label=f'Baseline (prevalence = {baseline_rate:.6f})')
+    
+    ax.set_xlabel('Recall', fontsize=12)
+    ax.set_ylabel('Precision', fontsize=12)
+    ax.set_title('Precision-Recall Curve', fontsize=14, fontweight='bold')
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim([0, 1])
+    ax.set_ylim([0, 1])
+    
+    plt.tight_layout()
+    
+    # Save PNG
+    png_path = output_dir / "modelC_pr_curve.png"
+    plt.savefig(png_path, dpi=300, bbox_inches='tight')
+    print(f"\nSaved PNG: {png_path}")
+    
+    # Save PDF
+    pdf_path = output_dir / "modelC_pr_curve.pdf"
+    plt.savefig(pdf_path, bbox_inches='tight')
+    print(f"Saved PDF: {pdf_path}")
+    
+    plt.close()
+
+
+def get_colombia_boundary(country_boundary_path: Optional[Path] = None) -> gpd.GeoDataFrame:
+    """Get Colombia boundary from file or download from Natural Earth."""
+    if country_boundary_path and country_boundary_path.exists():
+        print(f"Loading Colombia boundary from: {country_boundary_path}")
+        gdf = gpd.read_file(country_boundary_path)
+        # Filter to Colombia if multiple countries
+        if 'NAME' in gdf.columns:
+            gdf = gdf[gdf['NAME'] == 'Colombia']
+        elif 'NAME_EN' in gdf.columns:
+            gdf = gdf[gdf['NAME_EN'] == 'Colombia']
+        elif 'ADMIN' in gdf.columns:
+            gdf = gdf[gdf['ADMIN'] == 'Colombia']
+        elif 'ISO_A3' in gdf.columns:
+            gdf = gdf[gdf['ISO_A3'] == 'COL']
+        elif 'iso_a3' in gdf.columns:
+            gdf = gdf[gdf['iso_a3'] == 'COL']
+        return gdf
+    else:
+        print("Loading Colombia boundary from Natural Earth...")
+        try:
+            # Try to load Natural Earth dataset
+            # Method 1: Use geopandas built-in dataset
+            try:
+                world = gpd.read_file(gpd.datasets.get_path('naturalearth_lowres'))
+            except (AttributeError, ValueError):
+                # Method 2: Try alternative dataset name
+                try:
+                    world = gpd.read_file(gpd.datasets.get_path('naturalearth'))
+                except (AttributeError, ValueError):
+                    # Method 3: Direct URL download
+                    import urllib.request
+                    import tempfile
+                    url = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip"
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp:
+                        urllib.request.urlretrieve(url, tmp.name)
+                        import zipfile
+                        import shutil
+                        extract_dir = tempfile.mkdtemp()
+                        with zipfile.ZipFile(tmp.name, 'r') as zip_ref:
+                            zip_ref.extractall(extract_dir)
+                        # Find the shapefile
+                        shp_files = list(Path(extract_dir).glob('*.shp'))
+                        if shp_files:
+                            world = gpd.read_file(shp_files[0])
+                        else:
+                            raise ValueError("Could not find shapefile in downloaded zip")
+                        os.unlink(tmp.name)
+                        shutil.rmtree(extract_dir)
+            
+            # Filter to Colombia
+            colombia = None
+            if 'iso_a3' in world.columns:
+                colombia = world[world['iso_a3'] == 'COL'].copy()
+            elif 'ISO_A3' in world.columns:
+                colombia = world[world['ISO_A3'] == 'COL'].copy()
+            elif 'NAME' in world.columns:
+                colombia = world[world['NAME'] == 'Colombia'].copy()
+            elif 'NAME_EN' in world.columns:
+                colombia = world[world['NAME_EN'] == 'Colombia'].copy()
+            elif 'ADMIN' in world.columns:
+                colombia = world[world['ADMIN'] == 'Colombia'].copy()
+            
+            if colombia is None or len(colombia) == 0:
+                raise ValueError("Could not find Colombia in Natural Earth dataset")
+            
+            print(f"  Found Colombia boundary with {len(colombia)} feature(s)")
+            return colombia
+        except Exception as e:
+            print(f"  Error loading from Natural Earth: {e}")
+            print("  Attempting alternative download method...")
+            # Alternative: try direct GeoJSON URL
+            try:
+                import urllib.request
+                import tempfile
+                url = "https://raw.githubusercontent.com/holtzy/D3-graph-gallery/master/DATA/world.geojson"
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.geojson') as tmp:
+                    urllib.request.urlretrieve(url, tmp.name)
+                    world = gpd.read_file(tmp.name)
+                    if 'name' in world.columns:
+                        colombia = world[world['name'] == 'Colombia'].copy()
+                    elif 'NAME' in world.columns:
+                        colombia = world[world['NAME'] == 'Colombia'].copy()
+                    os.unlink(tmp.name)
+                    if colombia is not None and len(colombia) > 0:
+                        print(f"  Found Colombia boundary via alternative method")
+                        return colombia
+            except Exception as e2:
+                print(f"  Alternative download also failed: {e2}")
+            
+            raise RuntimeError(
+                "Could not load Colombia boundary. Please provide --country_boundary path "
+                "or ensure internet connection for Natural Earth download."
+            )
+
+
+def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], output_dir: Path) -> None:
+    """Create risk map showing Colombia boundary, top-1% predicted pixels, and observed positives."""
+    print("\n" + "=" * 70)
+    print("CREATING RISK MAP")
+    print("=" * 70)
+    
+    # Get Colombia boundary
+    colombia_gdf = get_colombia_boundary(country_boundary_path)
+    
+    # Ensure CRS is set (assume EPSG:4326 if not set)
+    if colombia_gdf.crs is None:
+        colombia_gdf.set_crs('EPSG:4326', inplace=True)
+    
+    print(f"  Colombia boundary CRS: {colombia_gdf.crs}")
+    print(f"  Colombia boundary bounds: {colombia_gdf.total_bounds}")
+    
+    # Create GeoDataFrame from predictions
+    geometry = [Point(xy) for xy in zip(df['x'], df['y'])]
+    gdf = gpd.GeoDataFrame(df, geometry=geometry, crs='EPSG:4326')
+    
+    print(f"  Prediction points: {len(gdf):,}")
+    print(f"  Prediction bounds: {gdf.total_bounds}")
+    
+    # Calculate top-1% threshold
+    top1pct_threshold = np.percentile(df['y_pred_proba'], 99)
+    print(f"  Top-1% threshold: {top1pct_threshold:.6f}")
+    
+    # Identify top-1% pixels
+    gdf['is_top1pct'] = df['y_pred_proba'] >= top1pct_threshold
+    gdf['is_positive'] = df['y_true'] == 1
+    
+    top1pct_count = gdf['is_top1pct'].sum()
+    positive_count = gdf['is_positive'].sum()
+    print(f"  Top-1% pixels: {top1pct_count:,}")
+    print(f"  Observed positives: {positive_count:,}")
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(12, 10))
+    
+    # Plot Colombia boundary
+    colombia_gdf.plot(ax=ax, color='white', edgecolor='black', linewidth=1.5, 
+                      label='Colombia boundary', zorder=1)
+    
+    # Optionally add a reproducible gray background sample (max 50,000 points)
+    if len(gdf) > 0:
+        n_sample = min(50000, len(gdf))
+        background_sample = gdf.sample(n=n_sample, random_state=42)
+        background_sample.plot(ax=ax, color='lightgray', markersize=0.5, alpha=0.3, zorder=2)
+    
+    # Plot top-1% predicted pixels (red/orange)
+    top1pct_gdf = gdf[gdf['is_top1pct']]
+    if len(top1pct_gdf) > 0:
+        top1pct_gdf.plot(ax=ax, color='red', markersize=1, alpha=0.6, 
+                        label=f'Top-1% predicted (n={top1pct_count:,})', zorder=3)
+    
+    # Plot observed positives (blue)
+    positive_gdf = gdf[gdf['is_positive']]
+    if len(positive_gdf) > 0:
+        positive_gdf.plot(ax=ax, color='blue', markersize=2, alpha=0.8, 
+                          label=f'Observed positives (n={positive_count:,})', zorder=4)
+    
+    ax.set_xlabel('Longitude', fontsize=12)
+    ax.set_ylabel('Latitude', fontsize=12)
+    ax.set_title('Model C Risk Map: Top-1% Predicted Pixels and Observed Positives', 
+                 fontsize=14, fontweight='bold')
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3)
+    
+    # Set aspect ratio to maintain geographic proportions
+    ax.set_aspect('equal', adjustable='box')
+    
+    plt.tight_layout()
+    
+    # Save PNG
+    png_path = output_dir / "modelC_risk_map_top1pct.png"
+    plt.savefig(png_path, dpi=300, bbox_inches='tight')
+    print(f"\nSaved PNG: {png_path}")
+    
+    # Save PDF
+    pdf_path = output_dir / "modelC_risk_map_top1pct.pdf"
+    plt.savefig(pdf_path, bbox_inches='tight')
+    print(f"Saved PDF: {pdf_path}")
+    
+    plt.close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Generate comprehensive results report for modelC_LGBM",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        '--metrics_json',
+        type=str,
+        required=True,
+        help='Path to modelC_lgbm_win5_metrics_*.json file'
+    )
+    parser.add_argument(
+        '--scored_parquet',
+        type=str,
+        required=True,
+        help='Path to modelC_lgbm_win5_scored_*.parquet file'
+    )
+    parser.add_argument(
+        '--out_dir',
+        type=str,
+        default=None,
+        help='Output directory (default: outputs/Results/ml_models/reporting/)'
+    )
+    parser.add_argument(
+        '--country_boundary',
+        type=str,
+        default=None,
+        help='Optional path to Colombia boundary GeoJSON/shapefile. If not provided, downloads from Natural Earth.'
+    )
+    
+    args = parser.parse_args()
+    
+    # Resolve paths
+    metrics_path = Path(args.metrics_json).resolve()
+    parquet_path = Path(args.scored_parquet).resolve()
+    
+    if args.out_dir:
+        output_dir = Path(args.out_dir).resolve()
+    else:
+        repo_root = get_repo_root()
+        output_dir = repo_root / "outputs/Results/ml_models/reporting"
+    
+    country_boundary_path = Path(args.country_boundary).resolve() if args.country_boundary else None
+    
+    # Validate inputs
+    if not metrics_path.exists():
+        print(f"ERROR: Metrics file not found: {metrics_path}")
+        sys.exit(1)
+    
+    if not parquet_path.exists():
+        print(f"ERROR: Scored parquet file not found: {parquet_path}")
+        sys.exit(1)
+    
+    # Create output directory
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    print("=" * 70)
+    print("MODEL C RESULTS REPORTING")
+    print("=" * 70)
+    print(f"\nMetrics JSON: {metrics_path}")
+    print(f"Scored parquet: {parquet_path}")
+    print(f"Output directory: {output_dir}")
+    if country_boundary_path:
+        print(f"Country boundary: {country_boundary_path}")
+    else:
+        print("Country boundary: Will download from Natural Earth")
+    
+    # Load data
+    print("\n" + "=" * 70)
+    print("LOADING DATA")
+    print("=" * 70)
+    metrics_data = load_metrics_json(metrics_path)
+    df = load_scored_parquet(parquet_path)
+    validate_coordinates(df)
+    
+    # Generate outputs
+    create_metrics_table(metrics_data, output_dir)
+    create_pr_curve(df, metrics_data, output_dir)
+    create_risk_map(df, country_boundary_path, output_dir)
+    
+    print("\n" + "=" * 70)
+    print("COMPLETE")
+    print("=" * 70)
+    print(f"\nAll outputs saved to: {output_dir}")
+
+
+if __name__ == "__main__":
+    main()
+
