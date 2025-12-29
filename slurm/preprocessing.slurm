@@ -41,14 +41,14 @@ echo "Starting preprocessing script..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/training_preprocessing/model1_preprocessing" ] || {
+[ -f "scripts/ML/ml_preprocessing/model1_preprocessing" ] || {
   echo "ERROR: model1_preprocessing not found"
-  echo "NOTE: model1_preprocessing script is in training_preprocessing/ directory"
+  echo "NOTE: model1_preprocessing script is in ml_preprocessing/ directory"
   find scripts -maxdepth 4 -type f -name "model1_preprocessing"
   exit 1
 }
 # Run the script
-python "scripts/ML/training_preprocessing/model1_preprocessing"
+python "scripts/ML/ml_preprocessing/model1_preprocessing"
 
 echo "model1_preprocessing script finished."
 
