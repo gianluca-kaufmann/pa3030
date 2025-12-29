@@ -631,6 +631,7 @@ def train_single_cv_fold(
     fold_idx: int,
     best_params: Dict[str, Any],
     use_wandb: bool,
+    use_manual_scale_pos_weight: bool = False,
 ) -> Dict[str, Any]:
     """
     Train and evaluate a single CV fold.
@@ -676,14 +677,33 @@ def train_single_cv_fold(
     train_weights = compute_year_weights(train_years_array, min_year=2000, max_year=train_years[1])
     print(f"  Training sample weights: min={train_weights.min():.3f}, max={train_weights.max():.3f}, mean={train_weights.mean():.3f}")
     
-    # Use scale_pos_weight from best_params
-    scale_pos_weight = best_params.get("scale_pos_weight", None)
+    # Compute or use manual scale_pos_weight
+    # Formula: scale_pos_weight = n_neg / n_pos
+    manual_scale_pos_weight = best_params.get("scale_pos_weight", None)
+    if use_manual_scale_pos_weight:
+        scale_pos_weight = manual_scale_pos_weight
+        if scale_pos_weight is not None:
+            print(f"  Using manual scale_pos_weight: {scale_pos_weight:.6f}")
+        else:
+            print(f"  WARNING: use_manual_scale_pos_weight=True but no manual value found in params")
+            # Fallback to computed value
+            scale_pos_weight = train_neg / max(train_pos, 1)
+            print(f"  Falling back to computed scale_pos_weight: {scale_pos_weight:.6f} = {train_neg:,} / {train_pos:,}")
+    else:
+        # Compute from actual training data: scale_pos_weight = n_neg / n_pos
+        scale_pos_weight = train_neg / max(train_pos, 1)
+        print(f"  Computed scale_pos_weight from training data: {scale_pos_weight:.6f} = {train_neg:,} / {train_pos:,}")
+        if manual_scale_pos_weight is not None:
+            print(f"  (Manual value in params: {manual_scale_pos_weight:.6f}, but using computed value)")
     
     # Train model
     num_boost_round_earlystop = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
     train_params = {**best_params, "is_unbalance": False}
     train_params.pop("num_boost_round", None)
     train_params.pop("n_estimators", None)
+    # Override scale_pos_weight with computed/manual value right before training
+    # Formula: scale_pos_weight = n_neg / n_pos
+    train_params["scale_pos_weight"] = scale_pos_weight
     
     print(f"  Creating datasets...")
     train_dataset = lgb.Dataset(X_train, label=y_train, weight=train_weights, free_raw_data=True)
@@ -706,9 +726,20 @@ def train_single_cv_fold(
     
     del train_dataset, earlystop_dataset; gc.collect()
     
-    # NO METRICS COMPUTED ON EARLYSTOP - earlystop is used ONLY for early stopping
-    # Clean up earlystop data immediately after training
-    del X_earlystop, y_earlystop, earlystop_years_array, lgb_model; gc.collect()
+    # Generate OOF predictions on earlystop set (true OOF for temporal CV)
+    # These predictions will be used for calibration
+    print(f"  Generating OOF predictions on earlystop set ({n_earlystop_samples:,} samples)...")
+    y_earlystop_proba = lgb_model.predict(X_earlystop, num_iteration=best_iteration if best_iteration else None).astype(np.float32)
+    
+    # Store OOF predictions for this fold
+    oof_predictions = {
+        "y_true": y_earlystop.copy(),
+        "y_pred_proba": y_earlystop_proba.copy(),
+        "fold_idx": np.full(len(y_earlystop), fold_idx, dtype=np.int32)
+    }
+    
+    # Clean up earlystop data and model after generating predictions
+    del X_earlystop, y_earlystop, earlystop_years_array, lgb_model, y_earlystop_proba; gc.collect()
     
     if use_wandb:
         wandb.log({
@@ -730,6 +761,7 @@ def train_single_cv_fold(
         "earlystop_negatives": int(earlystop_neg),
         "train_time_seconds": train_time,
         "best_iteration": int(best_iteration) if best_iteration is not None else None,
+        "oof_predictions": oof_predictions,  # Include OOF predictions for calibration
     }
 
 
@@ -758,7 +790,7 @@ def aggregate_cv_metrics(cv_results: list[Dict[str, Any]]) -> Dict[str, Any]:
 def phase1_training(
     train_path: Path, earlystop_path: Path, params_path: Optional[Path], feature_cols: list, keep_cols_train: list,
     best_params: Dict[str, Any], timestamp: str, model_dir: Path, output_dir: Path, use_wandb: bool, target_col: str,
-    cv_mode: str = "full",
+    cv_mode: str = "full", use_manual_scale_pos_weight: bool = False,
 ) -> tuple[Path, Dict[str, Any], Dict[str, Any], float, float, int, int, int, Dict[str, Any], Dict[str, Any]]:
     """
     Phase 1: Training with temporal cross-validation.
@@ -807,14 +839,57 @@ def phase1_training(
         else:
             raise ValueError(f"Invalid cv_mode: {cv_mode}. Must be one of: full, fold3, none")
         
+        # Collect OOF predictions from all folds for calibration
+        all_oof_predictions = []
+        
         for fold_idx in folds_to_run:
             train_years, earlystop_years = CV_FOLDS[fold_idx]
             fold_result = train_single_cv_fold(
                 cv_train_paths, cv_earlystop_paths, feature_cols, target_col,
-                train_years, earlystop_years, fold_idx, best_params, use_wandb
+                train_years, earlystop_years, fold_idx, best_params, use_wandb, use_manual_scale_pos_weight
             )
-            cv_results.append(fold_result)
+            
+            # Collect OOF predictions if available (skip if fold was skipped)
+            if not fold_result.get("skipped", False) and "oof_predictions" in fold_result:
+                all_oof_predictions.append(fold_result["oof_predictions"])
+                # Remove predictions from fold_result to avoid bloating JSON (they're saved separately)
+                fold_result_clean = {k: v for k, v in fold_result.items() if k != "oof_predictions"}
+                cv_results.append(fold_result_clean)
+            else:
+                cv_results.append(fold_result)
+            
             gc.collect()
+        
+        # Save temporal CV OOF predictions for calibration
+        if all_oof_predictions:
+            print(f"\nSaving temporal CV OOF predictions ({len(all_oof_predictions)} folds)...")
+            try:
+                # Concatenate predictions from all folds
+                y_true_all = np.concatenate([pred["y_true"] for pred in all_oof_predictions])
+                y_pred_proba_all = np.concatenate([pred["y_pred_proba"] for pred in all_oof_predictions])
+                fold_idx_all = np.concatenate([pred["fold_idx"] for pred in all_oof_predictions])
+                
+                # Create DataFrame and save to parquet with temporal CV naming pattern
+                temporal_cv_predictions_df = pd.DataFrame({
+                    "y_true": y_true_all,
+                    "y_pred_proba": y_pred_proba_all,
+                    "fold_idx": fold_idx_all
+                })
+                
+                temporal_cv_predictions_path = output_dir / f"modelC_lgbm_win5_temporal_cv_predictions_{timestamp}.parquet"
+                temporal_cv_predictions_df.to_parquet(temporal_cv_predictions_path, index=False, engine="pyarrow")
+                print(f"  Temporal CV OOF predictions saved: {temporal_cv_predictions_path.name}")
+                print(f"  Total samples: {len(temporal_cv_predictions_df):,}")
+                print(f"  Folds: {sorted(np.unique(fold_idx_all).tolist())}")
+                
+                # Clean up
+                del temporal_cv_predictions_df, y_true_all, y_pred_proba_all, fold_idx_all, all_oof_predictions
+                gc.collect()
+            except Exception as e:
+                print(f"  WARNING: Failed to save temporal CV OOF predictions: {e}")
+                import traceback
+                traceback.print_exc()
+                # Don't exit - continue with training
         
         # Aggregate CV metrics (no metrics computed on earlystop sets)
         cv_aggregated = aggregate_cv_metrics(cv_results)
@@ -929,18 +1004,31 @@ def phase1_training(
     train_weights = compute_year_weights(train_years_array_full, min_year=2000, max_year=EARLYSTOP_YEARS[1])
     print(f"  Training sample weights: min={train_weights.min():.3f}, max={train_weights.max():.3f}, mean={train_weights.mean():.3f}")
     
-    # Use scale_pos_weight from best_params
-    scale_pos_weight = best_params.get("scale_pos_weight", None)
-    
-    if scale_pos_weight is not None:
-        print(f"\nImbalance: scale_pos_weight {scale_pos_weight:.6f} (from JSON params)")
+    # Compute or use manual scale_pos_weight
+    # Formula: scale_pos_weight = n_neg / n_pos
+    manual_scale_pos_weight = best_params.get("scale_pos_weight", None)
+    if use_manual_scale_pos_weight:
+        scale_pos_weight = manual_scale_pos_weight
+        if scale_pos_weight is not None:
+            print(f"\nImbalance: Using manual scale_pos_weight: {scale_pos_weight:.6f}")
+        else:
+            print(f"\nWARNING: use_manual_scale_pos_weight=True but no manual value found in params")
+            # Fallback to computed value
+            scale_pos_weight = train_neg_full / max(train_pos_full, 1)
+            print(f"  Falling back to computed scale_pos_weight: {scale_pos_weight:.6f} = {train_neg_full:,} / {train_pos_full:,}")
     else:
-        print(f"\nImbalance: scale_pos_weight not specified in params")
+        # Compute from actual training data: scale_pos_weight = n_neg / n_pos
+        scale_pos_weight = train_neg_full / max(train_pos_full, 1)
+        print(f"\nImbalance: Computed scale_pos_weight from training data: {scale_pos_weight:.6f} = {train_neg_full:,} / {train_pos_full:,}")
+        if manual_scale_pos_weight is not None:
+            print(f"  (Manual value in params: {manual_scale_pos_weight:.6f}, but using computed value)")
     
     imbalance_info = {
         "neg": int(train_neg_full),
         "pos": int(train_pos_full),
-        "scale_pos_weight": float(scale_pos_weight) if scale_pos_weight is not None else None
+        "scale_pos_weight": float(scale_pos_weight),
+        "manual_scale_pos_weight": float(manual_scale_pos_weight) if manual_scale_pos_weight is not None else None,
+        "use_manual_scale_pos_weight": use_manual_scale_pos_weight
     }
     if use_wandb:
         wandb.log({
@@ -956,6 +1044,9 @@ def phase1_training(
     train_params = {**best_params, "is_unbalance": False}
     train_params.pop("num_boost_round", None)
     train_params.pop("n_estimators", None)
+    # Override scale_pos_weight with computed/manual value right before training
+    # Formula: scale_pos_weight = n_neg / n_pos
+    train_params["scale_pos_weight"] = scale_pos_weight
     
     print(f"  Creating dataset...")
     train_dataset = lgb.Dataset(X_train_full, label=y_train_full, weight=train_weights, free_raw_data=True)
@@ -1266,6 +1357,8 @@ def phase2_testing(
             "method": "scale_pos_weight", 
             "is_unbalance": False,
             "scale_pos_weight": imbalance_info.get("scale_pos_weight"),
+            "manual_scale_pos_weight": imbalance_info.get("manual_scale_pos_weight"),
+            "use_manual_scale_pos_weight": imbalance_info.get("use_manual_scale_pos_weight", False),
             "neg": imbalance_info.get("neg"), 
             "pos": imbalance_info.get("pos")
         },
@@ -1315,7 +1408,7 @@ def phase2_testing(
         wandb.finish()
 
 
-def main(timestamp: str, cv_mode: str = "full") -> None:
+def main(timestamp: str, cv_mode: str = "full", use_manual_scale_pos_weight: bool = False) -> None:
     start_time = time.time()
     repo_root = Path(__file__).resolve().parents[4]
     train_path = resolve_parquet_file("train_colombia_win5.parquet")
@@ -1359,6 +1452,7 @@ def main(timestamp: str, cv_mode: str = "full") -> None:
     print(f"Train: {train_path}\nEarlystop: {earlystop_path}\nTest: {test_path}\nParams: {params_path if params_path else 'Using default manual hyperparameters'}\nOutput: {output_dir}")
     print(f"\nConfiguration:")
     print(f"  CV Mode: {cv_mode}")
+    print(f"  Use Manual scale_pos_weight: {use_manual_scale_pos_weight}")
     print(f"  WDPA_LAST_YEAR: {WDPA_LAST_YEAR}")
     print(f"  LOOKAHEAD_YEARS: {LOOKAHEAD_YEARS}")
     print(f"  LAST_LABEL_YEAR: {LAST_LABEL_YEAR} (WDPA_LAST_YEAR - LOOKAHEAD_YEARS)")
@@ -1409,7 +1503,7 @@ def main(timestamp: str, cv_mode: str = "full") -> None:
     print(f"Target column: {target_col}")
     
     (model_path, earlystop_metrics, train_stats, train_time, earlystop_time, train_pos, train_neg, n_train_full, imbalance_info, cv_info) = phase1_training(
-        train_path, earlystop_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col, cv_mode)
+        train_path, earlystop_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col, cv_mode, use_manual_scale_pos_weight)
     
     phase2_testing(
         test_path, model_path, feature_cols, keep_cols_test, timestamp, output_dir, use_wandb, target_col,
@@ -1426,6 +1520,11 @@ if __name__ == "__main__":
         default="full",
         help="Cross-validation mode: 'full' (run all 3 folds), 'fold3' (run only fold 3 for fast dev), 'none' (skip CV)"
     )
+    parser.add_argument(
+        "--use-manual-scale-pos-weight",
+        action="store_true",
+        help="Use manually set scale_pos_weight from params/JSON instead of computing from training data (default: compute from data)"
+    )
     args = parser.parse_args()
     
     repo_root = Path(__file__).resolve().parents[4]
@@ -1436,7 +1535,7 @@ if __name__ == "__main__":
     tee = Tee(output_file)
     sys.stdout = tee
     try:
-        main(timestamp, cv_mode=args.cv_mode)
+        main(timestamp, cv_mode=args.cv_mode, use_manual_scale_pos_weight=args.use_manual_scale_pos_weight)
     finally:
         sys.stdout = tee.stdout
         tee.close()

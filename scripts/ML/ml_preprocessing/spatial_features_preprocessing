@@ -309,6 +309,7 @@ def main() -> None:
     env_input = os.environ.get("SPATIAL_FEATURES_INPUT_PATH")
     if env_input:
         input_path = Path(env_input)
+        logger.info(f"Using input path from environment variable: {input_path}")
     else:
         candidate_paths = []
         if scratch_root is not None:
@@ -327,6 +328,7 @@ def main() -> None:
         for cand in candidate_paths:
             if cand.exists():
                 input_path = cand
+                logger.info(f"Auto-detected input file: {input_path}")
                 break
 
     # On clusters, write large outputs to $SCRATCH; locally keep them under the repo
@@ -356,17 +358,43 @@ def main() -> None:
     logger.info(f"Input:  {input_path}")
     logger.info(f"Output: {output_path}")
     
+    # Validate input file exists and is readable
     if not input_path.exists():
-        raise FileNotFoundError(f"Input file not found: {input_path}")
+        raise FileNotFoundError(
+            f"Input file not found: {input_path}\n"
+            f"Please ensure the merged panel data exists or set SPATIAL_FEATURES_INPUT_PATH environment variable."
+        )
+    
+    # Validate input file is not empty and has expected structure
+    try:
+        input_size_mb = input_path.stat().st_size / (1024**2)
+        logger.info(f"Input file size: {input_size_mb:.1f} MB")
+        if input_size_mb < 0.1:
+            raise ValueError(f"Input file is suspiciously small ({input_size_mb:.2f} MB)")
+    except Exception as e:
+        raise RuntimeError(f"Failed to validate input file: {e}")
     
     temp_dir.mkdir(parents=True, exist_ok=True)
     
-    # Get metadata
-    logger.info("Reading metadata...")
+    # Get metadata and validate required columns
+    logger.info("Reading metadata and validating structure...")
+    
+    # Check that all required columns are present
+    schema = pq.read_schema(input_path)
+    required_cols = ['year', 'row', 'col', 'WDPA_b1']
+    missing_cols = [col for col in required_cols if col not in schema.names]
+    if missing_cols:
+        raise ValueError(
+            f"Input file is missing required columns: {missing_cols}\n"
+            f"Available columns: {schema.names}\n"
+            f"Expected format: merged panel data with year, row, col, and WDPA_b1 columns."
+        )
+    
     df_sample = pd.read_parquet(input_path, columns=['year'])
     years = sorted(df_sample['year'].unique())
     total_rows = len(df_sample)
     logger.info(f"Years: {years[0]}-{years[-1]} ({len(years)} years), Total rows: {total_rows:,}")
+    logger.info(f"Validation passed: Input file has correct structure")
     del df_sample
     gc.collect()
     

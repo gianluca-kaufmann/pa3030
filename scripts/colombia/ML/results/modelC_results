@@ -30,6 +30,7 @@ from typing import Dict, Any, Optional
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
@@ -72,18 +73,65 @@ def load_metrics_json(metrics_path: Path) -> Dict[str, Any]:
         return json.load(f)
 
 
+def check_calibration_status(parquet_path: Path, available_columns: list) -> None:
+    """Check if the parquet file contains calibrated predictions and print status.
+    
+    Args:
+        parquet_path: Path to the parquet file
+        available_columns: List of available column names in the parquet file
+    """
+    # Check for calibration indicators
+    has_uncalibrated_col = 'y_pred_proba_uncalibrated' in available_columns
+    has_calibrated_col = 'y_pred_proba_calibrated' in available_columns
+    filename_has_calibrated = 'calibrated' in parquet_path.name.lower()
+    
+    # Determine calibration status
+    if has_uncalibrated_col and has_calibrated_col:
+        # This is definitely a calibrated file
+        print(f"\n{'='*70}")
+        print("CALIBRATION STATUS: CALIBRATED")
+        print(f"{'='*70}")
+        print(f"  File contains both 'y_pred_proba_uncalibrated' and 'y_pred_proba_calibrated' columns")
+        print(f"  Using calibrated probabilities (y_pred_proba = calibrated values)")
+        print(f"{'='*70}\n")
+    elif filename_has_calibrated:
+        # Filename suggests calibrated but columns don't confirm
+        print(f"\n{'!'*70}")
+        print("WARNING: Filename suggests calibrated predictions, but calibration columns not found")
+        print(f"{'!'*70}")
+        print(f"  Filename: {parquet_path.name}")
+        print(f"  Expected columns: 'y_pred_proba_uncalibrated', 'y_pred_proba_calibrated'")
+        print(f"  Available columns: {', '.join(available_columns)}")
+        print(f"  Proceeding with available 'y_pred_proba' column")
+        print(f"{'!'*70}\n")
+    else:
+        # No calibration indicators - uncalibrated
+        print(f"\n{'!'*70}")
+        print("WARNING: You are plotting UNCALIBRATED probabilities")
+        print(f"{'!'*70}")
+        print(f"  File: {parquet_path.name}")
+        print(f"  No calibration metadata found (no 'y_pred_proba_uncalibrated'/'y_pred_proba_calibrated' columns)")
+        print(f"  For calibrated results, use: modelC_lgbm_win5_scored_calibrated_*.parquet")
+        print(f"{'!'*70}\n")
+
+
 def load_scored_parquet(parquet_path: Path) -> pd.DataFrame:
     """Load scored parquet file with only needed columns using pyarrow.
     
-    Reads only: y_true, y_pred_proba, x, y (with column name resolution)
+    Reads: y_true, y_pred_proba, x, y (with column name resolution)
+    Optionally reads: wdpa_b1 (protected area coverage as of end of 2017)
     """
     print(f"Reading parquet file: {parquet_path}")
     pfile = pq.ParquetFile(parquet_path)
     
     # Read schema to get available columns
-    schema = pfile.schema
-    available_columns = [schema.field(i).name for i in range(len(schema))]
+    # ParquetSchema doesn't have field() method, use schema_arrow to get Arrow schema
+    arrow_schema = pfile.schema_arrow
+    available_columns = arrow_schema.names
     print(f"  Available columns: {available_columns}")
+    
+    # Check calibration status
+    check_calibration_status(parquet_path, available_columns)
     
     # Map required logical fields with fallbacks
     field_mappings = {
@@ -92,6 +140,14 @@ def load_scored_parquet(parquet_path: Path) -> pd.DataFrame:
         'x': ['x', 'lon', 'longitude'],
         'y': ['y', 'lat', 'latitude']
     }
+    
+    # Optional field: protected area coverage
+    wdpa_col = None
+    for candidate in ['wdpa_b1', 'WDPA_b1']:
+        if candidate in available_columns:
+            wdpa_col = candidate
+            print(f"  Found protected area column: '{wdpa_col}'")
+            break
     
     # Resolve column names
     resolved_columns = {}
@@ -119,8 +175,11 @@ def load_scored_parquet(parquet_path: Path) -> pd.DataFrame:
         error_msg += "\nPlease ensure the parquet file contains one of the expected column names."
         raise ValueError(error_msg)
     
-    # Read all row groups with resolved column names
+    # Read all row groups with resolved column names (plus optional wdpa_b1)
     columns_to_read = list(resolved_columns.values())
+    if wdpa_col:
+        columns_to_read.append(wdpa_col)
+    
     all_data = []
     num_row_groups = pfile.metadata.num_row_groups
     print(f"  Reading {num_row_groups} row groups...")
@@ -136,16 +195,70 @@ def load_scored_parquet(parquet_path: Path) -> pd.DataFrame:
     rename_dict = {v: k for k, v in resolved_columns.items()}
     result = result.rename(columns=rename_dict)
     
+    # Rename wdpa column to standard name if present
+    if wdpa_col:
+        result = result.rename(columns={wdpa_col: 'wdpa_b1'})
+    
     print(f"  Loaded {len(result):,} rows")
     print(f"  Final columns: {list(result.columns)}")
     
     return result
 
 
+def detect_and_reproject_coordinates(df: pd.DataFrame) -> pd.DataFrame:
+    """Detect coordinate CRS and reproject to EPSG:4326 if needed.
+    
+    Detects if coordinates are in EPSG:3857 (Web Mercator) based on large values,
+    and reprojects to EPSG:4326 (WGS84) for visualization.
+    
+    Returns DataFrame with reprojected x/y coordinates in EPSG:4326.
+    """
+    print("\nDetecting coordinate CRS...")
+    
+    # Sample to check coordinate ranges
+    n_rows = len(df)
+    if n_rows > 100000:
+        sample_df = df.sample(n=100000, random_state=42)
+    else:
+        sample_df = df
+    
+    x_abs_max = sample_df['x'].abs().max()
+    y_abs_max = sample_df['y'].abs().max()
+    
+    print(f"  x range: [{df['x'].min():.2f}, {df['x'].max():.2f}]")
+    print(f"  y range: [{df['y'].min():.2f}, {df['y'].max():.2f}]")
+    
+    # If coordinates have large absolute values (>1000), likely Web Mercator (EPSG:3857)
+    # WGS84 coordinates are small (lon: -180 to 180, lat: -90 to 90)
+    if x_abs_max > 1000 or y_abs_max > 1000:
+        print("  Detected EPSG:3857 (Web Mercator) coordinates")
+        print("  Reprojecting to EPSG:4326 (WGS84)...")
+        
+        # Create GeoDataFrame with Web Mercator CRS
+        geometry = [Point(xy) for xy in zip(df['x'], df['y'])]
+        gdf = gpd.GeoDataFrame(df, geometry=geometry, crs='EPSG:3857')
+        
+        # Reproject to WGS84
+        gdf = gdf.to_crs('EPSG:4326')
+        
+        # Update x/y columns with reprojected coordinates
+        df = df.copy()
+        df['x'] = gdf.geometry.x.values
+        df['y'] = gdf.geometry.y.values
+        
+        print(f"  Reprojected x range: [{df['x'].min():.2f}, {df['x'].max():.2f}]")
+        print(f"  Reprojected y range: [{df['y'].min():.2f}, {df['y'].max():.2f}]")
+    else:
+        print("  Coordinates appear to be in EPSG:4326 (WGS84) already")
+    
+    return df
+
+
 def validate_coordinates(df: pd.DataFrame) -> None:
     """Validate that x/y coordinates look like Colombia lon/lat.
     
     Checks that x in [-85,-65] and y in [-5,15] for at least 99% of rows.
+    Assumes coordinates are already in EPSG:4326.
     """
     print("\nValidating coordinates...")
     
@@ -176,16 +289,16 @@ def validate_coordinates(df: pd.DataFrame) -> None:
         x_range = (df['x'].min(), df['x'].max())
         y_range = (df['y'].min(), df['y'].max())
         error_msg = (
-            f"ERROR: x/y coordinates do not look like Colombia lon/lat.\n\n"
-            f"Expected: x in [-85, -65], y in [-5, 15]\n"
+            f"ERROR: x/y coordinates do not look like Colombia lon/lat after reprojection.\n\n"
+            f"Expected: x in [-85, -65], y in [-5, 15] (EPSG:4326)\n"
             f"Found: x in [{x_range[0]:.2f}, {x_range[1]:.2f}], "
             f"y in [{y_range[0]:.2f}, {y_range[1]:.2f}]\n"
             f"Only {both_valid_pct:.2f}% of coordinates are in expected ranges.\n\n"
-            f"Please provide correct columns or reproject coordinates to EPSG:4326."
+            f"Please check that coordinates represent Colombia region."
         )
         raise ValueError(error_msg)
     
-    print(f"  ✓ Coordinate validation passed ({both_valid_pct:.2f}% in expected ranges)")
+    print(f"  Coordinate validation passed ({both_valid_pct:.2f}% in expected ranges)")
 
 
 def create_metrics_table(metrics_data: Dict[str, Any], output_dir: Path) -> None:
@@ -419,8 +532,16 @@ def get_colombia_boundary(country_boundary_path: Optional[Path] = None) -> gpd.G
             )
 
 
-def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], output_dir: Path) -> None:
-    """Create risk map showing Colombia boundary, top-1% predicted pixels, and observed positives."""
+def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], output_dir: Path, metrics_data: Optional[Dict[str, Any]] = None) -> None:
+    """Create risk map showing Colombia boundary, top-1% predicted pixels, and observed positives.
+    
+    Uses distinct colors for three categories:
+    - Yellow: Predicted high-risk only (not observed)
+    - Blue: Observed positives only (not predicted as high-risk)
+    - Orange: Overlap (predicted high-risk AND observed)
+    
+    Optionally shows existing protected areas (as of end of 2017) if wdpa_b1 column is present.
+    """
     print("\n" + "=" * 70)
     print("CREATING RISK MAP")
     print("=" * 70)
@@ -442,50 +563,160 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
     print(f"  Prediction points: {len(gdf):,}")
     print(f"  Prediction bounds: {gdf.total_bounds}")
     
+    # Check if protected area data is available
+    has_wdpa = 'wdpa_b1' in df.columns
+    if has_wdpa:
+        # Fill NaN with 0 (not protected) and convert to boolean
+        wdpa_values = df['wdpa_b1'].fillna(0)
+        # Handle both integer and float types
+        wdpa_values = wdpa_values.astype(float)
+        protected_count = (wdpa_values == 1).sum()
+        print(f"  Protected area coverage (as of end 2017): {protected_count:,} pixels ({protected_count/len(df)*100:.2f}%)")
+        print(f"  wdpa_b1 value range: [{wdpa_values.min()}, {wdpa_values.max()}], unique values: {sorted(wdpa_values.unique())[:10]}")
+        gdf['is_protected'] = (wdpa_values == 1).values
+    else:
+        print("  Note: wdpa_b1 column not found - protected areas will not be shown")
+        print(f"  Available columns: {list(df.columns)}")
+        gdf['is_protected'] = False
+    
     # Calculate top-1% threshold
     top1pct_threshold = np.percentile(df['y_pred_proba'], 99)
     print(f"  Top-1% threshold: {top1pct_threshold:.6f}")
     
-    # Identify top-1% pixels
+    # Identify categories
     gdf['is_top1pct'] = df['y_pred_proba'] >= top1pct_threshold
     gdf['is_positive'] = df['y_true'] == 1
     
-    top1pct_count = gdf['is_top1pct'].sum()
-    positive_count = gdf['is_positive'].sum()
-    print(f"  Top-1% pixels: {top1pct_count:,}")
-    print(f"  Observed positives: {positive_count:,}")
+    # Create three distinct categories
+    gdf['category'] = 'none'
+    gdf.loc[gdf['is_top1pct'] & ~gdf['is_positive'], 'category'] = 'predicted_only'
+    gdf.loc[~gdf['is_top1pct'] & gdf['is_positive'], 'category'] = 'observed_only'
+    gdf.loc[gdf['is_top1pct'] & gdf['is_positive'], 'category'] = 'overlap'
+    
+    # Count pixels in each category
+    predicted_only_count = (gdf['category'] == 'predicted_only').sum()
+    observed_only_count = (gdf['category'] == 'observed_only').sum()
+    overlap_count = (gdf['category'] == 'overlap').sum()
+    
+    print(f"  Predicted high-risk only: {predicted_only_count:,}")
+    print(f"  Observed positives only: {observed_only_count:,}")
+    print(f"  Overlap (predicted + observed): {overlap_count:,}")
+    
+    # Extract time period information from metrics or use defaults
+    # Based on modelC_LGBM: test period is 2018-2019, predictions are for 5-year lookahead (2018-2024)
+    time_period = "2018-2019"
+    prediction_horizon = "5-year lookahead (2018-2024)"
+    
+    if metrics_data:
+        # Try to extract time period from metadata
+        metadata = metrics_data.get("metadata", {})
+        test_year_range = metadata.get("test_year_range")
+        if test_year_range and isinstance(test_year_range, list) and len(test_year_range) == 2:
+            time_period = f"{test_year_range[0]}-{test_year_range[1]}"
+        elif "test_years" in metadata:
+            test_years = metadata["test_years"]
+            if isinstance(test_years, (list, tuple)) and len(test_years) == 2:
+                time_period = f"{test_years[0]}-{test_years[1]}"
+        
+        # Get lookahead years if available
+        lookahead = metadata.get("lookahead_years", 5)
+        if isinstance(lookahead, int) and test_year_range:
+            pred_end = test_year_range[1] + lookahead
+            prediction_horizon = f"{lookahead}-year lookahead ({test_year_range[0]}-{pred_end})"
     
     # Create figure
-    fig, ax = plt.subplots(figsize=(12, 10))
+    fig, ax = plt.subplots(figsize=(14, 11))
     
     # Plot Colombia boundary
-    colombia_gdf.plot(ax=ax, color='white', edgecolor='black', linewidth=1.5, 
-                      label='Colombia boundary', zorder=1)
+    colombia_gdf.plot(ax=ax, color='white', edgecolor='black', linewidth=1.5, zorder=1)
     
-    # Optionally add a reproducible gray background sample (max 50,000 points)
+    # Optionally add a reproducible gray background sample (max 50,000 points) for context
     if len(gdf) > 0:
         n_sample = min(50000, len(gdf))
         background_sample = gdf.sample(n=n_sample, random_state=42)
-        background_sample.plot(ax=ax, color='lightgray', markersize=0.5, alpha=0.3, zorder=2)
+        background_sample.plot(ax=ax, color='lightgray', markersize=0.3, alpha=0.2, zorder=2, label='_nolegend_')
     
-    # Plot top-1% predicted pixels (red/orange)
-    top1pct_gdf = gdf[gdf['is_top1pct']]
-    if len(top1pct_gdf) > 0:
-        top1pct_gdf.plot(ax=ax, color='red', markersize=1, alpha=0.6, 
-                        label=f'Top-1% predicted (n={top1pct_count:,})', zorder=3)
+    # Plot protected areas first (if available) - use green color for visibility
+    if has_wdpa:
+        protected_gdf = gdf[gdf['is_protected']]
+        if len(protected_gdf) > 0:
+            print(f"  Plotting {len(protected_gdf):,} protected area pixels")
+            # Sample if too many points for performance
+            if len(protected_gdf) > 200000:
+                protected_gdf = protected_gdf.sample(n=200000, random_state=42)
+                print(f"  Sampled to {len(protected_gdf):,} pixels for performance")
+            protected_gdf.plot(ax=ax, color='#2E8B57', markersize=1.0, alpha=0.6, 
+                             label='Existing protected areas (as of end 2017)', 
+                             zorder=2.5, edgecolors='none')
+        else:
+            print("  Warning: has_wdpa=True but no protected pixels found (all values are 0 or NaN)")
     
-    # Plot observed positives (blue)
-    positive_gdf = gdf[gdf['is_positive']]
-    if len(positive_gdf) > 0:
-        positive_gdf.plot(ax=ax, color='blue', markersize=2, alpha=0.8, 
-                          label=f'Observed positives (n={positive_count:,})', zorder=4)
+    # Plot in order: predicted_only, observed_only, then overlap (so overlap is on top)
+    # Use distinct, intuitive colors with good contrast
+    # Purple (overlap) is most important, so make it much more visible
     
+    # 1. Predicted high-risk only (yellow) - make less prominent
+    predicted_only_gdf = gdf[gdf['category'] == 'predicted_only']
+    if len(predicted_only_gdf) > 0:
+        predicted_only_gdf.plot(ax=ax, color='#FFD700', markersize=1.0, alpha=0.5, 
+                               label=f'Predicted high-risk only (n={predicted_only_count:,})', 
+                               zorder=3, edgecolors='none')
+    
+    # 2. Observed positives only (blue) - make less prominent
+    observed_only_gdf = gdf[gdf['category'] == 'observed_only']
+    if len(observed_only_gdf) > 0:
+        observed_only_gdf.plot(ax=ax, color='#1f77b4', markersize=1.0, alpha=0.5, 
+                              label=f'Observed positives only (n={observed_only_count:,})', 
+                              zorder=4, edgecolors='none')
+    
+    # 3. Overlap (orange) - MOST IMPORTANT, make it highly visible
+    overlap_gdf = gdf[gdf['category'] == 'overlap']
+    if len(overlap_gdf) > 0:
+        overlap_gdf.plot(ax=ax, color='#FF6600', markersize=3.5, alpha=1.0, 
+                        label=f'Overlap: predicted + observed (n={overlap_count:,})', 
+                        zorder=6, edgecolors='none')
+    
+    # Styling
     ax.set_xlabel('Longitude', fontsize=12)
     ax.set_ylabel('Latitude', fontsize=12)
-    ax.set_title('Model C Risk Map: Top-1% Predicted Pixels and Observed Positives', 
-                 fontsize=14, fontweight='bold')
-    ax.legend(loc='best', fontsize=10)
-    ax.grid(True, alpha=0.3)
+    ax.set_title('Model C Risk Map: Predicted High-Risk Pixels and Observed PA Establishments', 
+                 fontsize=15, fontweight='bold', pad=15)
+    
+    # Create comprehensive legend with time period information
+    legend_elements = []
+    
+    # Add protected areas legend item if available
+    if has_wdpa and len(gdf[gdf['is_protected']]) > 0:
+        protected_count = gdf['is_protected'].sum()
+        legend_elements.append(Line2D([0], [0], marker='o', color='w', 
+                                    markerfacecolor='#2E8B57', markersize=8, 
+                                    alpha=0.6, label=f'Existing protected areas (as of end 2017, n={protected_count:,})'))
+    
+    # Add category legend items - orange (overlap) first since it's most important
+    if len(overlap_gdf) > 0:
+        legend_elements.append(Line2D([0], [0], marker='o', color='w', 
+                                    markerfacecolor='#FF6600', markersize=10, 
+                                    alpha=1.0, label=f'Overlap: predicted + observed (n={overlap_count:,})'))
+    if len(predicted_only_gdf) > 0:
+        legend_elements.append(Line2D([0], [0], marker='o', color='w', 
+                                    markerfacecolor='#FFD700', markersize=8, 
+                                    alpha=0.5, label=f'Predicted high-risk only (n={predicted_only_count:,})'))
+    if len(observed_only_gdf) > 0:
+        legend_elements.append(Line2D([0], [0], marker='o', color='w', 
+                                    markerfacecolor='#1f77b4', markersize=8, 
+                                    alpha=0.5, label=f'Observed positives only (n={observed_only_count:,})'))
+    
+    # Add time period information as text in legend
+    legend = ax.legend(handles=legend_elements, loc='upper left', fontsize=10, 
+                      framealpha=0.95, fancybox=True, shadow=True)
+    
+    # Add time period text box below legend
+    time_text = f"Observation period: {time_period}\nPrediction horizon: {prediction_horizon}"
+    ax.text(0.02, 0.02, time_text, transform=ax.transAxes, fontsize=9,
+           verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat', 
+           alpha=0.8, edgecolor='black', linewidth=1), zorder=10)
+    
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
     
     # Set aspect ratio to maintain geographic proportions
     ax.set_aspect('equal', adjustable='box')
@@ -505,6 +736,16 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
     plt.close()
 
 
+def find_latest_file(pattern: str, search_dir: Path) -> Optional[Path]:
+    """Find the most recent file matching a pattern in a directory."""
+    matches = list(search_dir.glob(pattern))
+    if not matches:
+        return None
+    # Sort by modification time, most recent first
+    matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return matches[0]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate comprehensive results report for modelC_LGBM",
@@ -513,14 +754,14 @@ def main() -> None:
     parser.add_argument(
         '--metrics_json',
         type=str,
-        required=True,
-        help='Path to modelC_lgbm_win5_metrics_*.json file'
+        default=None,
+        help='Path to modelC_lgbm_win5_metrics_*.json file (default: auto-discover latest in outputs/Results/ml_models/)'
     )
     parser.add_argument(
         '--scored_parquet',
         type=str,
-        required=True,
-        help='Path to modelC_lgbm_win5_scored_*.parquet file'
+        default=None,
+        help='Path to modelC_lgbm_win5_scored_*.parquet file (default: auto-discover latest in outputs/Results/ml_models/)'
     )
     parser.add_argument(
         '--out_dir',
@@ -537,14 +778,40 @@ def main() -> None:
     
     args = parser.parse_args()
     
+    # Get repo root for auto-discovery
+    repo_root = get_repo_root()
+    ml_models_dir = repo_root / "outputs/Results/ml_models"
+    
+    # Auto-discover files if not provided
+    if args.metrics_json:
+        metrics_path = Path(args.metrics_json).resolve()
+    else:
+        print("Auto-discovering metrics JSON file...")
+        metrics_path = find_latest_file("modelC_lgbm_win5_metrics_*.json", ml_models_dir)
+        if metrics_path is None:
+            print(f"ERROR: Could not find modelC_lgbm_win5_metrics_*.json in {ml_models_dir}")
+            print("Please provide --metrics_json path explicitly.")
+            sys.exit(1)
+        print(f"  Found: {metrics_path}")
+    
+    if args.scored_parquet:
+        parquet_path = Path(args.scored_parquet).resolve()
+    else:
+        print("Auto-discovering scored parquet file...")
+        parquet_path = find_latest_file("modelC_lgbm_win5_scored*.parquet", ml_models_dir)
+        if parquet_path is None:
+            print(f"ERROR: Could not find modelC_lgbm_win5_scored*.parquet in {ml_models_dir}")
+            print("Please provide --scored_parquet path explicitly.")
+            sys.exit(1)
+        print(f"  Found: {parquet_path}")
+    
     # Resolve paths
-    metrics_path = Path(args.metrics_json).resolve()
-    parquet_path = Path(args.scored_parquet).resolve()
+    metrics_path = metrics_path.resolve()
+    parquet_path = parquet_path.resolve()
     
     if args.out_dir:
         output_dir = Path(args.out_dir).resolve()
     else:
-        repo_root = get_repo_root()
         output_dir = repo_root / "outputs/Results/ml_models/reporting"
     
     country_boundary_path = Path(args.country_boundary).resolve() if args.country_boundary else None
@@ -578,12 +845,15 @@ def main() -> None:
     print("=" * 70)
     metrics_data = load_metrics_json(metrics_path)
     df = load_scored_parquet(parquet_path)
+    
+    # Detect and reproject coordinates if needed
+    df = detect_and_reproject_coordinates(df)
     validate_coordinates(df)
     
     # Generate outputs
     create_metrics_table(metrics_data, output_dir)
     create_pr_curve(df, metrics_data, output_dir)
-    create_risk_map(df, country_boundary_path, output_dir)
+    create_risk_map(df, country_boundary_path, output_dir, metrics_data)
     
     print("\n" + "=" * 70)
     print("COMPLETE")

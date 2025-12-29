@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Sampling script for model1 training/validation/test splits.
+Sampling script for model1 training/validation/test splits with 5-year lookahead target.
 
 Rules
 -----
@@ -15,14 +15,22 @@ TRAIN_EARLY (2001–2014):
 VAL_LATE (2015–2017):
   - Full risk set (no sampling)
 
-TEST (2018–2024):
+TEST (2018–2019):
   - Full risk set (no sampling)
+  - Right-censored at max_year - 5 to ensure 5-year lookahead window
+
+5-Year Lookahead Target:
+  - Compute first_transition_year per (row, col) as min(year) where transition_01==1
+  - Add transition_01_win5: for each row at year t, set to 1 if first_transition_year exists 
+    AND t < first_transition_year <= t+5, else 0
+  - Filter to year <= max_year-5 to handle right-censoring
 
 Notes
 -----
 - No MAX_TRAIN_ROWS cap to avoid artificially inflating positive rate
 - Target neg/pos ratio maintains realistic class balance similar to val/test
 - Hard negative sampling focuses on areas near protected areas (most informative)
+- Right-censoring: max_year is computed from data and rows with year > max_year-5 are excluded
 """
 
 from __future__ import annotations
@@ -42,7 +50,8 @@ RANDOM_STATE = 42
 # Split configuration
 TRAIN_EARLY_YEARS = (2001, 2014)   # Sampled train with hard negatives (2000 excluded)
 VAL_LATE_YEARS = (2015, 2017)      # Full validation
-TEST_YEARS = (2018, 2024)          # Full test
+TEST_YEARS = (2018, 2019)          # Full test (right-censored for 5-year lookahead)
+LOOKAHEAD_YEARS = 5                # Number of years to look ahead for target
 WANDB_PROJECT = "ml-training-preprocessing"
 
 # Hard negative sampling configuration
@@ -91,6 +100,9 @@ def configure_duckdb(con: duckdb.DuckDBPyConnection) -> None:
     if isinstance(temp_dir, str):
         temp_dir = Path(temp_dir)
     temp_dir.mkdir(parents=True, exist_ok=True)
+    # Create duckdb_temp subdirectory
+    duckdb_temp_dir = temp_dir / "duckdb_temp"
+    duckdb_temp_dir.mkdir(parents=True, exist_ok=True)
     temp_dir_sql = str(temp_dir).replace("'", "''")
     con.execute(f"SET temp_directory='{temp_dir_sql}/duckdb_temp'")
 
@@ -101,18 +113,18 @@ def configure_duckdb(con: duckdb.DuckDBPyConnection) -> None:
     print(f"Running on: {'Euler cluster' if is_euler else 'local machine'}")
 
 
-def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: str, use_wandb: bool = False) -> None:
+def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: str, target_col: str = "transition_01", use_wandb: bool = False) -> None:
     escaped = str(parquet_path).replace("'", "''")
     rows = con.execute(
         f"""
         SELECT
             year,
-            SUM(transition_01) AS positives,
-            SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS negatives,
+            SUM({target_col}) AS positives,
+            SUM(CASE WHEN {target_col} = 0 THEN 1 ELSE 0 END) AS negatives,
             COUNT(*) AS total,
-            CASE WHEN COUNT(*) > 0 THEN SUM(transition_01)::DOUBLE / COUNT(*) ELSE 0 END AS pos_ratio,
-            CASE WHEN SUM(transition_01) > 0 
-                 THEN SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END)::DOUBLE / SUM(transition_01)
+            CASE WHEN COUNT(*) > 0 THEN SUM({target_col})::DOUBLE / COUNT(*) ELSE 0 END AS pos_ratio,
+            CASE WHEN SUM({target_col}) > 0 
+                 THEN SUM(CASE WHEN {target_col} = 0 THEN 1 ELSE 0 END)::DOUBLE / SUM({target_col})
                  ELSE 0 END AS neg_pos_ratio
         FROM read_parquet('{escaped}')
         GROUP BY year
@@ -120,12 +132,12 @@ def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: s
         """
     ).fetchall()
 
-    print(f"\n{label} per-year counts:")
+    print(f"\n{label} per-year counts (target: {target_col}):")
     for year, pos, neg, total, pos_ratio, neg_pos_ratio in rows:
         print(f"  {year}: total={total:,} pos={pos:,} neg={neg:,} | pos_ratio={pos_ratio:.5f} neg/pos={neg_pos_ratio:.1f}")
 
     if use_wandb:
-        wandb.log({f"{label.lower().replace(' ', '_')}/per_year": [
+        wandb.log({f"{label.lower().replace(' ', '_')}/per_year_{target_col}": [
             dict(year=y, positives=p, negatives=n, total=t, pos_ratio=r, neg_pos_ratio=npr) 
             for y, p, n, t, r, npr in rows
         ]})
@@ -147,15 +159,16 @@ def main() -> None:
         wandb.init(
             project=WANDB_PROJECT,
             entity=wandb_entity,
-            name=f"model1_preprocessing_{time.strftime('%Y%m%d_%H%M%S')}",
+            name=f"model1_preprocessing_win5_{time.strftime('%Y%m%d_%H%M%S')}",
             config={
                 "random_state": RANDOM_STATE,
                 "train_early_years": TRAIN_EARLY_YEARS,
                 "val_late_years": VAL_LATE_YEARS,
                 "test_years": TEST_YEARS,
+                "lookahead_years": LOOKAHEAD_YEARS,
                 "target_neg_pos_ratio": TARGET_NEG_POS_RATIO,
                 "dist_wdpa_decay": DIST_WDPA_DECAY,
-                "sampling_method": "per_year_hard_negatives_fixed_ratio",
+                "sampling_method": "per_year_hard_negatives_fixed_ratio_win5",
             },
         )
         use_wandb = True
@@ -165,11 +178,15 @@ def main() -> None:
 
     input_path = resolve_input()
     base_dir = input_path.parent
+    
+    # Output paths for win5 files
+    merged_win5_out = base_dir / "merged_panel_final_win5.parquet"
     train_early_out = base_dir / "train_early_sampled.parquet"
     val_late_out = base_dir / "val_late_full.parquet"
     test_out = base_dir / "test_full.parquet"
 
     print(f"\nInput: {input_path}")
+    print(f"Merged WIN5 output: {merged_win5_out}")
     print(f"TRAIN_EARLY (sampled) output: {train_early_out}")
     print(f"VAL_LATE_FULL output: {val_late_out}")
     print(f"TEST_FULL output: {test_out}")
@@ -178,11 +195,134 @@ def main() -> None:
     configure_duckdb(con)
 
     escaped_in = str(input_path).replace("'", "''")
+    escaped_merged_win5 = str(merged_win5_out).replace("'", "''")
     escaped_train_early = str(train_early_out).replace("'", "''")
     escaped_test = str(test_out).replace("'", "''")
     escaped_val_late = str(val_late_out).replace("'", "''")
 
     try:
+        print("\n" + "="*70)
+        print("STEP 1: Computing first_transition_year per (row, col)")
+        print("="*70)
+        
+        # Step 1: Compute first_transition_year per (row, col)
+        first_transition_sql = f"""
+        CREATE OR REPLACE TEMP TABLE first_transitions AS
+        SELECT
+            row,
+            col,
+            MIN(year) AS first_transition_year
+        FROM read_parquet('{escaped_in}')
+        WHERE transition_01 = 1
+        GROUP BY row, col
+        """
+        
+        step1_start = time.time()
+        con.execute(first_transition_sql)
+        n_transitions = con.execute("SELECT COUNT(*) FROM first_transitions").fetchone()[0]
+        print(f"  Found {n_transitions:,} (row, col) pairs with transitions")
+        print(f"  Completed in {time.time() - step1_start:.1f}s")
+        
+        print("\n" + "="*70)
+        print("STEP 2: Computing max_year and applying right-censoring")
+        print("="*70)
+        
+        # Step 2: Get max_year from data
+        max_year_result = con.execute(f"SELECT MAX(year) FROM read_parquet('{escaped_in}')").fetchone()
+        max_year = max_year_result[0] if max_year_result else 2024
+        cutoff_year = max_year - LOOKAHEAD_YEARS
+        
+        print(f"  Max year in data: {max_year}")
+        print(f"  Cutoff year (max_year - {LOOKAHEAD_YEARS}): {cutoff_year}")
+        print(f"  Filtering to year <= {cutoff_year}")
+        
+        print("\n" + "="*70)
+        print("STEP 3: Creating merged panel with transition_01_win5")
+        print("="*70)
+        
+        # Step 3: Create merged panel with transition_01_win5
+        # For each row at year t, set transition_01_win5 = 1 if first_transition_year exists 
+        # AND t < first_transition_year <= t+5, else 0
+        merged_win5_sql = f"""
+        COPY (
+            SELECT
+                d.*,
+                CASE 
+                    WHEN ft.first_transition_year IS NOT NULL 
+                         AND d.year < ft.first_transition_year 
+                         AND ft.first_transition_year <= d.year + {LOOKAHEAD_YEARS}
+                    THEN 1
+                    ELSE 0
+                END AS transition_01_win5
+            FROM read_parquet('{escaped_in}') d
+            LEFT JOIN first_transitions ft
+                ON d.row = ft.row AND d.col = ft.col
+            WHERE d.year <= {cutoff_year}
+        )
+        TO '{escaped_merged_win5}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        """
+        
+        step3_start = time.time()
+        con.execute(merged_win5_sql)
+        print(f"  Merged panel with win5 target written in {time.time() - step3_start:.1f}s")
+        
+        # Log counts for merged win5
+        log_year_counts(con, merged_win5_out, "MERGED_WIN5", "transition_01_win5", use_wandb)
+        
+        print("\n" + "="*70)
+        print("COMPARISON: transition_01 vs transition_01_win5")
+        print("="*70)
+        
+        # Compare total positives
+        comparison_stats = con.execute(
+            f"""
+            SELECT
+                SUM(transition_01) AS total_pos_original,
+                SUM(transition_01_win5) AS total_pos_win5,
+                COUNT(DISTINCT CASE WHEN transition_01 = 1 THEN (row::BIGINT<<32) + col END) AS distinct_rc_original,
+                COUNT(DISTINCT CASE WHEN transition_01_win5 = 1 THEN (row::BIGINT<<32) + col END) AS distinct_rc_win5
+            FROM read_parquet('{escaped_merged_win5}')
+            """
+        ).fetchone()
+        
+        total_pos_original, total_pos_win5, distinct_rc_original, distinct_rc_win5 = comparison_stats
+        
+        print(f"\nTotal positives:")
+        print(f"  transition_01:        {total_pos_original:,}")
+        print(f"  transition_01_win5:   {total_pos_win5:,}")
+        if total_pos_original > 0:
+            ratio = total_pos_win5 / total_pos_original
+            print(f"  Ratio (win5/original): {ratio:.3f}x")
+            if total_pos_win5 <= total_pos_original:
+                print(f"  WARNING: win5 positives ({total_pos_win5:,}) <= original ({total_pos_original:,})")
+            else:
+                print(f"  win5 has more positives (expected)")
+        
+        print(f"\nDistinct (row,col) with positives:")
+        print(f"  transition_01:        {distinct_rc_original:,}")
+        print(f"  transition_01_win5:   {distinct_rc_win5:,}")
+        if distinct_rc_original > 0:
+            ratio_rc = distinct_rc_win5 / distinct_rc_original
+            print(f"  Ratio (win5/original): {ratio_rc:.3f}x")
+            if distinct_rc_win5 <= distinct_rc_original:
+                print(f"  WARNING: win5 distinct (row,col) ({distinct_rc_win5:,}) <= original ({distinct_rc_original:,})")
+            else:
+                print(f"  win5 has more distinct (row,col) with positives (expected)")
+        
+        if use_wandb:
+            wandb.log({
+                "comparison/total_pos_original": int(total_pos_original),
+                "comparison/total_pos_win5": int(total_pos_win5),
+                "comparison/total_pos_ratio": float(total_pos_win5 / total_pos_original) if total_pos_original > 0 else 0.0,
+                "comparison/distinct_rc_original": int(distinct_rc_original),
+                "comparison/distinct_rc_win5": int(distinct_rc_win5),
+                "comparison/distinct_rc_ratio": float(distinct_rc_win5 / distinct_rc_original) if distinct_rc_original > 0 else 0.0,
+            })
+        
+        print("\n" + "="*70)
+        print("STEP 4: Creating temporal splits")
+        print("="*70)
+        
         # TRAIN_EARLY: positives + hard negatives per year (2001–2014)
         # Keep all positives, sample negatives per year at TARGET_NEG_POS_RATIO
         # 50% hard negatives (close to WDPA), 50% random from remainder
@@ -191,7 +331,7 @@ def main() -> None:
             WITH base AS (
                 SELECT
                     *
-                FROM read_parquet('{escaped_in}')
+                FROM read_parquet('{escaped_merged_win5}')
                 WHERE year BETWEEN {TRAIN_EARLY_YEARS[0]} AND {TRAIN_EARLY_YEARS[1]}
             ),
             year_counts AS (
@@ -315,7 +455,7 @@ def main() -> None:
         COPY (
             SELECT
                 *
-            FROM read_parquet('{escaped_in}')
+            FROM read_parquet('{escaped_merged_win5}')
             WHERE year BETWEEN {VAL_LATE_YEARS[0]} AND {VAL_LATE_YEARS[1]}
         )
         TO '{escaped_val_late}' (FORMAT PARQUET, COMPRESSION ZSTD)
@@ -326,26 +466,32 @@ def main() -> None:
         con.execute(val_late_sql)
         print(f"VAL_LATE_FULL written in {time.time() - val_late_start:.1f}s")
 
-        # TEST_FULL: full risk set 2018–2024
+        # TEST_FULL: full risk set 2018–2019 (right-censored)
         test_sql = f"""
         COPY (
             SELECT
                 *
-            FROM read_parquet('{escaped_in}')
+            FROM read_parquet('{escaped_merged_win5}')
             WHERE year BETWEEN {TEST_YEARS[0]} AND {TEST_YEARS[1]}
         )
         TO '{escaped_test}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """
 
-        print(f"\nCreating TEST_FULL split ({TEST_YEARS[0]}–{TEST_YEARS[1]}, full risk set)...")
+        print(f"\nCreating TEST_FULL split ({TEST_YEARS[0]}–{TEST_YEARS[1]}, full risk set, right-censored)...")
         test_start = time.time()
         con.execute(test_sql)
         print(f"TEST written in {time.time() - test_start:.1f}s")
 
-        # Log counts and check achieved ratios
-        log_year_counts(con, train_early_out, "TRAIN_EARLY", use_wandb)
-        log_year_counts(con, val_late_out, "VAL_LATE_FULL", use_wandb)
-        log_year_counts(con, test_out, "TEST_FULL", use_wandb)
+        # Log counts for both original and win5 targets
+        print("\n" + "="*70)
+        print("PER-YEAR STATISTICS")
+        print("="*70)
+        log_year_counts(con, train_early_out, "TRAIN_EARLY", "transition_01", use_wandb)
+        log_year_counts(con, train_early_out, "TRAIN_EARLY", "transition_01_win5", use_wandb)
+        log_year_counts(con, val_late_out, "VAL_LATE_FULL", "transition_01", use_wandb)
+        log_year_counts(con, val_late_out, "VAL_LATE_FULL", "transition_01_win5", use_wandb)
+        log_year_counts(con, test_out, "TEST_FULL", "transition_01", use_wandb)
+        log_year_counts(con, test_out, "TEST_FULL", "transition_01_win5", use_wandb)
 
         # Check total rows and achieved ratios
         total_train_early_rows = con.execute(
@@ -411,6 +557,10 @@ def main() -> None:
             f"SELECT COUNT(*) FROM read_parquet('{escaped_test}')"
         ).fetchone()[0]
 
+        total_val_late = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{escaped_val_late}')"
+        ).fetchone()[0]
+
         if use_wandb:
             wandb.log(
                 {
@@ -420,10 +570,11 @@ def main() -> None:
                     "train_early/scale_pos_weight": scale_pos_weight,
                     "train_early/target_neg_pos_ratio": TARGET_NEG_POS_RATIO,
                     "train_early/achieved_neg_pos_ratio": neg_pos_ratio,
-                    "val_late_full/rows": con.execute(
-                        f"SELECT COUNT(*) FROM read_parquet('{escaped_val_late}')"
-                    ).fetchone()[0],
+                    "val_late_full/rows": total_val_late,
                     "test_full/rows": total_test,
+                    "lookahead_years": LOOKAHEAD_YEARS,
+                    "cutoff_year": cutoff_year,
+                    "max_year": max_year,
                     "timing/total_seconds": time.time() - start_time,
                 }
             )
