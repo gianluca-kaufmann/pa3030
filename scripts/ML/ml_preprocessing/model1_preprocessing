@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Sampling script for model1 training/validation/test splits with 5-year lookahead target.
+Sampling script for model1 training/earlystop/test splits with 5-year lookahead target.
 
 Rules
 -----
@@ -12,8 +12,9 @@ TRAIN_EARLY (2001–2014):
   - Year 2000 excluded to avoid treating existing PAs as transitions
   - Result: positive rate ~0.25% (realistic for conservation risk modeling)
 
-VAL_LATE (2015–2017):
+EARLYSTOP (2015–2017):
   - Full risk set (no sampling)
+  - Used only for early stopping during CV, not for evaluation
 
 TEST (2018–2019):
   - Full risk set (no sampling)
@@ -28,7 +29,7 @@ TEST (2018–2019):
 Notes
 -----
 - No MAX_TRAIN_ROWS cap to avoid artificially inflating positive rate
-- Target neg/pos ratio maintains realistic class balance similar to val/test
+- Target neg/pos ratio maintains realistic class balance similar to earlystop/test
 - Hard negative sampling focuses on areas near protected areas (most informative)
 - Right-censoring: max_year is computed from data and rows with year > max_year-5 are excluded
 """
@@ -49,7 +50,7 @@ import wandb
 RANDOM_STATE = 42
 # Split configuration
 TRAIN_EARLY_YEARS = (2001, 2014)   # Sampled train with hard negatives (2000 excluded)
-VAL_LATE_YEARS = (2015, 2017)      # Full validation
+EARLYSTOP_YEARS = (2015, 2017)     # Full earlystop (for CV early stopping only)
 TEST_YEARS = (2018, 2019)          # Full test (right-censored for 5-year lookahead)
 LOOKAHEAD_YEARS = 5                # Number of years to look ahead for target
 WANDB_PROJECT = "ml-training-preprocessing"
@@ -163,7 +164,7 @@ def main() -> None:
             config={
                 "random_state": RANDOM_STATE,
                 "train_early_years": TRAIN_EARLY_YEARS,
-                "val_late_years": VAL_LATE_YEARS,
+                "earlystop_years": EARLYSTOP_YEARS,
                 "test_years": TEST_YEARS,
                 "lookahead_years": LOOKAHEAD_YEARS,
                 "target_neg_pos_ratio": TARGET_NEG_POS_RATIO,
@@ -182,13 +183,13 @@ def main() -> None:
     # Output paths for win5 files
     merged_win5_out = base_dir / "merged_panel_final_win5.parquet"
     train_early_out = base_dir / "train_early_sampled.parquet"
-    val_late_out = base_dir / "val_late_full.parquet"
+    earlystop_out = base_dir / "earlystop_full.parquet"
     test_out = base_dir / "test_full.parquet"
 
     print(f"\nInput: {input_path}")
     print(f"Merged WIN5 output: {merged_win5_out}")
     print(f"TRAIN_EARLY (sampled) output: {train_early_out}")
-    print(f"VAL_LATE_FULL output: {val_late_out}")
+    print(f"EARLYSTOP output: {earlystop_out}")
     print(f"TEST_FULL output: {test_out}")
 
     con = duckdb.connect()
@@ -198,7 +199,7 @@ def main() -> None:
     escaped_merged_win5 = str(merged_win5_out).replace("'", "''")
     escaped_train_early = str(train_early_out).replace("'", "''")
     escaped_test = str(test_out).replace("'", "''")
-    escaped_val_late = str(val_late_out).replace("'", "''")
+    escaped_earlystop = str(earlystop_out).replace("'", "''")
 
     try:
         print("\n" + "="*70)
@@ -450,21 +451,21 @@ def main() -> None:
         con.execute(train_early_sql)
         print(f"TRAIN_EARLY written in {time.time() - train_early_start:.1f}s")
 
-        # VAL_LATE_FULL: full risk set 2015–2017
-        val_late_sql = f"""
+        # EARLYSTOP: full risk set 2015–2017 (for early stopping during CV only, not evaluation)
+        earlystop_sql = f"""
         COPY (
             SELECT
                 *
             FROM read_parquet('{escaped_merged_win5}')
-            WHERE year BETWEEN {VAL_LATE_YEARS[0]} AND {VAL_LATE_YEARS[1]}
+            WHERE year BETWEEN {EARLYSTOP_YEARS[0]} AND {EARLYSTOP_YEARS[1]}
         )
-        TO '{escaped_val_late}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        TO '{escaped_earlystop}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """
 
-        print(f"\nCreating VAL_LATE_FULL split ({VAL_LATE_YEARS[0]}–{VAL_LATE_YEARS[1]}, full risk set)...")
-        val_late_start = time.time()
-        con.execute(val_late_sql)
-        print(f"VAL_LATE_FULL written in {time.time() - val_late_start:.1f}s")
+        print(f"\nCreating EARLYSTOP split ({EARLYSTOP_YEARS[0]}–{EARLYSTOP_YEARS[1]}, for early stopping during CV only)...")
+        earlystop_start = time.time()
+        con.execute(earlystop_sql)
+        print(f"EARLYSTOP written in {time.time() - earlystop_start:.1f}s")
 
         # TEST_FULL: full risk set 2018–2019 (right-censored)
         test_sql = f"""
@@ -488,8 +489,9 @@ def main() -> None:
         print("="*70)
         log_year_counts(con, train_early_out, "TRAIN_EARLY", "transition_01", use_wandb)
         log_year_counts(con, train_early_out, "TRAIN_EARLY", "transition_01_win5", use_wandb)
-        log_year_counts(con, val_late_out, "VAL_LATE_FULL", "transition_01", use_wandb)
-        log_year_counts(con, val_late_out, "VAL_LATE_FULL", "transition_01_win5", use_wandb)
+        # EARLYSTOP stats logged for information, but EARLYSTOP is only used for early stopping during CV, not evaluation
+        log_year_counts(con, earlystop_out, "EARLYSTOP", "transition_01", use_wandb)
+        log_year_counts(con, earlystop_out, "EARLYSTOP", "transition_01_win5", use_wandb)
         log_year_counts(con, test_out, "TEST_FULL", "transition_01", use_wandb)
         log_year_counts(con, test_out, "TEST_FULL", "transition_01_win5", use_wandb)
 
@@ -557,8 +559,8 @@ def main() -> None:
             f"SELECT COUNT(*) FROM read_parquet('{escaped_test}')"
         ).fetchone()[0]
 
-        total_val_late = con.execute(
-            f"SELECT COUNT(*) FROM read_parquet('{escaped_val_late}')"
+        total_earlystop = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{escaped_earlystop}')"
         ).fetchone()[0]
 
         if use_wandb:
@@ -570,7 +572,7 @@ def main() -> None:
                     "train_early/scale_pos_weight": scale_pos_weight,
                     "train_early/target_neg_pos_ratio": TARGET_NEG_POS_RATIO,
                     "train_early/achieved_neg_pos_ratio": neg_pos_ratio,
-                    "val_late_full/rows": total_val_late,
+                    "earlystop/rows": total_earlystop,
                     "test_full/rows": total_test,
                     "lookahead_years": LOOKAHEAD_YEARS,
                     "cutoff_year": cutoff_year,

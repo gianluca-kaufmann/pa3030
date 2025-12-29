@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
-"""LGBM Transition Model (0→1 Prediction)
-Train LightGBM on pre-split parquet files: train_early_sampled (2000-2014), 
-val_late_full (2015-2017), test_full (2018-2024). Final model trained on 2000-2014,
-with early stopping on 2015, evaluated on 2018-2024. Uses isotonic calibration fitted 
-on 2016-2017 predictions.
+"""LGBM Transition Model (5-Year Lookahead Prediction)
+Train LightGBM on pre-split parquet files: train_early_sampled (2001-2014), 
+earlystop_full (2015-2017), test_full (2018-2024). Final model trained on 2001-2014,
+with temporal cross-validation to determine num_boost_round, evaluated on 2018-2019.
+Uses isotonic calibration fitted on 2016-2017 predictions (capped at LAST_LABEL_YEAR).
+Target: transition_01_win5 (5-year lookahead)
+
+Features:
+- Temporal Cross-Validation: 3 folds with different train/earlystop year splits
+- Final Model: Uses average best_iteration from CV folds (no early stopping)
+- Time-based Sample Weighting: Later training years get higher weights
+  (Year 2001: weight 0.5, Year 2014: weight 1.0, linear interpolation in between)
+- Right-Censoring Protection: All splits (train/earlystop/calibration/test) filtered to LAST_LABEL_YEAR
+  (LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS) to avoid evaluating on
+  labels that don't have complete 5-year lookahead information
 """
 
 from __future__ import annotations
@@ -25,7 +35,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import lightgbm as lgb
 from sklearn.metrics import roc_auc_score, average_precision_score
-from sklearn.calibration import CalibratedClassifierCV
 from sklearn.isotonic import IsotonicRegression
 
 
@@ -46,19 +55,6 @@ class Tee:
         self.file.close()
 
 
-class LGBMBoosterWrapper:
-    """Wrapper to make LightGBM Booster sklearn-compatible for calibration."""
-    def __init__(self, booster: lgb.Booster):
-        self.booster = booster
-    
-    def predict_proba(self, X: np.ndarray | pd.DataFrame) -> np.ndarray:
-        """Return probabilities in sklearn format [n_samples, 2]."""
-        proba_positive = self.booster.predict(X)
-        proba_positive = np.clip(proba_positive, 0.0, 1.0)  # Ensure valid probabilities
-        proba_negative = 1.0 - proba_positive
-        return np.column_stack([proba_negative, proba_positive])
-
-
 class CalibratedLGBMWrapper:
     """Wrapper that applies isotonic calibration to LightGBM predictions."""
     def __init__(self, booster: lgb.Booster, isotonic_reg: IsotonicRegression):
@@ -77,12 +73,30 @@ class CalibratedLGBMWrapper:
 
 # Configuration
 RANDOM_STATE = 42
-EXCLUDE_COLS = {'transition_01', 'WDPA_b1', 'WDPA_prev', 'x', 'y', 'row', 'col', 'year'}
+TARGET_COL = "transition_01_win5"  # 5-year lookahead target
+EXCLUDE_COLS = {TARGET_COL, 'transition_01', 'WDPA_b1', 'WDPA_prev', 'x', 'y', 'row', 'col', 'year'}
 MIN_YEAR = int(os.environ.get("TRANSITION_MIN_YEAR", "2001"))  # drop year 2000 by default
 TRAIN_EARLY_YEAR_MAX = 2014
 VAL_STOPPING_YEARS = (2015, 2015)
 VAL_CALIBRATION_YEARS = (2016, 2017)
+LOOKAHEAD_YEARS = 5  # Number of years ahead for prediction
+WDPA_LAST_YEAR = 2024  # Last year with WDPA data
+LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS  # Last year we can reliably label (2019)
+TRAIN_YEARS = (MIN_YEAR, min(TRAIN_EARLY_YEAR_MAX, LAST_LABEL_YEAR))   # Train: 2001-2014 (capped at LAST_LABEL_YEAR)
+EARLYSTOP_YEARS = (VAL_STOPPING_YEARS[0], min(VAL_CALIBRATION_YEARS[1], LAST_LABEL_YEAR))     # Earlystop: 2015-2017 (capped at LAST_LABEL_YEAR)
+TEST_START = 2018
+TEST_END = 2024
+TEST_YEARS = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))    # Test: 2018-2019 (capped at LAST_LABEL_YEAR)
 FIXED_PARAMS = {'random_state': RANDOM_STATE, 'boosting_type': 'gbdt', 'objective': 'binary', 'verbose': -1}
+
+# Temporal Cross-Validation Folds
+# Each fold: (train_start, train_end, earlystop_start, earlystop_end)
+# Earlystop years are capped at LAST_LABEL_YEAR to avoid right-censored labels
+CV_FOLDS = [
+    ((MIN_YEAR, 2008), (2009, min(2009, LAST_LABEL_YEAR))),  # Fold 1: Train 2001-2008 → Earlystop 2009
+    ((MIN_YEAR, 2011), (2012, min(2012, LAST_LABEL_YEAR))),  # Fold 2: Train 2001-2011 → Earlystop 2012
+    ((MIN_YEAR, 2014), (2015, min(2015, LAST_LABEL_YEAR))),  # Fold 3: Train 2001-2014 → Earlystop 2015
+]
 
 # Utility Functions
 
@@ -149,7 +163,9 @@ def convert_numpy_types(obj: Any) -> Any:
 def compute_precision_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) -> float:
     """Compute precision at top k% of predictions."""
     n_top_k = max(1, int(len(y_true) * k / 100))
-    top_k_idx = np.argsort(y_proba)[-n_top_k:]
+    # Use argpartition for efficiency: only need to separate top K from the rest
+    # argpartition puts the n_top_k largest elements at the end
+    top_k_idx = np.argpartition(y_proba, -n_top_k)[-n_top_k:]
     return y_true[top_k_idx].sum() / n_top_k
 
 
@@ -170,6 +186,29 @@ def resolve_parquet_file(filename: str) -> Path:
     raise FileNotFoundError(f"{filename} not found in expected locations")
 
 
+def resolve_full_train_file() -> Optional[Path]:
+    """Try to locate a full (unsampled) train file for earlystop years <= 2014.
+    Returns None if not found."""
+    repo_root = Path(__file__).resolve().parents[3]
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+    
+    # Try common full file names
+    candidates = []
+    if scratch_root is not None:
+        candidates.append(scratch_root / "data/ml/train_early_full.parquet")
+        candidates.append(scratch_root / "data/ml/train_full.parquet")
+        candidates.append(scratch_root / "data/ml/merged_panel_final_win5.parquet")
+    candidates.append(repo_root / "data/ml/train_early_full.parquet")
+    candidates.append(repo_root / "data/ml/train_full.parquet")
+    candidates.append(repo_root / "data/ml/merged_panel_final_win5.parquet")
+    
+    for cand in candidates:
+        if cand.exists():
+            return cand
+    
+    return None
+
+
 def resolve_best_params_json() -> Optional[Path]:
     """Locate lgbm_best_params.json (in same directory as this script). Returns None if not found."""
     script_dir = Path(__file__).resolve().parent
@@ -179,23 +218,6 @@ def resolve_best_params_json() -> Optional[Path]:
         return None
     
     return params_path
-
-
-def resolve_train_metadata() -> Path:
-    """Locate train_early_metadata.json (prefer $SCRATCH if present)."""
-    repo_root = Path(__file__).resolve().parents[3]
-    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
-
-    candidates = []
-    if scratch_root is not None:
-        candidates.append(scratch_root / "data/ml/train_early_metadata.json")
-    candidates.append(repo_root / "data/ml/train_early_metadata.json")
-
-    for cand in candidates:
-        if cand.exists():
-            return cand
-
-    raise FileNotFoundError("train_early_metadata.json not found in expected locations")
 
 
 def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
@@ -235,7 +257,7 @@ def load_numpy_arrays_two_pass(
     year_filter, 
     name: str = "",
     batch_size: int = 50_000
-) -> tuple[np.ndarray, np.ndarray, int, int, list]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int, list]:
     """
     Two-pass NumPy loader: bypasses Pandas to minimize memory overhead.
     
@@ -245,6 +267,7 @@ def load_numpy_arrays_two_pass(
     Returns:
         X: Feature matrix (n_samples, n_features) as float32
         y: Target vector (n_samples,) as int8
+        years_array: Array of years (n_samples,) as int32
         pos: Number of positive samples
         neg: Number of negative samples
         years: Sorted list of unique years
@@ -293,6 +316,7 @@ def load_numpy_arrays_two_pass(
     print(f"  Pass 2: Pre-allocating arrays ({n_samples:,} samples, {len(feature_cols)} features)...")
     X = np.empty((n_samples, len(feature_cols)), dtype=np.float32)
     y = np.empty(n_samples, dtype=np.int8)
+    years_array = np.empty(n_samples, dtype=np.int32)
     
     parquet_file = pq.ParquetFile(df_path)
     idx_offset = 0
@@ -344,6 +368,7 @@ def load_numpy_arrays_two_pass(
             batch_size_actual = len(y_batch)
             X[idx_offset:idx_offset + batch_size_actual, :] = X_batch
             y[idx_offset:idx_offset + batch_size_actual] = y_batch
+            years_array[idx_offset:idx_offset + batch_size_actual] = year_filtered.astype(np.int32)
             idx_offset += batch_size_actual
             
             del batch_table, target_array, year_array, target_valid, year_valid, target_filtered, year_filtered
@@ -366,11 +391,196 @@ def load_numpy_arrays_two_pass(
     years = sorted(years_set)
     
     load_time = time.time() - load_start
-    mem_gb = (X.nbytes + y.nbytes) / 1024**3
+    mem_gb = (X.nbytes + y.nbytes + years_array.nbytes) / 1024**3
     print(f"  Loaded {n_samples:,} rows in {load_time:.1f}s ({mem_gb:.2f} GB)")
     print(f"  {neg:,} neg, {pos:,} pos, ratio 1:{neg/max(pos,1):.1f}, years {years[0]}-{years[-1]}")
     
-    return X, y, pos, neg, years
+    return X, y, years_array, pos, neg, years
+
+
+def compute_year_weights(years: np.ndarray, min_year: int = 2001, max_year: int = 2014, 
+                         min_weight: float = 0.5, max_weight: float = 1.0) -> np.ndarray:
+    """
+    Compute sample weights based on year.
+    Linear interpolation: min_year -> min_weight, max_year -> max_weight.
+    
+    Args:
+        years: Array of years
+        min_year: Earliest year (gets min_weight)
+        max_year: Latest year (gets max_weight)
+        min_weight: Weight for min_year (default 0.5)
+        max_weight: Weight for max_year (default 1.0)
+    
+    Returns:
+        Array of weights (float32)
+    """
+    # Guard against division by zero when min_year == max_year
+    if max_year == min_year:
+        return np.full(len(years), max_weight, dtype=np.float32)
+    
+    # Normalize years to [0, 1] range
+    years_normalized = (years - min_year) / (max_year - min_year)
+    # Clip to [0, 1] in case of out-of-range years
+    years_normalized = np.clip(years_normalized, 0.0, 1.0)
+    # Linear interpolation
+    weights = min_weight + years_normalized * (max_weight - min_weight)
+    return weights.astype(np.float32)
+
+
+def load_numpy_arrays_from_multiple_files(
+    df_paths: list[Path],
+    feature_cols: list,
+    target_col: str,
+    name: str = "",
+    batch_size: int = 50_000,
+    year_range: Optional[tuple[int, int]] = None
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int, list]:
+    """
+    Load data from multiple parquet files with optional year filtering.
+    Combines data from all files and filters by year_range if specified.
+    
+    Args:
+        df_paths: List of paths to parquet files to load from
+        year_range: Optional tuple (min_year, max_year) to filter data. Inclusive on both ends.
+    
+    Returns:
+        X: Feature matrix (n_samples, n_features) as float32
+        y: Target vector (n_samples,) as int8
+        years_array: Array of years (n_samples,) as int32
+        pos: Number of positive samples
+        neg: Number of negative samples
+        years: Sorted list of unique years
+    """
+    year_filter_str = f" (years {year_range[0]}-{year_range[1]})" if year_range else ""
+    print(f"\nLoading from {len(df_paths)} files{year_filter_str} (two-pass NumPy loader)...")
+    load_start = time.time()
+    essential_cols = feature_cols + [target_col, 'year']
+    
+    # Pass 1: Count rows across all files
+    print(f"  Pass 1: Counting rows...")
+    n_samples = 0
+    years_set = set()
+    
+    for file_idx, df_path in enumerate(df_paths):
+        parquet_file = pq.ParquetFile(df_path)
+        try:
+            for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols):
+                batch_table = batch
+                target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+                year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+                
+                # Filter out NaN in target
+                valid_mask = ~np.isnan(target_array)
+                if not valid_mask.any():
+                    continue
+                
+                target_valid = target_array[valid_mask]
+                year_valid = year_array[valid_mask]
+                
+                if year_range is not None:
+                    year_mask = (year_valid >= year_range[0]) & (year_valid <= year_range[1])
+                    target_valid = target_valid[year_mask]
+                    year_valid = year_valid[year_mask]
+                
+                if len(target_valid) == 0:
+                    continue
+                
+                n_samples += len(target_valid)
+                years_set.update(year_valid.tolist())
+                
+                del batch_table, target_array, year_array, target_valid, year_valid, batch
+        finally:
+            del parquet_file
+            gc.collect()
+    
+    print(f"  Found {n_samples:,} samples")
+    
+    if n_samples == 0:
+        raise ValueError(f"No samples found in files{year_filter_str}")
+    
+    # Pass 2: Pre-allocate arrays and fill from all files
+    print(f"  Pass 2: Pre-allocating arrays ({n_samples:,} samples, {len(feature_cols)} features)...")
+    X = np.empty((n_samples, len(feature_cols)), dtype=np.float32)
+    y = np.empty(n_samples, dtype=np.int8)
+    years_array = np.empty(n_samples, dtype=np.int32)
+    idx_offset = 0
+    batch_num = 0
+    
+    for file_idx, df_path in enumerate(df_paths):
+        parquet_file = pq.ParquetFile(df_path)
+        try:
+            for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols):
+                batch_num += 1
+                batch_table = batch
+                
+                target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+                year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+                
+                # Filter out NaN in target
+                valid_mask = ~np.isnan(target_array)
+                if not valid_mask.any():
+                    del batch_table, batch
+                    continue
+                
+                target_valid = target_array[valid_mask]
+                year_valid = year_array[valid_mask]
+                
+                if year_range is not None:
+                    year_mask = (year_valid >= year_range[0]) & (year_valid <= year_range[1])
+                    if not year_mask.any():
+                        del batch_table, target_array, year_array, batch
+                        continue
+                    target_valid = target_valid[year_mask]
+                    year_valid = year_valid[year_mask]
+                    
+                    feature_arrays = []
+                    for col in feature_cols:
+                        col_array = batch_table[col].to_numpy(zero_copy_only=False)
+                        col_valid = col_array[valid_mask]
+                        col_valid = col_valid[year_mask]
+                        col_float32 = col_valid.astype(np.float32)
+                        feature_arrays.append(col_float32)
+                else:
+                    feature_arrays = []
+                    for col in feature_cols:
+                        col_array = batch_table[col].to_numpy(zero_copy_only=False)
+                        col_valid = col_array[valid_mask]
+                        col_float32 = col_valid.astype(np.float32)
+                        feature_arrays.append(col_float32)
+                
+                X_batch = np.column_stack(feature_arrays)
+                y_batch = (target_valid > 0).astype(np.int8)
+                
+                batch_size_actual = len(y_batch)
+                X[idx_offset:idx_offset + batch_size_actual, :] = X_batch
+                y[idx_offset:idx_offset + batch_size_actual] = y_batch
+                years_array[idx_offset:idx_offset + batch_size_actual] = year_valid.astype(np.int32)
+                idx_offset += batch_size_actual
+                
+                del batch_table, target_array, year_array, target_valid, year_valid
+                del feature_arrays, X_batch, y_batch, batch
+                gc.collect()
+                
+                if batch_num % 10 == 0:
+                    print(f"  {batch_num} batches, {idx_offset:,}/{n_samples:,} samples loaded")
+                    report_memory_usage(f"load batch {batch_num}")
+        finally:
+            del parquet_file
+            gc.collect()
+    
+    if idx_offset != n_samples:
+        raise ValueError(f"Mismatch: expected {n_samples:,} samples but loaded {idx_offset:,}")
+    
+    pos = int(y.sum())
+    neg = int((y == 0).sum())
+    years = sorted(years_set)
+    
+    load_time = time.time() - load_start
+    mem_gb = (X.nbytes + y.nbytes + years_array.nbytes) / 1024**3
+    print(f"  Loaded {n_samples:,} rows in {load_time:.1f}s ({mem_gb:.2f} GB)")
+    print(f"  {neg:,} neg, {pos:,} pos, ratio 1:{neg/max(pos,1):.1f}, years {years[0]}-{years[-1]}")
+    
+    return X, y, years_array, pos, neg, years
 
 
 def compute_metrics(y_true: np.ndarray, y_proba: np.ndarray) -> Dict[str, float]:
@@ -391,184 +601,506 @@ def compute_metrics(y_true: np.ndarray, y_proba: np.ndarray) -> Dict[str, float]
 # Main Pipeline
 # =============================================================================
 
-def phase1_training(
-    train_path: Path, val_path: Path, params_path: Path, feature_cols: list, keep_cols_train: list,
-    best_params: Dict[str, Any], timestamp: str, model_dir: Path, output_dir: Path, use_wandb: bool, target_col: str,
-) -> tuple[Path, Dict[str, Any], Dict[str, Any], float, float, float, float, int, int, Dict[str, Any]]:
-    """Phase 1: Training - loads train/val splits, trains model, saves it."""
-    print("\n" + "="*70 + "\nPHASE 1: TRAINING\n" + "="*70)
-    report_memory_usage("start of Phase 1")
-    print("\nSTEP A: LOAD TRAIN_EARLY (≤2014)")
-    X_train_early, y_train_early, train_early_pos, train_early_neg, train_years = load_numpy_arrays_two_pass(
-        train_path, feature_cols, target_col, lambda y: (y >= MIN_YEAR) & (y <= TRAIN_EARLY_YEAR_MAX), "train_early_sampled.parquet")
-    n_train_full = len(y_train_early)
-    train_stats = {
-        "n_train": n_train_full,
-        "train_positives": int(train_early_pos),
-        "train_negatives": int(train_early_neg),
-        "train_positive_pct": float(train_early_pos / max(n_train_full, 1) * 100.0),
-        "train_years": f"{train_years[0]}-{train_years[-1]}",
-    }
-    report_memory_usage("after STEP A")
+def check_year_overlap(train_years: tuple[int, int], eval_years: tuple[int, int], eval_name: str) -> bool:
+    """
+    Check if evaluation years overlap with training years.
+    Returns True if there's overlap, False otherwise.
+    """
+    train_start, train_end = train_years
+    eval_start, eval_end = eval_years
     
-    print(f"\nSTEP B: LOAD VAL_STOPPING ({VAL_STOPPING_YEARS[0]})")
-    X_val_stopping, y_val_stopping, val_stopping_pos, val_stopping_neg, _ = load_numpy_arrays_two_pass(
-        val_path, feature_cols, target_col, lambda y: (y >= VAL_STOPPING_YEARS[0]) & (y <= VAL_STOPPING_YEARS[1]), "val_late_full.parquet")
-    report_memory_usage("after STEP B")
+    # Check for overlap: eval years should be strictly after training years
+    if eval_start <= train_end:
+        print(f"\n{'!'*70}")
+        print(f"WARNING: {eval_name} years ({eval_start}-{eval_end}) OVERLAP with training years ({train_start}-{train_end})!")
+        print(f"  Evaluation years must be strictly after training years to avoid data leakage.")
+        print(f"  SKIPPING {eval_name} evaluation for this fold.")
+        print(f"{'!'*70}\n")
+        return True
+    return False
+
+
+def train_single_cv_fold(
+    train_paths: list[Path],
+    earlystop_paths: list[Path],
+    feature_cols: list,
+    target_col: str,
+    train_years: tuple[int, int],
+    earlystop_years: tuple[int, int],
+    fold_idx: int,
+    best_params: Dict[str, Any],
+    use_wandb: bool,
+) -> Dict[str, Any]:
+    """
+    Train and evaluate a single CV fold.
+    Earlystop is used ONLY for early stopping, NOT for metric reporting.
     
-    print(f"\nSTEP C: TRAIN & EVALUATE\nTemporal split: train_early (≤{TRAIN_EARLY_YEAR_MAX}): {len(X_train_early):,} rows, val_stopping ({VAL_STOPPING_YEARS[0]}): {len(X_val_stopping):,} rows")
+    Returns:
+        Dictionary containing fold metrics and metadata
+    """
+    print(f"\n{'='*70}")
+    print(f"CV FOLD {fold_idx + 1}/{len(CV_FOLDS)}")
+    print(f"Train: {train_years[0]}-{train_years[1]} → Earlystop: {earlystop_years[0]}-{earlystop_years[1]}")
+    print(f"{'='*70}")
     
-    # Imbalance handling: hardcode scale_pos_weight to 150
-    scale_pos_weight = 150
+    # Check for year overlap
+    earlystop_year_range = (earlystop_years[0], min(earlystop_years[1], LAST_LABEL_YEAR))
+    if check_year_overlap(train_years, earlystop_year_range, f"Fold {fold_idx+1} Earlystop"):
+        # Skip this fold if overlap detected
+        return {
+            "fold_idx": fold_idx,
+            "train_years": list(train_years),
+            "earlystop_years": list(earlystop_years),
+            "skipped": True,
+            "skip_reason": "year_overlap",
+        }
     
-    neg_full, pos_full = val_stopping_neg, val_stopping_pos
-    neg_sampled, pos_sampled = train_early_neg, train_early_pos
-    ratio_full = float("inf") if pos_full == 0 else neg_full / pos_full
-    ratio_sampled = float("inf") if pos_sampled == 0 else neg_sampled / pos_sampled
-    print(f"\nImbalance: sampled ratio {ratio_sampled:.3f}, full ratio {ratio_full:.3f}, scale_pos_weight {scale_pos_weight:.6f} (hardcoded)")
-    best_params["is_unbalance"] = False
-    best_params["scale_pos_weight"] = scale_pos_weight
-    imbalance_info = {"neg_full": int(neg_full), "pos_full": int(pos_full), "neg_sampled": int(neg_sampled),
-                     "pos_sampled": int(pos_sampled), "ratio_full": float(ratio_full),
-                     "ratio_sampled": float(ratio_sampled), "scale_pos_weight": float(scale_pos_weight)}
-    if use_wandb:
-        wandb.log({"imbalance/neg_pos_ratio_full": float(ratio_full), "imbalance/neg_pos_ratio_sampled": float(ratio_sampled),
-                  "imbalance/scale_pos_weight": float(scale_pos_weight)})
+    # Load train data
+    X_train, y_train, train_years_array, train_pos, train_neg, train_years_list = load_numpy_arrays_from_multiple_files(
+        train_paths, feature_cols, target_col, f"Fold {fold_idx+1} Train", year_range=train_years
+    )
+    n_train_samples = len(X_train)
     
-    print(f"\nTraining on train_early ({len(X_train_early):,} samples)...")
-    report_memory_usage("before training")
-    train_early_start = time.time()
-    train_params = best_params.copy()
-    num_boost_round_val = train_params.pop("num_boost_round", train_params.pop("n_estimators", 3000))
+    # Load earlystop data (filter to LAST_LABEL_YEAR to avoid right-censored labels)
+    X_earlystop, y_earlystop, earlystop_years_array, earlystop_pos, earlystop_neg, earlystop_years_list = load_numpy_arrays_from_multiple_files(
+        earlystop_paths, feature_cols, target_col, f"Fold {fold_idx+1} Earlystop", year_range=earlystop_year_range
+    )
+    n_earlystop_samples = len(X_earlystop)
+    
+    print(f"\nFold {fold_idx+1}: Train {n_train_samples:,} samples, Earlystop {n_earlystop_samples:,} samples (earlystop years {earlystop_year_range[0]}-{earlystop_year_range[1]}, capped at LAST_LABEL_YEAR={LAST_LABEL_YEAR})")
+    print(f"  NOTE: Earlystop used ONLY for early stopping, NOT for metric reporting.")
+    
+    # Compute sample weights for training data (time-based weighting)
+    # Weight range: MIN_YEAR (weight 0.5) to train_years[1] (weight 1.0)
+    train_weights = compute_year_weights(train_years_array, min_year=MIN_YEAR, max_year=train_years[1])
+    print(f"  Training sample weights: min={train_weights.min():.3f}, max={train_weights.max():.3f}, mean={train_weights.mean():.3f}")
+    
+    # Compute scale_pos_weight from training data: scale_pos_weight = n_neg / n_pos
+    scale_pos_weight = train_neg / max(train_pos, 1)
+    print(f"  Computed scale_pos_weight from training data: {scale_pos_weight:.6f} = {train_neg:,} / {train_pos:,}")
+    
+    # Train model
+    num_boost_round_earlystop = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
+    train_params = {**best_params, "is_unbalance": False}
+    train_params.pop("num_boost_round", None)
     train_params.pop("n_estimators", None)
+    # Override scale_pos_weight with computed value right before training
+    train_params["scale_pos_weight"] = scale_pos_weight
     
     # Add memory-efficient LightGBM parameters
     train_params['force_col_wise'] = True  # More memory efficient for many features
     train_params['max_bin'] = 255  # Reduce memory usage
     train_params['two_round'] = True  # Reduce peak memory during histogram building
     
-    # Create datasets with free_raw_data=True to reduce memory usage
-    # Keep validation data in memory for later prediction (don't copy to save memory)
-    print(f"  Creating train dataset...")
-    train_dataset = lgb.Dataset(X_train_early, label=y_train_early, free_raw_data=True)
-    del X_train_early, y_train_early; gc.collect()
-    report_memory_usage("after train dataset creation")
+    print(f"  Creating datasets...")
+    train_dataset = lgb.Dataset(X_train, label=y_train, weight=train_weights, free_raw_data=True)
+    del X_train, y_train, train_years_array, train_weights; gc.collect()
     
-    print(f"  Creating validation dataset...")
-    val_dataset = lgb.Dataset(X_val_stopping, label=y_val_stopping, free_raw_data=True, reference=train_dataset)
-    # Don't delete X_val_stopping, y_val_stopping yet - needed for metrics after training
-    report_memory_usage("after val dataset creation")
+    earlystop_dataset = lgb.Dataset(X_earlystop, label=y_earlystop, free_raw_data=True, reference=train_dataset)
     
-    print(f"  Starting training...")
-    lgb_model = lgb.train(train_params, train_dataset, num_boost_round=num_boost_round_val, valid_sets=[val_dataset],
-                         valid_names=["val_stopping"], callbacks=[lgb.early_stopping(500), lgb.log_evaluation(100)])
-    train_early_time = time.time() - train_early_start
+    print(f"  Training...")
+    train_start = time.time()
+    lgb_model = lgb.train(
+        train_params,
+        train_dataset,
+        num_boost_round=num_boost_round_earlystop,
+        valid_sets=[earlystop_dataset],
+        valid_names=["earlystop"],
+        callbacks=[lgb.early_stopping(500), lgb.log_evaluation(100)]
+    )
+    train_time = time.time() - train_start
     best_iteration = lgb_model.best_iteration
-    print(f"\nTraining done in {train_early_time:.1f}s. Best iteration: {best_iteration if best_iteration else 'N/A'}")
     
-    # Free datasets after training
-    del train_dataset, val_dataset; gc.collect()
+    del train_dataset, earlystop_dataset; gc.collect()
+    del X_earlystop, y_earlystop, earlystop_years_array, lgb_model; gc.collect()
     
-    val_start = time.time()
-    y_val_proba = lgb_model.predict(X_val_stopping, num_iteration=best_iteration if best_iteration else None)
-    val_time = time.time() - val_start
-    validation_metrics = compute_metrics(y_val_stopping, y_val_proba)
-    print(f"\nValidation: ROC-AUC {validation_metrics['roc_auc']:.4f}, PR-AUC {validation_metrics['pr_auc']:.4f}, "
-          f"P@1% {validation_metrics['precision_at_1pct']:.4f}, P@5% {validation_metrics['precision_at_5pct']:.4f}, "
-          f"P@10% {validation_metrics['precision_at_10pct']:.4f}")
-    
-    if use_wandb:
-        wandb.log({**{f"val/{k}": v for k, v in validation_metrics.items()}, "val/n_samples": int(len(y_val_stopping)),
-                  "val/n_positives": int(np.sum(y_val_stopping)), "val/time_seconds": val_time})
-    
-    # Now free validation data and predictions
-    del X_val_stopping, y_val_stopping, y_val_proba; gc.collect()
-    
-    print("\nSTEP D: FINAL MODEL (TRAIN_EARLY ONLY, NO CONCATENATION)")
-    print("  Skipping concatenation of train + val to avoid OOM.")
-    print(f"  Using the train_early model (with early stopping on val_stopping {VAL_STOPPING_YEARS[0]}) as the final model.")
-    # For downstream summaries, treat this as the final training time and stats
-    train_time = train_early_time
     if use_wandb:
         wandb.log({
-            "data/n_features": len(feature_cols),
-            "data/n_train": train_stats["n_train"],
-            "data/train_positives": train_stats["train_positives"],
-            "data/train_negatives": train_stats["train_negatives"],
-            "data/train_positive_pct": train_stats["train_positive_pct"],
+            f"cv_fold_{fold_idx+1}/n_train": int(n_train_samples),
+            f"cv_fold_{fold_idx+1}/n_earlystop": int(n_earlystop_samples),
+            f"cv_fold_{fold_idx+1}/train_time_seconds": train_time,
+            f"cv_fold_{fold_idx+1}/best_iteration": int(best_iteration) if best_iteration is not None else None,
         })
     
-    model_path = model_dir / f"model1_lgbm_{timestamp}.pkl"
+    return {
+        "fold_idx": fold_idx,
+        "train_years": list(train_years),
+        "earlystop_years": list(earlystop_years),
+        "n_train_samples": int(n_train_samples),
+        "n_earlystop_samples": int(n_earlystop_samples),
+        "train_positives": int(train_pos),
+        "train_negatives": int(train_neg),
+        "earlystop_positives": int(earlystop_pos),
+        "earlystop_negatives": int(earlystop_neg),
+        "train_time_seconds": train_time,
+        "best_iteration": int(best_iteration) if best_iteration is not None else None,
+    }
+
+
+def aggregate_cv_metrics(cv_results: list[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Aggregate metrics across CV folds.
+    Only aggregates training metadata (no validation/earlystop metrics).
+    """
+    aggregated = {}
+    
+    # Filter out skipped folds
+    valid_folds = [fold for fold in cv_results if not fold.get("skipped", False)]
+    
+    if not valid_folds:
+        return aggregated
+    
+    # Aggregate sample sizes
+    aggregated["n_train_mean"] = float(np.mean([fold.get("n_train_samples", fold.get("train_positives", 0) + fold.get("train_negatives", 0)) for fold in valid_folds]))
+    aggregated["n_earlystop_mean"] = float(np.mean([fold.get("n_earlystop_samples", fold.get("earlystop_positives", 0) + fold.get("earlystop_negatives", 0)) for fold in valid_folds]))
+    
+    # NO earlystop metrics aggregated - earlystop is used ONLY for early stopping
+    
+    return aggregated
+
+
+def phase1_training(
+    train_path: Path, earlystop_path: Path, params_path: Optional[Path], feature_cols: list, keep_cols_train: list,
+    best_params: Dict[str, Any], timestamp: str, model_dir: Path, output_dir: Path, use_wandb: bool, target_col: str,
+    cv_mode: str = "full",
+) -> tuple[Path, Dict[str, Any], Dict[str, Any], float, float, int, int, int, Dict[str, Any], Dict[str, Any]]:
+    """
+    Phase 1: Training with temporal cross-validation.
+    
+    Steps:
+    1. Run temporal CV folds to assess model stability (earlystop used only for early stopping, no metrics)
+    2. Train final model on TRAIN_EARLY data (2001-2014, capped at LAST_LABEL_YEAR) with no early stopping
+    3. Fit isotonic calibration on earlystop calibration predictions (2016-2017, capped at LAST_LABEL_YEAR)
+    
+    Returns:
+        Tuple including CV results as additional element
+    """
+    print("\n" + "="*70 + "\nPHASE 1: TRAINING WITH TEMPORAL CROSS-VALIDATION\n" + "="*70)
+    report_memory_usage("start of Phase 1")
+    
+    # =============================================================================
+    # STEP A: TEMPORAL CROSS-VALIDATION
+    # =============================================================================
+    print("\n" + "="*70 + "\nSTEP A: TEMPORAL CROSS-VALIDATION\n" + "="*70)
+    print(f"CV Mode: {cv_mode}")
+    
+    cv_results = []
+    
+    if cv_mode == "none":
+        print("  Skipping CV (cv_mode=none)")
+        # Use default best_iteration from params
+        chosen_iteration = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
+        print(f"  Using default best_iteration from params: {chosen_iteration}")
+        cv_aggregated = {}
+        best_iterations = []
+        train_rows_per_fold = []
+        fold3_best_iteration = None
+        cv_results = []
+    else:
+        # For CV, we need data from both train and earlystop files
+        # Each fold will filter the appropriate year ranges
+        cv_train_paths = [train_path]  # Train file contains data needed for CV
+        
+        # Try to resolve a full (unsampled) file for earlystop years <= 2014
+        full_train_file = resolve_full_train_file()
+        
+        # Determine which folds to run
+        if cv_mode == "fold3":
+            folds_to_run = [2]  # Only fold 3 (0-indexed: 2)
+            print(f"  Running only fold 3 ({MIN_YEAR}-2014 -> 2015)")
+        elif cv_mode == "full":
+            folds_to_run = list(range(len(CV_FOLDS)))  # All folds
+            print(f"  Running all {len(CV_FOLDS)} folds")
+        else:
+            raise ValueError(f"Invalid cv_mode: {cv_mode}. Must be one of: full, fold3, none")
+        
+        for fold_idx in folds_to_run:
+            train_years, earlystop_years = CV_FOLDS[fold_idx]
+            
+            # For folds where earlystop years are <= 2014, prefer full (unsampled) file
+            earlystop_year_max = min(earlystop_years[1], LAST_LABEL_YEAR)
+            if earlystop_year_max <= 2014 and full_train_file is not None:
+                # Use full file for earlystop years <= 2014
+                cv_earlystop_paths = [full_train_file]
+                print(f"  Fold {fold_idx+1}: Using full (unsampled) file for earlystop years {earlystop_years[0]}-{earlystop_year_max}")
+            elif earlystop_year_max <= 2014:
+                # No full file available, use sampled file with warning
+                cv_earlystop_paths = [train_path]
+                print(f"\n{'!'*70}")
+                print(f"WARNING: Fold {fold_idx+1} earlystop years ({earlystop_years[0]}-{earlystop_year_max}) are <= 2014,")
+                print(f"  but no full (unsampled) parquet file found. Using sampled train_early_sampled.parquet.")
+                print(f"  This may bias chosen_iteration due to sampled distribution.")
+                print(f"{'!'*70}\n")
+            else:
+                # Earlystop years > 2014, use both train and earlystop files
+                cv_earlystop_paths = [train_path, earlystop_path]
+            
+            fold_result = train_single_cv_fold(
+                cv_train_paths, cv_earlystop_paths, feature_cols, target_col,
+                train_years, earlystop_years, fold_idx, best_params, use_wandb
+            )
+            cv_results.append(fold_result)
+            gc.collect()
+        
+        # Aggregate CV metrics (no metrics computed on earlystop sets)
+        cv_aggregated = aggregate_cv_metrics(cv_results)
+        
+        # Extract best_iterations and train_rows for each fold (skip folds that were skipped due to overlap)
+        best_iterations = [fold["best_iteration"] for fold in cv_results if fold.get("best_iteration") is not None and not fold.get("skipped", False)]
+        train_rows_per_fold = [fold["n_train_samples"] for fold in cv_results if not fold.get("skipped", False)]
+        
+        # Extract fold3's best_iteration (fold index 2) - skip if fold was skipped
+        fold3_best_iteration = None
+        for fold_result in cv_results:
+            if (fold_result.get("fold_idx") == 2 and 
+                fold_result.get("best_iteration") is not None and 
+                not fold_result.get("skipped", False)):
+                fold3_best_iteration = fold_result["best_iteration"]
+                break
+        
+        # Calculate chosen_iteration based on cv_mode
+        if cv_mode == "full":
+            if best_iterations and train_rows_per_fold:
+                # Weighted average: sum(iter_i * n_i) / sum(n_i) * 1.05
+                weighted_sum = sum(iter_i * n_i for iter_i, n_i in zip(best_iterations, train_rows_per_fold))
+                total_rows = sum(train_rows_per_fold)
+                chosen_iteration = int(np.round(weighted_sum / total_rows * 1.05))
+                print(f"\nCV best_iterations: {best_iterations}")
+                print(f"CV train_rows_per_fold: {train_rows_per_fold}")
+                print(f"Weighted average (before 1.05x): {weighted_sum / total_rows:.2f}")
+                print(f"Chosen iteration (weighted avg * 1.05): {chosen_iteration}")
+                
+                # Apply max constraint with fold3_best_iteration
+                if fold3_best_iteration is not None:
+                    chosen_iteration = max(chosen_iteration, fold3_best_iteration)
+                    print(f"After max with fold3_best_iteration ({fold3_best_iteration}): {chosen_iteration}")
+            else:
+                # Fallback: use default if no best_iteration found (e.g., all folds skipped)
+                skipped_count = len([f for f in cv_results if f.get("skipped", False)])
+                if skipped_count > 0:
+                    print(f"\nWarning: {skipped_count} fold(s) skipped due to year overlap. No best_iteration found in remaining folds.")
+                else:
+                    print(f"\nWarning: No best_iteration found in CV folds.")
+                chosen_iteration = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
+                print(f"  Using default iteration from params: {chosen_iteration}")
+        elif cv_mode == "fold3":
+            if fold3_best_iteration is not None:
+                chosen_iteration = fold3_best_iteration
+                print(f"\nUsing fold3_best_iteration: {chosen_iteration}")
+            else:
+                # Fallback: use default if fold3 best_iteration not found (e.g., fold3 was skipped)
+                fold3_result = next((f for f in cv_results if f.get("fold_idx") == 2), None)
+                if fold3_result and fold3_result.get("skipped", False):
+                    print(f"\nWarning: Fold 3 was skipped due to year overlap. fold3_best_iteration not available.")
+                else:
+                    print(f"\nWarning: fold3_best_iteration not found.")
+                chosen_iteration = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
+                print(f"  Using default iteration from params: {chosen_iteration}")
+        else:
+            # Fallback for any other mode
+            chosen_iteration = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
+            print(f"\nWarning: Unknown cv_mode, using default: {chosen_iteration}")
+    
+    print("\n" + "="*70)
+    print("TEMPORAL CV RESULTS (Aggregated)")
+    print("="*70)
+    print(f"CV Mode: {cv_mode}")
+    if cv_mode != "none":
+        print(f"Chosen iteration (for final model): {chosen_iteration}")
+        # Report number of skipped folds
+        skipped_folds = [fold for fold in cv_results if fold.get("skipped", False)]
+        if skipped_folds:
+            print(f"  WARNING: {len(skipped_folds)} fold(s) skipped due to year overlap")
+    else:
+        print(f"Chosen iteration (from params): {chosen_iteration}")
+    
+    # NO earlystop metrics displayed - earlystop is used ONLY for early stopping, not for evaluation
+    
+    print("="*70)
+    
+    if use_wandb:
+        wandb.log({
+            **{f"cv_aggregated/{k}": v for k, v in cv_aggregated.items() if not k.endswith("_values")}
+        })
+    
+    # =============================================================================
+    # STEP B: FINAL MODEL TRAINING (TRAIN_EARLY: 2001-2014)
+    # =============================================================================
+    print("\n" + "="*70 + "\nSTEP B: FINAL MODEL TRAINING\n" + "="*70)
+    print(f"Training final model on TRAIN_EARLY dataset: {TRAIN_YEARS[0]}-{TRAIN_YEARS[1]}")
+    report_memory_usage("before final model training")
+    
+    # Load TRAIN_EARLY data (2001-2014, capped at LAST_LABEL_YEAR)
+    print(f"\nLoading TRAIN_EARLY data ({TRAIN_YEARS[0]}-{TRAIN_YEARS[1]}, capped at LAST_LABEL_YEAR={LAST_LABEL_YEAR})...")
+    X_train_full, y_train_full, train_years_array_full, train_pos_full, train_neg_full, train_years_full = load_numpy_arrays_two_pass(
+        train_path, feature_cols, target_col, lambda y: (y >= TRAIN_YEARS[0]) & (y <= min(TRAIN_YEARS[1], LAST_LABEL_YEAR)), "train_early_sampled.parquet")
+    n_train_full = len(y_train_full)
+    
+    train_stats = {
+        "n_train": n_train_full,
+        "train_positives": int(train_pos_full),
+        "train_negatives": int(train_neg_full),
+        "train_positive_pct": float(train_pos_full / max(n_train_full, 1) * 100.0),
+        "train_years": f"{train_years_full[0]}-{train_years_full[-1]}",
+    }
+    report_memory_usage("after loading final data")
+    
+    print(f"\nFinal model training: train ({TRAIN_YEARS[0]}-{TRAIN_YEARS[1]}): {len(X_train_full):,} rows")
+    print(f"Final training: no earlystop/val; num_boost_round fixed from CV to avoid leakage.")
+    
+    # Compute sample weights for training data (time-based weighting)
+    # Weight range: MIN_YEAR (weight 0.5) to TRAIN_YEARS[1] (weight 1.0)
+    train_weights = compute_year_weights(train_years_array_full, min_year=MIN_YEAR, max_year=TRAIN_YEARS[1])
+    print(f"  Training sample weights: min={train_weights.min():.3f}, max={train_weights.max():.3f}, mean={train_weights.mean():.3f}")
+    
+    # Compute scale_pos_weight from training data: scale_pos_weight = n_neg / n_pos
+    scale_pos_weight = train_neg_full / max(train_pos_full, 1)
+    print(f"\nImbalance: Computed scale_pos_weight from training data: {scale_pos_weight:.6f} = {train_neg_full:,} / {train_pos_full:,}")
+    
+    imbalance_info = {
+        "neg": int(train_neg_full),
+        "pos": int(train_pos_full),
+        "scale_pos_weight": float(scale_pos_weight)
+    }
+    if use_wandb:
+        wandb.log({
+            "final_model/imbalance/scale_pos_weight": float(scale_pos_weight),
+            "final_model/sample_weights/min": float(train_weights.min()),
+            "final_model/sample_weights/max": float(train_weights.max()),
+            "final_model/sample_weights/mean": float(train_weights.mean()),
+        })
+    
+    print(f"\nTraining final model on {len(X_train_full):,} samples...")
+    report_memory_usage("before final training")
+    train_start = time.time()
+    train_params = {**best_params, "is_unbalance": False}
+    train_params.pop("num_boost_round", None)
+    train_params.pop("n_estimators", None)
+    # Override scale_pos_weight with computed value right before training
+    train_params["scale_pos_weight"] = scale_pos_weight
+    
+    # Add memory-efficient LightGBM parameters
+    train_params['force_col_wise'] = True  # More memory efficient for many features
+    train_params['max_bin'] = 255  # Reduce memory usage
+    train_params['two_round'] = True  # Reduce peak memory during histogram building
+    
+    print(f"  Creating dataset...")
+    train_dataset = lgb.Dataset(X_train_full, label=y_train_full, weight=train_weights, free_raw_data=True)
+    del X_train_full, y_train_full, train_years_array_full, train_weights; gc.collect()
+    report_memory_usage("after train dataset creation")
+    
+    print(f"  Starting training with num_boost_round={chosen_iteration} (fixed from CV, no validation set/early stopping)...")
+    lgb_model = lgb.train(
+        train_params,
+        train_dataset,
+        num_boost_round=chosen_iteration,
+        callbacks=[lgb.log_evaluation(100)]
+    )
+    train_time = time.time() - train_start
+    print(f"\nTraining done in {train_time:.1f}s. Used {chosen_iteration} iterations (chosen based on CV)")
+    
+    del train_dataset; gc.collect()
+    
+    model_path = model_dir / f"model1_lgbm_win5_{timestamp}.pkl"
     with open(model_path, 'wb') as f:
         pickle.dump(lgb_model, f)
-    print(f"Model saved: {model_path}")
+    print(f"Final model saved: {model_path}")
     gc.collect()
     
-    # Fit isotonic calibration on val_calibration predictions (two-pass approach to avoid memory spikes)
-    print(f"\nSTEP E: FITTING ISOTONIC CALIBRATION ON VAL_CALIBRATION ({VAL_CALIBRATION_YEARS[0]}-{VAL_CALIBRATION_YEARS[1]}) (TWO-PASS)")
+    # =============================================================================
+    # STEP C: FITTING ISOTONIC CALIBRATION ON EARLYSTOP CALIBRATION YEARS
+    # =============================================================================
+    # Fit isotonic calibration on earlystop calibration predictions (two-pass approach to avoid memory spikes)
+    print(f"\n" + "="*70 + "\nSTEP C: FITTING ISOTONIC CALIBRATION ON EARLYSTOP CALIBRATION YEARS\n" + "="*70)
+    print(f"Calibration years: {VAL_CALIBRATION_YEARS[0]}-{min(VAL_CALIBRATION_YEARS[1], LAST_LABEL_YEAR)} (capped at LAST_LABEL_YEAR={LAST_LABEL_YEAR})")
     cal_start = time.time()
     
     batch_size = 50_000
     essential_cols_cal = feature_cols + [target_col, 'year']
+    cal_year_range = (VAL_CALIBRATION_YEARS[0], min(VAL_CALIBRATION_YEARS[1], LAST_LABEL_YEAR))
     
     # Pass 1: Count rows matching the year filter (very fast, low memory)
-    print(f"  Pass 1: Counting rows matching year filter ({VAL_CALIBRATION_YEARS[0]}-{VAL_CALIBRATION_YEARS[1]})...")
-    parquet_file = pq.ParquetFile(val_path)
+    print(f"  Pass 1: Counting rows matching year filter ({cal_year_range[0]}-{cal_year_range[1]})...")
+    parquet_file = pq.ParquetFile(earlystop_path)
     n_cal_samples = 0
     try:
         for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols_cal):
-            batch_df = batch.to_pandas().dropna(subset=[target_col])
-            if len(batch_df) == 0:
+            batch_table = batch
+            target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+            year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+            
+            # Filter out NaN in target
+            valid_mask = ~np.isnan(target_array)
+            if not valid_mask.any():
                 continue
             
-            # Filter to calibration years only
-            year_mask = batch_df['year'].between(VAL_CALIBRATION_YEARS[0], VAL_CALIBRATION_YEARS[1])
-            n_cal_samples += int(year_mask.sum())
-            del batch_df, batch
+            # Filter to calibration years only (capped at LAST_LABEL_YEAR)
+            year_mask = (year_array >= cal_year_range[0]) & (year_array <= cal_year_range[1])
+            final_mask = valid_mask & year_mask
+            n_cal_samples += int(final_mask.sum())
+            
+            del batch_table, target_array, year_array, batch
     finally:
         del parquet_file; gc.collect()
     
     print(f"  Found {n_cal_samples:,} samples matching filter")
     
     if n_cal_samples == 0:
-        raise ValueError(f"No samples found in val_calibration for years {VAL_CALIBRATION_YEARS[0]}-{VAL_CALIBRATION_YEARS[1]}")
+        raise ValueError(f"No samples found in earlystop calibration years {cal_year_range[0]}-{cal_year_range[1]}")
     
     # Pass 2: Pre-allocate arrays and fill directly (avoids concatenation memory spike)
     print(f"  Pass 2: Pre-allocating arrays and collecting predictions...")
     y_true_cal = np.empty(n_cal_samples, dtype=np.int8)
     y_pred_cal = np.empty(n_cal_samples, dtype=np.float32)
     
-    parquet_file = pq.ParquetFile(val_path)
+    parquet_file = pq.ParquetFile(earlystop_path)
     cal_batch_num = 0
     idx_offset = 0
     
     try:
         for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols_cal):
             cal_batch_num += 1
-            batch_df = batch.to_pandas().dropna(subset=[target_col])
-            if len(batch_df) == 0:
+            batch_table = batch
+            target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+            year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+            
+            # Filter out NaN in target
+            valid_mask = ~np.isnan(target_array)
+            if not valid_mask.any():
+                del batch_table, target_array, year_array, batch
                 continue
             
-            # Filter to calibration years only
-            year_mask = batch_df['year'].between(VAL_CALIBRATION_YEARS[0], VAL_CALIBRATION_YEARS[1])
-            batch_df = batch_df[year_mask]
-            if len(batch_df) == 0:
+            # Filter to calibration years only (capped at LAST_LABEL_YEAR)
+            year_mask = (year_array >= cal_year_range[0]) & (year_array <= cal_year_range[1])
+            final_mask = valid_mask & year_mask
+            if not final_mask.any():
+                del batch_table, target_array, year_array, batch
                 continue
             
-            downcast_numeric_dtypes(batch_df)
-            y_batch = (batch_df[target_col] > 0).astype(np.int8)
-            X_batch = batch_df[feature_cols]
+            # Extract filtered data
+            target_filtered = target_array[final_mask]
+            
+            # Extract feature columns
+            feature_arrays = []
+            for col in feature_cols:
+                col_array = batch_table[col].to_numpy(zero_copy_only=False)
+                col_filtered = col_array[final_mask]
+                col_float32 = col_filtered.astype(np.float32)
+                feature_arrays.append(col_float32)
+            
+            X_batch = np.column_stack(feature_arrays)
+            y_batch = (target_filtered > 0).astype(np.int8)
             
             # Get uncalibrated predictions from the raw model
-            y_pred_batch = lgb_model.predict(X_batch, num_iteration=best_iteration if best_iteration else None).astype(np.float32)
+            y_pred_batch = lgb_model.predict(X_batch, num_iteration=chosen_iteration).astype(np.float32)
             
             # Insert directly into pre-allocated arrays
             batch_size_actual = len(y_batch)
-            y_true_cal[idx_offset:idx_offset + batch_size_actual] = y_batch.values
+            y_true_cal[idx_offset:idx_offset + batch_size_actual] = y_batch
             y_pred_cal[idx_offset:idx_offset + batch_size_actual] = y_pred_batch
             idx_offset += batch_size_actual
             
-            del batch_df, X_batch, y_batch, y_pred_batch, batch
+            del batch_table, target_array, year_array, target_filtered, feature_arrays, X_batch, y_batch, y_pred_batch, batch
             gc.collect()
             
             if cal_batch_num % 10 == 0:
@@ -580,7 +1112,7 @@ def phase1_training(
     if idx_offset != n_cal_samples:
         raise ValueError(f"Mismatch: expected {n_cal_samples:,} samples but collected {idx_offset:,}")
     
-    print(f"  Calibrating on {len(y_true_cal):,} val_calibration samples...")
+    print(f"  Calibrating on {len(y_true_cal):,} earlystop calibration samples...")
     report_memory_usage("before calibration fit")
     
     # Fit isotonic regression directly on collected predictions
@@ -592,7 +1124,7 @@ def phase1_training(
     cal_time = time.time() - cal_start
     print(f"  Calibration done in {cal_time:.1f}s")
     
-    calibrated_model_path = model_dir / f"model1_lgbm_calibrated_{timestamp}.pkl"
+    calibrated_model_path = model_dir / f"model1_lgbm_win5_calibrated_{timestamp}.pkl"
     with open(calibrated_model_path, 'wb') as f:
         pickle.dump(calibrated_model, f)
     print(f"  Calibrated model saved: {calibrated_model_path}")
@@ -601,26 +1133,54 @@ def phase1_training(
     report_memory_usage("after calibration")
     
     if use_wandb:
-        wandb.log({"training/train_early_time_seconds": train_early_time, "training/train_early_time_minutes": train_early_time / 60,
-                  "training/final_train_time_seconds": train_time, "training/final_train_time_minutes": train_time / 60,
-                  "training/final_num_boost_round": int(best_iteration) if best_iteration is not None else int(num_boost_round_val),
-                  "calibration/time_seconds": cal_time})
+        wandb.log({
+            "final_model/data/n_features": len(feature_cols),
+            "final_model/data/n_train": train_stats["n_train"],
+            "final_model/data/train_positives": train_stats["train_positives"],
+            "final_model/data/train_negatives": train_stats["train_negatives"],
+            "final_model/data/train_positive_pct": train_stats["train_positive_pct"],
+            "final_model/training/train_time_seconds": train_time,
+            "final_model/training/train_time_minutes": train_time / 60,
+            "final_model/training/final_num_boost_round": chosen_iteration,
+            "final_model/training/chosen_iteration": chosen_iteration,
+            "calibration/time_seconds": cal_time
+        })
     
     print("Phase 1 completed.")
-    train_pos = int(train_early_pos)
-    train_neg = int(train_early_neg)
-    return (calibrated_model_path, validation_metrics, train_stats, train_early_time, val_time, train_time, train_pos, train_neg, n_train_full, imbalance_info)
+    cv_info = {
+        "cv_mode": cv_mode,
+        "folds": cv_results,
+        "aggregated": cv_aggregated,
+        "cv_best_iterations": best_iterations,
+        "cv_train_rows_per_fold": train_rows_per_fold,
+        "fold3_best_iteration": int(fold3_best_iteration) if fold3_best_iteration is not None else None,
+        "final_num_boost_round": chosen_iteration,
+        "chosen_iteration": chosen_iteration  # Alias for backward compatibility
+    }
+    # Return None for validation_metrics - earlystop is not used for evaluation
+    return (calibrated_model_path, None, train_stats, train_time, 0.0, train_pos_full, train_neg_full, n_train_full, imbalance_info, cv_info)
 
 
 def phase2_testing(
     test_path: Path, model_path: Path, feature_cols: list, keep_cols_test: list, timestamp: str, output_dir: Path,
     use_wandb: bool, target_col: str, validation_metrics: Dict[str, Any], train_stats: Dict[str, Any],
-    train_early_time: float, val_time: float, train_time: float, train_pos: int, train_neg: int, n_train_full: int,
-    best_params: Dict[str, Any], start_time: float, imbalance_info: Dict[str, Any],
+    train_time: float, earlystop_time: float, train_pos: int, train_neg: int, n_train_full: int,
+    best_params: Dict[str, Any], start_time: float, imbalance_info: Dict[str, Any], cv_info: Dict[str, Any],
 ) -> None:
     """Phase 2: Testing - loads test in batches, loads calibrated model, evaluates."""
     print("\n" + "="*70 + "\nPHASE 2: TESTING\n" + "="*70)
     report_memory_usage("start of Phase 2")
+    
+    # Check for year overlap between training and test
+    final_train_years = TRAIN_YEARS  # Training period: 2001-2014
+    test_year_range = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))
+    
+    if check_year_overlap(final_train_years, test_year_range, "Test"):
+        print("\n" + "="*70)
+        print("ERROR: Cannot proceed with testing due to year overlap.")
+        print("="*70)
+        raise ValueError("Test years overlap with training years. Cannot evaluate.")
+    
     print(f"\nLoading calibrated model from {model_path}")
     with open(model_path, 'rb') as f:
         calibrated_model = pickle.load(f)
@@ -629,9 +1189,10 @@ def phase2_testing(
     # Use smaller batch size to reduce memory pressure
     batch_size = 50_000
     print(f"Processing test in batches of {batch_size:,}...")
+    print(f"Test year range: {test_year_range[0]}-{test_year_range[1]} (capped at LAST_LABEL_YEAR={LAST_LABEL_YEAR})")
     
     # Pass 1: Count rows (pre-allocate arrays to avoid concatenation memory spike)
-    print(f"  Pass 1: Counting test rows...")
+    print(f"  Pass 1: Counting test rows (year_range={test_year_range})...")
     parquet_file = pq.ParquetFile(test_path)
     n_test_total = 0
     test_years_set = set()
@@ -645,15 +1206,19 @@ def phase2_testing(
             # Filter out NaN in target
             valid_mask = ~np.isnan(target_array)
             if valid_mask.any():
-                n_test_total += int(valid_mask.sum())
-                test_years_set.update(year_array[valid_mask].tolist())
+                # Filter by year range to exclude right-censored labels
+                year_mask = (year_array >= test_year_range[0]) & (year_array <= test_year_range[1])
+                final_mask = valid_mask & year_mask
+                if final_mask.any():
+                    n_test_total += int(final_mask.sum())
+                    test_years_set.update(year_array[final_mask].tolist())
             
             del batch_table, target_array, year_array, batch
     finally:
         del parquet_file
         gc.collect()
     
-    print(f"  Found {n_test_total:,} test samples")
+    print(f"  Found {n_test_total:,} test samples (filtered to year_range={test_year_range[0]}-{test_year_range[1]})")
     
     if n_test_total == 0:
         raise ValueError("No test samples found")
@@ -666,44 +1231,95 @@ def phase2_testing(
     
     # Pass 2: Process batches and fill pre-allocated arrays
     parquet_file = pq.ParquetFile(test_path)
-    scored_path = output_dir / f"model1_lgbm_scored_{timestamp}.parquet"
+    scored_path = output_dir / f"model1_lgbm_win5_scored_{timestamp}.parquet"
     writer = None
     test_pos = test_neg = batch_num = idx_offset = 0
     pred_start = time.time()
     
+    # Get best iteration from CV info (chosen iteration from CV)
+    # Since final model doesn't use early stopping, we use the chosen iteration from CV
+    best_iteration = cv_info.get("final_num_boost_round", cv_info.get("chosen_iteration", None))
+    print(f"  Using {best_iteration} iterations for predictions (chosen from CV)")
+    
     try:
         for batch in parquet_file.iter_batches(batch_size=batch_size, columns=keep_cols_test):
             batch_num += 1
-            batch_df = batch.to_pandas().dropna(subset=[target_col])
-            if len(batch_df) == 0:
+            batch_table = batch
+            
+            # Use PyArrow null handling
+            target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+            year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+            
+            # Filter out NaN in target
+            valid_mask = ~np.isnan(target_array)
+            if not valid_mask.any():
+                del batch_table, batch
                 continue
-            downcast_numeric_dtypes(batch_df)
-            y_batch = (batch_df[target_col] > 0).astype(np.int8)
-            X_batch = batch_df[feature_cols].copy()
+            
+            # Filter by year range to exclude right-censored labels
+            year_mask = (year_array >= test_year_range[0]) & (year_array <= test_year_range[1])
+            final_mask = valid_mask & year_mask
+            if not final_mask.any():
+                del batch_table, target_array, year_array, batch
+                continue
+            
+            # Extract feature arrays directly from PyArrow (with year filtering)
+            feature_arrays = []
+            for col in feature_cols:
+                col_array = batch_table[col].to_numpy(zero_copy_only=False)
+                col_valid = col_array[final_mask]
+                # Convert to float32 (NaN values preserved for LightGBM to handle)
+                col_float32 = col_valid.astype(np.float32)
+                feature_arrays.append(col_float32)
+            
+            # Build feature matrix and target
+            X_batch = np.column_stack(feature_arrays)
+            target_valid = target_array[final_mask]
+            y_batch = (target_valid > 0).astype(np.int8)
+            
+            # Get predictions from calibrated model
             # Calibrated model returns [n_samples, 2] with [neg_prob, pos_prob], extract pos_prob (column 1)
             y_proba_batch = calibrated_model.predict_proba(X_batch)[:, 1].astype(np.float32)
             
             # Fill pre-allocated arrays directly
             batch_size_actual = len(y_batch)
-            y_test[idx_offset:idx_offset + batch_size_actual] = y_batch.values
+            y_test[idx_offset:idx_offset + batch_size_actual] = y_batch
             y_proba[idx_offset:idx_offset + batch_size_actual] = y_proba_batch
             idx_offset += batch_size_actual
             
             test_pos += int(y_batch.sum())
             test_neg += int((y_batch == 0).sum())
             
-            result_dict = {'row': batch_df['row'].values, 'col': batch_df['col'].values, 'year': batch_df['year'].values,
-                          'y_true': y_batch.values, 'y_pred_proba': y_proba_batch}
-            for col in ['x', 'y']:
-                if col in batch_df.columns:
-                    result_dict[col] = batch_df[col].values
-            result_df = pd.DataFrame(result_dict)
-            result_table = pa.Table.from_pandas(result_df, preserve_index=False)
+            # Extract metadata arrays for writing results (using final_mask which includes year filtering)
+            row_array = batch_table['row'].to_numpy(zero_copy_only=False)[final_mask]
+            col_array = batch_table['col'].to_numpy(zero_copy_only=False)[final_mask]
+            year_array_valid = year_array[final_mask]
+            
+            # Build result arrays and create PyArrow table directly
+            result_arrays = {
+                'row': row_array.astype(np.int32),
+                'col': col_array.astype(np.int32),
+                'year': year_array_valid.astype(np.int32),
+                'y_true': y_batch,
+                'y_pred_proba': y_proba_batch
+            }
+            
+            # Add optional x, y coordinates if present
+            for coord_col in ['x', 'y']:
+                if coord_col in batch_table.column_names:
+                    coord_array = batch_table[coord_col].to_numpy(zero_copy_only=False)[final_mask]
+                    result_arrays[coord_col] = coord_array.astype(np.float32)
+            
+            # Create PyArrow table directly from arrays (avoiding pandas)
+            result_table = pa.table(result_arrays)
+            
             if writer is None:
                 writer = pq.ParquetWriter(scored_path, result_table.schema)
                 print(f"Writing to {scored_path}")
             writer.write_table(result_table)
-            del batch_df, X_batch, y_batch, y_proba_batch, result_df, result_table, batch
+            
+            del batch_table, target_array, target_valid, feature_arrays, X_batch, y_batch, y_proba_batch
+            del row_array, col_array, year_array, year_array_valid, result_arrays, result_table, batch
             # More aggressive garbage collection during batch processing
             gc.collect()
             if batch_num % 10 == 0:
@@ -764,37 +1380,52 @@ def phase2_testing(
     # Free test data after metrics computation
     del y_test, y_proba; gc.collect()
     
-    metrics = {"metadata": {"timestamp": timestamp, "model": "LightGBM", "task": "transition_01_prediction",
+    metrics = {"metadata": {"timestamp": timestamp, "model": "LightGBM", "task": "transition_01_win5_prediction",
+                           "target_column": TARGET_COL,
+                           "lookahead_years": LOOKAHEAD_YEARS,
                            "random_state": RANDOM_STATE, "n_features": len(feature_cols), "features": feature_cols,
                            "calibration": "isotonic", "calibration_method": "IsotonicRegression (batched collection)",
-                           "calibration_data": f"val_calibration ({VAL_CALIBRATION_YEARS[0]}-{VAL_CALIBRATION_YEARS[1]}, streamed in batches)", "test_probabilities": "calibrated"},
+                           "calibration_data": f"earlystop_calibration ({VAL_CALIBRATION_YEARS[0]}-{min(VAL_CALIBRATION_YEARS[1], LAST_LABEL_YEAR)}, streamed in batches, capped at LAST_LABEL_YEAR={LAST_LABEL_YEAR})", "test_probabilities": "calibrated",
+                           "cv_mode": cv_info.get("cv_mode", "full")},
               "data": {"n_train_full": n_train_full, "n_test": int(n_test_total), "train_positives": train_pos,
                       "train_negatives": train_neg, "test_positives": test_pos, "test_negatives": test_neg},
-              "temporal_split": {"method": "strict_temporal_split", "train_early_max_year": TRAIN_EARLY_YEAR_MAX,
-                                "val_stopping_years": list(VAL_STOPPING_YEARS), "val_calibration_years": list(VAL_CALIBRATION_YEARS)},
-              "validation_performance": validation_metrics, "model_parameters": best_params,
+              "temporal_split": {"method": "strict_temporal_split", "train_years": list(TRAIN_YEARS),
+                                "earlystop_years": list(EARLYSTOP_YEARS), "test_years": list(TEST_YEARS)},
+              "cross_validation": cv_info,
+              "model_parameters": best_params,
               "imbalance_handling": {"method": "scale_pos_weight", "is_unbalance": False,
                                     "scale_pos_weight": imbalance_info.get("scale_pos_weight"),
-                                    "neg_pos_ratio_full": imbalance_info.get("ratio_full"),
-                                    "neg_pos_ratio_sampled": imbalance_info.get("ratio_sampled"),
-                                    "neg_full": imbalance_info.get("neg_full"), "pos_full": imbalance_info.get("pos_full"),
-                                    "neg_sampled": imbalance_info.get("neg_sampled"), "pos_sampled": imbalance_info.get("pos_sampled")},
+                                    "neg": imbalance_info.get("neg"), "pos": imbalance_info.get("pos")},
               "test_performance": test_metrics, "feature_importance": feature_importance.head(20).to_dict('records'),
-              "timing": {"train_early_seconds": train_early_time, "validation_seconds": val_time,
-                        "final_training_seconds": train_time, "prediction_seconds": pred_time, "total_seconds": time.time() - start_time}}
+              "timing": {"train_seconds": train_time,
+                        "prediction_seconds": pred_time, "total_seconds": time.time() - start_time}}
     metrics = convert_numpy_types(metrics)
-    metrics_path = output_dir / f"model1_lgbm_metrics_{timestamp}.json"
+    metrics_path = output_dir / f"model1_lgbm_win5_metrics_{timestamp}.json"
     with open(metrics_path, 'w') as f:
         json.dump(metrics, f, indent=2)
     print(f"\nMetrics saved: {metrics_path}")
     del calibrated_model; gc.collect()
     
     total_time = time.time() - start_time
+    cv_mode = cv_info.get("cv_mode", "full")
     print("\n" + "="*70 + "\nSUMMARY\n" + "="*70)
-    print(f"Model: LightGBM (with isotonic calibration), {len(feature_cols)} features\nValidation (≤{TRAIN_EARLY_YEAR_MAX}→{VAL_STOPPING_YEARS[0]}): PR-AUC {validation_metrics['pr_auc']:.4f}, ROC-AUC {validation_metrics['roc_auc']:.4f}")
-    print(f"Test (2018-2024, {n_test_total:,} samples, {test_pos/n_test_total*100:.3f}% pos, calibrated probabilities): ROC-AUC {test_metrics['roc_auc']:.4f}, PR-AUC {test_metrics['pr_auc']:.4f}")
+    print(f"Model: LightGBM (with isotonic calibration), {len(feature_cols)} features")
+    print(f"\nTemporal Cross-Validation (CV Mode: {cv_mode}):")
+    if cv_mode != "none":
+        n_folds_run = len([f for f in cv_info.get("folds", []) if not f.get("skipped", False)])
+        n_folds_skipped = len([f for f in cv_info.get("folds", []) if f.get("skipped", False)])
+        print(f"  Folds run: {n_folds_run}")
+        if n_folds_skipped > 0:
+            print(f"  Folds skipped (year overlap): {n_folds_skipped}")
+    print(f"  Final num_boost_round (chosen): {cv_info.get('final_num_boost_round', 'N/A')}")
+    if cv_info.get('fold3_best_iteration') is not None:
+        print(f"  Fold3 best_iteration: {cv_info.get('fold3_best_iteration')}")
+    
+    # NO earlystop/validation metrics displayed - only CV metadata and test metrics
+    
+    print(f"\nTest ({TEST_YEARS[0]}-{TEST_YEARS[1]}, {n_test_total:,} samples, {test_pos/n_test_total*100:.3f}% pos, calibrated probabilities): ROC-AUC {test_metrics['roc_auc']:.4f}, PR-AUC {test_metrics['pr_auc']:.4f}")
     print(f"  P@1%: {prec_at_k[1]:.4f} ({test_metrics['lift_at_1pct']:.1f}x), P@5%: {prec_at_k[5]:.4f} ({test_metrics['lift_at_5pct']:.1f}x), P@10%: {prec_at_k[10]:.4f} ({test_metrics['lift_at_10pct']:.1f}x)")
-    print(f"Timings: train_early {train_early_time:.1f}s, val {val_time:.1f}s, final_train {train_time:.1f}s, pred {pred_time:.1f}s, total {total_time:.1f}s ({total_time/60:.1f}m)")
+    print(f"\nTimings: train {train_time:.1f}s, pred {pred_time:.1f}s, total {total_time:.1f}s ({total_time/60:.1f}m)")
     print("="*70 + "\nDone.")
     
     if use_wandb:
@@ -802,11 +1433,11 @@ def phase2_testing(
         wandb.finish()
 
 
-def main() -> None:
+def main(cv_mode: str = "full") -> None:
     start_time = time.time()
     repo_root = Path(__file__).resolve().parents[3]
     train_path = resolve_parquet_file("train_early_sampled.parquet")
-    val_path = resolve_parquet_file("val_late_full.parquet")
+    earlystop_path = resolve_parquet_file("earlystop_full.parquet")
     test_path = resolve_parquet_file("test_full.parquet")
     params_path = resolve_best_params_json()
     output_dir = repo_root / "outputs/Results/ml_models"
@@ -817,17 +1448,23 @@ def main() -> None:
     
     use_wandb = False
     try:
-        wandb.init(project="ml-training-transitions", entity=os.environ.get("WANDB_ENTITY"), name=f"model1_lgbm_{timestamp}",
-                  config={"model": "LightGBM", "task": "transition_01_prediction", "random_state": RANDOM_STATE,
-                         "temporal_split": {"train_early_max_year": TRAIN_EARLY_YEAR_MAX, "val_stopping_years": list(VAL_STOPPING_YEARS),
-                                           "val_calibration_years": list(VAL_CALIBRATION_YEARS)}})
+        wandb.init(project="ml-training-transitions", entity=os.environ.get("WANDB_ENTITY"), name=f"model1_lgbm_win5_{timestamp}",
+                  config={"model": "LightGBM", "task": "transition_01_win5_prediction", "target_column": TARGET_COL,
+                         "lookahead_years": LOOKAHEAD_YEARS, "random_state": RANDOM_STATE,
+                         "temporal_split": {"train_years": list(TRAIN_YEARS), "earlystop_years": list(EARLYSTOP_YEARS),
+                                           "test_years": list(TEST_YEARS)}, "cv_mode": cv_mode})
         use_wandb = True
         print("W&B connected")
     except Exception as err:
         print(f"W&B failed: {err}")
     
-    print("="*70 + "\nLGBM TRANSITION MODEL\n" + "="*70)
-    print(f"Train: {train_path}\nVal: {val_path}\nTest: {test_path}\nParams: {params_path if params_path else 'Using default manual hyperparameters'}\nOutput: {output_dir}")
+    print("="*70 + "\nLGBM TRANSITION MODEL (5-YEAR LOOKAHEAD)\n" + "="*70)
+    print(f"Train: {train_path}\nEarlystop: {earlystop_path}\nTest: {test_path}\nParams: {params_path if params_path else 'Using default manual hyperparameters'}\nOutput: {output_dir}")
+    print(f"\nConfiguration:")
+    print(f"  WDPA_LAST_YEAR: {WDPA_LAST_YEAR}")
+    print(f"  LOOKAHEAD_YEARS: {LOOKAHEAD_YEARS}")
+    print(f"  LAST_LABEL_YEAR: {LAST_LABEL_YEAR} (WDPA_LAST_YEAR - LOOKAHEAD_YEARS)")
+    print(f"  All splits (train/earlystop/calibration/test) filtered to years <= {LAST_LABEL_YEAR} to avoid right-censored labels")
     
     best_params, best_cv_score = load_best_params(params_path)
     if params_path:
@@ -839,7 +1476,7 @@ def main() -> None:
     
     all_cols_train = pq.ParquetFile(train_path).schema_arrow.names
     all_cols_test = pq.ParquetFile(test_path).schema_arrow.names
-    target_col = "transition_01"
+    target_col = TARGET_COL
     # Build feature columns from PyArrow schema only (avoid loading full parquet into pandas)
     schema = pq.ParquetFile(train_path).schema_arrow
     numeric_cols = [
@@ -847,7 +1484,7 @@ def main() -> None:
         for name, field in zip(schema.names, schema)
         if pa.types.is_integer(field.type) or pa.types.is_floating(field.type)
     ]
-    # Exclude target and coordinates from features (year is included as a feature)
+    # Exclude target and coordinates from features (year is excluded)
     feature_cols = [c for c in numeric_cols if c not in EXCLUDE_COLS]
     required_cols = [target_col, 'year', 'row', 'col']
     optional_cols = [col for col in ['x', 'y'] if col in all_cols_train]
@@ -855,24 +1492,35 @@ def main() -> None:
     keep_cols_test = feature_cols + required_cols + [col for col in ['x', 'y'] if col in all_cols_test]
     print(f"Selected {len(feature_cols)} features, loading {len(keep_cols_train)} cols from train, {len(keep_cols_test)} from test")
     
-    (model_path, validation_metrics, train_stats, train_early_time, val_time, train_time, train_pos, train_neg, n_train_full, imbalance_info) = phase1_training(
-        train_path, val_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col)
+    (model_path, validation_metrics, train_stats, train_time, earlystop_time, train_pos, train_neg, n_train_full, imbalance_info, cv_info) = phase1_training(
+        train_path, earlystop_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col, cv_mode=cv_mode)
     
     phase2_testing(test_path, model_path, feature_cols, keep_cols_test, timestamp, output_dir, use_wandb, target_col,
-                  validation_metrics, train_stats, train_early_time, val_time, train_time, train_pos, train_neg, n_train_full,
-                  best_params, start_time, imbalance_info)
+                  validation_metrics, train_stats, train_time, earlystop_time, train_pos, train_neg, n_train_full,
+                  best_params, start_time, imbalance_info, cv_info)
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="LGBM Transition Model (5-Year Lookahead Prediction)")
+    parser.add_argument(
+        "--cv-mode",
+        type=str,
+        choices=["full", "fold3", "none"],
+        default="full",
+        help="Cross-validation mode: 'full' (run all 3 folds), 'fold3' (run only fold 3 for fast dev), 'none' (skip CV)"
+    )
+    args = parser.parse_args()
+    
     repo_root = Path(__file__).resolve().parents[3]
     output_dir = repo_root / "outputs/Results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"model1_lgbm_{timestamp}.txt"
+    output_file = output_dir / f"model1_lgbm_win5_{timestamp}.txt"
     tee = Tee(output_file)
     sys.stdout = tee
     try:
-        main()
+        main(cv_mode=args.cv_mode)
     finally:
         sys.stdout = tee.stdout
         tee.close()
