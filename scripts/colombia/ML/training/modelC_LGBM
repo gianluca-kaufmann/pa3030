@@ -70,6 +70,9 @@ TEST_END = 2019
 TEST_YEARS = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))    # Test: 2018-2019 (capped at LAST_LABEL_YEAR)
 FIXED_PARAMS = {'random_state': RANDOM_STATE, 'boosting_type': 'gbdt', 'objective': 'binary', 'verbose': -1}
 
+# Batch size for data loading (can be overridden via BATCH_SIZE env var)
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "200000"))
+
 # Temporal Cross-Validation Folds
 # Each fold: (train_start, train_end, earlystop_start, earlystop_end)
 # Earlystop years are capped at LAST_LABEL_YEAR to avoid right-censored labels
@@ -148,6 +151,32 @@ def compute_precision_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) ->
     # argpartition puts the n_top_k largest elements at the end
     top_k_idx = np.argpartition(y_proba, -n_top_k)[-n_top_k:]
     return y_true[top_k_idx].sum() / n_top_k
+
+
+def extract_features_pyarrow_to_numpy(feature_table: pa.Table, mask: np.ndarray) -> np.ndarray:
+    """
+    Extract feature columns from PyArrow table and convert to NumPy float32 array.
+    Pure PyArrow→NumPy path (no pandas) for speed.
+    
+    Args:
+        feature_table: PyArrow table containing feature columns
+        mask: Boolean mask to filter rows (applied after conversion)
+    
+    Returns:
+        Feature matrix (n_filtered, n_features) as float32
+    """
+    # Preallocate output array to avoid column_stack overhead
+    n_rows = int(mask.sum())
+    n_features = len(feature_table.column_names)
+    X = np.empty((n_rows, n_features), dtype=np.float32)
+    
+    # Fill each column directly into preallocated array
+    for col_idx, col_name in enumerate(feature_table.column_names):
+        col_array = feature_table[col_name].to_numpy(zero_copy_only=False)
+        # Apply mask and convert to float32, write directly to preallocated column
+        X[:, col_idx] = col_array[mask].astype(np.float32)
+    
+    return X
 
 
 def compute_year_weights(years: np.ndarray, min_year: int = 2000, max_year: int = 2014, 
@@ -233,7 +262,7 @@ def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
         print("  lgbm_best_params.json not found, using default manual hyperparameters")
         guardrail_params = {"max_depth": 8, "num_leaves": 255, "min_child_samples": 50, "subsample": 0.7,
                            "subsample_freq": 1, "colsample_bytree": 0.7, "learning_rate": 0.03, "n_estimators": 3000,
-                           "reg_alpha": 1.0, "reg_lambda": 1.0, "metric": "average_precision", "n_jobs": get_n_jobs(), "verbose": -1}
+                           "reg_alpha": 1.0, "reg_lambda": 1.0, "metric": "average_precision", "num_threads": get_n_jobs(), "verbose": -1}
         final_params = {**FIXED_PARAMS, **guardrail_params}
         return final_params, None
     
@@ -249,7 +278,7 @@ def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
     # Guardrails: only fill missing keys, don't overwrite existing ones
     guardrail_params = {"max_depth": 8, "num_leaves": 255, "min_child_samples": 50, "subsample": 0.7,
                        "subsample_freq": 1, "colsample_bytree": 0.7, "learning_rate": 0.03, "n_estimators": 3000,
-                       "reg_alpha": 1.0, "reg_lambda": 1.0, "metric": "average_precision", "n_jobs": get_n_jobs(), "verbose": -1}
+                       "reg_alpha": 1.0, "reg_lambda": 1.0, "metric": "average_precision", "num_threads": get_n_jobs(), "verbose": -1}
     
     # Only add guardrail params if key is missing
     for key, value in guardrail_params.items():
@@ -264,7 +293,7 @@ def load_numpy_arrays_two_pass(
     feature_cols: list, 
     target_col: str, 
     name: str = "",
-    batch_size: int = 50_000,
+    batch_size: int = BATCH_SIZE,
     year_range: Optional[tuple[int, int]] = None
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int, list]:
     """
@@ -296,7 +325,7 @@ def load_numpy_arrays_two_pass(
     years_set = set()
     
     try:
-        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols):
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols, use_threads=True):
             # Convert batch to numpy arrays directly (bypass pandas)
             batch_table = batch
             # Use PyArrow null handling
@@ -344,7 +373,7 @@ def load_numpy_arrays_two_pass(
     batch_num = 0
     
     try:
-        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols):
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols, use_threads=True):
             batch_num += 1
             batch_table = batch
             
@@ -371,27 +400,17 @@ def load_numpy_arrays_two_pass(
                 target_valid = target_valid[year_mask]
                 year_valid = year_valid[year_mask]
                 
-                # Need to also filter feature arrays
-                feature_arrays = []
-                for col in feature_cols:
-                    col_array = batch_table[col].to_numpy(zero_copy_only=False)
-                    col_valid = col_array[valid_mask]
-                    col_valid = col_valid[year_mask]
-                    # Convert to float32 (NaN values preserved for LightGBM to handle)
-                    col_float32 = col_valid.astype(np.float32)
-                    feature_arrays.append(col_float32)
+                # Build final mask: map year_mask (applied to valid data) back to original indices
+                final_mask = valid_mask.copy()
+                final_mask[valid_mask] = year_mask  # Map year_mask back to positions where valid_mask is True
+                
+                # Convert feature columns in bulk using pure PyArrow→NumPy path (no pandas)
+                feature_table = batch_table.select(feature_cols)
+                X_batch = extract_features_pyarrow_to_numpy(feature_table, final_mask)
             else:
-                # Extract feature columns (no year filter)
-                feature_arrays = []
-                for col in feature_cols:
-                    col_array = batch_table[col].to_numpy(zero_copy_only=False)
-                    col_valid = col_array[valid_mask]
-                    # Convert to float32 (NaN values preserved for LightGBM to handle)
-                    col_float32 = col_valid.astype(np.float32)
-                    feature_arrays.append(col_float32)
-            
-            # Stack features into matrix
-            X_batch = np.column_stack(feature_arrays)
+                # Convert feature columns in bulk using pure PyArrow→NumPy path (no pandas, no year filter)
+                feature_table = batch_table.select(feature_cols)
+                X_batch = extract_features_pyarrow_to_numpy(feature_table, valid_mask)
             y_batch = (target_valid > 0).astype(np.int8)
             
             # Insert directly into pre-allocated arrays
@@ -402,8 +421,10 @@ def load_numpy_arrays_two_pass(
             idx_offset += batch_size_actual
             
             del batch_table, target_array, year_array, target_valid, year_valid
-            del feature_arrays, X_batch, y_batch, batch
-            gc.collect()
+            del feature_table, X_batch, y_batch, batch
+            
+            if batch_num % 25 == 0:
+                gc.collect()
             
             if batch_num % 10 == 0:
                 print(f"  {batch_num} batches, {idx_offset:,}/{n_samples:,} samples loaded")
@@ -433,7 +454,7 @@ def load_numpy_arrays_from_multiple_files(
     feature_cols: list,
     target_col: str,
     name: str = "",
-    batch_size: int = 50_000,
+    batch_size: int = BATCH_SIZE,
     year_range: Optional[tuple[int, int]] = None
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int, list]:
     """
@@ -465,7 +486,7 @@ def load_numpy_arrays_from_multiple_files(
     for file_idx, df_path in enumerate(df_paths):
         parquet_file = pq.ParquetFile(df_path)
         try:
-            for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols):
+            for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols, use_threads=True):
                 batch_table = batch
                 null_mask = batch_table[target_col].is_null().to_numpy(zero_copy_only=False)
                 valid_mask = ~null_mask
@@ -510,7 +531,7 @@ def load_numpy_arrays_from_multiple_files(
     for file_idx, df_path in enumerate(df_paths):
         parquet_file = pq.ParquetFile(df_path)
         try:
-            for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols):
+            for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols, use_threads=True):
                 batch_num += 1
                 batch_table = batch
                 
@@ -534,22 +555,17 @@ def load_numpy_arrays_from_multiple_files(
                     target_valid = target_valid[year_mask]
                     year_valid = year_valid[year_mask]
                     
-                    feature_arrays = []
-                    for col in feature_cols:
-                        col_array = batch_table[col].to_numpy(zero_copy_only=False)
-                        col_valid = col_array[valid_mask]
-                        col_valid = col_valid[year_mask]
-                        col_float32 = col_valid.astype(np.float32)
-                        feature_arrays.append(col_float32)
+                    # Build final mask: valid AND passes year filter
+                    final_mask = valid_mask.copy()
+                    final_mask[valid_mask] = year_mask
+                    
+                    # Convert feature columns in bulk using pure PyArrow→NumPy path (no pandas)
+                    feature_table = batch_table.select(feature_cols)
+                    X_batch = extract_features_pyarrow_to_numpy(feature_table, final_mask)
                 else:
-                    feature_arrays = []
-                    for col in feature_cols:
-                        col_array = batch_table[col].to_numpy(zero_copy_only=False)
-                        col_valid = col_array[valid_mask]
-                        col_float32 = col_valid.astype(np.float32)
-                        feature_arrays.append(col_float32)
-                
-                X_batch = np.column_stack(feature_arrays)
+                    # Convert feature columns in bulk using pure PyArrow→NumPy path (no pandas, no year filter)
+                    feature_table = batch_table.select(feature_cols)
+                    X_batch = extract_features_pyarrow_to_numpy(feature_table, valid_mask)
                 y_batch = (target_valid > 0).astype(np.int8)
                 
                 batch_size_actual = len(y_batch)
@@ -559,8 +575,10 @@ def load_numpy_arrays_from_multiple_files(
                 idx_offset += batch_size_actual
                 
                 del batch_table, target_array, year_array, target_valid, year_valid
-                del feature_arrays, X_batch, y_batch, batch
-                gc.collect()
+                del feature_table, X_batch, y_batch, batch
+                
+                if batch_num % 25 == 0:
+                    gc.collect()
                 
                 if batch_num % 10 == 0:
                     print(f"  {batch_num} batches, {idx_offset:,}/{n_samples:,} samples loaded")
@@ -701,6 +719,10 @@ def train_single_cv_fold(
     train_params = {**best_params, "is_unbalance": False}
     train_params.pop("num_boost_round", None)
     train_params.pop("n_estimators", None)
+    train_params.pop("n_jobs", None)  # Remove n_jobs if present (use num_threads instead)
+    # Ensure num_threads is set for optimal CPU usage
+    if "num_threads" not in train_params:
+        train_params["num_threads"] = get_n_jobs()
     # Override scale_pos_weight with computed/manual value right before training
     # Formula: scale_pos_weight = n_neg / n_pos
     train_params["scale_pos_weight"] = scale_pos_weight
@@ -1044,6 +1066,10 @@ def phase1_training(
     train_params = {**best_params, "is_unbalance": False}
     train_params.pop("num_boost_round", None)
     train_params.pop("n_estimators", None)
+    train_params.pop("n_jobs", None)  # Remove n_jobs if present (use num_threads instead)
+    # Ensure num_threads is set for optimal CPU usage
+    if "num_threads" not in train_params:
+        train_params["num_threads"] = get_n_jobs()
     # Override scale_pos_weight with computed/manual value right before training
     # Formula: scale_pos_weight = n_neg / n_pos
     train_params["scale_pos_weight"] = scale_pos_weight
@@ -1126,8 +1152,8 @@ def phase2_testing(
         lgb_model = pickle.load(f)
     report_memory_usage("after loading model")
     
-    # Use smaller batch size to reduce memory pressure
-    batch_size = 50_000
+    # Use batch size from config (can be overridden via BATCH_SIZE env var)
+    batch_size = BATCH_SIZE
     
     print(f"Processing test in batches of {batch_size:,}...")
     print(f"Test year range: {test_year_range[0]}-{test_year_range[1]} (capped at LAST_LABEL_YEAR={LAST_LABEL_YEAR})")
@@ -1139,7 +1165,7 @@ def phase2_testing(
     test_years_set = set()
     
     try:
-        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=[target_col, 'year']):
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=[target_col, 'year'], use_threads=True):
             batch_table = batch
             # Use PyArrow null handling
             null_mask = batch_table[target_col].is_null().to_numpy(zero_copy_only=False)
@@ -1187,7 +1213,7 @@ def phase2_testing(
     pred_start = time.time()
     
     try:
-        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=keep_cols_test):
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=keep_cols_test, use_threads=True):
             batch_num += 1
             batch_table = batch
             
@@ -1210,17 +1236,9 @@ def phase2_testing(
                 del batch_table, target_array, year_array, batch
                 continue
             
-            # Extract feature arrays directly from PyArrow (with year filtering)
-            feature_arrays = []
-            for col in feature_cols:
-                col_array = batch_table[col].to_numpy(zero_copy_only=False)
-                col_valid = col_array[final_mask]
-                # Convert to float32 (NaN values preserved for LightGBM to handle)
-                col_float32 = col_valid.astype(np.float32)
-                feature_arrays.append(col_float32)
-            
-            # Build feature matrix and target
-            X_batch = np.column_stack(feature_arrays)
+            # Extract feature columns in bulk using pure PyArrow→NumPy path (no pandas)
+            feature_table = batch_table.select(feature_cols)
+            X_batch = extract_features_pyarrow_to_numpy(feature_table, final_mask)
             target_valid = target_array[final_mask]
             y_batch = (target_valid > 0).astype(np.int8)
             
@@ -1264,16 +1282,15 @@ def phase2_testing(
                 print(f"Writing to {scored_path}")
             writer.write_table(result_table)
             
-            del batch_table, target_array, target_valid, feature_arrays, X_batch, y_batch, y_proba_batch
+            del batch_table, target_array, target_valid, feature_table, X_batch, y_batch, y_proba_batch
             del row_array, col_array, year_array, year_array_valid, result_arrays, result_table, batch
-            # More aggressive garbage collection during batch processing
-            gc.collect()
+            
+            if batch_num % 25 == 0:
+                gc.collect()
+            
             if batch_num % 10 == 0:
                 print(f"  {batch_num} batches, {idx_offset:,}/{n_test_total:,} rows")
                 report_memory_usage(f"batch {batch_num}")
-            elif batch_num % 50 == 0:
-                # Extra cleanup every 50 batches
-                gc.collect()
     finally:
         if writer is not None:
             writer.close()
@@ -1517,7 +1534,7 @@ if __name__ == "__main__":
         "--cv-mode",
         type=str,
         choices=["full", "fold3", "none"],
-        default="full",
+        default="fold3",
         help="Cross-validation mode: 'full' (run all 3 folds), 'fold3' (run only fold 3 for fast dev), 'none' (skip CV)"
     )
     parser.add_argument(

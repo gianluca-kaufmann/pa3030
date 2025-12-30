@@ -89,6 +89,9 @@ TEST_END = 2024
 TEST_YEARS = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))    # Test: 2018-2019 (capped at LAST_LABEL_YEAR)
 FIXED_PARAMS = {'random_state': RANDOM_STATE, 'boosting_type': 'gbdt', 'objective': 'binary', 'verbose': -1}
 
+# Batch size for data loading (can be overridden via BATCH_SIZE env var)
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "200000"))
+
 # Temporal Cross-Validation Folds
 # Each fold: (train_start, train_end, earlystop_start, earlystop_end)
 # Earlystop years are capped at LAST_LABEL_YEAR to avoid right-censored labels
@@ -167,6 +170,31 @@ def compute_precision_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) ->
     # argpartition puts the n_top_k largest elements at the end
     top_k_idx = np.argpartition(y_proba, -n_top_k)[-n_top_k:]
     return y_true[top_k_idx].sum() / n_top_k
+
+
+def extract_features_pyarrow_to_numpy(feature_table: pa.Table, mask: np.ndarray) -> np.ndarray:
+    """
+    Extract feature columns from PyArrow table and convert to NumPy float32 array.
+    Pure PyArrow→NumPy path (no pandas) for speed.
+    
+    Args:
+        feature_table: PyArrow table containing feature columns
+        mask: Boolean mask to filter rows (applied after conversion)
+    
+    Returns:
+        Feature matrix (n_filtered, n_features) as float32
+    """
+    # Convert each column to numpy, apply mask, then stack
+    # This avoids pandas overhead
+    feature_arrays = []
+    for col_name in feature_table.column_names:
+        col_array = feature_table[col_name].to_numpy(zero_copy_only=False)
+        # Apply mask and convert to float32
+        col_filtered = col_array[mask].astype(np.float32)
+        feature_arrays.append(col_filtered)
+    
+    # Stack columns horizontally to form feature matrix
+    return np.column_stack(feature_arrays)
 
 
 def resolve_parquet_file(filename: str) -> Path:
@@ -256,7 +284,7 @@ def load_numpy_arrays_two_pass(
     target_col: str, 
     year_filter, 
     name: str = "",
-    batch_size: int = 50_000
+    batch_size: int = BATCH_SIZE
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int, list]:
     """
     Two-pass NumPy loader: bypasses Pandas to minimize memory overhead.
@@ -350,18 +378,14 @@ def load_numpy_arrays_two_pass(
             target_filtered = target_valid[year_mask]
             year_filtered = year_valid[year_mask]
             
-            # Extract feature columns
-            feature_arrays = []
-            for col in feature_cols:
-                col_array = batch_table[col].to_numpy(zero_copy_only=False)
-                col_valid = col_array[valid_mask]
-                col_filtered = col_valid[year_mask]
-                # Convert to float32 (NaN values preserved for LightGBM to handle)
-                col_float32 = col_filtered.astype(np.float32)
-                feature_arrays.append(col_float32)
+            # Extract feature columns in bulk: convert all feature columns at once
+            # Build final mask: map year_mask (applied to valid data) back to original indices
+            final_mask = valid_mask.copy()
+            final_mask[valid_mask] = year_mask  # Map year_mask back to positions where valid_mask is True
             
-            # Stack features into matrix
-            X_batch = np.column_stack(feature_arrays)
+            # Convert feature columns in bulk using pure PyArrow→NumPy path (no pandas)
+            feature_table = batch_table.select(feature_cols)
+            X_batch = extract_features_pyarrow_to_numpy(feature_table, final_mask)
             y_batch = (target_filtered > 0).astype(np.int8)
             
             # Insert directly into pre-allocated arrays
@@ -372,8 +396,10 @@ def load_numpy_arrays_two_pass(
             idx_offset += batch_size_actual
             
             del batch_table, target_array, year_array, target_valid, year_valid, target_filtered, year_filtered
-            del feature_arrays, X_batch, y_batch, batch
-            gc.collect()
+            del feature_table, X_batch, y_batch, batch
+            
+            if batch_num % 25 == 0:
+                gc.collect()
             
             if batch_num % 10 == 0:
                 print(f"  {batch_num} batches, {idx_offset:,}/{n_samples:,} samples loaded")
@@ -432,7 +458,7 @@ def load_numpy_arrays_from_multiple_files(
     feature_cols: list,
     target_col: str,
     name: str = "",
-    batch_size: int = 50_000,
+    batch_size: int = BATCH_SIZE,
     year_range: Optional[tuple[int, int]] = None
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int, list]:
     """
@@ -533,22 +559,17 @@ def load_numpy_arrays_from_multiple_files(
                     target_valid = target_valid[year_mask]
                     year_valid = year_valid[year_mask]
                     
-                    feature_arrays = []
-                    for col in feature_cols:
-                        col_array = batch_table[col].to_numpy(zero_copy_only=False)
-                        col_valid = col_array[valid_mask]
-                        col_valid = col_valid[year_mask]
-                        col_float32 = col_valid.astype(np.float32)
-                        feature_arrays.append(col_float32)
+                    # Build final mask: valid AND passes year filter
+                    final_mask = valid_mask.copy()
+                    final_mask[valid_mask] = year_mask
+                    
+                    # Convert feature columns in bulk using pure PyArrow→NumPy path (no pandas)
+                    feature_table = batch_table.select(feature_cols)
+                    X_batch = extract_features_pyarrow_to_numpy(feature_table, final_mask)
                 else:
-                    feature_arrays = []
-                    for col in feature_cols:
-                        col_array = batch_table[col].to_numpy(zero_copy_only=False)
-                        col_valid = col_array[valid_mask]
-                        col_float32 = col_valid.astype(np.float32)
-                        feature_arrays.append(col_float32)
-                
-                X_batch = np.column_stack(feature_arrays)
+                    # Convert feature columns in bulk using pure PyArrow→NumPy path (no pandas, no year filter)
+                    feature_table = batch_table.select(feature_cols)
+                    X_batch = extract_features_pyarrow_to_numpy(feature_table, valid_mask)
                 y_batch = (target_valid > 0).astype(np.int8)
                 
                 batch_size_actual = len(y_batch)
@@ -558,8 +579,10 @@ def load_numpy_arrays_from_multiple_files(
                 idx_offset += batch_size_actual
                 
                 del batch_table, target_array, year_array, target_valid, year_valid
-                del feature_arrays, X_batch, y_batch, batch
-                gc.collect()
+                del feature_table, X_batch, y_batch, batch
+                
+                if batch_num % 25 == 0:
+                    gc.collect()
                 
                 if batch_num % 10 == 0:
                     print(f"  {batch_num} batches, {idx_offset:,}/{n_samples:,} samples loaded")
@@ -581,6 +604,211 @@ def load_numpy_arrays_from_multiple_files(
     print(f"  {neg:,} neg, {pos:,} pos, ratio 1:{neg/max(pos,1):.1f}, years {years[0]}-{years[-1]}")
     
     return X, y, years_array, pos, neg, years
+
+
+def load_test_data_one_pass(
+    test_path: Path,
+    feature_cols: list,
+    target_col: str,
+    keep_cols_test: list,
+    year_range: tuple[int, int],
+    calibrated_model: CalibratedLGBMWrapper,
+    output_path: Path,
+    batch_size: int = BATCH_SIZE
+) -> tuple[np.ndarray, np.ndarray, int, int, list]:
+    """
+    One-pass streaming loader for test data.
+    Collects batches, concatenates, writes scored results, and returns metrics arrays.
+    
+    Returns:
+        y_test: Target array (n_samples,) as int8
+        y_proba: Calibrated probabilities (n_samples,) as float32
+        test_pos: Number of positive samples
+        test_neg: Number of negative samples
+        test_years: Sorted list of unique years
+    """
+    print(f"  Loading test data (one-pass streaming, years {year_range[0]}-{year_range[1]})...")
+    
+    batches_y_test = []
+    batches_y_proba = []
+    test_years_set = set()
+    test_pos = test_neg = 0
+    batch_num = 0
+    
+    writer = None
+    parquet_file = pq.ParquetFile(test_path)
+    
+    try:
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=keep_cols_test):
+            batch_num += 1
+            batch_table = batch
+            
+            target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+            year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+            
+            # Filter out NaN in target
+            valid_mask = ~np.isnan(target_array)
+            if not valid_mask.any():
+                del batch_table, target_array, year_array, batch
+                continue
+            
+            # Filter by year range
+            year_mask = (year_array >= year_range[0]) & (year_array <= year_range[1])
+            final_mask = valid_mask & year_mask
+            if not final_mask.any():
+                del batch_table, target_array, year_array, batch
+                continue
+            
+            # Extract target
+            target_valid = target_array[final_mask]
+            y_batch = (target_valid > 0).astype(np.int8)
+            
+            # Extract feature columns in bulk using pure PyArrow→NumPy path (no pandas)
+            feature_table = batch_table.select(feature_cols)
+            X_batch = extract_features_pyarrow_to_numpy(feature_table, final_mask)
+            
+            # Get predictions from calibrated model
+            y_proba_batch = calibrated_model.predict_proba(X_batch)[:, 1].astype(np.float32)
+            
+            batches_y_test.append(y_batch)
+            batches_y_proba.append(y_proba_batch)
+            
+            test_pos += int(y_batch.sum())
+            test_neg += int((y_batch == 0).sum())
+            test_years_set.update(year_array[final_mask].tolist())
+            
+            # Extract metadata for writing results
+            row_array = batch_table['row'].to_numpy(zero_copy_only=False)[final_mask]
+            col_array = batch_table['col'].to_numpy(zero_copy_only=False)[final_mask]
+            year_array_valid = year_array[final_mask]
+            
+            result_arrays = {
+                'row': row_array.astype(np.int32),
+                'col': col_array.astype(np.int32),
+                'year': year_array_valid.astype(np.int32),
+                'y_true': y_batch,
+                'y_pred_proba': y_proba_batch
+            }
+            
+            # Add optional x, y coordinates if present
+            for coord_col in ['x', 'y']:
+                if coord_col in batch_table.column_names:
+                    coord_array = batch_table[coord_col].to_numpy(zero_copy_only=False)[final_mask]
+                    result_arrays[coord_col] = coord_array.astype(np.float32)
+            
+            result_table = pa.table(result_arrays)
+            
+            if writer is None:
+                writer = pq.ParquetWriter(output_path, result_table.schema)
+                print(f"Writing to {output_path}")
+            writer.write_table(result_table)
+            
+            del batch_table, target_array, target_valid, feature_table, X_batch, y_batch, y_proba_batch
+            del row_array, col_array, year_array, year_array_valid, result_arrays, result_table, batch
+            
+            if batch_num % 25 == 0:
+                gc.collect()
+            
+            if batch_num % 10 == 0:
+                print(f"  {batch_num} batches processed")
+                report_memory_usage(f"test batch {batch_num}")
+    finally:
+        if writer is not None:
+            writer.close()
+        del parquet_file
+        gc.collect()
+    
+    # Concatenate all batches
+    print(f"  Concatenating {len(batches_y_test)} batches...")
+    y_test = np.concatenate(batches_y_test, axis=0).astype(np.int8)
+    y_proba = np.concatenate(batches_y_proba, axis=0).astype(np.float32)
+    
+    test_years = sorted(test_years_set)
+    print(f"  Loaded {len(y_test):,} test samples")
+    
+    return y_test, y_proba, test_pos, test_neg, test_years
+
+
+def load_calibration_data_one_pass(
+    df_path: Path,
+    feature_cols: list,
+    target_col: str,
+    year_range: tuple[int, int],
+    lgb_model: lgb.Booster,
+    num_iteration: int,
+    batch_size: int = BATCH_SIZE
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    One-pass streaming loader for calibration data.
+    Collects batches, concatenates, and returns y_true and y_pred.
+    
+    Returns:
+        y_true: Target array (n_samples,) as int8
+        y_pred: Uncalibrated predictions (n_samples,) as float32
+    """
+    print(f"  Loading calibration data (one-pass streaming, years {year_range[0]}-{year_range[1]})...")
+    essential_cols = feature_cols + [target_col, 'year']
+    
+    batches_y_true = []
+    batches_y_pred = []
+    
+    parquet_file = pq.ParquetFile(df_path)
+    batch_num = 0
+    
+    try:
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols):
+            batch_num += 1
+            batch_table = batch
+            
+            target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+            year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+            
+            # Filter out NaN in target
+            valid_mask = ~np.isnan(target_array)
+            if not valid_mask.any():
+                del batch_table, target_array, year_array, batch
+                continue
+            
+            # Filter to calibration years only
+            year_mask = (year_array >= year_range[0]) & (year_array <= year_range[1])
+            final_mask = valid_mask & year_mask
+            if not final_mask.any():
+                del batch_table, target_array, year_array, batch
+                continue
+            
+            # Extract target
+            target_filtered = target_array[final_mask]
+            y_batch = (target_filtered > 0).astype(np.int8)
+            
+            # Extract feature columns in bulk using pure PyArrow→NumPy path (no pandas)
+            feature_table = batch_table.select(feature_cols)
+            X_batch = extract_features_pyarrow_to_numpy(feature_table, final_mask)
+            
+            # Get uncalibrated predictions
+            y_pred_batch = lgb_model.predict(X_batch, num_iteration=num_iteration).astype(np.float32)
+            
+            batches_y_true.append(y_batch)
+            batches_y_pred.append(y_pred_batch)
+            
+            del batch_table, target_array, year_array, target_filtered, feature_table, X_batch, y_batch, y_pred_batch, batch
+            
+            if batch_num % 25 == 0:
+                gc.collect()
+            
+            if batch_num % 10 == 0:
+                print(f"  {batch_num} batches processed")
+                report_memory_usage(f"calibration batch {batch_num}")
+    finally:
+        del parquet_file
+        gc.collect()
+    
+    # Concatenate all batches
+    print(f"  Concatenating {len(batches_y_true)} batches...")
+    y_true = np.concatenate(batches_y_true, axis=0).astype(np.int8)
+    y_pred = np.concatenate(batches_y_pred, axis=0).astype(np.float32)
+    
+    print(f"  Loaded {len(y_true):,} calibration samples")
+    return y_true, y_pred
 
 
 def compute_metrics(y_true: np.ndarray, y_proba: np.ndarray) -> Dict[str, float]:
@@ -691,6 +919,7 @@ def train_single_cv_fold(
     train_params['force_col_wise'] = True  # More memory efficient for many features
     train_params['max_bin'] = 255  # Reduce memory usage
     train_params['two_round'] = True  # Reduce peak memory during histogram building
+    train_params['num_threads'] = get_n_jobs()  # Use SLURM_CPUS_PER_TASK if available
     
     print(f"  Creating datasets...")
     train_dataset = lgb.Dataset(X_train, label=y_train, weight=train_weights, free_raw_data=True)
@@ -762,7 +991,7 @@ def aggregate_cv_metrics(cv_results: list[Dict[str, Any]]) -> Dict[str, Any]:
 def phase1_training(
     train_path: Path, earlystop_path: Path, params_path: Optional[Path], feature_cols: list, keep_cols_train: list,
     best_params: Dict[str, Any], timestamp: str, model_dir: Path, output_dir: Path, use_wandb: bool, target_col: str,
-    cv_mode: str = "full",
+    cv_mode: str = "fold3",
 ) -> tuple[Path, Dict[str, Any], Dict[str, Any], float, float, int, int, int, Dict[str, Any], Dict[str, Any]]:
     """
     Phase 1: Training with temporal cross-validation.
@@ -983,6 +1212,7 @@ def phase1_training(
     train_params['force_col_wise'] = True  # More memory efficient for many features
     train_params['max_bin'] = 255  # Reduce memory usage
     train_params['two_round'] = True  # Reduce peak memory during histogram building
+    train_params['num_threads'] = get_n_jobs()  # Use SLURM_CPUS_PER_TASK if available
     
     print(f"  Creating dataset...")
     train_dataset = lgb.Dataset(X_train_full, label=y_train_full, weight=train_weights, free_raw_data=True)
@@ -1010,107 +1240,20 @@ def phase1_training(
     # =============================================================================
     # STEP C: FITTING ISOTONIC CALIBRATION ON EARLYSTOP CALIBRATION YEARS
     # =============================================================================
-    # Fit isotonic calibration on earlystop calibration predictions (two-pass approach to avoid memory spikes)
+    # Fit isotonic calibration on earlystop calibration predictions (one-pass streaming)
     print(f"\n" + "="*70 + "\nSTEP C: FITTING ISOTONIC CALIBRATION ON EARLYSTOP CALIBRATION YEARS\n" + "="*70)
     print(f"Calibration years: {VAL_CALIBRATION_YEARS[0]}-{min(VAL_CALIBRATION_YEARS[1], LAST_LABEL_YEAR)} (capped at LAST_LABEL_YEAR={LAST_LABEL_YEAR})")
     cal_start = time.time()
     
-    batch_size = 50_000
-    essential_cols_cal = feature_cols + [target_col, 'year']
     cal_year_range = (VAL_CALIBRATION_YEARS[0], min(VAL_CALIBRATION_YEARS[1], LAST_LABEL_YEAR))
     
-    # Pass 1: Count rows matching the year filter (very fast, low memory)
-    print(f"  Pass 1: Counting rows matching year filter ({cal_year_range[0]}-{cal_year_range[1]})...")
-    parquet_file = pq.ParquetFile(earlystop_path)
-    n_cal_samples = 0
-    try:
-        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols_cal):
-            batch_table = batch
-            target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
-            year_array = batch_table['year'].to_numpy(zero_copy_only=False)
-            
-            # Filter out NaN in target
-            valid_mask = ~np.isnan(target_array)
-            if not valid_mask.any():
-                continue
-            
-            # Filter to calibration years only (capped at LAST_LABEL_YEAR)
-            year_mask = (year_array >= cal_year_range[0]) & (year_array <= cal_year_range[1])
-            final_mask = valid_mask & year_mask
-            n_cal_samples += int(final_mask.sum())
-            
-            del batch_table, target_array, year_array, batch
-    finally:
-        del parquet_file; gc.collect()
+    # Use one-pass streaming loader
+    y_true_cal, y_pred_cal = load_calibration_data_one_pass(
+        earlystop_path, feature_cols, target_col, cal_year_range, lgb_model, chosen_iteration
+    )
     
-    print(f"  Found {n_cal_samples:,} samples matching filter")
-    
-    if n_cal_samples == 0:
+    if len(y_true_cal) == 0:
         raise ValueError(f"No samples found in earlystop calibration years {cal_year_range[0]}-{cal_year_range[1]}")
-    
-    # Pass 2: Pre-allocate arrays and fill directly (avoids concatenation memory spike)
-    print(f"  Pass 2: Pre-allocating arrays and collecting predictions...")
-    y_true_cal = np.empty(n_cal_samples, dtype=np.int8)
-    y_pred_cal = np.empty(n_cal_samples, dtype=np.float32)
-    
-    parquet_file = pq.ParquetFile(earlystop_path)
-    cal_batch_num = 0
-    idx_offset = 0
-    
-    try:
-        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols_cal):
-            cal_batch_num += 1
-            batch_table = batch
-            target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
-            year_array = batch_table['year'].to_numpy(zero_copy_only=False)
-            
-            # Filter out NaN in target
-            valid_mask = ~np.isnan(target_array)
-            if not valid_mask.any():
-                del batch_table, target_array, year_array, batch
-                continue
-            
-            # Filter to calibration years only (capped at LAST_LABEL_YEAR)
-            year_mask = (year_array >= cal_year_range[0]) & (year_array <= cal_year_range[1])
-            final_mask = valid_mask & year_mask
-            if not final_mask.any():
-                del batch_table, target_array, year_array, batch
-                continue
-            
-            # Extract filtered data
-            target_filtered = target_array[final_mask]
-            
-            # Extract feature columns
-            feature_arrays = []
-            for col in feature_cols:
-                col_array = batch_table[col].to_numpy(zero_copy_only=False)
-                col_filtered = col_array[final_mask]
-                col_float32 = col_filtered.astype(np.float32)
-                feature_arrays.append(col_float32)
-            
-            X_batch = np.column_stack(feature_arrays)
-            y_batch = (target_filtered > 0).astype(np.int8)
-            
-            # Get uncalibrated predictions from the raw model
-            y_pred_batch = lgb_model.predict(X_batch, num_iteration=chosen_iteration).astype(np.float32)
-            
-            # Insert directly into pre-allocated arrays
-            batch_size_actual = len(y_batch)
-            y_true_cal[idx_offset:idx_offset + batch_size_actual] = y_batch
-            y_pred_cal[idx_offset:idx_offset + batch_size_actual] = y_pred_batch
-            idx_offset += batch_size_actual
-            
-            del batch_table, target_array, year_array, target_filtered, feature_arrays, X_batch, y_batch, y_pred_batch, batch
-            gc.collect()
-            
-            if cal_batch_num % 10 == 0:
-                print(f"  {cal_batch_num} batches, {idx_offset:,}/{n_cal_samples:,} samples collected")
-                report_memory_usage(f"calibration batch {cal_batch_num}")
-    finally:
-        del parquet_file; gc.collect()
-    
-    if idx_offset != n_cal_samples:
-        raise ValueError(f"Mismatch: expected {n_cal_samples:,} samples but collected {idx_offset:,}")
     
     print(f"  Calibrating on {len(y_true_cal):,} earlystop calibration samples...")
     report_memory_usage("before calibration fit")
@@ -1186,162 +1329,25 @@ def phase2_testing(
         calibrated_model = pickle.load(f)
     report_memory_usage("after loading model")
     
-    # Use smaller batch size to reduce memory pressure
-    batch_size = 50_000
-    print(f"Processing test in batches of {batch_size:,}...")
+    print(f"Processing test (one-pass streaming)...")
     print(f"Test year range: {test_year_range[0]}-{test_year_range[1]} (capped at LAST_LABEL_YEAR={LAST_LABEL_YEAR})")
     
-    # Pass 1: Count rows (pre-allocate arrays to avoid concatenation memory spike)
-    print(f"  Pass 1: Counting test rows (year_range={test_year_range})...")
-    parquet_file = pq.ParquetFile(test_path)
-    n_test_total = 0
-    test_years_set = set()
+    scored_path = output_dir / f"model1_lgbm_win5_scored_{timestamp}.parquet"
+    pred_start = time.time()
     
-    try:
-        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=[target_col, 'year']):
-            batch_table = batch
-            target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
-            year_array = batch_table['year'].to_numpy(zero_copy_only=False)
-            
-            # Filter out NaN in target
-            valid_mask = ~np.isnan(target_array)
-            if valid_mask.any():
-                # Filter by year range to exclude right-censored labels
-                year_mask = (year_array >= test_year_range[0]) & (year_array <= test_year_range[1])
-                final_mask = valid_mask & year_mask
-                if final_mask.any():
-                    n_test_total += int(final_mask.sum())
-                    test_years_set.update(year_array[final_mask].tolist())
-            
-            del batch_table, target_array, year_array, batch
-    finally:
-        del parquet_file
-        gc.collect()
+    # Use one-pass streaming loader
+    y_test, y_proba, test_pos, test_neg, test_years = load_test_data_one_pass(
+        test_path, feature_cols, target_col, keep_cols_test, test_year_range, calibrated_model, scored_path
+    )
     
-    print(f"  Found {n_test_total:,} test samples (filtered to year_range={test_year_range[0]}-{test_year_range[1]})")
-    
+    n_test_total = len(y_test)
     if n_test_total == 0:
         raise ValueError("No test samples found")
     
-    # Pre-allocate arrays
-    print(f"  Pre-allocating arrays for {n_test_total:,} samples...")
-    y_test = np.empty(n_test_total, dtype=np.int8)
-    y_proba = np.empty(n_test_total, dtype=np.float32)
-    report_memory_usage("after pre-allocation")
-    
-    # Pass 2: Process batches and fill pre-allocated arrays
-    parquet_file = pq.ParquetFile(test_path)
-    scored_path = output_dir / f"model1_lgbm_win5_scored_{timestamp}.parquet"
-    writer = None
-    test_pos = test_neg = batch_num = idx_offset = 0
-    pred_start = time.time()
-    
-    # Get best iteration from CV info (chosen iteration from CV)
-    # Since final model doesn't use early stopping, we use the chosen iteration from CV
-    best_iteration = cv_info.get("final_num_boost_round", cv_info.get("chosen_iteration", None))
-    print(f"  Using {best_iteration} iterations for predictions (chosen from CV)")
-    
-    try:
-        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=keep_cols_test):
-            batch_num += 1
-            batch_table = batch
-            
-            # Use PyArrow null handling
-            target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
-            year_array = batch_table['year'].to_numpy(zero_copy_only=False)
-            
-            # Filter out NaN in target
-            valid_mask = ~np.isnan(target_array)
-            if not valid_mask.any():
-                del batch_table, batch
-                continue
-            
-            # Filter by year range to exclude right-censored labels
-            year_mask = (year_array >= test_year_range[0]) & (year_array <= test_year_range[1])
-            final_mask = valid_mask & year_mask
-            if not final_mask.any():
-                del batch_table, target_array, year_array, batch
-                continue
-            
-            # Extract feature arrays directly from PyArrow (with year filtering)
-            feature_arrays = []
-            for col in feature_cols:
-                col_array = batch_table[col].to_numpy(zero_copy_only=False)
-                col_valid = col_array[final_mask]
-                # Convert to float32 (NaN values preserved for LightGBM to handle)
-                col_float32 = col_valid.astype(np.float32)
-                feature_arrays.append(col_float32)
-            
-            # Build feature matrix and target
-            X_batch = np.column_stack(feature_arrays)
-            target_valid = target_array[final_mask]
-            y_batch = (target_valid > 0).astype(np.int8)
-            
-            # Get predictions from calibrated model
-            # Calibrated model returns [n_samples, 2] with [neg_prob, pos_prob], extract pos_prob (column 1)
-            y_proba_batch = calibrated_model.predict_proba(X_batch)[:, 1].astype(np.float32)
-            
-            # Fill pre-allocated arrays directly
-            batch_size_actual = len(y_batch)
-            y_test[idx_offset:idx_offset + batch_size_actual] = y_batch
-            y_proba[idx_offset:idx_offset + batch_size_actual] = y_proba_batch
-            idx_offset += batch_size_actual
-            
-            test_pos += int(y_batch.sum())
-            test_neg += int((y_batch == 0).sum())
-            
-            # Extract metadata arrays for writing results (using final_mask which includes year filtering)
-            row_array = batch_table['row'].to_numpy(zero_copy_only=False)[final_mask]
-            col_array = batch_table['col'].to_numpy(zero_copy_only=False)[final_mask]
-            year_array_valid = year_array[final_mask]
-            
-            # Build result arrays and create PyArrow table directly
-            result_arrays = {
-                'row': row_array.astype(np.int32),
-                'col': col_array.astype(np.int32),
-                'year': year_array_valid.astype(np.int32),
-                'y_true': y_batch,
-                'y_pred_proba': y_proba_batch
-            }
-            
-            # Add optional x, y coordinates if present
-            for coord_col in ['x', 'y']:
-                if coord_col in batch_table.column_names:
-                    coord_array = batch_table[coord_col].to_numpy(zero_copy_only=False)[final_mask]
-                    result_arrays[coord_col] = coord_array.astype(np.float32)
-            
-            # Create PyArrow table directly from arrays (avoiding pandas)
-            result_table = pa.table(result_arrays)
-            
-            if writer is None:
-                writer = pq.ParquetWriter(scored_path, result_table.schema)
-                print(f"Writing to {scored_path}")
-            writer.write_table(result_table)
-            
-            del batch_table, target_array, target_valid, feature_arrays, X_batch, y_batch, y_proba_batch
-            del row_array, col_array, year_array, year_array_valid, result_arrays, result_table, batch
-            # More aggressive garbage collection during batch processing
-            gc.collect()
-            if batch_num % 10 == 0:
-                print(f"  {batch_num} batches, {idx_offset:,}/{n_test_total:,} rows")
-                report_memory_usage(f"batch {batch_num}")
-            elif batch_num % 50 == 0:
-                # Extra cleanup every 50 batches
-                gc.collect()
-    finally:
-        if writer is not None:
-            writer.close()
-        del parquet_file; gc.collect()
-    
-    if idx_offset != n_test_total:
-        raise ValueError(f"Mismatch: expected {n_test_total:,} samples but processed {idx_offset:,}")
-    
     pred_time = time.time() - pred_start
-    print(f"Completed {batch_num} batches in {pred_time:.1f}s, {n_test_total:,} rows")
+    print(f"Completed test processing in {pred_time:.1f}s, {n_test_total:,} rows")
     report_memory_usage("after all predictions")
     
-    test_years = sorted(test_years_set)
-    del test_years_set; gc.collect()
     print(f"\nTest set: {test_neg:,} neg, {test_pos:,} pos, ratio 1:{test_neg/max(test_pos,1):.1f}, years {test_years[0]}-{test_years[-1]}")
     
     if use_wandb:
@@ -1433,7 +1439,7 @@ def phase2_testing(
         wandb.finish()
 
 
-def main(cv_mode: str = "full") -> None:
+def main(cv_mode: str = "fold3") -> None:
     start_time = time.time()
     repo_root = Path(__file__).resolve().parents[3]
     train_path = resolve_parquet_file("train_early_sampled.parquet")
@@ -1507,7 +1513,7 @@ if __name__ == "__main__":
         "--cv-mode",
         type=str,
         choices=["full", "fold3", "none"],
-        default="full",
+        default="fold3",
         help="Cross-validation mode: 'full' (run all 3 folds), 'fold3' (run only fold 3 for fast dev), 'none' (skip CV)"
     )
     args = parser.parse_args()
