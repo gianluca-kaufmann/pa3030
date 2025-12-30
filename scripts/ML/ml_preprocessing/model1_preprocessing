@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
 
 """
-Sampling script for model1 training/earlystop/test splits with 5-year lookahead target.
+Temporal split script for model1 training/earlystop/test splits (South America dataset)
+with 5-year lookahead target.
 
 Rules
 -----
-TRAIN_EARLY (2001–2014):
-  - Keep all positives (transition_01 = 1)
-  - Sample negatives per year at TARGET_NEG_POS_RATIO (e.g., 400:1)
-  - Negatives split 50/50: hard negatives (closest to WDPA) + random negatives
-  - Year 2000 excluded to avoid treating existing PAs as transitions
-  - Result: positive rate ~0.25% (realistic for conservation risk modeling)
+TRAIN (2000–2017):
+  - Full risk set (no sampling)
+  - Used for final model training
 
 EARLYSTOP (2015–2017):
   - Full risk set (no sampling)
   - Used only for early stopping during CV, not for evaluation
+  - Note: EARLYSTOP is a subset of TRAIN, but kept as separate file for CV folds
 
 TEST (2018–2019):
   - Full risk set (no sampling)
   - Right-censored at max_year - 5 to ensure 5-year lookahead window
+  - Used for final model evaluation
 
 5-Year Lookahead Target:
   - Compute first_transition_year per (row, col) as min(year) where transition_01==1
@@ -28,16 +28,16 @@ TEST (2018–2019):
 
 Notes
 -----
-- No MAX_TRAIN_ROWS cap to avoid artificially inflating positive rate
-- Target neg/pos ratio maintains realistic class balance similar to earlystop/test
-- Hard negative sampling focuses on areas near protected areas (most informative)
+- Simple temporal split with no sampling
+- TRAIN contains all training data (2000-2017) for final model training
+- EARLYSTOP is a subset of TRAIN (2015-2017), kept as separate file for CV early stopping only
+- TEST is used for final model evaluation (2018-2019)
 - Right-censoring: max_year is computed from data and rows with year > max_year-5 are excluded
 """
 
 from __future__ import annotations
 
 import json
-import math
 import os
 import sys
 import time
@@ -49,16 +49,11 @@ import wandb
 # Configuration
 RANDOM_STATE = 42
 # Split configuration
-TRAIN_EARLY_YEARS = (2001, 2014)   # Sampled train with hard negatives (2000 excluded)
+TRAIN_YEARS = (2000, 2017)   # Full train set (matches final model training in model1_LGBM)
 EARLYSTOP_YEARS = (2015, 2017)     # Full earlystop (for CV early stopping only)
-TEST_YEARS = (2018, 2019)          # Full test (right-censored for 5-year lookahead)
-LOOKAHEAD_YEARS = 5                # Number of years to look ahead for target
+TEST_YEARS = (2018, 2019)    # Full test (right-censored for 5-year lookahead)
+LOOKAHEAD_YEARS = 5          # Number of years to look ahead for target
 WANDB_PROJECT = "ml-training-preprocessing"
-
-# Hard negative sampling configuration
-TARGET_NEG_POS_RATIO = 400  # Target ratio of negatives to positives per year (keeps pos rate ~0.25%)
-DIST_WDPA_DECAY = 5.0  # Decay constant (km) for exponential weighting: exp(-dist_wdpa / k)
-# Note: No MAX_TRAIN_ROWS cap - we control size via TARGET_NEG_POS_RATIO to avoid inflating positive rate
 
 
 def resolve_input() -> Path:
@@ -163,13 +158,11 @@ def main() -> None:
             name=f"model1_preprocessing_win5_{time.strftime('%Y%m%d_%H%M%S')}",
             config={
                 "random_state": RANDOM_STATE,
-                "train_early_years": TRAIN_EARLY_YEARS,
+                "train_years": TRAIN_YEARS,
                 "earlystop_years": EARLYSTOP_YEARS,
                 "test_years": TEST_YEARS,
                 "lookahead_years": LOOKAHEAD_YEARS,
-                "target_neg_pos_ratio": TARGET_NEG_POS_RATIO,
-                "dist_wdpa_decay": DIST_WDPA_DECAY,
-                "sampling_method": "per_year_hard_negatives_fixed_ratio_win5",
+                "sampling_method": "temporal_split_full_win5",
             },
         )
         use_wandb = True
@@ -182,24 +175,24 @@ def main() -> None:
     
     # Output paths for win5 files
     merged_win5_out = base_dir / "merged_panel_final_win5.parquet"
-    train_early_out = base_dir / "train_early_sampled.parquet"
-    earlystop_out = base_dir / "earlystop_full.parquet"
-    test_out = base_dir / "test_full.parquet"
+    train_out = base_dir / "train_win5.parquet"
+    earlystop_out = base_dir / "earlystop_win5.parquet"
+    test_out = base_dir / "test_win5.parquet"
 
     print(f"\nInput: {input_path}")
     print(f"Merged WIN5 output: {merged_win5_out}")
-    print(f"TRAIN_EARLY (sampled) output: {train_early_out}")
+    print(f"TRAIN output: {train_out}")
     print(f"EARLYSTOP output: {earlystop_out}")
-    print(f"TEST_FULL output: {test_out}")
+    print(f"TEST output: {test_out}")
 
     con = duckdb.connect()
     configure_duckdb(con)
 
     escaped_in = str(input_path).replace("'", "''")
     escaped_merged_win5 = str(merged_win5_out).replace("'", "''")
-    escaped_train_early = str(train_early_out).replace("'", "''")
-    escaped_test = str(test_out).replace("'", "''")
+    escaped_train = str(train_out).replace("'", "''")
     escaped_earlystop = str(earlystop_out).replace("'", "''")
+    escaped_test = str(test_out).replace("'", "''")
 
     try:
         print("\n" + "="*70)
@@ -324,132 +317,21 @@ def main() -> None:
         print("STEP 4: Creating temporal splits")
         print("="*70)
         
-        # TRAIN_EARLY: positives + hard negatives per year (2001–2014)
-        # Keep all positives, sample negatives per year at TARGET_NEG_POS_RATIO
-        # 50% hard negatives (close to WDPA), 50% random from remainder
-        train_early_sql = f"""
+        # TRAIN: full risk set 2000–2017
+        train_sql = f"""
         COPY (
-            WITH base AS (
-                SELECT
-                    *
-                FROM read_parquet('{escaped_merged_win5}')
-                WHERE year BETWEEN {TRAIN_EARLY_YEARS[0]} AND {TRAIN_EARLY_YEARS[1]}
-            ),
-            year_counts AS (
-                SELECT
-                    year,
-                    SUM(transition_01) AS pos_count,
-                    SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS neg_count
-                FROM base
-                GROUP BY year
-            ),
-            -- Per-year negative budgets: pos_count * TARGET_NEG_POS_RATIO
-            -- Include ALL years, even if pos_count = 0 or neg_count = 0 (budget will be 0)
-            neg_budget AS (
-                SELECT
-                    yc.year,
-                    yc.pos_count,
-                    yc.neg_count,
-                    CASE 
-                        WHEN yc.pos_count > 0 AND yc.neg_count > 0 THEN
-                            LEAST(
-                                CAST(ROUND(yc.pos_count * {TARGET_NEG_POS_RATIO}) AS BIGINT),
-                                yc.neg_count
-                            )
-                        ELSE 0
-                    END AS year_neg_budget
-                FROM year_counts yc
-            ),
-            positives AS (
-                -- Keep all positives (no sampling)
-                SELECT * FROM base WHERE transition_01 = 1
-            ),
-            -- Prepare negative pool with per-year budgets
-            -- Use INNER JOIN - all years are now in neg_budget (even if budget is 0)
-            neg_candidates AS (
-                SELECT
-                    b.*,
-                    nb.year_neg_budget,
-                    -- Split the yearly negative budget into 50% hard and 50% random
-                    CAST(FLOOR(nb.year_neg_budget / 2.0) AS BIGINT) AS hard_budget,
-                    nb.year_neg_budget - CAST(FLOOR(nb.year_neg_budget / 2.0) AS BIGINT) AS rand_budget,
-                    COALESCE(b.dist_wdpa, 100.0) AS dist_for_rank,
-                    random() AS u
-                FROM base b
-                INNER JOIN neg_budget nb ON b.year = nb.year
-                WHERE b.transition_01 = 0 AND nb.year_neg_budget > 0
-            ),
-            -- Rank for hard negatives: by distance to WDPA (closest first), tie-broken by u
-            ranked_for_hard AS (
-                SELECT
-                    *,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY year
-                        ORDER BY dist_for_rank ASC, u
-                    ) AS dist_rank
-                FROM neg_candidates
-            ),
-            -- First half of the budget: hard negatives close to WDPA
-            hard_negs AS (
-                SELECT * EXCLUDE (
-                    year_neg_budget,
-                    hard_budget,
-                    rand_budget,
-                    dist_for_rank,
-                    u,
-                    dist_rank
-                )
-                FROM ranked_for_hard
-                WHERE dist_rank <= hard_budget
-            ),
-            -- Leftover pool for random selection (excludes hard negatives)
-            leftover_pool AS (
-                SELECT *
-                FROM ranked_for_hard
-                WHERE dist_rank > hard_budget
-            ),
-            ranked_leftover AS (
-                SELECT
-                    *,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY year
-                        ORDER BY u
-                    ) AS leftover_rand_rank
-                FROM leftover_pool
-            ),
-            -- Second half of the budget: random negatives from leftover pool
-            random_negs AS (
-                SELECT * EXCLUDE (
-                    year_neg_budget,
-                    hard_budget,
-                    rand_budget,
-                    dist_for_rank,
-                    u,
-                    dist_rank,
-                    leftover_rand_rank
-                )
-                FROM ranked_leftover
-                WHERE leftover_rand_rank <= rand_budget
-            )
-            SELECT * FROM positives
-            UNION ALL
-            SELECT * FROM hard_negs
-            UNION ALL
-            SELECT * FROM random_negs
+            SELECT
+                *
+            FROM read_parquet('{escaped_merged_win5}')
+            WHERE year BETWEEN {TRAIN_YEARS[0]} AND {TRAIN_YEARS[1]}
         )
-        TO '{escaped_train_early}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        TO '{escaped_train}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """
 
-        print(f"\nCreating TRAIN_EARLY split ({TRAIN_EARLY_YEARS[0]}–{TRAIN_EARLY_YEARS[1]}) with per-year negative sampling...")
-        print(f"  All positives are kept; negatives sampled at {TARGET_NEG_POS_RATIO}:1 ratio per year")
-        print(f"  Negatives: 50% closest to WDPA (hard), 50% random from remainder")
-        print(f"  Year 2000 excluded to avoid treating existing PAs as transitions")
-        # Set random seed for reproducible sampling
-        seed_value = RANDOM_STATE / 100.0
-        con.execute(f"SELECT setseed({seed_value})")
-        train_early_start = time.time()
-        con.execute(train_early_sql)
-        print(f"TRAIN_EARLY written in {time.time() - train_early_start:.1f}s")
+        print(f"\nCreating TRAIN split ({TRAIN_YEARS[0]}–{TRAIN_YEARS[1]}, full risk set)...")
+        train_start = time.time()
+        con.execute(train_sql)
+        print(f"TRAIN written in {time.time() - train_start:.1f}s")
 
         # EARLYSTOP: full risk set 2015–2017 (for early stopping during CV only, not evaluation)
         earlystop_sql = f"""
@@ -467,7 +349,7 @@ def main() -> None:
         con.execute(earlystop_sql)
         print(f"EARLYSTOP written in {time.time() - earlystop_start:.1f}s")
 
-        # TEST_FULL: full risk set 2018–2019 (right-censored)
+        # TEST: full risk set 2018–2019 (right-censored)
         test_sql = f"""
         COPY (
             SELECT
@@ -478,7 +360,7 @@ def main() -> None:
         TO '{escaped_test}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """
 
-        print(f"\nCreating TEST_FULL split ({TEST_YEARS[0]}–{TEST_YEARS[1]}, full risk set, right-censored)...")
+        print(f"\nCreating TEST split ({TEST_YEARS[0]}–{TEST_YEARS[1]}, full risk set, right-censored)...")
         test_start = time.time()
         con.execute(test_sql)
         print(f"TEST written in {time.time() - test_start:.1f}s")
@@ -487,93 +369,38 @@ def main() -> None:
         print("\n" + "="*70)
         print("PER-YEAR STATISTICS")
         print("="*70)
-        log_year_counts(con, train_early_out, "TRAIN_EARLY", "transition_01", use_wandb)
-        log_year_counts(con, train_early_out, "TRAIN_EARLY", "transition_01_win5", use_wandb)
+        log_year_counts(con, train_out, "TRAIN", "transition_01", use_wandb)
+        log_year_counts(con, train_out, "TRAIN", "transition_01_win5", use_wandb)
         # EARLYSTOP stats logged for information, but EARLYSTOP is only used for early stopping during CV, not evaluation
         log_year_counts(con, earlystop_out, "EARLYSTOP", "transition_01", use_wandb)
         log_year_counts(con, earlystop_out, "EARLYSTOP", "transition_01_win5", use_wandb)
-        log_year_counts(con, test_out, "TEST_FULL", "transition_01", use_wandb)
-        log_year_counts(con, test_out, "TEST_FULL", "transition_01_win5", use_wandb)
+        log_year_counts(con, test_out, "TEST", "transition_01", use_wandb)
+        log_year_counts(con, test_out, "TEST", "transition_01_win5", use_wandb)
 
-        # Check total rows and achieved ratios
-        total_train_early_rows = con.execute(
-            f"SELECT COUNT(*) FROM read_parquet('{escaped_train_early}')"
+        # Check total rows
+        total_train_rows = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{escaped_train}')"
         ).fetchone()[0]
         
-        print(f"\nTotal TRAIN_EARLY rows: {total_train_early_rows:,}")
-        
-        # Check per-year achieved neg/pos ratios vs target
-        print(f"\nChecking achieved neg/pos ratios vs target ({TARGET_NEG_POS_RATIO}:1)...")
-        achieved_ratios = con.execute(
-            f"""
-            SELECT
-                year,
-                SUM(transition_01) AS pos_count,
-                SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS neg_count,
-                CASE WHEN SUM(transition_01) > 0 
-                     THEN SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END)::DOUBLE / SUM(transition_01)
-                     ELSE 0 END AS achieved_ratio
-            FROM read_parquet('{escaped_train_early}')
-            GROUP BY year
-            ORDER BY year
-            """
-        ).fetchall()
-        
-        for year, pos, neg, achieved in achieved_ratios:
-            status = "" if abs(achieved - TARGET_NEG_POS_RATIO) / TARGET_NEG_POS_RATIO < 0.05 else ""
-            print(f"  {status} {year}: achieved {achieved:.1f}:1 (target {TARGET_NEG_POS_RATIO}:1) | pos={pos:,} neg={neg:,}")
-        
-        # Compute scale_pos_weight from TRAIN_EARLY only: sqrt(n_neg / n_pos)
-        train_stats = con.execute(
-            f"""
-            SELECT
-                SUM(transition_01) AS total_pos,
-                SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS total_neg
-            FROM read_parquet('{escaped_train_early}')
-            """
-        ).fetchone()
-        total_pos, total_neg = train_stats
-        neg_pos_ratio = total_neg / total_pos if total_pos > 0 else 1.0
-        scale_pos_weight = math.sqrt(neg_pos_ratio) if neg_pos_ratio > 0 else 1.0
-        
-        print(f"\nTRAIN_EARLY class balance:")
-        print(f"  Positives: {total_pos:,}")
-        print(f"  Negatives: {total_neg:,}")
-        print(f"  Ratio (neg/pos): {neg_pos_ratio:.2f}")
-        print(f"  scale_pos_weight for LightGBM: {scale_pos_weight:.6f} (sqrt of ratio)")
-        
-        # Save scale_pos_weight to metadata file for use in training
-        metadata_path = base_dir / "train_early_metadata.json"
-        metadata = {
-            "scale_pos_weight": scale_pos_weight,
-            "total_positives": int(total_pos),
-            "total_negatives": int(total_neg),
-            "neg_pos_ratio": float(neg_pos_ratio),
-            "computed_from": "train_early_sampled.parquet"
-        }
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
-        print(f"  Metadata saved to: {metadata_path}")
-
-        total_test = con.execute(
-            f"SELECT COUNT(*) FROM read_parquet('{escaped_test}')"
-        ).fetchone()[0]
-
-        total_earlystop = con.execute(
+        total_earlystop_rows = con.execute(
             f"SELECT COUNT(*) FROM read_parquet('{escaped_earlystop}')"
         ).fetchone()[0]
+        
+        total_test_rows = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{escaped_test}')"
+        ).fetchone()[0]
+        
+        print(f"\nTotal rows:")
+        print(f"  TRAIN: {total_train_rows:,}")
+        print(f"  EARLYSTOP: {total_earlystop_rows:,}")
+        print(f"  TEST: {total_test_rows:,}")
 
         if use_wandb:
             wandb.log(
                 {
-                    "train_early/rows": total_train_early_rows,
-                    "train_early/positives": total_pos,
-                    "train_early/negatives": total_neg,
-                    "train_early/scale_pos_weight": scale_pos_weight,
-                    "train_early/target_neg_pos_ratio": TARGET_NEG_POS_RATIO,
-                    "train_early/achieved_neg_pos_ratio": neg_pos_ratio,
-                    "earlystop/rows": total_earlystop,
-                    "test_full/rows": total_test,
+                    "train/rows": total_train_rows,
+                    "earlystop/rows": total_earlystop_rows,
+                    "test/rows": total_test_rows,
                     "lookahead_years": LOOKAHEAD_YEARS,
                     "cutoff_year": cutoff_year,
                     "max_year": max_year,
