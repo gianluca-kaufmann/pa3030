@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""Benchmark Evaluation Script for model1_LGBM
+
+Purpose: Extract final CV + test metrics from model1_LGBM training results,
+         create a benchmark JSON file with metrics, features, params, seed, and dataset hash.
+         Marks in-sample earlystop as NON-EVALUATIVE.
+
+Input:   - model1_lgbm_win5_metrics_*.json (most recent file from outputs/Results/ml_models)
+         - train_win5.parquet, test_win5.parquet
+           (for dataset hash computation; earlystop/val excluded)
+
+Output:  - benchmark JSON file with:
+           - CV aggregated metrics
+           - Test performance metrics  
+           - Features, model parameters, random seed
+           - Dataset hash
+           - Earlystop marked as NON-EVALUATIVE
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, Optional
+
+import pyarrow.parquet as pq
+
+
+class Tee:
+    """Write to both stdout and a file."""
+    def __init__(self, file_path: Path):
+        self.file = open(file_path, 'w', encoding='utf-8')
+        self.stdout = sys.stdout
+    
+    def write(self, text: str) -> None:
+        self.stdout.write(text)
+        self.file.write(text)
+        self.file.flush()
+    
+    def flush(self) -> None:
+        self.stdout.flush()
+        self.file.flush()
+    
+    def close(self) -> None:
+        self.file.close()
+
+
+def resolve_parquet_file(filename: str) -> Optional[Path]:
+    """Locate parquet file (prefer $SCRATCH if present)."""
+    repo_root = Path(__file__).resolve().parents[4]
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    candidates = []
+    if scratch_root is not None:
+        candidates.append(scratch_root / f"data/ml/{filename}")
+    candidates.append(repo_root / f"data/ml/{filename}")
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    return None
+
+
+def compute_dataset_hash(num_sample_row_groups: int = 3) -> str:
+    """Compute content-stable dataset hash from train/test parquet files.
+    
+    Uses a deterministic sample of Parquet metadata for content-based hashing:
+    - Column names (sorted for consistency)
+    - Total row count
+    - First N row-groups' metadata (num_rows, column stats)
+    
+    This avoids full content hashing while remaining content-stable.
+    Note: Earlystop/validation data is excluded from hash computation.
+    
+    Args:
+        num_sample_row_groups: Number of row-groups to sample (default: 3)
+    
+    Returns:
+        Hex digest of the dataset hash
+    """
+    files = [
+        ("train", "train_win5.parquet"),
+        ("test", "test_win5.parquet"),
+    ]
+    
+    hash_input = []
+    for file_type, filename in files:
+        file_path = resolve_parquet_file(filename)
+        if file_path is None:
+            # If file not found, use filename + "not_found" for reproducibility
+            hash_input.append(f"{file_type}:{filename}:not_found")
+            continue
+        
+        try:
+            parquet_file = pq.ParquetFile(file_path)
+            metadata = parquet_file.metadata
+            schema = parquet_file.schema_arrow
+            
+            # Get column names (sorted for consistency)
+            column_names = sorted([field.name for field in schema])
+            
+            # Get total row count
+            total_rows = metadata.num_rows
+            
+            # Sample first N row-groups
+            num_row_groups = metadata.num_row_groups
+            num_to_sample = min(num_sample_row_groups, num_row_groups)
+            
+            # Sample first N row-groups metadata
+            row_group_samples = []
+            for i in range(num_to_sample):
+                rg = metadata.row_group(i)
+                # Create deterministic string representation
+                rg_str = f"rg{i}:rows={rg.num_rows}:cols={rg.num_columns}"
+                row_group_samples.append(rg_str)
+            
+            # Create deterministic string representation
+            file_hash_parts = [
+                f"columns={','.join(column_names)}",
+                f"total_rows={total_rows}",
+                f"num_row_groups={num_row_groups}",
+                f"sample_row_groups={';'.join(row_group_samples)}",
+            ]
+            
+            hash_input.append(f"{file_type}:{filename}:{'|'.join(file_hash_parts)}")
+            
+        except Exception as e:
+            # Fallback if we can't read parquet metadata
+            hash_input.append(f"{file_type}:{filename}:parquet_error={str(e)}")
+    
+    # Compute hash
+    hash_str = "|".join(hash_input)
+    return hashlib.sha256(hash_str.encode('utf-8')).hexdigest()
+
+
+def find_latest_metrics_file(output_dir: Path) -> Path:
+    """Find the most recent model1_lgbm_win5_metrics JSON file.
+    
+    Parses timestamp from filename (format: YYYYMMDD_HHMMSS) and sorts by it.
+    Falls back to modification time if timestamp cannot be parsed.
+    
+    Args:
+        output_dir: Directory containing metrics files
+        
+    Returns:
+        Path to the most recent metrics file
+        
+    Raises:
+        FileNotFoundError: If no metrics file is found
+    """
+    pattern = "model1_lgbm_win5_metrics_*.json"
+    files = list(output_dir.glob(pattern))
+    
+    if not files:
+        raise FileNotFoundError(f"No metrics files found in {output_dir} matching pattern {pattern}")
+    
+    # Parse timestamp from filename: model1_lgbm_win5_metrics_YYYYMMDD_HHMMSS.json
+    timestamp_pattern = re.compile(r'model1_lgbm_win5_metrics_(\d{8}_\d{6})\.json')
+    
+    def get_timestamp_key(path: Path) -> tuple:
+        """Return (timestamp_datetime, fallback_mtime) for sorting."""
+        match = timestamp_pattern.match(path.name)
+        if match:
+            try:
+                timestamp_str = match.group(1)
+                dt = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
+                return (dt, 0)  # Use parsed timestamp, no fallback needed
+            except ValueError:
+                pass
+        # Fallback to modification time if parsing fails
+        return (datetime.fromtimestamp(0), path.stat().st_mtime)
+    
+    # Sort by timestamp (newest first), fallback to mtime if parsing fails
+    latest = max(files, key=get_timestamp_key)
+    return latest
+
+
+def load_metrics_file(metrics_path: Path) -> Dict[str, Any]:
+    """Load metrics JSON file.
+    
+    Args:
+        metrics_path: Path to metrics JSON file
+        
+    Returns:
+        Dictionary containing metrics data
+    """
+    with open(metrics_path, 'r') as f:
+        return json.load(f)
+
+
+def create_benchmark_json(metrics_data: Dict[str, Any], dataset_hash: str) -> Dict[str, Any]:
+    """Create benchmark JSON structure from metrics data.
+    
+    Args:
+        metrics_data: Loaded metrics JSON data
+        dataset_hash: Computed dataset hash
+        
+    Returns:
+        Benchmark JSON dictionary
+    """
+    metadata = metrics_data.get("metadata", {})
+    cv_data = metrics_data.get("cross_validation", {})
+    test_perf = metrics_data.get("test_performance", {})
+    val_perf = metrics_data.get("validation_performance", {})
+    model_params = metrics_data.get("model_parameters", {})
+    temporal_split = metrics_data.get("temporal_split", {})
+    data_info = metrics_data.get("data", {})
+    
+    benchmark = {
+        "benchmark_metadata": {
+            "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "source_metrics_file": metrics_data.get("metadata", {}).get("timestamp", "unknown"),
+            "model": metadata.get("model", "Unknown"),
+            "task": metadata.get("task", "Unknown"),
+            "target_column": metadata.get("target_column", "Unknown"),
+            "lookahead_years": metadata.get("lookahead_years", 5),
+        },
+        "dataset": {
+            "hash": dataset_hash,
+            "temporal_split": temporal_split,
+            "data_info": {
+                "n_train_full": data_info.get("n_train_full"),
+                "n_test": data_info.get("n_test"),
+                "train_positives": data_info.get("train_positives"),
+                "train_negatives": data_info.get("train_negatives"),
+                "test_positives": data_info.get("test_positives"),
+                "test_negatives": data_info.get("test_negatives"),
+            }
+        },
+        "model_config": {
+            "random_seed": metadata.get("random_state", model_params.get("random_state")),
+            "n_features": metadata.get("n_features", 0),
+            "features": metadata.get("features", []),
+            "hyperparameters": model_params,
+        },
+        "evaluative_metrics": {
+            "cross_validation": {
+                "aggregated": cv_data.get("aggregated", {}),
+                "note": "Temporal cross-validation across 3 folds"
+            },
+            "test_performance": test_perf,
+        },
+        "non_evaluative_metrics": {
+            "earlystop_performance": {
+                **{k: v for k, v in val_perf.items() if not k.startswith("precision_at_")},
+                "note": "In-sample earlystop on data used during training (NON-EVALUATIVE)"
+            }
+        },
+        "performance_summary": {
+            "cv_pr_auc_mean": cv_data.get("aggregated", {}).get("pr_auc_mean"),
+            "cv_pr_auc_std": cv_data.get("aggregated", {}).get("pr_auc_std"),
+            "cv_roc_auc_mean": cv_data.get("aggregated", {}).get("roc_auc_mean"),
+            "cv_roc_auc_std": cv_data.get("aggregated", {}).get("roc_auc_std"),
+            "test_pr_auc": test_perf.get("pr_auc"),
+            "test_roc_auc": test_perf.get("roc_auc"),
+        }
+    }
+    
+    return benchmark
+
+
+def main() -> None:
+    repo_root = Path(__file__).resolve().parents[4]
+    output_dir = repo_root / "outputs/Results/ml_models"
+    benchmark_output_dir = repo_root / "outputs/Results/ml_models"
+    benchmark_output_dir.mkdir(parents=True, exist_ok=True)
+    
+    print("=" * 70)
+    print("BENCHMARK EVALUATION: model1_LGBM")
+    print("=" * 70)
+    print(f"\nOutput directory: {output_dir}")
+    
+    # Step 1: Find latest metrics file
+    print("\n" + "=" * 70)
+    print("STEP 1: FIND LATEST METRICS FILE")
+    print("=" * 70)
+    try:
+        metrics_path = find_latest_metrics_file(output_dir)
+        print(f"\nFound latest metrics file: {metrics_path.name}")
+    except FileNotFoundError as e:
+        print(f"\nERROR: {e}")
+        sys.exit(1)
+    
+    # Step 2: Load metrics data
+    print("\n" + "=" * 70)
+    print("STEP 2: LOAD METRICS DATA")
+    print("=" * 70)
+    try:
+        metrics_data = load_metrics_file(metrics_path)
+        print(f"\nLoaded metrics from {metrics_path.name}")
+        print(f"  Model: {metrics_data.get('metadata', {}).get('model', 'Unknown')}")
+        print(f"  Task: {metrics_data.get('metadata', {}).get('task', 'Unknown')}")
+        print(f"  Timestamp: {metrics_data.get('metadata', {}).get('timestamp', 'Unknown')}")
+    except Exception as e:
+        print(f"\nERROR: Failed to load metrics file: {e}")
+        sys.exit(1)
+    
+    # Step 3: Compute dataset hash
+    print("\n" + "=" * 70)
+    print("STEP 3: COMPUTE DATASET HASH")
+    print("=" * 70)
+    try:
+        dataset_hash = compute_dataset_hash()
+        print(f"\nDataset hash: {dataset_hash}")
+        print("  (Content-stable hash from sampled Parquet metadata: column names, row counts, row-group samples)")
+    except Exception as e:
+        print(f"\nWARNING: Failed to compute dataset hash: {e}")
+        dataset_hash = "unknown"
+    
+    # Step 4: Create benchmark JSON
+    print("\n" + "=" * 70)
+    print("STEP 4: CREATE BENCHMARK JSON")
+    print("=" * 70)
+    try:
+        benchmark = create_benchmark_json(metrics_data, dataset_hash)
+        print("\nBenchmark JSON structure created")
+        print(f"  Evaluative metrics: CV aggregated + Test performance")
+        print(f"  Non-evaluative metrics: Earlystop performance (marked as NON-EVALUATIVE)")
+    except Exception as e:
+        print(f"\nERROR: Failed to create benchmark JSON: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    
+    # Step 5: Save benchmark JSON
+    print("\n" + "=" * 70)
+    print("STEP 5: SAVE BENCHMARK JSON")
+    print("=" * 70)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    benchmark_path = benchmark_output_dir / f"model1_lgbm_win5_benchmark_{timestamp}.json"
+    
+    try:
+        with open(benchmark_path, 'w') as f:
+            json.dump(benchmark, f, indent=2)
+        print(f"\nBenchmark JSON saved: {benchmark_path}")
+    except Exception as e:
+        print(f"\nERROR: Failed to save benchmark JSON: {e}")
+        sys.exit(1)
+    
+    # Step 6: Print summary
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    
+    cv_agg = benchmark["evaluative_metrics"]["cross_validation"]["aggregated"]
+    test_metrics = benchmark["evaluative_metrics"]["test_performance"]
+    
+    print(f"\nSource metrics: {metrics_path.name}")
+    print(f"Benchmark file: {benchmark_path.name}")
+    print(f"\nDataset hash: {dataset_hash[:16]}...")
+    
+    print(f"\nCross-Validation (Aggregated across 3 folds):")
+    roc_auc_mean = cv_agg.get('roc_auc_mean', 'N/A')
+    roc_auc_std = cv_agg.get('roc_auc_std', 0)
+    roc_auc_mean_str = f"{roc_auc_mean:.4f}" if isinstance(roc_auc_mean, (int, float)) else str(roc_auc_mean)
+    roc_auc_std_str = f"{roc_auc_std:.4f}" if isinstance(roc_auc_std, (int, float)) else str(roc_auc_std)
+    print(f"  ROC-AUC: {roc_auc_mean_str} ± {roc_auc_std_str}")
+    pr_auc_mean = cv_agg.get('pr_auc_mean', 'N/A')
+    pr_auc_std = cv_agg.get('pr_auc_std', 0)
+    pr_auc_mean_str = f"{pr_auc_mean:.4f}" if isinstance(pr_auc_mean, (int, float)) else str(pr_auc_mean)
+    pr_auc_std_str = f"{pr_auc_std:.4f}" if isinstance(pr_auc_std, (int, float)) else str(pr_auc_std)
+    print(f"  PR-AUC:  {pr_auc_mean_str} ± {pr_auc_std_str}")
+    p1_mean = cv_agg.get('precision_at_1pct_mean', 'N/A')
+    p1_std = cv_agg.get('precision_at_1pct_std', 0)
+    p1_mean_str = f"{p1_mean:.4f}" if isinstance(p1_mean, (int, float)) else str(p1_mean)
+    p1_std_str = f"{p1_std:.4f}" if isinstance(p1_std, (int, float)) else str(p1_std)
+    print(f"  P@1%:    {p1_mean_str} ± {p1_std_str}")
+    p5_mean = cv_agg.get('precision_at_5pct_mean', 'N/A')
+    p5_std = cv_agg.get('precision_at_5pct_std', 0)
+    p5_mean_str = f"{p5_mean:.4f}" if isinstance(p5_mean, (int, float)) else str(p5_mean)
+    p5_std_str = f"{p5_std:.4f}" if isinstance(p5_std, (int, float)) else str(p5_std)
+    print(f"  P@5%:    {p5_mean_str} ± {p5_std_str}")
+    p10_mean = cv_agg.get('precision_at_10pct_mean', 'N/A')
+    p10_std = cv_agg.get('precision_at_10pct_std', 0)
+    p10_mean_str = f"{p10_mean:.4f}" if isinstance(p10_mean, (int, float)) else str(p10_mean)
+    p10_std_str = f"{p10_std:.4f}" if isinstance(p10_std, (int, float)) else str(p10_std)
+    print(f"  P@10%:   {p10_mean_str} ± {p10_std_str}")
+    
+    print(f"\nTest Performance:")
+    test_roc_auc = test_metrics.get('roc_auc', 'N/A')
+    test_roc_auc_str = f"{test_roc_auc:.4f}" if isinstance(test_roc_auc, (int, float)) else str(test_roc_auc)
+    print(f"  ROC-AUC: {test_roc_auc_str}")
+    test_pr_auc = test_metrics.get('pr_auc', 'N/A')
+    test_pr_auc_str = f"{test_pr_auc:.4f}" if isinstance(test_pr_auc, (int, float)) else str(test_pr_auc)
+    print(f"  PR-AUC:  {test_pr_auc_str}")
+    test_p1 = test_metrics.get('precision_at_1pct', 'N/A')
+    test_p1_str = f"{test_p1:.4f}" if isinstance(test_p1, (int, float)) else str(test_p1)
+    print(f"  P@1%:    {test_p1_str}")
+    test_p5 = test_metrics.get('precision_at_5pct', 'N/A')
+    test_p5_str = f"{test_p5:.4f}" if isinstance(test_p5, (int, float)) else str(test_p5)
+    print(f"  P@5%:    {test_p5_str}")
+    test_p10 = test_metrics.get('precision_at_10pct', 'N/A')
+    test_p10_str = f"{test_p10:.4f}" if isinstance(test_p10, (int, float)) else str(test_p10)
+    print(f"  P@10%:   {test_p10_str}")
+    
+    print(f"\nEarlystop Performance (NON-EVALUATIVE):")
+    earlystop_metrics = benchmark["non_evaluative_metrics"]["earlystop_performance"]
+    earlystop_roc_auc = earlystop_metrics.get('roc_auc', 'N/A')
+    earlystop_roc_auc_str = f"{earlystop_roc_auc:.4f}" if isinstance(earlystop_roc_auc, (int, float)) else str(earlystop_roc_auc)
+    print(f"  ROC-AUC: {earlystop_roc_auc_str}")
+    earlystop_pr_auc = earlystop_metrics.get('pr_auc', 'N/A')
+    earlystop_pr_auc_str = f"{earlystop_pr_auc:.4f}" if isinstance(earlystop_pr_auc, (int, float)) else str(earlystop_pr_auc)
+    print(f"  PR-AUC:  {earlystop_pr_auc_str}")
+    print(f"  Note: This is in-sample earlystop on data used during training")
+    
+    print(f"\nModel Configuration:")
+    config = benchmark["model_config"]
+    print(f"  Random seed: {config.get('random_seed', 'N/A')}")
+    print(f"  Features: {config.get('n_features', 0)}")
+    
+    print("\n" + "=" * 70)
+    print("Done.")
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+    repo_root = Path(__file__).resolve().parents[4]
+    output_dir = repo_root / "outputs/Results/ml_models"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = output_dir / f"benchmark_model1_lgbm_{timestamp}.txt"
+    
+    tee = Tee(output_file)
+    sys.stdout = tee
+    
+    try:
+        main()
+    finally:
+        sys.stdout = tee.stdout
+        tee.close()
+        print(f"\nOutput saved to: {output_file}")
+

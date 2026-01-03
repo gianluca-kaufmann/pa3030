@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""Visualization Script for Protected Areas Coverage by Year
+
+Purpose: Create visualizations of protected areas (WDPA) coverage for every year (2000-2024)
+         in the merged_panel_colombia_final.parquet dataset.
+
+Input:   - merged_panel_colombia_final.parquet (from data/ml/ or $SCRATCH/data/ml/)
+
+Output:  - outputs/Figures/colombia_vis/colombia_WDPA/
+           - wdpa_coverage_2000_2024.png
+           - wdpa_coverage_2000_2024.pdf
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
+
+
+def get_repo_root() -> Path:
+    """Get repository root directory.
+    
+    Checks environment variables first, then searches upward for README.md.
+    """
+    # Check environment variable first
+    env_root = os.environ.get("PROJECT_ROOT") or os.environ.get("REPO_ROOT")
+    if env_root:
+        return Path(env_root).resolve()
+    
+    # Search upward from script location for README.md
+    script_dir = Path(__file__).resolve().parent
+    current = script_dir
+    for _ in range(10):  # Limit search depth
+        if (current / "README.md").exists():
+            return current
+        parent = current.parent
+        if parent == current:  # Reached filesystem root
+            break
+        current = parent
+    
+    # If not found, raise an error
+    raise RuntimeError(
+        f"Repository root not found. Searched upward from {script_dir} for README.md.\n"
+        "Set PROJECT_ROOT or REPO_ROOT environment variable, or ensure README.md exists in repo root."
+    )
+
+
+def locate_parquet_file() -> Path:
+    """Locate merged_panel_colombia_final.parquet (prefer $SCRATCH if present)."""
+    repo_root = get_repo_root()
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    candidates = []
+    if scratch_root is not None:
+        candidates.append(scratch_root / "data/ml/merged_panel_colombia_final.parquet")
+    candidates.append(repo_root / "data/ml/merged_panel_colombia_final.parquet")
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    raise FileNotFoundError("merged_panel_colombia_final.parquet not found in expected locations")
+
+
+def load_all_years_data(parquet_path: Path, years: list[int], wdpa_col: str) -> dict[int, pd.DataFrame]:
+    """Load data for multiple years from parquet file efficiently.
+    
+    Args:
+        parquet_path: Path to parquet file
+        years: List of years to load
+        wdpa_col: Name of the WDPA column (wdpa_b1 or WDPA_b1)
+    
+    Returns:
+        Dictionary mapping year to DataFrame with columns: x, y, wdpa_b1
+    """
+    print(f"  Loading data for years {min(years)}-{max(years)}...")
+    pfile = pq.ParquetFile(parquet_path)
+    
+    # Read schema to get available columns
+    arrow_schema = pfile.schema_arrow
+    available_columns = arrow_schema.names
+    
+    # Check which columns we need
+    required_cols = ['year', 'x', 'y', wdpa_col]
+    missing_cols = [col for col in required_cols if col not in available_columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}. Available: {available_columns}")
+    
+    # Read all row groups and filter by years
+    all_data = []
+    num_row_groups = pfile.metadata.num_row_groups
+    years_set = set(years)
+    
+    print(f"  Reading {num_row_groups} row groups...")
+    for rg_idx in range(num_row_groups):
+        if (rg_idx + 1) % 50 == 0:
+            print(f"    Progress: {rg_idx + 1}/{num_row_groups} row groups")
+        table = pfile.read_row_group(rg_idx, columns=required_cols)
+        df = table.to_pandas()
+        # Filter by years
+        df_filtered = df[df['year'].isin(years_set)].copy()
+        if len(df_filtered) > 0:
+            all_data.append(df_filtered)
+    
+    if not all_data:
+        print(f"    Warning: No data found for any of the requested years")
+        return {year: pd.DataFrame(columns=['x', 'y', 'wdpa_b1']) for year in years}
+    
+    # Combine all data
+    result = pd.concat(all_data, ignore_index=True)
+    
+    # Standardize column name to wdpa_b1
+    if wdpa_col != 'wdpa_b1':
+        result = result.rename(columns={wdpa_col: 'wdpa_b1'})
+    
+    # Group by year
+    year_data = {}
+    for year in years:
+        df_year = result[result['year'] == year][['x', 'y', 'wdpa_b1']].copy()
+        if len(df_year) > 0:
+            print(f"    Year {year}: {len(df_year):,} rows")
+        year_data[year] = df_year
+    
+    return year_data
+
+
+def create_wdpa_maps(parquet_path: Path, output_dir: Path, years: list[int]) -> None:
+    """Create maps of protected areas coverage for each year.
+    
+    Args:
+        parquet_path: Path to merged_panel_colombia_final.parquet
+        output_dir: Output directory for figures
+        years: List of years to visualize (2000-2024)
+    """
+    print("\n" + "=" * 70)
+    print("CREATING WDPA COVERAGE MAPS")
+    print("=" * 70)
+    
+    # Check which WDPA column exists
+    pfile = pq.ParquetFile(parquet_path)
+    arrow_schema = pfile.schema_arrow
+    available_columns = arrow_schema.names
+    
+    wdpa_col = None
+    for candidate in ['wdpa_b1', 'WDPA_b1']:
+        if candidate in available_columns:
+            wdpa_col = candidate
+            print(f"  Found WDPA column: '{wdpa_col}'")
+            break
+    
+    if wdpa_col is None:
+        raise ValueError(f"WDPA column not found. Available columns: {available_columns}")
+    
+    # Load data for all years efficiently
+    print(f"\n  Loading data for {len(years)} years...")
+    year_data = load_all_years_data(parquet_path, years, wdpa_col)
+    
+    # Remove empty years
+    year_data = {year: df for year, df in year_data.items() if len(df) > 0}
+    
+    if not year_data:
+        raise ValueError("No data loaded for any year!")
+    
+    print(f"\n  Loaded data for {len(year_data)} years: {sorted(year_data.keys())}")
+    
+    # Check coordinate system (just for labeling purposes)
+    print("\n  Checking coordinate system...")
+    data_crs = 'EPSG:4326'  # Default assumption
+    if year_data:
+        first_year = min(year_data.keys())
+        first_df = year_data[first_year]
+        
+        # Sample to check coordinate ranges
+        n_rows = len(first_df)
+        if n_rows > 100000:
+            sample_df = first_df.sample(n=100000, random_state=42)
+        else:
+            sample_df = first_df
+        
+        x_abs_max = sample_df['x'].abs().max()
+        y_abs_max = sample_df['y'].abs().max()
+        
+        # If coordinates have large absolute values, likely Web Mercator (EPSG:3857)
+        if x_abs_max > 1000 or y_abs_max > 1000:
+            print("  Detected EPSG:3857 (Web Mercator) coordinates in data")
+            data_crs = 'EPSG:3857'
+        else:
+            print("  Coordinates appear to be in EPSG:4326 (WGS84)")
+    
+    # Calculate bounds from all data (for consistent axis limits across all years)
+    print("\n  Calculating data bounds...")
+    all_x = []
+    all_y = []
+    for df_year in year_data.values():
+        all_x.extend(df_year['x'].tolist())
+        all_y.extend(df_year['y'].tolist())
+    
+    if all_x and all_y:
+        x_min, x_max = min(all_x), max(all_x)
+        y_min, y_max = min(all_y), max(all_y)
+        # Add small padding (2% on each side)
+        x_padding = (x_max - x_min) * 0.02
+        y_padding = (y_max - y_min) * 0.02
+        data_bounds = (x_min - x_padding, y_min - y_padding, 
+                      x_max + x_padding, y_max + y_padding)
+        print(f"  Data bounds: x=[{x_min:.2f}, {x_max:.2f}], y=[{y_min:.2f}, {y_max:.2f}]")
+    else:
+        data_bounds = None
+    
+    # Create figure with subplots (5x5 grid for 25 years)
+    n_years = len(years)
+    n_cols = 5
+    n_rows = (n_years + n_cols - 1) // n_cols  # Ceiling division
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(25, 5 * n_rows))
+    axes = axes.flatten() if n_years > 1 else [axes]
+    
+    # Plot each year
+    for idx, year in enumerate(years):
+        ax = axes[idx]
+        
+        if year not in year_data:
+            # No data for this year - show empty plot with label
+            ax.text(0.5, 0.5, f'Year {year}\n(No data)', 
+                   transform=ax.transAxes, ha='center', va='center', fontsize=12)
+            ax.set_title(f'{year}', fontsize=10, fontweight='bold')
+            ax.axis('off')
+            continue
+        
+        df_year = year_data[year]
+        
+        # Fill NaN with 0 and convert to boolean/int
+        wdpa_values = df_year['wdpa_b1'].fillna(0).astype(float)
+        is_protected = (wdpa_values == 1)
+        
+        # Plot points directly (no need for GeoDataFrame, just use x/y coordinates)
+        # This works for both EPSG:4326 and EPSG:3857 - matplotlib plots any (x,y) pairs
+        non_protected_mask = ~is_protected
+        if non_protected_mask.sum() > 0:
+            ax.scatter(df_year.loc[non_protected_mask, 'x'], 
+                      df_year.loc[non_protected_mask, 'y'],
+                      c='lightgray', s=0.1, alpha=0.2, zorder=2, edgecolors='none')
+        
+        if is_protected.sum() > 0:
+            ax.scatter(df_year.loc[is_protected, 'x'], 
+                      df_year.loc[is_protected, 'y'],
+                      c='#2E8B57', s=0.3, alpha=0.8, zorder=3, edgecolors='none')
+        
+        # Count protected pixels
+        protected_count = is_protected.sum()
+        total_count = len(df_year)
+        protected_pct = (protected_count / total_count * 100) if total_count > 0 else 0
+        
+        # Styling
+        ax.set_title(f'{year}\n({protected_pct:.2f}% protected)', 
+                    fontsize=10, fontweight='bold')
+        # Use appropriate labels based on CRS
+        if data_crs == 'EPSG:3857':
+            ax.set_xlabel('X (Web Mercator)', fontsize=8)
+            ax.set_ylabel('Y (Web Mercator)', fontsize=8)
+        else:
+            ax.set_xlabel('Longitude', fontsize=8)
+            ax.set_ylabel('Latitude', fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.3)
+        ax.set_aspect('equal', adjustable='box')
+        
+        # Set consistent bounds from data (if available)
+        if data_bounds is not None:
+            ax.set_xlim(data_bounds[0], data_bounds[2])
+            ax.set_ylim(data_bounds[1], data_bounds[3])
+    
+    # Hide unused subplots
+    for idx in range(len(years), len(axes)):
+        axes[idx].axis('off')
+    
+    # Add overall title
+    fig.suptitle('Protected Areas (WDPA) Coverage by Year (2000-2024)', 
+                fontsize=16, fontweight='bold', y=0.995)
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.99])
+    
+    # Save PNG with high DPI
+    png_path = output_dir / "wdpa_coverage_2000_2024.png"
+    plt.savefig(png_path, dpi=600, bbox_inches='tight')
+    print(f"\nSaved PNG: {png_path}")
+    
+    # Save PDF
+    pdf_path = output_dir / "wdpa_coverage_2000_2024.pdf"
+    plt.savefig(pdf_path, bbox_inches='tight')
+    print(f"Saved PDF: {pdf_path}")
+    
+    plt.close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Create visualizations of protected areas coverage by year",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        '--parquet_file',
+        type=str,
+        default=None,
+        help='Path to merged_panel_colombia_final.parquet (default: auto-locate)'
+    )
+    parser.add_argument(
+        '--out_dir',
+        type=str,
+        default=None,
+        help='Output directory (default: outputs/Figures/colombia_vis/colombia_WDPA/)'
+    )
+    parser.add_argument(
+        '--years',
+        type=str,
+        default='2000-2024',
+        help='Year range to visualize (default: 2000-2024). Format: start-end or comma-separated list'
+    )
+    
+    args = parser.parse_args()
+    
+    # Get repo root
+    repo_root = get_repo_root()
+    
+    # Locate parquet file
+    if args.parquet_file:
+        parquet_path = Path(args.parquet_file).resolve()
+    else:
+        parquet_path = locate_parquet_file()
+    
+    # Resolve output directory
+    if args.out_dir:
+        output_dir = Path(args.out_dir).resolve()
+    else:
+        scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+        if scratch_root is not None:
+            output_dir = scratch_root / "outputs/Figures/colombia_vis/colombia_WDPA"
+        else:
+            output_dir = repo_root / "outputs/Figures/colombia_vis/colombia_WDPA"
+    
+    # Parse years
+    if '-' in args.years:
+        # Range format: 2000-2024
+        start, end = map(int, args.years.split('-'))
+        years = list(range(start, end + 1))
+    else:
+        # Comma-separated list
+        years = [int(y.strip()) for y in args.years.split(',')]
+    
+    # Validate inputs
+    if not parquet_path.exists():
+        print(f"ERROR: Parquet file not found: {parquet_path}")
+        sys.exit(1)
+    
+    # Create output directory
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    print("=" * 70)
+    print("WDPA COVERAGE VISUALIZATION")
+    print("=" * 70)
+    print(f"\nParquet file: {parquet_path}")
+    print(f"Output directory: {output_dir}")
+    print(f"Years: {years}")
+    
+    # Create visualizations
+    create_wdpa_maps(parquet_path, output_dir, years)
+    
+    print("\n" + "=" * 70)
+    print("COMPLETE")
+    print("=" * 70)
+    print(f"\nAll outputs saved to: {output_dir}")
+
+
+if __name__ == "__main__":
+    main()
