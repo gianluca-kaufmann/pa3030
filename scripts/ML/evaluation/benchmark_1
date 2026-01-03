@@ -158,7 +158,18 @@ def find_latest_metrics_file(output_dir: Path) -> Path:
     files = list(output_dir.glob(pattern))
     
     if not files:
-        raise FileNotFoundError(f"No metrics files found in {output_dir} matching pattern {pattern}")
+        # Provide helpful error message with checked locations
+        repo_root = Path(__file__).resolve().parents[4]
+        scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+        checked_dirs = [str(output_dir)]
+        if scratch_root:
+            checked_dirs.append(str(scratch_root / "outputs/Results/ml_models"))
+        checked_dirs.append(str(repo_root / "outputs/Results/ml_models"))
+        raise FileNotFoundError(
+            f"No metrics files found matching pattern {pattern}\n"
+            f"  Checked directories:\n" + 
+            "\n".join(f"    - {d}" for d in checked_dirs)
+        )
     
     # Parse timestamp from filename: model1_lgbm_win5_metrics_YYYYMMDD_HHMMSS.json
     timestamp_pattern = re.compile(r'model1_lgbm_win5_metrics_(\d{8}_\d{6})\.json')
@@ -265,16 +276,38 @@ def create_benchmark_json(metrics_data: Dict[str, Any], dataset_hash: str) -> Di
     return benchmark
 
 
+def resolve_output_dir() -> Path:
+    """Resolve output directory (prefer $SCRATCH if present)."""
+    repo_root = Path(__file__).resolve().parents[4]
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+    
+    candidates = []
+    if scratch_root is not None:
+        candidates.append(scratch_root / "outputs/Results/ml_models")
+    candidates.append(repo_root / "outputs/Results/ml_models")
+    
+    for cand in candidates:
+        if cand.exists():
+            return cand
+    
+    # If neither exists, return the first candidate (will be created)
+    return candidates[0]
+
+
 def main() -> None:
     repo_root = Path(__file__).resolve().parents[4]
-    output_dir = repo_root / "outputs/Results/ml_models"
-    benchmark_output_dir = repo_root / "outputs/Results/ml_models"
+    output_dir = resolve_output_dir()
+    benchmark_output_dir = output_dir
     benchmark_output_dir.mkdir(parents=True, exist_ok=True)
     
     print("=" * 70)
     print("BENCHMARK EVALUATION: model1_LGBM")
     print("=" * 70)
     print(f"\nOutput directory: {output_dir}")
+    if output_dir.exists():
+        print(f"  ✓ Directory exists")
+    else:
+        print(f"  ⚠ Directory does not exist yet, will be created if needed")
     
     # Step 1: Find latest metrics file
     print("\n" + "=" * 70)
@@ -421,7 +454,18 @@ def main() -> None:
 
 if __name__ == "__main__":
     repo_root = Path(__file__).resolve().parents[4]
-    output_dir = repo_root / "outputs/Results/ml_models"
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+    
+    candidates = []
+    if scratch_root is not None:
+        candidates.append(scratch_root / "outputs/Results/ml_models")
+    candidates.append(repo_root / "outputs/Results/ml_models")
+    
+    output_dir = candidates[0]
+    for cand in candidates:
+        if cand.exists():
+            output_dir = cand
+            break
     output_dir.mkdir(parents=True, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

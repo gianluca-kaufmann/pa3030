@@ -82,6 +82,26 @@ def get_repo_root() -> Path:
     )
 
 
+def resolve_output_dir() -> Path:
+    """Resolve output directory (prefer $SCRATCH if present)."""
+    repo_root = get_repo_root()
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+    
+    candidates = []
+    if scratch_root is not None:
+        candidates.append(scratch_root / "outputs/Results/ml_models")
+    candidates.append(repo_root / "outputs/Results/ml_models")
+    
+    for cand in candidates:
+        if cand.exists():
+            return cand
+    
+    # If neither exists, return repo_root version and create it
+    output_dir = repo_root / "outputs/Results/ml_models"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
 def resolve_parquet_file(filename: str) -> Optional[Path]:
     """Locate parquet file (prefer $SCRATCH if present)."""
     repo_root = get_repo_root()
@@ -858,9 +878,7 @@ def main(
         test_predictions_path: Path to test predictions parquet file. If None, finds latest.
         calibration_method: Either "isotonic" or "platt"
     """
-    repo_root = get_repo_root()
-    output_dir = repo_root / "outputs/Results/ml_models"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = resolve_output_dir()
     
     print("=" * 70)
     print("CALIBRATION: model1_LGBM")
@@ -1216,7 +1234,25 @@ def main(
     print("=" * 70)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    figures_dir = repo_root / "outputs/Figures"
+    repo_root = get_repo_root()
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+    
+    # Resolve figures directory (prefer $SCRATCH if present)
+    figures_candidates = []
+    if scratch_root is not None:
+        figures_candidates.append(scratch_root / "outputs/Figures")
+    figures_candidates.append(repo_root / "outputs/Figures")
+    
+    figures_dir = None
+    for cand in figures_candidates:
+        if cand.exists():
+            figures_dir = cand
+            break
+    
+    if figures_dir is None:
+        # If neither exists, use repo_root version and create it
+        figures_dir = repo_root / "outputs/Figures"
+    
     figures_dir.mkdir(parents=True, exist_ok=True)
     
     plot_paths = []  # Initialize outside try block for summary
@@ -1660,9 +1696,7 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
-    repo_root = get_repo_root()
-    output_dir = repo_root / "outputs/Results/ml_models"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = resolve_output_dir()
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = output_dir / f"calibration_model1_lgbm_{args.method}_{timestamp}.txt"

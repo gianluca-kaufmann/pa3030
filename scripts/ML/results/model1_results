@@ -1249,12 +1249,18 @@ def create_probability_map(df: pd.DataFrame, region_boundary_path: Optional[Path
 
 def find_latest_file(pattern: str, search_dir: Path) -> Optional[Path]:
     """Find the most recent file matching a pattern in a directory."""
-    matches = list(search_dir.glob(pattern))
-    if not matches:
+    if not search_dir.exists():
         return None
-    # Sort by modification time, most recent first
-    matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return matches[0]
+    try:
+        matches = list(search_dir.glob(pattern))
+        if not matches:
+            return None
+        # Sort by modification time, most recent first
+        matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return matches[0]
+    except (OSError, PermissionError) as e:
+        print(f"  WARNING: Could not search in {search_dir}: {e}")
+        return None
 
 
 def main() -> None:
@@ -1295,32 +1301,82 @@ def main() -> None:
     
     args = parser.parse_args()
     
-    # Get repo root for auto-discovery
+    # Get repo root and scratch root for auto-discovery
     repo_root = get_repo_root()
-    ml_models_dir = repo_root / "outputs/Results/ml_models"
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+    
+    print("=" * 70)
+    print("PATH RESOLUTION")
+    print("=" * 70)
+    print(f"Repository root: {repo_root}")
+    if scratch_root:
+        print(f"SCRATCH directory: {scratch_root}")
+    else:
+        print("SCRATCH directory: Not set (running locally)")
+    print()
+    
+    # Check both $SCRATCH and repo root for ml_models directory
+    ml_models_candidates = []
+    if scratch_root is not None:
+        ml_models_candidates.append(scratch_root / "outputs/Results/ml_models")
+    ml_models_candidates.append(repo_root / "outputs/Results/ml_models")
+    
+    # Find the first existing ml_models directory
+    ml_models_dir = None
+    for candidate in ml_models_candidates:
+        if candidate.exists():
+            ml_models_dir = candidate
+            print(f"Using ml_models directory: {ml_models_dir}")
+            break
+    
+    if ml_models_dir is None:
+        # Fallback to repo root if neither exists (will create later)
+        ml_models_dir = repo_root / "outputs/Results/ml_models"
+        print(f"WARNING: ml_models directory not found, will use: {ml_models_dir}")
+    print()
     
     # Auto-discover files if not provided
     if args.metrics_json:
         metrics_path = Path(args.metrics_json).resolve()
     else:
         print("Auto-discovering metrics JSON file...")
-        metrics_path = find_latest_file("model1_lgbm_win5_metrics_*.json", ml_models_dir)
+        # Search in all candidate directories
+        metrics_path = None
+        for search_dir in ml_models_candidates:
+            if search_dir.exists():
+                found = find_latest_file("model1_lgbm_win5_metrics_*.json", search_dir)
+                if found is not None:
+                    metrics_path = found
+                    print(f"  Found: {metrics_path}")
+                    break
+        
         if metrics_path is None:
-            print(f"ERROR: Could not find model1_lgbm_win5_metrics_*.json in {ml_models_dir}")
+            print(f"ERROR: Could not find model1_lgbm_win5_metrics_*.json in any of:")
+            for cand in ml_models_candidates:
+                print(f"  - {cand}")
             print("Please provide --metrics_json path explicitly.")
             sys.exit(1)
-        print(f"  Found: {metrics_path}")
     
     if args.scored_parquet:
         parquet_path = Path(args.scored_parquet).resolve()
     else:
         print("Auto-discovering scored parquet file...")
-        parquet_path = find_latest_file("model1_lgbm_win5_scored*.parquet", ml_models_dir)
+        # Search in all candidate directories
+        parquet_path = None
+        for search_dir in ml_models_candidates:
+            if search_dir.exists():
+                found = find_latest_file("model1_lgbm_win5_scored*.parquet", search_dir)
+                if found is not None:
+                    parquet_path = found
+                    print(f"  Found: {parquet_path}")
+                    break
+        
         if parquet_path is None:
-            print(f"ERROR: Could not find model1_lgbm_win5_scored*.parquet in {ml_models_dir}")
+            print(f"ERROR: Could not find model1_lgbm_win5_scored*.parquet in any of:")
+            for cand in ml_models_candidates:
+                print(f"  - {cand}")
             print("Please provide --scored_parquet path explicitly.")
             sys.exit(1)
-        print(f"  Found: {parquet_path}")
     
     # Auto-discover test parquet if not provided
     if args.test_parquet:
@@ -1328,9 +1384,7 @@ def main() -> None:
     else:
         print("Auto-discovering test parquet file...")
         # Try to find test_win5.parquet in data/ml directory
-        repo_root = get_repo_root()
-        scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
-        
+        # Check both $SCRATCH and repo root
         candidates = []
         if scratch_root is not None:
             candidates.append(scratch_root / "data/ml/test_win5.parquet")
@@ -1344,7 +1398,9 @@ def main() -> None:
                 break
         
         if test_parquet_path is None:
-            print(f"  WARNING: Could not find test_win5.parquet")
+            print(f"  WARNING: Could not find test_win5.parquet in any of:")
+            for cand in candidates:
+                print(f"    - {cand}")
             print(f"  Risk map will use y_true only (may miss pixels established in test period)")
             print(f"  For accurate results, provide --test_parquet path to original test data")
             test_parquet_path = None
@@ -1358,9 +1414,19 @@ def main() -> None:
     if args.out_dir:
         output_dir = Path(args.out_dir).resolve()
     else:
-        output_dir = repo_root / "outputs/Results/ml_models/reporting"
+        # Prefer $SCRATCH for outputs on cluster, otherwise use repo root
+        if scratch_root is not None:
+            output_dir = scratch_root / "outputs/Results/ml_models/reporting"
+        else:
+            output_dir = repo_root / "outputs/Results/ml_models/reporting"
     
-    region_boundary_path = Path(args.region_boundary).resolve() if args.region_boundary else None
+    region_boundary_path = None
+    if args.region_boundary:
+        region_boundary_path = Path(args.region_boundary).resolve()
+        if not region_boundary_path.exists():
+            print(f"WARNING: Region boundary file not found: {region_boundary_path}")
+            print("  Will attempt to download from Natural Earth instead")
+            region_boundary_path = None
     
     # Validate inputs
     if not metrics_path.exists():
@@ -1371,8 +1437,12 @@ def main() -> None:
         print(f"ERROR: Scored parquet file not found: {parquet_path}")
         sys.exit(1)
     
-    # Create output directory
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Create output directory (with error handling)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except (OSError, PermissionError) as e:
+        print(f"ERROR: Could not create output directory {output_dir}: {e}")
+        sys.exit(1)
     
     print("=" * 70)
     print("MODEL 1 RESULTS REPORTING")
