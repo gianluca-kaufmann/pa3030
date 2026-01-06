@@ -42,8 +42,11 @@ def resolve_input() -> Path:
 
     candidates = []
     if scratch_root is not None:
-        # Try scratch location
+        # Check outputs/Results first (standard Euler location from colombia_features script)
+        candidates.append(scratch_root / "outputs/Results/merged_panel_colombia_final.parquet")
+        # Also check data/ml location
         candidates.append(scratch_root / "data/ml/merged_panel_colombia_final.parquet")
+    candidates.append(repo_root / "outputs/Results/merged_panel_colombia_final.parquet")
     candidates.append(repo_root / "data/ml/merged_panel_colombia_final.parquet")
 
     for cand in candidates:
@@ -124,8 +127,18 @@ def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: s
 def main() -> None:
     start_time = time.time()
 
+    repo_root = Path(__file__).resolve().parents[4]
     input_path = resolve_input()
-    base_dir = input_path.parent
+    
+    # Determine output location: prefer data/ml/tuning on scratch, else relative to input
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+    if scratch_root is not None:
+        # Use standard ML data location on scratch
+        base_dir = scratch_root / "data/ml"
+    else:
+        # Use repo location
+        base_dir = repo_root / "data/ml"
+    
     tuning_dir = base_dir / "tuning"
     tuning_dir.mkdir(parents=True, exist_ok=True)
     output_path = tuning_dir / "modelC_tuning_colombia.parquet"

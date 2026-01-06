@@ -175,14 +175,26 @@ def resolve_train_parquet() -> Path:
 
     candidates = []
     if scratch_root is not None:
+        # Check outputs/Results first (standard Euler location)
+        candidates.append(scratch_root / "outputs/Results/train.parquet")
+        # Also check data/ml location
         candidates.append(scratch_root / "data/ml/train.parquet")
+    candidates.append(repo_root / "outputs/Results/train.parquet")
     candidates.append(repo_root / "data/ml/train.parquet")
 
     for cand in candidates:
         if cand.exists():
             return cand
 
-    raise FileNotFoundError("train.parquet not found in expected locations")
+    # Provide detailed error message with all checked paths
+    error_msg = "train.parquet not found in expected locations.\n"
+    error_msg += "\nChecked locations:\n"
+    for cand in candidates:
+        error_msg += f"  - {cand}\n"
+    if scratch_root:
+        error_msg += f"\nSCRATCH root: {scratch_root}\n"
+    error_msg += f"Repository root: {repo_root}\n"
+    raise FileNotFoundError(error_msg)
 
 
 # =============================================================================
