@@ -101,8 +101,9 @@ N_ITER_RF = int(os.environ.get("N_ITER_RF", "100"))  # Default 100 iterations fo
 
 # Random Forest parameter grid
 RF_PARAM_GRID = {
-    "n_estimators": [200, 500, 1000],
-    "max_depth": [None, 10, 20, 40],
+    # Use 1000 for final training if feasible (not included here to keep tuning faster)
+    "n_estimators": [200, 500],
+    "max_depth": [15, 20, 30, 40, None],
     "min_samples_leaf": [5, 10, 20, 50],
     "min_samples_split": [2, 10, 50],
     "max_features": ["sqrt", "log2", 0.3, 0.5],
@@ -111,9 +112,9 @@ RF_PARAM_GRID = {
 }
 
 # Parallelism configuration
+# Default (Euler-safe): RandomizedSearchCV(n_jobs=1), RF(n_jobs=get_n_jobs())
+# Optional: Set TUNING_PARALLEL_MODE=search to parallelize search instead
 TUNING_PARALLEL_MODE = os.environ.get("TUNING_PARALLEL_MODE", "default")
-# Default: RandomizedSearchCV(n_jobs=1), RF(n_jobs=get_n_jobs())
-# If TUNING_PARALLEL_MODE=search: RandomizedSearchCV(n_jobs=get_n_jobs()), RF(n_jobs=1)
 
 # Random Forest fixed parameters (n_jobs set conditionally based on parallelism mode)
 RF_FIXED_PARAMS_BASE = {
@@ -524,11 +525,11 @@ def main() -> None:
 
     # Log to wandb
     if use_wandb:
-        # Log top 20 feature importances
-        top_20_dict = {
-            f"rf/feature_importance_impurity/{row['feature']}": float(row['importance'])
-            for _, row in top_20.iterrows()
-        }
+        # Log feature importances as a Table (not many scalar keys)
+        feature_importance_table = wandb.Table(
+            columns=["feature", "importance"],
+            data=[[row["feature"], float(row["importance"])] for _, row in importance_df.iterrows()]
+        )
         
         wandb.log(
             {
@@ -537,10 +538,13 @@ def main() -> None:
                 "rf/best_params": random_search_rf.best_params_,
                 "rf/total_param_combinations": total_combinations,
                 "rf/search_space_coverage_pct": (N_ITER_RF / total_combinations * 100),
-                **top_20_dict,
+                "rf/feature_importances": feature_importance_table,
             }
         )
 
+    # Extract top 10 features by importance
+    top_10_features = importance_df.head(10)["feature"].tolist()
+    
     # Save RF best parameters
     rf_best_params = {
         "best_params": random_search_rf.best_params_,
@@ -552,6 +556,7 @@ def main() -> None:
         "tuning_time_seconds": tune_time_rf,
         "total_param_combinations": total_combinations,
         "search_space_coverage_pct": (N_ITER_RF / total_combinations * 100),
+        "top_10_features_by_importance": top_10_features,
         "split_info": {
             "train_years": f"year <= {TRAIN_YEAR_MAX}",
             "earlystop_years": f"{EARLYSTOP_YEAR_MIN} <= year <= {EARLYSTOP_YEAR_MAX}",
