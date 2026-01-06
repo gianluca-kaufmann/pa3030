@@ -902,8 +902,18 @@ def create_risk_map(df: pd.DataFrame, region_boundary_path: Optional[Path], outp
             protected_raster[protected_raster == 0] = np.nan  # Set non-protected to NaN for masking
             print(f"  Protected areas raster created with {np.sum(~np.isnan(protected_raster)):,} pixels")
     
-    # Create figure
-    fig, ax = plt.subplots(figsize=(14, 11))
+    # Create figure with aspect ratio matching geographic bounds to avoid squishing
+    sa_bounds = sa_gdf.total_bounds  # (minx, miny, maxx, maxy)
+    sa_width = sa_bounds[2] - sa_bounds[0]
+    sa_height = sa_bounds[3] - sa_bounds[1]
+    # Guard against degenerate bounds
+    if sa_width <= 0 or sa_height <= 0:
+        fig, ax = plt.subplots(figsize=(14, 11))
+    else:
+        geo_aspect = sa_height / sa_width
+        base_width = 10
+        fig_height = base_width * geo_aspect
+        fig, ax = plt.subplots(figsize=(base_width, fig_height))
     
     # Plot South America boundary
     sa_gdf.plot(ax=ax, color='white', edgecolor='none', linewidth=1.5, zorder=1)
@@ -1128,11 +1138,11 @@ def create_probability_map(df: pd.DataFrame, region_boundary_path: Optional[Path
     
     # Use percentile-based range to balance color distribution
     # This clips extreme outliers and better utilizes the full colormap
-    # Using 25th to 98th percentile clips lowest 25% to reduce purple dominance
-    proba_p25 = np.percentile(proba_values, 25)
-    proba_p98 = np.percentile(proba_values, 98)
+    # Using 5th to 99.5th percentile keeps almost all variation while avoiding extreme tails
+    proba_p25 = np.percentile(proba_values, 5)
+    proba_p98 = np.percentile(proba_values, 99.5)
     
-    print(f"  Using percentile-based color range (25th-98th percentile)")
+    print(f"  Using percentile-based color range (5th-99.5th percentile)")
     print(f"  Probability range: [{proba_min:.6f}, {proba_max:.6f}]")
     print(f"  Colorbar range: [{proba_p25:.6f}, {proba_p98:.6f}]")
     print(f"  Range span: {proba_p98 - proba_p25:.6f}")
@@ -1142,7 +1152,7 @@ def create_probability_map(df: pd.DataFrame, region_boundary_path: Optional[Path
     
     # Apply power transformation to stretch the distribution
     # This helps distribute colors better across the colormap
-    # Using square root transformation to emphasize higher values
+    # Using square root transformation to emphasize higher values and reduce dominance of low values
     proba_shifted = proba_clipped - proba_p25  # Shift to start at 0
     proba_span = proba_p98 - proba_p25
     proba_normalized_linear = proba_shifted / proba_span  # Linear normalization to [0, 1]
@@ -1166,8 +1176,18 @@ def create_probability_map(df: pd.DataFrame, region_boundary_path: Optional[Path
     print(f"  Raster shape: {raster.shape}, extent: {extent}")
     print(f"  Valid (non-NaN) pixels: {np.sum(~np.isnan(raster)):,}")
     
-    # Create figure
-    fig, ax = plt.subplots(figsize=(14, 11))
+    # Create figure with aspect ratio matching geographic bounds to avoid squishing
+    sa_bounds = sa_gdf.total_bounds  # (minx, miny, maxx, maxy)
+    sa_width = sa_bounds[2] - sa_bounds[0]
+    sa_height = sa_bounds[3] - sa_bounds[1]
+    # Guard against degenerate bounds
+    if sa_width <= 0 or sa_height <= 0:
+        fig, ax = plt.subplots(figsize=(14, 11))
+    else:
+        geo_aspect = sa_height / sa_width
+        base_width = 10
+        fig_height = base_width * geo_aspect
+        fig, ax = plt.subplots(figsize=(base_width, fig_height))
     
     # Plot South America boundary
     sa_gdf.plot(ax=ax, color='white', edgecolor='none', linewidth=1.5, zorder=1)

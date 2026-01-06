@@ -52,7 +52,7 @@ class Tee:
 
 def resolve_parquet_file(filename: str) -> Optional[Path]:
     """Locate parquet file (prefer $SCRATCH if present)."""
-    repo_root = Path(__file__).resolve().parents[4]
+    repo_root = Path(__file__).resolve().parents[3]
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
 
     candidates = []
@@ -142,11 +142,12 @@ def compute_dataset_hash(num_sample_row_groups: int = 3) -> str:
 def find_latest_metrics_file(output_dir: Path) -> Path:
     """Find the most recent model1_lgbm_win5_metrics JSON file.
     
+    Searches in multiple candidate directories (SCRATCH and repo root) to find metrics files.
     Parses timestamp from filename (format: YYYYMMDD_HHMMSS) and sorts by it.
     Falls back to modification time if timestamp cannot be parsed.
     
     Args:
-        output_dir: Directory containing metrics files
+        output_dir: Primary directory to search (but will also check other candidates)
         
     Returns:
         Path to the most recent metrics file
@@ -155,21 +156,37 @@ def find_latest_metrics_file(output_dir: Path) -> Path:
         FileNotFoundError: If no metrics file is found
     """
     pattern = "model1_lgbm_win5_metrics_*.json"
-    files = list(output_dir.glob(pattern))
     
-    if not files:
+    # Build list of candidate directories to search
+    repo_root = Path(__file__).resolve().parents[3]
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+    
+    candidate_dirs = []
+    if scratch_root:
+        candidate_dirs.append(scratch_root / "outputs/Results/ml_models")
+    candidate_dirs.append(repo_root / "outputs/Results/ml_models")
+    # Also include the passed output_dir if it's different
+    if output_dir not in candidate_dirs:
+        candidate_dirs.append(output_dir)
+    
+    # Search all candidate directories
+    all_files = []
+    checked_dirs = []
+    for cand_dir in candidate_dirs:
+        if cand_dir.exists():
+            checked_dirs.append(str(cand_dir))
+            files = list(cand_dir.glob(pattern))
+            all_files.extend(files)
+    
+    if not all_files:
         # Provide helpful error message with checked locations
-        repo_root = Path(__file__).resolve().parents[4]
-        scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
-        checked_dirs = [str(output_dir)]
-        if scratch_root:
-            checked_dirs.append(str(scratch_root / "outputs/Results/ml_models"))
-        checked_dirs.append(str(repo_root / "outputs/Results/ml_models"))
         raise FileNotFoundError(
             f"No metrics files found matching pattern {pattern}\n"
             f"  Checked directories:\n" + 
             "\n".join(f"    - {d}" for d in checked_dirs)
         )
+    
+    files = all_files
     
     # Parse timestamp from filename: model1_lgbm_win5_metrics_YYYYMMDD_HHMMSS.json
     timestamp_pattern = re.compile(r'model1_lgbm_win5_metrics_(\d{8}_\d{6})\.json')
@@ -278,7 +295,7 @@ def create_benchmark_json(metrics_data: Dict[str, Any], dataset_hash: str) -> Di
 
 def resolve_output_dir() -> Path:
     """Resolve output directory (prefer $SCRATCH if present)."""
-    repo_root = Path(__file__).resolve().parents[4]
+    repo_root = Path(__file__).resolve().parents[3]
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
     
     candidates = []
@@ -295,7 +312,7 @@ def resolve_output_dir() -> Path:
 
 
 def main() -> None:
-    repo_root = Path(__file__).resolve().parents[4]
+    repo_root = Path(__file__).resolve().parents[3]
     output_dir = resolve_output_dir()
     benchmark_output_dir = output_dir
     benchmark_output_dir.mkdir(parents=True, exist_ok=True)
@@ -453,7 +470,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    repo_root = Path(__file__).resolve().parents[4]
+    repo_root = Path(__file__).resolve().parents[3]
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
     
     candidates = []
