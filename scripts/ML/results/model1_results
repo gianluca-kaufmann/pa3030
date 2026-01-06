@@ -623,13 +623,14 @@ def points_to_raster(x: np.ndarray, y: np.ndarray, values: np.ndarray,
     """Convert point data to a raster grid for pixel-perfect visualization.
     
     Uses histogram-based binning for maximum precision and performance.
-    For 1 km resolution, approximately 0.009 degrees.
+    Works with any coordinate system (degrees, meters, etc.).
+    For 1 km resolution in degrees: ~0.009 degrees. For meters: 1000.0 meters.
     
     Args:
-        x: Longitude coordinates
-        y: Latitude coordinates  
+        x: X coordinates (longitude in degrees, or easting in meters, etc.)
+        y: Y coordinates (latitude in degrees, or northing in meters, etc.)
         values: Values to rasterize
-        target_resolution: Target resolution in degrees. If None, auto-detects from data.
+        target_resolution: Target resolution in same units as coordinates. If None, auto-detects from data.
     
     Returns:
         Tuple of (raster_array, extent) where extent is (xmin, xmax, ymin, ymax)
@@ -878,15 +879,23 @@ def create_risk_map(df: pd.DataFrame, region_boundary_path: Optional[Path], outp
     # Update gdf to match filtered df (keep geometry and derived columns in sync)
     gdf = gdf[gdf.index.isin(df.index)].copy()
     
+    # Reproject to EPSG:3857 (Web Mercator) for proper aspect ratio
+    # This ensures 1 meter is drawn the same length in both directions
+    print(f"  Reprojecting to EPSG:3857 (Web Mercator) for proper aspect ratio...")
+    sa_gdf_proj = sa_gdf.to_crs('EPSG:3857')
+    gdf_proj = gdf.to_crs('EPSG:3857')
+    print(f"  Reprojected bounds: {gdf_proj.total_bounds}")
+    
     # Convert to raster for pixel-perfect visualization
-    print(f"  Converting {len(gdf):,} points to raster grid...")
+    # Use ~1 km resolution in meters (1000 m)
+    print(f"  Converting {len(gdf_proj):,} points to raster grid...")
     
     # Create main category raster
     category_raster, extent = points_to_raster(
-        gdf.geometry.x.values,
-        gdf.geometry.y.values,
-        gdf['category_code'].values,
-        target_resolution=0.009  # ~1 km resolution
+        gdf_proj.geometry.x.values,
+        gdf_proj.geometry.y.values,
+        gdf['category_code'].values,  # Use original gdf for category codes (index-aligned)
+        target_resolution=1000.0  # ~1 km resolution in meters
     )
     print(f"  Category raster shape: {category_raster.shape}, extent: {extent}")
     print(f"  Valid (non-NaN) pixels: {np.sum(~np.isnan(category_raster)):,}")
@@ -898,10 +907,10 @@ def create_risk_map(df: pd.DataFrame, region_boundary_path: Optional[Path], outp
         if protected_mask.sum() > 0:
             # Create protected areas raster using same grid as category raster
             protected_raster, protected_extent = points_to_raster(
-                gdf.geometry.x.values,
-                gdf.geometry.y.values,
+                gdf_proj.geometry.x.values,
+                gdf_proj.geometry.y.values,
                 protected_mask.astype(float),  # Convert boolean to float for rasterization
-                target_resolution=0.009  # ~1 km resolution
+                target_resolution=1000.0  # ~1 km resolution in meters
             )
             # Ensure extent matches (should be the same, but verify)
             if protected_extent != extent:
@@ -913,10 +922,10 @@ def create_risk_map(df: pd.DataFrame, region_boundary_path: Optional[Path], outp
             protected_raster[protected_raster == 0] = np.nan  # Set non-protected to NaN for masking
             print(f"  Protected areas raster created with {np.sum(~np.isnan(protected_raster)):,} pixels")
     
-    # Create figure with aspect ratio matching geographic bounds to avoid squishing
-    sa_bounds = sa_gdf.total_bounds  # (minx, miny, maxx, maxy)
-    sa_width = sa_bounds[2] - sa_bounds[0]
-    sa_height = sa_bounds[3] - sa_bounds[1]
+    # Create figure with aspect ratio matching geographic bounds (projected) to avoid squishing
+    sa_bounds_proj = sa_gdf_proj.total_bounds  # (minx, miny, maxx, maxy) in meters
+    sa_width = sa_bounds_proj[2] - sa_bounds_proj[0]
+    sa_height = sa_bounds_proj[3] - sa_bounds_proj[1]
     # Guard against degenerate bounds
     if sa_width <= 0 or sa_height <= 0:
         fig, ax = plt.subplots(figsize=(14, 11))
@@ -926,8 +935,8 @@ def create_risk_map(df: pd.DataFrame, region_boundary_path: Optional[Path], outp
         fig_height = base_width * geo_aspect
         fig, ax = plt.subplots(figsize=(base_width, fig_height))
     
-    # Plot South America boundary
-    sa_gdf.plot(ax=ax, color='white', edgecolor='none', linewidth=1.5, zorder=1)
+    # Plot South America boundary (reprojected)
+    sa_gdf_proj.plot(ax=ax, color='white', edgecolor='none', linewidth=1.5, zorder=1)
     
     # Define colors for each category using viridis colormap
     from matplotlib.colors import ListedColormap, BoundaryNorm
@@ -1017,8 +1026,8 @@ def create_risk_map(df: pd.DataFrame, region_boundary_path: Optional[Path], outp
                          zorder=2.5)
     
     # Styling
-    ax.set_xlabel('Longitude', fontsize=12)
-    ax.set_ylabel('Latitude', fontsize=12)
+    ax.set_xlabel('Easting (m, EPSG:3857)', fontsize=12)
+    ax.set_ylabel('Northing (m, EPSG:3857)', fontsize=12)
     ax.set_title('Model 1 Risk Map: Predicted High-Risk Pixels and Observed PA Establishments', 
                  fontsize=15, fontweight='bold', pad=15)
     
@@ -1071,13 +1080,13 @@ def create_risk_map(df: pd.DataFrame, region_boundary_path: Optional[Path], outp
     ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
     
     # Set aspect ratio to maintain geographic proportions
-    # aspect='equal' ensures degrees are not distorted
+    # aspect='equal' ensures 1 meter is drawn the same length in both directions (in projected CRS)
     ax.set_aspect('equal', adjustable='box')
     
-    # Force map extent using South America bounds to prevent rare bad coordinates from squishing the map
-    sa_bounds = sa_gdf.total_bounds  # (minx, miny, maxx, maxy)
-    ax.set_xlim(sa_bounds[0], sa_bounds[2])
-    ax.set_ylim(sa_bounds[1], sa_bounds[3])
+    # Force map extent using South America bounds (projected) to prevent rare bad coordinates from squishing the map
+    sa_bounds_proj = sa_gdf_proj.total_bounds  # (minx, miny, maxx, maxy) in meters
+    ax.set_xlim(sa_bounds_proj[0], sa_bounds_proj[2])
+    ax.set_ylim(sa_bounds_proj[1], sa_bounds_proj[3])
     
     plt.tight_layout()
     
@@ -1198,28 +1207,34 @@ def create_probability_map(df: pd.DataFrame, region_boundary_path: Optional[Path
     proba_normalized = proba_clipped_filtered / proba_p97  # Normalize to [0, 1]
     proba_normalized = np.power(proba_normalized, 0.5)  # Gentle power transformation
     
+    # Reproject to EPSG:3857 (Web Mercator) for proper aspect ratio
+    # This ensures 1 meter is drawn the same length in both directions
+    print(f"  Reprojecting to EPSG:3857 (Web Mercator) for proper aspect ratio...")
+    sa_gdf_proj = sa_gdf.to_crs('EPSG:3857')
+    gdf_proj = gdf.to_crs('EPSG:3857')
+    print(f"  Reprojected bounds: {gdf_proj.total_bounds}")
+    
     # Convert points to raster for pixel-perfect visualization
-    print(f"  Converting {len(gdf):,} points to raster grid...")
+    # Use ~1 km resolution in meters (1000 m)
+    print(f"  Converting {len(gdf_proj):,} points to raster grid...")
     raster, extent = points_to_raster(
-        gdf.geometry.x.values, 
-        gdf.geometry.y.values, 
+        gdf_proj.geometry.x.values, 
+        gdf_proj.geometry.y.values, 
         proba_normalized,  # Use normalized values to ensure full colormap usage
-        target_resolution=0.009  # ~1 km resolution
+        target_resolution=1000.0  # ~1 km resolution in meters
     )
     print(f"  Raster shape: {raster.shape}, extent: {extent}")
     print(f"  Valid (non-NaN) pixels: {np.sum(~np.isnan(raster)):,}")
     
-    # Create figure - use aspect ratio close to data extent
-    # South America spans roughly 55° longitude and 75° latitude
-    # Use 12 width, and calculate height to maintain geographic proportions
+    # Create figure - use aspect ratio close to data extent (now in meters)
     xmin, xmax, ymin, ymax = extent
-    data_aspect = (ymax - ymin) / (xmax - xmin)  # latitude range / longitude range
+    data_aspect = (ymax - ymin) / (xmax - xmin)  # height / width in meters
     fig_width = 12
     fig_height = fig_width * data_aspect * 0.9  # Scale down slightly for better display
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
     
-    # Plot South America boundary
-    sa_gdf.plot(ax=ax, color='white', edgecolor='none', linewidth=1.5, zorder=1)
+    # Plot South America boundary (reprojected)
+    sa_gdf_proj.plot(ax=ax, color='white', edgecolor='none', linewidth=1.5, zorder=1)
     
     # Plot probability raster with pixel-perfect rendering
     # Use 'plasma' colormap for a visually pleasing gradient (dark purple -> yellow)
@@ -1247,8 +1262,8 @@ def create_probability_map(df: pd.DataFrame, region_boundary_path: Optional[Path
     cbar.ax.tick_params(labelsize=10)
     
     # Styling
-    ax.set_xlabel('Longitude', fontsize=12)
-    ax.set_ylabel('Latitude', fontsize=12)
+    ax.set_xlabel('Easting (m, EPSG:3857)', fontsize=12)
+    ax.set_ylabel('Northing (m, EPSG:3857)', fontsize=12)
     
     # Check if calibrated probabilities were used
     calibration_note = ""
@@ -1279,13 +1294,13 @@ def create_probability_map(df: pd.DataFrame, region_boundary_path: Optional[Path
     ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
     
     # Set aspect ratio to maintain geographic proportions
-    # aspect='equal' ensures degrees are not distorted
+    # aspect='equal' ensures 1 meter is drawn the same length in both directions (in projected CRS)
     ax.set_aspect('equal', adjustable='box')
     
-    # Force map extent using South America bounds to prevent rare bad coordinates from squishing the map
-    sa_bounds = sa_gdf.total_bounds  # (minx, miny, maxx, maxy)
-    ax.set_xlim(sa_bounds[0], sa_bounds[2])
-    ax.set_ylim(sa_bounds[1], sa_bounds[3])
+    # Force map extent using South America bounds (projected) to prevent rare bad coordinates from squishing the map
+    sa_bounds_proj = sa_gdf_proj.total_bounds  # (minx, miny, maxx, maxy) in meters
+    ax.set_xlim(sa_bounds_proj[0], sa_bounds_proj[2])
+    ax.set_ylim(sa_bounds_proj[1], sa_bounds_proj[3])
     
     plt.tight_layout()
     
