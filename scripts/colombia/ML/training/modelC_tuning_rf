@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 
-"""ModelC LightGBM Hyperparameter Tuning Script (Colombia Dataset)
+"""ModelC Random Forest Hyperparameter Tuning Script (Colombia Dataset)
 
-Purpose: Perform comprehensive hyperparameter tuning for a LightGBM model using
+Purpose: Perform comprehensive hyperparameter tuning for a Random Forest model using
          the Colombia-specific tuning dataset (modelC_tuning_colombia.parquet)
          with per-year sampling and strict temporal split
          (train: year <= 2014, earlystop: 2015 <= year <= 2017).
 
 Input:   `modelC_tuning_colombia.parquet`
-Output:  - lgbm_best_params.json
+Output:  - rf_best_params.json
 
 Features:
 - Expanded hyperparameter search space for better optimization
-- More iterations for RandomizedSearchCV
+- RandomizedSearchCV with Random Forest classifier
 - Comprehensive parameter ranges covering common best practices
 """
 
@@ -24,6 +24,7 @@ import os
 import sys
 import time
 from copy import deepcopy
+
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -31,15 +32,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import wandb
-from lightgbm import LGBMClassifier
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import RandomizedSearchCV, PredefinedSplit
-
-# Import early_stopping callback - available in lightgbm 3.3.0+
-try:
-    from lightgbm import early_stopping
-except ImportError:
-    # Fallback for older versions
-    from lightgbm.callbacks import early_stopping
 
 
 class Tee:
@@ -102,48 +96,28 @@ EXCLUDE_COLS = {
     "year",  # Temporal identifier (kept for splitting)
 }
 
-# RandomizedSearchCV configuration - more iterations for better search
-N_ITER_LGBM = int(os.environ.get("N_ITER_LGBM", "500"))  # Increased to 500 for comprehensive search
+# RandomizedSearchCV configuration
+N_ITER_RF = int(os.environ.get("N_ITER_RF", "100"))  # Default 100 iterations for RF
 
-# Expanded LightGBM parameter grid for comprehensive search
-LGBM_PARAM_GRID_BASE = {
-    # Tree structure parameters
-    "num_leaves": [15, 31, 63, 127, 255],  # More options, including smaller and larger
-    "max_depth": [-1, 5, 10, 15, 20, 25, 30],  # Wider range including shallower trees
-    "min_child_samples": [10, 20, 30, 50, 100, 200],  # More granular options
-    "min_child_weight": [0.001, 0.01, 0.1, 1.0, 5.0],  # Additional regularization
-    
-    # Learning rate - wider range
-    "learning_rate": [0.005, 0.01, 0.03, 0.05, 0.1, 0.15, 0.2],
-    
-    # Sampling parameters
-    "subsample": [0.6, 0.7, 0.8, 0.9, 0.95, 1.0],  # Including 1.0 (no subsampling)
-    "subsample_freq": [0, 1, 3, 5, 7],  # Frequency of subsampling
-    "colsample_bytree": [0.6, 0.7, 0.8, 0.9, 1.0],  # Including 1.0
-    "colsample_bynode": [0.6, 0.7, 0.8, 0.9, 1.0],  # Additional sampling at node level
-    
-    # Class imbalance handling - wider range
-    "scale_pos_weight": [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0],
-    
-    # Regularization parameters - more granular
-    "reg_alpha": [0.0, 0.01, 0.1, 0.5, 1.0, 2.0, 5.0],  # L1 regularization
-    "reg_lambda": [0.0, 0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0],  # L2 regularization
-    
-    # Additional advanced parameters
-    "min_split_gain": [0.0, 0.1, 0.5, 1.0],  # Minimum gain to split
-    "max_bin": [63, 127, 255, 511],  # Number of bins for feature discretization
-    "path_smooth": [0.0, 0.1, 0.5, 1.0],  # Path smoothing (LightGBM 4.0+)
+# Random Forest parameter grid
+RF_PARAM_GRID = {
+    "n_estimators": [200, 500, 1000],
+    "max_depth": [None, 10, 20, 40],
+    "min_samples_leaf": [5, 10, 20, 50],
+    "min_samples_split": [2, 10, 50],
+    "max_features": ["sqrt", "log2", 0.3, 0.5],
+    "bootstrap": [True],
+    "class_weight": ["balanced_subsample"],
 }
 
-# LightGBM fixed parameters
-LGBM_FIXED_PARAMS = {
+# Parallelism configuration
+TUNING_PARALLEL_MODE = os.environ.get("TUNING_PARALLEL_MODE", "default")
+# Default: RandomizedSearchCV(n_jobs=1), RF(n_jobs=get_n_jobs())
+# If TUNING_PARALLEL_MODE=search: RandomizedSearchCV(n_jobs=get_n_jobs()), RF(n_jobs=1)
+
+# Random Forest fixed parameters (n_jobs set conditionally based on parallelism mode)
+RF_FIXED_PARAMS_BASE = {
     "random_state": RANDOM_STATE,
-    "n_jobs": get_n_jobs(),
-    "boosting_type": "gbdt",
-    "objective": "binary",
-    "verbose": -1,
-    # Use a high n_estimators value in combination with early stopping
-    "n_estimators": 3000,  # Increased from 2000 for potentially better convergence
 }
 
 
@@ -192,44 +166,6 @@ def convert_numpy_types(obj: Any) -> Any:
                 return obj
         except (ValueError, TypeError, AttributeError):
             return str(obj)
-
-
-def filter_supported_params(param_grid: dict) -> dict:
-    """Filter out hyperparameters not supported by the installed LightGBM version.
-    
-    Tests each parameter by attempting to create a minimal model with it.
-    Returns a filtered parameter grid with only supported parameters.
-    """
-    filtered_grid = {}
-    unsupported_params = []
-    
-    # Test each parameter in the grid
-    for param, values in param_grid.items():
-        if not values:
-            continue
-        try:
-            # Create a minimal test model with this parameter
-            # Use the first value from the list to test
-            test_value = values[0]
-            test_model = LGBMClassifier(
-                n_estimators=1,
-                verbose=-1,
-                **{param: test_value}
-            )
-            # If successful, parameter is supported
-            filtered_grid[param] = values
-        except (TypeError, ValueError, AttributeError) as e:
-            # Parameter not supported by this LightGBM version
-            unsupported_params.append(param)
-            # Only print if it's not a common unsupported param to reduce noise
-            if param == "path_smooth":
-                print(f"  Info: Parameter 'path_smooth' not supported (requires LightGBM 4.0+), skipping...")
-    
-    if unsupported_params:
-        if len(unsupported_params) > 1 or (len(unsupported_params) == 1 and unsupported_params[0] != "path_smooth"):
-            print(f"  Removed {len(unsupported_params)} unsupported parameter(s): {', '.join(unsupported_params)}")
-    
-    return filtered_grid
 
 
 def get_feature_columns(df: pd.DataFrame) -> list:
@@ -288,9 +224,9 @@ def main() -> None:
     try:
         print("Initializing Weights & Biases...")
         wandb.init(
-            project="ml-hyperparameter-tuning-lgbm-colombia",
+            project="ml-hyperparameter-tuning-rf-colombia",
             entity=wandb_entity,
-            name=f"modelC_tuning_lgbm_{timestamp}",
+            name=f"modelC_tuning_rf_{timestamp}",
             config={
                 "random_state": RANDOM_STATE,
                 "temporal_split": {
@@ -298,7 +234,7 @@ def main() -> None:
                     "earlystop_year_min": EARLYSTOP_YEAR_MIN,
                     "earlystop_year_max": EARLYSTOP_YEAR_MAX,
                 },
-                "n_iter_lgbm": N_ITER_LGBM,
+                "n_iter_rf": N_ITER_RF,
             },
         )
         use_wandb = True
@@ -307,7 +243,7 @@ def main() -> None:
         print(f"W&B initialization failed: {err}\n")
 
     print("=" * 70)
-    print("MODELC LIGHTGBM HYPERPARAMETER TUNING (COLOMBIA DATASET)")
+    print("MODELC RANDOM FOREST HYPERPARAMETER TUNING (COLOMBIA DATASET)")
     print("=" * 70)
     print(f"\nInput:  {train_path}")
     print(f"Output: {script_dir}")
@@ -459,10 +395,10 @@ def main() -> None:
     y_combined = np.concatenate([y_train.values, y_earlystop.values])
     split_indices = np.concatenate(
         [
-            np.full(n_train, -1),  # -1 for train
-            np.zeros(n_earlystop),  # 0 for earlystop/test
+            np.full(n_train, -1, dtype=int),  # -1 for train
+            np.zeros(n_earlystop, dtype=int),  # 0 for earlystop/test
         ]
-    )
+    ).astype(int)  # Ensure int dtype for PredefinedSplit
     predefined_split = PredefinedSplit(split_indices)
 
     print(f"\nCombined dataset for CV: {len(X_combined):,} rows")
@@ -470,152 +406,156 @@ def main() -> None:
     print(f"  Earlystop:   {n_earlystop:,} rows (indices 0)")
 
     # -------------------------------------------------------------------------
-    # Step 4: Prepare parameter grid (including auto scale_pos_weight)
+    # Step 4: Prepare parameter grid
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("STEP 4: PREPARE EXPANDED PARAMETER GRID")
+    print("STEP 4: PREPARE PARAMETER GRID")
     print("=" * 70)
 
-    # Compute auto scale_pos_weight from train distribution
-    auto_scale_pos_weight = train_neg / max(train_pos, 1)
-    print(f"\nAuto scale_pos_weight (train_neg/train_pos): {auto_scale_pos_weight:.3f}")
+    rf_param_grid = deepcopy(RF_PARAM_GRID)
 
-    lgbm_param_grid = deepcopy(LGBM_PARAM_GRID_BASE)
-    spw_values = list(lgbm_param_grid["scale_pos_weight"])
-    spw_values.append(float(auto_scale_pos_weight))
-    # Remove potential duplicates while preserving order
-    seen = set()
-    unique_spw_values = []
-    for v in spw_values:
-        if v not in seen:
-            seen.add(v)
-            unique_spw_values.append(v)
-    lgbm_param_grid["scale_pos_weight"] = unique_spw_values
-    
-    # Filter out unsupported parameters for version compatibility
-    print("\nFiltering parameter grid for version compatibility...")
-    lgbm_param_grid = filter_supported_params(lgbm_param_grid)
-
-    # Calculate total parameter combinations (for information) - after filtering
+    # Calculate total parameter combinations (for information)
     total_combinations = 1
-    for param, values in lgbm_param_grid.items():
+    for param, values in rf_param_grid.items():
         total_combinations *= len(values)
 
-    print("\nExpanded parameter grid:")
-    for param, values in sorted(lgbm_param_grid.items()):
+    print("\nParameter grid:")
+    for param, values in sorted(rf_param_grid.items()):
         print(f"  {param}: {len(values)} options - {values}")
     
     print(f"\nTotal possible combinations: {total_combinations:,}")
-    print(f"Searching {N_ITER_LGBM} random combinations ({(N_ITER_LGBM/total_combinations*100):.6f}% of search space)")
+    print(f"Searching {N_ITER_RF} random combinations ({(N_ITER_RF/total_combinations*100):.6f}% of search space)")
 
     print("\nFixed parameters:")
-    for param, value in LGBM_FIXED_PARAMS.items():
+    for param, value in RF_FIXED_PARAMS_BASE.items():
         print(f"  {param}: {value}")
+    print(f"  n_jobs: (set dynamically based on parallelism mode)")
 
     # -------------------------------------------------------------------------
-    # Step 5: LightGBM hyperparameter tuning with early stopping
+    # Step 5: Random Forest hyperparameter tuning
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("STEP 5: LIGHTGBM HYPERPARAMETER TUNING")
+    print("STEP 5: RANDOM FOREST HYPERPARAMETER TUNING")
     print("=" * 70)
 
     print(
         f"\nUsing temporal split: train (year <= {TRAIN_YEAR_MAX}) / "
         f"earlystop ({EARLYSTOP_YEAR_MIN} <= year <= {EARLYSTOP_YEAR_MAX})"
     )
-    print(f"Sampling {N_ITER_LGBM} parameter combinations with RandomizedSearchCV")
+    print(f"Sampling {N_ITER_RF} parameter combinations with RandomizedSearchCV")
 
-    # Create LightGBM model
-    lgbm_model = LGBMClassifier(**LGBM_FIXED_PARAMS)
+    # Configure parallelism based on TUNING_PARALLEL_MODE
+    if TUNING_PARALLEL_MODE == "search":
+        # Parallelize search, single-thread RF
+        search_n_jobs = get_n_jobs()
+        rf_n_jobs = 1
+        print(f"\nParallelism mode: search (RandomizedSearchCV n_jobs={search_n_jobs}, RF n_jobs=1)")
+    else:
+        # Default: Single-thread search, parallel RF
+        search_n_jobs = 1
+        rf_n_jobs = get_n_jobs()
+        print(f"\nParallelism mode: default (RandomizedSearchCV n_jobs=1, RF n_jobs={rf_n_jobs})")
+
+    # Create Random Forest model with appropriate n_jobs
+    RF_FIXED_PARAMS = {**RF_FIXED_PARAMS_BASE, "n_jobs": rf_n_jobs}
+    rf_model = RandomForestClassifier(**RF_FIXED_PARAMS)
 
     # Randomized search with fixed train/val split
-    print(f"\nStarting randomized search ({N_ITER_LGBM} iterations) with early stopping...")
+    print(f"\nStarting randomized search ({N_ITER_RF} iterations)...")
     print("This may take a while...\n")
 
-    random_search_lgbm = RandomizedSearchCV(
-        estimator=lgbm_model,
-        param_distributions=lgbm_param_grid,
-        n_iter=N_ITER_LGBM,
+    random_search_rf = RandomizedSearchCV(
+        estimator=rf_model,
+        param_distributions=rf_param_grid,
+        n_iter=N_ITER_RF,
         cv=predefined_split,  # Use fixed train/val split
         scoring="average_precision",  # PR-AUC (better for imbalanced data)
-        n_jobs=1,  # Avoid nested parallelism
+        n_jobs=search_n_jobs,  # Set based on parallelism mode
         verbose=2,
         random_state=RANDOM_STATE,
         return_train_score=True,
     )
 
-    # Early stopping using callback-based approach
-    # eval_set points only to the earlystop fold (X_earlystop, y_earlystop)
-    # Create early stopping callback
-    early_stopping_callback = early_stopping(
-        stopping_rounds=100,
-        verbose=False,
-        first_metric_only=True,
-    )
-    
-    fit_params_lgbm = {
-        "eval_set": [(X_earlystop, y_earlystop)],  # Earlystop fold only
-        "eval_metric": "aucpr",  # LightGBM-native PR metric (same as average_precision)
-        "callbacks": [early_stopping_callback],
-    }
-
-    tune_start_lgbm = time.time()
-    random_search_lgbm.fit(X_combined, y_combined, **fit_params_lgbm)
-    tune_time_lgbm = time.time() - tune_start_lgbm
+    tune_start_rf = time.time()
+    random_search_rf.fit(X_combined, y_combined)
+    tune_time_rf = time.time() - tune_start_rf
 
     # best_score_ is the score on the earlystop set
-    best_earlystop_score_lgbm = random_search_lgbm.best_score_
+    best_earlystop_score_rf = random_search_rf.best_score_
 
     print(
-        f"\nLightGBM randomized search completed in "
-        f"{tune_time_lgbm:.1f}s ({tune_time_lgbm/60:.1f} min)"
+        f"\nRandom Forest randomized search completed in "
+        f"{tune_time_rf:.1f}s ({tune_time_rf/60:.1f} min)"
     )
     print("\nBest parameters:")
-    for param, value in sorted(random_search_lgbm.best_params_.items()):
+    for param, value in sorted(random_search_rf.best_params_.items()):
         print(f"  {param}: {value}")
-    print(f"\nBest earlystop score (PR-AUC): {best_earlystop_score_lgbm:.4f}")
+    print(f"\nBest earlystop score (PR-AUC): {best_earlystop_score_rf:.4f}")
+
+    # Extract feature importances (impurity-based diagnostic)
+    best_estimator = random_search_rf.best_estimator_
+    feature_importances = best_estimator.feature_importances_
+    
+    # Create feature importance DataFrame
+    importance_df = pd.DataFrame({
+        "feature": feature_cols,
+        "importance": feature_importances
+    }).sort_values("importance", ascending=False)
+    
+    print("\n" + "=" * 70)
+    print("TOP 20 FEATURE IMPORTANCES (Impurity-based diagnostic)")
+    print("=" * 70)
+    top_20 = importance_df.head(20)
+    for idx, row in top_20.iterrows():
+        print(f"  {row['feature']:40s} {row['importance']:.6f}")
+    print("=" * 70)
 
     # Log to wandb
     if use_wandb:
+        # Log top 20 feature importances
+        top_20_dict = {
+            f"rf/feature_importance_impurity/{row['feature']}": float(row['importance'])
+            for _, row in top_20.iterrows()
+        }
+        
         wandb.log(
             {
-                "lgbm/best_earlystop_score": float(best_earlystop_score_lgbm),
-                "lgbm/tuning_time_seconds": tune_time_lgbm,
-                "lgbm/best_params": random_search_lgbm.best_params_,
-                "lgbm/auto_scale_pos_weight": float(auto_scale_pos_weight),
-                "lgbm/total_param_combinations": total_combinations,
-                "lgbm/search_space_coverage_pct": (N_ITER_LGBM / total_combinations * 100),
+                "rf/best_earlystop_score": float(best_earlystop_score_rf),
+                "rf/tuning_time_seconds": tune_time_rf,
+                "rf/best_params": random_search_rf.best_params_,
+                "rf/total_param_combinations": total_combinations,
+                "rf/search_space_coverage_pct": (N_ITER_RF / total_combinations * 100),
+                **top_20_dict,
             }
         )
 
-    # Save LGBM best parameters
-    lgbm_best_params = {
-        "best_params": random_search_lgbm.best_params_,
-        "best_earlystop_score": float(best_earlystop_score_lgbm),
-        "param_grid": lgbm_param_grid,
-        "fixed_params": LGBM_FIXED_PARAMS,
-        "n_iter": N_ITER_LGBM,
+    # Save RF best parameters
+    rf_best_params = {
+        "best_params": random_search_rf.best_params_,
+        "best_earlystop_score": float(best_earlystop_score_rf),
+        "param_grid": rf_param_grid,
+        "fixed_params": RF_FIXED_PARAMS,
+        "n_iter": N_ITER_RF,
         "scoring": "average_precision",
-        "tuning_time_seconds": tune_time_lgbm,
+        "tuning_time_seconds": tune_time_rf,
         "total_param_combinations": total_combinations,
-        "search_space_coverage_pct": (N_ITER_LGBM / total_combinations * 100),
+        "search_space_coverage_pct": (N_ITER_RF / total_combinations * 100),
         "split_info": {
             "train_years": f"year <= {TRAIN_YEAR_MAX}",
             "earlystop_years": f"{EARLYSTOP_YEAR_MIN} <= year <= {EARLYSTOP_YEAR_MAX}",
             "n_train": int(n_train),
             "n_earlystop": int(n_earlystop),
-            "auto_scale_pos_weight": float(auto_scale_pos_weight),
         },
     }
-    lgbm_best_params = convert_numpy_types(lgbm_best_params)
+    rf_best_params = convert_numpy_types(rf_best_params)
 
-    lgbm_output_path = script_dir / "lgbm_best_params.json"
-    with open(lgbm_output_path, "w") as f:
-        json.dump(lgbm_best_params, f, indent=2)
-    print(f"\nLGBM best parameters saved to: {lgbm_output_path}")
+    rf_output_path = script_dir / "rf_best_params.json"
+    with open(rf_output_path, "w") as f:
+        json.dump(rf_best_params, f, indent=2)
+    print(f"\nRF best parameters saved to: {rf_output_path}")
 
     # Free memory
-    del random_search_lgbm, lgbm_model
+    del random_search_rf, rf_model
     gc.collect()
 
     # -------------------------------------------------------------------------
@@ -631,16 +571,16 @@ def main() -> None:
     print("\nTemporal split:")
     print(f"  Train: year <= {TRAIN_YEAR_MAX}  ({n_train:,} rows)")
     print(f"  Earlystop:   {EARLYSTOP_YEAR_MIN} <= year <= {EARLYSTOP_YEAR_MAX}  ({n_earlystop:,} rows)")
-    print("\nLightGBM hyperparameter tuning:")
+    print("\nRandom Forest hyperparameter tuning:")
     print(f"  Total parameter combinations: {total_combinations:,}")
-    print(f"  Searched combinations:        {N_ITER_LGBM}")
-    print(f"  Search space coverage:        {(N_ITER_LGBM/total_combinations*100):.6f}%")
-    print(f"  Best earlystop score (PR-AUC):      {lgbm_best_params['best_earlystop_score']:.4f}")
+    print(f"  Searched combinations:        {N_ITER_RF}")
+    print(f"  Search space coverage:        {(N_ITER_RF/total_combinations*100):.6f}%")
+    print(f"  Best earlystop score (PR-AUC):      {rf_best_params['best_earlystop_score']:.4f}")
     print(
         f"  Tuning time:                  "
-        f"{tune_time_lgbm:.1f}s ({tune_time_lgbm/60:.1f} min)"
+        f"{tune_time_rf:.1f}s ({tune_time_rf/60:.1f} min)"
     )
-    print(f"  Best parameters saved to:     {lgbm_output_path}")
+    print(f"  Best parameters saved to:     {rf_output_path}")
     print(f"\nTotal time:                    {total_time:.1f}s ({total_time/60:.1f} min)")
     print("=" * 70)
     print("Done.")
@@ -650,8 +590,7 @@ def main() -> None:
             {
                 "summary/total_time_seconds": total_time,
                 "summary/total_time_minutes": total_time / 60,
-                "summary/lgbm_best_earlystop_score": float(lgbm_best_params["best_earlystop_score"]),
-                "summary/auto_scale_pos_weight": float(auto_scale_pos_weight),
+                "summary/rf_best_earlystop_score": float(rf_best_params["best_earlystop_score"]),
                 "summary/total_param_combinations": total_combinations,
                 "status": "success",
             }
@@ -666,7 +605,7 @@ if __name__ == "__main__":
     output_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"modelC_tuning_lgbm_{timestamp}.txt"
+    output_file = output_dir / f"modelC_tuning_rf_{timestamp}.txt"
 
     tee = Tee(output_file)
     sys.stdout = tee
