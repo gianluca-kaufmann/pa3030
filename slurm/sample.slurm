@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=compute-panel-statistics
+#SBATCH --job-name=sample
 #SBATCH --partition=normal.4h
 #SBATCH --time=04:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/compute_panel_statistics_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/compute_panel_statistics_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/modelC_sample_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/modelC_sample_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -27,27 +27,28 @@ module load cuda/12.4.1
 module load eth_proxy
 
 #------------------------------------------------------------------------------
-# Activate the Python virtual environment (master-thesis)
+# Activate the Python virtual environment (uav-genAI-opti)
 #------------------------------------------------------------------------------
 VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the compute_panel_statistics script
+# Run the modelC_sample script
 #------------------------------------------------------------------------------
-echo "Starting compute_panel_statistics script..."
+echo "Starting sample script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/consistency checks/compute_panel_statistics" ] || {
-  echo "ERROR: compute_panel_statistics not found"
-  echo "NOTE: compute_panel_statistics script is in consistency checks/ directory"
-  find scripts -maxdepth 4 -type f -name "compute_panel_statistics"
+[ -f "scripts/colombia/ML/ml_preprocessing/modelC_sample" ] || {
+  echo "ERROR: modelC_sample not found"
+  echo "NOTE: modelC_sample script is in ml_preprocessing/ directory"
+  find scripts -maxdepth 4 -type f -name "modelC_sample"
   exit 1
 }
 # Run the script
-python "scripts/consistency checks/compute_panel_statistics"
+python "scripts/colombia/ML/ml_preprocessing/modelC_sample"
 
-echo "compute_panel_statistics script finished."
+echo "modelC_sample script finished."
+
