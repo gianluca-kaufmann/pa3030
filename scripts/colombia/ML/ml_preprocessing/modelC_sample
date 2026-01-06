@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 
 """
-Sampling script for modelC tuning sample (Colombia dataset).
+Sampling script for modelC RF tuning sample (Colombia dataset).
 
 Rules
 -----
 - Keep all positives (transition_01 == 1)
-- Downsample negatives to target ~1:100 ratio per year
-- Preserve per-year balance
+- Cap total negatives at ~300,000 (sample uniformly across years)
+- Target total tuning size ≈ 350k–400k rows
 - Year 2000 excluded to avoid treating existing PAs as transitions
-- Output: data/ml/tuning/modelC_tuning_colombia.parquet
+- Output: data/ml/tuning/modelC_tuning_colombia_rf.parquet
 
 Notes
 -----
-- Per-year sampling ensures balanced class distribution across years
+- Uniform sampling across years ensures balanced temporal distribution
 - Random sampling for simplicity (no hard negatives)
-- Used by both LightGBM and Random Forest hyperparameter tuning scripts
+- Used by Random Forest hyperparameter tuning script
 """
 
 from __future__ import annotations
@@ -29,10 +29,7 @@ import duckdb
 
 # Configuration
 RANDOM_STATE = 42
-TARGET_NEG_POS_RATIO = 100  # Target ratio of negatives to positives per year
-MIN_POS_FOR_FULL_QUOTA = 200  # Minimum positives to use full quota logic
-MIN_NEG_PER_YEAR = 50000  # Minimum negative quota when pos >= MIN_POS_FOR_FULL_QUOTA
-SMALL_NEG_QUOTA = 5000  # Minimum negative quota when pos < MIN_POS_FOR_FULL_QUOTA
+MAX_TOTAL_NEGATIVES = 300_000  # Cap total negatives at ~300k
 
 
 def resolve_input() -> Path:
@@ -141,11 +138,11 @@ def main() -> None:
     
     tuning_dir = base_dir / "tuning"
     tuning_dir.mkdir(parents=True, exist_ok=True)
-    output_path = tuning_dir / "modelC_tuning_colombia.parquet"
+    output_path = tuning_dir / "modelC_tuning_colombia_rf.parquet"
 
     print(f"\nInput: {input_path}")
     print(f"Output: {output_path}")
-    print(f"Target neg/pos ratio: {TARGET_NEG_POS_RATIO}:1 per year")
+    print(f"Target: Keep all positives, cap negatives at {MAX_TOTAL_NEGATIVES:,}")
 
     con = duckdb.connect()
     configure_duckdb(con)
@@ -154,7 +151,7 @@ def main() -> None:
     escaped_out = str(output_path).replace("'", "''")
 
     try:
-        # Sample SQL: Keep all positives, downsample negatives per year to target ratio
+        # Sample SQL: Keep all positives, cap total negatives at MAX_TOTAL_NEGATIVES (uniform across years)
         sample_sql = f"""
         COPY (
             WITH base AS (
@@ -170,40 +167,22 @@ def main() -> None:
                 FROM base
                 GROUP BY year
             ),
-            -- Per-year negative budgets: 
-            --   If pos >= MIN_POS_FOR_FULL_QUOTA: min(neg_count, max(pos * ratio, MIN_NEG_PER_YEAR))
-            --   Else: min(neg_count, max(pos * ratio, SMALL_NEG_QUOTA))
+            num_years AS (
+                SELECT COUNT(*) AS n_years FROM year_counts
+            ),
+            -- Calculate per-year negative quota: distribute MAX_TOTAL_NEGATIVES uniformly across years
+            -- Each year gets: min(neg_count, MAX_TOTAL_NEGATIVES / num_years)
             neg_budget AS (
                 SELECT
                     yc.year,
                     yc.pos_count,
                     yc.neg_count,
-                    CASE 
-                        WHEN yc.neg_count > 0 THEN
-                            CASE
-                                WHEN yc.pos_count >= {MIN_POS_FOR_FULL_QUOTA} THEN
-                                    -- Full quota logic: min(neg_count, max(pos * ratio, MIN_NEG_PER_YEAR))
-                                    LEAST(
-                                        GREATEST(
-                                            CAST(ROUND(yc.pos_count * {TARGET_NEG_POS_RATIO}) AS BIGINT),
-                                            {MIN_NEG_PER_YEAR}
-                                        ),
-                                        yc.neg_count
-                                    )
-                                ELSE
-                                    -- Proportional quota with minimum when pos < MIN_POS_FOR_FULL_QUOTA
-                                    -- min(neg_count, max(pos * ratio, SMALL_NEG_QUOTA))
-                                    LEAST(
-                                        GREATEST(
-                                            CAST(ROUND(yc.pos_count * {TARGET_NEG_POS_RATIO}) AS BIGINT),
-                                            {SMALL_NEG_QUOTA}
-                                        ),
-                                        yc.neg_count
-                                    )
-                            END
-                        ELSE 0
-                    END AS year_neg_budget
+                    LEAST(
+                        yc.neg_count,
+                        CAST(ROUND({MAX_TOTAL_NEGATIVES}::DOUBLE / ny.n_years) AS BIGINT)
+                    ) AS year_neg_budget
                 FROM year_counts yc
+                CROSS JOIN num_years ny
             ),
             positives AS (
                 -- Keep all positives (no sampling)
@@ -246,10 +225,8 @@ def main() -> None:
         TO '{escaped_out}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """
 
-        print(f"\nCreating ModelC tuning sample with per-year negative downsampling...")
-        print(f"  All positives kept; negatives sampled per year:")
-        print(f"    If pos >= {MIN_POS_FOR_FULL_QUOTA}: min(neg_count, max(pos * {TARGET_NEG_POS_RATIO}, {MIN_NEG_PER_YEAR:,}))")
-        print(f"    If pos < {MIN_POS_FOR_FULL_QUOTA}: min(neg_count, max(pos * {TARGET_NEG_POS_RATIO}, {SMALL_NEG_QUOTA:,}))")
+        print(f"\nCreating ModelC RF tuning sample...")
+        print(f"  All positives kept; negatives capped at {MAX_TOTAL_NEGATIVES:,} total (uniform across years)")
         
         # Set random seed for reproducible sampling
         seed_value = RANDOM_STATE / 100.0
@@ -259,7 +236,7 @@ def main() -> None:
         con.execute(sample_sql)
         print(f"Sample written in {time.time() - sample_start:.1f}s")
 
-        # Log counts and check achieved ratios
+        # Log counts
         log_year_counts(con, output_path, "TUNING_SAMPLE")
 
         # Check total rows
@@ -269,26 +246,22 @@ def main() -> None:
         
         print(f"\nTotal rows: {total_rows:,}")
         
-        # Check per-year achieved neg/pos ratios vs target
-        print(f"\nChecking achieved neg/pos ratios vs target ({TARGET_NEG_POS_RATIO}:1)...")
-        achieved_ratios = con.execute(
+        # Check per-year distribution
+        print(f"\nPer-year distribution:")
+        year_stats = con.execute(
             f"""
             SELECT
                 year,
                 SUM(transition_01) AS pos_count,
-                SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS neg_count,
-                CASE WHEN SUM(transition_01) > 0 
-                     THEN SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END)::DOUBLE / SUM(transition_01)
-                     ELSE 0 END AS achieved_ratio
+                SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS neg_count
             FROM read_parquet('{escaped_out}')
             GROUP BY year
             ORDER BY year
             """
         ).fetchall()
         
-        for year, pos, neg, achieved in achieved_ratios:
-            status = "OK" if abs(achieved - TARGET_NEG_POS_RATIO) / TARGET_NEG_POS_RATIO < 0.1 else "WARN"
-            print(f"  {status} {year}: achieved {achieved:.1f}:1 (target {TARGET_NEG_POS_RATIO}:1) | pos={pos:,} neg={neg:,}")
+        for year, pos, neg in year_stats:
+            print(f"  {year}: pos={pos:,} neg={neg:,} total={pos+neg:,}")
         
         # Overall statistics
         overall_stats = con.execute(
@@ -304,8 +277,9 @@ def main() -> None:
         
         print(f"\nOverall class balance:")
         print(f"  Positives: {total_pos:,}")
-        print(f"  Negatives: {total_neg:,}")
+        print(f"  Negatives: {total_neg:,} (capped at {MAX_TOTAL_NEGATIVES:,})")
         print(f"  Ratio (neg/pos): {neg_pos_ratio:.2f}")
+        print(f"  Total size: {total_pos + total_neg:,} rows")
         
         print(f"\nDone. Total time: {time.time() - start_time:.1f}s")
 

@@ -3,10 +3,10 @@
 """Model1 Random Forest Hyperparameter Tuning Script
 
 Purpose: Perform hyperparameter tuning for a Random Forest model
-         using a random sample of ~1M rows from train.parquet with a strict
-         temporal split (train: year <= 2014, val: 2015 <= year <= 2017).
+         using modelC_tuning_colombia_rf.parquet (pre-sampled to ~350k-400k rows)
+         with a strict temporal split (train: year <= 2014, val: 2015 <= year <= 2017).
 
-Input:   `train.parquet`
+Input:   `modelC_tuning_colombia_rf.parquet`
 Output:  - rf_best_params.json
 """
 
@@ -76,7 +76,6 @@ def get_n_jobs() -> int:
 # Configuration
 # =============================================================================
 RANDOM_STATE = 42
-SAMPLE_SIZE = 1_000_000  # ~1M rows
 
 # Temporal split configuration
 TRAIN_YEAR_MAX = 2014  # train_idx = year <= 2014
@@ -97,14 +96,15 @@ EXCLUDE_COLS = {
 }
 
 # RandomizedSearchCV configuration
-N_ITER_RF = 10
+N_ITER_RF = 25
 
 # Random Forest parameter grid
+# Note: For final training, consider using n_estimators=1000 if feasible
 RF_PARAM_GRID = {
-    "rf__n_estimators": [300, 500],
-    "rf__max_depth": [15, 20, None],
+    "rf__n_estimators": [200, 500],  # Use 1000 for final training if feasible
+    "rf__max_depth": [15, 20, 30, 40, None],
     "rf__max_features": ["sqrt", "log2", 0.3],
-    "rf__min_samples_leaf": [2, 5, 10],
+    "rf__min_samples_leaf": [2, 5, 10, 20, 50],
 }
 
 # Random Forest fixed parameters
@@ -115,6 +115,10 @@ RF_FIXED_PARAMS = {
     "class_weight": "balanced_subsample",
     "bootstrap": True,
 }
+
+# Parallelism configuration
+# TUNING_PARALLEL_MODE: "search" to parallelize RandomizedSearchCV, "rf" (default) to use all CPUs for each RF
+TUNING_PARALLEL_MODE = os.environ.get("TUNING_PARALLEL_MODE", "rf")
 
 
 # =============================================================================
@@ -174,25 +178,25 @@ def get_feature_columns(df: pd.DataFrame) -> list:
 
 
 def resolve_train_parquet() -> Path:
-    """Locate train.parquet (prefer $SCRATCH if present)."""
+    """Locate modelC_tuning_colombia_rf.parquet (prefer $SCRATCH if present)."""
     repo_root = Path(__file__).resolve().parents[3]
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
 
     candidates = []
     if scratch_root is not None:
-        # Check outputs/Results first (standard Euler location)
-        candidates.append(scratch_root / "outputs/Results/train.parquet")
-        # Also check data/ml location
-        candidates.append(scratch_root / "data/ml/train.parquet")
-    candidates.append(repo_root / "outputs/Results/train.parquet")
-    candidates.append(repo_root / "data/ml/train.parquet")
+        # Check data/ml/tuning location (standard location from modelC_sample script)
+        candidates.append(scratch_root / "data/ml/tuning/modelC_tuning_colombia_rf.parquet")
+        # Also check outputs/Results location
+        candidates.append(scratch_root / "outputs/Results/modelC_tuning_colombia_rf.parquet")
+    candidates.append(repo_root / "data/ml/tuning/modelC_tuning_colombia_rf.parquet")
+    candidates.append(repo_root / "outputs/Results/modelC_tuning_colombia_rf.parquet")
 
     for cand in candidates:
         if cand.exists():
             return cand
 
     # Provide detailed error message with all checked paths
-    error_msg = "train.parquet not found in expected locations.\n"
+    error_msg = "modelC_tuning_colombia_rf.parquet not found in expected locations.\n"
     error_msg += "\nChecked locations:\n"
     for cand in candidates:
         error_msg += f"  - {cand}\n"
@@ -245,7 +249,6 @@ def main() -> None:
             name=f"model1_tuning_rf_{timestamp}",
             config={
                 "random_state": RANDOM_STATE,
-                "sample_size": SAMPLE_SIZE,
                 "temporal_split": {
                     "train_year_max": TRAIN_YEAR_MAX,
                     "val_year_min": VAL_YEAR_MIN,
@@ -266,26 +269,18 @@ def main() -> None:
     print(f"Output: {script_dir}")
 
     # -------------------------------------------------------------------------
-    # Step 1: Load and sample data
+    # Step 1: Load data
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("STEP 1: LOAD AND SAMPLE DATA")
+    print("STEP 1: LOAD DATA")
     print("=" * 70)
 
-    print(f"\nLoading train.parquet...")
+    print(f"\nLoading modelC_tuning_colombia_rf.parquet...")
     load_start = time.time()
     # Load only necessary columns for faster I/O
     df = pd.read_parquet(train_path)
     load_time = time.time() - load_start
     print(f"  Loaded {len(df):,} rows in {load_time:.1f}s")
-
-    # Randomly sample ~1M rows (before processing to save memory)
-    if len(df) > SAMPLE_SIZE:
-        print(f"\nRandomly sampling {SAMPLE_SIZE:,} rows...")
-        df = df.sample(n=SAMPLE_SIZE, random_state=RANDOM_STATE, replace=False)
-        print(f"  Sampled {len(df):,} rows")
-    else:
-        print(f"\nDataset has {len(df):,} rows (less than {SAMPLE_SIZE:,}), using all rows")
 
     target_col = "transition_01"
 
@@ -465,20 +460,16 @@ def main() -> None:
     )
     print(f"Sampling {N_ITER_RF} parameter combinations with RandomizedSearchCV")
 
-    # Optimize parallelization strategy
-    # For RandomForest, it's usually faster to use all CPUs for each RF model
-    # rather than parallelizing across parameter combinations (avoids nested parallelism)
-    # So we keep n_jobs=1 for RandomizedSearchCV and let RF use all CPUs
-    # However, if we have many CPUs and few iterations, we can parallelize the search
+    # Parallelization strategy (Euler-safe default: n_jobs=1 for CV, all CPUs for RF)
+    # Default: RandomizedSearchCV n_jobs=1, RandomForestClassifier n_jobs=get_n_jobs()
+    # Optional: Set TUNING_PARALLEL_MODE=search to parallelize across parameter combinations
     total_cpus = get_n_jobs() if get_n_jobs() > 0 else 1
     
-    # Use parallel search if we have enough CPUs and iterations
-    # Otherwise, let each RF use all CPUs (faster for RF training)
-    if total_cpus > 4 and N_ITER_RF >= 8:
+    if TUNING_PARALLEL_MODE == "search" and total_cpus > 4 and N_ITER_RF >= 8:
         # Parallelize across parameter combinations, each RF uses fewer CPUs
         n_jobs_cv = min(N_ITER_RF, total_cpus // 2)  # Reserve some CPUs per RF
         rf_n_jobs = max(1, total_cpus // n_jobs_cv)
-        print(f"Using {n_jobs_cv} parallel jobs for RandomizedSearchCV")
+        print(f"Using {n_jobs_cv} parallel jobs for RandomizedSearchCV (TUNING_PARALLEL_MODE=search)")
         print(f"Each RF model will use {rf_n_jobs} CPUs")
         # Update RF params for this run
         rf_params_optimized = RF_FIXED_PARAMS.copy()
@@ -486,9 +477,9 @@ def main() -> None:
         rf_model = RandomForestClassifier(**rf_params_optimized)
         final_rf_params = rf_params_optimized
     else:
-        # Let each RF use all CPUs (better for RF training bottleneck)
+        # Default: Euler-safe - sequential search, each RF uses all CPUs
         n_jobs_cv = 1
-        print(f"Using sequential search, each RF model will use {total_cpus} CPUs")
+        print(f"Using sequential search (Euler-safe default), each RF model will use {total_cpus} CPUs")
         rf_model = RandomForestClassifier(**RF_FIXED_PARAMS)
         final_rf_params = RF_FIXED_PARAMS
 
@@ -543,13 +534,40 @@ def main() -> None:
         print(f"  {param}: {value}")
     print(f"\nBest val score (PR-AUC): {best_val_score_rf:.4f}")
 
+    # Extract feature importances from best model
+    best_rf_model = random_search_rf.best_estimator_.named_steps["rf"]
+    feature_importances = best_rf_model.feature_importances_
+    
+    # Create DataFrame with feature names and importances
+    importance_df = pd.DataFrame({
+        "feature": feature_cols,
+        "importance": feature_importances
+    }).sort_values("importance", ascending=False)
+    
+    # Print top 20 features
+    print("\n" + "=" * 70)
+    print("TOP 20 FEATURES BY IMPORTANCE")
+    print("=" * 70)
+    top_20 = importance_df.head(20)
+    for idx, row in top_20.iterrows():
+        print(f"  {row['feature']:40s}  {row['importance']:.6f}")
+    
+    # Get top 10 feature names for JSON output
+    top_10_features = importance_df.head(10)["feature"].tolist()
+
     # Log to wandb
     if use_wandb:
+        # Log feature importances as a W&B Table
+        importance_table = wandb.Table(
+            dataframe=importance_df,
+            columns=["feature", "importance"]
+        )
         wandb.log(
             {
                 "rf/best_val_score": float(best_val_score_rf),
                 "rf/tuning_time_seconds": tune_time_rf,
                 "rf/best_params": random_search_rf.best_params_,
+                "rf/feature_importances": importance_table,
             }
         )
 
@@ -562,6 +580,7 @@ def main() -> None:
         "n_iter": N_ITER_RF,
         "scoring": "average_precision",
         "tuning_time_seconds": tune_time_rf,
+        "top_10_features_by_importance": top_10_features,
         "split_info": {
             "train_years": f"year <= {TRAIN_YEAR_MAX}",
             "val_years": f"{VAL_YEAR_MIN} <= year <= {VAL_YEAR_MAX}",
@@ -588,7 +607,7 @@ def main() -> None:
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    print(f"Dataset size (sampled):        {final_dataset_size:,} rows")
+    print(f"Dataset size:                  {final_dataset_size:,} rows")
     print(f"Features:                      {len(feature_cols)}")
     print("\nTemporal split:")
     print(f"  Train: year <= {TRAIN_YEAR_MAX}  ({n_train:,} rows)")
