@@ -1060,14 +1060,8 @@ def create_risk_map(df: pd.DataFrame, region_boundary_path: Optional[Path], outp
     ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
     
     # Set aspect ratio to maintain geographic proportions
-    # aspect='equal' ensures 1 degree lat = 1 degree lon in display
-    # This is correct for unprojected lat/lon coordinates (EPSG:4326)
-    ax.set_aspect('equal')
-    
-    # Set axis limits to data extent to prevent matplotlib from adding padding
-    xmin, xmax, ymin, ymax = extent
-    ax.set_xlim(xmin, xmax)
-    ax.set_ylim(ymin, ymax)
+    # aspect='equal' ensures degrees are not distorted
+    ax.set_aspect('equal', adjustable='box')
     
     plt.tight_layout()
     
@@ -1143,39 +1137,33 @@ def create_probability_map(df: pd.DataFrame, region_boundary_path: Optional[Path
             pred_end = test_year_range[1] + lookahead
             prediction_horizon = f"{lookahead}-year lookahead ({test_year_range[0]}-{pred_end})"
     
-    # Use quantile-based normalization to evenly distribute colors across the colormap
-    # This ensures that each color in the palette represents roughly the same number of pixels
-    # Create 1000 quantile bins to map probabilities to [0, 1] range
-    n_quantiles = 1000
-    quantiles = np.linspace(0, 1, n_quantiles)
-    quantile_values = np.percentile(proba_values, quantiles * 100)
+    # Use percentile-based scaling focused on showing realistic probability distribution
+    # Most areas have low probability, with gradual increase to high-risk areas
+    # Use 0-97th percentile to clip extreme outliers while keeping realistic distribution
+    proba_p97 = np.percentile(proba_values, 97)
     
-    print(f"  Using quantile-based normalization with {n_quantiles} bins")
+    print(f"  Using percentile-based color range (0-97th percentile)")
     print(f"  Probability range: [{proba_min:.6f}, {proba_max:.6f}]")
+    print(f"  Colorbar range: [0, {proba_p97:.6f}]")
     print(f"  Key percentiles:")
-    print(f"    10th: {np.percentile(proba_values, 10):.6f}")
     print(f"    25th: {np.percentile(proba_values, 25):.6f}")
     print(f"    50th: {proba_median:.6f}")
     print(f"    75th: {np.percentile(proba_values, 75):.6f}")
     print(f"    90th: {np.percentile(proba_values, 90):.6f}")
-    print(f"    99th: {np.percentile(proba_values, 99):.6f}")
+    print(f"    95th: {np.percentile(proba_values, 95):.6f}")
+    print(f"    97th: {proba_p97:.6f}")
     
-    # Map each probability to its quantile position [0, 1]
-    # This creates even color distribution: each color represents equal number of pixels
-    proba_normalized = np.zeros_like(proba_values, dtype=np.float32)
-    for i, val in enumerate(proba_values):
-        # Find which quantile this value belongs to
-        quantile_idx = np.searchsorted(quantile_values, val, side='left')
-        # Normalize to [0, 1]
-        proba_normalized[i] = quantile_idx / (n_quantiles - 1)
+    # Clip extreme values to 97th percentile
+    proba_clipped = np.clip(proba_values, 0, proba_p97)
     
-    # Ensure values are in [0, 1] range
-    proba_normalized = np.clip(proba_normalized, 0, 1)
+    # Apply gentle power transformation (x^0.5) to slightly spread out mid-range values
+    # while keeping most low probabilities dark
+    proba_normalized = proba_clipped / proba_p97  # Normalize to [0, 1]
+    proba_normalized = np.power(proba_normalized, 0.5)  # Gentle power transformation
     
-    print(f"  Applied quantile normalization for even color distribution")
+    print(f"  Applied gentle power transformation (x^0.5) to enhance mid-range visibility")
     print(f"  Normalized value range: [{proba_normalized.min():.4f}, {proba_normalized.max():.4f}]")
     print(f"  Normalized value mean: {proba_normalized.mean():.4f}, median: {np.median(proba_normalized):.4f}")
-    print(f"  This ensures each color represents approximately equal number of pixels")
     
     # Convert points to raster for pixel-perfect visualization
     print(f"  Converting {len(gdf):,} points to raster grid...")
@@ -1188,10 +1176,14 @@ def create_probability_map(df: pd.DataFrame, region_boundary_path: Optional[Path
     print(f"  Raster shape: {raster.shape}, extent: {extent}")
     print(f"  Valid (non-NaN) pixels: {np.sum(~np.isnan(raster)):,}")
     
-    # Create figure with proper dimensions for geographic data
-    # South America spans roughly -60° to 15° latitude (75°) and -85° to -30° longitude (55°)
-    # Use a moderate figure size and let matplotlib's aspect='equal' preserve true shape
-    fig, ax = plt.subplots(figsize=(10, 14))
+    # Create figure - use aspect ratio close to data extent
+    # South America spans roughly 55° longitude and 75° latitude
+    # Use 12 width, and calculate height to maintain geographic proportions
+    xmin, xmax, ymin, ymax = extent
+    data_aspect = (ymax - ymin) / (xmax - xmin)  # latitude range / longitude range
+    fig_width = 12
+    fig_height = fig_width * data_aspect * 0.9  # Scale down slightly for better display
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
     
     # Plot South America boundary
     sa_gdf.plot(ax=ax, color='white', edgecolor='none', linewidth=1.5, zorder=1)
@@ -1254,14 +1246,8 @@ def create_probability_map(df: pd.DataFrame, region_boundary_path: Optional[Path
     ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
     
     # Set aspect ratio to maintain geographic proportions
-    # aspect='equal' ensures 1 degree lat = 1 degree lon in display
-    # This is correct for unprojected lat/lon coordinates (EPSG:4326)
-    ax.set_aspect('equal')
-    
-    # Set axis limits to data extent to prevent matplotlib from adding padding
-    xmin, xmax, ymin, ymax = extent
-    ax.set_xlim(xmin, xmax)
-    ax.set_ylim(ymin, ymax)
+    # aspect='equal' ensures degrees are not distorted
+    ax.set_aspect('equal', adjustable='box')
     
     plt.tight_layout()
     
