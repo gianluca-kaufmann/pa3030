@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
-"""Calibration Script for modelC_LGBM
+"""Calibration Script for modelC (LGBM/RF/BRF)
 
-Purpose: Fit isotonic or Platt scaling calibration on CV predictions,
+Purpose: Fit isotonic or Platt scaling calibration on CV/earlystop predictions,
          apply to test predictions, and save calibrated scores + reliability plot data.
 
-Input:   - CV predictions parquet file (with columns: y_true, y_pred_proba, and optional metadata)
-         - Test predictions parquet file (modelC_lgbm_win5_scored_*.parquet from outputs/Results/ml_models)
+Input:   - CV/earlystop predictions parquet file (with columns: y_true, y_pred_proba, and optional metadata)
+         - Test predictions parquet file (modelC_{model_type}_win5_scored_*.parquet from outputs/Results/ml_models)
 
 Output:  - Calibrated test predictions parquet file
          - Reliability plot data JSON file (for visualization)
          - Calibration metadata JSON file
          - Reliability curve plots (PNG images) for CV and test sets (before/after calibration)
          - Brier score summary text file (before/after calibration metrics)
+
+Supports:
+  - LGBM: temporal_cv (default) or earlystop
+  - RF/BRF: earlystop (default)
 """
 
 from __future__ import annotations
@@ -89,7 +93,11 @@ def resolve_parquet_file(filename: str) -> Optional[Path]:
 
     candidates = []
     if scratch_root is not None:
+        # Check outputs/Results first (standard Euler location from preprocessing script)
+        candidates.append(scratch_root / f"outputs/Results/{filename}")
+        # Also check data/ml location
         candidates.append(scratch_root / f"data/ml/{filename}")
+    candidates.append(repo_root / f"outputs/Results/{filename}")
     candidates.append(repo_root / f"data/ml/{filename}")
 
     for cand in candidates:
@@ -102,6 +110,9 @@ def resolve_parquet_file(filename: str) -> Optional[Path]:
 def find_latest_scored_file(output_dir: Path, pattern: str = "modelC_lgbm_win5_scored_*.parquet") -> Path:
     """Find the most recent scored parquet file."""
     files = list(output_dir.glob(pattern))
+    
+    # Filter out already-calibrated files to prevent recursive calibration
+    files = [f for f in files if "calibrated" not in f.name]
     
     if not files:
         raise FileNotFoundError(f"No scored files found in {output_dir} matching pattern {pattern}")
@@ -849,7 +860,9 @@ def main(
     assume_oof: bool = False,
     per_fold: bool = False,
     require_temporal_cv: bool = False,
-    plot_binning: Literal["uniform", "quantile", "both"] = "both"
+    plot_binning: Literal["uniform", "quantile", "both"] = "both",
+    model_type: Literal["lgbm", "rf", "brf"] = "lgbm",
+    calib_source: Optional[Literal["temporal_cv", "earlystop"]] = None
 ) -> None:
     """Main calibration function.
     
@@ -862,75 +875,125 @@ def main(
     output_dir = repo_root / "outputs/Results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
     
+    # Set default calib_source based on model_type if not provided
+    if calib_source is None:
+        if model_type == "lgbm":
+            calib_source = "temporal_cv"
+        else:  # rf or brf
+            calib_source = "earlystop"
+    
+    # Validate: temporal_cv only works with lgbm
+    if calib_source == "temporal_cv" and model_type != "lgbm":
+        raise ValueError(
+            f"ERROR: calib_source='temporal_cv' is only supported for model_type='lgbm'.\n"
+            f"Only LGBM has temporal CV OOF predictions.\n"
+            f"For model_type='{model_type}', use calib_source='earlystop' instead."
+        )
+    
     print("=" * 70)
-    print("CALIBRATION: modelC_LGBM")
+    print(f"CALIBRATION: modelC_{model_type.upper()}")
     print("=" * 70)
-    print(f"\nCalibration method: {calibration_method}")
+    print(f"\nModel type: {model_type}")
+    print(f"Calibration source: {calib_source}")
+    print(f"Calibration method: {calibration_method}")
     print(f"Output directory: {output_dir}")
     
-    # Step 1: Load CV predictions
+    # Step 1: Load CV/earlystop predictions
     print("\n" + "=" * 70)
-    print("STEP 1: LOAD CV PREDICTIONS")
+    if calib_source == "earlystop":
+        print("STEP 1: LOAD EARLYSTOP VALIDATION PREDICTIONS")
+    else:
+        print("STEP 1: LOAD CV PREDICTIONS")
     print("=" * 70)
     
     if cv_predictions_path is None:
-        # Prefer temporal CV predictions (from training script) over spatial CV predictions
-        # Temporal CV predictions are used for calibration; spatial CV is only for robustness checks
-        print("\nSearching for CV predictions file...")
-        print("  Priority: temporal CV predictions (from training) > spatial CV predictions")
+        print(f"\nSearching for calibration predictions file...")
+        print(f"  Model type: {model_type}")
+        print(f"  Calibration source: {calib_source}")
         
-        # First, look for temporal CV predictions (preferred)
-        temporal_cv_files = list(output_dir.glob("modelC_lgbm_win5_temporal_cv_predictions_*.parquet"))
-        
-        if temporal_cv_files:
-            cv_predictions_path = max(temporal_cv_files, key=lambda p: p.stat().st_mtime)
-            print(f"\nFound TEMPORAL CV predictions file (preferred): {cv_predictions_path.name}")
-            print("  Using temporal CV OOF predictions from training script (rolling folds)")
-        else:
-            # If --require-temporal-cv is set, hard-fail
-            if require_temporal_cv:
-                raise FileNotFoundError(
-                    "ERROR: --require-temporal-cv flag is set, but no temporal CV predictions file found.\n"
-                    "Temporal CV predictions are required for calibration.\n"
-                    "Expected pattern: modelC_lgbm_win5_temporal_cv_predictions_*.parquet\n"
-                    "These are generated by the training script during temporal cross-validation.\n"
-                    "Please ensure temporal CV predictions are saved to outputs/Results/ml_models/."
+        if calib_source == "temporal_cv":
+            # Only LGBM has temporal CV predictions
+            if model_type != "lgbm":
+                raise ValueError(
+                    f"ERROR: calib_source='temporal_cv' is only supported for model_type='lgbm'.\n"
+                    f"Only LGBM has temporal CV OOF predictions.\n"
+                    f"For model_type='{model_type}', use calib_source='earlystop' instead."
                 )
             
-            # Fallback: look for other CV predictions (could be spatial CV)
-            other_cv_files = []
-            other_cv_files.extend(list(output_dir.glob("modelC_lgbm_win5_cv_predictions_*.parquet")))
-            other_cv_files.extend(list(output_dir.glob("*cv_predictions*.parquet")))
+            # Look for temporal CV predictions
+            pattern = f"modelC_{model_type}_win5_temporal_cv_predictions_*.parquet"
+            temporal_cv_files = list(output_dir.glob(pattern))
             
-            if other_cv_files:
-                cv_predictions_path = max(other_cv_files, key=lambda p: p.stat().st_mtime)
-                print(f"\nWARNING: Found CV predictions file (NOT temporal CV): {cv_predictions_path.name}")
-                print("  This may be spatial CV predictions, which are NOT suitable for calibration.")
-                print("  Spatial CV is for robustness/transfer checks, not for calibration.")
-                print("  Please ensure you have temporal CV predictions from the training script.")
-                print("  Temporal CV predictions should be named: modelC_lgbm_win5_temporal_cv_predictions_*.parquet")
-                print("\n  Proceeding with found file, but results may be suboptimal for calibration.")
+            if temporal_cv_files:
+                cv_predictions_path = max(temporal_cv_files, key=lambda p: p.stat().st_mtime)
+                print(f"\nFound TEMPORAL CV predictions file: {cv_predictions_path.name}")
+                print("  Using temporal CV OOF predictions from training script (rolling folds)")
+            else:
+                # If --require-temporal-cv is set, hard-fail
+                if require_temporal_cv:
+                    raise FileNotFoundError(
+                        f"ERROR: --require-temporal-cv flag is set, but no temporal CV predictions file found.\n"
+                        f"Temporal CV predictions are required for calibration.\n"
+                        f"Expected pattern: {pattern}\n"
+                        f"These are generated by the training script during temporal cross-validation.\n"
+                        f"Please ensure temporal CV predictions are saved to outputs/Results/ml_models/."
+                    )
+                
+                # Fallback: look for other CV predictions (could be spatial CV)
+                other_cv_files = []
+                other_cv_files.extend(list(output_dir.glob(f"modelC_{model_type}_win5_cv_predictions_*.parquet")))
+                other_cv_files.extend(list(output_dir.glob(f"*cv_predictions*.parquet")))
+                
+                if other_cv_files:
+                    cv_predictions_path = max(other_cv_files, key=lambda p: p.stat().st_mtime)
+                    print(f"\nWARNING: Found CV predictions file (NOT temporal CV): {cv_predictions_path.name}")
+                    print("  This may be spatial CV predictions, which are NOT suitable for calibration.")
+                    print("  Spatial CV is for robustness/transfer checks, not for calibration.")
+                    print(f"  Temporal CV predictions should be named: {pattern}")
+                    print("\n  Proceeding with found file, but results may be suboptimal for calibration.")
+                else:
+                    raise FileNotFoundError(
+                        f"CV predictions file not found. Please provide cv_predictions_path or ensure "
+                        f"temporal CV predictions are saved to outputs/Results/ml_models/.\n"
+                        f"Expected pattern: {pattern}\n"
+                        f"These are generated by the training script during temporal cross-validation."
+                    )
+        
+        elif calib_source == "earlystop":
+            # Look for earlystop scored predictions (this is the calibration-fit file)
+            pattern = f"modelC_{model_type}_win5_earlystop_scored_*.parquet"
+            earlystop_files = list(output_dir.glob(pattern))
+            
+            if earlystop_files:
+                cv_predictions_path = max(earlystop_files, key=lambda p: p.stat().st_mtime)
+                print(f"\nFound EARLYSTOP scored predictions file: {cv_predictions_path.name}")
+                print("  Using earlystop validation set predictions for calibration (held-out, not CV)")
             else:
                 raise FileNotFoundError(
-                    "CV predictions file not found. Please provide cv_predictions_path or ensure "
-                    "temporal CV predictions are saved to outputs/Results/ml_models/.\n"
-                    "Expected pattern: modelC_lgbm_win5_temporal_cv_predictions_*.parquet\n"
-                    "These are generated by the training script during temporal cross-validation."
+                    f"Earlystop predictions file not found. Please provide cv_predictions_path or ensure "
+                    f"earlystop scored predictions are saved to outputs/Results/ml_models/.\n"
+                    f"Expected pattern: {pattern}\n"
+                    f"These are generated by the training script during early stopping validation."
                 )
+        else:
+            raise ValueError(f"Unknown calib_source: {calib_source}. Must be 'temporal_cv' or 'earlystop'.")
     
     if not cv_predictions_path.exists():
         raise FileNotFoundError(f"CV predictions file not found: {cv_predictions_path}")
     
     # Verify CV type from filename
     is_temporal_cv = "temporal_cv_predictions" in cv_predictions_path.name
+    is_earlystop = "earlystop_scored" in cv_predictions_path.name
     is_spatial_cv = "spatial" in cv_predictions_path.name.lower() or (
-        "cv_predictions" in cv_predictions_path.name and "temporal" not in cv_predictions_path.name
+        "cv_predictions" in cv_predictions_path.name and "temporal" not in cv_predictions_path.name and not is_earlystop
     )
     
-    cv_type = "temporal" if is_temporal_cv else ("spatial" if is_spatial_cv else "unknown")
+    cv_type = "temporal" if is_temporal_cv else ("earlystop" if is_earlystop else ("spatial" if is_spatial_cv else "unknown"))
     
     if is_temporal_cv:
         print("  Verified: Temporal CV predictions (from training script - rolling folds)")
+    elif is_earlystop:
+        print("  Verified: Earlystop validation set predictions (held-out, not CV)")
     elif is_spatial_cv:
         # If --require-temporal-cv is set, hard-fail even if file was explicitly provided
         if require_temporal_cv:
@@ -938,7 +1001,7 @@ def main(
                 "ERROR: --require-temporal-cv flag is set, but the provided CV predictions file "
                 f"({cv_predictions_path.name}) appears to be spatial CV predictions, NOT temporal CV.\n"
                 "Temporal CV predictions are required for calibration.\n"
-                "Expected pattern: modelC_lgbm_win5_temporal_cv_predictions_*.parquet\n"
+                f"Expected pattern: modelC_{model_type}_win5_temporal_cv_predictions_*.parquet\n"
                 "These are generated by the training script during temporal cross-validation."
             )
         print("  WARNING: This appears to be spatial CV predictions, NOT temporal CV!")
@@ -948,8 +1011,11 @@ def main(
     else:
         print(f"  Note: CV type could not be determined from filename")
     
+    # For earlystop mode, don't request fold info (it's held-out, not CV)
+    return_fold_info_for_calib = (calib_source == "temporal_cv")
+    
     try:
-        y_cv_true, y_cv_proba, fold_idx = load_cv_predictions(cv_predictions_path, return_fold_info=True)
+        y_cv_true, y_cv_proba, fold_idx = load_cv_predictions(cv_predictions_path, return_fold_info=return_fold_info_for_calib)
     except Exception as e:
         print(f"\nERROR: Failed to load CV predictions: {e}")
         import traceback
@@ -957,48 +1023,85 @@ def main(
         sys.exit(1)
     
     # Step 1.5: Check OOF requirements and enforce calibration method
-    print("\n" + "=" * 70)
-    print("STEP 1.5: CHECK OUT-OF-FOLD (OOF) REQUIREMENTS")
-    print("=" * 70)
-    
-    if fold_idx is not None:
-        print(f"\nFold information found ({len(np.unique(fold_idx))} folds).")
+    # Skip this step entirely for earlystop mode (it's held-out, not CV)
+    if calib_source == "earlystop":
+        print("\n" + "=" * 70)
+        print("STEP 1.5: SKIP OOF REQUIREMENTS (EARLYSTOP MODE)")
+        print("=" * 70)
+        print("\nUsing earlystop validation set predictions (held-out, not CV).")
+        print("No OOF verification needed - treating as held-out validation set.")
+        print("Proceeding with standard calibration (isotonic or Platt scaling allowed).")
+        fold_idx = None  # Ensure fold_idx is None for earlystop mode
+    else:
+        print("\n" + "=" * 70)
+        print("STEP 1.5: CHECK OUT-OF-FOLD (OOF) REQUIREMENTS")
+        print("=" * 70)
         
-        if per_fold:
-            print("Using per-fold calibration (--per-fold flag set).")
-            # Per-fold calibration: isotonic cannot be averaged, so force Platt if isotonic requested
-            if calibration_method == "isotonic":
-                print("\n" + "!" * 70)
-                print("WARNING: Isotonic calibration cannot be averaged across folds.")
-                print("!" * 70)
-                print(f"\nCalibration method was set to '{calibration_method}', but --per-fold flag is set.")
-                print("Isotonic calibration requires guaranteed OOF predictions and cannot be averaged across folds.")
-                print("Automatically switching to Platt scaling (--method platt) for per-fold calibration.")
-                print("!" * 70 + "\n")
-                calibration_method = "platt"
-        else:
-            print("Using pooled calibration (--per-fold flag not set).")
-            print("\n" + "!" * 70)
-            print("NOTE: Fold information is available but pooled calibration is requested.")
-            print("!" * 70)
-            print("\nYou are using pooled calibration even though fold information exists.")
-            print("This assumes CV predictions are already OOF (pooled across folds).")
-            print("\nIf CV predictions contain in-sample predictions (rows used for training),")
-            print("calibration will overfit and produce misleading results.")
-            print("\nEnsure your CV predictions file contains only out-of-fold predictions:")
-            print("  - Each row should have exactly one prediction")
-            print("  - That prediction must come from a fold where the row was NOT used for training")
-            print("\nIf you want per-fold calibration instead, use --per-fold flag.")
-            print("!" * 70 + "\n")
+        if fold_idx is not None:
+            print(f"\nFold information found ({len(np.unique(fold_idx))} folds).")
             
-            # For pooled calibration with fold info, isotonic is allowed if assume_oof is set
+            if per_fold:
+                print("Using per-fold calibration (--per-fold flag set).")
+                # Per-fold calibration: isotonic cannot be averaged, so force Platt if isotonic requested
+                if calibration_method == "isotonic":
+                    print("\n" + "!" * 70)
+                    print("WARNING: Isotonic calibration cannot be averaged across folds.")
+                    print("!" * 70)
+                    print(f"\nCalibration method was set to '{calibration_method}', but --per-fold flag is set.")
+                    print("Isotonic calibration requires guaranteed OOF predictions and cannot be averaged across folds.")
+                    print("Automatically switching to Platt scaling (--method platt) for per-fold calibration.")
+                    print("!" * 70 + "\n")
+                    calibration_method = "platt"
+            else:
+                print("Using pooled calibration (--per-fold flag not set).")
+                print("\n" + "!" * 70)
+                print("NOTE: Fold information is available but pooled calibration is requested.")
+                print("!" * 70)
+                print("\nYou are using pooled calibration even though fold information exists.")
+                print("This assumes CV predictions are already OOF (pooled across folds).")
+                print("\nIf CV predictions contain in-sample predictions (rows used for training),")
+                print("calibration will overfit and produce misleading results.")
+                print("\nEnsure your CV predictions file contains only out-of-fold predictions:")
+                print("  - Each row should have exactly one prediction")
+                print("  - That prediction must come from a fold where the row was NOT used for training")
+                print("\nIf you want per-fold calibration instead, use --per-fold flag.")
+                print("!" * 70 + "\n")
+                
+                # For pooled calibration with fold info, isotonic is allowed if assume_oof is set
+                if calibration_method == "isotonic":
+                    if not assume_oof:
+                        error_msg = (
+                            "\nERROR: Isotonic calibration on pooled data requires --assume-oof flag.\n"
+                            "Isotonic calibration on non-OOF data can severely overfit.\n"
+                            "If you are certain the CV predictions are OOF, use --assume-oof flag.\n"
+                            "Alternatively, use --per-fold flag for per-fold calibration."
+                        )
+                        print(error_msg)
+                        raise ValueError(error_msg)
+                    
+                    # Big warning for isotonic + assume_oof
+                    print("Proceeding with --assume-oof flag (user confirmed OOF property).")
+                    print("\n" + "!" * 70)
+                    print("WARNING: ISOTONIC CALIBRATION WITH --assume-oof FLAG (POOLED)")
+                    print("!" * 70)
+                    print("\nYou are using isotonic calibration with --assume-oof flag on pooled data.")
+                    print("This is ONLY safe if CV predictions are guaranteed OOF by construction.")
+                    print("\nIf CV predictions contain in-sample predictions (rows used for training),")
+                    print("isotonic calibration will severely overfit and produce misleading results.")
+                    print("\nEnsure your CV predictions file contains only out-of-fold predictions:")
+                    print("  - Each row should have exactly one prediction")
+                    print("  - That prediction must come from a fold where the row was NOT used for training")
+                    print("!" * 70 + "\n")
+        else:
+            print("\nNo fold information found in CV predictions file.")
+            # Isotonic is only allowed when no fold info exists AND --assume-oof is set
             if calibration_method == "isotonic":
                 if not assume_oof:
                     error_msg = (
-                        "\nERROR: Isotonic calibration on pooled data requires --assume-oof flag.\n"
+                        "\nERROR: Cannot verify OOF property without fold information.\n"
                         "Isotonic calibration on non-OOF data can severely overfit.\n"
                         "If you are certain the CV predictions are OOF, use --assume-oof flag.\n"
-                        "Alternatively, use --per-fold flag for per-fold calibration."
+                        "Otherwise, ensure CV predictions include fold information for per-fold calibration."
                     )
                     print(error_msg)
                     raise ValueError(error_msg)
@@ -1006,9 +1109,9 @@ def main(
                 # Big warning for isotonic + assume_oof
                 print("Proceeding with --assume-oof flag (user confirmed OOF property).")
                 print("\n" + "!" * 70)
-                print("WARNING: ISOTONIC CALIBRATION WITH --assume-oof FLAG (POOLED)")
+                print("WARNING: ISOTONIC CALIBRATION WITH --assume-oof FLAG")
                 print("!" * 70)
-                print("\nYou are using isotonic calibration with --assume-oof flag on pooled data.")
+                print("\nYou are using isotonic calibration with --assume-oof flag.")
                 print("This is ONLY safe if CV predictions are guaranteed OOF by construction.")
                 print("\nIf CV predictions contain in-sample predictions (rows used for training),")
                 print("isotonic calibration will severely overfit and produce misleading results.")
@@ -1016,39 +1119,12 @@ def main(
                 print("  - Each row should have exactly one prediction")
                 print("  - That prediction must come from a fold where the row was NOT used for training")
                 print("!" * 70 + "\n")
-    else:
-        print("\nNo fold information found in CV predictions file.")
-        # Isotonic is only allowed when no fold info exists AND --assume-oof is set
-        if calibration_method == "isotonic":
-            if not assume_oof:
-                error_msg = (
-                    "\nERROR: Cannot verify OOF property without fold information.\n"
-                    "Isotonic calibration on non-OOF data can severely overfit.\n"
-                    "If you are certain the CV predictions are OOF, use --assume-oof flag.\n"
-                    "Otherwise, ensure CV predictions include fold information for per-fold calibration."
-                )
-                print(error_msg)
-                raise ValueError(error_msg)
-            
-            # Big warning for isotonic + assume_oof
-            print("Proceeding with --assume-oof flag (user confirmed OOF property).")
-            print("\n" + "!" * 70)
-            print("WARNING: ISOTONIC CALIBRATION WITH --assume-oof FLAG")
-            print("!" * 70)
-            print("\nYou are using isotonic calibration with --assume-oof flag.")
-            print("This is ONLY safe if CV predictions are guaranteed OOF by construction.")
-            print("\nIf CV predictions contain in-sample predictions (rows used for training),")
-            print("isotonic calibration will severely overfit and produce misleading results.")
-            print("\nEnsure your CV predictions file contains only out-of-fold predictions:")
-            print("  - Each row should have exactly one prediction")
-            print("  - That prediction must come from a fold where the row was NOT used for training")
-            print("!" * 70 + "\n")
-        else:
-            # Platt scaling doesn't require --assume-oof, but warn if it's set
-            if assume_oof:
-                print("Proceeding with --assume-oof flag (using pooled calibration).")
             else:
-                print("Proceeding with pooled calibration (no fold information available).")
+                # Platt scaling doesn't require --assume-oof, but warn if it's set
+                if assume_oof:
+                    print("Proceeding with --assume-oof flag (using pooled calibration).")
+                else:
+                    print("Proceeding with pooled calibration (no fold information available).")
     
     # Step 2: Load test predictions
     print("\n" + "=" * 70)
@@ -1057,7 +1133,9 @@ def main(
     
     if test_predictions_path is None:
         try:
-            test_predictions_path = find_latest_scored_file(output_dir)
+            # Test predictions always use the scored pattern: modelC_{model_type}_win5_scored_*.parquet
+            test_pattern = f"modelC_{model_type}_win5_scored_*.parquet"
+            test_predictions_path = find_latest_scored_file(output_dir, pattern=test_pattern)
             print(f"\nFound latest test predictions file: {test_predictions_path.name}")
         except FileNotFoundError as e:
             print(f"\nERROR: {e}")
@@ -1075,9 +1153,12 @@ def main(
         traceback.print_exc()
         sys.exit(1)
     
-    # Step 3: Fit calibration on CV predictions
+    # Step 3: Fit calibration on CV/earlystop predictions
     print("\n" + "=" * 70)
-    print(f"STEP 3: FIT {calibration_method.upper()} CALIBRATION ON CV PREDICTIONS")
+    if calib_source == "earlystop":
+        print(f"STEP 3: FIT {calibration_method.upper()} CALIBRATION ON EARLYSTOP VALIDATION PREDICTIONS")
+    else:
+        print(f"STEP 3: FIT {calibration_method.upper()} CALIBRATION ON CV PREDICTIONS")
     print("=" * 70)
     
     fold_info = None
@@ -1131,8 +1212,11 @@ def main(
         traceback.print_exc()
         sys.exit(1)
     
-    # Evaluate calibration on CV predictions (for reference)
-    print("\nEvaluating calibration on CV predictions...")
+    # Evaluate calibration on CV/earlystop predictions (for reference)
+    if calib_source == "earlystop":
+        print("\nEvaluating calibration on earlystop validation predictions...")
+    else:
+        print("\nEvaluating calibration on CV predictions...")
     y_cv_calibrated = apply_calibration(y_cv_proba)
     # Compute metrics with both uniform and quantile binning
     cv_calibration_metrics_uniform = compute_calibration_metrics(y_cv_true, y_cv_calibrated, binning_method="uniform")
@@ -1230,7 +1314,7 @@ def main(
         
         if use_uniform:
             # Test set - uncalibrated (uniform)
-            test_uncalibrated_plot_path = figures_dir / f"reliability_curve_test_uncalibrated_{calibration_method}_uniform_{timestamp}.png"
+            test_uncalibrated_plot_path = figures_dir / f"reliability_curve_test_uncalibrated_{model_type}_{calib_source}_{calibration_method}_uniform_{timestamp}.png"
             plot_reliability_curve(
                 test_uncalibrated_plot_uniform,
                 f"Reliability Curve - Test Set (Uncalibrated, Uniform Binning)\n{calibration_method.upper()} Calibration",
@@ -1243,7 +1327,7 @@ def main(
             plot_paths.append(("Test (uncalibrated, uniform)", test_uncalibrated_plot_path))
             
             # Test set - calibrated (uniform)
-            test_calibrated_plot_path = figures_dir / f"reliability_curve_test_calibrated_{calibration_method}_uniform_{timestamp}.png"
+            test_calibrated_plot_path = figures_dir / f"reliability_curve_test_calibrated_{model_type}_{calib_source}_{calibration_method}_uniform_{timestamp}.png"
             plot_reliability_curve(
                 test_calibrated_plot_uniform,
                 f"Reliability Curve - Test Set (Calibrated, Uniform Binning)\n{calibration_method.upper()} Calibration",
@@ -1256,7 +1340,7 @@ def main(
             plot_paths.append(("Test (calibrated, uniform)", test_calibrated_plot_path))
             
             # CV set - uncalibrated (uniform)
-            cv_uncalibrated_plot_path = figures_dir / f"reliability_curve_cv_uncalibrated_{calibration_method}_uniform_{timestamp}.png"
+            cv_uncalibrated_plot_path = figures_dir / f"reliability_curve_cv_uncalibrated_{model_type}_{calib_source}_{calibration_method}_uniform_{timestamp}.png"
             plot_reliability_curve(
                 cv_uncalibrated_plot_uniform,
                 f"Reliability Curve - CV Set (Uncalibrated, Uniform Binning)\n{calibration_method.upper()} Calibration",
@@ -1269,7 +1353,7 @@ def main(
             plot_paths.append(("CV (uncalibrated, uniform)", cv_uncalibrated_plot_path))
             
             # CV set - calibrated (uniform)
-            cv_calibrated_plot_path = figures_dir / f"reliability_curve_cv_calibrated_{calibration_method}_uniform_{timestamp}.png"
+            cv_calibrated_plot_path = figures_dir / f"reliability_curve_cv_calibrated_{model_type}_{calib_source}_{calibration_method}_uniform_{timestamp}.png"
             plot_reliability_curve(
                 cv_calibrated_plot_uniform,
                 f"Reliability Curve - CV Set (Calibrated, Uniform Binning)\n{calibration_method.upper()} Calibration",
@@ -1283,7 +1367,7 @@ def main(
         
         if use_quantile:
             # Test set - uncalibrated (quantile)
-            test_uncalibrated_plot_path_quantile = figures_dir / f"reliability_curve_test_uncalibrated_{calibration_method}_quantile_{timestamp}.png"
+            test_uncalibrated_plot_path_quantile = figures_dir / f"reliability_curve_test_uncalibrated_{model_type}_{calib_source}_{calibration_method}_quantile_{timestamp}.png"
             plot_reliability_curve(
                 test_uncalibrated_plot_quantile,
                 f"Reliability Curve - Test Set (Uncalibrated, Quantile Binning)\n{calibration_method.upper()} Calibration",
@@ -1296,7 +1380,7 @@ def main(
             plot_paths.append(("Test (uncalibrated, quantile)", test_uncalibrated_plot_path_quantile))
             
             # Test set - calibrated (quantile)
-            test_calibrated_plot_path_quantile = figures_dir / f"reliability_curve_test_calibrated_{calibration_method}_quantile_{timestamp}.png"
+            test_calibrated_plot_path_quantile = figures_dir / f"reliability_curve_test_calibrated_{model_type}_{calib_source}_{calibration_method}_quantile_{timestamp}.png"
             plot_reliability_curve(
                 test_calibrated_plot_quantile,
                 f"Reliability Curve - Test Set (Calibrated, Quantile Binning)\n{calibration_method.upper()} Calibration",
@@ -1309,7 +1393,7 @@ def main(
             plot_paths.append(("Test (calibrated, quantile)", test_calibrated_plot_path_quantile))
             
             # CV set - uncalibrated (quantile)
-            cv_uncalibrated_plot_path_quantile = figures_dir / f"reliability_curve_cv_uncalibrated_{calibration_method}_quantile_{timestamp}.png"
+            cv_uncalibrated_plot_path_quantile = figures_dir / f"reliability_curve_cv_uncalibrated_{model_type}_{calib_source}_{calibration_method}_quantile_{timestamp}.png"
             plot_reliability_curve(
                 cv_uncalibrated_plot_quantile,
                 f"Reliability Curve - CV Set (Uncalibrated, Quantile Binning)\n{calibration_method.upper()} Calibration",
@@ -1322,7 +1406,7 @@ def main(
             plot_paths.append(("CV (uncalibrated, quantile)", cv_uncalibrated_plot_path_quantile))
             
             # CV set - calibrated (quantile)
-            cv_calibrated_plot_path_quantile = figures_dir / f"reliability_curve_cv_calibrated_{calibration_method}_quantile_{timestamp}.png"
+            cv_calibrated_plot_path_quantile = figures_dir / f"reliability_curve_cv_calibrated_{model_type}_{calib_source}_{calibration_method}_quantile_{timestamp}.png"
             plot_reliability_curve(
                 cv_calibrated_plot_quantile,
                 f"Reliability Curve - CV Set (Calibrated, Quantile Binning)\n{calibration_method.upper()} Calibration",
@@ -1428,7 +1512,7 @@ def main(
     test_df_minimal['y_pred_proba_calibrated'] = y_test_calibrated
     test_df_minimal['y_pred_proba'] = y_test_calibrated  # Replace original with calibrated (for compatibility)
     
-    calibrated_test_path = output_dir / f"modelC_lgbm_win5_scored_calibrated_{calibration_method}_{timestamp}.parquet"
+    calibrated_test_path = output_dir / f"modelC_{model_type}_win5_scored_calibrated_{calibration_method}_{timestamp}.parquet"
     try:
         test_df_minimal.to_parquet(calibrated_test_path, index=False)
         print(f"\nCalibrated test predictions saved: {calibrated_test_path.name}")
@@ -1438,16 +1522,19 @@ def main(
         sys.exit(1)
     
     # Save reliability plot data
-    reliability_plot_path = output_dir / f"modelC_lgbm_win5_reliability_plot_{calibration_method}_{timestamp}.json"
+    reliability_plot_path = output_dir / f"modelC_{model_type}_win5_reliability_plot_{calibration_method}_{timestamp}.json"
     reliability_plot_data = {
         "metadata": {
             "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "model_type": model_type,
+            "calib_source": calib_source,
             "calibration_method": calibration_method,
             "cv_predictions_file": cv_predictions_path.name,
-            "cv_type": cv_type,  # "temporal", "spatial", or "unknown"
+            "cv_type": cv_type,  # "temporal", "earlystop", "spatial", or "unknown"
             "is_temporal_cv": is_temporal_cv,
+            "is_earlystop": is_earlystop,
             "is_spatial_cv": is_spatial_cv,
-            "note": "Temporal CV predictions (from training script) are preferred for calibration. Spatial CV is for robustness checks only." if is_temporal_cv else "WARNING: Using non-temporal CV predictions may produce suboptimal calibration.",
+            "note": "Temporal CV predictions (from training script) are preferred for calibration. Spatial CV is for robustness checks only." if is_temporal_cv else ("Earlystop validation set predictions (held-out, not CV) used for calibration." if is_earlystop else "WARNING: Using non-temporal CV predictions may produce suboptimal calibration."),
             "test_predictions_file": test_predictions_path.name,
             "fold_info_available": fold_idx is not None,
             "calibration_strategy": "per_fold" if (fold_idx is not None and per_fold) else "pooled",
@@ -1486,16 +1573,19 @@ def main(
         sys.exit(1)
     
     # Save calibration metadata
-    calibration_metadata_path = output_dir / f"modelC_lgbm_win5_calibration_{calibration_method}_{timestamp}.json"
+    calibration_metadata_path = output_dir / f"modelC_{model_type}_win5_calibration_{calibration_method}_{timestamp}.json"
     calibration_metadata = {
         "metadata": {
             "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "model_type": model_type,
+            "calib_source": calib_source,
             "calibration_method": calibration_method,
             "cv_predictions_file": cv_predictions_path.name,
-            "cv_type": cv_type,  # "temporal", "spatial", or "unknown"
+            "cv_type": cv_type,  # "temporal", "earlystop", "spatial", or "unknown"
             "is_temporal_cv": is_temporal_cv,
+            "is_earlystop": is_earlystop,
             "is_spatial_cv": is_spatial_cv,
-            "note": "Temporal CV predictions (from training script) are preferred for calibration. Spatial CV is for robustness checks only." if is_temporal_cv else "WARNING: Using non-temporal CV predictions may produce suboptimal calibration.",
+            "note": "Temporal CV predictions (from training script) are preferred for calibration. Spatial CV is for robustness checks only." if is_temporal_cv else ("Earlystop validation set predictions (held-out, not CV) used for calibration." if is_earlystop else "WARNING: Using non-temporal CV predictions may produce suboptimal calibration."),
             "test_predictions_file": test_predictions_path.name,
             "calibrated_test_predictions_file": calibrated_test_path.name,
         },
@@ -1548,7 +1638,7 @@ def main(
         sys.exit(1)
     
     # Save Brier score summary
-    brier_summary_path = output_dir / f"modelC_lgbm_win5_brier_summary_{calibration_method}_{timestamp}.txt"
+    brier_summary_path = output_dir / f"modelC_{model_type}_win5_brier_summary_{calibration_method}_{timestamp}.txt"
     try:
         save_brier_score_summary(
             brier_summary_path,
@@ -1567,7 +1657,10 @@ def main(
     print("SUMMARY")
     print("=" * 70)
     print(f"\nCalibration method: {calibration_method}")
-    print(f"CV predictions: {cv_predictions_path.name}")
+    if calib_source == "earlystop":
+        print(f"Earlystop validation predictions: {cv_predictions_path.name}")
+    else:
+        print(f"CV predictions: {cv_predictions_path.name}")
     print(f"Test predictions: {test_predictions_path.name}")
     print(f"\nOOF Verification:")
     if fold_idx is not None:
@@ -1626,7 +1719,21 @@ if __name__ == "__main__":
         "--test-predictions",
         type=Path,
         default=None,
-        help="Path to test predictions parquet file (default: find latest modelC_lgbm_win5_scored_*.parquet)"
+        help="Path to test predictions parquet file (default: find latest modelC_{model_type}_win5_scored_*.parquet)"
+    )
+    parser.add_argument(
+        "--model-type",
+        type=str,
+        choices=["lgbm", "rf", "brf"],
+        default="lgbm",
+        help="Model type: 'lgbm', 'rf', or 'brf' (default: lgbm)"
+    )
+    parser.add_argument(
+        "--calib-source",
+        type=str,
+        choices=["temporal_cv", "earlystop"],
+        default=None,
+        help="Calibration source: 'temporal_cv' (default for lgbm) or 'earlystop' (default for rf/brf). Only lgbm supports temporal_cv."
     )
     parser.add_argument(
         "--method",
@@ -1665,7 +1772,7 @@ if __name__ == "__main__":
     output_dir.mkdir(parents=True, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"calibration_modelC_lgbm_{args.method}_{timestamp}.txt"
+    output_file = output_dir / f"calibration_modelC_{args.model_type}_{args.method}_{timestamp}.txt"
     
     tee = Tee(output_file)
     sys.stdout = tee
@@ -1678,7 +1785,9 @@ if __name__ == "__main__":
             assume_oof=args.assume_oof,
             per_fold=args.per_fold,
             require_temporal_cv=args.require_temporal_cv,
-            plot_binning=args.plot_binning
+            plot_binning=args.plot_binning,
+            model_type=args.model_type,
+            calib_source=args.calib_source
         )
     finally:
         sys.stdout = tee.stdout

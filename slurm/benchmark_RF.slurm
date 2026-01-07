@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=visualise-panel
-#SBATCH --partition=normal.4h
-#SBATCH --time=04:00:00
+#SBATCH --job-name=benchmark_RF
+#SBATCH --partition=normal.24h
+#SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/visualise_panel_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/visualise_panel_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/benchmark_RF_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/benchmark_RF_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -33,25 +33,21 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the visualise_panel script
+# Run the benchmark_C script with RF model type
 #------------------------------------------------------------------------------
-echo "Starting visualise_panel script..."
-
-# Ensure footprint diagnostics are enabled
-export PANEL_VIS_SHOW_FOOTPRINT=1
+echo "Starting benchmark_C script (RF mode)..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/visualisations/visualise_panel" ] || {
-  echo "ERROR: visualise_panel not found"
-  echo "NOTE: visualise_panel script is in visualisations/ directory"
-  find scripts -maxdepth 4 -type f -name "visualise_panel"
+[ -f "scripts/colombia/ML/evaluation/benchmark_C" ] || {
+  echo "ERROR: benchmark_C not found"
+  echo "NOTE: benchmark_C script is in colombia/ML/evaluation/ directory"
+  find scripts -maxdepth 4 -type f -name "benchmark_C"
   exit 1
 }
 # Run the script
-python "scripts/ML/visualisations/visualise_panel"
+python "scripts/colombia/ML/evaluation/benchmark_C" --model_type rf
 
-echo "visualise_panel script finished."
-
+echo "benchmark_C script (RF mode) finished."

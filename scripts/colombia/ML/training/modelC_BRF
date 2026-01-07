@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
-"""LGBM Transition Model for Colombia Dataset (5-Year Lookahead Prediction)
-Train LightGBM on pre-split parquet files: train_colombia_win5 (2000-2014), 
+"""Balanced Random Forest Transition Model for Colombia Dataset (5-Year Lookahead Prediction)
+Train BalancedRandomForestClassifier on pre-split parquet files: train_colombia_win5 (2000-2014), 
 earlystop_colombia_win5 (2015-2017), test_colombia_win5 (2018-2019). Final model trained on 2000-2017,
-using average best_iteration from CV folds (no early stopping), evaluated on 2018-2019.
+evaluated on 2018-2019.
 Target: transition_01_win5 (1 if transition occurs within next 5 years, else 0)
 
 Features:
-- Temporal Cross-Validation: 3 folds with different train/earlystop year splits
-- Final Model: Uses average best_iteration from CV folds (no early stopping)
-- Time-based Sample Weighting: Later training years get higher weights
-  (Year 2000: weight 0.5, Year 2014: weight 1.0, linear interpolation in between)
 - Right-Censoring Protection: Earlystop and test data filtered to LAST_LABEL_YEAR
   (LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS) to avoid evaluating on
   labels that don't have complete 5-year lookahead information
+- Imbalance Handling: Uses BalancedRandomForestClassifier with sampling_strategy=0.1
 """
 
 from __future__ import annotations
@@ -23,7 +20,6 @@ import json
 import os
 import sys
 import time
-import pickle
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -36,8 +32,9 @@ except ImportError:
     wandb = None
 import pyarrow as pa
 import pyarrow.parquet as pq
-import lightgbm as lgb
+from imblearn.ensemble import BalancedRandomForestClassifier
 from sklearn.metrics import roc_auc_score, average_precision_score
+import joblib
 
 
 class Tee:
@@ -68,19 +65,11 @@ EARLYSTOP_YEARS = (2015, min(2017, LAST_LABEL_YEAR))     # Earlystop: 2015-2017 
 TEST_START = 2018
 TEST_END = 2019
 TEST_YEARS = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))    # Test: 2018-2019 (capped at LAST_LABEL_YEAR)
-FIXED_PARAMS = {'random_state': RANDOM_STATE, 'boosting_type': 'gbdt', 'objective': 'binary', 'verbose': -1}
 
 # Batch size for data loading (can be overridden via BATCH_SIZE env var)
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "200000"))
 
-# Temporal Cross-Validation Folds
-# Each fold: (train_start, train_end, earlystop_start, earlystop_end)
-# Earlystop years are capped at LAST_LABEL_YEAR to avoid right-censored labels
-CV_FOLDS = [
-    ((2000, 2008), (2009, min(2011, LAST_LABEL_YEAR))),  # Fold 1: Train 2000-2008 → Earlystop 2009-2011
-    ((2000, 2011), (2012, min(2014, LAST_LABEL_YEAR))),  # Fold 2: Train 2000-2011 → Earlystop 2012-2014
-    ((2000, 2014), (2015, min(2017, LAST_LABEL_YEAR))),  # Fold 3: Train 2000-2014 → Earlystop 2015-2017
-]
+# Note: MAX_NEG_TRAIN removed for BRF - BalancedRandomForest handles imbalance via sampling_strategy
 
 # Utility Functions
 
@@ -179,35 +168,6 @@ def extract_features_pyarrow_to_numpy(feature_table: pa.Table, mask: np.ndarray)
     return X
 
 
-def compute_year_weights(years: np.ndarray, min_year: int = 2000, max_year: int = 2014, 
-                         min_weight: float = 0.5, max_weight: float = 1.0) -> np.ndarray:
-    """
-    Compute sample weights based on year.
-    Linear interpolation: min_year -> min_weight, max_year -> max_weight.
-    
-    Args:
-        years: Array of years
-        min_year: Earliest year (gets min_weight)
-        max_year: Latest year (gets max_weight)
-        min_weight: Weight for min_year (default 0.5)
-        max_weight: Weight for max_year (default 1.0)
-    
-    Returns:
-        Array of weights (float32)
-    """
-    # Guard against division by zero when min_year == max_year
-    if max_year == min_year:
-        return np.full(len(years), max_weight, dtype=np.float32)
-    
-    # Normalize years to [0, 1] range
-    years_normalized = (years - min_year) / (max_year - min_year)
-    # Clip to [0, 1] in case of out-of-range years
-    years_normalized = np.clip(years_normalized, 0.0, 1.0)
-    # Linear interpolation
-    weights = min_weight + years_normalized * (max_weight - min_weight)
-    return weights.astype(np.float32)
-
-
 def resolve_parquet_file(filename: str) -> Path:
     """Locate parquet file (prefer $SCRATCH if present)."""
     repo_root = Path(__file__).resolve().parents[4]
@@ -259,9 +219,10 @@ def resolve_metadata_file(filename: str) -> Optional[Path]:
 
 
 def resolve_best_params_json() -> Optional[Path]:
-    """Locate lgbm_best_params.json (in same directory as this script). Returns None if not found."""
+    """Locate rf_best_params.json (in same directory as this script). Returns None if not found.
+    Note: For BRF, we overwrite JSON params with fixed hyperparameters."""
     script_dir = Path(__file__).resolve().parent
-    params_path = script_dir / "lgbm_best_params.json"
+    params_path = script_dir / "rf_best_params.json"
     
     if not params_path.exists():
         return None
@@ -270,38 +231,21 @@ def resolve_best_params_json() -> Optional[Path]:
 
 
 def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
-    """Load and merge parameters: FIXED_PARAMS → json_fixed_params → best_params → guardrails (fill missing only).
-    All parameters from JSON (including scale_pos_weight) are used as-is.
-    If params_path is None, returns default manual hyperparameters."""
-    if params_path is None:
-        # Use default manual hyperparameters when JSON file is not found
-        print("  lgbm_best_params.json not found, using default manual hyperparameters")
-        guardrail_params = {"max_depth": 8, "num_leaves": 255, "min_child_samples": 50, "subsample": 0.7,
-                           "subsample_freq": 1, "colsample_bytree": 0.7, "learning_rate": 0.03, "n_estimators": 3000,
-                           "reg_alpha": 1.0, "reg_lambda": 1.0, "metric": "average_precision", "num_threads": get_n_jobs(), "verbose": -1}
-        final_params = {**FIXED_PARAMS, **guardrail_params}
-        return final_params, None
+    """Return fixed BRF hyperparameters (overwrites JSON params).
+    Uses fast, robust baseline hyperparameters for BalancedRandomForestClassifier."""
+    # Fixed hyperparameters for BRF (overwrite any JSON params)
+    final_params = {
+        "n_estimators": 200,
+        "max_depth": 40,
+        "min_samples_leaf": 50,
+        "sampling_strategy": 0.1,  # ~1:10 pos:neg per tree
+        "replacement": False,
+        "bootstrap": True,
+        "random_state": RANDOM_STATE,
+        "n_jobs": get_n_jobs()
+    }
     
-    with open(params_path, 'r') as f:
-        params_data = json.load(f)
-    
-    # Start with FIXED_PARAMS, then add JSON params (including scale_pos_weight from JSON)
-    json_fixed = params_data.get('fixed_params', {})
-    json_best = params_data.get('best_params', {}).copy()
-    
-    final_params = {**FIXED_PARAMS, **json_fixed, **json_best}
-    
-    # Guardrails: only fill missing keys, don't overwrite existing ones
-    guardrail_params = {"max_depth": 8, "num_leaves": 255, "min_child_samples": 50, "subsample": 0.7,
-                       "subsample_freq": 1, "colsample_bytree": 0.7, "learning_rate": 0.03, "n_estimators": 3000,
-                       "reg_alpha": 1.0, "reg_lambda": 1.0, "metric": "average_precision", "num_threads": get_n_jobs(), "verbose": -1}
-    
-    # Only add guardrail params if key is missing
-    for key, value in guardrail_params.items():
-        if key not in final_params:
-            final_params[key] = value
-    
-    return final_params, params_data.get('best_val_score', params_data.get('best_cv_score', None))
+    return final_params, None
 
 
 def load_numpy_arrays_two_pass(
@@ -649,371 +593,26 @@ def check_year_overlap(train_years: tuple[int, int], eval_years: tuple[int, int]
         print(f"\n{'!'*70}")
         print(f"WARNING: {eval_name} years ({eval_start}-{eval_end}) OVERLAP with training years ({train_start}-{train_end})!")
         print(f"  Evaluation years must be strictly after training years to avoid data leakage.")
-        print(f"  SKIPPING {eval_name} evaluation for this fold.")
         print(f"{'!'*70}\n")
         return True
     return False
 
 
-def train_single_cv_fold(
-    train_paths: list[Path],
-    earlystop_paths: list[Path],
-    feature_cols: list,
-    target_col: str,
-    train_years: tuple[int, int],
-    earlystop_years: tuple[int, int],
-    fold_idx: int,
-    best_params: Dict[str, Any],
-    use_wandb: bool,
-    use_manual_scale_pos_weight: bool = False,
-) -> Dict[str, Any]:
-    """
-    Train and evaluate a single CV fold.
-    Earlystop is used ONLY for early stopping, NOT for metric reporting.
-    
-    Returns:
-        Dictionary containing fold metrics and metadata
-    """
-    print(f"\n{'='*70}")
-    print(f"CV FOLD {fold_idx + 1}/{len(CV_FOLDS)}")
-    print(f"Train: {train_years[0]}-{train_years[1]} → Earlystop: {earlystop_years[0]}-{earlystop_years[1]}")
-    print(f"{'='*70}")
-    
-    # Check for year overlap
-    earlystop_year_range = (earlystop_years[0], min(earlystop_years[1], LAST_LABEL_YEAR))
-    if check_year_overlap(train_years, earlystop_year_range, f"Fold {fold_idx+1} Earlystop"):
-        # Skip this fold if overlap detected
-        return {
-            "fold_idx": fold_idx,
-            "train_years": list(train_years),
-            "earlystop_years": list(earlystop_years),
-            "skipped": True,
-            "skip_reason": "year_overlap",
-        }
-    
-    # Load train data
-    X_train, y_train, train_years_array, train_pos, train_neg, train_years_list = load_numpy_arrays_from_multiple_files(
-        train_paths, feature_cols, target_col, f"Fold {fold_idx+1} Train", year_range=train_years
-    )
-    n_train_samples = len(X_train)
-    
-    # Load earlystop data (filter to LAST_LABEL_YEAR to avoid right-censored labels)
-    X_earlystop, y_earlystop, earlystop_years_array, earlystop_pos, earlystop_neg, earlystop_years_list = load_numpy_arrays_from_multiple_files(
-        earlystop_paths, feature_cols, target_col, f"Fold {fold_idx+1} Earlystop", year_range=earlystop_year_range
-    )
-    n_earlystop_samples = len(X_earlystop)
-    
-    print(f"\nFold {fold_idx+1}: Train {n_train_samples:,} samples, Earlystop {n_earlystop_samples:,} samples (earlystop years {earlystop_year_range[0]}-{earlystop_year_range[1]}, capped at LAST_LABEL_YEAR={LAST_LABEL_YEAR})")
-    print(f"  NOTE: Earlystop used ONLY for early stopping, NOT for metric reporting.")
-    
-    # Compute sample weights for training data (time-based weighting)
-    # Weight range: 2000 (weight 0.5) to train_years[1] (weight 1.0)
-    train_weights = compute_year_weights(train_years_array, min_year=2000, max_year=train_years[1])
-    print(f"  Training sample weights: min={train_weights.min():.3f}, max={train_weights.max():.3f}, mean={train_weights.mean():.3f}")
-    
-    # Compute or use manual scale_pos_weight
-    # Formula: scale_pos_weight = n_neg / n_pos
-    manual_scale_pos_weight = best_params.get("scale_pos_weight", None)
-    if use_manual_scale_pos_weight:
-        scale_pos_weight = manual_scale_pos_weight
-        if scale_pos_weight is not None:
-            print(f"  Using manual scale_pos_weight: {scale_pos_weight:.6f}")
-        else:
-            print(f"  WARNING: use_manual_scale_pos_weight=True but no manual value found in params")
-            # Fallback to computed value
-            scale_pos_weight = train_neg / max(train_pos, 1)
-            print(f"  Falling back to computed scale_pos_weight: {scale_pos_weight:.6f} = {train_neg:,} / {train_pos:,}")
-    else:
-        # Compute from actual training data: scale_pos_weight = n_neg / n_pos
-        scale_pos_weight = train_neg / max(train_pos, 1)
-        print(f"  Computed scale_pos_weight from training data: {scale_pos_weight:.6f} = {train_neg:,} / {train_pos:,}")
-        if manual_scale_pos_weight is not None:
-            print(f"  (Manual value in params: {manual_scale_pos_weight:.6f}, but using computed value)")
-    
-    # Train model
-    num_boost_round_earlystop = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
-    train_params = {**best_params, "is_unbalance": False}
-    train_params.pop("num_boost_round", None)
-    train_params.pop("n_estimators", None)
-    train_params.pop("n_jobs", None)  # Remove n_jobs if present (use num_threads instead)
-    # Ensure num_threads is set for optimal CPU usage
-    if "num_threads" not in train_params:
-        train_params["num_threads"] = get_n_jobs()
-    # Override scale_pos_weight with computed/manual value right before training
-    # Formula: scale_pos_weight = n_neg / n_pos
-    train_params["scale_pos_weight"] = scale_pos_weight
-    
-    print(f"  Creating datasets...")
-    train_dataset = lgb.Dataset(X_train, label=y_train, weight=train_weights, free_raw_data=True)
-    del X_train, y_train, train_years_array, train_weights; gc.collect()
-    
-    earlystop_dataset = lgb.Dataset(X_earlystop, label=y_earlystop, free_raw_data=True, reference=train_dataset)
-    
-    print(f"  Training...")
-    train_start = time.time()
-    lgb_model = lgb.train(
-        train_params,
-        train_dataset,
-        num_boost_round=num_boost_round_earlystop,
-        valid_sets=[earlystop_dataset],
-        valid_names=["earlystop"],
-        callbacks=[lgb.early_stopping(500), lgb.log_evaluation(100)]
-    )
-    train_time = time.time() - train_start
-    best_iteration = lgb_model.best_iteration
-    
-    del train_dataset, earlystop_dataset; gc.collect()
-    
-    # Generate OOF predictions on earlystop set (true OOF for temporal CV)
-    # These predictions will be used for calibration
-    print(f"  Generating OOF predictions on earlystop set ({n_earlystop_samples:,} samples)...")
-    y_earlystop_proba = lgb_model.predict(X_earlystop, num_iteration=best_iteration if best_iteration else None).astype(np.float32)
-    
-    # Store OOF predictions for this fold
-    oof_predictions = {
-        "y_true": y_earlystop.copy(),
-        "y_pred_proba": y_earlystop_proba.copy(),
-        "fold_idx": np.full(len(y_earlystop), fold_idx, dtype=np.int32)
-    }
-    
-    # Clean up earlystop data and model after generating predictions
-    del X_earlystop, y_earlystop, earlystop_years_array, lgb_model, y_earlystop_proba; gc.collect()
-    
-    if use_wandb:
-        wandb.log({
-            f"cv_fold_{fold_idx+1}/n_train": int(n_train_samples),
-            f"cv_fold_{fold_idx+1}/n_earlystop": int(n_earlystop_samples),
-            f"cv_fold_{fold_idx+1}/train_time_seconds": train_time,
-            f"cv_fold_{fold_idx+1}/best_iteration": int(best_iteration) if best_iteration is not None else None,
-        })
-    
-    return {
-        "fold_idx": fold_idx,
-        "train_years": list(train_years),
-        "earlystop_years": list(earlystop_years),
-        "n_train_samples": int(n_train_samples),
-        "n_earlystop_samples": int(n_earlystop_samples),
-        "train_positives": int(train_pos),
-        "train_negatives": int(train_neg),
-        "earlystop_positives": int(earlystop_pos),
-        "earlystop_negatives": int(earlystop_neg),
-        "train_time_seconds": train_time,
-        "best_iteration": int(best_iteration) if best_iteration is not None else None,
-        "oof_predictions": oof_predictions,  # Include OOF predictions for calibration
-    }
-
-
-def aggregate_cv_metrics(cv_results: list[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Aggregate metrics across CV folds.
-    Only aggregates training metadata (no validation/earlystop metrics).
-    """
-    aggregated = {}
-    
-    # Filter out skipped folds
-    valid_folds = [fold for fold in cv_results if not fold.get("skipped", False)]
-    
-    if not valid_folds:
-        return aggregated
-    
-    # Aggregate sample sizes
-    aggregated["n_train_mean"] = float(np.mean([fold.get("n_train_samples", fold.get("train_positives", 0) + fold.get("train_negatives", 0)) for fold in valid_folds]))
-    aggregated["n_earlystop_mean"] = float(np.mean([fold.get("n_earlystop_samples", fold.get("earlystop_positives", 0) + fold.get("earlystop_negatives", 0)) for fold in valid_folds]))
-    
-    # NO earlystop metrics aggregated - earlystop is used ONLY for early stopping
-    
-    return aggregated
-
-
 def phase1_training(
     train_path: Path, earlystop_path: Path, params_path: Optional[Path], feature_cols: list, keep_cols_train: list,
     best_params: Dict[str, Any], timestamp: str, model_dir: Path, output_dir: Path, use_wandb: bool, target_col: str,
-    cv_mode: str = "full", use_manual_scale_pos_weight: bool = False,
-) -> tuple[Path, Dict[str, Any], Dict[str, Any], float, float, int, int, int, Dict[str, Any], Dict[str, Any]]:
+) -> tuple[Path, Dict[str, Any], Dict[str, Any], float, float, int, int, int, Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     """
-    Phase 1: Training with temporal cross-validation.
+    Phase 1: Training Balanced Random Forest model.
     
-    Steps:
-    1. Run temporal CV folds to assess model stability (earlystop used only for early stopping, no metrics)
-    2. Train final model on full train+earlystop data (2000-2017)
+    Train final model on full train+earlystop data (2000-2017).
     
     Returns:
-        Tuple including CV results as additional element
+        Tuple including model path, stats, timing, and imbalance info
     """
-    print("\n" + "="*70 + "\nPHASE 1: TRAINING WITH TEMPORAL CROSS-VALIDATION\n" + "="*70)
+    print("\n" + "="*70 + "\nPHASE 1: TRAINING BALANCED RANDOM FOREST MODEL\n" + "="*70)
     report_memory_usage("start of Phase 1")
     
-    # =============================================================================
-    # STEP A: TEMPORAL CROSS-VALIDATION
-    # =============================================================================
-    print("\n" + "="*70 + "\nSTEP A: TEMPORAL CROSS-VALIDATION\n" + "="*70)
-    print(f"CV Mode: {cv_mode}")
-    
-    cv_results = []
-    
-    if cv_mode == "none":
-        print("  Skipping CV (cv_mode=none)")
-        # Use default best_iteration from params
-        chosen_iteration = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
-        print(f"  Using default best_iteration from params: {chosen_iteration}")
-        cv_aggregated = {}
-        best_iterations = []
-        train_rows_per_fold = []
-        fold3_best_iteration = None
-        cv_results = []
-    else:
-        # For CV, we need data from both train and earlystop files (2000-2017)
-        # Each fold will filter the appropriate year ranges
-        cv_train_paths = [train_path, earlystop_path]  # Both files contain data needed for CV
-        cv_earlystop_paths = [train_path, earlystop_path]    # Same, we filter by year_range
-        
-        # Determine which folds to run
-        if cv_mode == "fold3":
-            folds_to_run = [2]  # Only fold 3 (0-indexed: 2)
-            print(f"  Running only fold 3 (2000-2014 -> 2015-2017)")
-        elif cv_mode == "full":
-            folds_to_run = list(range(len(CV_FOLDS)))  # All folds
-            print(f"  Running all {len(CV_FOLDS)} folds")
-        else:
-            raise ValueError(f"Invalid cv_mode: {cv_mode}. Must be one of: full, fold3, none")
-        
-        # Collect OOF predictions from all folds for calibration
-        all_oof_predictions = []
-        
-        for fold_idx in folds_to_run:
-            train_years, earlystop_years = CV_FOLDS[fold_idx]
-            fold_result = train_single_cv_fold(
-                cv_train_paths, cv_earlystop_paths, feature_cols, target_col,
-                train_years, earlystop_years, fold_idx, best_params, use_wandb, use_manual_scale_pos_weight
-            )
-            
-            # Collect OOF predictions if available (skip if fold was skipped)
-            if not fold_result.get("skipped", False) and "oof_predictions" in fold_result:
-                all_oof_predictions.append(fold_result["oof_predictions"])
-                # Remove predictions from fold_result to avoid bloating JSON (they're saved separately)
-                fold_result_clean = {k: v for k, v in fold_result.items() if k != "oof_predictions"}
-                cv_results.append(fold_result_clean)
-            else:
-                cv_results.append(fold_result)
-            
-            gc.collect()
-        
-        # Save temporal CV OOF predictions for calibration
-        if all_oof_predictions:
-            print(f"\nSaving temporal CV OOF predictions ({len(all_oof_predictions)} folds)...")
-            try:
-                # Concatenate predictions from all folds
-                y_true_all = np.concatenate([pred["y_true"] for pred in all_oof_predictions])
-                y_pred_proba_all = np.concatenate([pred["y_pred_proba"] for pred in all_oof_predictions])
-                fold_idx_all = np.concatenate([pred["fold_idx"] for pred in all_oof_predictions])
-                
-                # Create DataFrame and save to parquet with temporal CV naming pattern
-                temporal_cv_predictions_df = pd.DataFrame({
-                    "y_true": y_true_all,
-                    "y_pred_proba": y_pred_proba_all,
-                    "fold_idx": fold_idx_all
-                })
-                
-                temporal_cv_predictions_path = output_dir / f"modelC_lgbm_win5_temporal_cv_predictions_{timestamp}.parquet"
-                temporal_cv_predictions_df.to_parquet(temporal_cv_predictions_path, index=False, engine="pyarrow")
-                print(f"  Temporal CV OOF predictions saved: {temporal_cv_predictions_path.name}")
-                print(f"  Total samples: {len(temporal_cv_predictions_df):,}")
-                print(f"  Folds: {sorted(np.unique(fold_idx_all).tolist())}")
-                
-                # Clean up
-                del temporal_cv_predictions_df, y_true_all, y_pred_proba_all, fold_idx_all, all_oof_predictions
-                gc.collect()
-            except Exception as e:
-                print(f"  WARNING: Failed to save temporal CV OOF predictions: {e}")
-                import traceback
-                traceback.print_exc()
-                # Don't exit - continue with training
-        
-        # Aggregate CV metrics (no metrics computed on earlystop sets)
-        cv_aggregated = aggregate_cv_metrics(cv_results)
-        
-        # Extract best_iterations and train_rows for each fold (skip folds that were skipped due to overlap)
-        best_iterations = [fold["best_iteration"] for fold in cv_results if fold.get("best_iteration") is not None and not fold.get("skipped", False)]
-        train_rows_per_fold = [fold["n_train_samples"] for fold in cv_results if not fold.get("skipped", False)]
-        
-        # Extract fold3's best_iteration (fold index 2) - skip if fold was skipped
-        fold3_best_iteration = None
-        for fold_result in cv_results:
-            if (fold_result.get("fold_idx") == 2 and 
-                fold_result.get("best_iteration") is not None and 
-                not fold_result.get("skipped", False)):
-                fold3_best_iteration = fold_result["best_iteration"]
-                break
-        
-        # Calculate chosen_iteration based on cv_mode
-        if cv_mode == "full":
-            if best_iterations and train_rows_per_fold:
-                # Weighted average: sum(iter_i * n_i) / sum(n_i) * 1.05
-                weighted_sum = sum(iter_i * n_i for iter_i, n_i in zip(best_iterations, train_rows_per_fold))
-                total_rows = sum(train_rows_per_fold)
-                chosen_iteration = int(np.round(weighted_sum / total_rows * 1.05))
-                print(f"\nCV best_iterations: {best_iterations}")
-                print(f"CV train_rows_per_fold: {train_rows_per_fold}")
-                print(f"Weighted average (before 1.05x): {weighted_sum / total_rows:.2f}")
-                print(f"Chosen iteration (weighted avg * 1.05): {chosen_iteration}")
-                
-                # Apply max constraint with fold3_best_iteration
-                if fold3_best_iteration is not None:
-                    chosen_iteration = max(chosen_iteration, fold3_best_iteration)
-                    print(f"After max with fold3_best_iteration ({fold3_best_iteration}): {chosen_iteration}")
-            else:
-                # Fallback: use default if no best_iteration found (e.g., all folds skipped)
-                skipped_count = len([f for f in cv_results if f.get("skipped", False)])
-                if skipped_count > 0:
-                    print(f"\nWarning: {skipped_count} fold(s) skipped due to year overlap. No best_iteration found in remaining folds.")
-                else:
-                    print(f"\nWarning: No best_iteration found in CV folds.")
-                chosen_iteration = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
-                print(f"  Using default iteration from params: {chosen_iteration}")
-        elif cv_mode == "fold3":
-            if fold3_best_iteration is not None:
-                chosen_iteration = fold3_best_iteration
-                print(f"\nUsing fold3_best_iteration: {chosen_iteration}")
-            else:
-                # Fallback: use default if fold3 best_iteration not found (e.g., fold3 was skipped)
-                fold3_result = next((f for f in cv_results if f.get("fold_idx") == 2), None)
-                if fold3_result and fold3_result.get("skipped", False):
-                    print(f"\nWarning: Fold 3 was skipped due to year overlap. fold3_best_iteration not available.")
-                else:
-                    print(f"\nWarning: fold3_best_iteration not found.")
-                chosen_iteration = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
-                print(f"  Using default iteration from params: {chosen_iteration}")
-        else:
-            # Fallback for any other mode
-            chosen_iteration = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
-            print(f"\nWarning: Unknown cv_mode, using default: {chosen_iteration}")
-    
-    print("\n" + "="*70)
-    print("TEMPORAL CV RESULTS (Aggregated)")
-    print("="*70)
-    print(f"CV Mode: {cv_mode}")
-    if cv_mode != "none":
-        print(f"Chosen iteration (for final model): {chosen_iteration}")
-        # Report number of skipped folds
-        skipped_folds = [fold for fold in cv_results if fold.get("skipped", False)]
-        if skipped_folds:
-            print(f"  WARNING: {len(skipped_folds)} fold(s) skipped due to year overlap")
-    else:
-        print(f"Chosen iteration (from params): {chosen_iteration}")
-    
-    # NO earlystop metrics displayed - earlystop is used ONLY for early stopping, not for evaluation
-    
-    print("="*70)
-    
-    if use_wandb:
-        wandb.log({
-            **{f"cv_aggregated/{k}": v for k, v in cv_aggregated.items() if not k.endswith("_values")}
-        })
-    
-    # =============================================================================
-    # STEP B: FINAL MODEL TRAINING (Full train+earlystop: 2000-2017)
-    # =============================================================================
-    print("\n" + "="*70 + "\nSTEP B: FINAL MODEL TRAINING\n" + "="*70)
     print(f"Training final model on full dataset: {TRAIN_YEARS[0]}-{EARLYSTOP_YEARS[1]}")
     report_memory_usage("before final model training")
     
@@ -1025,6 +624,8 @@ def phase1_training(
     )
     n_train_full = len(y_train_full)
     
+    # Note: No MAX_NEG_TRAIN downsampling for BRF - BalancedRandomForest handles imbalance via sampling_strategy
+    
     train_stats = {
         "n_train": n_train_full,
         "train_positives": int(train_pos_full),
@@ -1035,83 +636,64 @@ def phase1_training(
     report_memory_usage("after loading final data")
     
     print(f"\nFinal model training: train ({TRAIN_YEARS[0]}-{EARLYSTOP_YEARS[1]}): {len(X_train_full):,} rows")
-    print(f"Final training: no earlystop/val; num_boost_round fixed from CV to avoid leakage.")
     
-    # Compute sample weights for training data (time-based weighting)
-    # Weight range: 2000 (weight 0.5) to EARLYSTOP_YEARS[1] (weight 1.0)
-    train_weights = compute_year_weights(train_years_array_full, min_year=2000, max_year=EARLYSTOP_YEARS[1])
-    print(f"  Training sample weights: min={train_weights.min():.3f}, max={train_weights.max():.3f}, mean={train_weights.mean():.3f}")
+    # Prepare model parameters (use best_params directly - already set with fixed BRF hyperparameters)
+    model_params = best_params.copy()
     
-    # Compute or use manual scale_pos_weight
-    # Formula: scale_pos_weight = n_neg / n_pos
-    manual_scale_pos_weight = best_params.get("scale_pos_weight", None)
-    if use_manual_scale_pos_weight:
-        scale_pos_weight = manual_scale_pos_weight
-        if scale_pos_weight is not None:
-            print(f"\nImbalance: Using manual scale_pos_weight: {scale_pos_weight:.6f}")
-        else:
-            print(f"\nWARNING: use_manual_scale_pos_weight=True but no manual value found in params")
-            # Fallback to computed value
-            scale_pos_weight = train_neg_full / max(train_pos_full, 1)
-            print(f"  Falling back to computed scale_pos_weight: {scale_pos_weight:.6f} = {train_neg_full:,} / {train_pos_full:,}")
-    else:
-        # Compute from actual training data: scale_pos_weight = n_neg / n_pos
-        scale_pos_weight = train_neg_full / max(train_pos_full, 1)
-        print(f"\nImbalance: Computed scale_pos_weight from training data: {scale_pos_weight:.6f} = {train_neg_full:,} / {train_pos_full:,}")
-        if manual_scale_pos_weight is not None:
-            print(f"  (Manual value in params: {manual_scale_pos_weight:.6f}, but using computed value)")
+    # Ensure random_state and n_jobs are set (should already be in best_params, but double-check)
+    model_params["random_state"] = RANDOM_STATE
+    if "n_jobs" not in model_params:
+        model_params["n_jobs"] = get_n_jobs()
+    
+    # Remove any RF/LGBM-specific params that shouldn't be in BRF
+    model_params.pop("class_weight", None)  # BRF doesn't use class_weight
+    model_params.pop("scale_pos_weight", None)
+    model_params.pop("is_unbalance", None)
+    model_params.pop("num_boost_round", None)
+    model_params.pop("num_threads", None)
+    model_params.pop("verbose", None)
+    model_params.pop("boosting_type", None)
+    model_params.pop("objective", None)
+    model_params.pop("metric", None)
+    model_params.pop("min_samples_split", None)  # BRF uses min_samples_leaf, not min_samples_split
     
     imbalance_info = {
         "neg": int(train_neg_full),
         "pos": int(train_pos_full),
-        "scale_pos_weight": float(scale_pos_weight),
-        "manual_scale_pos_weight": float(manual_scale_pos_weight) if manual_scale_pos_weight is not None else None,
-        "use_manual_scale_pos_weight": use_manual_scale_pos_weight
+        "sampling_strategy": model_params.get("sampling_strategy", 0.1)
     }
+    
+    print(f"\nImbalance: {train_neg_full:,} neg, {train_pos_full:,} pos, ratio 1:{train_neg_full/max(train_pos_full,1):.1f}")
+    print(f"  Using BalancedRandomForest with sampling_strategy={model_params.get('sampling_strategy', 0.1)}")
+    
     if use_wandb:
         wandb.log({
-            "final_model/imbalance/scale_pos_weight": float(scale_pos_weight),
-            "final_model/sample_weights/min": float(train_weights.min()),
-            "final_model/sample_weights/max": float(train_weights.max()),
-            "final_model/sample_weights/mean": float(train_weights.mean()),
+            "final_model/imbalance/sampling_strategy": float(model_params.get("sampling_strategy", 0.1)),
+            "final_model/imbalance/neg": int(train_neg_full),
+            "final_model/imbalance/pos": int(train_pos_full),
         })
     
     print(f"\nTraining final model on {len(X_train_full):,} samples...")
+    print(f"  Model parameters: n_estimators={model_params.get('n_estimators', 'default')}, "
+          f"max_depth={model_params.get('max_depth', 'default')}, "
+          f"min_samples_leaf={model_params.get('min_samples_leaf', 'default')}, "
+          f"sampling_strategy={model_params.get('sampling_strategy', 'default')}")
     report_memory_usage("before final training")
     train_start = time.time()
-    train_params = {**best_params, "is_unbalance": False}
-    train_params.pop("num_boost_round", None)
-    train_params.pop("n_estimators", None)
-    train_params.pop("n_jobs", None)  # Remove n_jobs if present (use num_threads instead)
-    # Ensure num_threads is set for optimal CPU usage
-    if "num_threads" not in train_params:
-        train_params["num_threads"] = get_n_jobs()
-    # Override scale_pos_weight with computed/manual value right before training
-    # Formula: scale_pos_weight = n_neg / n_pos
-    train_params["scale_pos_weight"] = scale_pos_weight
     
-    print(f"  Creating dataset...")
-    train_dataset = lgb.Dataset(X_train_full, label=y_train_full, weight=train_weights, free_raw_data=True)
-    del X_train_full, y_train_full, train_years_array_full, train_weights; gc.collect()
-    report_memory_usage("after train dataset creation")
+    # Create and train Balanced Random Forest model
+    brf_model = BalancedRandomForestClassifier(**model_params)
+    brf_model.fit(X_train_full, y_train_full)
     
-    print(f"  Starting training with num_boost_round={chosen_iteration} (fixed from CV, no validation set/early stopping)...")
-    lgb_model = lgb.train(
-        train_params,
-        train_dataset,
-        num_boost_round=chosen_iteration,
-        callbacks=[lgb.log_evaluation(100)]
-    )
     train_time = time.time() - train_start
-    print(f"\nTraining done in {train_time:.1f}s. Used {chosen_iteration} iterations (chosen based on CV)")
+    print(f"\nTraining done in {train_time:.1f}s")
     
-    del train_dataset; gc.collect()
+    del X_train_full, y_train_full, train_years_array_full; gc.collect()
     
     earlystop_time = 0.0  # No earlystop prediction time (not computing metrics)
     
-    model_path = model_dir / f"modelC_lgbm_win5_{timestamp}.pkl"
-    with open(model_path, 'wb') as f:
-        pickle.dump(lgb_model, f)
+    model_path = model_dir / f"modelC_brf_win5_{timestamp}.joblib"
+    joblib.dump(brf_model, model_path)
     print(f"Final model saved: {model_path}")
     gc.collect()
     
@@ -1124,30 +706,19 @@ def phase1_training(
             "final_model/data/train_positive_pct": train_stats["train_positive_pct"],
             "final_model/training/train_time_seconds": train_time,
             "final_model/training/train_time_minutes": train_time / 60,
-            "final_model/training/final_num_boost_round": chosen_iteration,
-            "final_model/training/chosen_iteration": chosen_iteration,
         })
     
     print("Phase 1 completed.")
-    cv_info = {
-        "cv_mode": cv_mode,
-        "folds": cv_results,
-        "aggregated": cv_aggregated,
-        "cv_best_iterations": best_iterations,
-        "cv_train_rows_per_fold": train_rows_per_fold,
-        "fold3_best_iteration": int(fold3_best_iteration) if fold3_best_iteration is not None else None,
-        "final_num_boost_round": chosen_iteration,
-        "chosen_iteration": chosen_iteration  # Alias for backward compatibility
-    }
+    cv_info = {}  # Empty CV info for RF (no CV needed)
     # Return None for earlystop_metrics - earlystop is not used for evaluation
-    return (model_path, None, train_stats, train_time, earlystop_time, train_pos_full, train_neg_full, n_train_full, imbalance_info, cv_info)
+    return (model_path, None, train_stats, train_time, earlystop_time, train_pos_full, train_neg_full, n_train_full, imbalance_info, cv_info, model_params)
 
 
 def phase2_testing(
     test_path: Path, model_path: Path, feature_cols: list, keep_cols_test: list, timestamp: str, output_dir: Path,
     use_wandb: bool, target_col: str, earlystop_metrics: Optional[Dict[str, Any]], train_stats: Dict[str, Any],
     train_time: float, earlystop_time: float, train_pos: int, train_neg: int, n_train_full: int,
-    best_params: Dict[str, Any], start_time: float, imbalance_info: Dict[str, Any], cv_info: Dict[str, Any],
+    best_params: Dict[str, Any], model_params: Dict[str, Any], start_time: float, imbalance_info: Dict[str, Any], cv_info: Dict[str, Any],
 ) -> None:
     """Phase 2: Testing - loads test in batches, loads model, evaluates."""
     print("\n" + "="*70 + "\nPHASE 2: TESTING\n" + "="*70)
@@ -1164,8 +735,7 @@ def phase2_testing(
         raise ValueError("Test years overlap with training years. Cannot evaluate.")
     
     print(f"\nLoading model from {model_path}")
-    with open(model_path, 'rb') as f:
-        lgb_model = pickle.load(f)
+    brf_model = joblib.load(model_path)
     report_memory_usage("after loading model")
     
     # Use batch size from config (can be overridden via BATCH_SIZE env var)
@@ -1212,18 +782,10 @@ def phase2_testing(
     y_proba = np.empty(n_test_total, dtype=np.float32)
     report_memory_usage("after pre-allocation")
     
-    # Get best iteration from CV info (chosen iteration from CV)
-    # Since final model doesn't use early stopping, we use the chosen iteration from CV
-    best_iteration = cv_info.get("final_num_boost_round", cv_info.get("chosen_iteration", None))
-    if best_iteration is None:
-        # Fallback: use model's num_trees if cv_info doesn't have it
-        best_iteration = getattr(lgb_model, 'num_trees', None)
-    print(f"  Using {best_iteration} iterations for predictions (chosen from CV)")
-    
     # Pass 2: Process batches and fill pre-allocated arrays
     print(f"  Pass 2: Processing test batches (year_range={test_year_range})...")
     parquet_file = pq.ParquetFile(test_path)
-    scored_path = output_dir / f"modelC_lgbm_win5_scored_{timestamp}.parquet"
+    scored_path = output_dir / f"modelC_brf_win5_scored_{timestamp}.parquet"
     writer = None
     test_pos = test_neg = batch_num = idx_offset = 0
     pred_start = time.time()
@@ -1259,7 +821,7 @@ def phase2_testing(
             y_batch = (target_valid > 0).astype(np.int8)
             
             # Get predictions from model
-            y_proba_batch = lgb_model.predict(X_batch, num_iteration=best_iteration if best_iteration else None).astype(np.float32)
+            y_proba_batch = brf_model.predict_proba(X_batch)[:, 1].astype(np.float32)
             
             # Fill pre-allocated arrays directly
             batch_size_actual = len(y_batch)
@@ -1347,7 +909,7 @@ def phase2_testing(
     try:
         feature_importance = pd.DataFrame({
             'feature': feature_cols, 
-            'importance': lgb_model.feature_importance()
+            'importance': brf_model.feature_importances_
         }).sort_values('importance', ascending=False).head(20)
         print("\nTop 20 features:\n" + feature_importance.to_string(index=False))
     except Exception as e:
@@ -1360,15 +922,14 @@ def phase2_testing(
     metrics = {
         "metadata": {
             "timestamp": timestamp, 
-            "model": "LightGBM", 
+            "model": "BalancedRandomForest", 
             "task": "transition_01_win5_prediction",
             "target_column": TARGET_COL,
             "lookahead_years": 5,
             "random_state": RANDOM_STATE, 
             "n_features": len(feature_cols), 
             "features": feature_cols,
-            "test_probabilities": "uncalibrated",
-            "cv_mode": cv_info.get("cv_mode", "full")
+            "test_probabilities": "uncalibrated"
         },
         "data": {
             "n_train_full": n_train_full, 
@@ -1384,14 +945,10 @@ def phase2_testing(
             "earlystop_years": list(EARLYSTOP_YEARS), 
             "test_years": list(TEST_YEARS)
         },
-        "cross_validation": cv_info,
-        "model_parameters": best_params,
+        "trained_params": model_params,
         "imbalance_handling": {
-            "method": "scale_pos_weight", 
-            "is_unbalance": False,
-            "scale_pos_weight": imbalance_info.get("scale_pos_weight"),
-            "manual_scale_pos_weight": imbalance_info.get("manual_scale_pos_weight"),
-            "use_manual_scale_pos_weight": imbalance_info.get("use_manual_scale_pos_weight", False),
+            "method": "balanced_random_forest", 
+            "sampling_strategy": imbalance_info.get("sampling_strategy", 0.1),
             "neg": imbalance_info.get("neg"), 
             "pos": imbalance_info.get("pos")
         },
@@ -1404,28 +961,16 @@ def phase2_testing(
         }
     }
     metrics = convert_numpy_types(metrics)
-    metrics_path = output_dir / f"modelC_lgbm_win5_metrics_{timestamp}.json"
+    metrics_path = output_dir / f"modelC_brf_win5_metrics_{timestamp}.json"
     with open(metrics_path, 'w') as f:
         json.dump(metrics, f, indent=2)
     print(f"\nMetrics saved: {metrics_path}")
-    del lgb_model; gc.collect()
+    del brf_model; gc.collect()
     
     total_time = time.time() - start_time
-    cv_mode = cv_info.get("cv_mode", "full")
     print("\n" + "="*70 + "\nSUMMARY\n" + "="*70)
-    print(f"Model: LightGBM, {len(feature_cols)} features")
-    print(f"\nTemporal Cross-Validation (CV Mode: {cv_mode}):")
-    if cv_mode != "none":
-        n_folds_run = len([f for f in cv_info.get("folds", []) if not f.get("skipped", False)])
-        n_folds_skipped = len([f for f in cv_info.get("folds", []) if f.get("skipped", False)])
-        print(f"  Folds run: {n_folds_run}")
-        if n_folds_skipped > 0:
-            print(f"  Folds skipped (year overlap): {n_folds_skipped}")
-    print(f"  Final num_boost_round (chosen): {cv_info.get('final_num_boost_round', 'N/A')}")
-    if cv_info.get('fold3_best_iteration') is not None:
-        print(f"  Fold3 best_iteration: {cv_info.get('fold3_best_iteration')}")
-    
-    # NO earlystop/validation metrics displayed - only CV metadata and test metrics
+    print(f"Model: BalancedRandomForest, {len(feature_cols)} features")
+    print(f"  Sampling strategy: {imbalance_info.get('sampling_strategy', 0.1)}")
     
     print(f"\nTest ({TEST_YEARS[0]}-{TEST_YEARS[1]}, {n_test_total:,} samples, {test_pos/n_test_total*100:.3f}% pos): ROC-AUC {test_metrics['roc_auc']:.4f}, PR-AUC {test_metrics['pr_auc']:.4f}")
     print(f"  P@1%: {prec_at_k[1]:.4f} ({test_metrics['lift_at_1pct']:.1f}x), P@5%: {prec_at_k[5]:.4f} ({test_metrics['lift_at_5pct']:.1f}x), P@10%: {prec_at_k[10]:.4f} ({test_metrics['lift_at_10pct']:.1f}x)")
@@ -1441,7 +986,7 @@ def phase2_testing(
         wandb.finish()
 
 
-def main(timestamp: str, cv_mode: str = "full", use_manual_scale_pos_weight: bool = False) -> None:
+def main(timestamp: str) -> None:
     start_time = time.time()
     repo_root = Path(__file__).resolve().parents[4]
     train_path = resolve_parquet_file("train_colombia_win5.parquet")
@@ -1460,9 +1005,9 @@ def main(timestamp: str, cv_mode: str = "full", use_manual_scale_pos_weight: boo
             wandb.init(
             project="ml-training-colombia", 
             entity=os.environ.get("WANDB_ENTITY"), 
-            name=f"modelC_lgbm_win5_{timestamp}",
+            name=f"modelC_brf_win5_{timestamp}",
             config={
-                "model": "LightGBM", 
+                "model": "BalancedRandomForest", 
                 "task": "transition_01_win5_prediction", 
                 "target_column": TARGET_COL,
                 "lookahead_years": 5,
@@ -1481,40 +1026,19 @@ def main(timestamp: str, cv_mode: str = "full", use_manual_scale_pos_weight: boo
     else:
         print("W&B not available (module not installed)")
     
-    print("="*70 + "\nLGBM TRANSITION MODEL (COLOMBIA DATASET - 5-YEAR LOOKAHEAD)\n" + "="*70)
-    print(f"Train: {train_path}\nEarlystop: {earlystop_path}\nTest: {test_path}\nParams: {params_path if params_path else 'Using default manual hyperparameters'}\nOutput: {output_dir}")
+    print("="*70 + "\nBALANCED RANDOM FOREST TRANSITION MODEL (COLOMBIA DATASET - 5-YEAR LOOKAHEAD)\n" + "="*70)
+    print(f"Train: {train_path}\nEarlystop: {earlystop_path}\nTest: {test_path}\nParams: Using fixed BRF hyperparameters (overwrites JSON)\nOutput: {output_dir}")
     print(f"\nConfiguration:")
-    print(f"  CV Mode: {cv_mode}")
-    print(f"  Use Manual scale_pos_weight: {use_manual_scale_pos_weight}")
     print(f"  WDPA_LAST_YEAR: {WDPA_LAST_YEAR}")
     print(f"  LOOKAHEAD_YEARS: {LOOKAHEAD_YEARS}")
     print(f"  LAST_LABEL_YEAR: {LAST_LABEL_YEAR} (WDPA_LAST_YEAR - LOOKAHEAD_YEARS)")
     print(f"  Earlystop/Test data filtered to years <= {LAST_LABEL_YEAR} to avoid right-censored labels")
-    
-    # Load scale_pos_weight from metadata if available
-    scale_pos_weight_from_metadata = None
-    if metadata_path:
-        try:
-            with open(metadata_path, 'r') as f:
-                metadata = json.load(f)
-                scale_pos_weight_from_metadata = metadata.get("scale_pos_weight")
-                print(f"\nLoaded metadata from {metadata_path}")
-                print(f"  scale_pos_weight: {scale_pos_weight_from_metadata}")
-        except Exception as e:
-            print(f"\nWarning: Could not load metadata from {metadata_path}: {e}")
+    print(f"  Using BalancedRandomForestClassifier with fixed hyperparameters (no MAX_NEG_TRAIN downsampling)")
     
     best_params, best_cv_score = load_best_params(params_path)
-    if params_path:
-        print(f"\nLoaded params from {params_path}")
-        if best_cv_score:
-            print(f"Best CV score: {best_cv_score:.4f}")
-    else:
-        print(f"\nUsing default manual hyperparameters (lgbm_best_params.json not found)")
-    
-    # Override scale_pos_weight with value from metadata if available
-    if scale_pos_weight_from_metadata is not None:
-        best_params = {**best_params, "scale_pos_weight": scale_pos_weight_from_metadata}
-        print(f"Using scale_pos_weight from metadata: {scale_pos_weight_from_metadata:.6f}")
+    print(f"\nUsing fixed BRF hyperparameters:")
+    print(f"  n_estimators={best_params.get('n_estimators')}, max_depth={best_params.get('max_depth')}, "
+          f"min_samples_leaf={best_params.get('min_samples_leaf')}, sampling_strategy={best_params.get('sampling_strategy')}")
     
     all_cols_train = pq.ParquetFile(train_path).schema_arrow.names
     all_cols_test = pq.ParquetFile(test_path).schema_arrow.names
@@ -1535,40 +1059,28 @@ def main(timestamp: str, cv_mode: str = "full", use_manual_scale_pos_weight: boo
     print(f"Selected {len(feature_cols)} features, loading {len(keep_cols_train)} cols from train, {len(keep_cols_test)} from test")
     print(f"Target column: {target_col}")
     
-    (model_path, earlystop_metrics, train_stats, train_time, earlystop_time, train_pos, train_neg, n_train_full, imbalance_info, cv_info) = phase1_training(
-        train_path, earlystop_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col, cv_mode, use_manual_scale_pos_weight)
+    (model_path, earlystop_metrics, train_stats, train_time, earlystop_time, train_pos, train_neg, n_train_full, imbalance_info, cv_info, model_params) = phase1_training(
+        train_path, earlystop_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col)
     
     phase2_testing(
         test_path, model_path, feature_cols, keep_cols_test, timestamp, output_dir, use_wandb, target_col,
         earlystop_metrics, train_stats, train_time, earlystop_time, train_pos, train_neg, n_train_full,
-        best_params, start_time, imbalance_info, cv_info)
+        best_params, model_params, start_time, imbalance_info, cv_info)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="LGBM Transition Model for Colombia Dataset (5-Year Lookahead Prediction)")
-    parser.add_argument(
-        "--cv-mode",
-        type=str,
-        choices=["full", "fold3", "none"],
-        default="fold3",
-        help="Cross-validation mode: 'full' (run all 3 folds), 'fold3' (run only fold 3 for fast dev), 'none' (skip CV)"
-    )
-    parser.add_argument(
-        "--use-manual-scale-pos-weight",
-        action="store_true",
-        help="Use manually set scale_pos_weight from params/JSON instead of computing from training data (default: compute from data)"
-    )
+    parser = argparse.ArgumentParser(description="Balanced Random Forest Transition Model for Colombia Dataset (5-Year Lookahead Prediction)")
     args = parser.parse_args()
     
     repo_root = Path(__file__).resolve().parents[4]
     output_dir = repo_root / "outputs/Results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"modelC_lgbm_win5_{timestamp}.txt"
+    output_file = output_dir / f"modelC_brf_win5_{timestamp}.txt"
     tee = Tee(output_file)
     sys.stdout = tee
     try:
-        main(timestamp, cv_mode=args.cv_mode, use_manual_scale_pos_weight=args.use_manual_scale_pos_weight)
+        main(timestamp)
     finally:
         sys.stdout = tee.stdout
         tee.close()

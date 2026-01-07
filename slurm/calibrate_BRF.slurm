@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=modelC_preprocessing
+#SBATCH --job-name=calibrate_BRF
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/modelC_preprocessing_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/modelC_preprocessing_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/calibrate_BRF_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/calibrate_BRF_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -33,22 +33,22 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the modelC_preprocessing script
+# Run the calibrate_C script (BRF mode)
 #------------------------------------------------------------------------------
-echo "Starting modelC_preprocessing script..."
+echo "Starting calibrate_C script (BRF mode)..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/colombia/ML/ml_preprocessing/modelC_preprocessing" ] || {
-  echo "ERROR: modelC_preprocessing not found"
-  echo "NOTE: modelC_preprocessing script is in colombia/ML/ml_preprocessing/ directory"
-  find scripts -maxdepth 4 -type f -name "modelC_preprocessing"
+[ -f "scripts/colombia/ML/evaluation/calibrate_C" ] || {
+  echo "ERROR: calibrate_C not found"
+  echo "NOTE: calibrate_C script is in colombia/ML/evaluation/ directory"
+  find scripts -maxdepth 4 -type f -name "calibrate_C"
   exit 1
 }
 # Run the script
-python "scripts/colombia/ML/ml_preprocessing/modelC_preprocessing"
+python "scripts/colombia/ML/evaluation/calibrate_C" --model_type brf
 
-echo "modelC_preprocessing script finished."
+echo "calibrate_C script (BRF mode) finished."
 

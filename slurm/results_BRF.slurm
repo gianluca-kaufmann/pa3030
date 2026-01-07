@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=benchmark_1
+#SBATCH --job-name=modelC_results_BRF
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/benchmark_1_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/benchmark_1_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/modelC_results_BRF_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/modelC_results_BRF_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -33,22 +33,21 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the benchmark_1 script
+# Run the modelC_results script
 #------------------------------------------------------------------------------
-echo "Starting benchmark_1 script..."
+echo "Starting modelC_results script (BRF mode)..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/evaluation/benchmark_1" ] || {
-  echo "ERROR: benchmark_1 not found"
-  echo "NOTE: benchmark_1 script is in ML/evaluation/ directory"
-  find scripts -maxdepth 4 -type f -name "benchmark_1"
+[ -f "scripts/colombia/ML/results/modelC_results" ] || {
+  echo "ERROR: modelC_results not found"
+  echo "NOTE: modelC_results script is in colombia/ML/results/ directory"
+  find scripts -maxdepth 4 -type f -name "modelC_results"
   exit 1
 }
 # Run the script
-python "scripts/ML/evaluation/benchmark_1"
+python "scripts/colombia/ML/results/modelC_results" --model_type brf
 
-echo "benchmark_1 script finished."
-
+echo "modelC_results script (BRF mode) finished."

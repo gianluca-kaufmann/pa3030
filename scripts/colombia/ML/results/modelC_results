@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Results Reporting Script for modelC_LGBM
+"""Results Reporting Script for modelC
 
-Purpose: Generate comprehensive results report from modelC_LGBM predictions:
+Purpose: Generate comprehensive results report from modelC predictions:
          - Metrics table (CSV + LaTeX)
          - Precision-Recall curve (PNG + PDF) with baseline prevalence
          - Risk map showing Colombia boundary, top-1% predicted pixels, and observed PA establishments
          - Probability map showing continuous probability predictions across Colombia
 
-Input:   - modelC_lgbm_win5_metrics_*.json
-         - modelC_lgbm_win5_scored_*.parquet
+Input:   - modelC_{model_type}_win5_metrics_*.json
+         - modelC_{model_type}_win5_scored_*.parquet (raw or calibrated)
          - test_colombia_win5.parquet (optional, auto-discovered if available)
+
+Supports model types: lgbm, rf, brf
 
 Note:    The risk map uses WDPA_b1 from original test data to correctly identify pixels
          established in each year. Since transition_01_win5 (y_true) is a 5-year lookahead
@@ -19,14 +21,14 @@ Note:    The risk map uses WDPA_b1 from original test data to correctly identify
          are correctly shown.
 
 Output:  - outputs/Results/ml_models/reporting/
-           - modelC_metrics_table.csv
-           - modelC_metrics_table.tex
-           - modelC_pr_curve.png
-           - modelC_pr_curve.pdf
-           - modelC_risk_map_top1pct.png
-           - modelC_risk_map_top1pct.pdf
-           - modelC_probability_map.png
-           - modelC_probability_map.pdf
+           - modelC_{model_type}_metrics_table.csv
+           - modelC_{model_type}_metrics_table.tex
+           - modelC_{model_type}_pr_curve.png
+           - modelC_{model_type}_pr_curve.pdf
+           - modelC_{model_type}_risk_map_top1pct.png
+           - modelC_{model_type}_risk_map_top1pct.pdf
+           - modelC_{model_type}_probability_map.png
+           - modelC_{model_type}_probability_map.pdf
 """
 
 from __future__ import annotations
@@ -123,7 +125,7 @@ def check_calibration_status(parquet_path: Path, available_columns: list) -> Non
         print(f"{'!'*70}")
         print(f"  File: {parquet_path.name}")
         print(f"  No calibration metadata found (no 'y_pred_proba_uncalibrated'/'y_pred_proba_calibrated' columns)")
-        print(f"  For calibrated results, use: modelC_lgbm_win5_scored_calibrated_*.parquet")
+        print(f"  For calibrated results, use: modelC_<model_type>_win5_scored_calibrated_*.parquet")
         print(f"{'!'*70}\n")
 
 
@@ -321,13 +323,16 @@ def validate_coordinates(df: pd.DataFrame) -> None:
     print(f"  Coordinate validation passed ({both_valid_pct:.2f}% in expected ranges)")
 
 
-def create_metrics_table(metrics_data: Dict[str, Any], output_dir: Path) -> None:
+def create_metrics_table(metrics_data: Dict[str, Any], output_dir: Path, model_type: str) -> None:
     """Create metrics table in CSV and LaTeX formats."""
     print("\n" + "=" * 70)
     print("CREATING METRICS TABLE")
     print("=" * 70)
     
+    # Try test_performance first, then fall back to metrics, then empty dict
     test_perf = metrics_data.get("test_performance", {})
+    if not test_perf:
+        test_perf = metrics_data.get("metrics", {})
     
     # Extract metrics
     metrics_dict = {
@@ -375,12 +380,12 @@ def create_metrics_table(metrics_data: Dict[str, Any], output_dir: Path) -> None
     df['Value'] = df['Value'].apply(format_value)
     
     # Save CSV
-    csv_path = output_dir / "modelC_metrics_table.csv"
+    csv_path = output_dir / f"modelC_{model_type}_metrics_table.csv"
     df.to_csv(csv_path, index=False)
     print(f"\nSaved CSV: {csv_path}")
     
     # Create LaTeX table
-    latex_path = output_dir / "modelC_metrics_table.tex"
+    latex_path = output_dir / f"modelC_{model_type}_metrics_table.tex"
     with open(latex_path, 'w') as f:
         f.write("\\begin{table}[h]\n")
         f.write("\\centering\n")
@@ -398,14 +403,14 @@ def create_metrics_table(metrics_data: Dict[str, Any], output_dir: Path) -> None
         
         f.write("\\bottomrule\n")
         f.write("\\end{tabular}\n")
-        f.write("\\caption{Model C Performance Metrics}\n")
-        f.write("\\label{tab:modelc_metrics}\n")
+        f.write(f"\\caption{{Model C ({model_type.upper()}) Performance Metrics}}\n")
+        f.write(f"\\label{{tab:modelc_{model_type}_metrics}}\n")
         f.write("\\end{table}\n")
     
     print(f"Saved LaTeX: {latex_path}")
 
 
-def create_pr_curve(df: pd.DataFrame, metrics_data: Dict[str, Any], output_dir: Path) -> None:
+def create_pr_curve(df: pd.DataFrame, metrics_data: Dict[str, Any], output_dir: Path, model_type: str) -> None:
     """Create Precision-Recall curve with baseline prevalence."""
     print("\n" + "=" * 70)
     print("CREATING PRECISION-RECALL CURVE")
@@ -418,8 +423,11 @@ def create_pr_curve(df: pd.DataFrame, metrics_data: Dict[str, Any], output_dir: 
     precision, recall, thresholds = precision_recall_curve(y_true, y_pred_proba)
     pr_auc = average_precision_score(y_true, y_pred_proba)
     
-    # Get baseline prevalence
-    baseline_rate = metrics_data.get("test_performance", {}).get("baseline_rate", np.mean(y_true))
+    # Get baseline prevalence - try test_performance first, then metrics, then compute from df
+    test_perf = metrics_data.get("test_performance", {})
+    if not test_perf:
+        test_perf = metrics_data.get("metrics", {})
+    baseline_rate = test_perf.get("baseline_rate", np.mean(y_true))
     
     print(f"  PR AUC: {pr_auc:.4f}")
     print(f"  Baseline prevalence: {baseline_rate:.6f}")
@@ -436,7 +444,7 @@ def create_pr_curve(df: pd.DataFrame, metrics_data: Dict[str, Any], output_dir: 
     
     ax.set_xlabel('Recall', fontsize=12)
     ax.set_ylabel('Precision', fontsize=12)
-    ax.set_title('Precision-Recall Curve', fontsize=14, fontweight='bold')
+    ax.set_title(f'Model C ({model_type.upper()}) Precision-Recall Curve', fontsize=14, fontweight='bold')
     ax.legend(loc='best', fontsize=10)
     ax.grid(True, alpha=0.3)
     ax.set_xlim([0, 1])
@@ -445,12 +453,12 @@ def create_pr_curve(df: pd.DataFrame, metrics_data: Dict[str, Any], output_dir: 
     plt.tight_layout()
     
     # Save PNG
-    png_path = output_dir / "modelC_pr_curve.png"
+    png_path = output_dir / f"modelC_{model_type}_pr_curve.png"
     plt.savefig(png_path, dpi=300, bbox_inches='tight')
     print(f"\nSaved PNG: {png_path}")
     
     # Save PDF
-    pdf_path = output_dir / "modelC_pr_curve.pdf"
+    pdf_path = output_dir / f"modelC_{model_type}_pr_curve.pdf"
     plt.savefig(pdf_path, bbox_inches='tight')
     print(f"Saved PDF: {pdf_path}")
     
@@ -718,7 +726,7 @@ def points_to_raster(x: np.ndarray, y: np.ndarray, values: np.ndarray,
     return raster, extent
 
 
-def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], output_dir: Path, metrics_data: Optional[Dict[str, Any]] = None, test_parquet_path: Optional[Path] = None) -> None:
+def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], output_dir: Path, model_type: str, metrics_data: Optional[Dict[str, Any]] = None, test_parquet_path: Optional[Path] = None) -> None:
     """Create risk map showing Colombia boundary, top-1% predicted pixels, and observed positives.
     
     Uses distinct colors for three categories:
@@ -998,7 +1006,7 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
     # Styling
     ax.set_xlabel('Longitude', fontsize=12)
     ax.set_ylabel('Latitude', fontsize=12)
-    ax.set_title('Model C Risk Map: Predicted High-Risk Pixels and Observed PA Establishments', 
+    ax.set_title(f'Model C ({model_type.upper()}) Risk Map: Predicted High-Risk Pixels and Observed PA Establishments', 
                  fontsize=15, fontweight='bold', pad=15)
     
     # Add description text box explaining what the map shows
@@ -1055,19 +1063,19 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
     plt.tight_layout()
     
     # Save PNG with maximum DPI for sharpest visualization
-    png_path = output_dir / "modelC_risk_map_top1pct.png"
+    png_path = output_dir / f"modelC_{model_type}_risk_map_top1pct.png"
     plt.savefig(png_path, dpi=600, bbox_inches='tight')
     print(f"\nSaved PNG: {png_path}")
     
     # Save PDF with maximum quality for sharpest visualization
-    pdf_path = output_dir / "modelC_risk_map_top1pct.pdf"
+    pdf_path = output_dir / f"modelC_{model_type}_risk_map_top1pct.pdf"
     plt.savefig(pdf_path, dpi=600, bbox_inches='tight')
     print(f"Saved PDF: {pdf_path}")
     
     plt.close()
 
 
-def create_probability_map(df: pd.DataFrame, country_boundary_path: Optional[Path], output_dir: Path, metrics_data: Optional[Dict[str, Any]] = None) -> None:
+def create_probability_map(df: pd.DataFrame, country_boundary_path: Optional[Path], output_dir: Path, model_type: str, parquet_path: Path, metrics_data: Optional[Dict[str, Any]] = None) -> None:
     """Create continuous probability map showing predicted probabilities across Colombia.
     
     Uses percentile-based color scaling to make low probabilities visible.
@@ -1203,10 +1211,14 @@ def create_probability_map(df: pd.DataFrame, country_boundary_path: Optional[Pat
     
     # Check if calibrated probabilities were used
     calibration_note = ""
-    if 'y_pred_proba_calibrated' in df.columns or 'calibrated' in str(output_dir).lower():
+    has_uncalibrated_col = 'y_pred_proba_uncalibrated' in df.columns
+    has_calibrated_col = 'y_pred_proba_calibrated' in df.columns
+    filename_has_calibrated = 'calibrated' in parquet_path.name.lower()
+    
+    if filename_has_calibrated or (has_uncalibrated_col and has_calibrated_col):
         calibration_note = " (Calibrated Probabilities)"
     
-    ax.set_title(f'Model C Probability Map{calibration_note}', 
+    ax.set_title(f'Model C ({model_type.upper()}) Probability Map{calibration_note}', 
                  fontsize=15, fontweight='bold', pad=15)
     
     # Add description text box explaining what the map shows
@@ -1235,23 +1247,39 @@ def create_probability_map(df: pd.DataFrame, country_boundary_path: Optional[Pat
     plt.tight_layout()
     
     # Save PNG with maximum DPI for sharpest visualization
-    png_path = output_dir / "modelC_probability_map.png"
+    png_path = output_dir / f"modelC_{model_type}_probability_map.png"
     plt.savefig(png_path, dpi=600, bbox_inches='tight')
     print(f"\nSaved PNG: {png_path}")
     
     # Save PDF with maximum quality for sharpest visualization
-    pdf_path = output_dir / "modelC_probability_map.pdf"
+    pdf_path = output_dir / f"modelC_{model_type}_probability_map.pdf"
     plt.savefig(pdf_path, dpi=600, bbox_inches='tight')
     print(f"Saved PDF: {pdf_path}")
     
     plt.close()
 
 
-def find_latest_file(pattern: str, search_dir: Path) -> Optional[Path]:
-    """Find the most recent file matching a pattern in a directory."""
+def find_latest_file(pattern: str, search_dir: Path, exclude_substr: Optional[str] = None) -> Optional[Path]:
+    """Find the most recent file matching a pattern in a directory.
+    
+    Args:
+        pattern: Glob pattern to match files
+        search_dir: Directory to search in
+        exclude_substr: Optional substring to exclude from matches (case-insensitive)
+    
+    Returns:
+        Path to most recent matching file, or None if no matches
+    """
     matches = list(search_dir.glob(pattern))
     if not matches:
         return None
+    
+    # Filter out files containing exclude_substr if provided
+    if exclude_substr:
+        matches = [m for m in matches if exclude_substr.lower() not in m.name.lower()]
+        if not matches:
+            return None
+    
     # Sort by modification time, most recent first
     matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return matches[0]
@@ -1259,20 +1287,34 @@ def find_latest_file(pattern: str, search_dir: Path) -> Optional[Path]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Generate comprehensive results report for modelC_LGBM",
+        description="Generate comprehensive results report for modelC",
         formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        '--model_type',
+        type=str,
+        choices=['lgbm', 'rf', 'brf'],
+        default='lgbm',
+        help='Model type: lgbm, rf, or brf (default: lgbm)'
+    )
+    parser.add_argument(
+        '--use_calibrated',
+        type=str,
+        choices=['auto', 'true', 'false'],
+        default='auto',
+        help='Whether to use calibrated predictions: auto (prefer calibrated if present, else raw), true (require calibrated), false (require raw, exclude "calibrated") (default: auto)'
     )
     parser.add_argument(
         '--metrics_json',
         type=str,
         default=None,
-        help='Path to modelC_lgbm_win5_metrics_*.json file (default: auto-discover latest in outputs/Results/ml_models/)'
+        help='Path to modelC_{model_type}_win5_metrics_*.json file (default: auto-discover latest in outputs/Results/ml_models/)'
     )
     parser.add_argument(
         '--scored_parquet',
         type=str,
         default=None,
-        help='Path to modelC_lgbm_win5_scored_*.parquet file (default: auto-discover latest in outputs/Results/ml_models/)'
+        help='Path to modelC_{model_type}_win5_scored_*.parquet file (default: auto-discover latest in outputs/Results/ml_models/)'
     )
     parser.add_argument(
         '--out_dir',
@@ -1295,6 +1337,9 @@ def main() -> None:
     
     args = parser.parse_args()
     
+    model_type = args.model_type.lower()
+    use_calibrated = args.use_calibrated.lower()
+    
     # Get repo root for auto-discovery
     repo_root = get_repo_root()
     ml_models_dir = repo_root / "outputs/Results/ml_models"
@@ -1303,10 +1348,11 @@ def main() -> None:
     if args.metrics_json:
         metrics_path = Path(args.metrics_json).resolve()
     else:
-        print("Auto-discovering metrics JSON file...")
-        metrics_path = find_latest_file("modelC_lgbm_win5_metrics_*.json", ml_models_dir)
+        print(f"Auto-discovering metrics JSON file for model_type={model_type}...")
+        metrics_pattern = f"modelC_{model_type}_win5_metrics_*.json"
+        metrics_path = find_latest_file(metrics_pattern, ml_models_dir)
         if metrics_path is None:
-            print(f"ERROR: Could not find modelC_lgbm_win5_metrics_*.json in {ml_models_dir}")
+            print(f"ERROR: Could not find {metrics_pattern} in {ml_models_dir}")
             print("Please provide --metrics_json path explicitly.")
             sys.exit(1)
         print(f"  Found: {metrics_path}")
@@ -1314,12 +1360,46 @@ def main() -> None:
     if args.scored_parquet:
         parquet_path = Path(args.scored_parquet).resolve()
     else:
-        print("Auto-discovering scored parquet file...")
-        parquet_path = find_latest_file("modelC_lgbm_win5_scored*.parquet", ml_models_dir)
-        if parquet_path is None:
-            print(f"ERROR: Could not find modelC_lgbm_win5_scored*.parquet in {ml_models_dir}")
-            print("Please provide --scored_parquet path explicitly.")
-            sys.exit(1)
+        print(f"Auto-discovering scored parquet file for model_type={model_type}, use_calibrated={use_calibrated}...")
+        
+        # Determine which file to look for based on use_calibrated setting
+        if use_calibrated == 'true':
+            # Require calibrated file
+            parquet_pattern = f"modelC_{model_type}_win5_scored_calibrated_*.parquet"
+            parquet_path = find_latest_file(parquet_pattern, ml_models_dir)
+            if parquet_path is None:
+                print(f"ERROR: Could not find {parquet_pattern} in {ml_models_dir}")
+                print("Please provide --scored_parquet path explicitly or use --use_calibrated=auto")
+                sys.exit(1)
+        elif use_calibrated == 'false':
+            # Require raw file (exclude "calibrated")
+            parquet_pattern = f"modelC_{model_type}_win5_scored_*.parquet"
+            parquet_path = find_latest_file(parquet_pattern, ml_models_dir, exclude_substr="calibrated")
+            if parquet_path is None:
+                print(f"ERROR: Could not find {parquet_pattern} (excluding 'calibrated') in {ml_models_dir}")
+                print("Please provide --scored_parquet path explicitly or use --use_calibrated=auto")
+                sys.exit(1)
+        else:  # use_calibrated == 'auto'
+            # Prefer calibrated if present, else raw
+            calibrated_pattern = f"modelC_{model_type}_win5_scored_calibrated_*.parquet"
+            raw_pattern = f"modelC_{model_type}_win5_scored_*.parquet"
+            
+            calibrated_path = find_latest_file(calibrated_pattern, ml_models_dir)
+            raw_path = find_latest_file(raw_pattern, ml_models_dir, exclude_substr="calibrated")
+            
+            if calibrated_path is not None:
+                parquet_path = calibrated_path
+                print(f"  Found calibrated file (preferred): {parquet_path}")
+            elif raw_path is not None:
+                parquet_path = raw_path
+                print(f"  Found raw file: {parquet_path}")
+            else:
+                print(f"ERROR: Could not find any scored parquet file matching patterns:")
+                print(f"  - {calibrated_pattern}")
+                print(f"  - {raw_pattern} (excluding 'calibrated')")
+                print("Please provide --scored_parquet path explicitly.")
+                sys.exit(1)
+        
         print(f"  Found: {parquet_path}")
     
     # Auto-discover test parquet if not provided
@@ -1375,9 +1455,11 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     
     print("=" * 70)
-    print("MODEL C RESULTS REPORTING")
+    print(f"MODEL C ({model_type.upper()}) RESULTS REPORTING")
     print("=" * 70)
-    print(f"\nMetrics JSON: {metrics_path}")
+    print(f"\nModel type: {model_type}")
+    print(f"Use calibrated: {use_calibrated}")
+    print(f"Metrics JSON: {metrics_path}")
     print(f"Scored parquet: {parquet_path}")
     print(f"Output directory: {output_dir}")
     if country_boundary_path:
@@ -1397,10 +1479,10 @@ def main() -> None:
     validate_coordinates(df)
     
     # Generate outputs
-    create_metrics_table(metrics_data, output_dir)
-    create_pr_curve(df, metrics_data, output_dir)
-    create_risk_map(df, country_boundary_path, output_dir, metrics_data, test_parquet_path)
-    create_probability_map(df, country_boundary_path, output_dir, metrics_data)
+    create_metrics_table(metrics_data, output_dir, model_type)
+    create_pr_curve(df, metrics_data, output_dir, model_type)
+    create_risk_map(df, country_boundary_path, output_dir, model_type, metrics_data, test_parquet_path)
+    create_probability_map(df, country_boundary_path, output_dir, model_type, parquet_path, metrics_data)
     
     print("\n" + "=" * 70)
     print("COMPLETE")

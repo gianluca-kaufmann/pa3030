@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
-"""Benchmark Evaluation Script for modelC_LGBM
+"""Benchmark Evaluation Script for modelC (LGBM, RF, BRF)
 
-Purpose: Extract final CV + test metrics from modelC_LGBM training results,
+Purpose: Extract final CV + test metrics from modelC training results,
          create a benchmark JSON file with metrics, features, params, seed, and dataset hash.
          Marks in-sample earlystop as NON-EVALUATIVE.
 
-Input:   - modelC_lgbm_win5_metrics_*.json (most recent file from outputs/Results/ml_models)
+Input:   - modelC_{model_type}_win5_metrics_*.json (most recent file from outputs/Results/ml_models)
          - train_colombia_win5.parquet, test_colombia_win5.parquet
            (for dataset hash computation; earlystop/val excluded)
 
 Output:  - benchmark JSON file with:
-           - CV aggregated metrics
+           - CV aggregated metrics (if available)
            - Test performance metrics  
            - Features, model parameters, random seed
            - Dataset hash
-           - Earlystop marked as NON-EVALUATIVE
+           - Earlystop marked as NON-EVALUATIVE (if available)
 """
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -57,7 +58,11 @@ def resolve_parquet_file(filename: str) -> Optional[Path]:
 
     candidates = []
     if scratch_root is not None:
+        # Check outputs/Results first (standard Euler location from preprocessing script)
+        candidates.append(scratch_root / f"outputs/Results/{filename}")
+        # Also check data/ml location
         candidates.append(scratch_root / f"data/ml/{filename}")
+    candidates.append(repo_root / f"outputs/Results/{filename}")
     candidates.append(repo_root / f"data/ml/{filename}")
 
     for cand in candidates:
@@ -139,14 +144,15 @@ def compute_dataset_hash(num_sample_row_groups: int = 3) -> str:
     return hashlib.sha256(hash_str.encode('utf-8')).hexdigest()
 
 
-def find_latest_metrics_file(output_dir: Path) -> Path:
-    """Find the most recent modelC_lgbm_win5_metrics JSON file.
+def find_latest_metrics_file(output_dir: Path, model_type: str) -> Path:
+    """Find the most recent modelC_{model_type}_win5_metrics JSON file.
     
     Parses timestamp from filename (format: YYYYMMDD_HHMMSS) and sorts by it.
     Falls back to modification time if timestamp cannot be parsed.
     
     Args:
         output_dir: Directory containing metrics files
+        model_type: Model type (lgbm, rf, or brf)
         
     Returns:
         Path to the most recent metrics file
@@ -154,14 +160,14 @@ def find_latest_metrics_file(output_dir: Path) -> Path:
     Raises:
         FileNotFoundError: If no metrics file is found
     """
-    pattern = "modelC_lgbm_win5_metrics_*.json"
+    pattern = f"modelC_{model_type}_win5_metrics_*.json"
     files = list(output_dir.glob(pattern))
     
     if not files:
         raise FileNotFoundError(f"No metrics files found in {output_dir} matching pattern {pattern}")
     
-    # Parse timestamp from filename: modelC_lgbm_win5_metrics_YYYYMMDD_HHMMSS.json
-    timestamp_pattern = re.compile(r'modelC_lgbm_win5_metrics_(\d{8}_\d{6})\.json')
+    # Parse timestamp from filename: modelC_{model_type}_win5_metrics_YYYYMMDD_HHMMSS.json
+    timestamp_pattern = re.compile(rf'modelC_{re.escape(model_type)}_win5_metrics_(\d{{8}}_\d{{6}})\.json')
     
     def get_timestamp_key(path: Path) -> tuple:
         """Return (timestamp_datetime, fallback_mtime) for sorting."""
@@ -194,12 +200,13 @@ def load_metrics_file(metrics_path: Path) -> Dict[str, Any]:
         return json.load(f)
 
 
-def create_benchmark_json(metrics_data: Dict[str, Any], dataset_hash: str) -> Dict[str, Any]:
+def create_benchmark_json(metrics_data: Dict[str, Any], dataset_hash: str, source_metrics_filename: str) -> Dict[str, Any]:
     """Create benchmark JSON structure from metrics data.
     
     Args:
         metrics_data: Loaded metrics JSON data
         dataset_hash: Computed dataset hash
+        source_metrics_filename: Name of the source metrics file
         
     Returns:
         Benchmark JSON dictionary
@@ -208,14 +215,42 @@ def create_benchmark_json(metrics_data: Dict[str, Any], dataset_hash: str) -> Di
     cv_data = metrics_data.get("cross_validation", {})
     test_perf = metrics_data.get("test_performance", {})
     val_perf = metrics_data.get("validation_performance", {})
-    model_params = metrics_data.get("model_parameters", {})
+    model_params = (
+        metrics_data.get("model_parameters")
+        or metrics_data.get("trained_params")
+        or {}
+    )
     temporal_split = metrics_data.get("temporal_split", {})
     data_info = metrics_data.get("data", {})
+    
+    # Handle missing CV data (e.g., for RF/BRF models)
+    if not cv_data or not cv_data.get("aggregated"):
+        evaluative_cv = {"note": "Not available for this model type"}
+        cv_agg = {}
+    else:
+        evaluative_cv = {
+            "aggregated": cv_data.get("aggregated", {}),
+            "note": "Temporal cross-validation across 3 folds"
+        }
+        cv_agg = cv_data.get("aggregated", {})
+    
+    # Handle missing validation/earlystop data
+    if not val_perf:
+        non_evaluative_earlystop = {"note": "Not reported"}
+    else:
+        non_evaluative_earlystop = {
+            **{k: v for k, v in val_perf.items() if not k.startswith("precision_at_")},
+            "note": "In-sample earlystop on data used during training (NON-EVALUATIVE)"
+        }
+    
+    # Get timestamp from metadata if available, otherwise None
+    metadata_timestamp = metadata.get("timestamp")
     
     benchmark = {
         "benchmark_metadata": {
             "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "source_metrics_file": metrics_data.get("metadata", {}).get("timestamp", "unknown"),
+            "source_metrics_file": source_metrics_filename,
+            "source_metrics_timestamp": metadata_timestamp if metadata_timestamp else None,
             "model": metadata.get("model", "Unknown"),
             "task": metadata.get("task", "Unknown"),
             "target_column": metadata.get("target_column", "Unknown"),
@@ -240,23 +275,17 @@ def create_benchmark_json(metrics_data: Dict[str, Any], dataset_hash: str) -> Di
             "hyperparameters": model_params,
         },
         "evaluative_metrics": {
-            "cross_validation": {
-                "aggregated": cv_data.get("aggregated", {}),
-                "note": "Temporal cross-validation across 3 folds"
-            },
+            "cross_validation": evaluative_cv,
             "test_performance": test_perf,
         },
         "non_evaluative_metrics": {
-            "earlystop_performance": {
-                **{k: v for k, v in val_perf.items() if not k.startswith("precision_at_")},
-                "note": "In-sample earlystop on data used during training (NON-EVALUATIVE)"
-            }
+            "earlystop_performance": non_evaluative_earlystop
         },
         "performance_summary": {
-            "cv_pr_auc_mean": cv_data.get("aggregated", {}).get("pr_auc_mean"),
-            "cv_pr_auc_std": cv_data.get("aggregated", {}).get("pr_auc_std"),
-            "cv_roc_auc_mean": cv_data.get("aggregated", {}).get("roc_auc_mean"),
-            "cv_roc_auc_std": cv_data.get("aggregated", {}).get("roc_auc_std"),
+            "cv_pr_auc_mean": cv_agg.get("pr_auc_mean"),
+            "cv_pr_auc_std": cv_agg.get("pr_auc_std"),
+            "cv_roc_auc_mean": cv_agg.get("roc_auc_mean"),
+            "cv_roc_auc_std": cv_agg.get("roc_auc_std"),
             "test_pr_auc": test_perf.get("pr_auc"),
             "test_roc_auc": test_perf.get("roc_auc"),
         }
@@ -265,23 +294,24 @@ def create_benchmark_json(metrics_data: Dict[str, Any], dataset_hash: str) -> Di
     return benchmark
 
 
-def main() -> None:
+def main(model_type: str) -> None:
     repo_root = Path(__file__).resolve().parents[4]
     output_dir = repo_root / "outputs/Results/ml_models"
     benchmark_output_dir = repo_root / "outputs/Results/ml_models"
     benchmark_output_dir.mkdir(parents=True, exist_ok=True)
     
     print("=" * 70)
-    print("BENCHMARK EVALUATION: modelC_LGBM")
+    print(f"BENCHMARK EVALUATION: modelC_{model_type.upper()}")
     print("=" * 70)
     print(f"\nOutput directory: {output_dir}")
+    print(f"Model type: {model_type}")
     
     # Step 1: Find latest metrics file
     print("\n" + "=" * 70)
     print("STEP 1: FIND LATEST METRICS FILE")
     print("=" * 70)
     try:
-        metrics_path = find_latest_metrics_file(output_dir)
+        metrics_path = find_latest_metrics_file(output_dir, model_type)
         print(f"\nFound latest metrics file: {metrics_path.name}")
     except FileNotFoundError as e:
         print(f"\nERROR: {e}")
@@ -318,10 +348,18 @@ def main() -> None:
     print("STEP 4: CREATE BENCHMARK JSON")
     print("=" * 70)
     try:
-        benchmark = create_benchmark_json(metrics_data, dataset_hash)
+        benchmark = create_benchmark_json(metrics_data, dataset_hash, metrics_path.name)
         print("\nBenchmark JSON structure created")
-        print(f"  Evaluative metrics: CV aggregated + Test performance")
-        print(f"  Non-evaluative metrics: Earlystop performance (marked as NON-EVALUATIVE)")
+        cv_note = benchmark["evaluative_metrics"]["cross_validation"].get("note", "")
+        if "Not available" in cv_note:
+            print(f"  Evaluative metrics: Test performance (CV: {cv_note})")
+        else:
+            print(f"  Evaluative metrics: CV aggregated + Test performance")
+        earlystop_note = benchmark["non_evaluative_metrics"]["earlystop_performance"].get("note", "")
+        if "Not reported" in earlystop_note:
+            print(f"  Non-evaluative metrics: Earlystop performance ({earlystop_note})")
+        else:
+            print(f"  Non-evaluative metrics: Earlystop performance (marked as NON-EVALUATIVE)")
     except Exception as e:
         print(f"\nERROR: Failed to create benchmark JSON: {e}")
         import traceback
@@ -333,7 +371,7 @@ def main() -> None:
     print("STEP 5: SAVE BENCHMARK JSON")
     print("=" * 70)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    benchmark_path = benchmark_output_dir / f"modelC_lgbm_win5_benchmark_{timestamp}.json"
+    benchmark_path = benchmark_output_dir / f"modelC_{model_type}_win5_benchmark_{timestamp}.json"
     
     try:
         with open(benchmark_path, 'w') as f:
@@ -348,39 +386,44 @@ def main() -> None:
     print("SUMMARY")
     print("=" * 70)
     
-    cv_agg = benchmark["evaluative_metrics"]["cross_validation"]["aggregated"]
+    cv_section = benchmark["evaluative_metrics"]["cross_validation"]
     test_metrics = benchmark["evaluative_metrics"]["test_performance"]
     
     print(f"\nSource metrics: {metrics_path.name}")
     print(f"Benchmark file: {benchmark_path.name}")
     print(f"\nDataset hash: {dataset_hash[:16]}...")
     
-    print(f"\nCross-Validation (Aggregated across 3 folds):")
-    roc_auc_mean = cv_agg.get('roc_auc_mean', 'N/A')
-    roc_auc_std = cv_agg.get('roc_auc_std', 0)
-    roc_auc_mean_str = f"{roc_auc_mean:.4f}" if isinstance(roc_auc_mean, (int, float)) else str(roc_auc_mean)
-    roc_auc_std_str = f"{roc_auc_std:.4f}" if isinstance(roc_auc_std, (int, float)) else str(roc_auc_std)
-    print(f"  ROC-AUC: {roc_auc_mean_str} ± {roc_auc_std_str}")
-    pr_auc_mean = cv_agg.get('pr_auc_mean', 'N/A')
-    pr_auc_std = cv_agg.get('pr_auc_std', 0)
-    pr_auc_mean_str = f"{pr_auc_mean:.4f}" if isinstance(pr_auc_mean, (int, float)) else str(pr_auc_mean)
-    pr_auc_std_str = f"{pr_auc_std:.4f}" if isinstance(pr_auc_std, (int, float)) else str(pr_auc_std)
-    print(f"  PR-AUC:  {pr_auc_mean_str} ± {pr_auc_std_str}")
-    p1_mean = cv_agg.get('precision_at_1pct_mean', 'N/A')
-    p1_std = cv_agg.get('precision_at_1pct_std', 0)
-    p1_mean_str = f"{p1_mean:.4f}" if isinstance(p1_mean, (int, float)) else str(p1_mean)
-    p1_std_str = f"{p1_std:.4f}" if isinstance(p1_std, (int, float)) else str(p1_std)
-    print(f"  P@1%:    {p1_mean_str} ± {p1_std_str}")
-    p5_mean = cv_agg.get('precision_at_5pct_mean', 'N/A')
-    p5_std = cv_agg.get('precision_at_5pct_std', 0)
-    p5_mean_str = f"{p5_mean:.4f}" if isinstance(p5_mean, (int, float)) else str(p5_mean)
-    p5_std_str = f"{p5_std:.4f}" if isinstance(p5_std, (int, float)) else str(p5_std)
-    print(f"  P@5%:    {p5_mean_str} ± {p5_std_str}")
-    p10_mean = cv_agg.get('precision_at_10pct_mean', 'N/A')
-    p10_std = cv_agg.get('precision_at_10pct_std', 0)
-    p10_mean_str = f"{p10_mean:.4f}" if isinstance(p10_mean, (int, float)) else str(p10_mean)
-    p10_std_str = f"{p10_std:.4f}" if isinstance(p10_std, (int, float)) else str(p10_std)
-    print(f"  P@10%:   {p10_mean_str} ± {p10_std_str}")
+    # Handle CV metrics (may not be available for RF/BRF)
+    if "aggregated" in cv_section and cv_section["aggregated"]:
+        cv_agg = cv_section["aggregated"]
+        print(f"\nCross-Validation (Aggregated across 3 folds):")
+        roc_auc_mean = cv_agg.get('roc_auc_mean', 'N/A')
+        roc_auc_std = cv_agg.get('roc_auc_std', 0)
+        roc_auc_mean_str = f"{roc_auc_mean:.4f}" if isinstance(roc_auc_mean, (int, float)) else str(roc_auc_mean)
+        roc_auc_std_str = f"{roc_auc_std:.4f}" if isinstance(roc_auc_std, (int, float)) else str(roc_auc_std)
+        print(f"  ROC-AUC: {roc_auc_mean_str} ± {roc_auc_std_str}")
+        pr_auc_mean = cv_agg.get('pr_auc_mean', 'N/A')
+        pr_auc_std = cv_agg.get('pr_auc_std', 0)
+        pr_auc_mean_str = f"{pr_auc_mean:.4f}" if isinstance(pr_auc_mean, (int, float)) else str(pr_auc_mean)
+        pr_auc_std_str = f"{pr_auc_std:.4f}" if isinstance(pr_auc_std, (int, float)) else str(pr_auc_std)
+        print(f"  PR-AUC:  {pr_auc_mean_str} ± {pr_auc_std_str}")
+        p1_mean = cv_agg.get('precision_at_1pct_mean', 'N/A')
+        p1_std = cv_agg.get('precision_at_1pct_std', 0)
+        p1_mean_str = f"{p1_mean:.4f}" if isinstance(p1_mean, (int, float)) else str(p1_mean)
+        p1_std_str = f"{p1_std:.4f}" if isinstance(p1_std, (int, float)) else str(p1_std)
+        print(f"  P@1%:    {p1_mean_str} ± {p1_std_str}")
+        p5_mean = cv_agg.get('precision_at_5pct_mean', 'N/A')
+        p5_std = cv_agg.get('precision_at_5pct_std', 0)
+        p5_mean_str = f"{p5_mean:.4f}" if isinstance(p5_mean, (int, float)) else str(p5_mean)
+        p5_std_str = f"{p5_std:.4f}" if isinstance(p5_std, (int, float)) else str(p5_std)
+        print(f"  P@5%:    {p5_mean_str} ± {p5_std_str}")
+        p10_mean = cv_agg.get('precision_at_10pct_mean', 'N/A')
+        p10_std = cv_agg.get('precision_at_10pct_std', 0)
+        p10_mean_str = f"{p10_mean:.4f}" if isinstance(p10_mean, (int, float)) else str(p10_mean)
+        p10_std_str = f"{p10_std:.4f}" if isinstance(p10_std, (int, float)) else str(p10_std)
+        print(f"  P@10%:   {p10_mean_str} ± {p10_std_str}")
+    else:
+        print(f"\nCross-Validation: {cv_section.get('note', 'Not available')}")
     
     print(f"\nTest Performance:")
     test_roc_auc = test_metrics.get('roc_auc', 'N/A')
@@ -401,13 +444,16 @@ def main() -> None:
     
     print(f"\nEarlystop Performance (NON-EVALUATIVE):")
     earlystop_metrics = benchmark["non_evaluative_metrics"]["earlystop_performance"]
-    earlystop_roc_auc = earlystop_metrics.get('roc_auc', 'N/A')
-    earlystop_roc_auc_str = f"{earlystop_roc_auc:.4f}" if isinstance(earlystop_roc_auc, (int, float)) else str(earlystop_roc_auc)
-    print(f"  ROC-AUC: {earlystop_roc_auc_str}")
-    earlystop_pr_auc = earlystop_metrics.get('pr_auc', 'N/A')
-    earlystop_pr_auc_str = f"{earlystop_pr_auc:.4f}" if isinstance(earlystop_pr_auc, (int, float)) else str(earlystop_pr_auc)
-    print(f"  PR-AUC:  {earlystop_pr_auc_str}")
-    print(f"  Note: This is in-sample earlystop on data used during training")
+    if "note" in earlystop_metrics and earlystop_metrics["note"] == "Not reported":
+        print(f"  {earlystop_metrics['note']}")
+    else:
+        earlystop_roc_auc = earlystop_metrics.get('roc_auc', 'N/A')
+        earlystop_roc_auc_str = f"{earlystop_roc_auc:.4f}" if isinstance(earlystop_roc_auc, (int, float)) else str(earlystop_roc_auc)
+        print(f"  ROC-AUC: {earlystop_roc_auc_str}")
+        earlystop_pr_auc = earlystop_metrics.get('pr_auc', 'N/A')
+        earlystop_pr_auc_str = f"{earlystop_pr_auc:.4f}" if isinstance(earlystop_pr_auc, (int, float)) else str(earlystop_pr_auc)
+        print(f"  PR-AUC:  {earlystop_pr_auc_str}")
+        print(f"  Note: This is in-sample earlystop on data used during training")
     
     print(f"\nModel Configuration:")
     config = benchmark["model_config"]
@@ -420,18 +466,36 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Benchmark evaluation script for modelC (LGBM, RF, BRF)"
+    )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        choices=["lgbm", "rf", "brf"],
+        default=os.environ.get("MODEL_TYPE", "lgbm"),
+        help="Model type: lgbm, rf, or brf (default: lgbm, or from MODEL_TYPE env var)"
+    )
+    
+    args = parser.parse_args()
+    model_type = args.model_type.lower()
+    
+    if model_type not in ["lgbm", "rf", "brf"]:
+        print(f"ERROR: Invalid model_type '{model_type}'. Must be one of: lgbm, rf, brf")
+        sys.exit(1)
+    
     repo_root = Path(__file__).resolve().parents[4]
     output_dir = repo_root / "outputs/Results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"benchmark_modelC_lgbm_{timestamp}.txt"
+    output_file = output_dir / f"benchmark_modelC_{model_type}_{timestamp}.txt"
     
     tee = Tee(output_file)
     sys.stdout = tee
     
     try:
-        main()
+        main(model_type)
     finally:
         sys.stdout = tee.stdout
         tee.close()

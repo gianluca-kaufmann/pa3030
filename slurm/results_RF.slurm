@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=preprocess-features
-#SBATCH --partition=normal.4h
-#SBATCH --time=04:00:00
+#SBATCH --job-name=modelC_results_RF
+#SBATCH --partition=normal.24h
+#SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem-per-cpu=15G
-#SBATCH --output=/cluster/scratch/%u/logs/preprocess_features_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/preprocess_features_%j.err
+#SBATCH --mem-per-cpu=16G
+#SBATCH --output=/cluster/scratch/%u/logs/modelC_results_RF_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/modelC_results_RF_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -33,22 +33,21 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the spatial features preprocessing script
+# Run the modelC_results script
 #------------------------------------------------------------------------------
-echo "Starting spatial features preprocessing script..."
+echo "Starting modelC_results script (RF mode)..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/training_preprocessing/spatial_features_preprocessing" ] || {
-  echo "ERROR: spatial_features_preprocessing not found under scripts/ML/training_preprocessing"
-  find scripts -maxdepth 4 -type f -name "spatial_features_preprocessing"
+[ -f "scripts/colombia/ML/results/modelC_results" ] || {
+  echo "ERROR: modelC_results not found"
+  echo "NOTE: modelC_results script is in colombia/ML/results/ directory"
+  find scripts -maxdepth 4 -type f -name "modelC_results"
   exit 1
 }
-
 # Run the script
-python "scripts/ML/training_preprocessing/spatial_features_preprocessing"
+python "scripts/colombia/ML/results/modelC_results" --model_type rf
 
-echo "Spatial features preprocessing script finished."
-
+echo "modelC_results script (RF mode) finished."

@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Spatial Cross-Validation for modelC_LGBM
+"""Spatial Cross-Validation for modelC (LGBM / RF / BRF)
 
 Purpose: Perform spatial cross-validation by splitting Colombia into 4 spatial clusters
          (KMeans on standardized coordinates), training on 3 clusters and testing on 1 
          (rotating through all 4). Uses frozen benchmark features and hyperparameters.
+
+Supported models:
+  - lgbm: LightGBM (default)
+  - rf: RandomForestClassifier
+  - brf: BalancedRandomForestClassifier
 
 Protocols:
   - pooled_years (default): Train and test on 2000-2017 mixed across folds
@@ -14,7 +19,7 @@ Memory optimizations:
   - Aggressive memory cleanup after each fold
   - Efficient batch processing during data loading
 
-Input:   - modelC_lgbm_win5_benchmark_*.json (most recent file from outputs/Results/ml_models)
+Input:   - modelC_{model_type}_win5_benchmark_*.json (most recent file from outputs/Results/ml_models)
          - train_colombia_win5.parquet, earlystop_colombia_win5.parquet, test_colombia_win5.parquet
 
 Output:  - Spatial CV results JSON with PR-AUC, P@1%, Lift@1% for each fold
@@ -45,6 +50,8 @@ import lightgbm as lgb
 from sklearn.metrics import roc_auc_score, average_precision_score
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from imblearn.ensemble import BalancedRandomForestClassifier
 
 
 class Tee:
@@ -85,19 +92,31 @@ def resolve_parquet_file(filename: str) -> Path:
 
     candidates = []
     if scratch_root is not None:
+        # Check outputs/Results first (standard Euler location from preprocessing script)
+        candidates.append(scratch_root / f"outputs/Results/{filename}")
+        # Also check data/ml location
         candidates.append(scratch_root / f"data/ml/{filename}")
+    candidates.append(repo_root / f"outputs/Results/{filename}")
     candidates.append(repo_root / f"data/ml/{filename}")
 
     for cand in candidates:
         if cand.exists():
             return cand
 
-    raise FileNotFoundError(f"{filename} not found in expected locations")
+    # Provide detailed error message with all checked paths
+    error_msg = f"{filename} not found in expected locations.\n"
+    error_msg += "\nChecked locations:\n"
+    for cand in candidates:
+        error_msg += f"  - {cand}\n"
+    if scratch_root:
+        error_msg += f"\nSCRATCH root: {scratch_root}\n"
+    error_msg += f"Repository root: {repo_root}\n"
+    raise FileNotFoundError(error_msg)
 
 
-def find_latest_benchmark_file(output_dir: Path) -> Path:
-    """Find the most recent modelC_lgbm_win5_benchmark JSON file."""
-    pattern = "modelC_lgbm_win5_benchmark_*.json"
+def find_latest_benchmark_file(output_dir: Path, model_type: str) -> Path:
+    """Find the most recent modelC_{model_type}_win5_benchmark JSON file."""
+    pattern = f"modelC_{model_type}_win5_benchmark_*.json"
     files = list(output_dir.glob(pattern))
     
     if not files:
@@ -108,72 +127,82 @@ def find_latest_benchmark_file(output_dir: Path) -> Path:
     return latest
 
 
-def load_benchmark_config(benchmark_path: Path, output_dir: Path) -> Tuple[list, Dict[str, Any], int, int]:
+def load_benchmark_config(benchmark_path: Path, output_dir: Path, model_type: str) -> Tuple[list, Dict[str, Any], int, Optional[int]]:
     """Load features and hyperparameters from benchmark JSON.
     
-    Also extracts final_num_boost_round from the source metrics file to use as num_boost_round.
+    For LGBM: Also extracts final_num_boost_round from the source metrics file to use as num_boost_round.
     This is the value computed using weighted mean × 1.05, then max with fold3_best_iteration.
+    
+    For RF/BRF: num_boost_round is not used (returns None).
     
     Returns:
         Tuple of (feature_list, hyperparameters_dict, random_seed, num_boost_round)
+        num_boost_round is None for RF/BRF, int for LGBM
     """
     with open(benchmark_path, 'r') as f:
         benchmark = json.load(f)
     
     model_config = benchmark.get("model_config", {})
     features = model_config.get("features", [])
-    hyperparameters = model_config.get("hyperparameters", {}).copy()
+    # Try hyperparameters first, then trained_params, then empty dict
+    hyperparameters = (
+        model_config.get("hyperparameters")
+        or model_config.get("trained_params")
+        or {}
+    ).copy()
     random_seed = model_config.get("random_seed", RANDOM_STATE)
     
     # Ensure random_state is set
     hyperparameters["random_state"] = random_seed
     
-    # Extract final_num_boost_round from source metrics file
-    # The benchmark JSON has a reference to the source metrics file in benchmark_metadata.source_metrics_file
-    # final_num_boost_round is computed as: weighted_mean × 1.05, then max with fold3_best_iteration
+    # Extract final_num_boost_round only for LGBM
     num_boost_round = None
-    benchmark_metadata = benchmark.get("benchmark_metadata", {})
-    source_metrics_timestamp = benchmark_metadata.get("source_metrics_file", None)
-    
-    if source_metrics_timestamp:
-        # Try to load the source metrics file
-        metrics_file_pattern = f"modelC_lgbm_win5_metrics_{source_metrics_timestamp}.json"
-        metrics_path = output_dir / metrics_file_pattern
+    if model_type == "lgbm":
+        # Extract final_num_boost_round from source metrics file
+        # The benchmark JSON has a reference to the source metrics file in benchmark_metadata.source_metrics_file
+        # final_num_boost_round is computed as: weighted_mean × 1.05, then max with fold3_best_iteration
+        benchmark_metadata = benchmark.get("benchmark_metadata", {})
+        source_metrics_timestamp = benchmark_metadata.get("source_metrics_file", None)
         
-        if metrics_path.exists():
-            try:
-                with open(metrics_path, 'r') as f:
-                    metrics_data = json.load(f)
-                
-                # Try to get final_num_boost_round from cross_validation
-                # This is the value used in the actual training (weighted mean × 1.05, then max with fold3)
-                cross_validation = metrics_data.get("cross_validation", {})
-                
-                if isinstance(cross_validation, dict):
-                    # First priority: final_num_boost_round (the actual value used in training)
-                    if "final_num_boost_round" in cross_validation:
-                        num_boost_round = int(cross_validation["final_num_boost_round"])
-                        print(f"  Found final_num_boost_round in metrics file: {num_boost_round}")
-                    # Second priority: chosen_iteration (alias for final_num_boost_round)
-                    elif "chosen_iteration" in cross_validation:
-                        num_boost_round = int(cross_validation["chosen_iteration"])
-                        print(f"  Found chosen_iteration in metrics file: {num_boost_round}")
-                    # Fallback: compute simple average from folds (not ideal, but better than nothing)
-                    else:
-                        folds = cross_validation.get("folds", [])
-                        if folds:
-                            best_iterations = [fold.get("best_iteration") for fold in folds if fold.get("best_iteration") is not None]
-                            if best_iterations:
-                                num_boost_round = int(np.round(np.mean(best_iterations)))
-                                print(f"  Warning: final_num_boost_round not found, computed simple avg from folds: {num_boost_round} (mean of {best_iterations})")
-                                print(f"  Note: This is NOT the same as the training value (which uses weighted mean × 1.05, then max with fold3)")
-            except Exception as e:
-                print(f"  Warning: Could not load final_num_boost_round from metrics file: {e}")
-    
-    # Fallback: use n_estimators from hyperparameters
-    if num_boost_round is None:
-        num_boost_round = hyperparameters.get("num_boost_round", hyperparameters.get("n_estimators", 3000))
-        print(f"  Warning: Using n_estimators from hyperparameters as fallback: {num_boost_round}")
+        if source_metrics_timestamp:
+            # Try to load the source metrics file
+            metrics_file_pattern = f"modelC_lgbm_win5_metrics_{source_metrics_timestamp}.json"
+            metrics_path = output_dir / metrics_file_pattern
+            
+            if metrics_path.exists():
+                try:
+                    with open(metrics_path, 'r') as f:
+                        metrics_data = json.load(f)
+                    
+                    # Try to get final_num_boost_round from cross_validation
+                    # This is the value used in the actual training (weighted mean × 1.05, then max with fold3)
+                    cross_validation = metrics_data.get("cross_validation", {})
+                    
+                    if isinstance(cross_validation, dict):
+                        # First priority: final_num_boost_round (the actual value used in training)
+                        if "final_num_boost_round" in cross_validation:
+                            num_boost_round = int(cross_validation["final_num_boost_round"])
+                            print(f"  Found final_num_boost_round in metrics file: {num_boost_round}")
+                        # Second priority: chosen_iteration (alias for final_num_boost_round)
+                        elif "chosen_iteration" in cross_validation:
+                            num_boost_round = int(cross_validation["chosen_iteration"])
+                            print(f"  Found chosen_iteration in metrics file: {num_boost_round}")
+                        # Fallback: compute simple average from folds (not ideal, but better than nothing)
+                        else:
+                            folds = cross_validation.get("folds", [])
+                            if folds:
+                                best_iterations = [fold.get("best_iteration") for fold in folds if fold.get("best_iteration") is not None]
+                                if best_iterations:
+                                    num_boost_round = int(np.round(np.mean(best_iterations)))
+                                    print(f"  Warning: final_num_boost_round not found, computed simple avg from folds: {num_boost_round} (mean of {best_iterations})")
+                                    print(f"  Note: This is NOT the same as the training value (which uses weighted mean × 1.05, then max with fold3)")
+                except Exception as e:
+                    print(f"  Warning: Could not load final_num_boost_round from metrics file: {e}")
+        
+        # Fallback: use n_estimators from hyperparameters
+        if num_boost_round is None:
+            num_boost_round = hyperparameters.get("num_boost_round", hyperparameters.get("n_estimators", 3000))
+            print(f"  Warning: Using n_estimators from hyperparameters as fallback: {num_boost_round}")
     
     return features, hyperparameters, random_seed, num_boost_round
 
@@ -452,14 +481,16 @@ def train_spatial_fold(
     y_test: np.ndarray,
     fold_idx: int,
     hyperparameters: Dict[str, Any],
-    num_boost_round: int,
+    num_boost_round: Optional[int],
     feature_names: list,
+    model_type: str,
     use_wandb: bool = False
 ) -> Dict[str, Any]:
     """Train and evaluate a single spatial CV fold.
     
     Args:
-        num_boost_round: Fixed number of boosting rounds (from final_num_boost_round)
+        num_boost_round: Fixed number of boosting rounds (from final_num_boost_round) for LGBM, None for RF/BRF
+        model_type: One of "lgbm", "rf", "brf"
     
     Returns:
         Dictionary containing fold metrics and metadata
@@ -473,63 +504,143 @@ def train_spatial_fold(
     n_test = len(X_test)
     
     print(f"Train: {n_train:,} samples, Test: {n_test:,} samples")
-    print(f"  Using fixed num_boost_round: {num_boost_round} (from benchmark final_num_boost_round)")
+    print(f"  Model type: {model_type.upper()}")
+    if model_type == "lgbm" and num_boost_round is not None:
+        print(f"  Using fixed num_boost_round: {num_boost_round} (from benchmark final_num_boost_round)")
     
     # Compute class distribution for imbalance handling
     train_pos = int(y_train.sum())
     train_neg = int((y_train == 0).sum())
     train_pos_rate = float(y_train.mean())
     
-    # Compute scale_pos_weight from fold's training data: scale_pos_weight = n_neg / n_pos
-    # This matches the main training protocol
-    scale_pos_weight = train_neg / max(train_pos, 1)
     print(f"\n  Training set imbalance:")
     print(f"    Positives: {train_pos:,}, Negatives: {train_neg:,}, Pos rate: {train_pos_rate*100:.3f}%")
-    print(f"    Computed scale_pos_weight: {scale_pos_weight:.6f} = {train_neg:,} / {train_pos:,}")
     
-    # Compute sample weights for training data
-    train_weights = compute_year_weights(years_train, min_year=2000, max_year=years_train.max())
-    print(f"  Training sample weights: min={train_weights.min():.3f}, max={train_weights.max():.3f}, mean={train_weights.mean():.3f}")
-    
-    # Prepare hyperparameters
-    train_params = hyperparameters.copy()
-    # Remove num_boost_round and n_estimators from hyperparameters (we use the fixed value)
-    train_params.pop("num_boost_round", None)
-    train_params.pop("n_estimators", None)
-    # Ensure is_unbalance is False (we use scale_pos_weight instead)
-    train_params["is_unbalance"] = False
-    # Override scale_pos_weight with computed value (remove any manual value that might override)
-    train_params.pop("scale_pos_weight", None)  # Remove any existing value
-    train_params["scale_pos_weight"] = scale_pos_weight  # Set computed value
-    
-    # Train model
-    print("  Creating datasets...")
-    train_dataset = lgb.Dataset(X_train, label=y_train, weight=train_weights, 
-                                feature_name=feature_names, free_raw_data=True)
-    del X_train, y_train, years_train, train_weights
-    gc.collect()
-    
-    print("  Training...")
+    # Train model based on type
     train_start = time.time()
-    lgb_model = lgb.train(
-        train_params,
-        train_dataset,
-        num_boost_round=num_boost_round,
-        callbacks=[lgb.log_evaluation(100)]
-    )
-    train_time = time.time() - train_start
-    # Since we use fixed num_boost_round (no early stopping), best_iteration will be None or equal to num_boost_round
-    # We use num_boost_round explicitly for consistency
-    best_iteration = num_boost_round
     
-    del train_dataset
-    gc.collect()
-    
-    # Evaluate on test set
-    print("  Evaluating on test set...")
-    test_start = time.time()
-    y_test_proba = lgb_model.predict(X_test, num_iteration=best_iteration)
-    test_time = time.time() - test_start
+    if model_type == "lgbm":
+        # Compute scale_pos_weight from fold's training data: scale_pos_weight = n_neg / n_pos
+        # This matches the main training protocol
+        scale_pos_weight = train_neg / max(train_pos, 1)
+        print(f"    Computed scale_pos_weight: {scale_pos_weight:.6f} = {train_neg:,} / {train_pos:,}")
+        
+        # Compute sample weights for training data
+        train_weights = compute_year_weights(years_train, min_year=2000, max_year=years_train.max())
+        print(f"  Training sample weights: min={train_weights.min():.3f}, max={train_weights.max():.3f}, mean={train_weights.mean():.3f}")
+        
+        # Prepare hyperparameters
+        train_params = hyperparameters.copy()
+        # Remove num_boost_round and n_estimators from hyperparameters (we use the fixed value)
+        train_params.pop("num_boost_round", None)
+        train_params.pop("n_estimators", None)
+        # Ensure is_unbalance is False (we use scale_pos_weight instead)
+        train_params["is_unbalance"] = False
+        # Override scale_pos_weight with computed value (remove any manual value that might override)
+        train_params.pop("scale_pos_weight", None)  # Remove any existing value
+        train_params["scale_pos_weight"] = scale_pos_weight  # Set computed value
+        
+        # Train model
+        print("  Creating datasets...")
+        train_dataset = lgb.Dataset(X_train, label=y_train, weight=train_weights, 
+                                    feature_name=feature_names, free_raw_data=True)
+        del X_train, y_train, years_train, train_weights
+        gc.collect()
+        
+        print("  Training...")
+        model = lgb.train(
+            train_params,
+            train_dataset,
+            num_boost_round=num_boost_round if num_boost_round is not None else 3000,
+            callbacks=[lgb.log_evaluation(100)]
+        )
+        train_time = time.time() - train_start
+        # Since we use fixed num_boost_round (no early stopping), best_iteration will be None or equal to num_boost_round
+        # We use num_boost_round explicitly for consistency
+        best_iteration = num_boost_round if num_boost_round is not None else 3000
+        
+        del train_dataset
+        gc.collect()
+        
+        # Evaluate on test set
+        print("  Evaluating on test set...")
+        test_start = time.time()
+        y_test_proba = model.predict(X_test, num_iteration=best_iteration)
+        test_time = time.time() - test_start
+        
+        # Extract feature importance (gain)
+        feature_importance = model.feature_importance(importance_type='gain')
+        scale_pos_weight_value = float(scale_pos_weight)
+        
+    elif model_type == "rf":
+        # Prepare hyperparameters for RandomForest
+        train_params = hyperparameters.copy()
+        # Remove LGBM-specific parameters
+        train_params.pop("num_boost_round", None)
+        train_params.pop("scale_pos_weight", None)
+        train_params.pop("is_unbalance", None)
+        # Ensure class_weight is set (use balanced_subsample if not specified)
+        if "class_weight" not in train_params:
+            train_params["class_weight"] = "balanced_subsample"
+        # Force explicit parallelism
+        train_params.setdefault("n_jobs", os.cpu_count())
+        
+        print(f"  Training RandomForest (n_jobs={train_params['n_jobs']})...")
+        model = RandomForestClassifier(**train_params)
+        model.fit(X_train, y_train)
+        train_time = time.time() - train_start
+        
+        # Evaluate on test set
+        print("  Evaluating on test set...")
+        test_start = time.time()
+        y_test_proba = model.predict_proba(X_test)[:, 1]
+        test_time = time.time() - test_start
+        
+        # Extract feature importance
+        feature_importance = model.feature_importances_
+        best_iteration = None  # Not applicable for RF
+        scale_pos_weight_value = None  # Not applicable for RF
+        
+        # Clean up
+        del X_train, y_train, years_train
+        gc.collect()
+        
+    elif model_type == "brf":
+        # Prepare hyperparameters for BalancedRandomForest
+        train_params = hyperparameters.copy()
+        # Remove LGBM-specific parameters
+        train_params.pop("num_boost_round", None)
+        train_params.pop("scale_pos_weight", None)
+        train_params.pop("is_unbalance", None)
+        train_params.pop("class_weight", None)  # BRF doesn't use class_weight
+        # Ensure sampling_strategy is set (use 0.1 if not specified)
+        if "sampling_strategy" not in train_params:
+            train_params["sampling_strategy"] = 0.1
+        # Force explicit parallelism
+        train_params.setdefault("n_jobs", os.cpu_count())
+        
+        print(f"  Training BalancedRandomForest (n_jobs={train_params['n_jobs']}, sampling_strategy={train_params.get('sampling_strategy', 0.1)})...")
+        model = BalancedRandomForestClassifier(**train_params)
+        model.fit(X_train, y_train)
+        train_time = time.time() - train_start
+        
+        # Evaluate on test set
+        print("  Evaluating on test set...")
+        test_start = time.time()
+        y_test_proba = model.predict_proba(X_test)[:, 1]
+        test_time = time.time() - test_start
+        
+        # Extract feature importance
+        feature_importance = model.feature_importances_
+        best_iteration = None  # Not applicable for BRF
+        scale_pos_weight_value = None  # Not applicable for BRF
+        
+        # Clean up
+        del X_train, y_train, years_train
+        gc.collect()
+        
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}. Must be one of ['lgbm', 'rf', 'brf']")
     
     test_metrics = compute_metrics(y_test, y_test_proba)
     
@@ -538,10 +649,11 @@ def train_spatial_fold(
     n_test_neg = int((y_test == 0).sum())
     test_pos_rate = float(y_test.mean())
     
-    # Extract feature importance (gain)
-    feature_importance = lgb_model.feature_importance(importance_type='gain')
     # Create list of (feature_name, importance) tuples and sort by importance
-    feature_importance_list = list(zip(feature_names, feature_importance.tolist()))
+    # All models return numpy arrays for feature importance
+    if isinstance(feature_importance, np.ndarray):
+        feature_importance = feature_importance.tolist()
+    feature_importance_list = list(zip(feature_names, feature_importance))
     feature_importance_list.sort(key=lambda x: x[1], reverse=True)
     
     # Get top N features (top 20)
@@ -559,21 +671,24 @@ def train_spatial_fold(
         print(f"    {i:2d}. {feat_name:30s} {importance:12.2f}")
     
     if use_wandb:
-        wandb.log({
+        log_dict = {
             f"spatial_fold_{fold_idx + 1}/n_train": int(n_train),
             f"spatial_fold_{fold_idx + 1}/n_test": int(n_test),
             f"spatial_fold_{fold_idx + 1}/n_train_pos": train_pos,
             f"spatial_fold_{fold_idx + 1}/n_train_neg": train_neg,
             f"spatial_fold_{fold_idx + 1}/train_pos_rate": train_pos_rate,
-            f"spatial_fold_{fold_idx + 1}/scale_pos_weight": float(scale_pos_weight),
             f"spatial_fold_{fold_idx + 1}/n_test_pos": n_test_pos,
             f"spatial_fold_{fold_idx + 1}/n_test_neg": n_test_neg,
             f"spatial_fold_{fold_idx + 1}/test_pos_rate": test_pos_rate,
             f"spatial_fold_{fold_idx + 1}/train_time_seconds": train_time,
             f"spatial_fold_{fold_idx + 1}/test_time_seconds": test_time,
-            f"spatial_fold_{fold_idx + 1}/best_iteration": int(best_iteration),
             **{f"spatial_fold_{fold_idx + 1}/{k}": v for k, v in test_metrics.items()}
-        })
+        }
+        if scale_pos_weight_value is not None:
+            log_dict[f"spatial_fold_{fold_idx + 1}/scale_pos_weight"] = scale_pos_weight_value
+        if best_iteration is not None:
+            log_dict[f"spatial_fold_{fold_idx + 1}/best_iteration"] = int(best_iteration)
+        wandb.log(log_dict)
     
     # Return predictions before cleanup (needed for calibration)
     fold_predictions = {
@@ -583,27 +698,32 @@ def train_spatial_fold(
     }
     
     # Clean up model but keep predictions
-    del lgb_model
+    del model
     gc.collect()
     
-    return {
+    result = {
         "fold_idx": fold_idx,
         "n_train": int(n_train),
         "n_test": int(n_test),
         "n_train_pos": train_pos,
         "n_train_neg": train_neg,
         "train_pos_rate": train_pos_rate,
-        "scale_pos_weight": float(scale_pos_weight),
         "n_test_pos": n_test_pos,
         "n_test_neg": n_test_neg,
         "test_pos_rate": test_pos_rate,
         "train_time_seconds": train_time,
         "test_time_seconds": test_time,
-        "best_iteration": int(best_iteration),
         "metrics": test_metrics,
         "top_features": [{"feature": name, "importance": float(imp)} for name, imp in top_features],
         "predictions": fold_predictions  # Include predictions for saving
     }
+    
+    if scale_pos_weight_value is not None:
+        result["scale_pos_weight"] = scale_pos_weight_value
+    if best_iteration is not None:
+        result["best_iteration"] = int(best_iteration)
+    
+    return result
 
 
 def analyze_label_rarity_noise(cv_results: list[Dict[str, Any]]) -> Dict[str, Any]:
@@ -740,13 +860,18 @@ def aggregate_spatial_cv_metrics(cv_results: list[Dict[str, Any]]) -> Dict[str, 
     return aggregated
 
 
-def main(protocol: Literal["pooled_years", "deployment_like"] = "pooled_years") -> None:
+def main(protocol: Literal["pooled_years", "deployment_like"] = "pooled_years",
+         model_type: Literal["lgbm", "rf", "brf"] = "lgbm") -> None:
     """Main function for spatial cross-validation.
     
     Args:
         protocol: Evaluation protocol
             - "pooled_years": Train and test on 2000-2017 mixed across folds (default)
             - "deployment_like": Train on non-heldout regions using 2000-2017, test on heldout region using 2018-2019
+        model_type: Model type to use
+            - "lgbm": LightGBM (default)
+            - "rf": RandomForestClassifier
+            - "brf": BalancedRandomForestClassifier
     """
     start_time = time.time()
     repo_root = Path(__file__).resolve().parents[4]
@@ -771,14 +896,23 @@ def main(protocol: Literal["pooled_years", "deployment_like"] = "pooled_years") 
     else:
         raise ValueError(f"Unknown protocol: {protocol}")
     
+    # Map model_type to display name
+    model_display_names = {
+        "lgbm": "LightGBM",
+        "rf": "RandomForest",
+        "brf": "BalancedRandomForest"
+    }
+    model_display_name = model_display_names.get(model_type, model_type.upper())
+    
     if wandb is not None:
         try:
             wandb.init(
                 project="colombia-spatial-cv",
                 entity=os.environ.get("WANDB_ENTITY"),
-                name=f"spatial_cv_modelC_lgbm_{protocol}_{timestamp}",
+                name=f"spatial_cv_modelC_{model_type}_{protocol}_{timestamp}",
                 config={
-                    "model": "LightGBM",
+                    "model": model_display_name,
+                    "model_type": model_type,
                     "task": "transition_01_win5_prediction",
                     "target_column": TARGET_COL,
                     "lookahead_years": LOOKAHEAD_YEARS,
@@ -799,7 +933,7 @@ def main(protocol: Literal["pooled_years", "deployment_like"] = "pooled_years") 
         print("W&B not available (module not installed)")
     
     print("=" * 70)
-    print("SPATIAL CROSS-VALIDATION: modelC_LGBM")
+    print(f"SPATIAL CROSS-VALIDATION: modelC_{model_type.upper()}")
     print(f"Protocol: {protocol_description}")
     print("=" * 70)
     print(f"\nOutput directory: {output_dir}")
@@ -809,7 +943,7 @@ def main(protocol: Literal["pooled_years", "deployment_like"] = "pooled_years") 
     print("STEP 1: FIND LATEST BENCHMARK FILE")
     print("=" * 70)
     try:
-        benchmark_path = find_latest_benchmark_file(output_dir)
+        benchmark_path = find_latest_benchmark_file(output_dir, model_type)
         print(f"\nFound benchmark file: {benchmark_path.name}")
     except FileNotFoundError as e:
         print(f"\nERROR: {e}")
@@ -820,19 +954,24 @@ def main(protocol: Literal["pooled_years", "deployment_like"] = "pooled_years") 
     print("STEP 2: LOAD BENCHMARK CONFIG")
     print("=" * 70)
     try:
-        feature_cols, hyperparameters, random_seed, num_boost_round = load_benchmark_config(benchmark_path, output_dir)
+        feature_cols, hyperparameters, random_seed, num_boost_round = load_benchmark_config(benchmark_path, output_dir, model_type)
         print(f"\nLoaded benchmark config:")
         print(f"  Features: {len(feature_cols)}")
         print(f"  Random seed: {random_seed}")
         print(f"  Hyperparameters: {len(hyperparameters)} parameters")
-        print(f"  Num boost rounds: {num_boost_round} (from final_num_boost_round)")
+        if model_type == "lgbm" and num_boost_round is not None:
+            print(f"  Num boost rounds: {num_boost_round} (from final_num_boost_round)")
+        elif model_type in ["rf", "brf"]:
+            print(f"  Note: num_boost_round not applicable for {model_type.upper()}")
         
         if use_wandb:
-            wandb.config.update({
+            wandb_config_update = {
                 "n_features": len(feature_cols),
-                "num_boost_round": num_boost_round,
                 "source_benchmark": benchmark_path.name,
-            })
+            }
+            if num_boost_round is not None:
+                wandb_config_update["num_boost_round"] = num_boost_round
+            wandb.config.update(wandb_config_update)
     except Exception as e:
         print(f"\nERROR: Failed to load benchmark config: {e}")
         import traceback
@@ -964,7 +1103,7 @@ def main(protocol: Literal["pooled_years", "deployment_like"] = "pooled_years") 
         fold_result = train_spatial_fold(
             X_train, y_train, years_train,
             X_test, y_test,
-            fold_idx, hyperparameters, num_boost_round, feature_cols, use_wandb
+            fold_idx, hyperparameters, num_boost_round, feature_cols, model_type, use_wandb
         )
         
         # Collect predictions before cleanup
@@ -999,7 +1138,7 @@ def main(protocol: Literal["pooled_years", "deployment_like"] = "pooled_years") 
                 "fold_idx": fold_idx_all
             })
             
-            cv_predictions_path = output_dir / f"modelC_lgbm_win5_spatial_cv_predictions_{timestamp}.parquet"
+            cv_predictions_path = output_dir / f"modelC_{model_type}_win5_spatial_cv_predictions_{timestamp}.parquet"
             cv_predictions_df.to_parquet(cv_predictions_path, index=False, engine="pyarrow")
             print(f"\nCV predictions saved: {cv_predictions_path.name}")
             print(f"  Total samples: {len(cv_predictions_df):,}")
@@ -1068,13 +1207,14 @@ def main(protocol: Literal["pooled_years", "deployment_like"] = "pooled_years") 
     print("\n" + "=" * 70)
     print("STEP 7: SAVE RESULTS")
     print("=" * 70)
-    results_path = output_dir / f"modelC_lgbm_win5_spatial_cv_{timestamp}.json"
+    results_path = output_dir / f"modelC_{model_type}_win5_spatial_cv_{timestamp}.json"
     
     results = {
         "metadata": {
             "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "source_benchmark": benchmark_path.name,
-            "model": "LightGBM",
+            "model": model_display_name,
+            "model_type": model_type,
             "task": "transition_01_win5_prediction",
             "target_column": TARGET_COL,
             "lookahead_years": LOOKAHEAD_YEARS,
@@ -1139,13 +1279,20 @@ def main(protocol: Literal["pooled_years", "deployment_like"] = "pooled_years") 
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Spatial Cross-Validation for modelC_LGBM")
+    parser = argparse.ArgumentParser(description="Spatial Cross-Validation for modelC (LGBM / RF / BRF)")
     parser.add_argument(
         "--protocol",
         type=str,
         choices=["pooled_years", "deployment_like"],
         default="pooled_years",
         help="Evaluation protocol: 'pooled_years' (train/test on 2000-2017 mixed) or 'deployment_like' (train on 2000-2017, test on 2018-2019)"
+    )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        choices=["lgbm", "rf", "brf"],
+        default="lgbm",
+        help="Model type: 'lgbm' (LightGBM), 'rf' (RandomForest), or 'brf' (BalancedRandomForest)"
     )
     args = parser.parse_args()
     
@@ -1154,13 +1301,13 @@ if __name__ == "__main__":
     output_dir.mkdir(parents=True, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"spatial_cv_modelC_lgbm_{args.protocol}_{timestamp}.txt"
+    output_file = output_dir / f"spatial_cv_modelC_{args.model_type}_{args.protocol}_{timestamp}.txt"
     
     tee = Tee(output_file)
     sys.stdout = tee
     
     try:
-        main(protocol=args.protocol)
+        main(protocol=args.protocol, model_type=args.model_type)
     finally:
         sys.stdout = tee.stdout
         tee.close()
