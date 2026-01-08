@@ -43,6 +43,7 @@ from typing import Dict, Any, Optional
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
@@ -51,6 +52,55 @@ from sklearn.metrics import precision_recall_curve, average_precision_score
 import geopandas as gpd
 from shapely.geometry import Point
 from scipy.interpolate import interp1d, griddata
+
+
+# =============================================================================
+# VISUALIZATION CONSTANTS - Ensures consistent styling across all models
+# =============================================================================
+
+# Map figure dimensions (inches)
+MAP_FIGSIZE = (14, 11)
+
+# Map resolution for rasterization (degrees, approximately 1 km at Colombia latitude)
+MAP_RESOLUTION = 0.009
+
+# Map DPI for output files
+MAP_DPI = 600
+
+# Font sizes
+FONTSIZE_LABEL = 12  # Axis labels
+FONTSIZE_TITLE = 15  # Map titles
+FONTSIZE_DESCRIPTION = 8  # Description text boxes
+FONTSIZE_LEGEND = 10  # Legend text
+FONTSIZE_STATS = 9  # Statistics/time period text
+
+# Risk map color scheme
+# Category colors using viridis colormap samples
+# Compute viridis colors at module load to ensure accuracy while maintaining consistency
+_viridis_cmap = cm.get_cmap('viridis')
+RISK_MAP_COLORS = {
+    'none': _viridis_cmap(0.0),  # viridis(0.0) - darkest purple
+    'predicted_only': _viridis_cmap(0.35),  # viridis(0.35) - blue-green
+    'observed_only': (0.0, 1.0, 1.0, 1.0),  # bright cyan
+    'overlap': (1.0, 0.0, 0.0, 1.0),  # bright red
+    'protected': '#2E8B57'  # sea green for protected areas
+}
+
+# Risk map transparency settings
+RISK_MAP_ALPHA_BACKGROUND = 0.15  # Background category transparency
+RISK_MAP_ALPHA_PROTECTED = 0.6  # Protected areas overlay transparency
+
+# Probability map color scheme
+PROBABILITY_MAP_COLORMAP = 'plasma'  # Colormap: dark purple -> yellow
+
+# Probability map color scaling (percentile-based)
+PROBABILITY_MAP_PERCENTILE_MIN = 25  # Lower percentile for colorbar range
+PROBABILITY_MAP_PERCENTILE_MAX = 98  # Upper percentile for colorbar range
+PROBABILITY_MAP_TRANSFORMATION = 'sqrt'  # Transformation: 'sqrt' (square root) or 'linear'
+
+# PR curve figure dimensions
+PR_CURVE_FIGSIZE = (8, 6)
+PR_CURVE_DPI = 300
 
 
 def get_repo_root() -> Path:
@@ -433,7 +483,7 @@ def create_pr_curve(df: pd.DataFrame, metrics_data: Dict[str, Any], output_dir: 
     print(f"  Baseline prevalence: {baseline_rate:.6f}")
     
     # Create figure
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, ax = plt.subplots(figsize=PR_CURVE_FIGSIZE)
     
     # Plot PR curve
     ax.plot(recall, precision, linewidth=2, label=f'Model (AP = {pr_auc:.4f})')
@@ -442,10 +492,10 @@ def create_pr_curve(df: pd.DataFrame, metrics_data: Dict[str, Any], output_dir: 
     ax.axhline(y=baseline_rate, color='r', linestyle='--', linewidth=2, 
                label=f'Baseline (prevalence = {baseline_rate:.6f})')
     
-    ax.set_xlabel('Recall', fontsize=12)
-    ax.set_ylabel('Precision', fontsize=12)
-    ax.set_title(f'Model C ({model_type.upper()}) Precision-Recall Curve', fontsize=14, fontweight='bold')
-    ax.legend(loc='best', fontsize=10)
+    ax.set_xlabel('Recall', fontsize=FONTSIZE_LABEL)
+    ax.set_ylabel('Precision', fontsize=FONTSIZE_LABEL)
+    ax.set_title(f'Model C ({model_type.upper()}) Precision-Recall Curve', fontsize=FONTSIZE_TITLE, fontweight='bold')
+    ax.legend(loc='best', fontsize=FONTSIZE_LEGEND)
     ax.grid(True, alpha=0.3)
     ax.set_xlim([0, 1])
     ax.set_ylim([0, 1])
@@ -454,12 +504,12 @@ def create_pr_curve(df: pd.DataFrame, metrics_data: Dict[str, Any], output_dir: 
     
     # Save PNG
     png_path = output_dir / f"modelC_{model_type}_pr_curve.png"
-    plt.savefig(png_path, dpi=300, bbox_inches='tight')
+    plt.savefig(png_path, dpi=PR_CURVE_DPI, bbox_inches='tight')
     print(f"\nSaved PNG: {png_path}")
     
     # Save PDF
     pdf_path = output_dir / f"modelC_{model_type}_pr_curve.pdf"
-    plt.savefig(pdf_path, bbox_inches='tight')
+    plt.savefig(pdf_path, dpi=PR_CURVE_DPI, bbox_inches='tight')
     print(f"Saved PDF: {pdf_path}")
     
     plt.close()
@@ -996,7 +1046,7 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
         gdf.geometry.x.values,
         gdf.geometry.y.values,
         gdf['category_code'].values,
-        target_resolution=0.009  # ~1 km resolution at Colombia latitude
+        target_resolution=MAP_RESOLUTION
     )
     print(f"  Category raster shape: {category_raster.shape}, extent: {extent}")
     print(f"  Valid (non-NaN) pixels: {np.sum(~np.isnan(category_raster)):,}")
@@ -1011,7 +1061,7 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
                 gdf.geometry.x.values,
                 gdf.geometry.y.values,
                 protected_mask.astype(float),  # Convert boolean to float for rasterization
-                target_resolution=0.009
+                target_resolution=MAP_RESOLUTION
             )
             # Ensure extent matches (should be the same, but verify)
             if protected_extent != extent:
@@ -1024,23 +1074,20 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
             print(f"  Protected areas raster created with {np.sum(~np.isnan(protected_raster)):,} pixels")
     
     # Create figure
-    fig, ax = plt.subplots(figsize=(14, 11))
+    fig, ax = plt.subplots(figsize=MAP_FIGSIZE)
     
     # Plot Colombia boundary
     colombia_gdf.plot(ax=ax, color='white', edgecolor='none', linewidth=1.5, zorder=1)
     
-    # Define colors for each category using viridis colormap
+    # Define colors for each category using standardized color scheme
     from matplotlib.colors import ListedColormap, BoundaryNorm
-    import matplotlib.cm as cm
     
-    # Sample colors from viridis colormap
-    viridis = cm.get_cmap('viridis')
-    # Use high-contrast colors for better visibility
+    # Use standardized colors from constants
     category_colors_rgba = {
-        0: viridis(0.0),  # none - darkest purple (barely visible, like transparent black)
-        1: viridis(0.35),  # predicted_only - blue-green from viridis
-        2: (0.0, 1.0, 1.0, 1.0),  # observed_only - bright cyan (high contrast)
-        3: (1.0, 0.0, 0.0, 1.0)   # overlap - bright red (maximum contrast and visibility)
+        0: RISK_MAP_COLORS['none'],  # none - darkest purple
+        1: RISK_MAP_COLORS['predicted_only'],  # predicted_only - blue-green
+        2: RISK_MAP_COLORS['observed_only'],  # observed_only - bright cyan
+        3: RISK_MAP_COLORS['overlap']  # overlap - bright red
     }
     
     # Convert to hex for legend (take only RGB, ignore alpha)
@@ -1076,7 +1123,7 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
                  origin='upper',
                  interpolation='nearest',
                  aspect='equal',
-                 alpha=0.15,  # Very transparent - barely visible
+                 alpha=RISK_MAP_ALPHA_BACKGROUND,
                  zorder=1)
     
     # Plot main category raster (categories 1, 2, 3) with full opacity
@@ -1105,7 +1152,7 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
             if not protected_raster_masked.mask.all():
                 # Create a simple green colormap for protected areas
                 from matplotlib.colors import LinearSegmentedColormap
-                green_cmap = LinearSegmentedColormap.from_list('green', ['#2E8B57', '#2E8B57'], N=1)
+                green_cmap = LinearSegmentedColormap.from_list('green', [RISK_MAP_COLORS['protected'], RISK_MAP_COLORS['protected']], N=1)
                 ax.imshow(protected_raster_masked,
                          extent=extent,  # Use same extent as category raster
                          cmap=green_cmap,
@@ -1113,14 +1160,14 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
                          origin='upper',
                          interpolation='nearest',
                          aspect='equal',
-                         alpha=0.6,  # Semi-transparent overlay
+                         alpha=RISK_MAP_ALPHA_PROTECTED,
                          zorder=2.5)
     
     # Styling
-    ax.set_xlabel('Longitude', fontsize=12)
-    ax.set_ylabel('Latitude', fontsize=12)
+    ax.set_xlabel('Longitude', fontsize=FONTSIZE_LABEL)
+    ax.set_ylabel('Latitude', fontsize=FONTSIZE_LABEL)
     ax.set_title(f'Model C ({model_type.upper()}) Risk Map: Predicted High-Risk Pixels and Observed PA Establishments', 
-                 fontsize=15, fontweight='bold', pad=15)
+                 fontsize=FONTSIZE_TITLE, fontweight='bold', pad=15)
     
     # Add description text box explaining what the map shows
     description_text = (f"Top 1% predicted high-risk (blue-green),\n"
@@ -1129,7 +1176,7 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
                        f"Observed = pixels with WDPA_b1=1\n"
                        f"in {time_period} OR y_true=1.\n"
                        f"Predicting {prediction_horizon}.")
-    ax.text(0.98, 0.98, description_text, transform=ax.transAxes, fontsize=8,
+    ax.text(0.98, 0.98, description_text, transform=ax.transAxes, fontsize=FONTSIZE_DESCRIPTION,
            verticalalignment='top', horizontalalignment='right',
            bbox=dict(boxstyle='round', facecolor='lightblue', 
            alpha=0.9, edgecolor='black', linewidth=1, pad=0.5), zorder=10)
@@ -1141,10 +1188,10 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
     if has_wdpa and protected_raster is not None:
         protected_count = gdf['is_protected'].sum()
         legend_elements.append(Line2D([0], [0], marker='s', color='w', 
-                                    markerfacecolor='#2E8B57', markersize=10, 
-                                    alpha=0.6, label=f'Existing protected areas (as of end 2017, n={protected_count:,})'))
+                                    markerfacecolor=RISK_MAP_COLORS['protected'], markersize=10, 
+                                    alpha=RISK_MAP_ALPHA_PROTECTED, label=f'Existing protected areas (as of end 2017, n={protected_count:,})'))
     
-    # Add category legend items - overlap (bright yellow from viridis) first since it's most important
+    # Add category legend items - overlap (bright red) first since it's most important
     if overlap_count > 0:
         legend_elements.append(Line2D([0], [0], marker='s', color='w', 
                                     markerfacecolor=category_colors_hex[3], markersize=10, 
@@ -1159,12 +1206,12 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
                                     alpha=1.0, label=f'Observed PA establishments only (n={observed_only_count:,})'))
     
     # Add time period information as text in legend
-    legend = ax.legend(handles=legend_elements, loc='upper left', fontsize=10, 
+    legend = ax.legend(handles=legend_elements, loc='upper left', fontsize=FONTSIZE_LEGEND, 
                       framealpha=0.95, fancybox=True, shadow=True)
     
     # Add time period text box below legend
     time_text = f"Observation period: {time_period}\nPrediction horizon: {prediction_horizon}"
-    ax.text(0.02, 0.02, time_text, transform=ax.transAxes, fontsize=9,
+    ax.text(0.02, 0.02, time_text, transform=ax.transAxes, fontsize=FONTSIZE_STATS,
            verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat', 
            alpha=0.8, edgecolor='black', linewidth=1), zorder=10)
     
@@ -1175,14 +1222,14 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
     
     plt.tight_layout()
     
-    # Save PNG with maximum DPI for sharpest visualization
+    # Save PNG with standardized DPI
     png_path = output_dir / f"modelC_{model_type}_risk_map_top1pct.png"
-    plt.savefig(png_path, dpi=600, bbox_inches='tight')
+    plt.savefig(png_path, dpi=MAP_DPI, bbox_inches='tight')
     print(f"\nSaved PNG: {png_path}")
     
-    # Save PDF with maximum quality for sharpest visualization
+    # Save PDF with standardized DPI
     pdf_path = output_dir / f"modelC_{model_type}_risk_map_top1pct.pdf"
-    plt.savefig(pdf_path, dpi=600, bbox_inches='tight')
+    plt.savefig(pdf_path, dpi=MAP_DPI, bbox_inches='tight')
     print(f"Saved PDF: {pdf_path}")
     
     plt.close()
@@ -1249,30 +1296,31 @@ def create_probability_map(df: pd.DataFrame, country_boundary_path: Optional[Pat
     
     # Use percentile-based range to balance color distribution
     # This clips extreme outliers and better utilizes the full colormap
-    # Using 25th to 98th percentile clips lowest 25% to reduce purple dominance
-    proba_p25 = np.percentile(proba_values, 25)
-    proba_p98 = np.percentile(proba_values, 98)
+    proba_pmin = np.percentile(proba_values, PROBABILITY_MAP_PERCENTILE_MIN)
+    proba_pmax = np.percentile(proba_values, PROBABILITY_MAP_PERCENTILE_MAX)
     
-    print(f"  Using percentile-based color range (25th-98th percentile)")
+    print(f"  Using percentile-based color range ({PROBABILITY_MAP_PERCENTILE_MIN}th-{PROBABILITY_MAP_PERCENTILE_MAX}th percentile)")
     print(f"  Probability range: [{proba_min:.6f}, {proba_max:.6f}]")
-    print(f"  Colorbar range: [{proba_p25:.6f}, {proba_p98:.6f}]")
-    print(f"  Range span: {proba_p98 - proba_p25:.6f}")
+    print(f"  Colorbar range: [{proba_pmin:.6f}, {proba_pmax:.6f}]")
+    print(f"  Range span: {proba_pmax - proba_pmin:.6f}")
     
     # Clip values to percentile range
-    proba_clipped = np.clip(proba_values, proba_p25, proba_p98)
+    proba_clipped = np.clip(proba_values, proba_pmin, proba_pmax)
     
-    # Apply power transformation to stretch the distribution
-    # This helps distribute colors better across the colormap
-    # Using square root transformation to emphasize higher values
-    proba_shifted = proba_clipped - proba_p25  # Shift to start at 0
-    proba_span = proba_p98 - proba_p25
+    # Apply transformation to stretch the distribution
+    proba_shifted = proba_clipped - proba_pmin  # Shift to start at 0
+    proba_span = proba_pmax - proba_pmin
     proba_normalized_linear = proba_shifted / proba_span  # Linear normalization to [0, 1]
     
-    # Apply square root transformation to stretch lower values
-    # This makes the color distribution more even across the colormap
-    proba_normalized = np.sqrt(proba_normalized_linear)  # Square root stretches lower values
+    # Apply transformation based on constant setting
+    if PROBABILITY_MAP_TRANSFORMATION == 'sqrt':
+        proba_normalized = np.sqrt(proba_normalized_linear)  # Square root stretches lower values
+        transform_name = 'square root'
+    else:  # linear
+        proba_normalized = proba_normalized_linear
+        transform_name = 'linear'
     
-    print(f"  Applied square root transformation to stretch distribution")
+    print(f"  Applied {transform_name} transformation to stretch distribution")
     print(f"  Normalized value range: [{proba_normalized.min():.4f}, {proba_normalized.max():.4f}]")
     print(f"  Normalized value mean: {proba_normalized.mean():.4f}, median: {np.median(proba_normalized):.4f}")
     
@@ -1282,24 +1330,24 @@ def create_probability_map(df: pd.DataFrame, country_boundary_path: Optional[Pat
         gdf.geometry.x.values, 
         gdf.geometry.y.values, 
         proba_normalized,  # Use normalized values to ensure full colormap usage
-        target_resolution=0.009  # ~1 km resolution at Colombia latitude
+        target_resolution=MAP_RESOLUTION
     )
     print(f"  Raster shape: {raster.shape}, extent: {extent}")
     print(f"  Valid (non-NaN) pixels: {np.sum(~np.isnan(raster)):,}")
     
     # Create figure
-    fig, ax = plt.subplots(figsize=(14, 11))
+    fig, ax = plt.subplots(figsize=MAP_FIGSIZE)
     
     # Plot Colombia boundary
     colombia_gdf.plot(ax=ax, color='white', edgecolor='none', linewidth=1.5, zorder=1)
     
     # Plot probability raster with pixel-perfect rendering
-    # Use 'plasma' colormap for a visually pleasing gradient (dark purple -> yellow)
+    # Use standardized colormap for consistent visualization across all models
     # interpolation='nearest' ensures no smoothing - pixel-perfect rendering
     # Values are normalized to [0, 1] so full colormap is used
     im = ax.imshow(raster, 
                    extent=extent, 
-                   cmap='plasma', 
+                   cmap=PROBABILITY_MAP_COLORMAP, 
                    vmin=0, vmax=1,  # Normalized values, so use [0, 1] range
                    origin='upper',  # Match geographic convention (north at top)
                    interpolation='nearest',  # No smoothing - pixel perfect
@@ -1309,18 +1357,18 @@ def create_probability_map(df: pd.DataFrame, country_boundary_path: Optional[Pat
     # Add colorbar with custom formatter to show actual probability values
     cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label('Predicted Probability', 
-                   fontsize=12, rotation=270, labelpad=20)
+                   fontsize=FONTSIZE_LABEL, rotation=270, labelpad=20)
     
     # Set colorbar ticks with text labels instead of numeric values
     tick_positions = [0.0, 1.0]
     tick_labels = ['Low probability', 'High probability']
     cbar.set_ticks(tick_positions)
     cbar.set_ticklabels(tick_labels)
-    cbar.ax.tick_params(labelsize=10)
+    cbar.ax.tick_params(labelsize=FONTSIZE_LEGEND)
     
     # Styling
-    ax.set_xlabel('Longitude', fontsize=12)
-    ax.set_ylabel('Latitude', fontsize=12)
+    ax.set_xlabel('Longitude', fontsize=FONTSIZE_LABEL)
+    ax.set_ylabel('Latitude', fontsize=FONTSIZE_LABEL)
     
     # Check if calibrated probabilities were used
     calibration_note = ""
@@ -1332,7 +1380,7 @@ def create_probability_map(df: pd.DataFrame, country_boundary_path: Optional[Pat
         calibration_note = " (Calibrated Probabilities)"
     
     ax.set_title(f'Model C ({model_type.upper()}) Probability Map{calibration_note}', 
-                 fontsize=15, fontweight='bold', pad=15)
+                 fontsize=FONTSIZE_TITLE, fontweight='bold', pad=15)
     
     # Add description text box explaining what the map shows
     description_text = (f"Continuous predicted probability\n"
@@ -1340,7 +1388,7 @@ def create_probability_map(df: pd.DataFrame, country_boundary_path: Optional[Pat
                        f"Warmer colors (yellow) = higher.\n"
                        f"Based on {time_period} observations,\n"
                        f"predicting {prediction_horizon}.")
-    ax.text(0.98, 0.98, description_text, transform=ax.transAxes, fontsize=8,
+    ax.text(0.98, 0.98, description_text, transform=ax.transAxes, fontsize=FONTSIZE_DESCRIPTION,
            verticalalignment='top', horizontalalignment='right',
            bbox=dict(boxstyle='round', facecolor='lightblue', 
            alpha=0.9, edgecolor='black', linewidth=1, pad=0.5), zorder=10)
@@ -1348,7 +1396,7 @@ def create_probability_map(df: pd.DataFrame, country_boundary_path: Optional[Pat
     # Add statistics text box
     stats_text = (f"Min: {proba_min:.6f} | Max: {proba_max:.6f}\n"
                   f"Mean: {proba_mean:.6f} | Median: {proba_median:.6f}")
-    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=9,
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=FONTSIZE_STATS,
            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', 
            alpha=0.9, edgecolor='black', linewidth=1), zorder=10)
     
@@ -1359,14 +1407,14 @@ def create_probability_map(df: pd.DataFrame, country_boundary_path: Optional[Pat
     
     plt.tight_layout()
     
-    # Save PNG with maximum DPI for sharpest visualization
+    # Save PNG with standardized DPI
     png_path = output_dir / f"modelC_{model_type}_probability_map.png"
-    plt.savefig(png_path, dpi=600, bbox_inches='tight')
+    plt.savefig(png_path, dpi=MAP_DPI, bbox_inches='tight')
     print(f"\nSaved PNG: {png_path}")
     
-    # Save PDF with maximum quality for sharpest visualization
+    # Save PDF with standardized DPI
     pdf_path = output_dir / f"modelC_{model_type}_probability_map.pdf"
-    plt.savefig(pdf_path, dpi=600, bbox_inches='tight')
+    plt.savefig(pdf_path, dpi=MAP_DPI, bbox_inches='tight')
     print(f"Saved PDF: {pdf_path}")
     
     plt.close()
