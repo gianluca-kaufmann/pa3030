@@ -1501,9 +1501,28 @@ def main() -> None:
     model_type = args.model_type.lower()
     use_calibrated = args.use_calibrated.lower()
     
-    # Get repo root for auto-discovery
+    # Get repo root and scratch root for auto-discovery
     repo_root = get_repo_root()
-    ml_models_dir = repo_root / "outputs/Results/ml_models"
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+    
+    # Check both $SCRATCH and repo root for ml_models directory
+    ml_models_candidates = []
+    if scratch_root is not None:
+        ml_models_candidates.append(scratch_root / "outputs/Results/ml_models")
+    ml_models_candidates.append(repo_root / "outputs/Results/ml_models")
+    
+    # Find the first existing ml_models directory
+    ml_models_dir = None
+    for candidate in ml_models_candidates:
+        if candidate.exists():
+            ml_models_dir = candidate
+            print(f"Using ml_models directory: {ml_models_dir}")
+            break
+    
+    if ml_models_dir is None:
+        # Fallback to repo root if neither exists (will create later)
+        ml_models_dir = repo_root / "outputs/Results/ml_models"
+        print(f"WARNING: ml_models directory not found, will use: {ml_models_dir}")
     
     # Auto-discover files if not provided
     if args.metrics_json:
@@ -1569,9 +1588,6 @@ def main() -> None:
     else:
         print("Auto-discovering test parquet file...")
         # Try to find test_colombia_win5.parquet in data/ml directory
-        repo_root = get_repo_root()
-        scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
-        
         candidates = []
         if scratch_root is not None:
             candidates.append(scratch_root / "data/ml/test_colombia_win5.parquet")
@@ -1599,7 +1615,11 @@ def main() -> None:
     if args.out_dir:
         output_dir = Path(args.out_dir).resolve()
     else:
-        output_dir = repo_root / f"outputs/Results/results_modelC_{model_type}"
+        # Prefer $SCRATCH for outputs on cluster, otherwise use repo root
+        if scratch_root is not None:
+            output_dir = scratch_root / f"outputs/Results/results_modelC_{model_type}"
+        else:
+            output_dir = repo_root / f"outputs/Results/results_modelC_{model_type}"
     
     country_boundary_path = Path(args.country_boundary).resolve() if args.country_boundary else None
     
