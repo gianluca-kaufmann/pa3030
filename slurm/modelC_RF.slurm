@@ -47,6 +47,13 @@ echo "PWD = $(pwd)"
   find scripts -maxdepth 4 -type f -name "modelC_RF"
   exit 1
 }
+
+# Enable fast train mode
+export FAST_TRAIN=1
+
+# Set verbose output for scikit-learn
+export SK_VERBOSE=1
+
 # Run the script
 python "scripts/colombia/ML/training/modelC_RF"
 
