@@ -1435,22 +1435,6 @@ def find_latest_file(pattern: str, search_dir: Path, exclude_substr: Optional[st
         return None
     
     matches = list(search_dir.glob(pattern))
-    
-    # If no matches, try case-insensitive search
-    if not matches:
-        # Try case-insensitive matching by listing all files and filtering
-        try:
-            all_files = list(search_dir.glob("*"))
-            # Convert pattern to regex for case-insensitive matching
-            import re
-            # Escape special glob characters and convert to regex
-            pattern_regex = pattern.replace(".", r"\.").replace("*", ".*").replace("?", ".")
-            pattern_regex = f"^{pattern_regex}$"
-            regex = re.compile(pattern_regex, re.IGNORECASE)
-            matches = [f for f in all_files if f.is_file() and regex.match(f.name)]
-        except Exception:
-            pass
-    
     if not matches:
         return None
     
@@ -1463,6 +1447,39 @@ def find_latest_file(pattern: str, search_dir: Path, exclude_substr: Optional[st
     # Sort by modification time, most recent first
     matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return matches[0]
+
+
+def find_latest_file_in_dirs(pattern: str, search_dirs: list[Path], exclude_substr: Optional[str] = None) -> Optional[Path]:
+    """Find the most recent file matching a pattern across multiple directories.
+    
+    Searches all provided directories and returns the most recent file found across all of them.
+    
+    Args:
+        pattern: Glob pattern to match files
+        search_dirs: List of directories to search in
+        exclude_substr: Optional substring to exclude from matches (case-insensitive)
+    
+    Returns:
+        Path to most recent matching file, or None if no matches
+    """
+    all_matches = []
+    for search_dir in search_dirs:
+        if search_dir.exists():
+            matches = list(search_dir.glob(pattern))
+            all_matches.extend(matches)
+    
+    if not all_matches:
+        return None
+    
+    # Filter out files containing exclude_substr if provided
+    if exclude_substr:
+        all_matches = [m for m in all_matches if exclude_substr.lower() not in m.name.lower()]
+        if not all_matches:
+            return None
+    
+    # Sort by modification time, most recent first
+    all_matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return all_matches[0]
 
 
 def main() -> None:
@@ -1530,107 +1547,51 @@ def main() -> None:
         ml_models_candidates.append(scratch_root / "outputs/Results/ml_models")
     ml_models_candidates.append(repo_root / "outputs/Results/ml_models")
     
-    # Find the first existing ml_models directory
-    ml_models_dir = None
-    for candidate in ml_models_candidates:
-        if candidate.exists():
-            ml_models_dir = candidate
-            print(f"Using ml_models directory: {ml_models_dir}")
-            break
-    
-    if ml_models_dir is None:
-        # Fallback to repo root if neither exists (will create later)
-        ml_models_dir = repo_root / "outputs/Results/ml_models"
-        print(f"WARNING: ml_models directory not found, will use: {ml_models_dir}")
+    # Print all candidate directories for debugging
+    print(f"Searching for ml_models files in:")
+    for cand in ml_models_candidates:
+        exists = "✓" if cand.exists() else "✗"
+        print(f"  {exists} {cand}")
     
     # Auto-discover files if not provided
     if args.metrics_json:
         metrics_path = Path(args.metrics_json).resolve()
     else:
-        print(f"Auto-discovering metrics JSON file for model_type={model_type}...")
+        print(f"\nAuto-discovering metrics JSON file for model_type={model_type}...")
         metrics_pattern = f"modelC_{model_type}_win5_metrics_*.json"
-        metrics_path = find_latest_file(metrics_pattern, ml_models_dir)
+        metrics_path = find_latest_file_in_dirs(metrics_pattern, ml_models_candidates)
         if metrics_path is None:
-            print(f"ERROR: Could not find {metrics_pattern} in {ml_models_dir}")
-            # List available files to help debug
-            if ml_models_dir.exists():
-                print(f"\nAvailable files in {ml_models_dir}:")
-                try:
-                    all_files = sorted(ml_models_dir.glob("*.json"))
-                    if all_files:
-                        # Show modelC metrics files first
-                        modelc_files = [f for f in all_files if "modelC" in f.name and "metrics" in f.name]
-                        if modelc_files:
-                            print(f"  ModelC metrics files found:")
-                            for f in modelc_files[:10]:
-                                print(f"    - {f.name}")
-                            if len(modelc_files) > 10:
-                                print(f"    ... and {len(modelc_files) - 10} more modelC metrics files")
-                        # Show all JSON files
-                        print(f"\n  All JSON files (showing first 20):")
-                        for f in all_files[:20]:
-                            print(f"    - {f.name}")
-                        if len(all_files) > 20:
-                            print(f"    ... and {len(all_files) - 20} more files")
-                    else:
-                        print("  (no JSON files found)")
-                    
-                    # Try case variations and alternative patterns
-                    print(f"\nTrying alternative patterns...")
-                    alternative_patterns = [
-                        f"modelC_{model_type.upper()}_win5_metrics_*.json",
-                        f"modelC_{model_type.capitalize()}_win5_metrics_*.json",
-                        f"modelC_*{model_type}*_win5_metrics_*.json",  # More flexible
-                    ]
-                    for alt_pattern in alternative_patterns:
-                        alt_path = find_latest_file(alt_pattern, ml_models_dir)
-                        if alt_path:
-                            print(f"  Found with pattern '{alt_pattern}': {alt_path}")
-                            metrics_path = alt_path
-                            break
-                    
-                    # Last resort: search for any modelC metrics file and filter by model type in filename
-                    if metrics_path is None:
-                        print(f"\nTrying fallback: searching for any modelC metrics file containing '{model_type}'...")
-                        fallback_files = [f for f in all_files 
-                                         if "modelC" in f.name.lower() 
-                                         and "metrics" in f.name.lower()
-                                         and "win5" in f.name.lower()
-                                         and model_type.lower() in f.name.lower()]
-                        if fallback_files:
-                            # Sort by modification time
-                            fallback_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-                            metrics_path = fallback_files[0]
-                            print(f"  Found via fallback: {metrics_path}")
-                except Exception as e:
-                    print(f"  (error listing files: {e})")
-            else:
-                print(f"  Directory does not exist: {ml_models_dir}")
-            if metrics_path is None:
-                print("\nPlease provide --metrics_json path explicitly.")
-                sys.exit(1)
+            print(f"ERROR: Could not find {metrics_pattern} in any of the following directories:")
+            for cand in ml_models_candidates:
+                print(f"  - {cand}")
+            print("Please provide --metrics_json path explicitly.")
+            sys.exit(1)
         print(f"  Found: {metrics_path}")
     
     if args.scored_parquet:
         parquet_path = Path(args.scored_parquet).resolve()
     else:
-        print(f"Auto-discovering scored parquet file for model_type={model_type}, use_calibrated={use_calibrated}...")
+        print(f"\nAuto-discovering scored parquet file for model_type={model_type}, use_calibrated={use_calibrated}...")
         
         # Determine which file to look for based on use_calibrated setting
         if use_calibrated == 'true':
             # Require calibrated file
             parquet_pattern = f"modelC_{model_type}_win5_scored_calibrated_*.parquet"
-            parquet_path = find_latest_file(parquet_pattern, ml_models_dir)
+            parquet_path = find_latest_file_in_dirs(parquet_pattern, ml_models_candidates)
             if parquet_path is None:
-                print(f"ERROR: Could not find {parquet_pattern} in {ml_models_dir}")
+                print(f"ERROR: Could not find {parquet_pattern} in any of the following directories:")
+                for cand in ml_models_candidates:
+                    print(f"  - {cand}")
                 print("Please provide --scored_parquet path explicitly or use --use_calibrated=auto")
                 sys.exit(1)
         elif use_calibrated == 'false':
             # Require raw file (exclude "calibrated")
             parquet_pattern = f"modelC_{model_type}_win5_scored_*.parquet"
-            parquet_path = find_latest_file(parquet_pattern, ml_models_dir, exclude_substr="calibrated")
+            parquet_path = find_latest_file_in_dirs(parquet_pattern, ml_models_candidates, exclude_substr="calibrated")
             if parquet_path is None:
-                print(f"ERROR: Could not find {parquet_pattern} (excluding 'calibrated') in {ml_models_dir}")
+                print(f"ERROR: Could not find {parquet_pattern} (excluding 'calibrated') in any of the following directories:")
+                for cand in ml_models_candidates:
+                    print(f"  - {cand}")
                 print("Please provide --scored_parquet path explicitly or use --use_calibrated=auto")
                 sys.exit(1)
         else:  # use_calibrated == 'auto'
@@ -1638,8 +1599,8 @@ def main() -> None:
             calibrated_pattern = f"modelC_{model_type}_win5_scored_calibrated_*.parquet"
             raw_pattern = f"modelC_{model_type}_win5_scored_*.parquet"
             
-            calibrated_path = find_latest_file(calibrated_pattern, ml_models_dir)
-            raw_path = find_latest_file(raw_pattern, ml_models_dir, exclude_substr="calibrated")
+            calibrated_path = find_latest_file_in_dirs(calibrated_pattern, ml_models_candidates)
+            raw_path = find_latest_file_in_dirs(raw_pattern, ml_models_candidates, exclude_substr="calibrated")
             
             if calibrated_path is not None:
                 parquet_path = calibrated_path
@@ -1651,6 +1612,9 @@ def main() -> None:
                 print(f"ERROR: Could not find any scored parquet file matching patterns:")
                 print(f"  - {calibrated_pattern}")
                 print(f"  - {raw_pattern} (excluding 'calibrated')")
+                print("in any of the following directories:")
+                for cand in ml_models_candidates:
+                    print(f"  - {cand}")
                 print("Please provide --scored_parquet path explicitly.")
                 sys.exit(1)
         
