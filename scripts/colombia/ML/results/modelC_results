@@ -20,7 +20,7 @@ Note:    The risk map uses WDPA_b1 from original test data to correctly identify
          By loading WDPA_b1 from the original test data, we ensure all establishments
          are correctly shown.
 
-Output:  - outputs/Results/ml_models/reporting/
+Output:  - outputs/Results/results_modelC_{model_type}/
            - modelC_{model_type}_metrics_table.csv
            - modelC_{model_type}_metrics_table.tex
            - modelC_{model_type}_pr_curve.png
@@ -568,7 +568,8 @@ def load_wdpa_from_test_parquet(test_parquet_path: Optional[Path]) -> Optional[p
     y_true=1 only for years before 2018, not for 2018 itself. By loading WDPA_b1 from the
     original test data, we can correctly identify pixels that were actually established in each year.
     
-    Returns DataFrame with columns: row, col, year, WDPA_b1 (or None if file not found/not available)
+    Returns DataFrame with columns: row, col, year, x, y, WDPA_b1 (or None if file not found/not available)
+    Includes x, y coordinates as fallback for joining when row/col are missing in scored data.
     """
     if test_parquet_path is None or not test_parquet_path.exists():
         return None
@@ -589,12 +590,25 @@ def load_wdpa_from_test_parquet(test_parquet_path: Optional[Path]) -> Optional[p
             print(f"  WARNING: WDPA column not found in test parquet. Available columns: {available_columns}")
             return None
         
-        # Check for required join columns
-        required_cols = ['row', 'col', 'year', wdpa_col]
-        missing_cols = [col for col in required_cols if col not in available_columns]
-        if missing_cols:
-            print(f"  WARNING: Missing required columns for joining: {missing_cols}")
+        # Check for required join columns - try row/col first, then x/y as fallback
+        has_row_col = 'row' in available_columns and 'col' in available_columns
+        has_xy = 'x' in available_columns and 'y' in available_columns
+        
+        if not has_row_col and not has_xy:
+            print(f"  WARNING: Missing required join columns. Need either (row, col) or (x, y)")
+            print(f"  Available columns: {available_columns}")
             return None
+        
+        if 'year' not in available_columns:
+            print(f"  WARNING: Missing 'year' column for joining")
+            return None
+        
+        # Build list of columns to read
+        required_cols = ['year', wdpa_col]
+        if has_row_col:
+            required_cols.extend(['row', 'col'])
+        if has_xy:
+            required_cols.extend(['x', 'y'])
         
         # Read data
         all_data = []
@@ -615,11 +629,81 @@ def load_wdpa_from_test_parquet(test_parquet_path: Optional[Path]) -> Optional[p
         # Fill NaN with 0 and convert to int
         result['WDPA_b1'] = result['WDPA_b1'].fillna(0).astype(int)
         
+        # Identify pixels established in test period (2018-2019)
+        # WDPA_b1 is cumulative (protected by that year), so we identify establishments by:
+        # - WDPA_b1=1 in 2018 or 2019 AND WDPA_b1=0 in 2017 (or earlier)
+        # Create a flag for pixels established in 2018-2019 that can be joined to all years
+        print(f"  Identifying pixels established in test period (2018-2019)...")
+        
+        # Get unique identifier for each pixel (row/col or x/y)
+        if has_row_col:
+            pixel_id_cols = ['row', 'col']
+        else:
+            pixel_id_cols = ['x', 'y']
+        
+        # Sort by pixel and year
+        result = result.sort_values(pixel_id_cols + ['year'])
+        
+        # For each pixel, check if it was established in 2018 or 2019
+        # Establishment = WDPA_b1=1 in 2018/2019 AND WDPA_b1=0 in 2017 (or no 2017 data)
+        establishments = []
+        
+        for pixel_id, pixel_data in result.groupby(pixel_id_cols):
+            pixel_data = pixel_data.sort_values('year')
+            
+            # Get WDPA status for relevant years
+            wdpa_2017 = pixel_data[pixel_data['year'] == 2017]['WDPA_b1'].values
+            wdpa_2018 = pixel_data[pixel_data['year'] == 2018]['WDPA_b1'].values
+            wdpa_2019 = pixel_data[pixel_data['year'] == 2019]['WDPA_b1'].values
+            
+            # Check if established in 2018: WDPA_b1=1 in 2018 AND (WDPA_b1=0 in 2017 OR no 2017 data)
+            established_2018 = False
+            if len(wdpa_2018) > 0 and wdpa_2018[0] == 1:
+                if len(wdpa_2017) == 0 or wdpa_2017[0] == 0:
+                    established_2018 = True
+            
+            # Check if established in 2019: WDPA_b1=1 in 2019 AND WDPA_b1=0 in 2018 (or no 2018 data)
+            established_2019 = False
+            if len(wdpa_2019) > 0 and wdpa_2019[0] == 1:
+                if len(wdpa_2018) == 0 or wdpa_2018[0] == 0:
+                    established_2019 = True
+            
+            # If established in either 2018 or 2019, mark this pixel
+            if established_2018 or established_2019:
+                # pixel_id is a tuple from groupby, convert to dict
+                if has_row_col:
+                    establishments.append({'row': pixel_id[0], 'col': pixel_id[1]})
+                else:
+                    establishments.append({'x': pixel_id[0], 'y': pixel_id[1]})
+        
+        # Create establishment flag DataFrame
+        if establishments:
+            estab_df = pd.DataFrame(establishments)
+            estab_df['established_2018_2019'] = 1
+            print(f"  Found {len(estab_df):,} pixels established in 2018-2019")
+        else:
+            # Create empty DataFrame with correct columns
+            if has_row_col:
+                estab_df = pd.DataFrame(columns=['row', 'col', 'established_2018_2019'])
+            else:
+                estab_df = pd.DataFrame(columns=['x', 'y', 'established_2018_2019'])
+            print(f"  WARNING: No pixels found established in 2018-2019")
+        
+        # Merge establishment flag back into result
+        # This adds the flag to all years for each pixel
+        result = result.merge(estab_df, on=pixel_id_cols, how='left')
+        result['established_2018_2019'] = result['established_2018_2019'].fillna(0).astype(int)
+        
         print(f"  Loaded {len(result):,} rows with WDPA data")
         print(f"  Years: {sorted(result['year'].unique())}")
         print(f"  Protected pixels (WDPA_b1=1): {(result['WDPA_b1'] == 1).sum():,}")
+        print(f"  Pixels with establishment flag: {(result['established_2018_2019'] == 1).sum():,}")
+        if has_row_col:
+            print(f"  Join method: row/col/year (with establishment flag)")
+        elif has_xy:
+            print(f"  Join method: x/y/year (with establishment flag)")
         
-        return result[['row', 'col', 'year', 'WDPA_b1']]
+        return result
     
     except Exception as e:
         print(f"  WARNING: Failed to load WDPA data from test parquet: {e}")
@@ -782,27 +866,56 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
     # (since transition_01_win5 is a 5-year lookahead target, it doesn't mark the actual year of establishment)
     wdpa_test_df = load_wdpa_from_test_parquet(test_parquet_path)
     
-    # Join WDPA data if available
-    # This is critical for correctly identifying pixels established in 2018,
+    # Join WDPA establishment flag if available
+    # This is critical for correctly identifying pixels established in 2018-2019,
     # since transition_01_win5 (y_true) is a 5-year lookahead target that doesn't mark
-    # the actual year of establishment
-    if wdpa_test_df is not None and all(col in df.columns for col in ['row', 'col', 'year']):
-        print(f"\n  Joining WDPA data from original test parquet...")
-        # Rename WDPA column in test data to avoid conflicts
-        wdpa_test_df_renamed = wdpa_test_df.rename(columns={'WDPA_b1': 'WDPA_b1_from_test'})
-        df_with_wdpa = df.merge(
-            wdpa_test_df_renamed,
-            on=['row', 'col', 'year'],
-            how='left'
-        )
-        # Use WDPA_b1 from test data (this represents actual establishment in that year)
-        df_with_wdpa['WDPA_b1_actual'] = df_with_wdpa['WDPA_b1_from_test'].fillna(0).astype(int)
-        print(f"  Joined WDPA data: {(df_with_wdpa['WDPA_b1_actual'] == 1).sum():,} protected pixels")
-        df = df_with_wdpa
-    else:
-        if wdpa_test_df is not None:
-            print(f"  WARNING: Cannot join WDPA data - missing row/col/year columns in scored data")
+    # the actual year of establishment. We join on pixel identifier (not year) so the
+    # flag applies to all years for each pixel.
+    if wdpa_test_df is not None and 'established_2018_2019' in wdpa_test_df.columns:
+        print(f"\n  Joining WDPA establishment flag from original test parquet...")
+        
+        # Extract establishment flag for each pixel (join on pixel identifier, not year)
+        # This ensures the flag applies to all years for each pixel
+        if all(col in df.columns for col in ['row', 'col']) and all(col in wdpa_test_df.columns for col in ['row', 'col']):
+            print(f"  Using row/col join method (pixel-level, not year-specific)...")
+            estab_flag_df = wdpa_test_df[['row', 'col', 'established_2018_2019']].drop_duplicates()
+            df = df.merge(estab_flag_df, on=['row', 'col'], how='left')
+            join_method = "row/col"
+        elif all(col in df.columns for col in ['x', 'y']) and all(col in wdpa_test_df.columns for col in ['x', 'y']):
+            print(f"  Using x/y join method (pixel-level, not year-specific)...")
+            # Round coordinates to avoid floating point precision issues
+            df_rounded = df.copy()
+            df_rounded['x_rounded'] = df_rounded['x'].round(6)
+            df_rounded['y_rounded'] = df_rounded['y'].round(6)
+            
+            estab_flag_df = wdpa_test_df[['x', 'y', 'established_2018_2019']].copy()
+            estab_flag_df['x_rounded'] = estab_flag_df['x'].round(6)
+            estab_flag_df['y_rounded'] = estab_flag_df['y'].round(6)
+            estab_flag_df = estab_flag_df[['x_rounded', 'y_rounded', 'established_2018_2019']].drop_duplicates()
+            
+            df_rounded = df_rounded.merge(estab_flag_df, on=['x_rounded', 'y_rounded'], how='left')
+            df_rounded = df_rounded.drop(columns=['x_rounded', 'y_rounded'])
+            df = df_rounded
+            join_method = "x/y"
+        else:
+            missing_cols_df = [col for col in ['row', 'col', 'x', 'y'] if col not in df.columns]
+            missing_cols_wdpa = [col for col in ['row', 'col', 'x', 'y'] if col not in wdpa_test_df.columns]
+            print(f"  WARNING: Cannot join WDPA establishment flag - missing required columns")
+            print(f"  Missing in scored data: {missing_cols_df}")
+            print(f"  Missing in test data: {missing_cols_wdpa}")
             print(f"  Available columns in scored data: {list(df.columns)}")
+            df['established_2018_2019'] = 0
+            join_method = None
+        
+        if join_method is not None:
+            df['established_2018_2019'] = df['established_2018_2019'].fillna(0).astype(int)
+            df['WDPA_b1_actual'] = df['established_2018_2019']
+            print(f"  Joined WDPA establishment flag using {join_method}: {(df['WDPA_b1_actual'] == 1).sum():,} pixels established in 2018-2019")
+    else:
+        if wdpa_test_df is None:
+            print(f"  WARNING: WDPA test data not available - using y_true only for observed positives")
+        else:
+            print(f"  WARNING: Establishment flag not found in WDPA test data - using y_true only for observed positives")
         df['WDPA_b1_actual'] = 0
     
     # Calculate top-1% threshold
@@ -1320,7 +1433,7 @@ def main() -> None:
         '--out_dir',
         type=str,
         default=None,
-        help='Output directory (default: outputs/Results/ml_models/reporting/)'
+        help='Output directory (default: outputs/Results/results_modelC_{model_type}/)'
     )
     parser.add_argument(
         '--country_boundary',
@@ -1438,7 +1551,7 @@ def main() -> None:
     if args.out_dir:
         output_dir = Path(args.out_dir).resolve()
     else:
-        output_dir = repo_root / "outputs/Results/ml_models/reporting"
+        output_dir = repo_root / f"outputs/Results/results_modelC_{model_type}"
     
     country_boundary_path = Path(args.country_boundary).resolve() if args.country_boundary else None
     
