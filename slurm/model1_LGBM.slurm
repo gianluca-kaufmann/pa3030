@@ -48,7 +48,7 @@ echo "PWD = $(pwd)"
   exit 1
 }
 # Run the script
-python "scripts/ML/training/model1_LGBM"
+python "scripts/ML/training/model1_LGBM" --cv-mode fold3 
 
 echo "model1_LGBM script finished."
 
