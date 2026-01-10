@@ -1,189 +1,173 @@
 # Protected Area Designation Prediction using Machine Learning
 
-## Overview
+A large-scale machine learning pipeline for predicting future protected area establishment across South America using historical patterns, environmental features, and socio-economic indicators.
 
-This repository accompanies a master's thesis that studies the drivers of protected area establishment across South America and develops machine learning models to predict future designations. The pipeline combines large-scale remote sensing products, socio-economic indicators, and conservation datasets to create spatial panels, derive features, and train predictive models.
+**For a high-level project overview, see [`context.md`](context.md).**
 
-## Repository Layout
+---
+
+## Repository Structure
 
 ```
-├── README.md
-├── data/
-│   ├── ready/                       # GeoTIFF layers ready for analysis and merging
-│   ├── ml/                          # Data ready for ML model runs
-│   └── old data/                    # Archived inputs kept for reproducibility
 ├── scripts/
-│   ├── data extraction/             # Google Earth Engine (GEE) and API exporters
-│   ├── preprocessing/               # Cleaning, harmonisation of external, non-GEE datasets
-│   ├── visualisations/              # Exploratory figures & sanity checks
-│   └── merging/                     # Merging scripts for the embeddings dataset + the standard dataset
+│   ├── data extraction/       # Google Earth Engine and API exporters
+│   ├── preprocessing/          # Format harmonization, storage optimization
+│   ├── merging/                # Panel dataset construction
+│   ├── visualisations/         # Exploratory plots and data validation
+│   ├── ML/                     # Model 1: Full South America pipeline
+│   │   ├── ml_preprocessing/   # Train/test splits, feature engineering
+│   │   ├── training/           # LightGBM, Random Forest, tuning
+│   │   ├── evaluation/         # Temporal CV, spatial CV, calibration
+│   │   └── results/            # Metrics, maps, and visualizations
+│   ├── colombia/               # Model C: Colombia-only (rapid validation)
+│   │   ├── export/
+│   │   ├── preprocessing/
+│   │   ├── merge/
+│   │   └── ML/
+│   └── embeddings/             # Model E: Satellite embedding features
+│       ├── export/
+│       ├── preprocessing/
+│       ├── merge/
+│       └── ML/
 ├── outputs/
-│   ├── Figures/                     # Generated plots (per dataset)
-│   ├── Results/                     # Model outputs, predictions, diagnostics
-│   └── Tables/                      # Summaries from preprocessing and merges
-├── slurm/
-│   ├── RUN.slurm                    # Main SLURM submission script
-│   ├── requirements.txt             # Dependency lockfile for cluster runs
-│   ├── create_env.sh                # Euler helper to load modules & create venvs
-│   └── euler_run_instructions.md    # Step-by-step guide for running on Euler
-└── wandb/                           # Weights & Biases run artefacts and logs
+│   ├── Results/                # Model predictions, metrics, maps
+│   │   ├── ml_models/          # JSON metrics, text logs
+│   │   ├── results_model1_lgbm/
+│   │   ├── results_modelC_lgbm/
+│   │   ├── results_modelC_rf/
+│   │   └── results_modelC_brf/
+│   └── Tables/                 # Summary statistics, validation reports
+├── environment.yml             # Conda environment specification
+├── context.md                  # High-level project overview (start here!)
+└── README.md                   # This file
 ```
 
-## Environment Setup
+---
 
-- Python 3.11 or newer.
-- Raster and vector dependencies (GDAL ≥3.6, PROJ, GEOS). On macOS use `brew install gdal` prior to installing Python packages.
-- Google Earth Engine (GEE) Python API with an authenticated account.
-- Access to ETH Zurich's Euler cluster (or another SLURM cluster) for large-scale merges and model training.
+## Pipeline Overview
 
-### Quick start
+The pipeline consists of the following stages:
 
-```bash
-# from the repository root
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r slurm/requirements.txt
-```
+1. **Data Extraction** – Export datasets from Google Earth Engine and external APIs to GeoTIFF rasters
+2. **Preprocessing** – Harmonize external datasets (format conversion, reprojection, optimization)
+3. **Visualizations** – Generate exploratory plots to validate spatial alignment and data quality
+4. **Merging** – Build modeling panels by stacking rasters and constructing pixel-year observations
+5. **ML Preprocessing** – Split data into train/validation/test sets, engineer spatial features, prepare lookahead targets
+6. **Model Training** – Train models with hyperparameter tuning (LightGBM, Random Forest, Balanced RF)
+7. **Evaluation** – Temporal CV, spatial CV, benchmarking, probability calibration
+8. **Results Generation** – Generate metrics tables, PR curves, risk maps, probability maps
 
-For Euler cluster setup, use the helper inside `slurm/`:
+---
 
-```bash
-ssh <ethz_username>@euler.ethz.ch
-cd /cluster/home/<ethz_username>/master_thesis
-bash slurm/create_env.sh
-```
+## Model Variants
 
-Authenticate with GEE once per machine:
+| Model | Region | Features | Dataset Size | Use Case |
+|-------|--------|----------|--------------|----------|
+| **Model 1** | South America | Standard features | ~350M pixel-years | Full-scale production |
+| **Model C** | Colombia | Standard features | ~7M pixel-years | Rapid validation, development |
+| **Model E** | South America | Satellite embeddings | ~20M pixel-years | Embedding experiments |
 
-```bash
-earthengine authenticate
-```
+## Algorithms
 
-## Workflow at a Glance
+| Algorithm | Class Balance | Use Case |
+|-----------|---------------|----------|
+| **LightGBM** | Weighted (primary) | Primary production model |
+| **Random Forest** | Imbalanced | Tree ensemble baseline |
+| **Balanced RF** | Balanced sampling | Class balance experiment |
 
-1. **Data extraction** – export datasets from GEE into `data/ready`.
-2. **Preprocessing** – clean, resample, and harmonise external, non-GEE datasets.
-3. **Visualisations** – inspect the processed layers with exploratory figures and standard statistical computations.
-4. **Merging** – merge aligned layers into a panel dataset stored in `data/ml`. merge all annual embeddings datasets into a single dataset stored in `data/ml`.
-5. **Model training** – launch SLURM jobs (or local scripts) to fit predictive models and generate outputs.
+## Data Splits
 
-The sections below detail each stage, expected inputs/outputs, and common command sequences.
+- **Training:** 2000–2014 (pixels unprotected at time t, with 5-year lookahead labels)
+- **Validation:** 2015–2017 (for early stopping and hyperparameter selection)
+- **Test:** 2018–2019 (right-censored at 2019 to ensure complete 5-year lookahead)
 
+**Right-censoring:** `LAST_LABEL_YEAR = 2024 - 5 = 2019` ensures all labels have complete 5-year observation windows.
 
-## Typical run sequence
-
-## 1. Data Extraction
-
-Scripts under `scripts/data extraction/` pull data from Google Earth Engine and assorted APIs. Each script targets a specific theme (deforestation, land cover, NDVI, VIIRS night lights, infrastructure layers, etc.) and writes aligned GeoTIFF rasters into `data/ready/<dataset>/`.
-
-### Recommended order
-
-1. Confirm the Earth Engine project, spatial bounds, and export resolution in the script constants (top of each exporter).
-2. Launch exports dataset by dataset. Use `python` directly; each script handles its own directories and logging.
-
-```bash
-python scripts/data\ extraction/deforestation_export
-python scripts/data\ extraction/DW_export
-python scripts/data\ extraction/NDVI_export
-python scripts/data\ extraction/VIIRS_export
-python scripts/data\ extraction/WDPA_export
-python scripts/data\ extraction/powerplants_export
-# ... continue for other datasets you require
-```
-
-3. Monitor Earth Engine Tasks (`earthengine task list`) until all jobs finish. Downloaded assets are stored locally.
-
-**Tips**
-
-- If you extend the study area or temporal coverage, update the `START_YEAR`, `END_YEAR`, or bounding geometries at the top of each exporter.
-
-## 2. Preprocessing
-
-Preprocessing externally downloaded scripts to harmonise formats. Outputs are saved back into `data/ready/` (overwriting intermediate files). Summaries of final, pre-merge overview over all prepared datasets in `outputs/Tables/`. The externally downloaded datasets can be found in the Google Drive folder "Protected Areas/ External Data". Before running the scripts, this external data needs to be moved into the working directory. 
-
-### Recommended order
-
-```bash
-# Dataset-specific cleaners
-python scripts/preprocessing/assetlevel_preprocessing
-python scripts/preprocessing/gdp_preprocessing
-python scripts/preprocessing/gsn_preprocessing
-python scripts/preprocessing/roads_preprocessing
-# ... execute additional preprocessing scripts as relevant
-
-# Global overview (generates QA tables and HTML report)
-python scripts/preprocessing/pre-merge_overview
-```
-
-- Each script reports missing tiles, nodata percentages, and reprojected CRS. Inspect console output and the generated `pre-merge_overview.*` files before moving on.
-- Some preprocessors expect auxiliary CSV or shapefiles. Refer to inline comments at the top of the script to adjust paths.
-
-## 3. Visualisations
-
-Visualisation scripts provide quick sanity checks and first-look analytics. They read the harmonised rasters from `data/ready/` and write PNGs to `outputs/Figures/<dataset>_vis/`.
-
-```bash
-python scripts/visualisations/deforestation_visualisation
-python scripts/visualisations/dw_visualisation
-python scripts/visualisations/ndvi_visualisation
-python scripts/visualisations/viirs_visualisation
-python scripts/visualisations/worldclim_visualisation
-# ... run for each dataset of interest
-```
-
-- Review the generated maps/statistics to confirm spatial alignment, expected ranges, and time trends.
-- Visualisations are optional for production runs but strongly recommended after changes to the extraction or preprocessing stages.
-
-## 4. Merging
-
-Merging scripts build the modelling panels by stacking rasters, masking to valid coverage, and aggregating temporal layers. The main entry points are in `scripts/merging/`. There are two distinct datasets and therefore merging scripts, one for the standard dataset, and one for the embeddings dataset.
-
-```bash
-# Merge satellite embeddings produced per tile (optional, heavy)
-python scripts/merging/merge_embeddings_total
-
-# Assemble the final standard panel dataset
-python scripts/merging/merge_total_optimized
-```
-
-- The merged files are stored in `data/ml/` and `outputs/Results/merged_tifs/`.
-- For very large runs (e.g. `merge_total_optimized`), submit the merging script to SLURM using the provided batch files (e.g., `sbatch slurm/RUN.slurm`); adapt partition and memory requirements as needed.
-
-## 5. Model Training
-
-Model fitting is orchestrated via the batch scripts in the `slurm/` directory. The typical workflow:
-
-1. Configure hyperparameters, data splits, and output locations inside `slurm/RUN.slurm` (or any additional SLURM scripts you add).
-2. Submit the job on Euler (or another SLURM cluster):
-
-```bash
-sbatch slurm/RUN.slurm
-```
-
-3. Monitor progress with `squeue -u <ethz_username>` and check logs stored under `wandb/` and `$SCRATCH/logs/merge_run_<jobid>.{out,err}`.
-
-Consult `slurm/euler_run_instructions.md` for a detailed, step-by-step Euler walkthrough.
-
-For small experiments you can mirror the SLURM script locally by running the referenced Python module directly; ensure you activate the same environment and set any required environment variables (`WANDB_API_KEY`, etc.).
-
-## Outputs
-
-- `outputs/Figures/` – raster snapshots, histograms, and trend plots used for exploratory analysis and reporting.
-- `outputs/Tables/` – CSV/HTML summaries from preprocessing (coverage stats, missing data checks).
-- `outputs/Results/` – merged GeoTIFFs, modelling matrices, predictions, and evaluation metrics.
-- `wandb/` – Weights & Biases run metadata, configs, and logs (created automatically during training).
+---
 
 ## Data Characteristics
 
-- **Spatial resolution**: 1 km × 1 km grid cells.
-- **Coordinate reference system**: EPSG:3857 (Web Mercator).
-- **Formats**: GeoTIFF for rasters, CSV/Parquet for panel datasets.
-- **Temporal coverage**: 2000–2024 (dataset-specific availability).
-- **Region**: South America (continental extent).
+| Property | Value |
+|----------|-------|
+| **Spatial resolution** | ~1 km × 1 km |
+| **CRS** | EPSG:3857 (Web Mercator) |
+| **Temporal coverage** | 2000–2024 (annual observations) |
+| **Region** | South America (continental extent) |
+| **Target variable** | `transition_01_win5` (5-year lookahead) |
+| **Features** | ~60–80 (static, dynamic, spatial context) |
+| **Class balance** | ~0.3–0.5% positive (extreme imbalance) |
+| **Format** | GeoTIFF (rasters), Parquet (panels) |
 
-## Troubleshooting
+---
 
-- Missing GDAL/PROJ libraries usually surface as `rasterio.errors.RasterioIOError`. Ensure GDAL is installed at the system level before installing Python packages.
-- GEE `QuotaExceededError` indicates too many concurrent tasks; stagger export scripts or reduce tiling.
-- When extending the pipeline to new regions, update bounding boxes, masks, and valid country codes consistently across extraction and preprocessing scripts.
+## Outputs
+
+**Metrics:**
+- JSON files with full metrics (ROC-AUC, PR-AUC, Brier Score, Precision@K)
+- CSV and LaTeX tables for reporting
+
+**Visualizations:**
+- Precision-Recall curves (PNG + PDF)
+- Reliability diagrams (calibration plots)
+- High-resolution risk maps showing top K% predictions vs. observed establishments
+- Probability maps (continuous predictions across study region)
+- Top-1% diagnostic plots
+
+**Predictions:**
+- Scored Parquet files with pixel-level predictions (calibrated and uncalibrated)
+- Ranked pixel lists for prioritization
+
+All outputs stored in `outputs/Results/` and reproducible from scripts in `scripts/`.
+
+---
+
+## Dependencies
+
+Core dependencies:
+
+- **Geospatial:** rasterio, geopandas, shapely, pyproj, fiona
+- **ML:** scikit-learn, lightgbm, imbalanced-learn
+- **Data:** pandas, numpy, pyarrow, scipy
+- **Visualization:** matplotlib, seaborn
+- **Remote sensing:** earthengine-api
+- **Experiment tracking:** wandb (optional)
+
+See `environment.yml` for complete environment specification.
+
+---
+
+## Citation
+
+If you use this code or methodology, please cite:
+
+```bibtex
+@mastersthesis{kaufmann2025protectedareas,
+  author = {Kaufmann, Gian-Luca},
+  title = {Predicting Future Protected Area Designations with Machine Learning},
+  school = {ETH Zurich},
+  year = {2025},
+  type = {Master's Thesis}
+}
+```
+
+---
+
+## Contact
+
+**Gian-Luca Kaufmann**  
+ETH Zurich  
+Email: (see thesis manuscript)
+
+For questions, collaboration, or reuse inquiries.
+
+---
+
+## License
+
+This project is part of academic research at ETH Zurich. For reuse permissions, please contact the author.
+
+---
+
+**Related Files:**
+- [`context.md`](context.md) – High-level project overview (read this first!)
+- [`environment.yml`](environment.yml) – Conda environment specification

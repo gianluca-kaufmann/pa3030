@@ -271,7 +271,7 @@ def resolve_best_params_json() -> Optional[Path]:
 
 def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
     """Load and merge parameters: FIXED_PARAMS → json_fixed_params → best_params → guardrails (fill missing only).
-    All parameters from JSON (including scale_pos_weight) are used as-is.
+    All parameters from JSON are used as-is.
     If params_path is None, returns default manual hyperparameters."""
     if params_path is None:
         # Use default manual hyperparameters when JSON file is not found
@@ -285,7 +285,7 @@ def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
     with open(params_path, 'r') as f:
         params_data = json.load(f)
     
-    # Start with FIXED_PARAMS, then add JSON params (including scale_pos_weight from JSON)
+    # Start with FIXED_PARAMS, then add JSON params
     json_fixed = params_data.get('fixed_params', {})
     json_best = params_data.get('best_params', {}).copy()
     
@@ -665,7 +665,7 @@ def train_single_cv_fold(
     fold_idx: int,
     best_params: Dict[str, Any],
     use_wandb: bool,
-    use_manual_scale_pos_weight: bool = False,
+    use_time_weights: bool = True,
 ) -> Dict[str, Any]:
     """
     Train and evaluate a single CV fold.
@@ -708,27 +708,17 @@ def train_single_cv_fold(
     
     # Compute sample weights for training data (time-based weighting)
     # Weight range: 2000 (weight 0.5) to train_years[1] (weight 1.0)
-    train_weights = compute_year_weights(train_years_array, min_year=2000, max_year=train_years[1])
-    print(f"  Training sample weights: min={train_weights.min():.3f}, max={train_weights.max():.3f}, mean={train_weights.mean():.3f}")
-    
-    # Compute or use manual scale_pos_weight
-    # Formula: scale_pos_weight = n_neg / n_pos
-    manual_scale_pos_weight = best_params.get("scale_pos_weight", None)
-    if use_manual_scale_pos_weight:
-        scale_pos_weight = manual_scale_pos_weight
-        if scale_pos_weight is not None:
-            print(f"  Using manual scale_pos_weight: {scale_pos_weight:.6f}")
-        else:
-            print(f"  WARNING: use_manual_scale_pos_weight=True but no manual value found in params")
-            # Fallback to computed value
-            scale_pos_weight = train_neg / max(train_pos, 1)
-            print(f"  Falling back to computed scale_pos_weight: {scale_pos_weight:.6f} = {train_neg:,} / {train_pos:,}")
+    if use_time_weights:
+        train_weights = compute_year_weights(train_years_array, min_year=2000, max_year=train_years[1])
+        print(f"  Training sample weights: min={train_weights.min():.3f}, max={train_weights.max():.3f}, mean={train_weights.mean():.3f}")
     else:
-        # Compute from actual training data: scale_pos_weight = n_neg / n_pos
-        scale_pos_weight = train_neg / max(train_pos, 1)
-        print(f"  Computed scale_pos_weight from training data: {scale_pos_weight:.6f} = {train_neg:,} / {train_pos:,}")
-        if manual_scale_pos_weight is not None:
-            print(f"  (Manual value in params: {manual_scale_pos_weight:.6f}, but using computed value)")
+        train_weights = None
+        print(f"  Training sample weights: DISABLED (use_time_weights=False)")
+    
+    # Compute scale_pos_weight from training data
+    # Formula: scale_pos_weight = n_neg / n_pos
+    scale_pos_weight = train_neg / max(train_pos, 1)
+    print(f"  Computed scale_pos_weight from training data: {scale_pos_weight:.6f} = {train_neg:,} / {train_pos:,}")
     
     # Train model
     num_boost_round_earlystop = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
@@ -739,13 +729,19 @@ def train_single_cv_fold(
     # Ensure num_threads is set for optimal CPU usage
     if "num_threads" not in train_params:
         train_params["num_threads"] = get_n_jobs()
-    # Override scale_pos_weight with computed/manual value right before training
+    # Override scale_pos_weight with computed value right before training
     # Formula: scale_pos_weight = n_neg / n_pos
     train_params["scale_pos_weight"] = scale_pos_weight
     
     print(f"  Creating datasets...")
-    train_dataset = lgb.Dataset(X_train, label=y_train, weight=train_weights, free_raw_data=True)
-    del X_train, y_train, train_years_array, train_weights; gc.collect()
+    if train_weights is not None:
+        train_dataset = lgb.Dataset(X_train, label=y_train, weight=train_weights, free_raw_data=True)
+    else:
+        train_dataset = lgb.Dataset(X_train, label=y_train, free_raw_data=True)
+    del X_train, y_train, train_years_array
+    if train_weights is not None:
+        del train_weights
+    gc.collect()
     
     earlystop_dataset = lgb.Dataset(X_earlystop, label=y_earlystop, free_raw_data=True, reference=train_dataset)
     
@@ -828,7 +824,7 @@ def aggregate_cv_metrics(cv_results: list[Dict[str, Any]]) -> Dict[str, Any]:
 def phase1_training(
     train_path: Path, earlystop_path: Path, params_path: Optional[Path], feature_cols: list, keep_cols_train: list,
     best_params: Dict[str, Any], timestamp: str, model_dir: Path, output_dir: Path, use_wandb: bool, target_col: str,
-    cv_mode: str = "full", use_manual_scale_pos_weight: bool = False,
+    cv_mode: str = "full", use_time_weights: bool = True,
 ) -> tuple[Path, Dict[str, Any], Dict[str, Any], float, float, int, int, int, Dict[str, Any], Dict[str, Any]]:
     """
     Phase 1: Training with temporal cross-validation.
@@ -884,7 +880,7 @@ def phase1_training(
             train_years, earlystop_years = CV_FOLDS[fold_idx]
             fold_result = train_single_cv_fold(
                 cv_train_paths, cv_earlystop_paths, feature_cols, target_col,
-                train_years, earlystop_years, fold_idx, best_params, use_wandb, use_manual_scale_pos_weight
+                train_years, earlystop_years, fold_idx, best_params, use_wandb, use_time_weights
             )
             
             # Collect OOF predictions if available (skip if fold was skipped)
@@ -1039,42 +1035,34 @@ def phase1_training(
     
     # Compute sample weights for training data (time-based weighting)
     # Weight range: 2000 (weight 0.5) to EARLYSTOP_YEARS[1] (weight 1.0)
-    train_weights = compute_year_weights(train_years_array_full, min_year=2000, max_year=EARLYSTOP_YEARS[1])
-    print(f"  Training sample weights: min={train_weights.min():.3f}, max={train_weights.max():.3f}, mean={train_weights.mean():.3f}")
-    
-    # Compute or use manual scale_pos_weight
-    # Formula: scale_pos_weight = n_neg / n_pos
-    manual_scale_pos_weight = best_params.get("scale_pos_weight", None)
-    if use_manual_scale_pos_weight:
-        scale_pos_weight = manual_scale_pos_weight
-        if scale_pos_weight is not None:
-            print(f"\nImbalance: Using manual scale_pos_weight: {scale_pos_weight:.6f}")
-        else:
-            print(f"\nWARNING: use_manual_scale_pos_weight=True but no manual value found in params")
-            # Fallback to computed value
-            scale_pos_weight = train_neg_full / max(train_pos_full, 1)
-            print(f"  Falling back to computed scale_pos_weight: {scale_pos_weight:.6f} = {train_neg_full:,} / {train_pos_full:,}")
+    if use_time_weights:
+        train_weights = compute_year_weights(train_years_array_full, min_year=2000, max_year=EARLYSTOP_YEARS[1])
+        print(f"  Training sample weights: min={train_weights.min():.3f}, max={train_weights.max():.3f}, mean={train_weights.mean():.3f}")
     else:
-        # Compute from actual training data: scale_pos_weight = n_neg / n_pos
-        scale_pos_weight = train_neg_full / max(train_pos_full, 1)
-        print(f"\nImbalance: Computed scale_pos_weight from training data: {scale_pos_weight:.6f} = {train_neg_full:,} / {train_pos_full:,}")
-        if manual_scale_pos_weight is not None:
-            print(f"  (Manual value in params: {manual_scale_pos_weight:.6f}, but using computed value)")
+        train_weights = None
+        print(f"  Training sample weights: DISABLED (use_time_weights=False)")
+    
+    # Compute scale_pos_weight from training data
+    # Formula: scale_pos_weight = n_neg / n_pos
+    scale_pos_weight = train_neg_full / max(train_pos_full, 1)
+    print(f"\nImbalance: Computed scale_pos_weight from training data: {scale_pos_weight:.6f} = {train_neg_full:,} / {train_pos_full:,}")
     
     imbalance_info = {
         "neg": int(train_neg_full),
         "pos": int(train_pos_full),
-        "scale_pos_weight": float(scale_pos_weight),
-        "manual_scale_pos_weight": float(manual_scale_pos_weight) if manual_scale_pos_weight is not None else None,
-        "use_manual_scale_pos_weight": use_manual_scale_pos_weight
+        "scale_pos_weight": float(scale_pos_weight)
     }
     if use_wandb:
-        wandb.log({
+        log_dict = {
             "final_model/imbalance/scale_pos_weight": float(scale_pos_weight),
-            "final_model/sample_weights/min": float(train_weights.min()),
-            "final_model/sample_weights/max": float(train_weights.max()),
-            "final_model/sample_weights/mean": float(train_weights.mean()),
-        })
+        }
+        if train_weights is not None:
+            log_dict.update({
+                "final_model/sample_weights/min": float(train_weights.min()),
+                "final_model/sample_weights/max": float(train_weights.max()),
+                "final_model/sample_weights/mean": float(train_weights.mean()),
+            })
+        wandb.log(log_dict)
     
     print(f"\nTraining final model on {len(X_train_full):,} samples...")
     report_memory_usage("before final training")
@@ -1086,13 +1074,19 @@ def phase1_training(
     # Ensure num_threads is set for optimal CPU usage
     if "num_threads" not in train_params:
         train_params["num_threads"] = get_n_jobs()
-    # Override scale_pos_weight with computed/manual value right before training
+    # Override scale_pos_weight with computed value right before training
     # Formula: scale_pos_weight = n_neg / n_pos
     train_params["scale_pos_weight"] = scale_pos_weight
     
     print(f"  Creating dataset...")
-    train_dataset = lgb.Dataset(X_train_full, label=y_train_full, weight=train_weights, free_raw_data=True)
-    del X_train_full, y_train_full, train_years_array_full, train_weights; gc.collect()
+    if train_weights is not None:
+        train_dataset = lgb.Dataset(X_train_full, label=y_train_full, weight=train_weights, free_raw_data=True)
+    else:
+        train_dataset = lgb.Dataset(X_train_full, label=y_train_full, free_raw_data=True)
+    del X_train_full, y_train_full, train_years_array_full
+    if train_weights is not None:
+        del train_weights
+    gc.collect()
     report_memory_usage("after train dataset creation")
     
     print(f"  Starting training with num_boost_round={chosen_iteration} (fixed from CV, no validation set/early stopping)...")
@@ -1368,7 +1362,8 @@ def phase2_testing(
             "n_features": len(feature_cols), 
             "features": feature_cols,
             "test_probabilities": "uncalibrated",
-            "cv_mode": cv_info.get("cv_mode", "full")
+            "cv_mode": cv_info.get("cv_mode", "full"),
+            "use_time_weights": True
         },
         "data": {
             "n_train_full": n_train_full, 
@@ -1390,8 +1385,6 @@ def phase2_testing(
             "method": "scale_pos_weight", 
             "is_unbalance": False,
             "scale_pos_weight": imbalance_info.get("scale_pos_weight"),
-            "manual_scale_pos_weight": imbalance_info.get("manual_scale_pos_weight"),
-            "use_manual_scale_pos_weight": imbalance_info.get("use_manual_scale_pos_weight", False),
             "neg": imbalance_info.get("neg"), 
             "pos": imbalance_info.get("pos")
         },
@@ -1441,14 +1434,13 @@ def phase2_testing(
         wandb.finish()
 
 
-def main(timestamp: str, cv_mode: str = "full", use_manual_scale_pos_weight: bool = False) -> None:
+def main(timestamp: str, cv_mode: str = "full", use_time_weights: bool = True) -> None:
     start_time = time.time()
     repo_root = Path(__file__).resolve().parents[4]
     train_path = resolve_parquet_file("train_colombia_win5.parquet")
     earlystop_path = resolve_parquet_file("earlystop_colombia_win5.parquet")
     test_path = resolve_parquet_file("test_colombia_win5.parquet")
     params_path = resolve_best_params_json()
-    metadata_path = resolve_metadata_file("train_colombia_win5_metadata.json")
     output_dir = repo_root / "outputs/Results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
     model_dir = repo_root / "data/ml/models"
@@ -1467,6 +1459,7 @@ def main(timestamp: str, cv_mode: str = "full", use_manual_scale_pos_weight: boo
                 "target_column": TARGET_COL,
                 "lookahead_years": 5,
                 "random_state": RANDOM_STATE,
+                "use_time_weights": use_time_weights,
                 "temporal_split": {
                     "train_years": list(TRAIN_YEARS), 
                     "earlystop_years": list(EARLYSTOP_YEARS),
@@ -1485,23 +1478,11 @@ def main(timestamp: str, cv_mode: str = "full", use_manual_scale_pos_weight: boo
     print(f"Train: {train_path}\nEarlystop: {earlystop_path}\nTest: {test_path}\nParams: {params_path if params_path else 'Using default manual hyperparameters'}\nOutput: {output_dir}")
     print(f"\nConfiguration:")
     print(f"  CV Mode: {cv_mode}")
-    print(f"  Use Manual scale_pos_weight: {use_manual_scale_pos_weight}")
+    print(f"  Use Time Weights: {use_time_weights}")
     print(f"  WDPA_LAST_YEAR: {WDPA_LAST_YEAR}")
     print(f"  LOOKAHEAD_YEARS: {LOOKAHEAD_YEARS}")
     print(f"  LAST_LABEL_YEAR: {LAST_LABEL_YEAR} (WDPA_LAST_YEAR - LOOKAHEAD_YEARS)")
     print(f"  Earlystop/Test data filtered to years <= {LAST_LABEL_YEAR} to avoid right-censored labels")
-    
-    # Load scale_pos_weight from metadata if available
-    scale_pos_weight_from_metadata = None
-    if metadata_path:
-        try:
-            with open(metadata_path, 'r') as f:
-                metadata = json.load(f)
-                scale_pos_weight_from_metadata = metadata.get("scale_pos_weight")
-                print(f"\nLoaded metadata from {metadata_path}")
-                print(f"  scale_pos_weight: {scale_pos_weight_from_metadata}")
-        except Exception as e:
-            print(f"\nWarning: Could not load metadata from {metadata_path}: {e}")
     
     best_params, best_cv_score = load_best_params(params_path)
     if params_path:
@@ -1510,11 +1491,6 @@ def main(timestamp: str, cv_mode: str = "full", use_manual_scale_pos_weight: boo
             print(f"Best CV score: {best_cv_score:.4f}")
     else:
         print(f"\nUsing default manual hyperparameters (lgbm_best_params.json not found)")
-    
-    # Override scale_pos_weight with value from metadata if available
-    if scale_pos_weight_from_metadata is not None:
-        best_params = {**best_params, "scale_pos_weight": scale_pos_weight_from_metadata}
-        print(f"Using scale_pos_weight from metadata: {scale_pos_weight_from_metadata:.6f}")
     
     all_cols_train = pq.ParquetFile(train_path).schema_arrow.names
     all_cols_test = pq.ParquetFile(test_path).schema_arrow.names
@@ -1536,7 +1512,7 @@ def main(timestamp: str, cv_mode: str = "full", use_manual_scale_pos_weight: boo
     print(f"Target column: {target_col}")
     
     (model_path, earlystop_metrics, train_stats, train_time, earlystop_time, train_pos, train_neg, n_train_full, imbalance_info, cv_info) = phase1_training(
-        train_path, earlystop_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col, cv_mode, use_manual_scale_pos_weight)
+        train_path, earlystop_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col, cv_mode, use_time_weights)
     
     phase2_testing(
         test_path, model_path, feature_cols, keep_cols_test, timestamp, output_dir, use_wandb, target_col,
@@ -1553,11 +1529,6 @@ if __name__ == "__main__":
         default="fold3",
         help="Cross-validation mode: 'full' (run all 3 folds), 'fold3' (run only fold 3 for fast dev), 'none' (skip CV)"
     )
-    parser.add_argument(
-        "--use-manual-scale-pos-weight",
-        action="store_true",
-        help="Use manually set scale_pos_weight from params/JSON instead of computing from training data (default: compute from data)"
-    )
     args = parser.parse_args()
     
     repo_root = Path(__file__).resolve().parents[4]
@@ -1568,7 +1539,8 @@ if __name__ == "__main__":
     tee = Tee(output_file)
     sys.stdout = tee
     try:
-        main(timestamp, cv_mode=args.cv_mode, use_manual_scale_pos_weight=args.use_manual_scale_pos_weight)
+        # Always use time_weights=True
+        main(timestamp, cv_mode=args.cv_mode, use_time_weights=True)
     finally:
         sys.stdout = tee.stdout
         tee.close()

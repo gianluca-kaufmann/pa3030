@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """LGBM Transition Model (5-Year Lookahead Prediction)
-Train LightGBM on pre-split parquet files: train_early_sampled (2001-2014), 
-earlystop_full (2015-2017), test_full (2018-2024). Final model trained on 2001-2014,
-with temporal cross-validation to determine num_boost_round, evaluated on 2018-2019.
-Uses isotonic calibration fitted on 2016-2017 predictions (capped at LAST_LABEL_YEAR).
-Target: transition_01_win5 (5-year lookahead)
+Train LightGBM on pre-split parquet files: train_win5 (2000-2014), 
+earlystop_win5 (2015-2017), test_win5 (2018-2019). Final model trained on 2000-2017,
+using average best_iteration from CV folds (no early stopping), evaluated on 2018-2019.
+Target: transition_01_win5 (1 if transition occurs within next 5 years, else 0)
 
 Features:
 - Temporal Cross-Validation: 3 folds with different train/earlystop year splits
 - Final Model: Uses average best_iteration from CV folds (no early stopping)
 - Time-based Sample Weighting: Later training years get higher weights
-  (Year 2001: weight 0.5, Year 2014: weight 1.0, linear interpolation in between)
-- Right-Censoring Protection: All splits (train/earlystop/calibration/test) filtered to LAST_LABEL_YEAR
+  (Year 2000: weight 0.5, Year 2014: weight 1.0, linear interpolation in between)
+- Right-Censoring Protection: Earlystop and test data filtered to LAST_LABEL_YEAR
   (LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS) to avoid evaluating on
   labels that don't have complete 5-year lookahead information
 """
 
 from __future__ import annotations
 
+import argparse
 import gc
 import json
 import os
@@ -30,7 +30,10 @@ from typing import Dict, Any, Optional
 
 import numpy as np
 import pandas as pd
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 import pyarrow as pa
 import pyarrow.parquet as pq
 import lightgbm as lgb
@@ -162,17 +165,18 @@ def extract_features_pyarrow_to_numpy(feature_table: pa.Table, mask: np.ndarray)
     Returns:
         Feature matrix (n_filtered, n_features) as float32
     """
-    # Convert each column to numpy, apply mask, then stack
-    # This avoids pandas overhead
-    feature_arrays = []
-    for col_name in feature_table.column_names:
-        col_array = feature_table[col_name].to_numpy(zero_copy_only=False)
-        # Apply mask and convert to float32
-        col_filtered = col_array[mask].astype(np.float32)
-        feature_arrays.append(col_filtered)
+    # Preallocate output array to avoid column_stack overhead
+    n_rows = int(mask.sum())
+    n_features = len(feature_table.column_names)
+    X = np.empty((n_rows, n_features), dtype=np.float32)
     
-    # Stack columns horizontally to form feature matrix
-    return np.column_stack(feature_arrays)
+    # Fill each column directly into preallocated array
+    for col_idx, col_name in enumerate(feature_table.column_names):
+        col_array = feature_table[col_name].to_numpy(zero_copy_only=False)
+        # Apply mask and convert to float32, write directly to preallocated column
+        X[:, col_idx] = col_array[mask].astype(np.float32)
+    
+    return X
 
 
 def resolve_parquet_file(filename: str) -> Path:
@@ -182,70 +186,118 @@ def resolve_parquet_file(filename: str) -> Path:
 
     candidates = []
     if scratch_root is not None:
+        # Check outputs/Results first (standard Euler location from preprocessing script)
+        candidates.append(scratch_root / f"outputs/Results/{filename}")
+        # Also check data/ml location
         candidates.append(scratch_root / f"data/ml/{filename}")
+    candidates.append(repo_root / f"outputs/Results/{filename}")
     candidates.append(repo_root / f"data/ml/{filename}")
 
     for cand in candidates:
         if cand.exists():
             return cand
 
-    raise FileNotFoundError(f"{filename} not found in expected locations")
+    # Provide detailed error message with all checked paths
+    error_msg = f"{filename} not found in expected locations.\n"
+    error_msg += "\nChecked locations:\n"
+    for cand in candidates:
+        error_msg += f"  - {cand}\n"
+    if scratch_root:
+        error_msg += f"\nSCRATCH root: {scratch_root}\n"
+    error_msg += f"Repository root: {repo_root}\n"
+    raise FileNotFoundError(error_msg)
+
+
+def resolve_metadata_file(filename: str) -> Optional[Path]:
+    """Locate metadata JSON file (prefer $SCRATCH if present)."""
+    repo_root = Path(__file__).resolve().parents[3]
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    candidates = []
+    if scratch_root is not None:
+        # Check outputs/Results first (standard Euler location from preprocessing script)
+        candidates.append(scratch_root / f"outputs/Results/{filename}")
+        # Also check data/ml location
+        candidates.append(scratch_root / f"data/ml/{filename}")
+    candidates.append(repo_root / f"outputs/Results/{filename}")
+    candidates.append(repo_root / f"data/ml/{filename}")
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    return None
 
 
 def resolve_best_params_json() -> Optional[Path]:
-    """Locate lgbm_best_params.json (in same directory as this script). Returns None if not found."""
+    """Locate lgbm_best_params.json - use Colombia version from parent directory. Returns None if not found."""
     script_dir = Path(__file__).resolve().parent
+    
+    # Look for lgbm_best_params.json in ../colombia/ML/training/ directory
+    colombia_params_path = script_dir.parent.parent / "colombia/ML/training/lgbm_best_params.json"
+    
+    if colombia_params_path.exists():
+        return colombia_params_path
+    
+    # Fallback: check current directory
     params_path = script_dir / "lgbm_best_params.json"
+    if params_path.exists():
+        return params_path
     
-    if not params_path.exists():
-        return None
-    
-    return params_path
+    return None
 
 
 def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
-    """Load and merge parameters: FIXED_PARAMS → json_fixed_params → best_params → guardrails.
+    """Load and merge parameters: FIXED_PARAMS → json_fixed_params → best_params → guardrails (fill missing only).
+    All parameters from JSON are used as-is.
     If params_path is None, returns default manual hyperparameters."""
     if params_path is None:
         # Use default manual hyperparameters when JSON file is not found
         print("  lgbm_best_params.json not found, using default manual hyperparameters")
         guardrail_params = {"max_depth": 8, "num_leaves": 255, "min_child_samples": 50, "subsample": 0.7,
                            "subsample_freq": 1, "colsample_bytree": 0.7, "learning_rate": 0.03, "n_estimators": 3000,
-                           "reg_alpha": 1.0, "reg_lambda": 1.0, "metric": "average_precision", "n_jobs": get_n_jobs(), "verbose": -1}
+                           "reg_alpha": 1.0, "reg_lambda": 1.0, "metric": "average_precision", "num_threads": get_n_jobs(), "verbose": -1}
         final_params = {**FIXED_PARAMS, **guardrail_params}
         return final_params, None
     
     with open(params_path, 'r') as f:
         params_data = json.load(f)
-    final_params = {**FIXED_PARAMS, **params_data.get('fixed_params', {}), **params_data.get('best_params', {})}
+    
+    # Start with FIXED_PARAMS, then add JSON params
+    json_fixed = params_data.get('fixed_params', {})
+    json_best = params_data.get('best_params', {}).copy()
+    
+    final_params = {**FIXED_PARAMS, **json_fixed, **json_best}
+    
+    # Guardrails: only fill missing keys, don't overwrite existing ones
     guardrail_params = {"max_depth": 8, "num_leaves": 255, "min_child_samples": 50, "subsample": 0.7,
                        "subsample_freq": 1, "colsample_bytree": 0.7, "learning_rate": 0.03, "n_estimators": 3000,
-                       "reg_alpha": 1.0, "reg_lambda": 1.0, "metric": "average_precision", "n_jobs": get_n_jobs(), "verbose": -1}
-    final_params.update(guardrail_params)
-    return final_params, params_data.get('best_cv_score', None)
-
-
-def downcast_numeric_dtypes(df: pd.DataFrame) -> None:
-    """Downcast numeric dtypes to reduce memory usage (in-place)."""
-    for col in df.select_dtypes(include=['float64']).columns:
-        df[col] = df[col].astype('float32', copy=False)
-    for col in df.select_dtypes(include=['int64']).columns:
-        df[col] = df[col].astype('int32', copy=False)
+                       "reg_alpha": 1.0, "reg_lambda": 1.0, "metric": "average_precision", "num_threads": get_n_jobs(), "verbose": -1}
+    
+    # Only add guardrail params if key is missing
+    for key, value in guardrail_params.items():
+        if key not in final_params:
+            final_params[key] = value
+    
+    return final_params, params_data.get('best_val_score', params_data.get('best_cv_score', None))
 
 
 def load_numpy_arrays_two_pass(
     df_path: Path, 
     feature_cols: list, 
     target_col: str, 
-    year_filter, 
     name: str = "",
-    batch_size: int = BATCH_SIZE
+    batch_size: int = BATCH_SIZE,
+    year_range: Optional[tuple[int, int]] = None
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int, list]:
     """
     Two-pass NumPy loader: bypasses Pandas to minimize memory overhead.
     
-    Pass 1: Count rows matching filter (after dropna on target).
+    Pass 1: Count rows (after dropna on target and optional year filtering).
     Pass 2: Pre-allocate float32 arrays and stream data directly into them.
+    
+    Args:
+        year_range: Optional tuple (min_year, max_year) to filter data. Inclusive on both ends.
     
     Returns:
         X: Feature matrix (n_samples, n_features) as float32
@@ -255,45 +307,54 @@ def load_numpy_arrays_two_pass(
         neg: Number of negative samples
         years: Sorted list of unique years
     """
-    print(f"\nLoading {name or df_path.name} (two-pass NumPy loader)...")
+    year_filter_str = f" (years {year_range[0]}-{year_range[1]})" if year_range else ""
+    print(f"\nLoading {name or df_path.name}{year_filter_str} (two-pass NumPy loader)...")
     load_start = time.time()
     essential_cols = feature_cols + [target_col, 'year']
     
-    # Pass 1: Count rows matching filter
-    print(f"  Pass 1: Counting rows matching filter...")
+    # Pass 1: Count rows
+    print(f"  Pass 1: Counting rows...")
     parquet_file = pq.ParquetFile(df_path)
     n_samples = 0
     years_set = set()
     
     try:
-        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols):
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols, use_threads=True):
             # Convert batch to numpy arrays directly (bypass pandas)
             batch_table = batch
-            target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
-            year_array = batch_table['year'].to_numpy(zero_copy_only=False)
-            
-            # Filter out NaN in target
-            valid_mask = ~np.isnan(target_array)
+            # Use PyArrow null handling
+            null_mask = batch_table[target_col].is_null().to_numpy(zero_copy_only=False)
+            valid_mask = ~null_mask
             if not valid_mask.any():
                 continue
+            
+            target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+            year_array = batch_table['year'].to_numpy(zero_copy_only=False)
             
             target_valid = target_array[valid_mask]
             year_valid = year_array[valid_mask]
             
-            # Apply year filter (works directly on numpy arrays)
-            year_mask = year_filter(year_valid)
-            n_samples += int(year_mask.sum())
-            years_set.update(year_valid[year_mask].tolist())
+            # Apply year filter if specified
+            if year_range is not None:
+                year_mask = (year_valid >= year_range[0]) & (year_valid <= year_range[1])
+                target_valid = target_valid[year_mask]
+                year_valid = year_valid[year_mask]
+            
+            if len(target_valid) == 0:
+                continue
+            
+            n_samples += len(target_valid)
+            years_set.update(year_valid.tolist())
             
             del batch_table, target_array, year_array, target_valid, year_valid, batch
     finally:
         del parquet_file
         gc.collect()
     
-    print(f"  Found {n_samples:,} samples matching filter")
+    print(f"  Found {n_samples:,} samples")
     
     if n_samples == 0:
-        raise ValueError(f"No samples found matching filter in {name or df_path.name}")
+        raise ValueError(f"No samples found in {name or df_path.name}{year_filter_str}")
     
     # Pass 2: Pre-allocate arrays and fill directly
     print(f"  Pass 2: Pre-allocating arrays ({n_samples:,} samples, {len(feature_cols)} features)...")
@@ -306,51 +367,54 @@ def load_numpy_arrays_two_pass(
     batch_num = 0
     
     try:
-        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols):
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols, use_threads=True):
             batch_num += 1
             batch_table = batch
+            
+            # Use PyArrow null handling
+            null_mask = batch_table[target_col].is_null().to_numpy(zero_copy_only=False)
+            valid_mask = ~null_mask
+            if not valid_mask.any():
+                del batch_table, batch
+                continue
             
             # Extract arrays directly from PyArrow
             target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
             year_array = batch_table['year'].to_numpy(zero_copy_only=False)
             
-            # Filter out NaN in target
-            valid_mask = ~np.isnan(target_array)
-            if not valid_mask.any():
-                del batch_table, target_array, year_array, batch
-                continue
-            
             target_valid = target_array[valid_mask]
             year_valid = year_array[valid_mask]
             
-            # Apply year filter (works directly on numpy arrays)
-            year_mask = year_filter(year_valid)
-            if not year_mask.any():
-                del batch_table, target_array, year_array, target_valid, year_valid, batch
-                continue
-            
-            # Extract filtered data
-            target_filtered = target_valid[year_mask]
-            year_filtered = year_valid[year_mask]
-            
-            # Extract feature columns in bulk: convert all feature columns at once
-            # Build final mask: map year_mask (applied to valid data) back to original indices
-            final_mask = valid_mask.copy()
-            final_mask[valid_mask] = year_mask  # Map year_mask back to positions where valid_mask is True
-            
-            # Convert feature columns in bulk using pure PyArrow→NumPy path (no pandas)
-            feature_table = batch_table.select(feature_cols)
-            X_batch = extract_features_pyarrow_to_numpy(feature_table, final_mask)
-            y_batch = (target_filtered > 0).astype(np.int8)
+            # Apply year filter if specified
+            if year_range is not None:
+                year_mask = (year_valid >= year_range[0]) & (year_valid <= year_range[1])
+                if not year_mask.any():
+                    del batch_table, target_array, year_array, batch
+                    continue
+                target_valid = target_valid[year_mask]
+                year_valid = year_valid[year_mask]
+                
+                # Build final mask: map year_mask (applied to valid data) back to original indices
+                final_mask = valid_mask.copy()
+                final_mask[valid_mask] = year_mask  # Map year_mask back to positions where valid_mask is True
+                
+                # Convert feature columns in bulk using pure PyArrow→NumPy path (no pandas)
+                feature_table = batch_table.select(feature_cols)
+                X_batch = extract_features_pyarrow_to_numpy(feature_table, final_mask)
+            else:
+                # Convert feature columns in bulk using pure PyArrow→NumPy path (no pandas, no year filter)
+                feature_table = batch_table.select(feature_cols)
+                X_batch = extract_features_pyarrow_to_numpy(feature_table, valid_mask)
+            y_batch = (target_valid > 0).astype(np.int8)
             
             # Insert directly into pre-allocated arrays
             batch_size_actual = len(y_batch)
             X[idx_offset:idx_offset + batch_size_actual, :] = X_batch
             y[idx_offset:idx_offset + batch_size_actual] = y_batch
-            years_array[idx_offset:idx_offset + batch_size_actual] = year_filtered.astype(np.int32)
+            years_array[idx_offset:idx_offset + batch_size_actual] = year_valid.astype(np.int32)
             idx_offset += batch_size_actual
             
-            del batch_table, target_array, year_array, target_valid, year_valid, target_filtered, year_filtered
+            del batch_table, target_array, year_array, target_valid, year_valid
             del feature_table, X_batch, y_batch, batch
             
             if batch_num % 25 == 0:
@@ -445,15 +509,15 @@ def load_numpy_arrays_from_multiple_files(
     for file_idx, df_path in enumerate(df_paths):
         parquet_file = pq.ParquetFile(df_path)
         try:
-            for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols):
+            for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols, use_threads=True):
                 batch_table = batch
-                target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
-                year_array = batch_table['year'].to_numpy(zero_copy_only=False)
-                
-                # Filter out NaN in target
-                valid_mask = ~np.isnan(target_array)
+                null_mask = batch_table[target_col].is_null().to_numpy(zero_copy_only=False)
+                valid_mask = ~null_mask
                 if not valid_mask.any():
                     continue
+                
+                target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+                year_array = batch_table['year'].to_numpy(zero_copy_only=False)
                 
                 target_valid = target_array[valid_mask]
                 year_valid = year_array[valid_mask]
@@ -490,18 +554,18 @@ def load_numpy_arrays_from_multiple_files(
     for file_idx, df_path in enumerate(df_paths):
         parquet_file = pq.ParquetFile(df_path)
         try:
-            for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols):
+            for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols, use_threads=True):
                 batch_num += 1
                 batch_table = batch
                 
-                target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
-                year_array = batch_table['year'].to_numpy(zero_copy_only=False)
-                
-                # Filter out NaN in target
-                valid_mask = ~np.isnan(target_array)
+                null_mask = batch_table[target_col].is_null().to_numpy(zero_copy_only=False)
+                valid_mask = ~null_mask
                 if not valid_mask.any():
                     del batch_table, batch
                     continue
+                
+                target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+                year_array = batch_table['year'].to_numpy(zero_copy_only=False)
                 
                 target_valid = target_array[valid_mask]
                 year_valid = year_array[valid_mask]
@@ -561,132 +625,8 @@ def load_numpy_arrays_from_multiple_files(
     return X, y, years_array, pos, neg, years
 
 
-def load_test_data_one_pass(
-    test_path: Path,
-    feature_cols: list,
-    target_col: str,
-    keep_cols_test: list,
-    year_range: tuple[int, int],
-    lgb_model: lgb.Booster,
-    output_path: Path,
-    best_iteration: Optional[int],
-    batch_size: int = BATCH_SIZE
-) -> tuple[np.ndarray, np.ndarray, int, int, list]:
-    """
-    One-pass streaming loader for test data.
-    Collects batches, concatenates, writes scored results, and returns metrics arrays.
-    
-    Returns:
-        y_test: Target array (n_samples,) as int8
-        y_proba: Calibrated probabilities (n_samples,) as float32
-        test_pos: Number of positive samples
-        test_neg: Number of negative samples
-        test_years: Sorted list of unique years
-    """
-    print(f"  Loading test data (one-pass streaming, years {year_range[0]}-{year_range[1]})...")
-    
-    batches_y_test = []
-    batches_y_proba = []
-    test_years_set = set()
-    test_pos = test_neg = 0
-    batch_num = 0
-    
-    writer = None
-    parquet_file = pq.ParquetFile(test_path)
-    
-    try:
-        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=keep_cols_test):
-            batch_num += 1
-            batch_table = batch
-            
-            target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
-            year_array = batch_table['year'].to_numpy(zero_copy_only=False)
-            
-            # Filter out NaN in target
-            valid_mask = ~np.isnan(target_array)
-            if not valid_mask.any():
-                del batch_table, target_array, year_array, batch
-                continue
-            
-            # Filter by year range
-            year_mask = (year_array >= year_range[0]) & (year_array <= year_range[1])
-            final_mask = valid_mask & year_mask
-            if not final_mask.any():
-                del batch_table, target_array, year_array, batch
-                continue
-            
-            # Extract target
-            target_valid = target_array[final_mask]
-            y_batch = (target_valid > 0).astype(np.int8)
-            
-            # Extract feature columns in bulk using pure PyArrow→NumPy path (no pandas)
-            feature_table = batch_table.select(feature_cols)
-            X_batch = extract_features_pyarrow_to_numpy(feature_table, final_mask)
-            
-            # Get predictions from model
-            y_proba_batch = lgb_model.predict(X_batch, num_iteration=best_iteration if best_iteration else None).astype(np.float32)
-            
-            batches_y_test.append(y_batch)
-            batches_y_proba.append(y_proba_batch)
-            
-            test_pos += int(y_batch.sum())
-            test_neg += int((y_batch == 0).sum())
-            test_years_set.update(year_array[final_mask].tolist())
-            
-            # Extract metadata for writing results
-            row_array = batch_table['row'].to_numpy(zero_copy_only=False)[final_mask]
-            col_array = batch_table['col'].to_numpy(zero_copy_only=False)[final_mask]
-            year_array_valid = year_array[final_mask]
-            
-            result_arrays = {
-                'row': row_array.astype(np.int32),
-                'col': col_array.astype(np.int32),
-                'year': year_array_valid.astype(np.int32),
-                'y_true': y_batch,
-                'y_pred_proba': y_proba_batch
-            }
-            
-            # Add optional x, y coordinates if present
-            for coord_col in ['x', 'y']:
-                if coord_col in batch_table.column_names:
-                    coord_array = batch_table[coord_col].to_numpy(zero_copy_only=False)[final_mask]
-                    result_arrays[coord_col] = coord_array.astype(np.float32)
-            
-            result_table = pa.table(result_arrays)
-            
-            if writer is None:
-                writer = pq.ParquetWriter(output_path, result_table.schema)
-                print(f"Writing to {output_path}")
-            writer.write_table(result_table)
-            
-            del batch_table, target_array, target_valid, feature_table, X_batch, y_batch, y_proba_batch
-            del row_array, col_array, year_array, year_array_valid, result_arrays, result_table, batch
-            
-            if batch_num % 25 == 0:
-                gc.collect()
-            
-            if batch_num % 10 == 0:
-                print(f"  {batch_num} batches processed")
-                report_memory_usage(f"test batch {batch_num}")
-    finally:
-        if writer is not None:
-            writer.close()
-        del parquet_file
-        gc.collect()
-    
-    # Concatenate all batches
-    print(f"  Concatenating {len(batches_y_test)} batches...")
-    y_test = np.concatenate(batches_y_test, axis=0).astype(np.int8)
-    y_proba = np.concatenate(batches_y_proba, axis=0).astype(np.float32)
-    
-    test_years = sorted(test_years_set)
-    print(f"  Loaded {len(y_test):,} test samples")
-    
-    return y_test, y_proba, test_pos, test_neg, test_years
-
-
 def compute_metrics(y_true: np.ndarray, y_proba: np.ndarray) -> Dict[str, float]:
-    """Compute all validation/test metrics."""
+    """Compute all metrics (used for earlystop/test sets)."""
     roc_auc = roc_auc_score(y_true, y_proba)
     pr_auc = average_precision_score(y_true, y_proba)
     baseline_rate = y_true.mean()
@@ -702,24 +642,6 @@ def compute_metrics(y_true: np.ndarray, y_proba: np.ndarray) -> Dict[str, float]
 # =============================================================================
 # Main Pipeline
 # =============================================================================
-
-def wandb_log_callback(env):
-    """Custom callback to log LightGBM training metrics to wandb."""
-    # Log every 100 iterations (matching log_evaluation frequency)
-    if env.iteration % 100 == 0:
-        try:
-            log_dict = {"final_model/training/iteration": env.iteration}
-            # Log training metrics
-            for eval_result in env.evaluation_result_list:
-                metric_name = eval_result[0]
-                metric_value = eval_result[1]
-                # Clean metric name (e.g., "train's average_precision" -> "train_average_precision")
-                clean_name = metric_name.replace("'s ", "_").replace(" ", "_")
-                log_dict[f"final_model/training/{clean_name}"] = metric_value
-            wandb.log(log_dict)
-        except Exception as e:
-            # Silently fail if wandb is not available or logging fails
-            pass
 
 
 def check_year_overlap(train_years: tuple[int, int], eval_years: tuple[int, int], eval_name: str) -> bool:
@@ -751,6 +673,7 @@ def train_single_cv_fold(
     fold_idx: int,
     best_params: Dict[str, Any],
     use_wandb: bool,
+    use_time_weights: bool = True,
 ) -> Dict[str, Any]:
     """
     Train and evaluate a single CV fold.
@@ -793,10 +716,15 @@ def train_single_cv_fold(
     
     # Compute sample weights for training data (time-based weighting)
     # Weight range: 2000 (weight 0.5) to train_years[1] (weight 1.0)
-    train_weights = compute_year_weights(train_years_array, min_year=2000, max_year=train_years[1])
-    print(f"  Training sample weights: min={train_weights.min():.3f}, max={train_weights.max():.3f}, mean={train_weights.mean():.3f}")
+    if use_time_weights:
+        train_weights = compute_year_weights(train_years_array, min_year=2000, max_year=train_years[1])
+        print(f"  Training sample weights: min={train_weights.min():.3f}, max={train_weights.max():.3f}, mean={train_weights.mean():.3f}")
+    else:
+        train_weights = None
+        print(f"  Training sample weights: DISABLED (use_time_weights=False)")
     
-    # Compute scale_pos_weight from training data: scale_pos_weight = n_neg / n_pos
+    # Compute scale_pos_weight from training data
+    # Formula: scale_pos_weight = n_neg / n_pos
     scale_pos_weight = train_neg / max(train_pos, 1)
     print(f"  Computed scale_pos_weight from training data: {scale_pos_weight:.6f} = {train_neg:,} / {train_pos:,}")
     
@@ -805,18 +733,23 @@ def train_single_cv_fold(
     train_params = {**best_params, "is_unbalance": False}
     train_params.pop("num_boost_round", None)
     train_params.pop("n_estimators", None)
+    train_params.pop("n_jobs", None)  # Remove n_jobs if present (use num_threads instead)
+    # Ensure num_threads is set for optimal CPU usage
+    if "num_threads" not in train_params:
+        train_params["num_threads"] = get_n_jobs()
     # Override scale_pos_weight with computed value right before training
+    # Formula: scale_pos_weight = n_neg / n_pos
     train_params["scale_pos_weight"] = scale_pos_weight
     
-    # Add memory-efficient LightGBM parameters
-    train_params['force_col_wise'] = True  # More memory efficient for many features
-    train_params['max_bin'] = 255  # Reduce memory usage
-    train_params['two_round'] = True  # Reduce peak memory during histogram building
-    train_params['num_threads'] = get_n_jobs()  # Use SLURM_CPUS_PER_TASK if available
-    
     print(f"  Creating datasets...")
-    train_dataset = lgb.Dataset(X_train, label=y_train, weight=train_weights, free_raw_data=True)
-    del X_train, y_train, train_years_array, train_weights; gc.collect()
+    if train_weights is not None:
+        train_dataset = lgb.Dataset(X_train, label=y_train, weight=train_weights, free_raw_data=True)
+    else:
+        train_dataset = lgb.Dataset(X_train, label=y_train, free_raw_data=True)
+    del X_train, y_train, train_years_array
+    if train_weights is not None:
+        del train_weights
+    gc.collect()
     
     earlystop_dataset = lgb.Dataset(X_earlystop, label=y_earlystop, free_raw_data=True, reference=train_dataset)
     
@@ -834,7 +767,21 @@ def train_single_cv_fold(
     best_iteration = lgb_model.best_iteration
     
     del train_dataset, earlystop_dataset; gc.collect()
-    del X_earlystop, y_earlystop, earlystop_years_array, lgb_model; gc.collect()
+    
+    # Generate OOF predictions on earlystop set (true OOF for temporal CV)
+    # These predictions will be used for calibration
+    print(f"  Generating OOF predictions on earlystop set ({n_earlystop_samples:,} samples)...")
+    y_earlystop_proba = lgb_model.predict(X_earlystop, num_iteration=best_iteration if best_iteration else None).astype(np.float32)
+    
+    # Store OOF predictions for this fold
+    oof_predictions = {
+        "y_true": y_earlystop.copy(),
+        "y_pred_proba": y_earlystop_proba.copy(),
+        "fold_idx": np.full(len(y_earlystop), fold_idx, dtype=np.int32)
+    }
+    
+    # Clean up earlystop data and model after generating predictions
+    del X_earlystop, y_earlystop, earlystop_years_array, lgb_model, y_earlystop_proba; gc.collect()
     
     if use_wandb:
         wandb.log({
@@ -856,6 +803,7 @@ def train_single_cv_fold(
         "earlystop_negatives": int(earlystop_neg),
         "train_time_seconds": train_time,
         "best_iteration": int(best_iteration) if best_iteration is not None else None,
+        "oof_predictions": oof_predictions,  # Include OOF predictions for calibration
     }
 
 
@@ -884,7 +832,7 @@ def aggregate_cv_metrics(cv_results: list[Dict[str, Any]]) -> Dict[str, Any]:
 def phase1_training(
     train_path: Path, earlystop_path: Path, params_path: Optional[Path], feature_cols: list, keep_cols_train: list,
     best_params: Dict[str, Any], timestamp: str, model_dir: Path, output_dir: Path, use_wandb: bool, target_col: str,
-    cv_mode: str = "fold3",
+    cv_mode: str = "full", use_time_weights: bool = True,
 ) -> tuple[Path, Dict[str, Any], Dict[str, Any], float, float, int, int, int, Dict[str, Any], Dict[str, Any]]:
     """
     Phase 1: Training with temporal cross-validation.
@@ -933,14 +881,57 @@ def phase1_training(
         else:
             raise ValueError(f"Invalid cv_mode: {cv_mode}. Must be one of: full, fold3, none")
         
+        # Collect OOF predictions from all folds for calibration
+        all_oof_predictions = []
+        
         for fold_idx in folds_to_run:
             train_years, earlystop_years = CV_FOLDS[fold_idx]
             fold_result = train_single_cv_fold(
                 cv_train_paths, cv_earlystop_paths, feature_cols, target_col,
-                train_years, earlystop_years, fold_idx, best_params, use_wandb
+                train_years, earlystop_years, fold_idx, best_params, use_wandb, use_time_weights
             )
-            cv_results.append(fold_result)
+            
+            # Collect OOF predictions if available (skip if fold was skipped)
+            if not fold_result.get("skipped", False) and "oof_predictions" in fold_result:
+                all_oof_predictions.append(fold_result["oof_predictions"])
+                # Remove predictions from fold_result to avoid bloating JSON (they're saved separately)
+                fold_result_clean = {k: v for k, v in fold_result.items() if k != "oof_predictions"}
+                cv_results.append(fold_result_clean)
+            else:
+                cv_results.append(fold_result)
+            
             gc.collect()
+        
+        # Save temporal CV OOF predictions for calibration
+        if all_oof_predictions:
+            print(f"\nSaving temporal CV OOF predictions ({len(all_oof_predictions)} folds)...")
+            try:
+                # Concatenate predictions from all folds
+                y_true_all = np.concatenate([pred["y_true"] for pred in all_oof_predictions])
+                y_pred_proba_all = np.concatenate([pred["y_pred_proba"] for pred in all_oof_predictions])
+                fold_idx_all = np.concatenate([pred["fold_idx"] for pred in all_oof_predictions])
+                
+                # Create DataFrame and save to parquet with temporal CV naming pattern
+                temporal_cv_predictions_df = pd.DataFrame({
+                    "y_true": y_true_all,
+                    "y_pred_proba": y_pred_proba_all,
+                    "fold_idx": fold_idx_all
+                })
+                
+                temporal_cv_predictions_path = output_dir / f"model1_lgbm_win5_temporal_cv_predictions_{timestamp}.parquet"
+                temporal_cv_predictions_df.to_parquet(temporal_cv_predictions_path, index=False, engine="pyarrow")
+                print(f"  Temporal CV OOF predictions saved: {temporal_cv_predictions_path.name}")
+                print(f"  Total samples: {len(temporal_cv_predictions_df):,}")
+                print(f"  Folds: {sorted(np.unique(fold_idx_all).tolist())}")
+                
+                # Clean up
+                del temporal_cv_predictions_df, y_true_all, y_pred_proba_all, fold_idx_all, all_oof_predictions
+                gc.collect()
+            except Exception as e:
+                print(f"  WARNING: Failed to save temporal CV OOF predictions: {e}")
+                import traceback
+                traceback.print_exc()
+                # Don't exit - continue with training
         
         # Aggregate CV metrics (no metrics computed on earlystop sets)
         cv_aggregated = aggregate_cv_metrics(cv_results)
@@ -1052,10 +1043,15 @@ def phase1_training(
     
     # Compute sample weights for training data (time-based weighting)
     # Weight range: 2000 (weight 0.5) to EARLYSTOP_YEARS[1] (weight 1.0)
-    train_weights = compute_year_weights(train_years_array_full, min_year=2000, max_year=EARLYSTOP_YEARS[1])
-    print(f"  Training sample weights: min={train_weights.min():.3f}, max={train_weights.max():.3f}, mean={train_weights.mean():.3f}")
+    if use_time_weights:
+        train_weights = compute_year_weights(train_years_array_full, min_year=2000, max_year=EARLYSTOP_YEARS[1])
+        print(f"  Training sample weights: min={train_weights.min():.3f}, max={train_weights.max():.3f}, mean={train_weights.mean():.3f}")
+    else:
+        train_weights = None
+        print(f"  Training sample weights: DISABLED (use_time_weights=False)")
     
-    # Compute scale_pos_weight from training data: scale_pos_weight = n_neg / n_pos
+    # Compute scale_pos_weight from training data
+    # Formula: scale_pos_weight = n_neg / n_pos
     scale_pos_weight = train_neg_full / max(train_pos_full, 1)
     print(f"\nImbalance: Computed scale_pos_weight from training data: {scale_pos_weight:.6f} = {train_neg_full:,} / {train_pos_full:,}")
     
@@ -1065,12 +1061,16 @@ def phase1_training(
         "scale_pos_weight": float(scale_pos_weight)
     }
     if use_wandb:
-        wandb.log({
+        log_dict = {
             "final_model/imbalance/scale_pos_weight": float(scale_pos_weight),
-            "final_model/sample_weights/min": float(train_weights.min()),
-            "final_model/sample_weights/max": float(train_weights.max()),
-            "final_model/sample_weights/mean": float(train_weights.mean()),
-        })
+        }
+        if train_weights is not None:
+            log_dict.update({
+                "final_model/sample_weights/min": float(train_weights.min()),
+                "final_model/sample_weights/max": float(train_weights.max()),
+                "final_model/sample_weights/mean": float(train_weights.mean()),
+            })
+        wandb.log(log_dict)
     
     print(f"\nTraining final model on {len(X_train_full):,} samples...")
     report_memory_usage("before final training")
@@ -1078,33 +1078,31 @@ def phase1_training(
     train_params = {**best_params, "is_unbalance": False}
     train_params.pop("num_boost_round", None)
     train_params.pop("n_estimators", None)
+    train_params.pop("n_jobs", None)  # Remove n_jobs if present (use num_threads instead)
+    # Ensure num_threads is set for optimal CPU usage
+    if "num_threads" not in train_params:
+        train_params["num_threads"] = get_n_jobs()
     # Override scale_pos_weight with computed value right before training
+    # Formula: scale_pos_weight = n_neg / n_pos
     train_params["scale_pos_weight"] = scale_pos_weight
     
-    # Add memory-efficient LightGBM parameters
-    train_params['force_col_wise'] = True  # More memory efficient for many features
-    train_params['max_bin'] = 255  # Reduce memory usage
-    train_params['two_round'] = True  # Reduce peak memory during histogram building
-    train_params['num_threads'] = get_n_jobs()  # Use SLURM_CPUS_PER_TASK if available
-    
     print(f"  Creating dataset...")
-    train_dataset = lgb.Dataset(X_train_full, label=y_train_full, weight=train_weights, free_raw_data=True)
-    del X_train_full, y_train_full, train_years_array_full, train_weights; gc.collect()
+    if train_weights is not None:
+        train_dataset = lgb.Dataset(X_train_full, label=y_train_full, weight=train_weights, free_raw_data=True)
+    else:
+        train_dataset = lgb.Dataset(X_train_full, label=y_train_full, free_raw_data=True)
+    del X_train_full, y_train_full, train_years_array_full
+    if train_weights is not None:
+        del train_weights
+    gc.collect()
     report_memory_usage("after train dataset creation")
     
     print(f"  Starting training with num_boost_round={chosen_iteration} (fixed from CV, no validation set/early stopping)...")
-    print(f"  Training for {chosen_iteration} iterations (progress logged every 100 iterations)")
-    
-    # Set up callbacks
-    callbacks = [lgb.log_evaluation(100, show_stdv=True)]
-    if use_wandb:
-        callbacks.append(wandb_log_callback)
-    
     lgb_model = lgb.train(
         train_params,
         train_dataset,
         num_boost_round=chosen_iteration,
-        callbacks=callbacks
+        callbacks=[lgb.log_evaluation(100)]
     )
     train_time = time.time() - train_start
     print(f"\nTraining done in {train_time:.1f}s. Used {chosen_iteration} iterations (chosen based on CV)")
@@ -1130,10 +1128,6 @@ def phase1_training(
             "final_model/training/train_time_minutes": train_time / 60,
             "final_model/training/final_num_boost_round": chosen_iteration,
             "final_model/training/chosen_iteration": chosen_iteration,
-            # Logging similar to fold3 structure
-            "final_model/n_train": int(n_train_full),
-            "final_model/train_time_seconds": train_time,
-            "final_model/best_iteration": int(chosen_iteration) if chosen_iteration is not None else None,
         })
     
     print("Phase 1 completed.")
@@ -1153,7 +1147,7 @@ def phase1_training(
 
 def phase2_testing(
     test_path: Path, model_path: Path, feature_cols: list, keep_cols_test: list, timestamp: str, output_dir: Path,
-    use_wandb: bool, target_col: str, validation_metrics: Dict[str, Any], train_stats: Dict[str, Any],
+    use_wandb: bool, target_col: str, earlystop_metrics: Optional[Dict[str, Any]], train_stats: Dict[str, Any],
     train_time: float, earlystop_time: float, train_pos: int, train_neg: int, n_train_full: int,
     best_params: Dict[str, Any], start_time: float, imbalance_info: Dict[str, Any], cv_info: Dict[str, Any],
 ) -> None:
@@ -1176,6 +1170,50 @@ def phase2_testing(
         lgb_model = pickle.load(f)
     report_memory_usage("after loading model")
     
+    # Use batch size from config (can be overridden via BATCH_SIZE env var)
+    batch_size = BATCH_SIZE
+    
+    print(f"Processing test in batches of {batch_size:,}...")
+    print(f"Test year range: {test_year_range[0]}-{test_year_range[1]} (capped at LAST_LABEL_YEAR={LAST_LABEL_YEAR})")
+    
+    # Pass 1: Count rows (pre-allocate arrays to avoid concatenation memory spike)
+    print(f"  Pass 1: Counting test rows (year_range={test_year_range})...")
+    parquet_file = pq.ParquetFile(test_path)
+    n_test_total = 0
+    test_years_set = set()
+    
+    try:
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=[target_col, 'year'], use_threads=True):
+            batch_table = batch
+            # Use PyArrow null handling
+            null_mask = batch_table[target_col].is_null().to_numpy(zero_copy_only=False)
+            valid_mask = ~null_mask
+            if valid_mask.any():
+                year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+                # Filter by year range to exclude right-censored labels
+                year_mask = (year_array >= test_year_range[0]) & (year_array <= test_year_range[1])
+                final_mask = valid_mask & year_mask
+                if final_mask.any():
+                    n_test_total += int(final_mask.sum())
+                    test_years_set.update(year_array[final_mask].tolist())
+                del year_array
+            
+            del batch_table, batch
+    finally:
+        del parquet_file
+        gc.collect()
+    
+    print(f"  Found {n_test_total:,} test samples (filtered to year_range={test_year_range[0]}-{test_year_range[1]})")
+    
+    if n_test_total == 0:
+        raise ValueError("No test samples found")
+    
+    # Pre-allocate arrays
+    print(f"  Pre-allocating arrays for {n_test_total:,} samples...")
+    y_test = np.empty(n_test_total, dtype=np.int8)
+    y_proba = np.empty(n_test_total, dtype=np.float32)
+    report_memory_usage("after pre-allocation")
+    
     # Get best iteration from CV info (chosen iteration from CV)
     # Since final model doesn't use early stopping, we use the chosen iteration from CV
     best_iteration = cv_info.get("final_num_boost_round", cv_info.get("chosen_iteration", None))
@@ -1184,23 +1222,95 @@ def phase2_testing(
         best_iteration = getattr(lgb_model, 'num_trees', None)
     print(f"  Using {best_iteration} iterations for predictions (chosen from CV)")
     
-    print(f"Processing test (one-pass streaming)...")
-    print(f"Test year range: {test_year_range[0]}-{test_year_range[1]} (capped at LAST_LABEL_YEAR={LAST_LABEL_YEAR})")
-    
+    # Pass 2: Process batches and fill pre-allocated arrays
+    print(f"  Pass 2: Processing test batches (year_range={test_year_range})...")
+    parquet_file = pq.ParquetFile(test_path)
     scored_path = output_dir / f"model1_lgbm_win5_scored_{timestamp}.parquet"
+    writer = None
+    test_pos = test_neg = batch_num = idx_offset = 0
     pred_start = time.time()
     
-    # Use one-pass streaming loader
-    y_test, y_proba, test_pos, test_neg, test_years = load_test_data_one_pass(
-        test_path, feature_cols, target_col, keep_cols_test, test_year_range, lgb_model, scored_path, best_iteration
-    )
-    
-    n_test_total = len(y_test)
-    if n_test_total == 0:
-        raise ValueError("No test samples found")
+    try:
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=keep_cols_test, use_threads=True):
+            batch_num += 1
+            batch_table = batch
+            
+            # Use PyArrow null handling
+            null_mask = batch_table[target_col].is_null().to_numpy(zero_copy_only=False)
+            valid_mask = ~null_mask
+            if not valid_mask.any():
+                del batch_table, batch
+                continue
+            
+            # Extract target array and year array
+            target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+            year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+            
+            # Filter by year range to exclude right-censored labels
+            # year_range=(TEST_START, min(TEST_END, LAST_LABEL_YEAR))
+            year_mask = (year_array >= test_year_range[0]) & (year_array <= test_year_range[1])
+            final_mask = valid_mask & year_mask
+            if not final_mask.any():
+                del batch_table, target_array, year_array, batch
+                continue
+            
+            # Extract feature columns in bulk using pure PyArrow→NumPy path (no pandas)
+            feature_table = batch_table.select(feature_cols)
+            X_batch = extract_features_pyarrow_to_numpy(feature_table, final_mask)
+            target_valid = target_array[final_mask]
+            y_batch = (target_valid > 0).astype(np.int8)
+            
+            # Get predictions from model
+            y_proba_batch = lgb_model.predict(X_batch, num_iteration=best_iteration if best_iteration else None).astype(np.float32)
+            
+            # Fill pre-allocated arrays directly
+            batch_size_actual = len(y_batch)
+            y_test[idx_offset:idx_offset + batch_size_actual] = y_batch
+            y_proba[idx_offset:idx_offset + batch_size_actual] = y_proba_batch
+            idx_offset += batch_size_actual
+            
+            test_pos += int(y_batch.sum())
+            test_neg += int((y_batch == 0).sum())
+            
+            # Extract metadata arrays for writing results (using final_mask which includes year filtering)
+            row_array = batch_table['row'].to_numpy(zero_copy_only=False)[final_mask]
+            col_array = batch_table['col'].to_numpy(zero_copy_only=False)[final_mask]
+            year_array_valid = year_array[final_mask]
+            
+            # Build result arrays and create PyArrow table directly
+            result_arrays = {
+                'row': row_array.astype(np.int32),
+                'col': col_array.astype(np.int32),
+                'year': year_array_valid.astype(np.int32),
+                'y_true': y_batch,
+                'y_pred_proba': y_proba_batch
+            }
+            
+            # Add optional x, y coordinates if present
+            for coord_col in ['x', 'y']:
+                if coord_col in batch_table.column_names:
+                    coord_array = batch_table[coord_col].to_numpy(zero_copy_only=False)[final_mask]
+                    result_arrays[coord_col] = coord_array.astype(np.float32)
+            
+            # Create PyArrow table directly from arrays (avoiding pandas)
+            result_table = pa.table(result_arrays)
+            
+            # Write results incrementally
+            if writer is None:
+                writer = pq.ParquetWriter(scored_path, result_table.schema, compression='snappy')
+            writer.write_table(result_table)
+            
+            del batch_table, X_batch, y_batch, y_proba_batch, result_table, batch
+    finally:
+        if writer is not None:
+            writer.close()
+        del parquet_file
+        gc.collect()
     
     pred_time = time.time() - pred_start
+    test_years = sorted(test_years_set)
     print(f"Completed test processing in {pred_time:.1f}s, {n_test_total:,} rows")
+    print(f"Saved scored predictions: {scored_path}")
     report_memory_usage("after all predictions")
     
     print(f"\nTest set: {test_neg:,} neg, {test_pos:,} pos, ratio 1:{test_neg/max(test_pos,1):.1f}, years {test_years[0]}-{test_years[-1]}")
@@ -1235,24 +1345,51 @@ def phase2_testing(
     # Free test data after metrics computation
     del y_test, y_proba; gc.collect()
     
-    metrics = {"metadata": {"timestamp": timestamp, "model": "LightGBM", "task": "transition_01_win5_prediction",
-                           "target_column": TARGET_COL,
-                           "lookahead_years": LOOKAHEAD_YEARS,
-                           "random_state": RANDOM_STATE, "n_features": len(feature_cols), "features": feature_cols,
-                           "test_probabilities": "uncalibrated",
-                           "cv_mode": cv_info.get("cv_mode", "full")},
-              "data": {"n_train_full": n_train_full, "n_test": int(n_test_total), "train_positives": train_pos,
-                      "train_negatives": train_neg, "test_positives": test_pos, "test_negatives": test_neg},
-              "temporal_split": {"method": "strict_temporal_split", "train_years": list(TRAIN_YEARS),
-                                "earlystop_years": list(EARLYSTOP_YEARS), "test_years": list(TEST_YEARS)},
-              "cross_validation": cv_info,
-              "model_parameters": best_params,
-              "imbalance_handling": {"method": "scale_pos_weight", "is_unbalance": False,
-                                    "scale_pos_weight": imbalance_info.get("scale_pos_weight"),
-                                    "neg": imbalance_info.get("neg"), "pos": imbalance_info.get("pos")},
-              "test_performance": test_metrics, "feature_importance": feature_importance.head(20).to_dict('records'),
-              "timing": {"train_seconds": train_time,
-                        "prediction_seconds": pred_time, "total_seconds": time.time() - start_time}}
+    metrics = {
+        "metadata": {
+            "timestamp": timestamp, 
+            "model": "LightGBM", 
+            "task": "transition_01_win5_prediction",
+            "target_column": TARGET_COL,
+            "lookahead_years": 5,
+            "random_state": RANDOM_STATE, 
+            "n_features": len(feature_cols), 
+            "features": feature_cols,
+            "test_probabilities": "uncalibrated",
+            "cv_mode": cv_info.get("cv_mode", "full"),
+            "use_time_weights": True
+        },
+        "data": {
+            "n_train_full": n_train_full, 
+            "n_test": int(n_test_total), 
+            "train_positives": train_pos,
+            "train_negatives": train_neg, 
+            "test_positives": test_pos, 
+            "test_negatives": test_neg
+        },
+        "temporal_split": {
+            "method": "strict_temporal_split", 
+            "train_years": list(TRAIN_YEARS),
+            "earlystop_years": list(EARLYSTOP_YEARS), 
+            "test_years": list(TEST_YEARS)
+        },
+        "cross_validation": cv_info,
+        "model_parameters": best_params,
+        "imbalance_handling": {
+            "method": "scale_pos_weight", 
+            "is_unbalance": False,
+            "scale_pos_weight": imbalance_info.get("scale_pos_weight"),
+            "neg": imbalance_info.get("neg"), 
+            "pos": imbalance_info.get("pos")
+        },
+        "test_performance": test_metrics, 
+        "feature_importance": feature_importance.head(20).to_dict('records'),
+        "timing": {
+            "train_seconds": train_time,
+            "prediction_seconds": pred_time, 
+            "total_seconds": time.time() - start_time
+        }
+    }
     metrics = convert_numpy_types(metrics)
     metrics_path = output_dir / f"model1_lgbm_win5_metrics_{timestamp}.json"
     with open(metrics_path, 'w') as f:
@@ -1283,11 +1420,15 @@ def phase2_testing(
     print("="*70 + "\nDone.")
     
     if use_wandb:
-        wandb.log({"summary/total_time_seconds": total_time, "summary/total_time_minutes": total_time / 60, "status": "success"})
+        wandb.log({
+            "summary/total_time_seconds": total_time, 
+            "summary/total_time_minutes": total_time / 60, 
+            "status": "success"
+        })
         wandb.finish()
 
 
-def main(cv_mode: str = "none") -> None:
+def main(timestamp: str, cv_mode: str = "full", use_time_weights: bool = True) -> None:
     start_time = time.time()
     repo_root = Path(__file__).resolve().parents[3]
     train_path = resolve_parquet_file("train_win5.parquet")
@@ -1298,23 +1439,40 @@ def main(cv_mode: str = "none") -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     model_dir = repo_root / "data/ml/models"
     model_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
     use_wandb = False
-    try:
-        wandb.init(project="ml-training-transitions", entity=os.environ.get("WANDB_ENTITY"), name=f"model1_lgbm_win5_{timestamp}",
-                  config={"model": "LightGBM", "task": "transition_01_win5_prediction", "target_column": TARGET_COL,
-                         "lookahead_years": LOOKAHEAD_YEARS, "random_state": RANDOM_STATE,
-                         "temporal_split": {"train_years": list(TRAIN_YEARS), "earlystop_years": list(EARLYSTOP_YEARS),
-                                           "test_years": list(TEST_YEARS)}, "cv_mode": cv_mode})
-        use_wandb = True
-        print("W&B connected")
-    except Exception as err:
-        print(f"W&B failed: {err}")
+    if wandb is not None:
+        try:
+            wandb.init(
+            project="ml-training-transitions", 
+            entity=os.environ.get("WANDB_ENTITY"), 
+            name=f"model1_lgbm_win5_{timestamp}",
+            config={
+                "model": "LightGBM", 
+                "task": "transition_01_win5_prediction", 
+                "target_column": TARGET_COL,
+                "lookahead_years": 5,
+                "random_state": RANDOM_STATE,
+                "use_time_weights": use_time_weights,
+                "temporal_split": {
+                    "train_years": list(TRAIN_YEARS), 
+                    "earlystop_years": list(EARLYSTOP_YEARS),
+                    "test_years": list(TEST_YEARS)
+                }
+            }
+            )
+            use_wandb = True
+            print("W&B connected")
+        except Exception as err:
+            print(f"W&B failed: {err}")
+    else:
+        print("W&B not available (module not installed)")
     
-    print("="*70 + "\nLGBM TRANSITION MODEL (SOUTH AMERICA DATASET - 5-YEAR LOOKAHEAD)\n" + "="*70)
+    print("="*70 + "\nLGBM TRANSITION MODEL (CONTINENT SCALE - 5-YEAR LOOKAHEAD)\n" + "="*70)
     print(f"Train: {train_path}\nEarlystop: {earlystop_path}\nTest: {test_path}\nParams: {params_path if params_path else 'Using default manual hyperparameters'}\nOutput: {output_dir}")
     print(f"\nConfiguration:")
+    print(f"  CV Mode: {cv_mode}")
+    print(f"  Use Time Weights: {use_time_weights}")
     print(f"  WDPA_LAST_YEAR: {WDPA_LAST_YEAR}")
     print(f"  LOOKAHEAD_YEARS: {LOOKAHEAD_YEARS}")
     print(f"  LAST_LABEL_YEAR: {LAST_LABEL_YEAR} (WDPA_LAST_YEAR - LOOKAHEAD_YEARS)")
@@ -1346,8 +1504,9 @@ def main(cv_mode: str = "none") -> None:
     keep_cols_test = feature_cols + required_cols + [col for col in ['x', 'y'] if col in all_cols_test]
     print(f"Selected {len(feature_cols)} features, loading {len(keep_cols_train)} cols from train, {len(keep_cols_test)} from test")
     
+    # Always use time_weights=True
     (model_path, validation_metrics, train_stats, train_time, earlystop_time, train_pos, train_neg, n_train_full, imbalance_info, cv_info) = phase1_training(
-        train_path, earlystop_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col, cv_mode=cv_mode)
+        train_path, earlystop_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col, cv_mode=cv_mode, use_time_weights=use_time_weights)
     
     phase2_testing(test_path, model_path, feature_cols, keep_cols_test, timestamp, output_dir, use_wandb, target_col,
                   validation_metrics, train_stats, train_time, earlystop_time, train_pos, train_neg, n_train_full,
@@ -1364,6 +1523,12 @@ if __name__ == "__main__":
         default="none",
         help="Cross-validation mode: 'full' (run all 3 folds), 'fold3' (run only fold 3 for fast dev), 'none' (skip CV)"
     )
+    parser.add_argument(
+        "--use-time-weights",
+        action="store_true",
+        default=True,
+        help="Use time-based sample weighting for final model training"
+    )
     args = parser.parse_args()
     
     repo_root = Path(__file__).resolve().parents[3]
@@ -1374,7 +1539,7 @@ if __name__ == "__main__":
     tee = Tee(output_file)
     sys.stdout = tee
     try:
-        main(cv_mode=args.cv_mode)
+        main(timestamp, cv_mode=args.cv_mode, use_time_weights=args.use_time_weights)
     finally:
         sys.stdout = tee.stdout
         tee.close()

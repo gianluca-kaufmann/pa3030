@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import pickle
 import sys
 from pathlib import Path
 from typing import Dict, Any, Optional
@@ -52,6 +53,14 @@ from sklearn.metrics import precision_recall_curve, average_precision_score
 import geopandas as gpd
 from shapely.geometry import Point
 from scipy.interpolate import interp1d, griddata
+
+# Try to import shap - if not available, raise clear error when SHAP analysis is requested
+try:
+    import shap
+    SHAP_AVAILABLE = True
+except ImportError:
+    SHAP_AVAILABLE = False
+    shap = None
 
 
 # =============================================================================
@@ -77,7 +86,17 @@ FONTSIZE_STATS = 9  # Statistics/time period text
 # Risk map color scheme
 # Category colors using viridis colormap samples
 # Compute viridis colors at module load to ensure accuracy while maintaining consistency
-_viridis_cmap = cm.get_cmap('viridis')
+# Use modern matplotlib API to avoid deprecation warnings (matplotlib 3.5+)
+try:
+    # Modern API: matplotlib.colormaps registry (matplotlib 3.5+)
+    _viridis_cmap = matplotlib.colormaps['viridis']
+except (AttributeError, KeyError, TypeError):
+    try:
+        # Fallback: plt.get_cmap (also deprecated but works in 3.5-3.7)
+        _viridis_cmap = plt.get_cmap('viridis')
+    except (AttributeError, TypeError):
+        # Final fallback: cm.get_cmap (deprecated in 3.7+)
+        _viridis_cmap = cm.get_cmap('viridis')
 RISK_MAP_COLORS = {
     'none': _viridis_cmap(0.0),  # viridis(0.0) - darkest purple
     'predicted_only': _viridis_cmap(0.35),  # viridis(0.35) - blue-green
@@ -922,7 +941,10 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
     # the actual year of establishment. We join on pixel identifier (not year) so the
     # flag applies to all years for each pixel.
     if wdpa_test_df is not None and 'established_2018_2019' in wdpa_test_df.columns:
-        print(f"\n  Joining WDPA establishment flag from original test parquet...")
+        print(f"\n  {'='*70}")
+        print(f"  WDPA ESTABLISHMENT DATA LOADED SUCCESSFULLY")
+        print(f"  {'='*70}")
+        print(f"  Joining WDPA establishment flag from original test parquet...")
         
         # Extract establishment flag for each pixel (join on pixel identifier, not year)
         # This ensures the flag applies to all years for each pixel
@@ -962,10 +984,18 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
             df['WDPA_b1_actual'] = df['established_2018_2019']
             print(f"  Joined WDPA establishment flag using {join_method}: {(df['WDPA_b1_actual'] == 1).sum():,} pixels established in 2018-2019")
     else:
+        print(f"\n  {'!'*70}")
+        print(f"  WARNING: WDPA ESTABLISHMENT DATA NOT LOADED")
+        print(f"  {'!'*70}")
         if wdpa_test_df is None:
-            print(f"  WARNING: WDPA test data not available - using y_true only for observed positives")
+            print(f"  Reason: WDPA test data file not available or failed to load")
+            print(f"  Impact: Using y_true only for observed positives (may undercount establishments)")
+            print(f"  Expected file: test_colombia_win5.parquet in data/ml/ or outputs/Results/")
         else:
-            print(f"  WARNING: Establishment flag not found in WDPA test data - using y_true only for observed positives")
+            print(f"  Reason: Establishment flag 'established_2018_2019' not found in WDPA test data")
+            print(f"  Available columns in WDPA test data: {list(wdpa_test_df.columns)}")
+            print(f"  Impact: Using y_true only for observed positives (may undercount establishments)")
+        print(f"  {'!'*70}")
         df['WDPA_b1_actual'] = 0
     
     # Calculate top-1% threshold
@@ -986,16 +1016,38 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
     print(f"  Observed PA establishments: y_true={y_true_positives:,}, WDPA_b1_actual={wdpa_positives:,}, combined={combined_positives:,}")
     print(f"  Note: Combined uses WDPA_b1_actual=1 OR y_true=1 to correctly identify pixels established in each year")
     
-    # Create three distinct categories
-    gdf['category'] = 'none'
-    gdf.loc[gdf['is_top1pct'] & ~gdf['is_positive'], 'category'] = 'predicted_only'
-    gdf.loc[~gdf['is_top1pct'] & gdf['is_positive'], 'category'] = 'observed_only'
-    gdf.loc[gdf['is_top1pct'] & gdf['is_positive'], 'category'] = 'overlap'
+    # CRITICAL FIX: Deduplicate to pixel-level before counting to avoid multi-year inflation
+    # Some pixels appear in multiple years (2018, 2019), causing overlap counts to be inflated
+    # when counted per-row instead of per-pixel
+    print(f"\n  Deduplicating to pixel-level before counting overlaps...")
+    print(f"  Total rows (may include same pixel in multiple years): {len(gdf):,}")
     
-    # Count pixels in each category
-    predicted_only_count = (gdf['category'] == 'predicted_only').sum()
-    observed_only_count = (gdf['category'] == 'observed_only').sum()
-    overlap_count = (gdf['category'] == 'overlap').sum()
+    # Aggregate to pixel-level: a pixel is high-risk/positive if it's high-risk/positive in ANY year
+    pixel_df = gdf.groupby(['row', 'col']).agg({
+        'is_top1pct': 'max',    # Pixel is high-risk if high-risk in ANY year
+        'is_positive': 'max',    # Pixel is positive if positive in ANY year
+        'x': 'first',            # Keep coordinates for visualization
+        'y': 'first',
+        'is_protected': 'max'    # Keep protected status
+    }).reset_index()
+    
+    print(f"  Unique pixels (after deduplication): {len(pixel_df):,}")
+    
+    # Create categories at pixel-level
+    pixel_df['category'] = 'none'
+    pixel_df.loc[pixel_df['is_top1pct'] & ~pixel_df['is_positive'], 'category'] = 'predicted_only'
+    pixel_df.loc[~pixel_df['is_top1pct'] & pixel_df['is_positive'], 'category'] = 'observed_only'
+    pixel_df.loc[pixel_df['is_top1pct'] & pixel_df['is_positive'], 'category'] = 'overlap'
+    
+    # Count pixels in each category (now at pixel-level, not row-level)
+    predicted_only_count = (pixel_df['category'] == 'predicted_only').sum()
+    observed_only_count = (pixel_df['category'] == 'observed_only').sum()
+    overlap_count = (pixel_df['category'] == 'overlap').sum()
+    
+    # Update gdf to use pixel-level data for visualization
+    # Create GeoDataFrame from pixel-level data
+    geometry_px = [Point(xy) for xy in zip(pixel_df['x'], pixel_df['y'])]
+    gdf = gpd.GeoDataFrame(pixel_df, geometry=geometry_px, crs='EPSG:4326')
     
     print(f"  Predicted high-risk only: {predicted_only_count:,}")
     print(f"  Observed PA establishments only: {observed_only_count:,}")
@@ -1181,6 +1233,17 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
            bbox=dict(boxstyle='round', facecolor='lightblue', 
            alpha=0.9, edgecolor='black', linewidth=1, pad=0.5), zorder=10)
     
+    # Add note explaining discrepancy with P@1% metric
+    discrepancy_note = (f"NOTE: Map shows pixel-level aggregation.\n"
+                       f"A pixel is marked high-risk/positive if\n"
+                       f"ANY of its years meet criteria (not same year).\n"
+                       f"This can make overlap appear higher than\n"
+                       f"P@1% metrics (which are row-level).")
+    ax.text(0.98, 0.75, discrepancy_note, transform=ax.transAxes, fontsize=FONTSIZE_DESCRIPTION-1,
+           verticalalignment='top', horizontalalignment='right',
+           bbox=dict(boxstyle='round', facecolor='yellow', 
+           alpha=0.85, edgecolor='black', linewidth=1, pad=0.5), zorder=10)
+    
     # Create comprehensive legend with time period information
     legend_elements = []
     
@@ -1229,6 +1292,232 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
     
     # Save PDF with standardized DPI
     pdf_path = output_dir / f"modelC_{model_type}_risk_map_top1pct.pdf"
+    plt.savefig(pdf_path, dpi=MAP_DPI, bbox_inches='tight')
+    print(f"Saved PDF: {pdf_path}")
+    
+    plt.close()
+
+
+def create_p1pct_diagnostic_map(df: pd.DataFrame, country_boundary_path: Optional[Path], output_dir: Path, model_type: str, metrics_data: Optional[Dict[str, Any]] = None) -> None:
+    """Create diagnostic map showing row-level P@1% metric visualization.
+    
+    This map uses the EXACT same logic as the P@1% metric computation:
+    - Selects global top 1% rows (pixel-years) by probability
+    - Marks overlap only when y_true == 1 in the SAME row
+    - No pixel-level deduplication, no cross-year aggregation, no WDPA OR-logic
+    
+    This diagnostic helps visualize why P@1% metrics may differ from pixel-level risk maps.
+    """
+    print("\n" + "=" * 70)
+    print("CREATING ROW-LEVEL P@1% DIAGNOSTIC MAP")
+    print("=" * 70)
+    
+    # Get Colombia boundary
+    colombia_gdf = get_colombia_boundary(country_boundary_path)
+    
+    # Ensure CRS is set (assume EPSG:4326 if not set)
+    if colombia_gdf.crs is None:
+        colombia_gdf.set_crs('EPSG:4326', inplace=True)
+    
+    print(f"  Colombia boundary CRS: {colombia_gdf.crs}")
+    
+    # Create GeoDataFrame from predictions (keep all rows, no deduplication)
+    geometry = [Point(xy) for xy in zip(df['x'], df['y'])]
+    gdf = gpd.GeoDataFrame(df, geometry=geometry, crs='EPSG:4326')
+    
+    print(f"  Total rows (pixel-years): {len(gdf):,}")
+    
+    # Compute top 1% threshold using EXACT same logic as compute_precision_at_k
+    y_proba = df['y_pred_proba'].values
+    n_top_k = max(1, int(len(y_proba) * 1 / 100))
+    print(f"  Top 1% count: {n_top_k:,} rows")
+    
+    # Use argpartition to get top 1% indices (same as training script)
+    top_k_idx = np.argpartition(y_proba, -n_top_k)[-n_top_k:]
+    top_k_threshold = np.min(y_proba[top_k_idx])
+    print(f"  Top 1% threshold: {top_k_threshold:.6f}")
+    
+    # Mark rows as top-1% (row-level, no aggregation)
+    gdf['is_top1pct'] = df['y_pred_proba'] >= top_k_threshold
+    
+    # Mark rows as positive using ONLY y_true (no WDPA OR-logic, no cross-year)
+    gdf['is_positive'] = (df['y_true'] == 1)
+    
+    # Create categories at row-level (overlap only when both true in SAME row)
+    gdf['category'] = 'none'
+    gdf.loc[gdf['is_top1pct'] & ~gdf['is_positive'], 'category'] = 'predicted_only'
+    gdf.loc[~gdf['is_top1pct'] & gdf['is_positive'], 'category'] = 'observed_only'
+    gdf.loc[gdf['is_top1pct'] & gdf['is_positive'], 'category'] = 'overlap'
+    
+    # Count rows in each category
+    predicted_only_count = (gdf['category'] == 'predicted_only').sum()
+    observed_only_count = (gdf['category'] == 'observed_only').sum()
+    overlap_count = (gdf['category'] == 'overlap').sum()
+    
+    # Compute actual P@1% metric for verification
+    y_true = df['y_true'].values
+    actual_p1pct = y_true[top_k_idx].sum() / n_top_k
+    print(f"  Row-level P@1% metric: {actual_p1pct:.4f} ({overlap_count:,}/{n_top_k:,})")
+    print(f"  Predicted high-risk only: {predicted_only_count:,}")
+    print(f"  Observed positives only: {observed_only_count:,}")
+    print(f"  Overlap (same row): {overlap_count:,}")
+    
+    # Create categorical raster
+    category_codes = {
+        'none': 0,
+        'predicted_only': 1,
+        'observed_only': 2,
+        'overlap': 3
+    }
+    gdf['category_code'] = gdf['category'].map(category_codes)
+    
+    # Extract time period information
+    time_period = "2018-2019"
+    prediction_horizon = "5-year lookahead (2018-2024)"
+    
+    if metrics_data:
+        metadata = metrics_data.get("metadata", {})
+        test_year_range = metadata.get("test_year_range")
+        if test_year_range and isinstance(test_year_range, list) and len(test_year_range) == 2:
+            time_period = f"{test_year_range[0]}-{test_year_range[1]}"
+        elif "test_years" in metadata:
+            test_years = metadata["test_years"]
+            if isinstance(test_years, (list, tuple)) and len(test_years) == 2:
+                time_period = f"{test_years[0]}-{test_years[1]}"
+        
+        lookahead = metadata.get("lookahead_years", 5)
+        if isinstance(lookahead, int) and test_year_range:
+            pred_end = test_year_range[1] + lookahead
+            prediction_horizon = f"{lookahead}-year lookahead ({test_year_range[0]}-{pred_end})"
+    
+    # Convert to raster for visualization
+    print(f"  Converting {len(gdf):,} points to raster grid...")
+    category_raster, extent = points_to_raster(
+        gdf.geometry.x.values,
+        gdf.geometry.y.values,
+        gdf['category_code'].values,
+        target_resolution=MAP_RESOLUTION
+    )
+    print(f"  Category raster shape: {category_raster.shape}, extent: {extent}")
+    print(f"  Valid (non-NaN) pixels: {np.sum(~np.isnan(category_raster)):,}")
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=MAP_FIGSIZE)
+    
+    # Plot Colombia boundary
+    colombia_gdf.plot(ax=ax, color='white', edgecolor='none', linewidth=1.5, zorder=1)
+    
+    # Define colors for each category
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+    
+    category_colors_rgba = {
+        0: RISK_MAP_COLORS['none'],
+        1: RISK_MAP_COLORS['predicted_only'],
+        2: RISK_MAP_COLORS['observed_only'],
+        3: RISK_MAP_COLORS['overlap']
+    }
+    
+    def rgba_to_hex(rgba):
+        """Convert RGBA tuple to hex color string."""
+        r, g, b = int(rgba[0] * 255), int(rgba[1] * 255), int(rgba[2] * 255)
+        return f'#{r:02x}{g:02x}{b:02x}'
+    
+    category_colors_hex = {
+        0: rgba_to_hex(category_colors_rgba[0]),
+        1: rgba_to_hex(category_colors_rgba[1]),
+        2: rgba_to_hex(category_colors_rgba[2]),
+        3: rgba_to_hex(category_colors_rgba[3])
+    }
+    
+    # Create colormap and normalization
+    colors_list_no_bg = [category_colors_rgba[i] for i in range(1, 4)]
+    cmap_cat = ListedColormap(colors_list_no_bg)
+    bounds = [0.5, 1.5, 2.5, 3.5]
+    norm_cat = BoundaryNorm(bounds, cmap_cat.N)
+    
+    # Create separate raster for background
+    background_raster = np.where(category_raster == 0, 1, np.nan)
+    background_raster_masked = np.ma.masked_where(np.isnan(background_raster), background_raster)
+    
+    # Plot background separately
+    if not background_raster_masked.mask.all():
+        ax.imshow(background_raster_masked,
+                 extent=extent,
+                 cmap=ListedColormap([category_colors_rgba[0]]),
+                 vmin=0, vmax=1,
+                 origin='upper',
+                 interpolation='nearest',
+                 aspect='equal',
+                 alpha=RISK_MAP_ALPHA_BACKGROUND,
+                 zorder=1)
+    
+    # Plot main category raster
+    category_raster_no_bg = np.where(category_raster == 0, np.nan, category_raster)
+    category_raster_masked = np.ma.masked_where(np.isnan(category_raster_no_bg), category_raster_no_bg)
+    
+    im = ax.imshow(category_raster_masked,
+                   extent=extent,
+                   cmap=cmap_cat,
+                   norm=norm_cat,
+                   origin='upper',
+                   interpolation='nearest',
+                   aspect='equal',
+                   zorder=2)
+    
+    # Styling
+    ax.set_xlabel('Longitude', fontsize=FONTSIZE_LABEL)
+    ax.set_ylabel('Latitude', fontsize=FONTSIZE_LABEL)
+    ax.set_title(f'Model C ({model_type.upper()}) Row-Level P@1% Diagnostic Map', 
+                 fontsize=FONTSIZE_TITLE, fontweight='bold', pad=15)
+    
+    # Add description text box
+    description_text = (f"Row-level P@1% diagnostic.\n"
+                       f"Top 1% rows by probability (blue-green),\n"
+                       f"observed positives (cyan), overlap (red).\n"
+                       f"Overlap = same row has both.\n"
+                       f"No pixel deduplication.\n"
+                       f"P@1% = {actual_p1pct:.4f} ({overlap_count:,}/{n_top_k:,})")
+    ax.text(0.98, 0.98, description_text, transform=ax.transAxes, fontsize=FONTSIZE_DESCRIPTION,
+           verticalalignment='top', horizontalalignment='right',
+           bbox=dict(boxstyle='round', facecolor='lightgreen', 
+           alpha=0.9, edgecolor='black', linewidth=1, pad=0.5), zorder=10)
+    
+    # Create legend
+    legend_elements = []
+    if overlap_count > 0:
+        legend_elements.append(Line2D([0], [0], marker='s', color='w', 
+                                    markerfacecolor=category_colors_hex[3], markersize=10, 
+                                    alpha=1.0, label=f'Overlap: predicted + observed (n={overlap_count:,} rows)'))
+    if predicted_only_count > 0:
+        legend_elements.append(Line2D([0], [0], marker='s', color='w', 
+                                    markerfacecolor=category_colors_hex[1], markersize=10, 
+                                    alpha=1.0, label=f'Predicted high-risk only (n={predicted_only_count:,} rows)'))
+    if observed_only_count > 0:
+        legend_elements.append(Line2D([0], [0], marker='s', color='w', 
+                                    markerfacecolor=category_colors_hex[2], markersize=10, 
+                                    alpha=1.0, label=f'Observed positives only (n={observed_only_count:,} rows)'))
+    
+    ax.legend(handles=legend_elements, loc='upper left', fontsize=FONTSIZE_LEGEND, 
+              framealpha=0.95, fancybox=True, shadow=True)
+    
+    # Add time period text box
+    time_text = f"Observation period: {time_period}\nPrediction horizon: {prediction_horizon}\nRow-level (no pixel deduplication)"
+    ax.text(0.02, 0.02, time_text, transform=ax.transAxes, fontsize=FONTSIZE_STATS,
+           verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat', 
+           alpha=0.8, edgecolor='black', linewidth=1), zorder=10)
+    
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+    ax.set_aspect('equal', adjustable='box')
+    
+    plt.tight_layout()
+    
+    # Save PNG
+    png_path = output_dir / f"modelC_{model_type}_p1pct_diagnostic.png"
+    plt.savefig(png_path, dpi=MAP_DPI, bbox_inches='tight')
+    print(f"\nSaved PNG: {png_path}")
+    
+    # Save PDF
+    pdf_path = output_dir / f"modelC_{model_type}_p1pct_diagnostic.pdf"
     plt.savefig(pdf_path, dpi=MAP_DPI, bbox_inches='tight')
     print(f"Saved PDF: {pdf_path}")
     
@@ -1420,6 +1709,148 @@ def create_probability_map(df: pd.DataFrame, country_boundary_path: Optional[Pat
     plt.close()
 
 
+def compute_shap_analysis(
+    model_path: Path,
+    feature_cols: list,
+    data_sources: Dict[str, Path],
+    output_dir: Path,
+    model_type: str,
+    timestamp: str,
+    allow_test_shap: bool = False
+) -> None:
+    """Compute SHAP analysis and generate visualizations.
+    
+    Data source priority:
+    1. earlystop_colombia_win5.parquet (validation set)
+    2. train_colombia_win5.parquet (train set)
+    3. test_colombia_win5.parquet (only if allow_test_shap=True)
+    
+    Args:
+        model_path: Path to trained model pickle file
+        feature_cols: List of feature column names
+        data_sources: Dict with keys 'earlystop', 'train', 'test' pointing to parquet files
+        output_dir: Output directory for SHAP results
+        model_type: Model type (lgbm, rf, brf)
+        timestamp: Timestamp for output files
+        allow_test_shap: If True, allow SHAP on test set (only if earlystop/train unavailable)
+    """
+    if not SHAP_AVAILABLE:
+        raise RuntimeError(
+            "SHAP is not installed. To use SHAP analysis, please install it:\n"
+            "  conda install -c conda-forge shap\n"
+            "or:\n"
+            "  pip install shap"
+        )
+    
+    print("\n" + "=" * 70)
+    print("COMPUTING SHAP ANALYSIS")
+    print("=" * 70)
+    
+    # Load trained model
+    print(f"Loading model from {model_path}...")
+    with open(model_path, 'rb') as f:
+        model = pickle.load(f)
+    
+    # Select data source (priority: earlystop → train → test)
+    data_source_priority = ['earlystop', 'train', 'test']
+    selected_source = None
+    selected_path = None
+    
+    for source in data_source_priority:
+        if source in data_sources and data_sources[source] is not None and data_sources[source].exists():
+            # Check if test set requires explicit flag
+            if source == 'test' and not allow_test_shap:
+                print(f"  Skipping test set (requires --allow_test_shap flag)")
+                continue
+            selected_source = source
+            selected_path = data_sources[source]
+            break
+    
+    if selected_source is None:
+        print("  WARNING: No suitable data source found for SHAP analysis")
+        if 'test' in data_sources and data_sources['test'] is not None and data_sources['test'].exists():
+            print("  Test set available but --allow_test_shap flag not set")
+        return
+    
+    print(f"  Using data source: {selected_source} ({selected_path.name})")
+    
+    # Load feature data (sample 5000 rows with fixed seed)
+    print(f"  Loading feature data from {selected_source}...")
+    
+    # Read full dataset first to allow proper sampling
+    df_full = pd.read_parquet(selected_path, columns=feature_cols)
+    n_total = len(df_full)
+    print(f"  Total rows in {selected_source}: {n_total:,}")
+    
+    # Sample exactly 5000 rows (or all if less than 5000)
+    n_sample = min(5000, n_total)
+    print(f"  Sampling {n_sample:,} rows for SHAP analysis (seed=42)...")
+    df_sample = df_full.sample(n=n_sample, random_state=42)
+    
+    # Convert to float32 for SHAP (memory efficiency)
+    X_shap = df_sample[feature_cols].astype(np.float32).values
+    print(f"  Feature matrix shape: {X_shap.shape}")
+    print(f"  Memory: {X_shap.nbytes / 1024**2:.1f} MB")
+    
+    del df_full, df_sample
+    
+    # Compute SHAP values
+    print(f"  Computing SHAP values using TreeExplainer...")
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X_shap, check_additivity=False)
+    print(f"  SHAP values computed: shape {shap_values.shape}")
+    
+    # For binary classification, shap_values might be a list [neg_class, pos_class]
+    # or a single array for positive class - handle both cases
+    if isinstance(shap_values, list):
+        # Use positive class SHAP values (index 1)
+        shap_values_pos = shap_values[1] if len(shap_values) > 1 else shap_values[0]
+    else:
+        shap_values_pos = shap_values
+    
+    # Generate SHAP summary plot
+    print(f"  Generating SHAP summary plot...")
+    plt.figure(figsize=(10, 8))
+    shap.summary_plot(shap_values_pos, X_shap, feature_names=feature_cols, show=False, plot_type="dot")
+    plt.tight_layout()
+    
+    summary_plot_path = output_dir / f"modelC_{model_type}_shap_summary_{timestamp}.png"
+    plt.savefig(summary_plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved SHAP summary plot: {summary_plot_path.name}")
+    
+    # Compute feature importance metrics
+    print(f"  Computing feature importance metrics...")
+    
+    # Mean absolute SHAP value per feature
+    mean_abs_shap = np.abs(shap_values_pos).mean(axis=0)
+    
+    # Mean SHAP value per feature (signed)
+    mean_shap = shap_values_pos.mean(axis=0)
+    
+    # Percentage of positive SHAP values per feature
+    pct_shap_positive = (shap_values_pos > 0).mean(axis=0) * 100
+    
+    # Create DataFrame with top 20 features
+    shap_importance_df = pd.DataFrame({
+        'feature': feature_cols,
+        'mean_abs_shap': mean_abs_shap,
+        'mean_shap': mean_shap,
+        'pct_shap_positive': pct_shap_positive
+    }).sort_values('mean_abs_shap', ascending=False).head(20)
+    
+    # Save to CSV
+    shap_csv_path = output_dir / f"modelC_{model_type}_shap_top20_{timestamp}.csv"
+    shap_importance_df.to_csv(shap_csv_path, index=False)
+    print(f"  Saved top 20 features: {shap_csv_path.name}")
+    
+    print(f"\n  Top 10 features by mean absolute SHAP:")
+    for idx, row in shap_importance_df.head(10).iterrows():
+        print(f"    {row['feature']:40s}: {row['mean_abs_shap']:.4f} (mean: {row['mean_shap']:+.4f}, {row['pct_shap_positive']:.1f}% positive)")
+    
+    print("  SHAP analysis completed.")
+
+
 def find_latest_file(pattern: str, search_dir: Path, exclude_substr: Optional[str] = None) -> Optional[Path]:
     """Find the most recent file matching a pattern in a directory.
     
@@ -1530,6 +1961,16 @@ def main() -> None:
         type=str,
         default=None,
         help='Path to original test_colombia_win5.parquet file (for loading WDPA_b1 data). If not provided, will try to auto-discover.'
+    )
+    parser.add_argument(
+        '--allow_test_shap',
+        action='store_true',
+        help='Allow SHAP analysis on test set if earlystop/train data unavailable (default: False)'
+    )
+    parser.add_argument(
+        '--skip_shap',
+        action='store_true',
+        help='Skip SHAP analysis (default: False)'
     )
     
     args = parser.parse_args()
@@ -1644,6 +2085,72 @@ def main() -> None:
             print(f"  For accurate results, provide --test_parquet path to original test data")
             test_parquet_path = None
     
+    # Auto-discover model pickle file for SHAP (unless --skip_shap)
+    model_path = None
+    if not args.skip_shap:
+        print("\nAuto-discovering trained model file for SHAP analysis...")
+        model_pattern = f"modelC_{model_type}_win5_*.pkl"
+        model_candidates = []
+        if scratch_root is not None:
+            model_candidates.append(scratch_root / "data/ml/models")
+        model_candidates.append(repo_root / "data/ml/models")
+        
+        model_path = find_latest_file_in_dirs(model_pattern, model_candidates)
+        if model_path is None:
+            print(f"  WARNING: Could not find trained model file matching {model_pattern}")
+            print(f"  SHAP analysis will be skipped")
+        else:
+            print(f"  Found: {model_path}")
+    
+    # Auto-discover data sources for SHAP (earlystop, train)
+    shap_data_sources = {}
+    if not args.skip_shap and model_path is not None:
+        print("\nAuto-discovering data sources for SHAP analysis...")
+        
+        # Try to find earlystop_colombia_win5.parquet
+        earlystop_candidates = []
+        if scratch_root is not None:
+            earlystop_candidates.extend([
+                scratch_root / "outputs/Results/earlystop_colombia_win5.parquet",
+                scratch_root / "data/ml/earlystop_colombia_win5.parquet"
+            ])
+        earlystop_candidates.extend([
+            repo_root / "outputs/Results/earlystop_colombia_win5.parquet",
+            repo_root / "data/ml/earlystop_colombia_win5.parquet"
+        ])
+        
+        for cand in earlystop_candidates:
+            if cand.exists():
+                shap_data_sources['earlystop'] = cand
+                print(f"  Found earlystop: {cand}")
+                break
+        
+        # Try to find train_colombia_win5.parquet
+        train_candidates = []
+        if scratch_root is not None:
+            train_candidates.extend([
+                scratch_root / "outputs/Results/train_colombia_win5.parquet",
+                scratch_root / "data/ml/train_colombia_win5.parquet"
+            ])
+        train_candidates.extend([
+            repo_root / "outputs/Results/train_colombia_win5.parquet",
+            repo_root / "data/ml/train_colombia_win5.parquet"
+        ])
+        
+        for cand in train_candidates:
+            if cand.exists():
+                shap_data_sources['train'] = cand
+                print(f"  Found train: {cand}")
+                break
+        
+        # Add test as fallback (only used if --allow_test_shap)
+        if test_parquet_path is not None:
+            shap_data_sources['test'] = test_parquet_path
+            if args.allow_test_shap:
+                print(f"  Found test (allowed with --allow_test_shap): {test_parquet_path}")
+            else:
+                print(f"  Found test (disabled, use --allow_test_shap to enable): {test_parquet_path}")
+    
     # Resolve paths
     metrics_path = metrics_path.resolve()
     parquet_path = parquet_path.resolve()
@@ -1701,7 +2208,67 @@ def main() -> None:
     create_metrics_table(metrics_data, output_dir, model_type)
     create_pr_curve(df, metrics_data, output_dir, model_type)
     create_risk_map(df, country_boundary_path, output_dir, model_type, metrics_data, test_parquet_path)
+    create_p1pct_diagnostic_map(df, country_boundary_path, output_dir, model_type, metrics_data)
     create_probability_map(df, country_boundary_path, output_dir, model_type, parquet_path, metrics_data)
+    
+    # SHAP analysis (if model and data sources available)
+    if not args.skip_shap and model_path is not None and shap_data_sources:
+        # Extract timestamp from metrics or use current time
+        timestamp = metrics_data.get("metadata", {}).get("timestamp", "")
+        if not timestamp:
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Extract feature columns from metrics
+        feature_cols = metrics_data.get("metadata", {}).get("features", [])
+        if not feature_cols:
+            print("\n" + "!" * 70)
+            print("WARNING: Feature columns not found in metrics JSON")
+            print("SHAP analysis will be skipped")
+            print("!" * 70)
+        else:
+            try:
+                compute_shap_analysis(
+                    model_path=model_path,
+                    feature_cols=feature_cols,
+                    data_sources=shap_data_sources,
+                    output_dir=output_dir,
+                    model_type=model_type,
+                    timestamp=timestamp,
+                    allow_test_shap=args.allow_test_shap
+                )
+            except RuntimeError as e:
+                # Handle SHAP not installed more gracefully
+                if "SHAP is not installed" in str(e):
+                    print("\n" + "!" * 70)
+                    print("WARNING: SHAP analysis skipped - SHAP is not installed")
+                    print("!" * 70)
+                    print(f"  {e}")
+                    print("\n  To enable SHAP analysis, install SHAP:")
+                    print("    conda install -c conda-forge shap")
+                    print("    or: pip install shap")
+                    print("!" * 70)
+                else:
+                    # Re-raise other RuntimeErrors
+                    raise
+            except Exception as e:
+                print("\n" + "!" * 70)
+                print(f"WARNING: SHAP analysis failed: {e}")
+                print("!" * 70)
+                import traceback
+                traceback.print_exc()
+    elif args.skip_shap:
+        print("\n" + "=" * 70)
+        print("SHAP ANALYSIS SKIPPED (--skip_shap flag set)")
+        print("=" * 70)
+    elif model_path is None:
+        print("\n" + "=" * 70)
+        print("SHAP ANALYSIS SKIPPED (model file not found)")
+        print("=" * 70)
+    elif not shap_data_sources:
+        print("\n" + "=" * 70)
+        print("SHAP ANALYSIS SKIPPED (no data sources found)")
+        print("=" * 70)
     
     print("\n" + "=" * 70)
     print("COMPLETE")
