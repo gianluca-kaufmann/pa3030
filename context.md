@@ -77,17 +77,20 @@ All rasters are preprocessed, aligned, and optimized before panel construction.
    
 3. Merging
    └─> Panel construction (pixel-year observations, Parquet format)
+
+4. Feature engineering
+   └─> spatial features (Distance, Smoothed neighbouring averages)
    
-4. ML Preprocessing
-   └─> Train/validation/test splits, feature engineering, spatial features
+5. ML Preprocessing
+   └─> Train/validation/test splits
    
-5. Model Training
+6. Model Training
    └─> Hyperparameter tuning → Final model training → Out-of-fold predictions
    
-6. Evaluation
+7. Evaluation
    └─> Temporal CV, spatial CV, benchmarking, probability calibration
    
-7. Results Generation
+8. Results Generation
    └─> Metrics tables, PR curves, risk maps, probability maps
 ```
 
@@ -97,9 +100,9 @@ The project includes three complementary modeling approaches:
 
 **Model 1 (Full):** South America dataset with standard features (~350M pixel-years)
 
-**Model C (Colombia):** Colombia-only subset for rapid validation (~7M pixel-years)
+**Model C (Colombia):** Colombia-only subset for rapid validation
 
-**Model E (Embeddings):** Uses satellite image embeddings in addition to standard features
+**Model E (Embeddings):** Uses satellite image embeddings from AlphaEarth Foundations
 
 For each variant, the following algorithms are evaluated:
 - **LightGBM** (primary model) – scales to hundreds of millions of rows, handles extreme imbalance
@@ -187,7 +190,7 @@ This project is built with:
 - Clear separation of data / code / outputs
 - Comprehensive logging and validation checks
 
-**Goal:** An external researcher or AI agent can fully understand, audit, and extend the project without direct supervision.
+**Goal:** An external researcher can fully understand, audit, and extend the project without direct supervision.
 
 ## 12. Key Technical Features
 
@@ -211,6 +214,7 @@ This project is built with:
 
 **Intended Use:**
 - Strategic conservation planning ("where is protection likely next?")
+- Business and Investment strategy (Transition Risks)
 - Scenario analysis and policy counterfactuals
 - Research on environmental policy dynamics
 
@@ -247,7 +251,7 @@ These limitations are explicitly discussed in the thesis.
 
 ## 15. Roadmap
 
-Planned or optional extensions:
+Planned:
 - Forward prediction to 2030
 - Political and institutional covariates
 - Embedding-based satellite features at scale

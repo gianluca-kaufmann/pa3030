@@ -122,10 +122,10 @@ def report_memory_usage(label: str = "") -> None:
 
 def convert_numpy_types(obj: Any) -> Any:
     """Recursively convert NumPy types to native Python types for JSON serialization."""
-    if isinstance(obj, (np.integer, np.int_, np.intc, np.intp, np.int8, np.int16, np.int32, 
+    if isinstance(obj, (np.integer, np.intc, np.intp, np.int8, np.int16, np.int32, 
                         np.int64, np.uint8, np.uint16, np.uint32, np.uint64)):
         return int(obj)
-    elif isinstance(obj, (np.floating, np.float_, np.float16, np.float32, np.float64)):
+    elif isinstance(obj, (np.floating, np.float16, np.float32, np.float64)):
         return float(obj)
     elif isinstance(obj, np.bool_):
         return bool(obj)
@@ -773,15 +773,19 @@ def train_single_cv_fold(
     print(f"  Generating OOF predictions on earlystop set ({n_earlystop_samples:,} samples)...")
     y_earlystop_proba = lgb_model.predict(X_earlystop, num_iteration=best_iteration if best_iteration else None).astype(np.float32)
     
-    # Store OOF predictions for this fold
+    # Store OOF predictions for this fold (make copies before cleanup)
     oof_predictions = {
         "y_true": y_earlystop.copy(),
         "y_pred_proba": y_earlystop_proba.copy(),
         "fold_idx": np.full(len(y_earlystop), fold_idx, dtype=np.int32)
     }
     
-    # Clean up earlystop data and model after generating predictions
-    del X_earlystop, y_earlystop, earlystop_years_array, lgb_model, y_earlystop_proba; gc.collect()
+    # Clean up earlystop data and model immediately after generating predictions
+    # This is critical for memory management, especially for large folds
+    del X_earlystop, y_earlystop, earlystop_years_array
+    del lgb_model, y_earlystop_proba
+    gc.collect()
+    report_memory_usage(f"after fold {fold_idx+1} predictions")
     
     if use_wandb:
         wandb.log({
@@ -832,7 +836,7 @@ def aggregate_cv_metrics(cv_results: list[Dict[str, Any]]) -> Dict[str, Any]:
 def phase1_training(
     train_path: Path, earlystop_path: Path, params_path: Optional[Path], feature_cols: list, keep_cols_train: list,
     best_params: Dict[str, Any], timestamp: str, model_dir: Path, output_dir: Path, use_wandb: bool, target_col: str,
-    cv_mode: str = "full", use_time_weights: bool = True,
+    cv_mode: str = "fold3", use_time_weights: bool = True,
 ) -> tuple[Path, Dict[str, Any], Dict[str, Any], float, float, int, int, int, Dict[str, Any], Dict[str, Any]]:
     """
     Phase 1: Training with temporal cross-validation.
@@ -881,8 +885,9 @@ def phase1_training(
         else:
             raise ValueError(f"Invalid cv_mode: {cv_mode}. Must be one of: full, fold3, none")
         
-        # Collect OOF predictions from all folds for calibration
-        all_oof_predictions = []
+        # Save OOF predictions incrementally to avoid memory accumulation
+        # Use temporary files for each fold, then concatenate at the end
+        temp_prediction_files = []
         
         for fold_idx in folds_to_run:
             train_years, earlystop_years = CV_FOLDS[fold_idx]
@@ -891,44 +896,74 @@ def phase1_training(
                 train_years, earlystop_years, fold_idx, best_params, use_wandb, use_time_weights
             )
             
-            # Collect OOF predictions if available (skip if fold was skipped)
+            # Save OOF predictions immediately to disk if available (skip if fold was skipped)
             if not fold_result.get("skipped", False) and "oof_predictions" in fold_result:
-                all_oof_predictions.append(fold_result["oof_predictions"])
-                # Remove predictions from fold_result to avoid bloating JSON (they're saved separately)
-                fold_result_clean = {k: v for k, v in fold_result.items() if k != "oof_predictions"}
-                cv_results.append(fold_result_clean)
-            else:
-                cv_results.append(fold_result)
-            
-            gc.collect()
-        
-        # Save temporal CV OOF predictions for calibration
-        if all_oof_predictions:
-            print(f"\nSaving temporal CV OOF predictions ({len(all_oof_predictions)} folds)...")
-            try:
-                # Concatenate predictions from all folds
-                y_true_all = np.concatenate([pred["y_true"] for pred in all_oof_predictions])
-                y_pred_proba_all = np.concatenate([pred["y_pred_proba"] for pred in all_oof_predictions])
-                fold_idx_all = np.concatenate([pred["fold_idx"] for pred in all_oof_predictions])
+                oof_pred = fold_result["oof_predictions"]
+                # Save this fold's predictions to a temporary file immediately
+                temp_file = output_dir / f"model1_lgbm_win5_temporal_cv_fold{fold_idx+1}_temp_{timestamp}.parquet"
+                try:
+                    fold_df = pd.DataFrame({
+                        "y_true": oof_pred["y_true"],
+                        "y_pred_proba": oof_pred["y_pred_proba"],
+                        "fold_idx": oof_pred["fold_idx"]
+                    })
+                    fold_df.to_parquet(temp_file, index=False, engine="pyarrow")
+                    temp_prediction_files.append(temp_file)
+                    print(f"  Saved fold {fold_idx+1} OOF predictions to temporary file: {temp_file.name}")
+                except Exception as e:
+                    print(f"  WARNING: Failed to save fold {fold_idx+1} OOF predictions: {e}")
+                    import traceback
+                    traceback.print_exc()
                 
-                # Create DataFrame and save to parquet with temporal CV naming pattern
-                temporal_cv_predictions_df = pd.DataFrame({
-                    "y_true": y_true_all,
-                    "y_pred_proba": y_pred_proba_all,
-                    "fold_idx": fold_idx_all
-                })
+                # Remove predictions from fold_result to free memory immediately
+                del fold_result["oof_predictions"]
+                del oof_pred
+                gc.collect()
+            
+            # Remove predictions from fold_result to avoid bloating JSON (they're saved separately)
+            fold_result_clean = {k: v for k, v in fold_result.items() if k != "oof_predictions"}
+            cv_results.append(fold_result_clean)
+            
+            # Aggressive cleanup between folds to prevent memory accumulation
+            del fold_result, fold_result_clean
+            gc.collect()
+            report_memory_usage(f"after fold {fold_idx+1}")
+        
+        # Concatenate all fold predictions from temporary files
+        if temp_prediction_files:
+            print(f"\nConcatenating temporal CV OOF predictions from {len(temp_prediction_files)} folds...")
+            try:
+                # Read and concatenate all temporary files
+                dfs = []
+                for temp_file in temp_prediction_files:
+                    df = pd.read_parquet(temp_file, engine="pyarrow")
+                    dfs.append(df)
+                    del df
+                
+                temporal_cv_predictions_df = pd.concat(dfs, ignore_index=True)
+                del dfs
+                gc.collect()
                 
                 temporal_cv_predictions_path = output_dir / f"model1_lgbm_win5_temporal_cv_predictions_{timestamp}.parquet"
                 temporal_cv_predictions_df.to_parquet(temporal_cv_predictions_path, index=False, engine="pyarrow")
                 print(f"  Temporal CV OOF predictions saved: {temporal_cv_predictions_path.name}")
                 print(f"  Total samples: {len(temporal_cv_predictions_df):,}")
-                print(f"  Folds: {sorted(np.unique(fold_idx_all).tolist())}")
+                fold_idx_unique = sorted(temporal_cv_predictions_df["fold_idx"].unique().tolist())
+                print(f"  Folds: {fold_idx_unique}")
                 
                 # Clean up
-                del temporal_cv_predictions_df, y_true_all, y_pred_proba_all, fold_idx_all, all_oof_predictions
+                del temporal_cv_predictions_df
                 gc.collect()
+                
+                # Delete temporary files
+                for temp_file in temp_prediction_files:
+                    try:
+                        temp_file.unlink()
+                        print(f"  Deleted temporary file: {temp_file.name}")
+                    except Exception as e:
+                        print(f"  WARNING: Failed to delete temporary file {temp_file.name}: {e}")
             except Exception as e:
-                print(f"  WARNING: Failed to save temporal CV OOF predictions: {e}")
+                print(f"  WARNING: Failed to concatenate temporal CV OOF predictions: {e}")
                 import traceback
                 traceback.print_exc()
                 # Don't exit - continue with training
@@ -976,8 +1011,17 @@ def phase1_training(
                 print(f"  Using default iteration from params: {chosen_iteration}")
         elif cv_mode == "fold3":
             if fold3_best_iteration is not None:
-                chosen_iteration = fold3_best_iteration
-                print(f"\nUsing fold3_best_iteration: {chosen_iteration}")
+                # Use weighted avg * 1.05, clamped by fold3 (same logic as full mode)
+                # For fold3 mode, weighted avg is just fold3_best_iteration
+                weighted_avg = fold3_best_iteration
+                chosen_iteration = int(np.round(weighted_avg * 1.05))
+                print(f"\nFold3 best_iteration: {fold3_best_iteration}")
+                print(f"Weighted average (before 1.05x): {weighted_avg:.2f}")
+                print(f"Chosen iteration (weighted avg * 1.05): {chosen_iteration}")
+                
+                # Apply max constraint with fold3_best_iteration (clamp by fold3)
+                chosen_iteration = max(chosen_iteration, fold3_best_iteration)
+                print(f"After max with fold3_best_iteration ({fold3_best_iteration}): {chosen_iteration}")
             else:
                 # Fallback: use default if fold3 best_iteration not found (e.g., fold3 was skipped)
                 fold3_result = next((f for f in cv_results if f.get("fold_idx") == 2), None)
@@ -1428,7 +1472,7 @@ def phase2_testing(
         wandb.finish()
 
 
-def main(timestamp: str, cv_mode: str = "full", use_time_weights: bool = True) -> None:
+def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True) -> None:
     start_time = time.time()
     repo_root = Path(__file__).resolve().parents[3]
     train_path = resolve_parquet_file("train_win5.parquet")
@@ -1520,7 +1564,7 @@ if __name__ == "__main__":
         "--cv-mode",
         type=str,
         choices=["full", "fold3", "none"],
-        default="none",
+        default="fold3",
         help="Cross-validation mode: 'full' (run all 3 folds), 'fold3' (run only fold 3 for fast dev), 'none' (skip CV)"
     )
     parser.add_argument(
