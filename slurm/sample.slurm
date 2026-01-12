@@ -41,7 +41,7 @@ echo "Starting modelC_sample script..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/colombia/ML/ml_preprocessing/modelC_sample"" ] || {
+[ -f "scripts/colombia/ML/ml_preprocessing/modelC_sample" ] || {
   echo "ERROR: modelC_sample not found"
   echo "NOTE: modelC_sample script is in ml_preprocessing/ directory"
   find scripts -maxdepth 4 -type f -name "modelC_sample"

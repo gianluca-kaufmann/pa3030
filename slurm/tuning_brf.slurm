@@ -17,7 +17,7 @@ mkdir -p "$SCRATCH/outputs"
 mkdir -p "$SCRATCH/outputs/Tables"
 
 #------------------------------------------------------------------------------
-# Load modules
+# Load modules 
 #------------------------------------------------------------------------------
 module purge
 module load stack/2024-06
