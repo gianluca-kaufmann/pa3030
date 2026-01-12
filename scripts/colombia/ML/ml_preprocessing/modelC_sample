@@ -5,7 +5,7 @@ Sampling script for modelC tuning sample (Colombia dataset).
 
 Rules
 -----
-- Keep all positives (transition_01 == 1)
+- Keep all positives (transition_01_win5 == 1)
 - Cap total negatives at ~300,000 (sample uniformly across years)
 - Target total tuning size ≈ 350k–400k rows
 - Year 2000 excluded to avoid treating existing PAs as transitions
@@ -16,6 +16,7 @@ Notes
 - Uniform sampling across years ensures balanced temporal distribution
 - Random sampling for simplicity (no hard negatives)
 - Used by both Random Forest and LightGBM hyperparameter tuning scripts
+- Uses 5-year lookahead target (transition_01_win5) from merged_panel_colombia_final_win5.parquet
 """
 
 from __future__ import annotations
@@ -26,32 +27,34 @@ import time
 from pathlib import Path
 
 import duckdb
+import wandb
 
 # Configuration
 RANDOM_STATE = 42
 MAX_TOTAL_NEGATIVES = 300_000  # Cap total negatives at ~300k
+WANDB_PROJECT = "ml-preprocessing"
 
 
 def resolve_input() -> Path:
-    """Locate merged_panel_colombia_final.parquet (prefer $SCRATCH if present)."""
+    """Locate merged_panel_colombia_final_win5.parquet (prefer $SCRATCH if present)."""
     repo_root = Path(__file__).resolve().parents[4]
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
 
     candidates = []
     if scratch_root is not None:
         # Check outputs/Results first (standard Euler location from colombia_features script)
-        candidates.append(scratch_root / "outputs/Results/merged_panel_colombia_final.parquet")
+        candidates.append(scratch_root / "outputs/Results/merged_panel_colombia_final_win5.parquet")
         # Also check data/ml location
-        candidates.append(scratch_root / "data/ml/merged_panel_colombia_final.parquet")
-    candidates.append(repo_root / "outputs/Results/merged_panel_colombia_final.parquet")
-    candidates.append(repo_root / "data/ml/merged_panel_colombia_final.parquet")
+        candidates.append(scratch_root / "data/ml/merged_panel_colombia_final_win5.parquet")
+    candidates.append(repo_root / "outputs/Results/merged_panel_colombia_final_win5.parquet")
+    candidates.append(repo_root / "data/ml/merged_panel_colombia_final_win5.parquet")
 
     for cand in candidates:
         if cand.exists():
             return cand
 
     # Provide detailed error message with all checked paths
-    error_msg = "merged_panel_colombia_final.parquet not found in expected locations.\n"
+    error_msg = "merged_panel_colombia_final_win5.parquet not found in expected locations.\n"
     error_msg += "\nChecked locations:\n"
     for cand in candidates:
         error_msg += f"  - {cand}\n"
@@ -96,19 +99,19 @@ def configure_duckdb(con: duckdb.DuckDBPyConnection) -> None:
     print(f"Running on: {'Euler cluster' if is_euler else 'local machine'}")
 
 
-def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: str) -> None:
+def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: str, use_wandb: bool = False) -> None:
     """Log per-year counts and ratios."""
     escaped = str(parquet_path).replace("'", "''")
     rows = con.execute(
         f"""
         SELECT
             year,
-            SUM(transition_01) AS positives,
-            SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS negatives,
+            SUM(transition_01_win5) AS positives,
+            SUM(CASE WHEN transition_01_win5 = 0 THEN 1 ELSE 0 END) AS negatives,
             COUNT(*) AS total,
-            CASE WHEN COUNT(*) > 0 THEN SUM(transition_01)::DOUBLE / COUNT(*) ELSE 0 END AS pos_ratio,
-            CASE WHEN SUM(transition_01) > 0 
-                 THEN SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END)::DOUBLE / SUM(transition_01)
+            CASE WHEN COUNT(*) > 0 THEN SUM(transition_01_win5)::DOUBLE / COUNT(*) ELSE 0 END AS pos_ratio,
+            CASE WHEN SUM(transition_01_win5) > 0 
+                 THEN SUM(CASE WHEN transition_01_win5 = 0 THEN 1 ELSE 0 END)::DOUBLE / SUM(transition_01_win5)
                  ELSE 0 END AS neg_pos_ratio
         FROM read_parquet('{escaped}')
         GROUP BY year
@@ -120,9 +123,41 @@ def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: s
     for year, pos, neg, total, pos_ratio, neg_pos_ratio in rows:
         print(f"  {year}: total={total:,} pos={pos:,} neg={neg:,} | pos_ratio={pos_ratio:.5f} neg/pos={neg_pos_ratio:.1f}")
 
+    if use_wandb:
+        wandb.log({f"{label.lower().replace(' ', '_')}/per_year_transition_01_win5": [
+            dict(year=y, positives=p, negatives=n, total=t, pos_ratio=r, neg_pos_ratio=npr) 
+            for y, p, n, t, r, npr in rows
+        ]})
+
 
 def main() -> None:
     start_time = time.time()
+
+    wandb_api_key = os.environ.get("WANDB_API_KEY")
+    wandb_entity = os.environ.get("WANDB_ENTITY")
+    if not wandb_api_key:
+        print("Warning: WANDB_API_KEY not found in environment")
+    if not wandb_entity:
+        print("Warning: WANDB_ENTITY not found in environment (will use default)")
+    
+    use_wandb = False
+    try:
+        print("Initializing Weights & Biases...")
+        wandb.init(
+            project=WANDB_PROJECT,
+            entity=wandb_entity,
+            name=f"modelC_sample_{time.strftime('%Y%m%d_%H%M%S')}",
+            config={
+                "random_state": RANDOM_STATE,
+                "max_total_negatives": MAX_TOTAL_NEGATIVES,
+                "sampling_method": "uniform_across_years",
+                "exclude_year": 2000,
+            },
+        )
+        use_wandb = True
+        print("W&B connected\n")
+    except Exception as err:
+        print(f"W&B initialization failed: {err}\n")
 
     repo_root = Path(__file__).resolve().parents[4]
     input_path = resolve_input()
@@ -162,8 +197,8 @@ def main() -> None:
             year_counts AS (
                 SELECT
                     year,
-                    SUM(transition_01) AS pos_count,
-                    SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS neg_count
+                    SUM(transition_01_win5) AS pos_count,
+                    SUM(CASE WHEN transition_01_win5 = 0 THEN 1 ELSE 0 END) AS neg_count
                 FROM base
                 GROUP BY year
             ),
@@ -186,7 +221,7 @@ def main() -> None:
             ),
             positives AS (
                 -- Keep all positives (no sampling)
-                SELECT * FROM base WHERE transition_01 = 1
+                SELECT * FROM base WHERE transition_01_win5 = 1
             ),
             -- Prepare negative pool with per-year budgets and random ordering
             neg_candidates AS (
@@ -196,7 +231,7 @@ def main() -> None:
                     random() AS u
                 FROM base b
                 INNER JOIN neg_budget nb ON b.year = nb.year
-                WHERE b.transition_01 = 0 AND nb.year_neg_budget > 0
+                WHERE b.transition_01_win5 = 0 AND nb.year_neg_budget > 0
             ),
             -- Rank negatives randomly within each year
             ranked_negs AS (
@@ -237,7 +272,7 @@ def main() -> None:
         print(f"Sample written in {time.time() - sample_start:.1f}s")
 
         # Log counts
-        log_year_counts(con, output_path, "TUNING_SAMPLE")
+        log_year_counts(con, output_path, "TUNING_SAMPLE", use_wandb)
 
         # Check total rows
         total_rows = con.execute(
@@ -252,8 +287,8 @@ def main() -> None:
             f"""
             SELECT
                 year,
-                SUM(transition_01) AS pos_count,
-                SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS neg_count
+                SUM(transition_01_win5) AS pos_count,
+                SUM(CASE WHEN transition_01_win5 = 0 THEN 1 ELSE 0 END) AS neg_count
             FROM read_parquet('{escaped_out}')
             GROUP BY year
             ORDER BY year
@@ -267,8 +302,8 @@ def main() -> None:
         overall_stats = con.execute(
             f"""
             SELECT
-                SUM(transition_01) AS total_pos,
-                SUM(CASE WHEN transition_01 = 0 THEN 1 ELSE 0 END) AS total_neg
+                SUM(transition_01_win5) AS total_pos,
+                SUM(CASE WHEN transition_01_win5 = 0 THEN 1 ELSE 0 END) AS total_neg
             FROM read_parquet('{escaped_out}')
             """
         ).fetchone()
@@ -280,13 +315,28 @@ def main() -> None:
         print(f"  Negatives: {total_neg:,} (capped at {MAX_TOTAL_NEGATIVES:,})")
         print(f"  Ratio (neg/pos): {neg_pos_ratio:.2f}")
         print(f"  Total size: {total_pos + total_neg:,} rows")
+
+        if use_wandb:
+            wandb.log({
+                "sample/total_rows": total_rows,
+                "sample/total_positives": total_pos,
+                "sample/total_negatives": total_neg,
+                "sample/neg_pos_ratio": neg_pos_ratio,
+                "sample/max_total_negatives": MAX_TOTAL_NEGATIVES,
+                "timing/total_seconds": time.time() - start_time,
+            })
         
         print(f"\nDone. Total time: {time.time() - start_time:.1f}s")
 
     except Exception as e:
         error_msg = f"{type(e).__name__}: {e}"
         print(f"\nERROR: {error_msg}")
+        if use_wandb:
+            wandb.log({"status": "failed", "error": error_msg})
         raise
+    finally:
+        if use_wandb:
+            wandb.finish()
 
 
 if __name__ == "__main__":

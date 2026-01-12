@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=tuning
+#SBATCH --job-name=tuning_rf
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
@@ -41,13 +41,13 @@ echo "Starting modelC_tuning_rf script..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/colombia/ML/training/modelC_tuning_rf" ] || {
+[ -f "scripts/colombia/ML/tuning/modelC_tuning_rf" ] || {
   echo "ERROR: modelC_tuning_rf not found"
-  echo "NOTE: modelC_tuning_rf script is in training/ directory"
+  echo "NOTE: modelC_tuning_rf script is in tuning/ directory"
   find scripts -maxdepth 4 -type f -name "modelC_tuning_rf"
   exit 1
 }
 # Run the script
-python "scripts/colombia/ML/training/modelC_tuning_rf"
+python "scripts/colombia/ML/tuning/modelC_tuning_rf"
 
 echo "modelC_tuning_rf script finished."

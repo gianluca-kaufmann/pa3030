@@ -4,11 +4,11 @@
 
 Purpose: Perform comprehensive hyperparameter tuning for a Random Forest model using
          the Colombia-specific tuning dataset (modelC_tuning_colombia.parquet)
-         with per-year sampling and strict temporal split
+         with strict temporal split
          (train: year <= 2014, earlystop: 2015 <= year <= 2017).
 
 Input:   `modelC_tuning_colombia.parquet`
-Output:  - rf_best_params.json
+Output:  - rf_best_params.json (saved to training/ directory for use by modelC_RF)
 
 Features:
 - Expanded hyperparameter search space for better optimization
@@ -99,16 +99,20 @@ EXCLUDE_COLS = {
 # RandomizedSearchCV configuration
 N_ITER_RF = int(os.environ.get("N_ITER_RF", "100"))  # Default 100 iterations for RF
 
+# Temporal sample weights configuration
+USE_TIME_WEIGHTS = (os.environ.get("USE_TIME_WEIGHTS", "0") == "1")
+
 # Random Forest parameter grid
 RF_PARAM_GRID = {
     # Use 1000 for final training if feasible (not included here to keep tuning faster)
     "n_estimators": [200, 500],
     "max_depth": [15, 20, 30, 40, None],
     "min_samples_leaf": [5, 10, 20, 50],
-    "min_samples_split": [2, 10, 50],
+    "min_samples_split": [10, 50, 100],
     "max_features": ["sqrt", "log2", 0.3, 0.5],
     "bootstrap": [True],
     "class_weight": ["balanced_subsample"],
+    "criterion": ["gini", "log_loss"],
 }
 
 # Parallelism configuration
@@ -176,6 +180,30 @@ def get_feature_columns(df: pd.DataFrame) -> list:
         col for col in numeric_cols if col.lower() not in {c.lower() for c in EXCLUDE_COLS}
     ]
     return feature_cols
+
+
+def compute_temporal_weights(years: np.ndarray, min_year: int, max_year: int) -> np.ndarray:
+    """
+    Compute temporal sample weights linearly scaled from 0.5 at min_year to 1.0 at max_year.
+    
+    Args:
+        years: Array of year values
+        min_year: Minimum year (weight = 0.5)
+        max_year: Maximum year (weight = 1.0)
+    
+    Returns:
+        Array of weights, capped within [0.5, 1.0]
+    """
+    years = np.asarray(years, dtype=float)
+    # Linear scaling: weight = 0.5 + 0.5 * (year - min_year) / (max_year - min_year)
+    if max_year == min_year:
+        # Edge case: all years are the same
+        weights = np.full_like(years, 1.0)
+    else:
+        weights = 0.5 + 0.5 * (years - min_year) / (max_year - min_year)
+    # Cap weights within [0.5, 1.0]
+    weights = np.clip(weights, 0.5, 1.0)
+    return weights
 
 
 def resolve_tuning_parquet() -> Path:
@@ -347,6 +375,17 @@ def main() -> None:
     print(f"\nTrain set: {len(df_train):,} rows")
     print(f"Earlystop set:   {len(df_earlystop):,} rows")
 
+    # Validate that both splits are non-empty
+    if len(df_train) == 0 or len(df_earlystop) == 0:
+        available_years = sorted(df_clean["year"].unique())
+        raise ValueError(
+            f"Empty split detected. Train set: {len(df_train):,} rows, "
+            f"Earlystop set: {len(df_earlystop):,} rows.\n"
+            f"Expected train: year <= {TRAIN_YEAR_MAX}, "
+            f"earlystop: {EARLYSTOP_YEAR_MIN} <= year <= {EARLYSTOP_YEAR_MAX}.\n"
+            f"Available years in dataset: {available_years}"
+        )
+
     # Check years in each split
     train_years = sorted(df_train["year"].unique())
     earlystop_years = sorted(df_earlystop["year"].unique())
@@ -381,10 +420,12 @@ def main() -> None:
     # Training set
     y_train = (df_train[target_col] > 0).astype(np.int8)
     X_train = df_train[feature_cols]
+    years_train = df_train["year"].values.copy()
 
     # Earlystop set
     y_earlystop = (df_earlystop[target_col] > 0).astype(np.int8)
     X_earlystop = df_earlystop[feature_cols]
+    years_earlystop = df_earlystop["year"].values.copy()
 
     print(f"\nTrain feature matrix shape: {X_train.shape}")
     print(f"Train target shape: {y_train.shape}")
@@ -406,6 +447,7 @@ def main() -> None:
     # -1 indicates train, 0 indicates test/earlystop
     X_combined = pd.concat([X_train, X_earlystop], ignore_index=True)
     y_combined = np.concatenate([y_train.values, y_earlystop.values])
+    years_combined = np.concatenate([years_train, years_earlystop])
     split_indices = np.concatenate(
         [
             np.full(n_train, -1, dtype=int),  # -1 for train
@@ -417,6 +459,17 @@ def main() -> None:
     print(f"\nCombined dataset for CV: {len(X_combined):,} rows")
     print(f"  Train: {n_train:,} rows (indices -1)")
     print(f"  Earlystop:   {n_earlystop:,} rows (indices 0)")
+
+    # Compute temporal sample weights if enabled
+    weights_combined = None
+    if USE_TIME_WEIGHTS:
+        weights_combined = compute_temporal_weights(years_combined, MIN_YEAR, EARLYSTOP_YEAR_MAX)
+        print(f"\nTemporal sample weights: ENABLED")
+        print(f"  Weight range: [{weights_combined.min():.3f}, {weights_combined.max():.3f}]")
+        print(f"  Mean weight: {weights_combined.mean():.3f}")
+        print(f"  Scaling: 0.5 at year {MIN_YEAR} -> 1.0 at year {EARLYSTOP_YEAR_MAX}")
+    else:
+        print(f"\nTemporal sample weights: DISABLED")
 
     # -------------------------------------------------------------------------
     # Step 4: Prepare parameter grid
@@ -486,11 +539,14 @@ def main() -> None:
         n_jobs=search_n_jobs,  # Set based on parallelism mode
         verbose=2,
         random_state=RANDOM_STATE,
-        return_train_score=True,
+        return_train_score=False,
     )
 
     tune_start_rf = time.time()
-    random_search_rf.fit(X_combined, y_combined)
+    if USE_TIME_WEIGHTS:
+        random_search_rf.fit(X_combined, y_combined, sample_weight=weights_combined)
+    else:
+        random_search_rf.fit(X_combined, y_combined)
     tune_time_rf = time.time() - tune_start_rf
 
     # best_score_ is the score on the earlystop set
@@ -566,7 +622,10 @@ def main() -> None:
     }
     rf_best_params = convert_numpy_types(rf_best_params)
 
-    rf_output_path = script_dir / "rf_best_params.json"
+    # Save to training directory where modelC_RF expects it
+    training_dir = script_dir.parent / "training"
+    training_dir.mkdir(parents=True, exist_ok=True)
+    rf_output_path = training_dir / "rf_best_params.json"
     with open(rf_output_path, "w") as f:
         json.dump(rf_best_params, f, indent=2)
     print(f"\nRF best parameters saved to: {rf_output_path}")

@@ -332,7 +332,7 @@ def load_numpy_arrays_two_pass(
     year_filter_str = f" (years {year_range[0]}-{year_range[1]})" if year_range else ""
     print(f"\nLoading {name or df_path.name}{year_filter_str} (two-pass NumPy loader)...")
     load_start = time.time()
-    essential_cols = feature_cols + [target_col, 'year']
+    essential_cols = feature_cols + [target_col, 'year', 'WDPA_prev']
     
     # Pass 1: Count rows
     print(f"  Pass 1: Counting rows...")
@@ -352,9 +352,17 @@ def load_numpy_arrays_two_pass(
             
             target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
             year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+            wdpa_prev_array = batch_table['WDPA_prev'].to_numpy(zero_copy_only=False)
             
-            target_valid = target_array[valid_mask]
-            year_valid = year_array[valid_mask]
+            # Apply risk-set filtering: WDPA_prev == 0
+            risk_mask = (wdpa_prev_array == 0)
+            final_mask_pass1 = valid_mask & risk_mask
+            
+            if not final_mask_pass1.any():
+                continue
+            
+            target_valid = target_array[final_mask_pass1]
+            year_valid = year_array[final_mask_pass1]
             
             # Apply year filter if specified
             if year_range is not None:
@@ -368,7 +376,7 @@ def load_numpy_arrays_two_pass(
             n_samples += len(target_valid)
             years_set.update(year_valid.tolist())
             
-            del batch_table, target_array, year_array, target_valid, year_valid, batch
+            del batch_table, target_array, year_array, wdpa_prev_array, target_valid, year_valid, batch
     finally:
         del parquet_file
         gc.collect()
@@ -403,22 +411,31 @@ def load_numpy_arrays_two_pass(
             # Extract arrays directly from PyArrow
             target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
             year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+            wdpa_prev_array = batch_table['WDPA_prev'].to_numpy(zero_copy_only=False)
             
-            target_valid = target_array[valid_mask]
-            year_valid = year_array[valid_mask]
+            # Apply risk-set filtering: WDPA_prev == 0
+            risk_mask = (wdpa_prev_array == 0)
+            # Combine valid_mask and risk_mask
+            base_mask = valid_mask & risk_mask
+            if not base_mask.any():
+                del batch_table, target_array, year_array, wdpa_prev_array, batch
+                continue
+            
+            target_valid = target_array[base_mask]
+            year_valid = year_array[base_mask]
             
             # Apply year filter if specified
             if year_range is not None:
                 year_mask = (year_valid >= year_range[0]) & (year_valid <= year_range[1])
                 if not year_mask.any():
-                    del batch_table, target_array, year_array, batch
+                    del batch_table, target_array, year_array, wdpa_prev_array, batch
                     continue
                 target_valid = target_valid[year_mask]
                 year_valid = year_valid[year_mask]
                 
-                # Build final mask: map year_mask (applied to valid data) back to original indices
-                final_mask = valid_mask.copy()
-                final_mask[valid_mask] = year_mask  # Map year_mask back to positions where valid_mask is True
+                # Build final mask: map year_mask (applied to base_mask data) back to original indices
+                final_mask = base_mask.copy()
+                final_mask[base_mask] = year_mask  # Map year_mask back to positions where base_mask is True
                 
                 # Convert feature columns in bulk using pure PyArrow→NumPy path (no pandas)
                 feature_table = batch_table.select(feature_cols)
@@ -426,7 +443,7 @@ def load_numpy_arrays_two_pass(
             else:
                 # Convert feature columns in bulk using pure PyArrow→NumPy path (no pandas, no year filter)
                 feature_table = batch_table.select(feature_cols)
-                X_batch = extract_features_pyarrow_to_numpy(feature_table, valid_mask)
+                X_batch = extract_features_pyarrow_to_numpy(feature_table, base_mask)
             y_batch = (target_valid > 0).astype(np.int8)
             
             # Insert directly into pre-allocated arrays
@@ -436,7 +453,7 @@ def load_numpy_arrays_two_pass(
             years_array[idx_offset:idx_offset + batch_size_actual] = year_valid.astype(np.int32)
             idx_offset += batch_size_actual
             
-            del batch_table, target_array, year_array, target_valid, year_valid
+            del batch_table, target_array, year_array, wdpa_prev_array, target_valid, year_valid
             del feature_table, X_batch, y_batch, batch
             
             if batch_num % 25 == 0:
@@ -492,7 +509,7 @@ def load_numpy_arrays_from_multiple_files(
     year_filter_str = f" (years {year_range[0]}-{year_range[1]})" if year_range else ""
     print(f"\nLoading from {len(df_paths)} files{year_filter_str} (two-pass NumPy loader)...")
     load_start = time.time()
-    essential_cols = feature_cols + [target_col, 'year']
+    essential_cols = feature_cols + [target_col, 'year', 'WDPA_prev']
     
     # Pass 1: Count rows across all files
     print(f"  Pass 1: Counting rows...")
@@ -511,9 +528,17 @@ def load_numpy_arrays_from_multiple_files(
                 
                 target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
                 year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+                wdpa_prev_array = batch_table['WDPA_prev'].to_numpy(zero_copy_only=False)
                 
-                target_valid = target_array[valid_mask]
-                year_valid = year_array[valid_mask]
+                # Apply risk-set filtering: WDPA_prev == 0
+                risk_mask = (wdpa_prev_array == 0)
+                final_mask_pass1 = valid_mask & risk_mask
+                
+                if not final_mask_pass1.any():
+                    continue
+                
+                target_valid = target_array[final_mask_pass1]
+                year_valid = year_array[final_mask_pass1]
                 
                 if year_range is not None:
                     year_mask = (year_valid >= year_range[0]) & (year_valid <= year_range[1])
@@ -526,7 +551,7 @@ def load_numpy_arrays_from_multiple_files(
                 n_samples += len(target_valid)
                 years_set.update(year_valid.tolist())
                 
-                del batch_table, target_array, year_array, target_valid, year_valid, batch
+                del batch_table, target_array, year_array, wdpa_prev_array, target_valid, year_valid, batch
         finally:
             del parquet_file
             gc.collect()
@@ -559,21 +584,30 @@ def load_numpy_arrays_from_multiple_files(
                 
                 target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
                 year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+                wdpa_prev_array = batch_table['WDPA_prev'].to_numpy(zero_copy_only=False)
                 
-                target_valid = target_array[valid_mask]
-                year_valid = year_array[valid_mask]
+                # Apply risk-set filtering: WDPA_prev == 0
+                risk_mask = (wdpa_prev_array == 0)
+                # Combine valid_mask and risk_mask
+                base_mask = valid_mask & risk_mask
+                if not base_mask.any():
+                    del batch_table, target_array, year_array, wdpa_prev_array, batch
+                    continue
+                
+                target_valid = target_array[base_mask]
+                year_valid = year_array[base_mask]
                 
                 if year_range is not None:
                     year_mask = (year_valid >= year_range[0]) & (year_valid <= year_range[1])
                     if not year_mask.any():
-                        del batch_table, target_array, year_array, batch
+                        del batch_table, target_array, year_array, wdpa_prev_array, batch
                         continue
                     target_valid = target_valid[year_mask]
                     year_valid = year_valid[year_mask]
                     
-                    # Build final mask: valid AND passes year filter
-                    final_mask = valid_mask.copy()
-                    final_mask[valid_mask] = year_mask
+                    # Build final mask: map year_mask (applied to base_mask data) back to original indices
+                    final_mask = base_mask.copy()
+                    final_mask[base_mask] = year_mask
                     
                     # Convert feature columns in bulk using pure PyArrow→NumPy path (no pandas)
                     feature_table = batch_table.select(feature_cols)
@@ -581,7 +615,7 @@ def load_numpy_arrays_from_multiple_files(
                 else:
                     # Convert feature columns in bulk using pure PyArrow→NumPy path (no pandas, no year filter)
                     feature_table = batch_table.select(feature_cols)
-                    X_batch = extract_features_pyarrow_to_numpy(feature_table, valid_mask)
+                    X_batch = extract_features_pyarrow_to_numpy(feature_table, base_mask)
                 y_batch = (target_valid > 0).astype(np.int8)
                 
                 batch_size_actual = len(y_batch)
@@ -590,7 +624,7 @@ def load_numpy_arrays_from_multiple_files(
                 years_array[idx_offset:idx_offset + batch_size_actual] = year_valid.astype(np.int32)
                 idx_offset += batch_size_actual
                 
-                del batch_table, target_array, year_array, target_valid, year_valid
+                del batch_table, target_array, year_array, wdpa_prev_array, target_valid, year_valid
                 del feature_table, X_batch, y_batch, batch
                 
                 if batch_num % 25 == 0:
@@ -1192,20 +1226,23 @@ def phase2_testing(
     test_years_set = set()
     
     try:
-        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=[target_col, 'year'], use_threads=True):
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=[target_col, 'year', 'WDPA_prev'], use_threads=True):
             batch_table = batch
             # Use PyArrow null handling
             null_mask = batch_table[target_col].is_null().to_numpy(zero_copy_only=False)
             valid_mask = ~null_mask
             if valid_mask.any():
                 year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+                wdpa_prev_array = batch_table['WDPA_prev'].to_numpy(zero_copy_only=False)
+                # Apply risk-set filtering: WDPA_prev == 0
+                risk_mask = (wdpa_prev_array == 0)
                 # Filter by year range to exclude right-censored labels
                 year_mask = (year_array >= test_year_range[0]) & (year_array <= test_year_range[1])
-                final_mask = valid_mask & year_mask
+                final_mask = valid_mask & year_mask & risk_mask
                 if final_mask.any():
                     n_test_total += int(final_mask.sum())
                     test_years_set.update(year_array[final_mask].tolist())
-                del year_array
+                del year_array, wdpa_prev_array
             
             del batch_table, batch
     finally:
@@ -1239,8 +1276,11 @@ def phase2_testing(
     test_pos = test_neg = batch_num = idx_offset = 0
     pred_start = time.time()
     
+    # Ensure WDPA_prev is included in columns to read
+    keep_cols_test_with_wdpa = keep_cols_test + ['WDPA_prev'] if 'WDPA_prev' not in keep_cols_test else keep_cols_test
+    
     try:
-        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=keep_cols_test, use_threads=True):
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=keep_cols_test_with_wdpa, use_threads=True):
             batch_num += 1
             batch_table = batch
             
@@ -1251,16 +1291,19 @@ def phase2_testing(
                 del batch_table, batch
                 continue
             
-            # Extract target array and year array
+            # Extract target array, year array, and WDPA_prev
             target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
             year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+            wdpa_prev_array = batch_table['WDPA_prev'].to_numpy(zero_copy_only=False)
             
+            # Apply risk-set filtering: WDPA_prev == 0
+            risk_mask = (wdpa_prev_array == 0)
             # Filter by year range to exclude right-censored labels
             # year_range=(TEST_START, min(TEST_END, LAST_LABEL_YEAR))
             year_mask = (year_array >= test_year_range[0]) & (year_array <= test_year_range[1])
-            final_mask = valid_mask & year_mask
+            final_mask = valid_mask & year_mask & risk_mask
             if not final_mask.any():
-                del batch_table, target_array, year_array, batch
+                del batch_table, target_array, year_array, wdpa_prev_array, batch
                 continue
             
             # Extract feature columns in bulk using pure PyArrow→NumPy path (no pandas)
@@ -1309,7 +1352,7 @@ def phase2_testing(
                 print(f"Writing to {scored_path}")
             writer.write_table(result_table)
             
-            del batch_table, target_array, target_valid, feature_table, X_batch, y_batch, y_proba_batch
+            del batch_table, target_array, wdpa_prev_array, target_valid, feature_table, X_batch, y_batch, y_proba_batch
             del row_array, col_array, year_array, year_array_valid, result_arrays, result_table, batch
             
             if batch_num % 25 == 0:
