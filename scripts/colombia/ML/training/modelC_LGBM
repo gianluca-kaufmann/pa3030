@@ -9,7 +9,7 @@ Features:
 - Temporal Cross-Validation: 3 folds with different train/earlystop year splits
 - Final Model: Uses average best_iteration from CV folds (no early stopping)
 - Time-based Sample Weighting: Later training years get higher weights
-  (Year 2000: weight 0.5, Year 2014: weight 1.0, linear interpolation in between)
+  (Year 2000: weight 0.5, Year 2017: weight 1.0, linear interpolation in between)
 - Right-Censoring Protection: Earlystop and test data filtered to LAST_LABEL_YEAR
   (LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS) to avoid evaluating on
   labels that don't have complete 5-year lookahead information
@@ -799,6 +799,34 @@ def train_single_cv_fold(
     print(f"  Generating OOF predictions on earlystop set ({n_earlystop_samples:,} samples)...")
     y_earlystop_proba = lgb_model.predict(X_earlystop, num_iteration=best_iteration if best_iteration else None).astype(np.float32)
     
+    # DIAGNOSTIC ONLY (not used for model selection / early stopping): Compute CV fold metrics
+    fold_pr_auc = average_precision_score(y_earlystop, y_earlystop_proba)
+    fold_roc_auc = roc_auc_score(y_earlystop, y_earlystop_proba)
+    fold_base_rate = y_earlystop.mean()
+    fold_p_at_1pct = compute_precision_at_k(y_earlystop, y_earlystop_proba, 1)
+    
+    print(f"\n  DIAGNOSTIC ONLY (not used for model selection / early stopping):")
+    print(f"    PR-AUC: {fold_pr_auc:.4f}")
+    print(f"    ROC-AUC: {fold_roc_auc:.4f}")
+    print(f"    Base rate: {fold_base_rate:.4f}")
+    print(f"    Precision@1%: {fold_p_at_1pct:.4f}")
+    
+    if use_wandb:
+        wandb.log({
+            f"cv_fold_{fold_idx+1}/diag_pr_auc": float(fold_pr_auc),
+            f"cv_fold_{fold_idx+1}/diag_roc_auc": float(fold_roc_auc),
+            f"cv_fold_{fold_idx+1}/diag_base_rate": float(fold_base_rate),
+            f"cv_fold_{fold_idx+1}/diag_precision_at_1pct": float(fold_p_at_1pct),
+        })
+    
+    # Store diagnostic metrics in fold result
+    fold_diagnostics = {
+        "diag_pr_auc": float(fold_pr_auc),
+        "diag_roc_auc": float(fold_roc_auc),
+        "diag_base_rate": float(fold_base_rate),
+        "diag_precision_at_1pct": float(fold_p_at_1pct),
+    }
+    
     # Store OOF predictions for this fold
     oof_predictions = {
         "y_true": y_earlystop.copy(),
@@ -830,6 +858,7 @@ def train_single_cv_fold(
         "train_time_seconds": train_time,
         "best_iteration": int(best_iteration) if best_iteration is not None else None,
         "oof_predictions": oof_predictions,  # Include OOF predictions for calibration
+        "diagnostics": fold_diagnostics,  # Diagnostic-only metrics (not used for model selection)
     }
 
 
@@ -965,6 +994,33 @@ def phase1_training(
         
         # Aggregate CV metrics (no metrics computed on earlystop sets)
         cv_aggregated = aggregate_cv_metrics(cv_results)
+        
+        # Aggregate diagnostic metrics across non-skipped folds
+        valid_folds_for_diagnostics = [fold for fold in cv_results if not fold.get("skipped", False) and "diagnostics" in fold]
+        if valid_folds_for_diagnostics:
+            diag_pr_aucs = [fold["diagnostics"]["diag_pr_auc"] for fold in valid_folds_for_diagnostics]
+            diag_roc_aucs = [fold["diagnostics"]["diag_roc_auc"] for fold in valid_folds_for_diagnostics]
+            
+            cv_diagnostics = {
+                "pr_auc_mean": float(np.mean(diag_pr_aucs)),
+                "pr_auc_std": float(np.std(diag_pr_aucs)),
+                "roc_auc_mean": float(np.mean(diag_roc_aucs)),
+                "roc_auc_std": float(np.std(diag_roc_aucs)),
+            }
+            
+            print(f"\nCV Diagnostics (aggregated across {len(valid_folds_for_diagnostics)} non-skipped folds):")
+            print(f"  PR-AUC: {cv_diagnostics['pr_auc_mean']:.4f} ± {cv_diagnostics['pr_auc_std']:.4f}")
+            print(f"  ROC-AUC: {cv_diagnostics['roc_auc_mean']:.4f} ± {cv_diagnostics['roc_auc_std']:.4f}")
+            
+            if use_wandb:
+                wandb.log({
+                    "cv_diagnostics/pr_auc_mean": cv_diagnostics["pr_auc_mean"],
+                    "cv_diagnostics/pr_auc_std": cv_diagnostics["pr_auc_std"],
+                    "cv_diagnostics/roc_auc_mean": cv_diagnostics["roc_auc_mean"],
+                    "cv_diagnostics/roc_auc_std": cv_diagnostics["roc_auc_std"],
+                })
+        else:
+            cv_diagnostics = {}
         
         # Extract best_iterations and train_rows for each fold (skip folds that were skipped due to overlap)
         best_iterations = [fold["best_iteration"] for fold in cv_results if fold.get("best_iteration") is not None and not fold.get("skipped", False)]
