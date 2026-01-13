@@ -32,7 +32,7 @@ import numpy as np
 import pandas as pd
 import wandb
 from lightgbm import LGBMClassifier
-from sklearn.model_selection import RandomizedSearchCV, PredefinedSplit
+from sklearn.model_selection import RandomizedSearchCV, PredefinedSplit, train_test_split
 
 # Import early_stopping callback - available in lightgbm 3.3.0+
 try:
@@ -103,33 +103,33 @@ EXCLUDE_COLS = {
     "year",  # Temporal identifier (kept for splitting)
 }
 
-# RandomizedSearchCV configuration - more iterations for better search
-N_ITER_LGBM = int(os.environ.get("N_ITER_LGBM", "500"))  # Increased to 500 for comprehensive search
+# RandomizedSearchCV configuration
+N_ITER_LGBM = int(os.environ.get("N_ITER_LGBM", "100"))  # Default 100 for faster tuning
 
-# Expanded LightGBM parameter grid for comprehensive search
+# Pruned LightGBM parameter grid for faster tuning
 LGBM_PARAM_GRID_BASE = {
     # Tree structure parameters
-    "num_leaves": [15, 31, 63, 127, 255],  # More options, including smaller and larger
-    "max_depth": [-1, 5, 10, 15, 20, 25, 30],  # Wider range including shallower trees
-    "min_child_samples": [10, 20, 30, 50, 100, 200],  # More granular options
-    "min_child_weight": [0.001, 0.01, 0.1, 1.0, 5.0],  # Additional regularization
+    "num_leaves": [31, 63, 127],  # Capped range
+    "max_depth": [5, 10, 15, 20],  # Capped range
+    "min_child_samples": [10, 20, 30, 50, 100],  # Simplified
+    "min_child_weight": [0.01, 0.1, 1.0],  # Simplified
     
-    # Learning rate - wider range
-    "learning_rate": [0.005, 0.01, 0.03, 0.05, 0.1, 0.15, 0.2],
+    # Learning rate - drop values < 0.05
+    "learning_rate": [0.05, 0.1, 0.15, 0.2],
     
-    # Sampling parameters
-    "subsample": [0.6, 0.7, 0.8, 0.9, 0.95, 1.0],  # Including 1.0 (no subsampling)
-    "subsample_freq": [0, 1, 3, 5, 7],  # Frequency of subsampling
-    "colsample_bytree": [0.6, 0.7, 0.8, 0.9, 1.0],  # Including 1.0
-    "colsample_bynode": [0.6, 0.7, 0.8, 0.9, 1.0],  # Additional sampling at node level
+    # Sampling parameters - simplified
+    "subsample": [0.7, 0.8, 0.9, 1.0],  # Simplified
+    "subsample_freq": [0, 1, 3],  # Simplified
+    "colsample_bytree": [0.7, 0.8, 0.9, 1.0],  # Simplified
+    "colsample_bynode": [0.7, 0.8, 0.9, 1.0],  # Simplified
     
-    # Regularization parameters - more granular
-    "reg_alpha": [0.0, 0.01, 0.1, 0.5, 1.0, 2.0, 5.0],  # L1 regularization
-    "reg_lambda": [0.0, 0.01, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0],  # L2 regularization
+    # Regularization parameters - simplified
+    "reg_alpha": [0.0, 0.1, 1.0],  # Simplified
+    "reg_lambda": [0.0, 0.1, 1.0, 5.0],  # Simplified
     
     # Additional advanced parameters
-    "min_split_gain": [0.0, 0.1, 0.5, 1.0],  # Minimum gain to split
-    "max_bin": [63, 127, 255, 511],  # Number of bins for feature discretization
+    "min_split_gain": [0.0, 0.1, 0.5],  # Simplified
+    "max_bin": [127, 255],  # Simplified
     "path_smooth": [0.0, 0.1, 0.5, 1.0],  # Path smoothing (LightGBM 4.0+)
 }
 
@@ -472,6 +472,31 @@ def main() -> None:
     print(f"Earlystop feature matrix shape: {X_earlystop.shape}")
     print(f"Earlystop target shape: {y_earlystop.shape}")
 
+    # Create eval subset for early stopping: simple random sampling (cap 500k rows) preserving class ratio
+    EVAL_SUBSET_MAX_ROWS = 500_000
+    n_earlystop_full = len(X_earlystop)
+    if n_earlystop_full > EVAL_SUBSET_MAX_ROWS:
+        print(f"\nCreating eval subset for early stopping (cap {EVAL_SUBSET_MAX_ROWS:,} rows)...")
+        # Use stratified sampling to preserve class ratio
+        X_earlystop_eval, _, y_earlystop_eval, _ = train_test_split(
+            X_earlystop,
+            y_earlystop,
+            train_size=EVAL_SUBSET_MAX_ROWS,
+            stratify=y_earlystop,
+            random_state=RANDOM_STATE,
+        )
+        print(f"  Full earlystop set: {n_earlystop_full:,} rows")
+        print(f"  Eval subset: {len(X_earlystop_eval):,} rows")
+        # Verify class ratio preservation
+        orig_pos_ratio = y_earlystop.sum() / len(y_earlystop)
+        eval_pos_ratio = y_earlystop_eval.sum() / len(y_earlystop_eval)
+        print(f"  Original class ratio (pos): {orig_pos_ratio:.5f}")
+        print(f"  Eval subset class ratio (pos): {eval_pos_ratio:.5f}")
+    else:
+        print(f"\nEarlystop set ({n_earlystop_full:,} rows) <= {EVAL_SUBSET_MAX_ROWS:,}, using full set for eval")
+        X_earlystop_eval = X_earlystop
+        y_earlystop_eval = y_earlystop
+
     # Store sizes for summary (before deleting DataFrames)
     cleaned_row_count = len(df_clean)
     n_train = len(X_train)
@@ -503,7 +528,7 @@ def main() -> None:
     # Step 4: Prepare parameter grid and fixed parameters
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("STEP 4: PREPARE EXPANDED PARAMETER GRID")
+    print("STEP 4: PREPARE PARAMETER GRID")
     print("=" * 70)
 
     # Compute scale_pos_weight from train distribution (n_neg/n_pos)
@@ -521,7 +546,7 @@ def main() -> None:
     for param, values in lgbm_param_grid.items():
         total_combinations *= len(values)
 
-    print("\nExpanded parameter grid:")
+    print("\nPruned parameter grid:")
     for param, values in sorted(lgbm_param_grid.items()):
         print(f"  {param}: {len(values)} options - {values}")
     
@@ -568,16 +593,16 @@ def main() -> None:
     )
 
     # Early stopping using callback-based approach
-    # eval_set points only to the earlystop fold (X_earlystop, y_earlystop)
+    # eval_set points to the sampled eval subset (X_earlystop_eval, y_earlystop_eval)
     # Create early stopping callback
     early_stopping_callback = early_stopping(
-        stopping_rounds=100,
+        stopping_rounds=50,  # Reduced from 100 for faster tuning
         verbose=False,
         first_metric_only=True,
     )
     
     fit_params_lgbm = {
-        "eval_set": [(X_earlystop, y_earlystop)],  # Earlystop fold only
+        "eval_set": [(X_earlystop_eval, y_earlystop_eval)],  # Use sampled eval subset
         "eval_metric": "aucpr",  # LightGBM-native PR metric (same as average_precision)
         "callbacks": [early_stopping_callback],
     }

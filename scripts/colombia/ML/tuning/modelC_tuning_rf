@@ -33,7 +33,7 @@ import numpy as np
 import pandas as pd
 import wandb
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import RandomizedSearchCV, PredefinedSplit
+from sklearn.model_selection import RandomizedSearchCV, PredefinedSplit, train_test_split
 
 
 class Tee:
@@ -86,8 +86,8 @@ MIN_YEAR = int(os.environ.get("TRANSITION_MIN_YEAR", "2001"))  # drop year 2000 
 
 # Columns to exclude from features
 EXCLUDE_COLS = {
-    "transition_01",  # Target variable
-    "transition_01_win5",  # Leakage
+    "transition_01",  # Old target variable
+    "transition_01_win5",  # Target variable (5-year lookahead)
     "WDPA_b1",  # Leakage
     "WDPA_prev",  # Leakage
     "x",  # Coordinate
@@ -106,7 +106,7 @@ USE_TIME_WEIGHTS = (os.environ.get("USE_TIME_WEIGHTS", "0") == "1")
 # Random Forest parameter grid
 RF_PARAM_GRID = {
     # Use 1000 for final training if feasible (not included here to keep tuning faster)
-    "n_estimators": [200, 500],
+    "n_estimators": [100, 200],
     "max_depth": [15, 20, 30, 40, None],
     "min_samples_leaf": [5, 10, 20, 50],
     "min_samples_split": [10, 50, 100],
@@ -118,7 +118,7 @@ RF_PARAM_GRID = {
 # Parallelism configuration
 # Default (Euler-safe): RandomizedSearchCV(n_jobs=1), RF(n_jobs=get_n_jobs())
 # Optional: Set TUNING_PARALLEL_MODE=search to parallelize search instead
-TUNING_PARALLEL_MODE = os.environ.get("TUNING_PARALLEL_MODE", "default")
+TUNING_PARALLEL_MODE = os.environ.get("TUNING_PARALLEL_MODE", "search")
 
 # Random Forest fixed parameters (n_jobs set conditionally based on parallelism mode)
 RF_FIXED_PARAMS_BASE = {
@@ -175,11 +175,15 @@ def convert_numpy_types(obj: Any) -> Any:
 
 
 def get_feature_columns(df: pd.DataFrame) -> list:
-    """Get valid feature columns, excluding identifiers and leakage columns."""
+    """Get valid feature columns, excluding identifiers and leakage columns.
+    
+    Includes both numeric and boolean feature columns.
+    """
     numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
-    feature_cols = [
-        col for col in numeric_cols if col.lower() not in {c.lower() for c in EXCLUDE_COLS}
-    ]
+    bool_cols = df.select_dtypes(include=["bool"]).columns.tolist()
+    candidate_cols = numeric_cols + [c for c in bool_cols if c not in numeric_cols]
+    exclude_lower = {c.lower() for c in EXCLUDE_COLS}
+    feature_cols = [col for col in candidate_cols if col.lower() not in exclude_lower]
     return feature_cols
 
 
@@ -252,6 +256,20 @@ def main() -> None:
 
     train_path = resolve_tuning_parquet()
 
+    # Check modification time of input parquet file to ensure data is fresh
+    mod_time = train_path.stat().st_mtime
+    mod_time_str = datetime.fromtimestamp(mod_time).strftime("%Y-%m-%d %H:%M:%S")
+    mod_datetime = datetime.fromtimestamp(mod_time)
+    current_datetime = datetime.now()
+    age_hours = (current_datetime - mod_datetime).total_seconds() / 3600
+    age_days = age_hours / 24
+    
+    print(f"\nInput parquet file modification time: {mod_time_str}")
+    if age_days > 7:
+        print(f"WARNING: Input file is {age_days:.1f} days old. Consider regenerating if data may be stale.")
+    elif age_hours > 24:
+        print(f"Info: Input file is {age_hours:.1f} hours old ({age_days:.1f} days)")
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     # Initialize W&B
@@ -314,7 +332,7 @@ def main() -> None:
         df[col] = df[col].astype("int32")
     print("  Downcasting completed")
 
-    target_col = "transition_01"
+    target_col = "transition_01_win5"
 
     # Check target column exists
     if target_col not in df.columns:
@@ -432,6 +450,35 @@ def main() -> None:
     print(f"Train target shape: {y_train.shape}")
     print(f"Earlystop feature matrix shape: {X_earlystop.shape}")
     print(f"Earlystop target shape: {y_earlystop.shape}")
+
+    # Create eval subset for early stopping: simple random sampling (cap 500k rows) preserving class ratio
+    EVAL_SUBSET_MAX_ROWS = 500_000
+    n_earlystop_full = len(X_earlystop)
+    if n_earlystop_full > EVAL_SUBSET_MAX_ROWS:
+        print(f"\nCreating eval subset for early stopping (cap {EVAL_SUBSET_MAX_ROWS:,} rows)...")
+        # Calculate original class ratio before subsampling
+        orig_pos_ratio = y_earlystop.sum() / len(y_earlystop)
+        # Use stratified sampling to preserve class ratio
+        # Get indices for consistent subsampling
+        indices = np.arange(len(X_earlystop))
+        indices_eval, _ = train_test_split(
+            indices,
+            train_size=EVAL_SUBSET_MAX_ROWS,
+            stratify=y_earlystop,
+            random_state=RANDOM_STATE,
+        )
+        # Subsample all arrays using the same indices
+        X_earlystop = X_earlystop.iloc[indices_eval].reset_index(drop=True)
+        y_earlystop = y_earlystop.iloc[indices_eval].reset_index(drop=True)
+        years_earlystop = years_earlystop[indices_eval]
+        print(f"  Full earlystop set: {n_earlystop_full:,} rows")
+        print(f"  Eval subset: {len(X_earlystop):,} rows")
+        # Verify class ratio preservation
+        eval_pos_ratio = y_earlystop.sum() / len(y_earlystop)
+        print(f"  Original class ratio (pos): {orig_pos_ratio:.5f}")
+        print(f"  Eval subset class ratio (pos): {eval_pos_ratio:.5f}")
+    else:
+        print(f"\nEarlystop set ({n_earlystop_full:,} rows) <= {EVAL_SUBSET_MAX_ROWS:,}, using full set for eval")
 
     # Store sizes for summary (before deleting DataFrames)
     cleaned_row_count = len(df_clean)
