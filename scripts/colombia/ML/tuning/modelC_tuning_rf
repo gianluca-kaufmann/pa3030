@@ -37,20 +37,20 @@ from sklearn.model_selection import RandomizedSearchCV, PredefinedSplit, train_t
 
 
 class Tee:
-    """Write to both stdout and a file."""
+    """Write to both stdout/stderr and a file."""
 
-    def __init__(self, file_path: Path):
-        self.file = open(file_path, "w", encoding="utf-8")
-        self.stdout = sys.stdout
+    def __init__(self, file_path: Path, original_stream):
+        self.file = open(file_path, "a", encoding="utf-8")  # Append mode to capture both stdout and stderr
+        self.original_stream = original_stream
 
     def write(self, text: str) -> None:
-        self.stdout.write(text)
-        self.stdout.flush()
+        self.original_stream.write(text)
+        self.original_stream.flush()
         self.file.write(text)
         self.file.flush()
 
     def flush(self) -> None:
-        self.stdout.flush()
+        self.original_stream.flush()
         self.file.flush()
 
     def close(self) -> None:
@@ -585,7 +585,7 @@ def main() -> None:
         cv=predefined_split,  # Use fixed train/val split
         scoring="average_precision",  # PR-AUC (better for imbalanced data)
         n_jobs=search_n_jobs,  # Set based on parallelism mode
-        verbose=2,
+        verbose=3,  # Log each iteration with detailed progress
         random_state=RANDOM_STATE,
         return_train_score=False,
     )
@@ -731,13 +731,26 @@ if __name__ == "__main__":
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = output_dir / f"modelC_tuning_rf_{timestamp}.txt"
 
-    tee = Tee(output_file)
-    sys.stdout = tee
+    # Open file in write mode to start fresh, then switch to append for stderr
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(f"Log file started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 70 + "\n\n")
+
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    
+    tee_stdout = Tee(output_file, original_stdout)
+    tee_stderr = Tee(output_file, original_stderr)
+    
+    sys.stdout = tee_stdout
+    sys.stderr = tee_stderr
 
     try:
         main()
     finally:
-        sys.stdout = tee.stdout
-        tee.close()
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        tee_stdout.close()
+        tee_stderr.close()
         print(f"\nOutput saved to: {output_file}")
 
