@@ -5,15 +5,17 @@ Sampling script for modelC tuning sample (Colombia dataset).
 
 Rules
 -----
-- Keep all positives (transition_01_win5 == 1)
-- Cap total negatives at ~300,000 (sample uniformly across years)
-- Target total tuning size ≈ 350k–400k rows
+- Keep all positives (transition_01_win5 == 1) in TRAIN set only
+- Cap total negatives in TRAIN set at ~3,000,000 (sample uniformly across years)
+- EARLYSTOP set (2015-2017) is kept as-is (true unbalanced, no sampling)
 - Year 2000 excluded to avoid treating existing PAs as transitions
 - Output: data/ml/tuning/modelC_tuning_colombia.parquet
 
 Notes
 -----
-- Uniform sampling across years ensures balanced temporal distribution
+- Sampling is applied ONLY to train set (year <= 2014)
+- Earlystop set (2015 <= year <= 2017) remains completely unbalanced
+- Uniform sampling across train years ensures balanced temporal distribution
 - Random sampling for simplicity (no hard negatives)
 - Used by both Random Forest and LightGBM hyperparameter tuning scripts
 - Uses 5-year lookahead target (transition_01_win5) from merged_panel_colombia_final_win5.parquet
@@ -31,8 +33,13 @@ import wandb
 
 # Configuration
 RANDOM_STATE = 42
-MAX_TOTAL_NEGATIVES = 300_000  # Cap total negatives at ~300k
+MAX_TOTAL_NEGATIVES = 3_000_000  # Cap total negatives in TRAIN set at 3M
 WANDB_PROJECT = "ml-preprocessing"
+
+# Temporal split configuration (must match tuning scripts)
+TRAIN_YEAR_MAX = 2014  # Train set: year <= 2014 (sampled)
+EARLYSTOP_YEAR_MIN = 2015  # Earlystop set: 2015 <= year <= 2017 (no sampling)
+EARLYSTOP_YEAR_MAX = 2017
 
 
 def resolve_input() -> Path:
@@ -99,9 +106,10 @@ def configure_duckdb(con: duckdb.DuckDBPyConnection) -> None:
     print(f"Running on: {'Euler cluster' if is_euler else 'local machine'}")
 
 
-def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: str, use_wandb: bool = False) -> None:
+def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: str, use_wandb: bool = False, year_filter: str | None = None) -> None:
     """Log per-year counts and ratios."""
     escaped = str(parquet_path).replace("'", "''")
+    where_clause = f"WHERE {year_filter}" if year_filter else ""
     rows = con.execute(
         f"""
         SELECT
@@ -114,6 +122,7 @@ def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: s
                  THEN SUM(CASE WHEN transition_01_win5 = 0 THEN 1 ELSE 0 END)::DOUBLE / SUM(transition_01_win5)
                  ELSE 0 END AS neg_pos_ratio
         FROM read_parquet('{escaped}')
+        {where_clause}
         GROUP BY year
         ORDER BY year
         """
@@ -150,8 +159,11 @@ def main() -> None:
             config={
                 "random_state": RANDOM_STATE,
                 "max_total_negatives": MAX_TOTAL_NEGATIVES,
-                "sampling_method": "uniform_across_years",
+                "sampling_method": "uniform_across_years_train_only",
                 "exclude_year": 2000,
+                "train_year_max": TRAIN_YEAR_MAX,
+                "earlystop_year_min": EARLYSTOP_YEAR_MIN,
+                "earlystop_year_max": EARLYSTOP_YEAR_MAX,
             },
         )
         use_wandb = True
@@ -177,7 +189,9 @@ def main() -> None:
 
     print(f"\nInput: {input_path}")
     print(f"Output: {output_path}")
-    print(f"Target: Keep all positives, cap negatives at {MAX_TOTAL_NEGATIVES:,}")
+    print(f"Sampling strategy:")
+    print(f"  TRAIN set (year <= {TRAIN_YEAR_MAX}): Keep all positives, cap negatives at {MAX_TOTAL_NEGATIVES:,}")
+    print(f"  EARLYSTOP set ({EARLYSTOP_YEAR_MIN} <= year <= {EARLYSTOP_YEAR_MAX}): No sampling (true unbalanced)")
 
     con = duckdb.connect()
     configure_duckdb(con)
@@ -186,7 +200,9 @@ def main() -> None:
     escaped_out = str(output_path).replace("'", "''")
 
     try:
-        # Sample SQL: Keep all positives, cap total negatives at MAX_TOTAL_NEGATIVES (uniform across years)
+        # Sample SQL: 
+        # - TRAIN set (year <= TRAIN_YEAR_MAX): Keep all positives, cap negatives at MAX_TOTAL_NEGATIVES (uniform across years)
+        # - EARLYSTOP set (EARLYSTOP_YEAR_MIN <= year <= EARLYSTOP_YEAR_MAX): Keep all rows as-is (no sampling)
         sample_sql = f"""
         COPY (
             WITH base AS (
@@ -194,20 +210,28 @@ def main() -> None:
                 FROM read_parquet('{escaped_in}')
                 WHERE year != 2000
             ),
-            year_counts AS (
+            -- Split into train and earlystop sets
+            train_base AS (
+                SELECT * FROM base WHERE year <= {TRAIN_YEAR_MAX}
+            ),
+            earlystop_base AS (
+                SELECT * FROM base 
+                WHERE year >= {EARLYSTOP_YEAR_MIN} AND year <= {EARLYSTOP_YEAR_MAX}
+            ),
+            -- Calculate sampling budget for TRAIN set only
+            train_year_counts AS (
                 SELECT
                     year,
                     SUM(transition_01_win5) AS pos_count,
                     SUM(CASE WHEN transition_01_win5 = 0 THEN 1 ELSE 0 END) AS neg_count
-                FROM base
+                FROM train_base
                 GROUP BY year
             ),
-            num_years AS (
-                SELECT COUNT(*) AS n_years FROM year_counts
+            num_train_years AS (
+                SELECT COUNT(*) AS n_years FROM train_year_counts
             ),
-            -- Calculate per-year negative quota: distribute MAX_TOTAL_NEGATIVES uniformly across years
-            -- Each year gets: min(neg_count, MAX_TOTAL_NEGATIVES / num_years)
-            neg_budget AS (
+            -- Calculate per-year negative quota for TRAIN set: distribute MAX_TOTAL_NEGATIVES uniformly across train years
+            train_neg_budget AS (
                 SELECT
                     yc.year,
                     yc.pos_count,
@@ -216,52 +240,60 @@ def main() -> None:
                         yc.neg_count,
                         CAST(ROUND({MAX_TOTAL_NEGATIVES}::DOUBLE / ny.n_years) AS BIGINT)
                     ) AS year_neg_budget
-                FROM year_counts yc
-                CROSS JOIN num_years ny
+                FROM train_year_counts yc
+                CROSS JOIN num_train_years ny
             ),
-            positives AS (
-                -- Keep all positives (no sampling)
-                SELECT * FROM base WHERE transition_01_win5 = 1
+            -- TRAIN set: Keep all positives
+            train_positives AS (
+                SELECT * FROM train_base WHERE transition_01_win5 = 1
             ),
-            -- Prepare negative pool with per-year budgets and random ordering
-            neg_candidates AS (
+            -- TRAIN set: Prepare negative pool with per-year budgets and random ordering
+            train_neg_candidates AS (
                 SELECT
                     b.*,
                     nb.year_neg_budget,
                     random() AS u
-                FROM base b
-                INNER JOIN neg_budget nb ON b.year = nb.year
+                FROM train_base b
+                INNER JOIN train_neg_budget nb ON b.year = nb.year
                 WHERE b.transition_01_win5 = 0 AND nb.year_neg_budget > 0
             ),
-            -- Rank negatives randomly within each year
-            ranked_negs AS (
+            -- TRAIN set: Rank negatives randomly within each year
+            train_ranked_negs AS (
                 SELECT
                     *,
                     ROW_NUMBER() OVER (
                         PARTITION BY year
                         ORDER BY u
                     ) AS neg_rank
-                FROM neg_candidates
+                FROM train_neg_candidates
             ),
-            -- Sample negatives up to budget per year
-            sampled_negs AS (
+            -- TRAIN set: Sample negatives up to budget per year
+            train_sampled_negs AS (
                 SELECT * EXCLUDE (
                     year_neg_budget,
                     u,
                     neg_rank
                 )
-                FROM ranked_negs
+                FROM train_ranked_negs
                 WHERE neg_rank <= year_neg_budget
+            ),
+            -- Combine sampled train set
+            train_sampled AS (
+                SELECT * FROM train_positives
+                UNION ALL
+                SELECT * FROM train_sampled_negs
             )
-            SELECT * FROM positives
+            -- Final output: sampled train + unsampled earlystop
+            SELECT * FROM train_sampled
             UNION ALL
-            SELECT * FROM sampled_negs
+            SELECT * FROM earlystop_base
         )
         TO '{escaped_out}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """
 
-        print(f"\nCreating ModelC RF tuning sample...")
-        print(f"  All positives kept; negatives capped at {MAX_TOTAL_NEGATIVES:,} total (uniform across years)")
+        print(f"\nCreating ModelC tuning sample...")
+        print(f"  TRAIN set (year <= {TRAIN_YEAR_MAX}): All positives kept; negatives capped at {MAX_TOTAL_NEGATIVES:,} total (uniform across years)")
+        print(f"  EARLYSTOP set ({EARLYSTOP_YEAR_MIN} <= year <= {EARLYSTOP_YEAR_MAX}): No sampling (all rows kept as-is)")
         
         # Set random seed for reproducible sampling
         seed_value = RANDOM_STATE / 100.0
@@ -271,8 +303,16 @@ def main() -> None:
         con.execute(sample_sql)
         print(f"Sample written in {time.time() - sample_start:.1f}s")
 
-        # Log counts
-        log_year_counts(con, output_path, "TUNING_SAMPLE", use_wandb)
+        # Log counts for train and earlystop separately
+        print("\n" + "=" * 70)
+        print("TRAIN SET (year <= 2014) - SAMPLED")
+        print("=" * 70)
+        log_year_counts(con, output_path, "TRAIN_SAMPLE", use_wandb, year_filter=f"year <= {TRAIN_YEAR_MAX}")
+        
+        print("\n" + "=" * 70)
+        print("EARLYSTOP SET (2015 <= year <= 2017) - UNSAMPLED")
+        print("=" * 70)
+        log_year_counts(con, output_path, "EARLYSTOP_UNSAMPLED", use_wandb, year_filter=f"year >= {EARLYSTOP_YEAR_MIN} AND year <= {EARLYSTOP_YEAR_MAX}")
 
         # Check total rows
         total_rows = con.execute(
@@ -298,30 +338,68 @@ def main() -> None:
         for year, pos, neg in year_stats:
             print(f"  {year}: pos={pos:,} neg={neg:,} total={pos+neg:,}")
         
-        # Overall statistics
-        overall_stats = con.execute(
+        # Overall statistics for train and earlystop separately
+        train_stats = con.execute(
             f"""
             SELECT
                 SUM(transition_01_win5) AS total_pos,
                 SUM(CASE WHEN transition_01_win5 = 0 THEN 1 ELSE 0 END) AS total_neg
             FROM read_parquet('{escaped_out}')
+            WHERE year <= {TRAIN_YEAR_MAX}
             """
         ).fetchone()
-        total_pos, total_neg = overall_stats
-        neg_pos_ratio = total_neg / total_pos if total_pos > 0 else 1.0
+        train_pos, train_neg = train_stats
+        train_neg_pos_ratio = train_neg / train_pos if train_pos > 0 else 1.0
         
-        print(f"\nOverall class balance:")
-        print(f"  Positives: {total_pos:,}")
-        print(f"  Negatives: {total_neg:,} (capped at {MAX_TOTAL_NEGATIVES:,})")
-        print(f"  Ratio (neg/pos): {neg_pos_ratio:.2f}")
-        print(f"  Total size: {total_pos + total_neg:,} rows")
+        earlystop_stats = con.execute(
+            f"""
+            SELECT
+                SUM(transition_01_win5) AS total_pos,
+                SUM(CASE WHEN transition_01_win5 = 0 THEN 1 ELSE 0 END) AS total_neg
+            FROM read_parquet('{escaped_out}')
+            WHERE year >= {EARLYSTOP_YEAR_MIN} AND year <= {EARLYSTOP_YEAR_MAX}
+            """
+        ).fetchone()
+        earlystop_pos, earlystop_neg = earlystop_stats
+        earlystop_neg_pos_ratio = earlystop_neg / earlystop_pos if earlystop_pos > 0 else 1.0
+        
+        overall_pos = train_pos + earlystop_pos
+        overall_neg = train_neg + earlystop_neg
+        overall_neg_pos_ratio = overall_neg / overall_pos if overall_pos > 0 else 1.0
+        
+        print(f"\n" + "=" * 70)
+        print("OVERALL CLASS BALANCE")
+        print("=" * 70)
+        print(f"\nTRAIN set (year <= {TRAIN_YEAR_MAX}) - SAMPLED:")
+        print(f"  Positives: {train_pos:,}")
+        print(f"  Negatives: {train_neg:,} (capped at {MAX_TOTAL_NEGATIVES:,})")
+        print(f"  Ratio (neg/pos): {train_neg_pos_ratio:.2f}")
+        print(f"  Total size: {train_pos + train_neg:,} rows")
+        
+        print(f"\nEARLYSTOP set ({EARLYSTOP_YEAR_MIN} <= year <= {EARLYSTOP_YEAR_MAX}) - UNSAMPLED:")
+        print(f"  Positives: {earlystop_pos:,}")
+        print(f"  Negatives: {earlystop_neg:,} (true unbalanced)")
+        print(f"  Ratio (neg/pos): {earlystop_neg_pos_ratio:.2f}")
+        print(f"  Total size: {earlystop_pos + earlystop_neg:,} rows")
+        
+        print(f"\nCOMBINED:")
+        print(f"  Positives: {overall_pos:,}")
+        print(f"  Negatives: {overall_neg:,}")
+        print(f"  Ratio (neg/pos): {overall_neg_pos_ratio:.2f}")
+        print(f"  Total size: {overall_pos + overall_neg:,} rows")
 
         if use_wandb:
             wandb.log({
                 "sample/total_rows": total_rows,
-                "sample/total_positives": total_pos,
-                "sample/total_negatives": total_neg,
-                "sample/neg_pos_ratio": neg_pos_ratio,
+                "sample/train_positives": train_pos,
+                "sample/train_negatives": train_neg,
+                "sample/train_neg_pos_ratio": train_neg_pos_ratio,
+                "sample/earlystop_positives": earlystop_pos,
+                "sample/earlystop_negatives": earlystop_neg,
+                "sample/earlystop_neg_pos_ratio": earlystop_neg_pos_ratio,
+                "sample/total_positives": overall_pos,
+                "sample/total_negatives": overall_neg,
+                "sample/neg_pos_ratio": overall_neg_pos_ratio,
                 "sample/max_total_negatives": MAX_TOTAL_NEGATIVES,
                 "timing/total_seconds": time.time() - start_time,
             })

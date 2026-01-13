@@ -4,7 +4,7 @@
 
 Purpose: Perform comprehensive hyperparameter tuning for a LightGBM model using
          the Colombia-specific tuning dataset (modelC_tuning_colombia.parquet)
-         with per-year sampling and strict temporal split
+         with strict temporal split
          (train: year <= 2014, earlystop: 2015 <= year <= 2017).
 
 Input:   `modelC_tuning_colombia.parquet`
@@ -92,7 +92,8 @@ MIN_YEAR = int(os.environ.get("TRANSITION_MIN_YEAR", "2001"))  # drop year 2000 
 
 # Columns to exclude from features
 EXCLUDE_COLS = {
-    "transition_01",  # Target variable
+    "transition_01",  # Old target variable
+    "transition_01_win5",  # Target variable (5-year lookahead)
     "WDPA_b1",  # Leakage
     "WDPA_prev",  # Leakage
     "x",  # Coordinate
@@ -121,9 +122,6 @@ LGBM_PARAM_GRID_BASE = {
     "subsample_freq": [0, 1, 3, 5, 7],  # Frequency of subsampling
     "colsample_bytree": [0.6, 0.7, 0.8, 0.9, 1.0],  # Including 1.0
     "colsample_bynode": [0.6, 0.7, 0.8, 0.9, 1.0],  # Additional sampling at node level
-    
-    # Class imbalance handling - wider range
-    "scale_pos_weight": [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0],
     
     # Regularization parameters - more granular
     "reg_alpha": [0.0, 0.01, 0.1, 0.5, 1.0, 2.0, 5.0],  # L1 regularization
@@ -172,7 +170,8 @@ def convert_numpy_types(obj: Any) -> Any:
         ),
     ):
         return int(obj)
-    elif isinstance(obj, (np.floating, np.float_, np.float16, np.float32, np.float64)):
+    # NumPy 2.0 removed np.float_; np.floating already covers float scalars
+    elif isinstance(obj, (np.floating, np.float16, np.float32, np.float64)):
         return float(obj)
     elif isinstance(obj, np.bool_):
         return bool(obj)
@@ -233,11 +232,15 @@ def filter_supported_params(param_grid: dict) -> dict:
 
 
 def get_feature_columns(df: pd.DataFrame) -> list:
-    """Get valid feature columns, excluding identifiers and leakage columns."""
+    """Get valid feature columns, excluding identifiers and leakage columns.
+    
+    Includes both numeric and boolean feature columns.
+    """
     numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
-    feature_cols = [
-        col for col in numeric_cols if col.lower() not in {c.lower() for c in EXCLUDE_COLS}
-    ]
+    bool_cols = df.select_dtypes(include=["bool"]).columns.tolist()
+    candidate_cols = numeric_cols + [c for c in bool_cols if c not in numeric_cols]
+    exclude_lower = {c.lower() for c in EXCLUDE_COLS}
+    feature_cols = [col for col in candidate_cols if col.lower() not in exclude_lower]
     return feature_cols
 
 
@@ -348,7 +351,7 @@ def main() -> None:
         df[col] = df[col].astype("int32")
     print("  Downcasting completed")
 
-    target_col = "transition_01"
+    target_col = "transition_01_win5"
 
     # Check target column exists
     if target_col not in df.columns:
@@ -367,6 +370,14 @@ def main() -> None:
         removed = before - len(df_clean)
         if removed > 0:
             print(f"\nDropped {removed:,} rows with year < {MIN_YEAR} (TRANSITION_MIN_YEAR)")
+
+    # Apply risk-set filter: WDPA_prev == 0 (exclude already protected pixels)
+    if "WDPA_prev" in df_clean.columns:
+        before = len(df_clean)
+        df_clean = df_clean[df_clean["WDPA_prev"] == 0].copy()
+        removed = before - len(df_clean)
+        if removed > 0:
+            print(f"\nDropped {removed:,} rows with WDPA_prev != 0 (risk-set filter)")
 
     print(f"\nDataset after cleaning: {len(df_clean):,} rows")
 
@@ -402,6 +413,13 @@ def main() -> None:
 
     df_train = df_clean[train_idx].copy()
     df_earlystop = df_clean[earlystop_idx].copy()
+
+    if len(df_earlystop) == 0:
+        raise ValueError(
+            "No rows exist for years 2015–2017 in the early stopping set after "
+            "applying filtering steps (MIN_YEAR, WDPA_prev risk-set filter, and "
+            "missing-target removal). Please verify the input data and filters."
+        )
 
     print(f"\nTemporal split configuration:")
     print(f"  Train: year <= {TRAIN_YEAR_MAX}")
@@ -471,8 +489,8 @@ def main() -> None:
     y_combined = np.concatenate([y_train.values, y_earlystop.values])
     split_indices = np.concatenate(
         [
-            np.full(n_train, -1),  # -1 for train
-            np.zeros(n_earlystop),  # 0 for earlystop/test
+            np.full(n_train, -1, dtype=np.int32),  # -1 for train
+            np.zeros(n_earlystop, dtype=np.int32),  # 0 for earlystop/test
         ]
     )
     predefined_split = PredefinedSplit(split_indices)
@@ -482,27 +500,17 @@ def main() -> None:
     print(f"  Earlystop:   {n_earlystop:,} rows (indices 0)")
 
     # -------------------------------------------------------------------------
-    # Step 4: Prepare parameter grid (including auto scale_pos_weight)
+    # Step 4: Prepare parameter grid and fixed parameters
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
     print("STEP 4: PREPARE EXPANDED PARAMETER GRID")
     print("=" * 70)
 
-    # Compute auto scale_pos_weight from train distribution
-    auto_scale_pos_weight = train_neg / max(train_pos, 1)
-    print(f"\nAuto scale_pos_weight (train_neg/train_pos): {auto_scale_pos_weight:.3f}")
+    # Compute scale_pos_weight from train distribution (n_neg/n_pos)
+    scale_pos_weight = train_neg / max(train_pos, 1)
+    print(f"\nscale_pos_weight (train_neg/train_pos): {scale_pos_weight:.3f}")
 
     lgbm_param_grid = deepcopy(LGBM_PARAM_GRID_BASE)
-    spw_values = list(lgbm_param_grid["scale_pos_weight"])
-    spw_values.append(float(auto_scale_pos_weight))
-    # Remove potential duplicates while preserving order
-    seen = set()
-    unique_spw_values = []
-    for v in spw_values:
-        if v not in seen:
-            seen.add(v)
-            unique_spw_values.append(v)
-    lgbm_param_grid["scale_pos_weight"] = unique_spw_values
     
     # Filter out unsupported parameters for version compatibility
     print("\nFiltering parameter grid for version compatibility...")
@@ -520,8 +528,11 @@ def main() -> None:
     print(f"\nTotal possible combinations: {total_combinations:,}")
     print(f"Searching {N_ITER_LGBM} random combinations ({(N_ITER_LGBM/total_combinations*100):.6f}% of search space)")
 
+    # Add scale_pos_weight to fixed parameters
+    lgbm_fixed_params = {**LGBM_FIXED_PARAMS, "scale_pos_weight": scale_pos_weight}
+
     print("\nFixed parameters:")
-    for param, value in LGBM_FIXED_PARAMS.items():
+    for param, value in lgbm_fixed_params.items():
         print(f"  {param}: {value}")
 
     # -------------------------------------------------------------------------
@@ -538,7 +549,7 @@ def main() -> None:
     print(f"Sampling {N_ITER_LGBM} parameter combinations with RandomizedSearchCV")
 
     # Create LightGBM model
-    lgbm_model = LGBMClassifier(**LGBM_FIXED_PARAMS)
+    lgbm_model = LGBMClassifier(**lgbm_fixed_params)
 
     # Randomized search with fixed train/val split
     print(f"\nStarting randomized search ({N_ITER_LGBM} iterations) with early stopping...")
@@ -553,7 +564,7 @@ def main() -> None:
         n_jobs=1,  # Avoid nested parallelism
         verbose=2,
         random_state=RANDOM_STATE,
-        return_train_score=True,
+        return_train_score=False,
     )
 
     # Early stopping using callback-based approach
@@ -594,7 +605,7 @@ def main() -> None:
                 "lgbm/best_earlystop_score": float(best_earlystop_score_lgbm),
                 "lgbm/tuning_time_seconds": tune_time_lgbm,
                 "lgbm/best_params": random_search_lgbm.best_params_,
-                "lgbm/auto_scale_pos_weight": float(auto_scale_pos_weight),
+                "lgbm/scale_pos_weight": float(scale_pos_weight),
                 "lgbm/total_param_combinations": total_combinations,
                 "lgbm/search_space_coverage_pct": (N_ITER_LGBM / total_combinations * 100),
             }
@@ -605,7 +616,7 @@ def main() -> None:
         "best_params": random_search_lgbm.best_params_,
         "best_earlystop_score": float(best_earlystop_score_lgbm),
         "param_grid": lgbm_param_grid,
-        "fixed_params": LGBM_FIXED_PARAMS,
+        "fixed_params": lgbm_fixed_params,
         "n_iter": N_ITER_LGBM,
         "scoring": "average_precision",
         "tuning_time_seconds": tune_time_lgbm,
@@ -616,7 +627,7 @@ def main() -> None:
             "earlystop_years": f"{EARLYSTOP_YEAR_MIN} <= year <= {EARLYSTOP_YEAR_MAX}",
             "n_train": int(n_train),
             "n_earlystop": int(n_earlystop),
-            "auto_scale_pos_weight": float(auto_scale_pos_weight),
+            "scale_pos_weight": float(scale_pos_weight),
         },
     }
     lgbm_best_params = convert_numpy_types(lgbm_best_params)
@@ -663,7 +674,7 @@ def main() -> None:
                 "summary/total_time_seconds": total_time,
                 "summary/total_time_minutes": total_time / 60,
                 "summary/lgbm_best_earlystop_score": float(lgbm_best_params["best_earlystop_score"]),
-                "summary/auto_scale_pos_weight": float(auto_scale_pos_weight),
+                "summary/scale_pos_weight": float(scale_pos_weight),
                 "summary/total_param_combinations": total_combinations,
                 "status": "success",
             }
