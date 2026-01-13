@@ -253,7 +253,7 @@ def resolve_tuning_parquet() -> Path:
 # =============================================================================
 
 
-def main() -> None:
+def main(use_wandb: bool = False) -> None:
     start_time = time.time()
 
     # -------------------------------------------------------------------------
@@ -268,38 +268,6 @@ def main() -> None:
     mod_time = train_path.stat().st_mtime
     mod_time_str = datetime.fromtimestamp(mod_time).strftime("%Y-%m-%d %H:%M:%S")
     print(f"\nInput parquet file modification time: {mod_time_str}")
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    # Initialize W&B
-    wandb_api_key = os.environ.get("WANDB_API_KEY")
-    wandb_entity = os.environ.get("WANDB_ENTITY")
-    if not wandb_api_key:
-        print("Warning: WANDB_API_KEY not found in environment")
-    if not wandb_entity:
-        print("Warning: WANDB_ENTITY not found in environment (will use default)")
-
-    use_wandb = False
-    try:
-        print("Initializing Weights & Biases...")
-        wandb.init(
-            project="ml-hyperparameter-tuning",
-            entity=wandb_entity,
-            name=f"modelC_tuning_brf_{timestamp}",
-            config={
-                "random_state": RANDOM_STATE,
-                "temporal_split": {
-                    "train_year_max": TRAIN_YEAR_MAX,
-                    "earlystop_year_min": EARLYSTOP_YEAR_MIN,
-                    "earlystop_year_max": EARLYSTOP_YEAR_MAX,
-                },
-                "n_iter_brf": N_ITER_BRF,
-            },
-        )
-        use_wandb = True
-        print("W&B connected\n")
-    except Exception as err:
-        print(f"W&B initialization failed: {err}\n")
 
     print("=" * 70)
     print("MODELC BALANCED RANDOM FOREST HYPERPARAMETER TUNING (COLOMBIA DATASET)")
@@ -731,6 +699,36 @@ if __name__ == "__main__":
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = output_dir / f"modelC_tuning_brf_{timestamp}.txt"
 
+    # Initialize W&B BEFORE redirecting stdout/stderr so it can capture output
+    wandb_api_key = os.environ.get("WANDB_API_KEY")
+    wandb_entity = os.environ.get("WANDB_ENTITY")
+    if not wandb_api_key:
+        print("Warning: WANDB_API_KEY not found in environment")
+    if not wandb_entity:
+        print("Warning: WANDB_ENTITY not found in environment (will use default)")
+
+    use_wandb = False
+    try:
+        print("Initializing Weights & Biases...")
+        wandb.init(
+            project="ml-hyperparameter-tuning",
+            entity=wandb_entity,
+            name=f"modelC_tuning_brf_{timestamp}",
+            config={
+                "random_state": RANDOM_STATE,
+                "temporal_split": {
+                    "train_year_max": TRAIN_YEAR_MAX,
+                    "earlystop_year_min": EARLYSTOP_YEAR_MIN,
+                    "earlystop_year_max": EARLYSTOP_YEAR_MAX,
+                },
+                "n_iter_brf": N_ITER_BRF,
+            },
+        )
+        use_wandb = True
+        print("W&B connected\n")
+    except Exception as err:
+        print(f"W&B initialization failed: {err}\n")
+
     # Open file in write mode to start fresh, then switch to append for stderr
     with open(output_file, "w", encoding="utf-8") as f:
         f.write(f"Log file started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -746,7 +744,7 @@ if __name__ == "__main__":
     sys.stderr = tee_stderr
 
     try:
-        main()
+        main(use_wandb=use_wandb)
     finally:
         sys.stdout = original_stdout
         sys.stderr = original_stderr
