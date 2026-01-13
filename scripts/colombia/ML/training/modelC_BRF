@@ -219,10 +219,9 @@ def resolve_metadata_file(filename: str) -> Optional[Path]:
 
 
 def resolve_best_params_json() -> Optional[Path]:
-    """Locate rf_best_params.json (in same directory as this script). Returns None if not found.
-    Note: For BRF, we overwrite JSON params with fixed hyperparameters."""
+    """Locate brf_best_params.json (in same directory as this script). Returns None if not found."""
     script_dir = Path(__file__).resolve().parent
-    params_path = script_dir / "rf_best_params.json"
+    params_path = script_dir / "brf_best_params.json"
     
     if not params_path.exists():
         return None
@@ -231,23 +230,73 @@ def resolve_best_params_json() -> Optional[Path]:
 
 
 def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
-    """Return fixed BRF hyperparameters (overwrites JSON params).
-    Uses fast, robust baseline hyperparameters for BalancedRandomForestClassifier."""
-    # n_estimators configurable via BRF_N_ESTIMATORS env var, default 1000
-    n_estimators = int(os.environ.get("BRF_N_ESTIMATORS", "1000"))
-    # Fixed hyperparameters for BRF (overwrite any JSON params)
-    final_params = {
-        "n_estimators": n_estimators,
-        "max_depth": 40,
-        "min_samples_leaf": 50,
-        "sampling_strategy": 0.1,  # ~1:10 pos:neg per tree
-        "replacement": False,
-        "bootstrap": True,
-        "random_state": RANDOM_STATE,
-        "n_jobs": get_n_jobs()
-    }
+    """Load BRF hyperparameters from JSON file if available, otherwise use default fallback parameters.
     
-    return final_params, None
+    If JSON exists: loads params from JSON, converts numpy types to Python, removes incompatible keys,
+    and adds defaults (random_state, n_jobs) only if missing.
+    
+    If JSON is missing: returns default fallback parameters.
+    
+    Args:
+        params_path: Path to brf_best_params.json file, or None if not found
+        
+    Returns:
+        Tuple of (final_params dict, best_cv_score)
+    """
+    if params_path is None:
+        # Use default fallback parameters when JSON file is not found
+        n_estimators = int(os.environ.get("BRF_N_ESTIMATORS", "1000"))
+        final_params = {
+            "n_estimators": n_estimators,
+            "max_depth": 40,
+            "min_samples_leaf": 50,
+            "sampling_strategy": 0.1,  # ~1:10 pos:neg per tree
+            "replacement": False,
+            "bootstrap": True,
+            "random_state": RANDOM_STATE,
+            "n_jobs": get_n_jobs()
+        }
+        return final_params, None
+    
+    # Load JSON file
+    with open(params_path, 'r') as f:
+        params_data = json.load(f)
+    
+    # Extract best_params and fixed_params from JSON
+    json_fixed = params_data.get('fixed_params', {})
+    json_best = params_data.get('best_params', {}).copy()
+    
+    # Merge fixed_params and best_params (best_params takes precedence)
+    final_params = {**json_fixed, **json_best}
+    
+    # Convert numpy types to Python native types
+    final_params = convert_numpy_types(final_params)
+    
+    # Add defaults only if missing
+    if "random_state" not in final_params:
+        final_params["random_state"] = RANDOM_STATE
+    if "n_jobs" not in final_params:
+        final_params["n_jobs"] = get_n_jobs()
+    
+    # Remove only incompatible keys (RF/LGBM-specific params that BRF doesn't support)
+    incompatible_keys = [
+        "class_weight",      # RF-specific, BRF uses sampling_strategy instead
+        "scale_pos_weight",  # LGBM/XGBoost-specific
+        "is_unbalance",      # LGBM-specific
+        "num_boost_round",   # LGBM-specific
+        "num_threads",       # LGBM-specific (use n_jobs instead)
+        "boosting_type",     # LGBM-specific
+        "objective",         # LGBM-specific
+        "metric",            # LGBM-specific
+        "verbose",           # LGBM-specific
+    ]
+    for key in incompatible_keys:
+        final_params.pop(key, None)
+    
+    # Return best score if available
+    best_score = params_data.get('best_earlystop_score', params_data.get('best_val_score', params_data.get('best_cv_score', None)))
+    
+    return final_params, best_score
 
 
 def load_numpy_arrays_two_pass(
@@ -1183,9 +1232,14 @@ def main(timestamp: str) -> None:
     model_dir = repo_root / "data/ml/models"
     model_dir.mkdir(parents=True, exist_ok=True)
     
+    # Load hyperparameters before initializing W&B so we can log them
+    best_params, best_cv_score = load_best_params(params_path)
+    
     use_wandb = False
     if wandb is not None:
         try:
+            # Convert params to native Python types for W&B logging
+            wandb_params = convert_numpy_types(best_params.copy())
             wandb.init(
             project="ml-training-colombia", 
             entity=os.environ.get("WANDB_ENTITY"), 
@@ -1196,6 +1250,7 @@ def main(timestamp: str) -> None:
                 "target_column": TARGET_COL,
                 "lookahead_years": 5,
                 "random_state": RANDOM_STATE,
+                "hyperparameters": wandb_params,
                 "temporal_split": {
                     "train_years": list(TRAIN_YEARS), 
                     "earlystop_years": list(EARLYSTOP_YEARS),
@@ -1211,16 +1266,18 @@ def main(timestamp: str) -> None:
         print("W&B not available (module not installed)")
     
     print("="*70 + "\nBALANCED RANDOM FOREST TRANSITION MODEL (COLOMBIA DATASET - 5-YEAR LOOKAHEAD)\n" + "="*70)
-    print(f"Train: {train_path}\nEarlystop: {earlystop_path}\nTest: {test_path}\nParams: Using fixed BRF hyperparameters (overwrites JSON)\nOutput: {output_dir}")
+    params_source = f"Params: {params_path.name}" if params_path else "Params: Using default fallback hyperparameters"
+    print(f"Train: {train_path}\nEarlystop: {earlystop_path}\nTest: {test_path}\n{params_source}\nOutput: {output_dir}")
     print(f"\nConfiguration:")
     print(f"  WDPA_LAST_YEAR: {WDPA_LAST_YEAR}")
     print(f"  LOOKAHEAD_YEARS: {LOOKAHEAD_YEARS}")
     print(f"  LAST_LABEL_YEAR: {LAST_LABEL_YEAR} (WDPA_LAST_YEAR - LOOKAHEAD_YEARS)")
     print(f"  Earlystop/Test data filtered to years <= {LAST_LABEL_YEAR} to avoid right-censored labels")
-    print(f"  Using BalancedRandomForestClassifier with fixed hyperparameters (no MAX_NEG_TRAIN downsampling)")
-    
-    best_params, best_cv_score = load_best_params(params_path)
-    print(f"\nUsing fixed BRF hyperparameters:")
+    print(f"  Using BalancedRandomForestClassifier (no MAX_NEG_TRAIN downsampling)")
+    if params_path:
+        print(f"\nUsing tuned BRF hyperparameters from {params_path.name}:")
+    else:
+        print(f"\nUsing default fallback BRF hyperparameters:")
     print(f"  n_estimators={best_params.get('n_estimators')}, max_depth={best_params.get('max_depth')}, "
           f"min_samples_leaf={best_params.get('min_samples_leaf')}, sampling_strategy={best_params.get('sampling_strategy')}")
     

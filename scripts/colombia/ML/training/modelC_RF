@@ -238,6 +238,8 @@ def resolve_best_params_json() -> Optional[Path]:
 
 def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
     """Load and merge parameters from JSON with safe defaults for Random Forest.
+    Supports both flat JSON (direct param dict) and nested JSON (with 'fixed_params' and 'best_params' keys).
+    Treats JSON params as primary, guardrails only fill missing keys.
     If params_path is None, returns default manual hyperparameters."""
     if params_path is None:
         # Use default manual hyperparameters when JSON file is not found
@@ -258,11 +260,17 @@ def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
     with open(params_path, 'r') as f:
         params_data = json.load(f)
     
-    # Start with JSON params
-    json_fixed = params_data.get('fixed_params', {})
-    json_best = params_data.get('best_params', {}).copy()
-    
-    final_params = {**json_fixed, **json_best}
+    # Support both flat and nested JSON formats
+    if isinstance(params_data, dict) and ('fixed_params' in params_data or 'best_params' in params_data):
+        # Nested format: {fixed_params: {...}, best_params: {...}, ...}
+        json_fixed = params_data.get('fixed_params', {})
+        json_best = params_data.get('best_params', {}).copy()
+        final_params = {**json_fixed, **json_best}
+        best_score = params_data.get('best_val_score', params_data.get('best_cv_score', None))
+    else:
+        # Flat format: direct parameter dictionary
+        final_params = params_data.copy() if isinstance(params_data, dict) else {}
+        best_score = None
     
     # Guardrails: only fill missing keys, don't overwrite existing ones
     guardrail_params = {
@@ -285,7 +293,7 @@ def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
     if "class_weight" not in final_params:
         final_params["class_weight"] = "balanced_subsample"
     
-    return final_params, params_data.get('best_val_score', params_data.get('best_cv_score', None))
+    return final_params, best_score
 
 
 def load_numpy_arrays_two_pass(
@@ -731,8 +739,8 @@ def phase1_training(
     model_params_intermediate["random_state"] = RANDOM_STATE
     if "n_jobs" not in model_params_intermediate:
         model_params_intermediate["n_jobs"] = get_n_jobs()
-    # Remove any LGBM-specific params (do NOT remove verbose - it's used for RF)
-    for key in ["scale_pos_weight", "is_unbalance", "num_boost_round", "num_threads", "boosting_type", "objective", "metric"]:
+    # Remove any non-RF params that may have been in JSON
+    for key in ["scale_pos_weight", "is_unbalance", "num_boost_round", "boosting_type", "metric"]:
         model_params_intermediate.pop(key, None)
     
     # Inject verbose parameter
@@ -921,14 +929,9 @@ def phase1_training(
     if "n_jobs" not in model_params:
         model_params["n_jobs"] = get_n_jobs()
     
-    # Remove any LGBM-specific params that might have been in JSON (do NOT remove verbose - it's used for RF)
-    model_params.pop("scale_pos_weight", None)
-    model_params.pop("is_unbalance", None)
-    model_params.pop("num_boost_round", None)
-    model_params.pop("num_threads", None)
-    model_params.pop("boosting_type", None)
-    model_params.pop("objective", None)
-    model_params.pop("metric", None)
+    # Remove any non-RF params that may have been in JSON (preserve class_weight which is RF-specific)
+    for key in ["scale_pos_weight", "is_unbalance", "num_boost_round", "boosting_type", "metric"]:
+        model_params.pop(key, None)
     
     # Inject verbose parameter
     model_params["verbose"] = SK_VERBOSE
@@ -942,6 +945,11 @@ def phase1_training(
     print(f"\nImbalance: {train_neg_full:,} neg, {train_pos_full:,} pos, ratio 1:{train_neg_full/max(train_pos_full,1):.1f}")
     print(f"  Using class_weight: {model_params.get('class_weight', 'balanced_subsample')}")
     
+    # Print final parameters before model creation
+    print(f"\nFinal model parameters:")
+    for key in sorted(model_params.keys()):
+        print(f"  {key}: {model_params[key]}")
+    
     if use_wandb:
         wandb.log({
             "final_model/imbalance/class_weight": str(model_params.get("class_weight", "balanced_subsample")),
@@ -950,9 +958,6 @@ def phase1_training(
         })
     
     print(f"\nTraining final model on {len(X_train_full):,} samples...")
-    print(f"  Model parameters: n_estimators={model_params.get('n_estimators', 'default')}, "
-          f"max_depth={model_params.get('max_depth', 'default')}, "
-          f"class_weight={model_params.get('class_weight', 'default')}")
     report_memory_usage("before final training")
     train_start = time.time()
     
@@ -1279,6 +1284,16 @@ def main(timestamp: str) -> None:
     test_path = resolve_parquet_file("test_colombia_win5.parquet")
     params_path = resolve_best_params_json()
     metadata_path = resolve_metadata_file("train_colombia_win5_metadata.json")
+    
+    # Load parameters before wandb.init() so we can log them
+    best_params, best_cv_score = load_best_params(params_path)
+    if params_path:
+        print(f"\nLoaded params from {params_path}")
+        if best_cv_score:
+            print(f"Best CV score: {best_cv_score:.4f}")
+    else:
+        print(f"\nUsing default manual hyperparameters (rf_best_params.json not found)")
+    
     output_dir = repo_root / "outputs/Results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
     model_dir = repo_root / "data/ml/models"
@@ -1301,7 +1316,8 @@ def main(timestamp: str) -> None:
                     "train_years": list(TRAIN_YEARS), 
                     "earlystop_years": list(EARLYSTOP_YEARS),
                     "test_years": list(TEST_YEARS)
-                }
+                },
+                "hyperparameters": best_params
             }
             )
             use_wandb = True
@@ -1322,14 +1338,6 @@ def main(timestamp: str) -> None:
         print(f"  MAX_NEG_TRAIN: {MAX_NEG_TRAIN} (negative samples will be downsampled to this cap)")
     else:
         print(f"  MAX_NEG_TRAIN: 0 (no downsampling)")
-    
-    best_params, best_cv_score = load_best_params(params_path)
-    if params_path:
-        print(f"\nLoaded params from {params_path}")
-        if best_cv_score:
-            print(f"Best CV score: {best_cv_score:.4f}")
-    else:
-        print(f"\nUsing default manual hyperparameters (rf_best_params.json not found)")
     
     # Override parameters if FAST_TRAIN is enabled
     if FAST_TRAIN:

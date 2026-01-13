@@ -271,7 +271,8 @@ def resolve_best_params_json() -> Optional[Path]:
 
 def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
     """Load and merge parameters: FIXED_PARAMS → json_fixed_params → best_params → guardrails (fill missing only).
-    All parameters from JSON are used as-is.
+    Supports both flat JSON (direct param dict) and nested JSON (with 'fixed_params' and 'best_params' keys).
+    Treats JSON params as primary, guardrails only fill missing keys.
     If params_path is None, returns default manual hyperparameters."""
     if params_path is None:
         # Use default manual hyperparameters when JSON file is not found
@@ -285,11 +286,17 @@ def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
     with open(params_path, 'r') as f:
         params_data = json.load(f)
     
-    # Start with FIXED_PARAMS, then add JSON params
-    json_fixed = params_data.get('fixed_params', {})
-    json_best = params_data.get('best_params', {}).copy()
-    
-    final_params = {**FIXED_PARAMS, **json_fixed, **json_best}
+    # Support both flat and nested JSON formats
+    if isinstance(params_data, dict) and ('fixed_params' in params_data or 'best_params' in params_data):
+        # Nested format: {fixed_params: {...}, best_params: {...}, ...}
+        json_fixed = params_data.get('fixed_params', {})
+        json_best = params_data.get('best_params', {}).copy()
+        final_params = {**FIXED_PARAMS, **json_fixed, **json_best}
+        best_score = params_data.get('best_val_score', params_data.get('best_cv_score', None))
+    else:
+        # Flat format: direct parameter dictionary
+        final_params = {**FIXED_PARAMS, **(params_data.copy() if isinstance(params_data, dict) else {})}
+        best_score = None
     
     # Guardrails: only fill missing keys, don't overwrite existing ones
     guardrail_params = {"max_depth": 8, "num_leaves": 255, "min_child_samples": 50, "subsample": 0.7,
@@ -301,7 +308,7 @@ def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
         if key not in final_params:
             final_params[key] = value
     
-    return final_params, params_data.get('best_val_score', params_data.get('best_cv_score', None))
+    return final_params, best_score
 
 
 def load_numpy_arrays_two_pass(
@@ -760,6 +767,9 @@ def train_single_cv_fold(
     train_params.pop("num_boost_round", None)
     train_params.pop("n_estimators", None)
     train_params.pop("n_jobs", None)  # Remove n_jobs if present (use num_threads instead)
+    # Remove any non-LGBM params that may have been in JSON
+    for key in ["sampling_strategy", "replacement", "bootstrap", "class_weight"]:
+        train_params.pop(key, None)
     # Ensure num_threads is set for optimal CPU usage
     if "num_threads" not in train_params:
         train_params["num_threads"] = get_n_jobs()
@@ -1174,6 +1184,9 @@ def phase1_training(
     train_params.pop("num_boost_round", None)
     train_params.pop("n_estimators", None)
     train_params.pop("n_jobs", None)  # Remove n_jobs if present (use num_threads instead)
+    # Remove any non-LGBM params that may have been in JSON
+    for key in ["sampling_strategy", "replacement", "bootstrap", "class_weight"]:
+        train_params.pop(key, None)
     # Remove early stopping parameters since we're training without validation set
     train_params.pop("early_stopping_rounds", None)
     train_params.pop("early_stopping", None)
@@ -1183,6 +1196,11 @@ def phase1_training(
     # Override scale_pos_weight with computed value right before training
     # Formula: scale_pos_weight = n_neg / n_pos
     train_params["scale_pos_weight"] = scale_pos_weight
+    
+    # Print final parameters before model creation
+    print(f"\nFinal model parameters:")
+    for key in sorted(train_params.keys()):
+        print(f"  {key}: {train_params[key]}")
     
     print(f"  Creating dataset...")
     if train_weights is not None:
@@ -1557,6 +1575,16 @@ def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True, 
     earlystop_path = resolve_parquet_file("earlystop_colombia_win5.parquet")
     test_path = resolve_parquet_file("test_colombia_win5.parquet")
     params_path = resolve_best_params_json()
+    
+    # Load parameters before wandb.init() so we can log them
+    best_params, best_cv_score = load_best_params(params_path)
+    if params_path:
+        print(f"\nLoaded params from {params_path}")
+        if best_cv_score:
+            print(f"Best CV score: {best_cv_score:.4f}")
+    else:
+        print(f"\nUsing default manual hyperparameters (lgbm_best_params.json not found)")
+    
     output_dir = repo_root / "outputs/Results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
     model_dir = repo_root / "data/ml/models"
@@ -1580,7 +1608,8 @@ def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True, 
                     "train_years": list(TRAIN_YEARS), 
                     "earlystop_years": list(EARLYSTOP_YEARS),
                     "test_years": list(TEST_YEARS)
-                }
+                },
+                "hyperparameters": best_params
             }
             )
             use_wandb = True
@@ -1599,14 +1628,6 @@ def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True, 
     print(f"  LOOKAHEAD_YEARS: {LOOKAHEAD_YEARS}")
     print(f"  LAST_LABEL_YEAR: {LAST_LABEL_YEAR} (WDPA_LAST_YEAR - LOOKAHEAD_YEARS)")
     print(f"  Earlystop/Test data filtered to years <= {LAST_LABEL_YEAR} to avoid right-censored labels")
-    
-    best_params, best_cv_score = load_best_params(params_path)
-    if params_path:
-        print(f"\nLoaded params from {params_path}")
-        if best_cv_score:
-            print(f"Best CV score: {best_cv_score:.4f}")
-    else:
-        print(f"\nUsing default manual hyperparameters (lgbm_best_params.json not found)")
     
     all_cols_train = pq.ParquetFile(train_path).schema_arrow.names
     all_cols_test = pq.ParquetFile(test_path).schema_arrow.names
