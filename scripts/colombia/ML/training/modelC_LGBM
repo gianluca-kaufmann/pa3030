@@ -756,15 +756,10 @@ def train_single_cv_fold(
         train_weights = None
         print(f"  Training sample weights: DISABLED (use_time_weights=False)")
     
-    # Compute or use overridden scale_pos_weight
-    # If scale_pos_weight is already in best_params (from override), use that value.
-    # Otherwise, compute from training data: scale_pos_weight = n_neg / n_pos
-    if "scale_pos_weight" in best_params:
-        scale_pos_weight = best_params["scale_pos_weight"]
-        print(f"  Using overridden scale_pos_weight: {scale_pos_weight:.6f}")
-    else:
-        scale_pos_weight = train_neg / max(train_pos, 1)
-        print(f"  Computed scale_pos_weight from training data: {scale_pos_weight:.6f} = {train_neg:,} / {train_pos:,}")
+    # Compute scale_pos_weight from training data
+    # Formula: scale_pos_weight = n_neg / n_pos
+    scale_pos_weight = train_neg / max(train_pos, 1)
+    print(f"  Computed scale_pos_weight from training data: {scale_pos_weight:.6f} = {train_neg:,} / {train_pos:,}")
     
     # Train model
     num_boost_round_earlystop = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
@@ -775,10 +770,12 @@ def train_single_cv_fold(
     # Remove any non-LGBM params that may have been in JSON
     for key in ["sampling_strategy", "replacement", "bootstrap", "class_weight"]:
         train_params.pop(key, None)
+    # Remove scale_pos_weight from best_params if present (always compute from data)
+    train_params.pop("scale_pos_weight", None)
     # Ensure num_threads is set for optimal CPU usage
     if "num_threads" not in train_params:
         train_params["num_threads"] = get_n_jobs()
-    # Set scale_pos_weight (either overridden or computed)
+    # Set scale_pos_weight (computed from training data)
     train_params["scale_pos_weight"] = scale_pos_weight
     
     print(f"  Creating datasets...")
@@ -1159,15 +1156,10 @@ def phase1_training(
         train_weights = None
         print(f"  Training sample weights: DISABLED (use_time_weights=False)")
     
-    # Compute or use overridden scale_pos_weight
-    # If scale_pos_weight is already in best_params (from override), use that value.
-    # Otherwise, compute from training data: scale_pos_weight = n_neg / n_pos
-    if "scale_pos_weight" in best_params:
-        scale_pos_weight = best_params["scale_pos_weight"]
-        print(f"\nImbalance: Using overridden scale_pos_weight: {scale_pos_weight:.6f}")
-    else:
-        scale_pos_weight = train_neg_full / max(train_pos_full, 1)
-        print(f"\nImbalance: Computed scale_pos_weight from training data: {scale_pos_weight:.6f} = {train_neg_full:,} / {train_pos_full:,}")
+    # Compute scale_pos_weight from training data
+    # Formula: scale_pos_weight = n_neg / n_pos
+    scale_pos_weight = train_neg_full / max(train_pos_full, 1)
+    print(f"\nImbalance: Computed scale_pos_weight from training data: {scale_pos_weight:.6f} = {train_neg_full:,} / {train_pos_full:,}")
     
     imbalance_info = {
         "neg": int(train_neg_full),
@@ -1199,10 +1191,12 @@ def phase1_training(
     # Remove early stopping parameters since we're training without validation set
     train_params.pop("early_stopping_rounds", None)
     train_params.pop("early_stopping", None)
+    # Remove scale_pos_weight from best_params if present (always compute from data)
+    train_params.pop("scale_pos_weight", None)
     # Ensure num_threads is set for optimal CPU usage
     if "num_threads" not in train_params:
         train_params["num_threads"] = get_n_jobs()
-    # Set scale_pos_weight (either overridden or computed)
+    # Set scale_pos_weight (computed from training data)
     train_params["scale_pos_weight"] = scale_pos_weight
     
     # Print final parameters before model creation
@@ -1602,10 +1596,11 @@ def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True, 
     # Note: scale_pos_weight is computed automatically from training data (n_neg / n_pos)
     # and should not be overridden here unless you have a specific reason.
     # =============================================================================
+    # Maximum boosting rounds cap (allows fold3 to early-stop naturally)
+    MAX_NUM_BOOST_ROUND = 5000
+    
     HYPERPARAMETER_OVERRIDES = {
-        "num_leaves": 127,           # Override: 255 -> 127
-        "min_child_samples": 500,    # Override: 200 -> 500
-        "reg_lambda": 3.0,           # Override: 1.0 -> 3.0
+        "num_boost_round": MAX_NUM_BOOST_ROUND,  # Increase max boosting rounds to 4500
     }
     
     # Apply overrides to best_params
