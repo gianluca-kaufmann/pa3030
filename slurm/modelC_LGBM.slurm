@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=model1_LGBM
+#SBATCH --job-name=modelC_LGBM
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/model1_LGBM_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/model1_LGBM_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/modelC_LGBM_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/modelC_LGBM_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -33,22 +33,22 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the model1_LGBM script
+# Run the modelC_LGBM script
 #------------------------------------------------------------------------------
-echo "Starting model1_LGBM script..."
+echo "Starting modelC_LGBM script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/training/model1_LGBM" ] || {
-  echo "ERROR: model1_LGBM not found"
-  echo "NOTE: model1_LGBM script is in ML/training/ directory"
-  find scripts -maxdepth 4 -type f -name "model1_LGBM"
+[ -f "scripts/ML/training/modelC_LGBM" ] || {
+  echo "ERROR: modelC_LGBM not found"
+  echo "NOTE: modelC_LGBM script is in ML/training/ directory"
+  find scripts -maxdepth 4 -type f -name "modelC_LGBM"
   exit 1
 }
 # Run the script
-python "scripts/ML/training/model1_LGBM" --cv-mode fold3 
+python "scripts/ML/training/modelC_LGBM" --cv-mode fold3 
 
-echo "model1_LGBM script finished."
+echo "modelC_LGBM script finished."
 
