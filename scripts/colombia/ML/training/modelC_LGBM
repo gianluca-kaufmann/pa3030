@@ -756,10 +756,15 @@ def train_single_cv_fold(
         train_weights = None
         print(f"  Training sample weights: DISABLED (use_time_weights=False)")
     
-    # Compute scale_pos_weight from training data
-    # Formula: scale_pos_weight = n_neg / n_pos
-    scale_pos_weight = train_neg / max(train_pos, 1)
-    print(f"  Computed scale_pos_weight from training data: {scale_pos_weight:.6f} = {train_neg:,} / {train_pos:,}")
+    # Compute or use overridden scale_pos_weight
+    # If scale_pos_weight is already in best_params (from override), use that value.
+    # Otherwise, compute from training data: scale_pos_weight = n_neg / n_pos
+    if "scale_pos_weight" in best_params:
+        scale_pos_weight = best_params["scale_pos_weight"]
+        print(f"  Using overridden scale_pos_weight: {scale_pos_weight:.6f}")
+    else:
+        scale_pos_weight = train_neg / max(train_pos, 1)
+        print(f"  Computed scale_pos_weight from training data: {scale_pos_weight:.6f} = {train_neg:,} / {train_pos:,}")
     
     # Train model
     num_boost_round_earlystop = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
@@ -773,8 +778,7 @@ def train_single_cv_fold(
     # Ensure num_threads is set for optimal CPU usage
     if "num_threads" not in train_params:
         train_params["num_threads"] = get_n_jobs()
-    # Override scale_pos_weight with computed value right before training
-    # Formula: scale_pos_weight = n_neg / n_pos
+    # Set scale_pos_weight (either overridden or computed)
     train_params["scale_pos_weight"] = scale_pos_weight
     
     print(f"  Creating datasets...")
@@ -1155,10 +1159,15 @@ def phase1_training(
         train_weights = None
         print(f"  Training sample weights: DISABLED (use_time_weights=False)")
     
-    # Compute scale_pos_weight from training data
-    # Formula: scale_pos_weight = n_neg / n_pos
-    scale_pos_weight = train_neg_full / max(train_pos_full, 1)
-    print(f"\nImbalance: Computed scale_pos_weight from training data: {scale_pos_weight:.6f} = {train_neg_full:,} / {train_pos_full:,}")
+    # Compute or use overridden scale_pos_weight
+    # If scale_pos_weight is already in best_params (from override), use that value.
+    # Otherwise, compute from training data: scale_pos_weight = n_neg / n_pos
+    if "scale_pos_weight" in best_params:
+        scale_pos_weight = best_params["scale_pos_weight"]
+        print(f"\nImbalance: Using overridden scale_pos_weight: {scale_pos_weight:.6f}")
+    else:
+        scale_pos_weight = train_neg_full / max(train_pos_full, 1)
+        print(f"\nImbalance: Computed scale_pos_weight from training data: {scale_pos_weight:.6f} = {train_neg_full:,} / {train_pos_full:,}")
     
     imbalance_info = {
         "neg": int(train_neg_full),
@@ -1193,8 +1202,7 @@ def phase1_training(
     # Ensure num_threads is set for optimal CPU usage
     if "num_threads" not in train_params:
         train_params["num_threads"] = get_n_jobs()
-    # Override scale_pos_weight with computed value right before training
-    # Formula: scale_pos_weight = n_neg / n_pos
+    # Set scale_pos_weight (either overridden or computed)
     train_params["scale_pos_weight"] = scale_pos_weight
     
     # Print final parameters before model creation
@@ -1584,6 +1592,31 @@ def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True, 
             print(f"Best CV score: {best_cv_score:.4f}")
     else:
         print(f"\nUsing default manual hyperparameters (lgbm_best_params.json not found)")
+    
+    # =============================================================================
+    # HYPERPARAMETER OVERRIDE SECTION
+    # =============================================================================
+    # Override specific hyperparameters here. These will overwrite values loaded
+    # from the tuning script output. Set to None to use computed/default values.
+    # 
+    # Note: scale_pos_weight is computed automatically from training data (n_neg / n_pos)
+    # and should not be overridden here unless you have a specific reason.
+    # =============================================================================
+    HYPERPARAMETER_OVERRIDES = {
+        "num_leaves": 127,           # Override: 255 -> 127
+        "min_child_samples": 500,    # Override: 200 -> 500
+        "reg_lambda": 3.0,           # Override: 1.0 -> 3.0
+    }
+    
+    # Apply overrides to best_params
+    if HYPERPARAMETER_OVERRIDES:
+        print(f"\nApplying hyperparameter overrides:")
+        for key, value in HYPERPARAMETER_OVERRIDES.items():
+            if value is not None:
+                old_value = best_params.get(key, "not set")
+                best_params[key] = value
+                print(f"  {key}: {old_value} -> {value}")
+    # =============================================================================
     
     output_dir = repo_root / "outputs/Results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
