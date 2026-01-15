@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """LGBM Transition Model for Colombia Dataset (5-Year Lookahead Prediction)
-Train LightGBM on pre-split parquet files: train_colombia_win5 (2000-2014), 
-earlystop_colombia_win5 (2015-2017), test_colombia_win5 (2018-2019). Final model trained on 2000-2017,
-using average best_iteration from CV folds (no early stopping), evaluated on 2018-2019.
+Train LightGBM on pre-split parquet files: train_colombia_win5 (2000-2013), 
+earlystop_colombia_win5 (2014-2016), test_colombia_win5 (2017-2019). Final model trained on 2000-2016,
+using average best_iteration from CV folds (no early stopping), evaluated on 2017-2019.
 Target: transition_01_win5 (1 if transition occurs within next 5 years, else 0)
 
 Features:
@@ -63,11 +63,11 @@ TARGET_COL = "transition_01_win5"  # 5-year lookahead target
 LOOKAHEAD_YEARS = 5  # Number of years ahead for prediction
 WDPA_LAST_YEAR = 2024  # Last year with WDPA data
 LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS  # Last year we can reliably label (2019)
-TRAIN_YEARS = (2000, 2014)   # Train: 2000-2014 (for final model)
-EARLYSTOP_YEARS = (2015, min(2017, LAST_LABEL_YEAR))     # Earlystop: 2015-2017 (capped at LAST_LABEL_YEAR)
-TEST_START = 2018
+TRAIN_YEARS = (2000, 2013)   # Train: 2000-2013 (for final model)
+EARLYSTOP_YEARS = (2014, min(2016, LAST_LABEL_YEAR))     # Earlystop: 2014-2016 (capped at LAST_LABEL_YEAR)
+TEST_START = 2017
 TEST_END = 2019
-TEST_YEARS = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))    # Test: 2018-2019 (capped at LAST_LABEL_YEAR)
+TEST_YEARS = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))    # Test: 2017-2019 (capped at LAST_LABEL_YEAR)
 FIXED_PARAMS = {'random_state': RANDOM_STATE, 'boosting_type': 'gbdt', 'objective': 'binary', 'verbose': -1}
 
 # Batch size for data loading (can be overridden via BATCH_SIZE env var)
@@ -77,9 +77,9 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "200000"))
 # Each fold: (train_start, train_end, earlystop_start, earlystop_end)
 # Earlystop years are capped at LAST_LABEL_YEAR to avoid right-censored labels
 CV_FOLDS = [
-    ((2000, 2008), (2009, min(2011, LAST_LABEL_YEAR))),  # Fold 1: Train 2000-2008 → Earlystop 2009-2011
-    ((2000, 2011), (2012, min(2014, LAST_LABEL_YEAR))),  # Fold 2: Train 2000-2011 → Earlystop 2012-2014
-    ((2000, 2014), (2015, min(2017, LAST_LABEL_YEAR))),  # Fold 3: Train 2000-2014 → Earlystop 2015-2017
+    ((2000, 2007), (2008, min(2010, LAST_LABEL_YEAR))),  # Fold 1: Train 2000-2007 → Earlystop 2008-2010
+    ((2000, 2010), (2011, min(2013, LAST_LABEL_YEAR))),  # Fold 2: Train 2000-2010 → Earlystop 2011-2013
+    ((2000, 2013), (2014, min(2016, LAST_LABEL_YEAR))),  # Fold 3: Train 2000-2013 → Earlystop 2014-2016
 ]
 
 # Utility Functions
@@ -1121,7 +1121,7 @@ def phase1_training(
         })
     
     # =============================================================================
-    # STEP B: FINAL MODEL TRAINING (Full train+earlystop: 2000-2017)
+    # STEP B: FINAL MODEL TRAINING (Full train+earlystop: 2000-2016)
     # =============================================================================
     print("\n" + "="*70 + "\nSTEP B: FINAL MODEL TRAINING\n" + "="*70)
     print(f"Training final model on full dataset: {TRAIN_YEARS[0]}-{EARLYSTOP_YEARS[1]}")
@@ -1275,7 +1275,7 @@ def phase2_testing(
     report_memory_usage("start of Phase 2")
     
     # Check for year overlap between training and test
-    final_train_years = (TRAIN_YEARS[0], EARLYSTOP_YEARS[1])  # Full training period: 2000-2017
+    final_train_years = (TRAIN_YEARS[0], EARLYSTOP_YEARS[1])  # Full training period: 2000-2016
     test_year_range = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))
     
     if check_year_overlap(final_train_years, test_year_range, "Test"):
@@ -1601,7 +1601,7 @@ def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True, 
     
     HYPERPARAMETER_OVERRIDES = {
         "num_boost_round": MAX_NUM_BOOST_ROUND,  # Increase max boosting rounds to 4500
-        "learning_rate": 0.035,                  # Override: 0.02 -> 0.03
+        "learning_rate": 0.03,                  # Override: 0.02 -> 0.03
     }
     
     # Apply overrides to best_params
