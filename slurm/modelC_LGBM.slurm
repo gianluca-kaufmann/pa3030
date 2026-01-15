@@ -41,14 +41,14 @@ echo "Starting modelC_LGBM script..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/training/modelC_LGBM" ] || {
+[ -f "scripts/colombia/ML/training/modelC_LGBM" ] || {
   echo "ERROR: modelC_LGBM not found"
-  echo "NOTE: modelC_LGBM script is in ML/training/ directory"
+  echo "NOTE: modelC_LGBM script is in colombia/ML/training/ directory"
   find scripts -maxdepth 4 -type f -name "modelC_LGBM"
   exit 1
 }
 # Run the script
-python "scripts/ML/training/modelC_LGBM" --cv-mode fold3 
+python "scripts/colombia/ML/training/modelC_LGBM" --cv-mode fold3 
 
 echo "modelC_LGBM script finished."
 
