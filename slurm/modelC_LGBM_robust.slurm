@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=preprocessing_main
+#SBATCH --job-name=modelC_LGBM_robust
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/modelC_preprocessing_main_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/modelC_preprocessing_main_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/modelC_LGBM_robust_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/modelC_LGBM_robust_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -27,27 +27,27 @@ module load cuda/12.4.1
 module load eth_proxy
 
 #------------------------------------------------------------------------------
-# Activate the Python virtual environment (master-thesis)
+# Activate the Python virtual environment (uav-genAI-opti)
 #------------------------------------------------------------------------------
 VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the modelC_preprocessing script
+# Run the modelC_LGBM script with robust split variant
 #------------------------------------------------------------------------------
-echo "Starting modelC_preprocessing script..."
+echo "Starting modelC_LGBM script (robust split)..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/colombia/ML/ml_preprocessing/modelC_preprocessing" ] || {
-  echo "ERROR: modelC_preprocessing not found"
-  echo "NOTE: modelC_preprocessing script is in ml_preprocessing/ directory"
-  find scripts -maxdepth 4 -type f -name "modelC_preprocessing"
+[ -f "scripts/colombia/ML/training/modelC_LGBM" ] || {
+  echo "ERROR: modelC_LGBM not found"
+  echo "NOTE: modelC_LGBM script is in colombia/ML/training/ directory"
+  find scripts -maxdepth 4 -type f -name "modelC_LGBM"
   exit 1
 }
-# Run the script with main split variant (default)
-python "scripts/colombia/ML/ml_preprocessing/modelC_preprocessing" --split-variant main
+# Run the script with robust split variant
+python "scripts/colombia/ML/training/modelC_LGBM" --cv-mode fold3 --split-variant robust
 
-echo "modelC_preprocessing script finished (main split)."
+echo "modelC_LGBM script finished (robust split)."

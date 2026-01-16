@@ -20,6 +20,7 @@ Optimizations:
 
 from __future__ import annotations
 
+import argparse
 import gc
 import json
 import os
@@ -41,12 +42,26 @@ from sklearn.model_selection import RandomizedSearchCV, PredefinedSplit, train_t
 # Configuration
 # =============================================================================
 RANDOM_STATE = 42
-
-# Temporal split configuration
-TRAIN_YEAR_MAX = 2013
-EARLYSTOP_YEAR_MIN = 2014
-EARLYSTOP_YEAR_MAX = 2016
 MIN_YEAR = int(os.environ.get("TRANSITION_MIN_YEAR", "2001"))
+
+# Temporal Split Configurations
+SPLIT_CONFIGS = {
+    "main": {
+        "train_year_max": 2014,
+        "earlystop_year_min": 2015,
+        "earlystop_year_max": 2017,
+        "description": "Main split: train <= 2014, earlystop 2015-2017"
+    },
+    "robust": {
+        "train_year_max": 2013,
+        "earlystop_year_min": 2014,
+        "earlystop_year_max": 2016,
+        "description": "Robust split: train <= 2013, earlystop 2014-2016"
+    }
+}
+
+# Default split configuration
+SPLIT_VARIANT = os.environ.get("SPLIT_VARIANT", "main")
 
 # Columns to exclude from features
 EXCLUDE_COLS = {
@@ -165,9 +180,18 @@ def resolve_tuning_parquet() -> Path:
 # =============================================================================
 
 
-def main(log_file: Path = None, use_wandb: bool = False) -> None:
+def main(log_file: Path = None, use_wandb: bool = False, split_variant: str = "main") -> None:
     """Main tuning pipeline with optimized performance."""
     start_time = time.time()
+    
+    # Get split configuration
+    if split_variant not in SPLIT_CONFIGS:
+        raise ValueError(f"Invalid split_variant: {split_variant}. Must be one of: {list(SPLIT_CONFIGS.keys())}")
+    
+    config = SPLIT_CONFIGS[split_variant]
+    TRAIN_YEAR_MAX = config["train_year_max"]
+    EARLYSTOP_YEAR_MIN = config["earlystop_year_min"]
+    EARLYSTOP_YEAR_MAX = config["earlystop_year_max"]
     
     def log(msg: str) -> None:
         """Minimal logging function."""
@@ -180,11 +204,12 @@ def main(log_file: Path = None, use_wandb: bool = False) -> None:
     # Setup paths
     # -------------------------------------------------------------------------
     script_dir = Path(__file__).resolve().parent
-    train_path = resolve_tuning_parquet()
+    train_path = resolve_tuning_parquet(split_variant)
 
     log("=" * 70)
-    log("MODELC RF HYPERPARAMETER TUNING (OPTIMIZED)")
+    log(f"MODELC RF HYPERPARAMETER TUNING - {split_variant.upper()} SPLIT")
     log("=" * 70)
+    log(f"Description: {config['description']}")
     log(f"Input:  {train_path}")
 
     # -------------------------------------------------------------------------
@@ -382,10 +407,11 @@ def main(log_file: Path = None, use_wandb: bool = False) -> None:
     }
     rf_best_params = convert_numpy_types(rf_best_params)
     
-    # Save to training directory
+    # Save to training directory with split variant suffix
     training_dir = script_dir.parent / "training"
     training_dir.mkdir(parents=True, exist_ok=True)
-    rf_output_path = training_dir / "rf_best_params.json"
+    suffix = f"_{split_variant}" if split_variant != "main" else ""
+    rf_output_path = training_dir / f"rf_best_params{suffix}.json"
     with open(rf_output_path, "w") as f:
         json.dump(rf_best_params, f, indent=2)
     log(f"  Saved to: {rf_output_path}")
@@ -420,13 +446,23 @@ def main(log_file: Path = None, use_wandb: bool = False) -> None:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="ModelC RF tuning with configurable temporal splits")
+    parser.add_argument(
+        "--split-variant",
+        type=str,
+        choices=list(SPLIT_CONFIGS.keys()),
+        default=SPLIT_VARIANT,
+        help=f"Temporal split variant to use. Choices: {', '.join(SPLIT_CONFIGS.keys())}. Default: {SPLIT_VARIANT}"
+    )
+    args = parser.parse_args()
+    
     # Set up output file
     repo_root = Path(__file__).resolve().parents[4]
     output_dir = repo_root / "outputs/Results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"modelC_tuning_rf_{timestamp}.txt"
+    output_file = output_dir / f"modelC_tuning_rf_{args.split_variant}_{timestamp}.txt"
     
     # Initialize W&B
     wandb_api_key = os.environ.get("WANDB_API_KEY")
@@ -439,16 +475,18 @@ if __name__ == "__main__":
     use_wandb = False
     try:
         print("Initializing Weights & Biases...")
+        config = SPLIT_CONFIGS[args.split_variant]
         wandb.init(
             project="ml-hyperparameter-tuning",
             entity=wandb_entity,
-            name=f"modelC_tuning_rf_{timestamp}",
+            name=f"modelC_tuning_rf_{args.split_variant}_{timestamp}",
             config={
                 "random_state": RANDOM_STATE,
+                "split_variant": args.split_variant,
                 "temporal_split": {
-                    "train_year_max": TRAIN_YEAR_MAX,
-                    "earlystop_year_min": EARLYSTOP_YEAR_MIN,
-                    "earlystop_year_max": EARLYSTOP_YEAR_MAX,
+                    "train_year_max": config["train_year_max"],
+                    "earlystop_year_min": config["earlystop_year_min"],
+                    "earlystop_year_max": config["earlystop_year_max"],
                 },
                 "n_iter_rf": N_ITER_RF,
             },
@@ -464,7 +502,7 @@ if __name__ == "__main__":
         f.write("=" * 70 + "\n\n")
     
     try:
-        main(log_file=output_file, use_wandb=use_wandb)
+        main(log_file=output_file, use_wandb=use_wandb, split_variant=args.split_variant)
         print(f"\nOutput saved to: {output_file}")
     except Exception as e:
         print(f"\nERROR: {e}")

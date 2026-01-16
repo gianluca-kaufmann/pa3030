@@ -60,11 +60,27 @@ TARGET_COL = "transition_01_win5"  # 5-year lookahead target
 LOOKAHEAD_YEARS = 5  # Number of years ahead for prediction
 WDPA_LAST_YEAR = 2024  # Last year with WDPA data
 LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS  # Last year we can reliably label (2019)
-TRAIN_YEARS = (2000, 2013)   # Train: 2000-2013 (for final model)
-EARLYSTOP_YEARS = (2014, min(2016, LAST_LABEL_YEAR))     # Earlystop: 2014-2016 (capped at LAST_LABEL_YEAR)
-TEST_START = 2017
-TEST_END = 2019
-TEST_YEARS = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))    # Test: 2017-2019 (capped at LAST_LABEL_YEAR)
+
+# Temporal Split Configurations
+SPLIT_CONFIGS = {
+    "main": {
+        "train_years": (2000, 2014),
+        "earlystop_years": (2015, min(2017, LAST_LABEL_YEAR)),
+        "test_start": 2018,
+        "test_end": 2019,
+        "description": "Main split: train 2000-2017, test 2018-2019"
+    },
+    "robust": {
+        "train_years": (2000, 2013),
+        "earlystop_years": (2014, min(2016, LAST_LABEL_YEAR)),
+        "test_start": 2017,
+        "test_end": 2019,
+        "description": "Robust split: train 2000-2016, test 2017-2019"
+    }
+}
+
+# Default split configuration
+SPLIT_VARIANT = os.environ.get("SPLIT_VARIANT", "main")
 
 # Batch size for data loading (can be overridden via BATCH_SIZE env var)
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "200000"))
@@ -172,26 +188,33 @@ def extract_features_pyarrow_to_numpy(feature_table: pa.Table, mask: np.ndarray)
     return X
 
 
-def resolve_parquet_file(filename: str) -> Path:
-    """Locate parquet file (prefer $SCRATCH if present)."""
+def resolve_parquet_file(filename: str, split_variant: str = "main") -> Path:
+    """Locate parquet file with split variant suffix (prefer $SCRATCH if present)."""
     repo_root = Path(__file__).resolve().parents[4]
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
 
+    # Add split variant suffix to filename (except for shared files like merged_panel)
+    if "merged_panel" not in filename:
+        suffix = f"_{split_variant}" if split_variant != "main" else ""
+        filename_with_suffix = filename.replace(".parquet", f"{suffix}.parquet")
+    else:
+        filename_with_suffix = filename
+    
     candidates = []
     if scratch_root is not None:
         # Check outputs/Results first (standard Euler location from preprocessing script)
-        candidates.append(scratch_root / f"outputs/Results/{filename}")
+        candidates.append(scratch_root / f"outputs/Results/{filename_with_suffix}")
         # Also check data/ml location
-        candidates.append(scratch_root / f"data/ml/{filename}")
-    candidates.append(repo_root / f"outputs/Results/{filename}")
-    candidates.append(repo_root / f"data/ml/{filename}")
+        candidates.append(scratch_root / f"data/ml/{filename_with_suffix}")
+    candidates.append(repo_root / f"outputs/Results/{filename_with_suffix}")
+    candidates.append(repo_root / f"data/ml/{filename_with_suffix}")
 
     for cand in candidates:
         if cand.exists():
             return cand
 
     # Provide detailed error message with all checked paths
-    error_msg = f"{filename} not found in expected locations.\n"
+    error_msg = f"{filename_with_suffix} not found in expected locations.\n"
     error_msg += "\nChecked locations:\n"
     for cand in candidates:
         error_msg += f"  - {cand}\n"
@@ -222,10 +245,11 @@ def resolve_metadata_file(filename: str) -> Optional[Path]:
     return None
 
 
-def resolve_best_params_json() -> Optional[Path]:
-    """Locate rf_best_params.json (in same directory as this script). Returns None if not found."""
+def resolve_best_params_json(split_variant: str = "main") -> Optional[Path]:
+    """Locate rf_best_params.json with split variant suffix (in same directory as this script). Returns None if not found."""
     script_dir = Path(__file__).resolve().parent
-    params_path = script_dir / "rf_best_params.json"
+    suffix = f"_{split_variant}" if split_variant != "main" else ""
+    params_path = script_dir / f"rf_best_params{suffix}.json"
     
     if not params_path.exists():
         return None
@@ -1277,13 +1301,25 @@ def phase2_testing(
         wandb.finish()
 
 
-def main(timestamp: str) -> None:
+def main(timestamp: str, split_variant: str = "main") -> None:
     start_time = time.time()
+    
+    # Get split configuration
+    if split_variant not in SPLIT_CONFIGS:
+        raise ValueError(f"Invalid split_variant: {split_variant}. Must be one of: {list(SPLIT_CONFIGS.keys())}")
+    
+    config = SPLIT_CONFIGS[split_variant]
+    TRAIN_YEARS = config["train_years"]
+    EARLYSTOP_YEARS = config["earlystop_years"]
+    TEST_START = config["test_start"]
+    TEST_END = config["test_end"]
+    TEST_YEARS = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))
+    
     repo_root = Path(__file__).resolve().parents[4]
-    train_path = resolve_parquet_file("train_colombia_win5.parquet")
-    earlystop_path = resolve_parquet_file("earlystop_colombia_win5.parquet")
-    test_path = resolve_parquet_file("test_colombia_win5.parquet")
-    params_path = resolve_best_params_json()
+    train_path = resolve_parquet_file("train_colombia_win5.parquet", split_variant)
+    earlystop_path = resolve_parquet_file("earlystop_colombia_win5.parquet", split_variant)
+    test_path = resolve_parquet_file("test_colombia_win5.parquet", split_variant)
+    params_path = resolve_best_params_json(split_variant)
     metadata_path = resolve_metadata_file("train_colombia_win5_metadata.json")
     
     # Load parameters before wandb.init() so we can log them
@@ -1330,13 +1366,14 @@ def main(timestamp: str) -> None:
             wandb.init(
             project="ml-training-colombia", 
             entity=os.environ.get("WANDB_ENTITY"), 
-            name=f"modelC_rf_win5_{timestamp}",
+            name=f"modelC_rf_win5_{split_variant}_{timestamp}",
             config={
                 "model": "RandomForest", 
                 "task": "transition_01_win5_prediction", 
                 "target_column": TARGET_COL,
                 "lookahead_years": 5,
                 "random_state": RANDOM_STATE,
+                "split_variant": split_variant,
                 "temporal_split": {
                     "train_years": list(TRAIN_YEARS), 
                     "earlystop_years": list(EARLYSTOP_YEARS),
@@ -1352,8 +1389,18 @@ def main(timestamp: str) -> None:
     else:
         print("W&B not available (module not installed)")
     
-    print("="*70 + "\nRANDOM FOREST TRANSITION MODEL (COLOMBIA DATASET - 5-YEAR LOOKAHEAD)\n" + "="*70)
-    print(f"Train: {train_path}\nEarlystop: {earlystop_path}\nTest: {test_path}\nParams: {params_path if params_path else 'Using default manual hyperparameters'}\nOutput: {output_dir}")
+    print("="*70 + f"\nRANDOM FOREST - {split_variant.upper()} SPLIT (5-YEAR LOOKAHEAD)\n" + "="*70)
+    print(f"Split variant: {split_variant}")
+    print(f"Description: {config['description']}")
+    print(f"  Train: {TRAIN_YEARS[0]}-{TRAIN_YEARS[1]}")
+    print(f"  Earlystop: {EARLYSTOP_YEARS[0]}-{EARLYSTOP_YEARS[1]}")
+    print(f"  Test: {TEST_YEARS[0]}-{TEST_YEARS[1]}")
+    print(f"\nPaths:")
+    print(f"  Train: {train_path}")
+    print(f"  Earlystop: {earlystop_path}")
+    print(f"  Test: {test_path}")
+    print(f"  Params: {params_path if params_path else 'Using default manual hyperparameters'}")
+    print(f"  Output: {output_dir}")
     print(f"\nConfiguration:")
     print(f"  WDPA_LAST_YEAR: {WDPA_LAST_YEAR}")
     print(f"  LOOKAHEAD_YEARS: {LOOKAHEAD_YEARS}")
@@ -1397,17 +1444,24 @@ def main(timestamp: str) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Random Forest Transition Model for Colombia Dataset (5-Year Lookahead Prediction)")
+    parser.add_argument(
+        "--split-variant",
+        type=str,
+        choices=list(SPLIT_CONFIGS.keys()),
+        default=SPLIT_VARIANT,
+        help=f"Temporal split variant to use. Choices: {', '.join(SPLIT_CONFIGS.keys())}. Default: {SPLIT_VARIANT}"
+    )
     args = parser.parse_args()
     
     repo_root = Path(__file__).resolve().parents[4]
     output_dir = repo_root / "outputs/Results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"modelC_rf_win5_{timestamp}.txt"
+    output_file = output_dir / f"modelC_rf_win5_{args.split_variant}_{timestamp}.txt"
     tee = Tee(output_file)
     sys.stdout = tee
     try:
-        main(timestamp)
+        main(timestamp, split_variant=args.split_variant)
     finally:
         sys.stdout = tee.stdout
         tee.close()

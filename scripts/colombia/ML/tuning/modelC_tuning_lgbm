@@ -18,6 +18,7 @@ Features:
 
 from __future__ import annotations
 
+import argparse
 import gc
 import json
 import os
@@ -83,12 +84,26 @@ def get_n_jobs() -> int:
 # Configuration
 # =============================================================================
 RANDOM_STATE = 42
-
-# Temporal split configuration
-TRAIN_YEAR_MAX = 2013  # train_idx = year <= 2013
-EARLYSTOP_YEAR_MIN = 2014  # earlystop_idx = 2014 <= year <= 2016
-EARLYSTOP_YEAR_MAX = 2016
 MIN_YEAR = int(os.environ.get("TRANSITION_MIN_YEAR", "2001"))  # drop year 2000 by default
+
+# Temporal Split Configurations
+SPLIT_CONFIGS = {
+    "main": {
+        "train_year_max": 2014,
+        "earlystop_year_min": 2015,
+        "earlystop_year_max": 2017,
+        "description": "Main split: train <= 2014, earlystop 2015-2017"
+    },
+    "robust": {
+        "train_year_max": 2013,
+        "earlystop_year_min": 2014,
+        "earlystop_year_max": 2016,
+        "description": "Robust split: train <= 2013, earlystop 2014-2016"
+    }
+}
+
+# Default split configuration
+SPLIT_VARIANT = os.environ.get("SPLIT_VARIANT", "main")
 
 # Columns to exclude from features
 EXCLUDE_COLS = {
@@ -244,26 +259,29 @@ def get_feature_columns(df: pd.DataFrame) -> list:
     return feature_cols
 
 
-def resolve_tuning_parquet() -> Path:
-    """Locate modelC_tuning_colombia.parquet (prefer $SCRATCH if present)."""
+def resolve_tuning_parquet(split_variant: str = "main") -> Path:
+    """Locate modelC_tuning_colombia.parquet with split variant suffix (prefer $SCRATCH if present)."""
     repo_root = Path(__file__).resolve().parents[4]
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
 
+    suffix = f"_{split_variant}" if split_variant != "main" else ""
+    filename = f"modelC_tuning_colombia{suffix}.parquet"
+    
     candidates = []
     if scratch_root is not None:
         # Check data/ml/tuning location on scratch (standard location from modelC_sample)
-        candidates.append(scratch_root / "data/ml/tuning/modelC_tuning_colombia.parquet")
+        candidates.append(scratch_root / f"data/ml/tuning/{filename}")
         # Also check outputs/Results/tuning (if modelC_sample wrote it there)
-        candidates.append(scratch_root / "outputs/Results/tuning/modelC_tuning_colombia.parquet")
-    candidates.append(repo_root / "data/ml/tuning/modelC_tuning_colombia.parquet")
-    candidates.append(repo_root / "outputs/Results/tuning/modelC_tuning_colombia.parquet")
+        candidates.append(scratch_root / f"outputs/Results/tuning/{filename}")
+    candidates.append(repo_root / f"data/ml/tuning/{filename}")
+    candidates.append(repo_root / f"outputs/Results/tuning/{filename}")
 
     for cand in candidates:
         if cand.exists():
             return cand
 
     # Provide detailed error message with all checked paths
-    error_msg = "modelC_tuning_colombia.parquet not found in expected locations.\n"
+    error_msg = f"{filename} not found in expected locations.\n"
     error_msg += "\nChecked locations:\n"
     for cand in candidates:
         error_msg += f"  - {cand}\n"
@@ -278,8 +296,17 @@ def resolve_tuning_parquet() -> Path:
 # =============================================================================
 
 
-def main() -> None:
+def main(split_variant: str = "main") -> None:
     start_time = time.time()
+    
+    # Get split configuration
+    if split_variant not in SPLIT_CONFIGS:
+        raise ValueError(f"Invalid split_variant: {split_variant}. Must be one of: {list(SPLIT_CONFIGS.keys())}")
+    
+    config = SPLIT_CONFIGS[split_variant]
+    TRAIN_YEAR_MAX = config["train_year_max"]
+    EARLYSTOP_YEAR_MIN = config["earlystop_year_min"]
+    EARLYSTOP_YEAR_MAX = config["earlystop_year_max"]
 
     # -------------------------------------------------------------------------
     # Setup paths
@@ -287,7 +314,14 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parents[4]
     script_dir = Path(__file__).resolve().parent
 
-    train_path = resolve_tuning_parquet()
+    train_path = resolve_tuning_parquet(split_variant)
+    
+    print("=" * 70)
+    print(f"MODELC LGBM HYPERPARAMETER TUNING - {split_variant.upper()} SPLIT")
+    print("=" * 70)
+    print(f"Description: {config['description']}")
+    print(f"Input: {train_path}")
+    print("=" * 70 + "\n")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -657,7 +691,8 @@ def main() -> None:
     }
     lgbm_best_params = convert_numpy_types(lgbm_best_params)
 
-    lgbm_output_path = script_dir / "lgbm_best_params.json"
+    suffix = f"_{split_variant}" if split_variant != "main" else ""
+    lgbm_output_path = script_dir / f"lgbm_best_params{suffix}.json"
     with open(lgbm_output_path, "w") as f:
         json.dump(lgbm_best_params, f, indent=2)
     print(f"\nLGBM best parameters saved to: {lgbm_output_path}")
@@ -708,19 +743,29 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="ModelC LGBM tuning with configurable temporal splits")
+    parser.add_argument(
+        "--split-variant",
+        type=str,
+        choices=list(SPLIT_CONFIGS.keys()),
+        default=SPLIT_VARIANT,
+        help=f"Temporal split variant to use. Choices: {', '.join(SPLIT_CONFIGS.keys())}. Default: {SPLIT_VARIANT}"
+    )
+    args = parser.parse_args()
+    
     # Set up output file capture
     repo_root = Path(__file__).resolve().parents[4]
     output_dir = repo_root / "outputs/Results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"modelC_tuning_lgbm_{timestamp}.txt"
+    output_file = output_dir / f"modelC_tuning_lgbm_{args.split_variant}_{timestamp}.txt"
 
     tee = Tee(output_file)
     sys.stdout = tee
 
     try:
-        main()
+        main(split_variant=args.split_variant)
     finally:
         sys.stdout = tee.stdout
         tee.close()

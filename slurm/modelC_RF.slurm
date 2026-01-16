@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=modelC_RF
+#SBATCH --job-name=modelC_RF_main
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/modelC_RF_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/modelC_RF_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/modelC_RF_main_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/modelC_RF_main_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -54,8 +54,8 @@ export FAST_TRAIN=1
 # Set verbose output for scikit-learn
 export SK_VERBOSE=1
 
-# Run the script
-python "scripts/colombia/ML/training/modelC_RF"
+# Run the script with main split variant
+python "scripts/colombia/ML/training/modelC_RF" --split-variant main
 
-echo "modelC_RF script finished."
+echo "modelC_RF script finished (main split)."
 

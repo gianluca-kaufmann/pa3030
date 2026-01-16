@@ -37,6 +37,7 @@ Notes
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -48,12 +49,27 @@ import wandb
 
 # Configuration
 RANDOM_STATE = 42
-# Split configuration
-TRAIN_YEARS = (2000, 2016)   # Full train set (matches final model training in modelC_LGBM)
-EARLYSTOP_YEARS = (2014, 2016)     # Full earlystop (for CV early stopping only)
-TEST_YEARS = (2017, 2019)    # Full test (right-censored for 5-year lookahead)
 LOOKAHEAD_YEARS = 5          # Number of years to look ahead for target
 WANDB_PROJECT = "ml-preprocessing"
+
+# Temporal Split Configurations
+SPLIT_CONFIGS = {
+    "main": {
+        "train_years": (2000, 2017),
+        "earlystop_years": (2015, 2017),
+        "test_years": (2018, 2019),
+        "description": "Main split: 90% train (2000-2017), 10% test (2018-2019)"
+    },
+    "robust": {
+        "train_years": (2000, 2016),
+        "earlystop_years": (2014, 2016),
+        "test_years": (2017, 2019),
+        "description": "Robust split: 85% train (2000-2016), 15% test (2017-2019)"
+    }
+}
+
+# Default split configuration (can be overridden via command-line)
+SPLIT_VARIANT = os.environ.get("SPLIT_VARIANT", "main")
 
 
 def resolve_input() -> Path:
@@ -151,8 +167,26 @@ def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: s
         ]})
 
 
-def main() -> None:
+def main(split_variant: str = "main") -> None:
     start_time = time.time()
+    
+    # Get split configuration
+    if split_variant not in SPLIT_CONFIGS:
+        raise ValueError(f"Invalid split_variant: {split_variant}. Must be one of: {list(SPLIT_CONFIGS.keys())}")
+    
+    config = SPLIT_CONFIGS[split_variant]
+    TRAIN_YEARS = config["train_years"]
+    EARLYSTOP_YEARS = config["earlystop_years"]
+    TEST_YEARS = config["test_years"]
+    
+    print(f"\n{'='*70}")
+    print(f"TEMPORAL SPLIT VARIANT: {split_variant.upper()}")
+    print(f"{'='*70}")
+    print(f"Description: {config['description']}")
+    print(f"  Train: {TRAIN_YEARS[0]}-{TRAIN_YEARS[1]}")
+    print(f"  Earlystop: {EARLYSTOP_YEARS[0]}-{EARLYSTOP_YEARS[1]}")
+    print(f"  Test: {TEST_YEARS[0]}-{TEST_YEARS[1]}")
+    print(f"{'='*70}\n")
 
     wandb_api_key = os.environ.get("WANDB_API_KEY")
     wandb_entity = os.environ.get("WANDB_ENTITY")
@@ -167,9 +201,10 @@ def main() -> None:
         wandb.init(
             project=WANDB_PROJECT,
             entity=wandb_entity,
-            name=f"modelC_preprocessing_win5_{time.strftime('%Y%m%d_%H%M%S')}",
+            name=f"modelC_preprocessing_win5_{split_variant}_{time.strftime('%Y%m%d_%H%M%S')}",
             config={
                 "random_state": RANDOM_STATE,
+                "split_variant": split_variant,
                 "train_years": TRAIN_YEARS,
                 "earlystop_years": EARLYSTOP_YEARS,
                 "test_years": TEST_YEARS,
@@ -185,11 +220,12 @@ def main() -> None:
     input_path = resolve_input()
     base_dir = input_path.parent
     
-    # Output paths for win5 files
-    merged_win5_out = base_dir / "merged_panel_colombia_final_win5.parquet"
-    train_out = base_dir / "train_colombia_win5.parquet"
-    earlystop_out = base_dir / "earlystop_colombia_win5.parquet"
-    test_out = base_dir / "test_colombia_win5.parquet"
+    # Output paths for win5 files (include split variant suffix)
+    suffix = f"_{split_variant}" if split_variant != "main" else ""
+    merged_win5_out = base_dir / "merged_panel_colombia_final_win5.parquet"  # Shared across splits
+    train_out = base_dir / f"train_colombia_win5{suffix}.parquet"
+    earlystop_out = base_dir / f"earlystop_colombia_win5{suffix}.parquet"
+    test_out = base_dir / f"test_colombia_win5{suffix}.parquet"
 
     print(f"\nInput: {input_path}")
     print(f"Merged WIN5 output: {merged_win5_out}")
@@ -434,8 +470,18 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="ModelC preprocessing with configurable temporal splits")
+    parser.add_argument(
+        "--split-variant",
+        type=str,
+        choices=list(SPLIT_CONFIGS.keys()),
+        default=SPLIT_VARIANT,
+        help=f"Temporal split variant to use. Choices: {', '.join(SPLIT_CONFIGS.keys())}. Default: {SPLIT_VARIANT}"
+    )
+    args = parser.parse_args()
+    
     try:
-        main()
+        main(split_variant=args.split_variant)
     except Exception as e:
         print(f"\nScript failed: {e}", file=sys.stderr)
         sys.exit(1)
