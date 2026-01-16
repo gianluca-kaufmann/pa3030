@@ -4,10 +4,14 @@
 
 Purpose: Perform hyperparameter tuning for a Random Forest model using
          the Colombia-specific tuning dataset (modelC_tuning_colombia.parquet)
-         with strict temporal split (train: year <= 2013, earlystop: 2014 <= year <= 2016).
+         with strict temporal split.
 
-Input:   `modelC_tuning_colombia.parquet`
-Output:  - rf_best_params.json (saved to training/ directory for use by modelC_RF)
+Supports two split configurations:
+- 'original': Train <= 2014, Earlystop 2015-2017
+- 'robustness': Train <= 2013, Earlystop 2014-2016
+
+Input:   `modelC_tuning_colombia.parquet` (from split-specific directory)
+Output:  - rf_best_params_{split_version}.json (saved to training/ directory for use by modelC_RF)
 
 Optimizations:
 - Minimal logging overhead
@@ -42,26 +46,24 @@ from sklearn.model_selection import RandomizedSearchCV, PredefinedSplit, train_t
 # Configuration
 # =============================================================================
 RANDOM_STATE = 42
-MIN_YEAR = int(os.environ.get("TRANSITION_MIN_YEAR", "2001"))
 
-# Temporal Split Configurations
+# Split configurations - must match sampling/training scripts
 SPLIT_CONFIGS = {
-    "main": {
-        "train_year_max": 2014,
-        "earlystop_year_min": 2015,
-        "earlystop_year_max": 2017,
-        "description": "Main split: train <= 2014, earlystop 2015-2017"
+    'original': {
+        'train_year_max': 2014,
+        'earlystop_year_min': 2015,
+        'earlystop_year_max': 2017,
+        'description': 'Original split: Train <=2014, Earlystop 2015-2017'
     },
-    "robust": {
-        "train_year_max": 2013,
-        "earlystop_year_min": 2014,
-        "earlystop_year_max": 2016,
-        "description": "Robust split: train <= 2013, earlystop 2014-2016"
+    'robustness': {
+        'train_year_max': 2013,
+        'earlystop_year_min': 2014,
+        'earlystop_year_max': 2016,
+        'description': 'Robustness split: Train <=2013, Earlystop 2014-2016'
     }
 }
 
-# Default split configuration
-SPLIT_VARIANT = os.environ.get("SPLIT_VARIANT", "main")
+MIN_YEAR = int(os.environ.get("TRANSITION_MIN_YEAR", "2001"))
 
 # Columns to exclude from features
 EXCLUDE_COLS = {
@@ -146,32 +148,38 @@ def compute_temporal_weights(years: np.ndarray, min_year: int, max_year: int) ->
     return np.clip(weights, 0.5, 1.0).astype(np.float32)
 
 
-def resolve_tuning_parquet() -> Path:
-    """Locate modelC_tuning_colombia.parquet (prefer $SCRATCH if present)."""
+def resolve_tuning_parquet(split_version: str) -> Path:
+    """Locate modelC_tuning_colombia.parquet from split-specific directory (prefer $SCRATCH if present)."""
     repo_root = Path(__file__).resolve().parents[4]
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
 
     candidates = []
     if scratch_root is not None:
-        # Check data/ml/tuning location on scratch (standard location from modelC_sample)
+        # Check split-specific subdirectory in data/ml/tuning location on scratch
+        candidates.append(scratch_root / f"data/ml/tuning/{split_version}/modelC_tuning_colombia.parquet")
+        # Fallback to old location (for backward compatibility)
         candidates.append(scratch_root / "data/ml/tuning/modelC_tuning_colombia.parquet")
-        # Also check outputs/Results/tuning (if modelC_sample wrote it there)
-        candidates.append(scratch_root / "outputs/Results/tuning/modelC_tuning_colombia.parquet")
+        # Also check outputs/Results/tuning
+        candidates.append(scratch_root / f"outputs/Results/tuning/{split_version}/modelC_tuning_colombia.parquet")
+    # Check split-specific subdirectory in repo
+    candidates.append(repo_root / f"data/ml/tuning/{split_version}/modelC_tuning_colombia.parquet")
+    # Fallback to old location (for backward compatibility)
     candidates.append(repo_root / "data/ml/tuning/modelC_tuning_colombia.parquet")
-    candidates.append(repo_root / "outputs/Results/tuning/modelC_tuning_colombia.parquet")
+    candidates.append(repo_root / f"outputs/Results/tuning/{split_version}/modelC_tuning_colombia.parquet")
 
     for cand in candidates:
         if cand.exists():
             return cand
 
     # Provide detailed error message with all checked paths
-    error_msg = "modelC_tuning_colombia.parquet not found in expected locations.\n"
+    error_msg = f"modelC_tuning_colombia.parquet not found for split '{split_version}'.\n"
     error_msg += "\nChecked locations:\n"
     for cand in candidates:
         error_msg += f"  - {cand}\n"
     if scratch_root:
         error_msg += f"\nSCRATCH root: {scratch_root}\n"
     error_msg += f"Repository root: {repo_root}\n"
+    error_msg += f"\nHint: Run modelC_sample with --split-version {split_version} first.\n"
     raise FileNotFoundError(error_msg)
 
 
@@ -180,18 +188,18 @@ def resolve_tuning_parquet() -> Path:
 # =============================================================================
 
 
-def main(log_file: Path = None, use_wandb: bool = False, split_variant: str = "main") -> None:
+def main(split_version: str = 'original', log_file: Path = None, use_wandb: bool = False) -> None:
     """Main tuning pipeline with optimized performance."""
     start_time = time.time()
     
     # Get split configuration
-    if split_variant not in SPLIT_CONFIGS:
-        raise ValueError(f"Invalid split_variant: {split_variant}. Must be one of: {list(SPLIT_CONFIGS.keys())}")
+    if split_version not in SPLIT_CONFIGS:
+        raise ValueError(f"Invalid split_version: {split_version}. Must be one of: {list(SPLIT_CONFIGS.keys())}")
     
-    config = SPLIT_CONFIGS[split_variant]
-    TRAIN_YEAR_MAX = config["train_year_max"]
-    EARLYSTOP_YEAR_MIN = config["earlystop_year_min"]
-    EARLYSTOP_YEAR_MAX = config["earlystop_year_max"]
+    config = SPLIT_CONFIGS[split_version]
+    TRAIN_YEAR_MAX = config['train_year_max']
+    EARLYSTOP_YEAR_MIN = config['earlystop_year_min']
+    EARLYSTOP_YEAR_MAX = config['earlystop_year_max']
     
     def log(msg: str) -> None:
         """Minimal logging function."""
@@ -204,12 +212,12 @@ def main(log_file: Path = None, use_wandb: bool = False, split_variant: str = "m
     # Setup paths
     # -------------------------------------------------------------------------
     script_dir = Path(__file__).resolve().parent
-    train_path = resolve_tuning_parquet(split_variant)
+    train_path = resolve_tuning_parquet(split_version)
 
     log("=" * 70)
-    log(f"MODELC RF HYPERPARAMETER TUNING - {split_variant.upper()} SPLIT")
+    log(f"MODELC RF HYPERPARAMETER TUNING - SPLIT: {split_version.upper()}")
     log("=" * 70)
-    log(f"Description: {config['description']}")
+    log(f"Configuration: {config['description']}")
     log(f"Input:  {train_path}")
 
     # -------------------------------------------------------------------------
@@ -389,6 +397,7 @@ def main(log_file: Path = None, use_wandb: bool = False, split_variant: str = "m
     
     # Save RF best parameters (minimal metadata)
     rf_best_params = {
+        "split_version": split_version,
         "best_params": random_search_rf.best_params_,
         "best_earlystop_score": float(best_earlystop_score_rf),
         "param_grid": RF_PARAM_GRID,
@@ -399,6 +408,7 @@ def main(log_file: Path = None, use_wandb: bool = False, split_variant: str = "m
         "total_param_combinations": int(total_combinations),
         "search_space_coverage_pct": float(n_iter / total_combinations * 100),
         "split_info": {
+            "split_version": split_version,
             "train_years": f"year <= {TRAIN_YEAR_MAX}",
             "earlystop_years": f"{EARLYSTOP_YEAR_MIN} <= year <= {EARLYSTOP_YEAR_MAX}",
             "n_train": int(n_train),
@@ -407,11 +417,10 @@ def main(log_file: Path = None, use_wandb: bool = False, split_variant: str = "m
     }
     rf_best_params = convert_numpy_types(rf_best_params)
     
-    # Save to training directory with split variant suffix
+    # Save to training directory with split-specific filename
     training_dir = script_dir.parent / "training"
     training_dir.mkdir(parents=True, exist_ok=True)
-    suffix = f"_{split_variant}" if split_variant != "main" else ""
-    rf_output_path = training_dir / f"rf_best_params{suffix}.json"
+    rf_output_path = training_dir / f"rf_best_params_{split_version}.json"
     with open(rf_output_path, "w") as f:
         json.dump(rf_best_params, f, indent=2)
     log(f"  Saved to: {rf_output_path}")
@@ -446,15 +455,21 @@ def main(log_file: Path = None, use_wandb: bool = False, split_variant: str = "m
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ModelC RF tuning with configurable temporal splits")
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description="ModelC RF hyperparameter tuning"
+    )
     parser.add_argument(
-        "--split-variant",
+        "--split-version",
         type=str,
         choices=list(SPLIT_CONFIGS.keys()),
-        default=SPLIT_VARIANT,
-        help=f"Temporal split variant to use. Choices: {', '.join(SPLIT_CONFIGS.keys())}. Default: {SPLIT_VARIANT}"
+        default="original",
+        help=f"Split configuration to use. Choices: {', '.join(SPLIT_CONFIGS.keys())} (default: original)"
     )
     args = parser.parse_args()
+    
+    # Get split config for W&B
+    config = SPLIT_CONFIGS[args.split_version]
     
     # Set up output file
     repo_root = Path(__file__).resolve().parents[4]
@@ -462,7 +477,7 @@ if __name__ == "__main__":
     output_dir.mkdir(parents=True, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"modelC_tuning_rf_{args.split_variant}_{timestamp}.txt"
+    output_file = output_dir / f"modelC_tuning_rf_{args.split_version}_{timestamp}.txt"
     
     # Initialize W&B
     wandb_api_key = os.environ.get("WANDB_API_KEY")
@@ -475,18 +490,17 @@ if __name__ == "__main__":
     use_wandb = False
     try:
         print("Initializing Weights & Biases...")
-        config = SPLIT_CONFIGS[args.split_variant]
         wandb.init(
             project="ml-hyperparameter-tuning",
             entity=wandb_entity,
-            name=f"modelC_tuning_rf_{args.split_variant}_{timestamp}",
+            name=f"modelC_tuning_rf_{args.split_version}_{timestamp}",
             config={
                 "random_state": RANDOM_STATE,
-                "split_variant": args.split_variant,
+                "split_version": args.split_version,
                 "temporal_split": {
-                    "train_year_max": config["train_year_max"],
-                    "earlystop_year_min": config["earlystop_year_min"],
-                    "earlystop_year_max": config["earlystop_year_max"],
+                    "train_year_max": config['train_year_max'],
+                    "earlystop_year_min": config['earlystop_year_min'],
+                    "earlystop_year_max": config['earlystop_year_max'],
                 },
                 "n_iter_rf": N_ITER_RF,
             },
@@ -499,10 +513,11 @@ if __name__ == "__main__":
     # Initialize log file
     with open(output_file, "w", encoding="utf-8") as f:
         f.write(f"Log started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Split version: {args.split_version}\n")
         f.write("=" * 70 + "\n\n")
     
     try:
-        main(log_file=output_file, use_wandb=use_wandb, split_variant=args.split_variant)
+        main(split_version=args.split_version, log_file=output_file, use_wandb=use_wandb)
         print(f"\nOutput saved to: {output_file}")
     except Exception as e:
         print(f"\nERROR: {e}")

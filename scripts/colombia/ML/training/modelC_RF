@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Random Forest Transition Model for Colombia Dataset (5-Year Lookahead Prediction)
-Train RandomForestClassifier on pre-split parquet files with configurable splits:
-- Main: train_colombia_win5 (2000-2014), earlystop_colombia_win5 (2015-2017), test_colombia_win5 (2018-2019). Final model trained on 2000-2017.
-- Robust: train_colombia_win5 (2000-2013), earlystop_colombia_win5 (2014-2016), test_colombia_win5 (2017-2019). Final model trained on 2000-2016.
+Train RandomForestClassifier on pre-split parquet files. Final model trained on train+earlystop,
+evaluated on test.
 Target: transition_01_win5 (1 if transition occurs within next 5 years, else 0)
+
+Supports two split configurations:
+- 'original': Train 2000-2014, Earlystop 2015-2017, Test 2018-2019
+- 'robustness': Train 2000-2013, Earlystop 2014-2016, Test 2017-2019
 
 Features:
 - Right-Censoring Protection: Earlystop and test data filtered to LAST_LABEL_YEAR
@@ -61,26 +64,23 @@ LOOKAHEAD_YEARS = 5  # Number of years ahead for prediction
 WDPA_LAST_YEAR = 2024  # Last year with WDPA data
 LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS  # Last year we can reliably label (2019)
 
-# Temporal Split Configurations
+# Split configurations - must match preprocessing/tuning scripts
 SPLIT_CONFIGS = {
-    "main": {
-        "train_years": (2000, 2014),
-        "earlystop_years": (2015, min(2017, LAST_LABEL_YEAR)),
-        "test_start": 2018,
-        "test_end": 2019,
-        "description": "Main split: train 2000-2017, test 2018-2019"
+    'original': {
+        'train_years': (2000, 2014),
+        'earlystop_years': (2015, min(2017, LAST_LABEL_YEAR)),
+        'test_start': 2018,
+        'test_end': 2019,
+        'description': 'Original split: Train 2000-2014, Earlystop 2015-2017, Test 2018-2019'
     },
-    "robust": {
-        "train_years": (2000, 2013),
-        "earlystop_years": (2014, min(2016, LAST_LABEL_YEAR)),
-        "test_start": 2017,
-        "test_end": 2019,
-        "description": "Robust split: train 2000-2016, test 2017-2019"
+    'robustness': {
+        'train_years': (2000, 2013),
+        'earlystop_years': (2014, min(2016, LAST_LABEL_YEAR)),
+        'test_start': 2017,
+        'test_end': 2019,
+        'description': 'Robustness split: Train 2000-2013, Earlystop 2014-2016, Test 2017-2019'
     }
 }
-
-# Default split configuration
-SPLIT_VARIANT = os.environ.get("SPLIT_VARIANT", "main")
 
 # Batch size for data loading (can be overridden via BATCH_SIZE env var)
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "200000"))
@@ -188,39 +188,38 @@ def extract_features_pyarrow_to_numpy(feature_table: pa.Table, mask: np.ndarray)
     return X
 
 
-def resolve_parquet_file(filename: str, split_variant: str = "main") -> Path:
-    """Locate parquet file with split variant suffix (prefer $SCRATCH if present)."""
+def resolve_parquet_file(filename: str, split_version: str) -> Path:
+    """Locate parquet file from split-specific directory (prefer $SCRATCH if present)."""
     repo_root = Path(__file__).resolve().parents[4]
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
 
-    # Add split variant suffix to filename (except for shared files like merged_panel)
-    if "merged_panel" not in filename:
-        suffix = f"_{split_variant}" if split_variant != "main" else ""
-        filename_with_suffix = filename.replace(".parquet", f"{suffix}.parquet")
-    else:
-        filename_with_suffix = filename
-    
     candidates = []
     if scratch_root is not None:
-        # Check outputs/Results first (standard Euler location from preprocessing script)
-        candidates.append(scratch_root / f"outputs/Results/{filename_with_suffix}")
+        # Check split-specific subdirectory in outputs/Results first
+        candidates.append(scratch_root / f"outputs/Results/{split_version}/{filename}")
+        # Fallback to old location (for backward compatibility)
+        candidates.append(scratch_root / f"outputs/Results/{filename}")
         # Also check data/ml location
-        candidates.append(scratch_root / f"data/ml/{filename_with_suffix}")
-    candidates.append(repo_root / f"outputs/Results/{filename_with_suffix}")
-    candidates.append(repo_root / f"data/ml/{filename_with_suffix}")
+        candidates.append(scratch_root / f"data/ml/{split_version}/{filename}")
+    # Check split-specific subdirectory in repo
+    candidates.append(repo_root / f"outputs/Results/{split_version}/{filename}")
+    # Fallback to old location (for backward compatibility)
+    candidates.append(repo_root / f"outputs/Results/{filename}")
+    candidates.append(repo_root / f"data/ml/{split_version}/{filename}")
 
     for cand in candidates:
         if cand.exists():
             return cand
 
     # Provide detailed error message with all checked paths
-    error_msg = f"{filename_with_suffix} not found in expected locations.\n"
+    error_msg = f"{filename} not found for split '{split_version}'.\n"
     error_msg += "\nChecked locations:\n"
     for cand in candidates:
         error_msg += f"  - {cand}\n"
     if scratch_root:
         error_msg += f"\nSCRATCH root: {scratch_root}\n"
     error_msg += f"Repository root: {repo_root}\n"
+    error_msg += f"\nHint: Run modelC_preprocessing with --split-version {split_version} first.\n"
     raise FileNotFoundError(error_msg)
 
 
@@ -245,16 +244,23 @@ def resolve_metadata_file(filename: str) -> Optional[Path]:
     return None
 
 
-def resolve_best_params_json(split_variant: str = "main") -> Optional[Path]:
-    """Locate rf_best_params.json with split variant suffix (in same directory as this script). Returns None if not found."""
+def resolve_best_params_json(split_version: str) -> Optional[Path]:
+    """Locate rf_best_params_{split_version}.json (in same directory as this script). Returns None if not found."""
     script_dir = Path(__file__).resolve().parent
-    suffix = f"_{split_variant}" if split_variant != "main" else ""
-    params_path = script_dir / f"rf_best_params{suffix}.json"
     
-    if not params_path.exists():
-        return None
+    # Try split-specific params file first
+    params_path = script_dir / f"rf_best_params_{split_version}.json"
+    if params_path.exists():
+        return params_path
     
-    return params_path
+    # Fallback to non-split-specific file (for backward compatibility with 'original' split)
+    if split_version == 'original':
+        legacy_path = script_dir / "rf_best_params.json"
+        if legacy_path.exists():
+            print(f"  Warning: Using legacy rf_best_params.json (consider renaming to rf_best_params_original.json)")
+            return legacy_path
+    
+    return None
 
 
 def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
@@ -726,7 +732,6 @@ def check_year_overlap(train_years: tuple[int, int], eval_years: tuple[int, int]
 def phase1_training(
     train_path: Path, earlystop_path: Path, params_path: Optional[Path], feature_cols: list, keep_cols_train: list,
     best_params: Dict[str, Any], timestamp: str, model_dir: Path, output_dir: Path, use_wandb: bool, target_col: str,
-    train_years: tuple[int, int], earlystop_years: tuple[int, int],
 ) -> tuple[Path, Dict[str, Any], Dict[str, Any], float, float, int, int, int, Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     """
     Phase 1: Training Random Forest model.
@@ -744,13 +749,13 @@ def phase1_training(
     print("\n" + "-"*70)
     print("STEP 1: GENERATE EARLYSTOP PREDICTIONS FOR CALIBRATION")
     print("-"*70)
-    print(f"Training intermediate model on train data only ({train_years[0]}-{train_years[1]})...")
+    print(f"Training intermediate model on train data only ({TRAIN_YEARS[0]}-{TRAIN_YEARS[1]})...")
     
     # Load train data only
-    print(f"\nLoading train data ({train_years[0]}-{train_years[1]})...")
+    print(f"\nLoading train data ({TRAIN_YEARS[0]}-{TRAIN_YEARS[1]})...")
     X_train_only, y_train_only, train_years_array_only, train_pos_only, train_neg_only, train_years_only = load_numpy_arrays_two_pass(
         train_path, feature_cols, target_col, "train_only", 
-        year_range=train_years
+        year_range=TRAIN_YEARS
     )
     n_train_only = len(y_train_only)
     
@@ -787,8 +792,8 @@ def phase1_training(
     del X_train_only, y_train_only, train_years_array_only; gc.collect()
     
     # Load earlystop data and generate predictions
-    print(f"\nLoading earlystop data ({earlystop_years[0]}-{earlystop_years[1]}) for predictions...")
-    earlystop_year_range = (earlystop_years[0], min(earlystop_years[1], LAST_LABEL_YEAR))
+    print(f"\nLoading earlystop data ({EARLYSTOP_YEARS[0]}-{EARLYSTOP_YEARS[1]}) for predictions...")
+    earlystop_year_range = (EARLYSTOP_YEARS[0], min(EARLYSTOP_YEARS[1], LAST_LABEL_YEAR))
     X_earlystop, y_earlystop, earlystop_years_array, earlystop_pos, earlystop_neg, earlystop_years = load_numpy_arrays_two_pass(
         earlystop_path, feature_cols, target_col, "earlystop", 
         year_range=earlystop_year_range
@@ -888,14 +893,14 @@ def phase1_training(
     print("\n" + "-"*70)
     print("STEP 2: TRAIN FINAL MODEL ON FULL DATASET")
     print("-"*70)
-    print(f"Training final model on full dataset: {train_years[0]}-{earlystop_years[1]}")
+    print(f"Training final model on full dataset: {TRAIN_YEARS[0]}-{EARLYSTOP_YEARS[1]}")
     report_memory_usage("before final model training")
     
-    # Load full training data from both files (combines train_years and earlystop_years)
-    print(f"\nLoading full training data ({train_years[0]}-{earlystop_years[1]})...")
+    # Load full training data (2000-2017) from both files
+    print(f"\nLoading full training data ({TRAIN_YEARS[0]}-{EARLYSTOP_YEARS[1]})...")
     X_train_full, y_train_full, train_years_array_full, train_pos_full, train_neg_full, train_years_full = load_numpy_arrays_from_multiple_files(
         [train_path, earlystop_path], feature_cols, target_col, "full_train", 
-        year_range=(train_years[0], earlystop_years[1])
+        year_range=(TRAIN_YEARS[0], EARLYSTOP_YEARS[1])
     )
     n_train_full = len(y_train_full)
     
@@ -940,7 +945,7 @@ def phase1_training(
     }
     report_memory_usage("after loading final data")
     
-    print(f"\nFinal model training: train ({train_years[0]}-{earlystop_years[1]}): {len(X_train_full):,} rows")
+    print(f"\nFinal model training: train ({TRAIN_YEARS[0]}-{EARLYSTOP_YEARS[1]}): {len(X_train_full):,} rows")
     
     # Prepare model parameters
     # Ensure class_weight defaults to balanced_subsample if not specified
@@ -1025,15 +1030,14 @@ def phase2_testing(
     use_wandb: bool, target_col: str, earlystop_metrics: Optional[Dict[str, Any]], train_stats: Dict[str, Any],
     train_time: float, earlystop_time: float, train_pos: int, train_neg: int, n_train_full: int,
     best_params: Dict[str, Any], model_params: Dict[str, Any], start_time: float, imbalance_info: Dict[str, Any], cv_info: Dict[str, Any],
-    train_years: tuple[int, int], earlystop_years: tuple[int, int], test_start: int, test_end: int, test_years: tuple[int, int],
 ) -> None:
     """Phase 2: Testing - loads test in batches, loads model, evaluates."""
     print("\n" + "="*70 + "\nPHASE 2: TESTING\n" + "="*70)
     report_memory_usage("start of Phase 2")
     
     # Check for year overlap between training and test
-    final_train_years = (train_years[0], earlystop_years[1])  # Full training period (varies by split variant)
-    test_year_range = (test_start, min(test_end, LAST_LABEL_YEAR))
+    final_train_years = (TRAIN_YEARS[0], EARLYSTOP_YEARS[1])  # Full training period: 2000-2017
+    test_year_range = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))
     
     if check_year_overlap(final_train_years, test_year_range, "Test"):
         print("\n" + "="*70)
@@ -1257,9 +1261,9 @@ def phase2_testing(
         },
         "temporal_split": {
             "method": "strict_temporal_split", 
-            "train_years": list(train_years),
-            "earlystop_years": list(earlystop_years), 
-            "test_years": list(test_years)
+            "train_years": list(TRAIN_YEARS),
+            "earlystop_years": list(EARLYSTOP_YEARS), 
+            "test_years": list(TEST_YEARS)
         },
         "best_params_from_json": best_params,
         "trained_params": model_params,
@@ -1289,7 +1293,7 @@ def phase2_testing(
     print(f"Model: RandomForest, {len(feature_cols)} features")
     print(f"  Class weight: {imbalance_info.get('class_weight', 'balanced_subsample')}")
     
-    print(f"\nTest ({test_years[0]}-{test_years[1]}, {n_test_total:,} samples, {test_pos/n_test_total*100:.3f}% pos): ROC-AUC {test_metrics['roc_auc']:.4f}, PR-AUC {test_metrics['pr_auc']:.4f}")
+    print(f"\nTest ({TEST_YEARS[0]}-{TEST_YEARS[1]}, {n_test_total:,} samples, {test_pos/n_test_total*100:.3f}% pos): ROC-AUC {test_metrics['roc_auc']:.4f}, PR-AUC {test_metrics['pr_auc']:.4f}")
     print(f"  P@1%: {prec_at_k[1]:.4f} ({test_metrics['lift_at_1pct']:.1f}x), P@5%: {prec_at_k[5]:.4f} ({test_metrics['lift_at_5pct']:.1f}x), P@10%: {prec_at_k[10]:.4f} ({test_metrics['lift_at_10pct']:.1f}x)")
     print(f"\nTimings: train {train_time:.1f}s, pred {pred_time:.1f}s, total {total_time:.1f}s ({total_time/60:.1f}m)")
     print("="*70 + "\nDone.")
@@ -1303,25 +1307,36 @@ def phase2_testing(
         wandb.finish()
 
 
-def main(timestamp: str, split_variant: str = "main") -> None:
+def main(timestamp: str, split_version: str = 'original') -> None:
+    global TRAIN_YEARS, EARLYSTOP_YEARS, TEST_START, TEST_END, TEST_YEARS
+    
     start_time = time.time()
     
     # Get split configuration
-    if split_variant not in SPLIT_CONFIGS:
-        raise ValueError(f"Invalid split_variant: {split_variant}. Must be one of: {list(SPLIT_CONFIGS.keys())}")
+    if split_version not in SPLIT_CONFIGS:
+        raise ValueError(f"Invalid split_version: {split_version}. Must be one of: {list(SPLIT_CONFIGS.keys())}")
     
-    config = SPLIT_CONFIGS[split_variant]
-    TRAIN_YEARS = config["train_years"]
-    EARLYSTOP_YEARS = config["earlystop_years"]
-    TEST_START = config["test_start"]
-    TEST_END = config["test_end"]
+    config = SPLIT_CONFIGS[split_version]
+    TRAIN_YEARS = config['train_years']
+    EARLYSTOP_YEARS = config['earlystop_years']
+    TEST_START = config['test_start']
+    TEST_END = config['test_end']
     TEST_YEARS = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))
     
+    print(f"\n{'='*70}")
+    print(f"SPLIT VERSION: {split_version.upper()}")
+    print(f"{'='*70}")
+    print(f"Configuration: {config['description']}")
+    print(f"  TRAIN: {TRAIN_YEARS[0]}-{TRAIN_YEARS[1]} ({TRAIN_YEARS[1]-TRAIN_YEARS[0]+1} years)")
+    print(f"  EARLYSTOP: {EARLYSTOP_YEARS[0]}-{EARLYSTOP_YEARS[1]} ({EARLYSTOP_YEARS[1]-EARLYSTOP_YEARS[0]+1} years)")
+    print(f"  TEST: {TEST_YEARS[0]}-{TEST_YEARS[1]} ({TEST_YEARS[1]-TEST_YEARS[0]+1} years)")
+    print(f"{'='*70}\n")
+    
     repo_root = Path(__file__).resolve().parents[4]
-    train_path = resolve_parquet_file("train_colombia_win5.parquet", split_variant)
-    earlystop_path = resolve_parquet_file("earlystop_colombia_win5.parquet", split_variant)
-    test_path = resolve_parquet_file("test_colombia_win5.parquet", split_variant)
-    params_path = resolve_best_params_json(split_variant)
+    train_path = resolve_parquet_file("train_colombia_win5.parquet", split_version)
+    earlystop_path = resolve_parquet_file("earlystop_colombia_win5.parquet", split_version)
+    test_path = resolve_parquet_file("test_colombia_win5.parquet", split_version)
+    params_path = resolve_best_params_json(split_version)
     metadata_path = resolve_metadata_file("train_colombia_win5_metadata.json")
     
     # Load parameters before wandb.init() so we can log them
@@ -1331,7 +1346,7 @@ def main(timestamp: str, split_variant: str = "main") -> None:
         if best_cv_score:
             print(f"Best CV score: {best_cv_score:.4f}")
     else:
-        print(f"\nUsing default manual hyperparameters (rf_best_params.json not found)")
+        print(f"\nUsing default manual hyperparameters (rf_best_params_{split_version}.json not found)")
     
     # =============================================================================
     # Hyperparameter Override Section
@@ -1340,7 +1355,7 @@ def main(timestamp: str, split_variant: str = "main") -> None:
     # These overrides will apply to all model training phases
     HYPERPARAMETER_OVERRIDES = {
         # Add overrides here as needed:
-        "random_state": 43,
+        # "random_state": 43,
         # "n_estimators": 200,
         # "max_depth": 25,
         # "min_samples_split": 20,
@@ -1357,9 +1372,10 @@ def main(timestamp: str, split_variant: str = "main") -> None:
             best_params[key] = value
             print(f"  {key}: {old_value} → {value}")
     
-    output_dir = repo_root / "outputs/Results/ml_models"
+    # Create split-specific output directories
+    output_dir = repo_root / "outputs/Results/ml_models" / split_version
     output_dir.mkdir(parents=True, exist_ok=True)
-    model_dir = repo_root / "data/ml/models"
+    model_dir = repo_root / "data/ml/models" / split_version
     model_dir.mkdir(parents=True, exist_ok=True)
     
     use_wandb = False
@@ -1368,14 +1384,14 @@ def main(timestamp: str, split_variant: str = "main") -> None:
             wandb.init(
             project="ml-training-colombia", 
             entity=os.environ.get("WANDB_ENTITY"), 
-            name=f"modelC_rf_win5_{split_variant}_{timestamp}",
+            name=f"modelC_rf_win5_{split_version}_{timestamp}",
             config={
                 "model": "RandomForest", 
                 "task": "transition_01_win5_prediction", 
                 "target_column": TARGET_COL,
                 "lookahead_years": 5,
                 "random_state": RANDOM_STATE,
-                "split_variant": split_variant,
+                "split_version": split_version,
                 "temporal_split": {
                     "train_years": list(TRAIN_YEARS), 
                     "earlystop_years": list(EARLYSTOP_YEARS),
@@ -1391,18 +1407,9 @@ def main(timestamp: str, split_variant: str = "main") -> None:
     else:
         print("W&B not available (module not installed)")
     
-    print("="*70 + f"\nRANDOM FOREST - {split_variant.upper()} SPLIT (5-YEAR LOOKAHEAD)\n" + "="*70)
-    print(f"Split variant: {split_variant}")
-    print(f"Description: {config['description']}")
-    print(f"  Train: {TRAIN_YEARS[0]}-{TRAIN_YEARS[1]}")
-    print(f"  Earlystop: {EARLYSTOP_YEARS[0]}-{EARLYSTOP_YEARS[1]}")
-    print(f"  Test: {TEST_YEARS[0]}-{TEST_YEARS[1]}")
-    print(f"\nPaths:")
-    print(f"  Train: {train_path}")
-    print(f"  Earlystop: {earlystop_path}")
-    print(f"  Test: {test_path}")
-    print(f"  Params: {params_path if params_path else 'Using default manual hyperparameters'}")
-    print(f"  Output: {output_dir}")
+    print("="*70 + "\nRANDOM FOREST TRANSITION MODEL (COLOMBIA DATASET - 5-YEAR LOOKAHEAD)\n" + "="*70)
+    print(f"Split version: {split_version}")
+    print(f"Train: {train_path}\nEarlystop: {earlystop_path}\nTest: {test_path}\nParams: {params_path if params_path else f'Using default manual hyperparameters (rf_best_params_{split_version}.json not found)'}\nOutput: {output_dir}")
     print(f"\nConfiguration:")
     print(f"  WDPA_LAST_YEAR: {WDPA_LAST_YEAR}")
     print(f"  LOOKAHEAD_YEARS: {LOOKAHEAD_YEARS}")
@@ -1436,34 +1443,35 @@ def main(timestamp: str, split_variant: str = "main") -> None:
     print(f"Target column: {target_col}")
     
     (model_path, earlystop_metrics, train_stats, train_time, earlystop_time, train_pos, train_neg, n_train_full, imbalance_info, cv_info, model_params) = phase1_training(
-        train_path, earlystop_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col, TRAIN_YEARS, EARLYSTOP_YEARS)
+        train_path, earlystop_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col)
     
     phase2_testing(
         test_path, model_path, feature_cols, keep_cols_test, timestamp, output_dir, use_wandb, target_col,
         earlystop_metrics, train_stats, train_time, earlystop_time, train_pos, train_neg, n_train_full,
-        best_params, model_params, start_time, imbalance_info, cv_info, TRAIN_YEARS, EARLYSTOP_YEARS, TEST_START, TEST_END, TEST_YEARS)
+        best_params, model_params, start_time, imbalance_info, cv_info)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Random Forest Transition Model for Colombia Dataset (5-Year Lookahead Prediction)")
     parser.add_argument(
-        "--split-variant",
+        "--split-version",
         type=str,
         choices=list(SPLIT_CONFIGS.keys()),
-        default=SPLIT_VARIANT,
-        help=f"Temporal split variant to use. Choices: {', '.join(SPLIT_CONFIGS.keys())}. Default: {SPLIT_VARIANT}"
+        default="original",
+        help=f"Split configuration to use. Choices: {', '.join(SPLIT_CONFIGS.keys())} (default: original)"
     )
     args = parser.parse_args()
     
     repo_root = Path(__file__).resolve().parents[4]
-    output_dir = repo_root / "outputs/Results/ml_models"
+    # Create split-specific output directory
+    output_dir = repo_root / "outputs/Results/ml_models" / args.split_version
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"modelC_rf_win5_{args.split_variant}_{timestamp}.txt"
+    output_file = output_dir / f"modelC_rf_win5_{timestamp}.txt"
     tee = Tee(output_file)
     sys.stdout = tee
     try:
-        main(timestamp, split_variant=args.split_variant)
+        main(timestamp, split_version=args.split_version)
     finally:
         sys.stdout = tee.stdout
         tee.close()

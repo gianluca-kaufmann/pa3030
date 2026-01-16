@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=modelC_RF_robust
+#SBATCH --job-name=modelC_RF_robustness
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/modelC_RF_robust_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/modelC_RF_robust_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/modelC_RF_robustness_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/modelC_RF_robustness_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -33,9 +33,9 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the modelC_RF script with robust split variant
+# Run the modelC_RF script with robustness split
 #------------------------------------------------------------------------------
-echo "Starting modelC_RF script (robust split)..."
+echo "Starting modelC_RF script (robustness split)..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
@@ -47,14 +47,7 @@ echo "PWD = $(pwd)"
   find scripts -maxdepth 4 -type f -name "modelC_RF"
   exit 1
 }
+# Run the script with robustness split
+python "scripts/colombia/ML/training/modelC_RF" --split-version robustness
 
-# Enable fast train mode
-export FAST_TRAIN=1
-
-# Set verbose output for scikit-learn
-export SK_VERBOSE=1
-
-# Run the script with robust split variant
-python "scripts/colombia/ML/training/modelC_RF" --split-variant robust
-
-echo "modelC_RF script finished (robust split)."
+echo "modelC_RF script (robustness split) finished."

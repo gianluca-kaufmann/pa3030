@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=modelC_LGBM_main
+#SBATCH --job-name=modelC_LGBM
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/modelC_LGBM_main_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/modelC_LGBM_main_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/modelC_LGBM_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/modelC_LGBM_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -47,8 +47,8 @@ echo "PWD = $(pwd)"
   find scripts -maxdepth 4 -type f -name "modelC_LGBM"
   exit 1
 }
-# Run the script with main split variant
-python "scripts/colombia/ML/training/modelC_LGBM" --cv-mode fold3 --split-variant main
+# Run the script
+python "scripts/colombia/ML/training/modelC_LGBM" --cv-mode fold3 
 
-echo "modelC_LGBM script finished (main split)."
+echo "modelC_LGBM script finished."
 

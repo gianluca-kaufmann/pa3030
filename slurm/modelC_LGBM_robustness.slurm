@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=modelC_RF
+#SBATCH --job-name=modelC_LGBM_robustness
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/modelC_RF_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/modelC_RF_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/modelC_LGBM_robustness_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/modelC_LGBM_robustness_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -33,21 +33,21 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the modelC_RF script
+# Run the modelC_LGBM script with robustness split
 #------------------------------------------------------------------------------
-echo "Starting modelC_RF script..."
+echo "Starting modelC_LGBM script (robustness split)..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/colombia/ML/training/modelC_RF" ] || {
-  echo "ERROR: modelC_RF not found"
-  echo "NOTE: modelC_RF script is in colombia/ML/training/ directory"
-  find scripts -maxdepth 4 -type f -name "modelC_RF"
+[ -f "scripts/colombia/ML/training/modelC_LGBM" ] || {
+  echo "ERROR: modelC_LGBM not found"
+  echo "NOTE: modelC_LGBM script is in colombia/ML/training/ directory"
+  find scripts -maxdepth 4 -type f -name "modelC_LGBM"
   exit 1
 }
-# Run the script
-python "scripts/colombia/ML/training/modelC_RF"
+# Run the script with robustness split and fold3 CV mode
+python "scripts/colombia/ML/training/modelC_LGBM" --split-version robustness --cv-mode fold3
 
-echo "modelC_RF script finished."
+echo "modelC_LGBM script (robustness split) finished."

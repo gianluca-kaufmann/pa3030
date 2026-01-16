@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=preprocessing_main
+#SBATCH --job-name=preprocessing
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/modelC_preprocessing_main_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/modelC_preprocessing_main_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/modelC_preprocessing_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/modelC_preprocessing_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -47,7 +47,7 @@ echo "PWD = $(pwd)"
   find scripts -maxdepth 4 -type f -name "modelC_preprocessing"
   exit 1
 }
-# Run the script with main split variant (default)
-python "scripts/colombia/ML/ml_preprocessing/modelC_preprocessing" --split-variant main
+# Run the script
+python "scripts/colombia/ML/ml_preprocessing/modelC_preprocessing"
 
-echo "modelC_preprocessing script finished (main split)."
+echo "modelC_preprocessing script finished."

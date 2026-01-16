@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=modelC_LGBM_robust
+#SBATCH --job-name=tuning_rf_robustness
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/modelC_LGBM_robust_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/modelC_LGBM_robust_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/modelC_tuning_rf_robustness_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/modelC_tuning_rf_robustness_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -27,27 +27,27 @@ module load cuda/12.4.1
 module load eth_proxy
 
 #------------------------------------------------------------------------------
-# Activate the Python virtual environment (uav-genAI-opti)
+# Activate the Python virtual environment (master-thesis)
 #------------------------------------------------------------------------------
 VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the modelC_LGBM script with robust split variant
+# Run the modelC_tuning_rf script with robustness split
 #------------------------------------------------------------------------------
-echo "Starting modelC_LGBM script (robust split)..."
+echo "Starting modelC_tuning_rf script (robustness split)..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/colombia/ML/training/modelC_LGBM" ] || {
-  echo "ERROR: modelC_LGBM not found"
-  echo "NOTE: modelC_LGBM script is in colombia/ML/training/ directory"
-  find scripts -maxdepth 4 -type f -name "modelC_LGBM"
+[ -f "scripts/colombia/ML/tuning/modelC_tuning_rf" ] || {
+  echo "ERROR: modelC_tuning_rf not found"
+  echo "NOTE: modelC_tuning_rf script is in tuning/ directory"
+  find scripts -maxdepth 4 -type f -name "modelC_tuning_rf"
   exit 1
 }
-# Run the script with robust split variant
-python "scripts/colombia/ML/training/modelC_LGBM" --cv-mode fold3 --split-variant robust
+# Run the script with robustness split
+python "scripts/colombia/ML/tuning/modelC_tuning_rf" --split-version robustness
 
-echo "modelC_LGBM script finished (robust split)."
+echo "modelC_tuning_rf script (robustness split) finished."

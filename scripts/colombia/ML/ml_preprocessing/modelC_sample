@@ -3,18 +3,22 @@
 """
 Sampling script for modelC tuning sample (Colombia dataset).
 
+Supports two split configurations:
+- 'original': Train <= 2014, Earlystop 2015-2017
+- 'robustness': Train <= 2013, Earlystop 2014-2016
+
 Rules
 -----
 - Keep all positives (transition_01_win5 == 1) in TRAIN set only
-- Cap total negatives in TRAIN set at ~3,000,000 (sample uniformly across years)
-- EARLYSTOP set (2014-2016) is kept as-is (true unbalanced, no sampling)
+- Cap total negatives in TRAIN set at ~1,000,000 (sample uniformly across years)
+- EARLYSTOP set is kept as-is (true unbalanced, no sampling)
 - Year 2000 excluded to avoid treating existing PAs as transitions
-- Output: data/ml/tuning/modelC_tuning_colombia.parquet
+- Output: data/ml/tuning/{split_version}/modelC_tuning_colombia.parquet
 
 Notes
 -----
-- Sampling is applied ONLY to train set (year <= 2013)
-- Earlystop set (2014 <= year <= 2016) remains completely unbalanced
+- Sampling is applied ONLY to train set (year <= TRAIN_YEAR_MAX)
+- Earlystop set remains completely unbalanced
 - Uniform sampling across train years ensures balanced temporal distribution
 - Random sampling for simplicity (no hard negatives)
 - Used by both Random Forest and LightGBM hyperparameter tuning scripts
@@ -37,52 +41,55 @@ RANDOM_STATE = 42
 MAX_TOTAL_NEGATIVES = 1_000_000  # Cap total negatives in TRAIN set at 1M
 WANDB_PROJECT = "ml-preprocessing"
 
-# Temporal Split Configurations (must match tuning scripts)
+# Split configurations - must match tuning/training scripts
 SPLIT_CONFIGS = {
-    "main": {
-        "train_year_max": 2014,
-        "earlystop_year_min": 2015,
-        "earlystop_year_max": 2017,
-        "description": "Main split: train <= 2014, earlystop 2015-2017"
+    'original': {
+        'train_year_max': 2014,
+        'earlystop_year_min': 2015,
+        'earlystop_year_max': 2017,
+        'description': 'Original split: Train <=2014, Earlystop 2015-2017'
     },
-    "robust": {
-        "train_year_max": 2013,
-        "earlystop_year_min": 2014,
-        "earlystop_year_max": 2016,
-        "description": "Robust split: train <= 2013, earlystop 2014-2016"
+    'robustness': {
+        'train_year_max': 2013,
+        'earlystop_year_min': 2014,
+        'earlystop_year_max': 2016,
+        'description': 'Robustness split: Train <=2013, Earlystop 2014-2016'
     }
 }
 
-# Default split configuration
-SPLIT_VARIANT = os.environ.get("SPLIT_VARIANT", "main")
 
-
-def resolve_input() -> Path:
-    """Locate merged_panel_colombia_final_win5.parquet (prefer $SCRATCH if present)."""
+def resolve_input(split_version: str) -> Path:
+    """Locate merged_panel_colombia_final_win5.parquet from split-specific directory (prefer $SCRATCH if present)."""
     repo_root = Path(__file__).resolve().parents[4]
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
 
     candidates = []
     if scratch_root is not None:
-        # Check outputs/Results first (standard Euler location from colombia_features script)
+        # Check split-specific subdirectory in outputs/Results first
+        candidates.append(scratch_root / f"outputs/Results/{split_version}/merged_panel_colombia_final_win5.parquet")
+        # Fallback to old location (for backward compatibility)
         candidates.append(scratch_root / "outputs/Results/merged_panel_colombia_final_win5.parquet")
         # Also check data/ml location
-        candidates.append(scratch_root / "data/ml/merged_panel_colombia_final_win5.parquet")
+        candidates.append(scratch_root / f"data/ml/{split_version}/merged_panel_colombia_final_win5.parquet")
+    # Check split-specific subdirectory in repo
+    candidates.append(repo_root / f"outputs/Results/{split_version}/merged_panel_colombia_final_win5.parquet")
+    # Fallback to old location (for backward compatibility)
     candidates.append(repo_root / "outputs/Results/merged_panel_colombia_final_win5.parquet")
-    candidates.append(repo_root / "data/ml/merged_panel_colombia_final_win5.parquet")
+    candidates.append(repo_root / f"data/ml/{split_version}/merged_panel_colombia_final_win5.parquet")
 
     for cand in candidates:
         if cand.exists():
             return cand
 
     # Provide detailed error message with all checked paths
-    error_msg = "merged_panel_colombia_final_win5.parquet not found in expected locations.\n"
+    error_msg = f"merged_panel_colombia_final_win5.parquet not found for split '{split_version}'.\n"
     error_msg += "\nChecked locations:\n"
     for cand in candidates:
         error_msg += f"  - {cand}\n"
     if scratch_root:
         error_msg += f"\nSCRATCH root: {scratch_root}\n"
     error_msg += f"Repository root: {repo_root}\n"
+    error_msg += f"\nHint: Run modelC_preprocessing with --split-version {split_version} first.\n"
     raise FileNotFoundError(error_msg)
 
 
@@ -154,24 +161,24 @@ def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: s
         ]})
 
 
-def main(split_variant: str = "main") -> None:
+def main(split_version: str = 'original') -> None:
     start_time = time.time()
-    
+
     # Get split configuration
-    if split_variant not in SPLIT_CONFIGS:
-        raise ValueError(f"Invalid split_variant: {split_variant}. Must be one of: {list(SPLIT_CONFIGS.keys())}")
+    if split_version not in SPLIT_CONFIGS:
+        raise ValueError(f"Invalid split_version: {split_version}. Must be one of: {list(SPLIT_CONFIGS.keys())}")
     
-    config = SPLIT_CONFIGS[split_variant]
-    TRAIN_YEAR_MAX = config["train_year_max"]
-    EARLYSTOP_YEAR_MIN = config["earlystop_year_min"]
-    EARLYSTOP_YEAR_MAX = config["earlystop_year_max"]
+    config = SPLIT_CONFIGS[split_version]
+    TRAIN_YEAR_MAX = config['train_year_max']
+    EARLYSTOP_YEAR_MIN = config['earlystop_year_min']
+    EARLYSTOP_YEAR_MAX = config['earlystop_year_max']
     
     print(f"\n{'='*70}")
-    print(f"TEMPORAL SPLIT VARIANT: {split_variant.upper()}")
+    print(f"SPLIT VERSION: {split_version.upper()}")
     print(f"{'='*70}")
-    print(f"Description: {config['description']}")
-    print(f"  Train: year <= {TRAIN_YEAR_MAX}")
-    print(f"  Earlystop: {EARLYSTOP_YEAR_MIN} <= year <= {EARLYSTOP_YEAR_MAX}")
+    print(f"Configuration: {config['description']}")
+    print(f"  TRAIN: year <= {TRAIN_YEAR_MAX}")
+    print(f"  EARLYSTOP: {EARLYSTOP_YEAR_MIN} <= year <= {EARLYSTOP_YEAR_MAX}")
     print(f"{'='*70}\n")
 
     wandb_api_key = os.environ.get("WANDB_API_KEY")
@@ -187,10 +194,10 @@ def main(split_variant: str = "main") -> None:
         wandb.init(
             project=WANDB_PROJECT,
             entity=wandb_entity,
-            name=f"modelC_sample_{split_variant}_{time.strftime('%Y%m%d_%H%M%S')}",
+            name=f"modelC_sample_{split_version}_{time.strftime('%Y%m%d_%H%M%S')}",
             config={
                 "random_state": RANDOM_STATE,
-                "split_variant": split_variant,
+                "split_version": split_version,
                 "max_total_negatives": MAX_TOTAL_NEGATIVES,
                 "sampling_method": "uniform_across_years_train_only",
                 "exclude_year": 2000,
@@ -205,7 +212,7 @@ def main(split_variant: str = "main") -> None:
         print(f"W&B initialization failed: {err}\n")
 
     repo_root = Path(__file__).resolve().parents[4]
-    input_path = resolve_input()
+    input_path = resolve_input(split_version)
     
     # Determine output location: prefer data/ml/tuning on scratch, else relative to input
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
@@ -216,12 +223,10 @@ def main(split_variant: str = "main") -> None:
         # Use repo location
         base_dir = repo_root / "data/ml"
     
-    tuning_dir = base_dir / "tuning"
+    # Create split-specific subdirectory
+    tuning_dir = base_dir / "tuning" / split_version
     tuning_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Output path includes split variant suffix
-    suffix = f"_{split_variant}" if split_variant != "main" else ""
-    output_path = tuning_dir / f"modelC_tuning_colombia{suffix}.parquet"
+    output_path = tuning_dir / "modelC_tuning_colombia.parquet"
 
     print(f"\nInput: {input_path}")
     print(f"Output: {output_path}")
@@ -454,18 +459,20 @@ def main(split_variant: str = "main") -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ModelC sampling with configurable temporal splits")
+    parser = argparse.ArgumentParser(
+        description="ModelC sampling: create tuning dataset with balanced sampling"
+    )
     parser.add_argument(
-        "--split-variant",
+        "--split-version",
         type=str,
         choices=list(SPLIT_CONFIGS.keys()),
-        default=SPLIT_VARIANT,
-        help=f"Temporal split variant to use. Choices: {', '.join(SPLIT_CONFIGS.keys())}. Default: {SPLIT_VARIANT}"
+        default="original",
+        help=f"Split configuration to use. Choices: {', '.join(SPLIT_CONFIGS.keys())} (default: original)"
     )
     args = parser.parse_args()
     
     try:
-        main(split_variant=args.split_variant)
+        main(split_version=args.split_version)
     except Exception as e:
         print(f"\nScript failed: {e}", file=sys.stderr)
         sys.exit(1)

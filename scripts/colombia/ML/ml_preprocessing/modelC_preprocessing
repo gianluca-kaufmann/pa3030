@@ -2,20 +2,27 @@
 
 """
 Temporal split script for modelC training/earlystop/test splits (Colombia dataset)
-with 5-year lookahead target. Supports two split variants:
+with 5-year lookahead target.
 
-Main Split (default):
-  TRAIN (2000–2017), EARLYSTOP (2015–2017), TEST (2018–2019)
-
-Robust Split:
-  TRAIN (2000–2016), EARLYSTOP (2014–2016), TEST (2017–2019)
+Supports two split configurations:
+- 'original': TRAIN (2000–2017), EARLYSTOP (2015–2017), TEST (2018–2019)
+- 'robustness': TRAIN (2000–2016), EARLYSTOP (2014–2016), TEST (2017–2019)
 
 Rules
 -----
-- Full risk set (no sampling) for all splits
-- TRAIN: Used for final model training
-- EARLYSTOP: Subset of TRAIN, kept as separate file for CV early stopping only (not for evaluation)
-- TEST: Right-censored at max_year - 5 to ensure 5-year lookahead window, used for final evaluation
+TRAIN:
+  - Full risk set (no sampling)
+  - Used for final model training
+
+EARLYSTOP:
+  - Full risk set (no sampling)
+  - Used only for early stopping during CV, not for evaluation
+  - Note: EARLYSTOP is a subset of TRAIN, but kept as separate file for CV folds
+
+TEST:
+  - Full risk set (no sampling)
+  - Right-censored at max_year - 5 to ensure 5-year lookahead window
+  - Used for final model evaluation
 
 5-Year Lookahead Target:
   - Compute first_transition_year per (row, col) as min(year) where transition_01==1
@@ -26,8 +33,9 @@ Rules
 Notes
 -----
 - Simple temporal split with no sampling
-- Use --split-variant to select between 'main' (default) and 'robust' configurations
-- Output files include variant suffix (_robust) for non-main splits
+- TRAIN contains all training data for final model training
+- EARLYSTOP is a subset of TRAIN, kept as separate file for CV early stopping only
+- TEST is used for final model evaluation
 - Right-censoring: max_year is computed from data and rows with year > max_year-5 are excluded
 """
 
@@ -45,27 +53,25 @@ import wandb
 
 # Configuration
 RANDOM_STATE = 42
-LOOKAHEAD_YEARS = 5          # Number of years to look ahead for target
-WANDB_PROJECT = "ml-preprocessing"
 
-# Temporal Split Configurations
+# Split configurations - supports both original and robustness splits
 SPLIT_CONFIGS = {
-    "main": {
-        "train_years": (2000, 2017),
-        "earlystop_years": (2015, 2017),
-        "test_years": (2018, 2019),
-        "description": "Main split: 90% train (2000-2017), 10% test (2018-2019)"
+    'original': {
+        'train_years': (2000, 2017),
+        'earlystop_years': (2015, 2017),
+        'test_years': (2018, 2019),
+        'description': 'Original split: 18y train, 2y test (90/10)'
     },
-    "robust": {
-        "train_years": (2000, 2016),
-        "earlystop_years": (2014, 2016),
-        "test_years": (2017, 2019),
-        "description": "Robust split: 85% train (2000-2016), 15% test (2017-2019)"
+    'robustness': {
+        'train_years': (2000, 2016),
+        'earlystop_years': (2014, 2016),
+        'test_years': (2017, 2019),
+        'description': 'Robustness split: 17y train, 3y test (85/15)'
     }
 }
 
-# Default split configuration (can be overridden via command-line)
-SPLIT_VARIANT = os.environ.get("SPLIT_VARIANT", "main")
+LOOKAHEAD_YEARS = 5          # Number of years to look ahead for target
+WANDB_PROJECT = "ml-preprocessing"
 
 
 def resolve_input() -> Path:
@@ -163,25 +169,25 @@ def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: s
         ]})
 
 
-def main(split_variant: str = "main") -> None:
+def main(split_version: str = 'original') -> None:
     start_time = time.time()
-    
+
     # Get split configuration
-    if split_variant not in SPLIT_CONFIGS:
-        raise ValueError(f"Invalid split_variant: {split_variant}. Must be one of: {list(SPLIT_CONFIGS.keys())}")
+    if split_version not in SPLIT_CONFIGS:
+        raise ValueError(f"Invalid split_version: {split_version}. Must be one of: {list(SPLIT_CONFIGS.keys())}")
     
-    config = SPLIT_CONFIGS[split_variant]
-    TRAIN_YEARS = config["train_years"]
-    EARLYSTOP_YEARS = config["earlystop_years"]
-    TEST_YEARS = config["test_years"]
+    config = SPLIT_CONFIGS[split_version]
+    TRAIN_YEARS = config['train_years']
+    EARLYSTOP_YEARS = config['earlystop_years']
+    TEST_YEARS = config['test_years']
     
     print(f"\n{'='*70}")
-    print(f"TEMPORAL SPLIT VARIANT: {split_variant.upper()}")
+    print(f"SPLIT VERSION: {split_version.upper()}")
     print(f"{'='*70}")
-    print(f"Description: {config['description']}")
-    print(f"  Train: {TRAIN_YEARS[0]}-{TRAIN_YEARS[1]}")
-    print(f"  Earlystop: {EARLYSTOP_YEARS[0]}-{EARLYSTOP_YEARS[1]}")
-    print(f"  Test: {TEST_YEARS[0]}-{TEST_YEARS[1]}")
+    print(f"Configuration: {config['description']}")
+    print(f"  TRAIN: {TRAIN_YEARS[0]}-{TRAIN_YEARS[1]} ({TRAIN_YEARS[1]-TRAIN_YEARS[0]+1} years)")
+    print(f"  EARLYSTOP: {EARLYSTOP_YEARS[0]}-{EARLYSTOP_YEARS[1]} ({EARLYSTOP_YEARS[1]-EARLYSTOP_YEARS[0]+1} years)")
+    print(f"  TEST: {TEST_YEARS[0]}-{TEST_YEARS[1]} ({TEST_YEARS[1]-TEST_YEARS[0]+1} years)")
     print(f"{'='*70}\n")
 
     wandb_api_key = os.environ.get("WANDB_API_KEY")
@@ -197,10 +203,10 @@ def main(split_variant: str = "main") -> None:
         wandb.init(
             project=WANDB_PROJECT,
             entity=wandb_entity,
-            name=f"modelC_preprocessing_win5_{split_variant}_{time.strftime('%Y%m%d_%H%M%S')}",
+            name=f"modelC_preprocessing_win5_{split_version}_{time.strftime('%Y%m%d_%H%M%S')}",
             config={
                 "random_state": RANDOM_STATE,
-                "split_variant": split_variant,
+                "split_version": split_version,
                 "train_years": TRAIN_YEARS,
                 "earlystop_years": EARLYSTOP_YEARS,
                 "test_years": TEST_YEARS,
@@ -216,14 +222,18 @@ def main(split_variant: str = "main") -> None:
     input_path = resolve_input()
     base_dir = input_path.parent
     
-    # Output paths for win5 files (include split variant suffix)
-    suffix = f"_{split_variant}" if split_variant != "main" else ""
-    merged_win5_out = base_dir / "merged_panel_colombia_final_win5.parquet"  # Shared across splits
-    train_out = base_dir / f"train_colombia_win5{suffix}.parquet"
-    earlystop_out = base_dir / f"earlystop_colombia_win5{suffix}.parquet"
-    test_out = base_dir / f"test_colombia_win5{suffix}.parquet"
+    # Create split-specific subdirectory
+    split_dir = base_dir / split_version
+    split_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Output paths for win5 files (in split-specific subdirectory)
+    merged_win5_out = split_dir / "merged_panel_colombia_final_win5.parquet"
+    train_out = split_dir / "train_colombia_win5.parquet"
+    earlystop_out = split_dir / "earlystop_colombia_win5.parquet"
+    test_out = split_dir / "test_colombia_win5.parquet"
 
     print(f"\nInput: {input_path}")
+    print(f"Output directory: {split_dir}")
     print(f"Merged WIN5 output: {merged_win5_out}")
     print(f"TRAIN output: {train_out}")
     print(f"EARLYSTOP output: {earlystop_out}")
@@ -466,18 +476,20 @@ def main(split_variant: str = "main") -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="ModelC preprocessing with configurable temporal splits")
+    parser = argparse.ArgumentParser(
+        description="ModelC preprocessing: temporal split with 5-year lookahead target"
+    )
     parser.add_argument(
-        "--split-variant",
+        "--split-version",
         type=str,
         choices=list(SPLIT_CONFIGS.keys()),
-        default=SPLIT_VARIANT,
-        help=f"Temporal split variant to use. Choices: {', '.join(SPLIT_CONFIGS.keys())}. Default: {SPLIT_VARIANT}"
+        default="original",
+        help=f"Split configuration to use. Choices: {', '.join(SPLIT_CONFIGS.keys())} (default: original)"
     )
     args = parser.parse_args()
     
     try:
-        main(split_variant=args.split_variant)
+        main(split_version=args.split_version)
     except Exception as e:
         print(f"\nScript failed: {e}", file=sys.stderr)
         sys.exit(1)
