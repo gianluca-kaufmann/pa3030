@@ -726,6 +726,7 @@ def check_year_overlap(train_years: tuple[int, int], eval_years: tuple[int, int]
 def phase1_training(
     train_path: Path, earlystop_path: Path, params_path: Optional[Path], feature_cols: list, keep_cols_train: list,
     best_params: Dict[str, Any], timestamp: str, model_dir: Path, output_dir: Path, use_wandb: bool, target_col: str,
+    train_years: tuple[int, int], earlystop_years: tuple[int, int],
 ) -> tuple[Path, Dict[str, Any], Dict[str, Any], float, float, int, int, int, Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     """
     Phase 1: Training Random Forest model.
@@ -743,13 +744,13 @@ def phase1_training(
     print("\n" + "-"*70)
     print("STEP 1: GENERATE EARLYSTOP PREDICTIONS FOR CALIBRATION")
     print("-"*70)
-    print(f"Training intermediate model on train data only ({TRAIN_YEARS[0]}-{TRAIN_YEARS[1]})...")
+    print(f"Training intermediate model on train data only ({train_years[0]}-{train_years[1]})...")
     
     # Load train data only
-    print(f"\nLoading train data ({TRAIN_YEARS[0]}-{TRAIN_YEARS[1]})...")
+    print(f"\nLoading train data ({train_years[0]}-{train_years[1]})...")
     X_train_only, y_train_only, train_years_array_only, train_pos_only, train_neg_only, train_years_only = load_numpy_arrays_two_pass(
         train_path, feature_cols, target_col, "train_only", 
-        year_range=TRAIN_YEARS
+        year_range=train_years
     )
     n_train_only = len(y_train_only)
     
@@ -786,8 +787,8 @@ def phase1_training(
     del X_train_only, y_train_only, train_years_array_only; gc.collect()
     
     # Load earlystop data and generate predictions
-    print(f"\nLoading earlystop data ({EARLYSTOP_YEARS[0]}-{EARLYSTOP_YEARS[1]}) for predictions...")
-    earlystop_year_range = (EARLYSTOP_YEARS[0], min(EARLYSTOP_YEARS[1], LAST_LABEL_YEAR))
+    print(f"\nLoading earlystop data ({earlystop_years[0]}-{earlystop_years[1]}) for predictions...")
+    earlystop_year_range = (earlystop_years[0], min(earlystop_years[1], LAST_LABEL_YEAR))
     X_earlystop, y_earlystop, earlystop_years_array, earlystop_pos, earlystop_neg, earlystop_years = load_numpy_arrays_two_pass(
         earlystop_path, feature_cols, target_col, "earlystop", 
         year_range=earlystop_year_range
@@ -887,14 +888,14 @@ def phase1_training(
     print("\n" + "-"*70)
     print("STEP 2: TRAIN FINAL MODEL ON FULL DATASET")
     print("-"*70)
-    print(f"Training final model on full dataset: {TRAIN_YEARS[0]}-{EARLYSTOP_YEARS[1]}")
+    print(f"Training final model on full dataset: {train_years[0]}-{earlystop_years[1]}")
     report_memory_usage("before final model training")
     
     # Load full training data (2000-2017) from both files
-    print(f"\nLoading full training data ({TRAIN_YEARS[0]}-{EARLYSTOP_YEARS[1]})...")
+    print(f"\nLoading full training data ({train_years[0]}-{earlystop_years[1]})...")
     X_train_full, y_train_full, train_years_array_full, train_pos_full, train_neg_full, train_years_full = load_numpy_arrays_from_multiple_files(
         [train_path, earlystop_path], feature_cols, target_col, "full_train", 
-        year_range=(TRAIN_YEARS[0], EARLYSTOP_YEARS[1])
+        year_range=(train_years[0], earlystop_years[1])
     )
     n_train_full = len(y_train_full)
     
@@ -939,7 +940,7 @@ def phase1_training(
     }
     report_memory_usage("after loading final data")
     
-    print(f"\nFinal model training: train ({TRAIN_YEARS[0]}-{EARLYSTOP_YEARS[1]}): {len(X_train_full):,} rows")
+    print(f"\nFinal model training: train ({train_years[0]}-{earlystop_years[1]}): {len(X_train_full):,} rows")
     
     # Prepare model parameters
     # Ensure class_weight defaults to balanced_subsample if not specified
@@ -1024,14 +1025,15 @@ def phase2_testing(
     use_wandb: bool, target_col: str, earlystop_metrics: Optional[Dict[str, Any]], train_stats: Dict[str, Any],
     train_time: float, earlystop_time: float, train_pos: int, train_neg: int, n_train_full: int,
     best_params: Dict[str, Any], model_params: Dict[str, Any], start_time: float, imbalance_info: Dict[str, Any], cv_info: Dict[str, Any],
+    train_years: tuple[int, int], earlystop_years: tuple[int, int], test_start: int, test_end: int, test_years: tuple[int, int],
 ) -> None:
     """Phase 2: Testing - loads test in batches, loads model, evaluates."""
     print("\n" + "="*70 + "\nPHASE 2: TESTING\n" + "="*70)
     report_memory_usage("start of Phase 2")
     
     # Check for year overlap between training and test
-    final_train_years = (TRAIN_YEARS[0], EARLYSTOP_YEARS[1])  # Full training period: 2000-2016
-    test_year_range = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))
+    final_train_years = (train_years[0], earlystop_years[1])  # Full training period: 2000-2016
+    test_year_range = (test_start, min(test_end, LAST_LABEL_YEAR))
     
     if check_year_overlap(final_train_years, test_year_range, "Test"):
         print("\n" + "="*70)
@@ -1255,9 +1257,9 @@ def phase2_testing(
         },
         "temporal_split": {
             "method": "strict_temporal_split", 
-            "train_years": list(TRAIN_YEARS),
-            "earlystop_years": list(EARLYSTOP_YEARS), 
-            "test_years": list(TEST_YEARS)
+            "train_years": list(train_years),
+            "earlystop_years": list(earlystop_years), 
+            "test_years": list(test_years)
         },
         "best_params_from_json": best_params,
         "trained_params": model_params,
@@ -1287,7 +1289,7 @@ def phase2_testing(
     print(f"Model: RandomForest, {len(feature_cols)} features")
     print(f"  Class weight: {imbalance_info.get('class_weight', 'balanced_subsample')}")
     
-    print(f"\nTest ({TEST_YEARS[0]}-{TEST_YEARS[1]}, {n_test_total:,} samples, {test_pos/n_test_total*100:.3f}% pos): ROC-AUC {test_metrics['roc_auc']:.4f}, PR-AUC {test_metrics['pr_auc']:.4f}")
+    print(f"\nTest ({test_years[0]}-{test_years[1]}, {n_test_total:,} samples, {test_pos/n_test_total*100:.3f}% pos): ROC-AUC {test_metrics['roc_auc']:.4f}, PR-AUC {test_metrics['pr_auc']:.4f}")
     print(f"  P@1%: {prec_at_k[1]:.4f} ({test_metrics['lift_at_1pct']:.1f}x), P@5%: {prec_at_k[5]:.4f} ({test_metrics['lift_at_5pct']:.1f}x), P@10%: {prec_at_k[10]:.4f} ({test_metrics['lift_at_10pct']:.1f}x)")
     print(f"\nTimings: train {train_time:.1f}s, pred {pred_time:.1f}s, total {total_time:.1f}s ({total_time/60:.1f}m)")
     print("="*70 + "\nDone.")
@@ -1434,12 +1436,12 @@ def main(timestamp: str, split_variant: str = "main") -> None:
     print(f"Target column: {target_col}")
     
     (model_path, earlystop_metrics, train_stats, train_time, earlystop_time, train_pos, train_neg, n_train_full, imbalance_info, cv_info, model_params) = phase1_training(
-        train_path, earlystop_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col)
+        train_path, earlystop_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col, TRAIN_YEARS, EARLYSTOP_YEARS)
     
     phase2_testing(
         test_path, model_path, feature_cols, keep_cols_test, timestamp, output_dir, use_wandb, target_col,
         earlystop_metrics, train_stats, train_time, earlystop_time, train_pos, train_neg, n_train_full,
-        best_params, model_params, start_time, imbalance_info, cv_info)
+        best_params, model_params, start_time, imbalance_info, cv_info, TRAIN_YEARS, EARLYSTOP_YEARS, TEST_START, TEST_END, TEST_YEARS)
 
 
 if __name__ == "__main__":

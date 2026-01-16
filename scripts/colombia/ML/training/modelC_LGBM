@@ -731,6 +731,7 @@ def train_single_cv_fold(
     fold_idx: int,
     best_params: Dict[str, Any],
     use_wandb: bool,
+    cv_folds: list,
     use_time_weights: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -741,7 +742,7 @@ def train_single_cv_fold(
         Dictionary containing fold metrics and metadata
     """
     print(f"\n{'='*70}")
-    print(f"CV FOLD {fold_idx + 1}/{len(CV_FOLDS)}")
+    print(f"CV FOLD {fold_idx + 1}/{len(cv_folds)}")
     print(f"Train: {train_years[0]}-{train_years[1]} → Earlystop: {earlystop_years[0]}-{earlystop_years[1]}")
     print(f"{'='*70}")
     
@@ -923,7 +924,7 @@ def aggregate_cv_metrics(cv_results: list[Dict[str, Any]]) -> Dict[str, Any]:
 def phase1_training(
     train_path: Path, earlystop_path: Path, params_path: Optional[Path], feature_cols: list, keep_cols_train: list,
     best_params: Dict[str, Any], timestamp: str, model_dir: Path, output_dir: Path, use_wandb: bool, target_col: str,
-    cv_mode: str = "fold3", use_time_weights: bool = True, num_boost_round: Optional[int] = None,
+    cv_folds: list, cv_mode: str = "fold3", use_time_weights: bool = True, num_boost_round: Optional[int] = None,
 ) -> tuple[Path, Dict[str, Any], Dict[str, Any], float, float, int, int, int, Dict[str, Any], Dict[str, Any]]:
     """
     Phase 1: Training with temporal cross-validation.
@@ -971,8 +972,8 @@ def phase1_training(
             folds_to_run = [2]  # Only fold 3 (0-indexed: 2)
             print(f"  Running only fold 3 (2000-2014 -> 2015-2017)")
         elif cv_mode == "full":
-            folds_to_run = list(range(len(CV_FOLDS)))  # All folds
-            print(f"  Running all {len(CV_FOLDS)} folds")
+            folds_to_run = list(range(len(cv_folds)))  # All folds
+            print(f"  Running all {len(cv_folds)} folds")
         else:
             raise ValueError(f"Invalid cv_mode: {cv_mode}. Must be one of: full, fold3, none")
         
@@ -980,10 +981,10 @@ def phase1_training(
         all_oof_predictions = []
         
         for fold_idx in folds_to_run:
-            train_years, earlystop_years = CV_FOLDS[fold_idx]
+            train_years, earlystop_years = cv_folds[fold_idx]
             fold_result = train_single_cv_fold(
                 cv_train_paths, cv_earlystop_paths, feature_cols, target_col,
-                train_years, earlystop_years, fold_idx, best_params, use_wandb, use_time_weights
+                train_years, earlystop_years, fold_idx, best_params, use_wandb, cv_folds, use_time_weights
             )
             
             # Collect OOF predictions if available (skip if fold was skipped)
@@ -1727,7 +1728,7 @@ def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True, 
     print(f"Target column: {target_col}")
     
     (model_path, earlystop_metrics, train_stats, train_time, earlystop_time, train_pos, train_neg, n_train_full, imbalance_info, cv_info) = phase1_training(
-        train_path, earlystop_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col, cv_mode, use_time_weights, num_boost_round=num_boost_round)
+        train_path, earlystop_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col, CV_FOLDS, cv_mode, use_time_weights, num_boost_round=num_boost_round)
     
     phase2_testing(
         test_path, model_path, feature_cols, keep_cols_test, timestamp, output_dir, use_wandb, target_col,
