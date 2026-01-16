@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Random Forest Transition Model for Colombia Dataset (5-Year Lookahead Prediction)
-Train RandomForestClassifier on pre-split parquet files: train_colombia_win5 (2000-2013), 
-earlystop_colombia_win5 (2014-2016), test_colombia_win5 (2017-2019). Final model trained on 2000-2016,
-evaluated on 2017-2019.
+Train RandomForestClassifier on pre-split parquet files with configurable splits:
+- Main: train_colombia_win5 (2000-2014), earlystop_colombia_win5 (2015-2017), test_colombia_win5 (2018-2019). Final model trained on 2000-2017.
+- Robust: train_colombia_win5 (2000-2013), earlystop_colombia_win5 (2014-2016), test_colombia_win5 (2017-2019). Final model trained on 2000-2016.
 Target: transition_01_win5 (1 if transition occurs within next 5 years, else 0)
 
 Features:
@@ -891,7 +891,7 @@ def phase1_training(
     print(f"Training final model on full dataset: {train_years[0]}-{earlystop_years[1]}")
     report_memory_usage("before final model training")
     
-    # Load full training data (2000-2017) from both files
+    # Load full training data from both files (combines train_years and earlystop_years)
     print(f"\nLoading full training data ({train_years[0]}-{earlystop_years[1]})...")
     X_train_full, y_train_full, train_years_array_full, train_pos_full, train_neg_full, train_years_full = load_numpy_arrays_from_multiple_files(
         [train_path, earlystop_path], feature_cols, target_col, "full_train", 
@@ -1032,7 +1032,7 @@ def phase2_testing(
     report_memory_usage("start of Phase 2")
     
     # Check for year overlap between training and test
-    final_train_years = (train_years[0], earlystop_years[1])  # Full training period: 2000-2016
+    final_train_years = (train_years[0], earlystop_years[1])  # Full training period (varies by split variant)
     test_year_range = (test_start, min(test_end, LAST_LABEL_YEAR))
     
     if check_year_overlap(final_train_years, test_year_range, "Test"):
@@ -1340,7 +1340,7 @@ def main(timestamp: str, split_variant: str = "main") -> None:
     # These overrides will apply to all model training phases
     HYPERPARAMETER_OVERRIDES = {
         # Add overrides here as needed:
-        # "random_state": 43,
+        "random_state": 43,
         # "n_estimators": 200,
         # "max_depth": 25,
         # "min_samples_split": 20,

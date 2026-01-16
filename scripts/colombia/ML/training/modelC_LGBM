@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """LGBM Transition Model for Colombia Dataset (5-Year Lookahead Prediction)
-Train LightGBM on pre-split parquet files: train_colombia_win5 (2000-2013), 
-earlystop_colombia_win5 (2014-2016), test_colombia_win5 (2017-2019). Final model trained on 2000-2016,
-using average best_iteration from CV folds (no early stopping), evaluated on 2017-2019.
+Train LightGBM on pre-split parquet files: train_colombia_win5 (2000-2014), 
+earlystop_colombia_win5 (2015-2017), test_colombia_win5 (2018-2019). Final model trained on 2000-2017,
+using average best_iteration from CV folds (no early stopping), evaluated on 2018-2019.
 Target: transition_01_win5 (1 if transition occurs within next 5 years, else 0)
 
 Features:
@@ -63,41 +63,24 @@ TARGET_COL = "transition_01_win5"  # 5-year lookahead target
 LOOKAHEAD_YEARS = 5  # Number of years ahead for prediction
 WDPA_LAST_YEAR = 2024  # Last year with WDPA data
 LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS  # Last year we can reliably label (2019)
+TRAIN_YEARS = (2000, 2014)   # Train: 2000-2014 (for final model)
+EARLYSTOP_YEARS = (2015, min(2017, LAST_LABEL_YEAR))     # Earlystop: 2015-2017 (capped at LAST_LABEL_YEAR)
+TEST_START = 2018
+TEST_END = 2019
+TEST_YEARS = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))    # Test: 2018-2019 (capped at LAST_LABEL_YEAR)
 FIXED_PARAMS = {'random_state': RANDOM_STATE, 'boosting_type': 'gbdt', 'objective': 'binary', 'verbose': -1}
 
 # Batch size for data loading (can be overridden via BATCH_SIZE env var)
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "200000"))
 
-# Temporal Split Configurations
-SPLIT_CONFIGS = {
-    "main": {
-        "train_years": (2000, 2014),
-        "earlystop_years": (2015, min(2017, LAST_LABEL_YEAR)),
-        "test_start": 2018,
-        "test_end": 2019,
-        "cv_folds": [
-            ((2000, 2008), (2009, min(2011, LAST_LABEL_YEAR))),  # Fold 1: Train 2000-2008 → Earlystop 2009-2011
-            ((2000, 2011), (2012, min(2014, LAST_LABEL_YEAR))),  # Fold 2: Train 2000-2011 → Earlystop 2012-2014
-            ((2000, 2014), (2015, min(2017, LAST_LABEL_YEAR))),  # Fold 3: Train 2000-2014 → Earlystop 2015-2017
-        ],
-        "description": "Main split: train 2000-2017, test 2018-2019"
-    },
-    "robust": {
-        "train_years": (2000, 2013),
-        "earlystop_years": (2014, min(2016, LAST_LABEL_YEAR)),
-        "test_start": 2017,
-        "test_end": 2019,
-        "cv_folds": [
-            ((2000, 2007), (2008, min(2010, LAST_LABEL_YEAR))),  # Fold 1: Train 2000-2007 → Earlystop 2008-2010
-            ((2000, 2010), (2011, min(2013, LAST_LABEL_YEAR))),  # Fold 2: Train 2000-2010 → Earlystop 2011-2013
-            ((2000, 2013), (2014, min(2016, LAST_LABEL_YEAR))),  # Fold 3: Train 2000-2013 → Earlystop 2014-2016
-        ],
-        "description": "Robust split: train 2000-2016, test 2017-2019"
-    }
-}
-
-# Default split configuration
-SPLIT_VARIANT = os.environ.get("SPLIT_VARIANT", "main")
+# Temporal Cross-Validation Folds
+# Each fold: (train_start, train_end, earlystop_start, earlystop_end)
+# Earlystop years are capped at LAST_LABEL_YEAR to avoid right-censored labels
+CV_FOLDS = [
+    ((2000, 2008), (2009, min(2011, LAST_LABEL_YEAR))),  # Fold 1: Train 2000-2008 → Earlystop 2009-2011
+    ((2000, 2011), (2012, min(2014, LAST_LABEL_YEAR))),  # Fold 2: Train 2000-2011 → Earlystop 2012-2014
+    ((2000, 2014), (2015, min(2017, LAST_LABEL_YEAR))),  # Fold 3: Train 2000-2014 → Earlystop 2015-2017
+]
 
 # Utility Functions
 
@@ -225,33 +208,26 @@ def compute_year_weights(years: np.ndarray, min_year: int = 2000, max_year: int 
     return weights.astype(np.float32)
 
 
-def resolve_parquet_file(filename: str, split_variant: str = "main") -> Path:
-    """Locate parquet file with split variant suffix (prefer $SCRATCH if present)."""
+def resolve_parquet_file(filename: str) -> Path:
+    """Locate parquet file (prefer $SCRATCH if present)."""
     repo_root = Path(__file__).resolve().parents[4]
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
 
-    # Add split variant suffix to filename (except for shared files like merged_panel)
-    if "merged_panel" not in filename:
-        suffix = f"_{split_variant}" if split_variant != "main" else ""
-        filename_with_suffix = filename.replace(".parquet", f"{suffix}.parquet")
-    else:
-        filename_with_suffix = filename
-    
     candidates = []
     if scratch_root is not None:
         # Check outputs/Results first (standard Euler location from preprocessing script)
-        candidates.append(scratch_root / f"outputs/Results/{filename_with_suffix}")
+        candidates.append(scratch_root / f"outputs/Results/{filename}")
         # Also check data/ml location
-        candidates.append(scratch_root / f"data/ml/{filename_with_suffix}")
-    candidates.append(repo_root / f"outputs/Results/{filename_with_suffix}")
-    candidates.append(repo_root / f"data/ml/{filename_with_suffix}")
+        candidates.append(scratch_root / f"data/ml/{filename}")
+    candidates.append(repo_root / f"outputs/Results/{filename}")
+    candidates.append(repo_root / f"data/ml/{filename}")
 
     for cand in candidates:
         if cand.exists():
             return cand
 
     # Provide detailed error message with all checked paths
-    error_msg = f"{filename_with_suffix} not found in expected locations.\n"
+    error_msg = f"{filename} not found in expected locations.\n"
     error_msg += "\nChecked locations:\n"
     for cand in candidates:
         error_msg += f"  - {cand}\n"
@@ -282,11 +258,10 @@ def resolve_metadata_file(filename: str) -> Optional[Path]:
     return None
 
 
-def resolve_best_params_json(split_variant: str = "main") -> Optional[Path]:
-    """Locate lgbm_best_params.json with split variant suffix (in same directory as this script). Returns None if not found."""
+def resolve_best_params_json() -> Optional[Path]:
+    """Locate lgbm_best_params.json (in same directory as this script). Returns None if not found."""
     script_dir = Path(__file__).resolve().parent
-    suffix = f"_{split_variant}" if split_variant != "main" else ""
-    params_path = script_dir / f"lgbm_best_params{suffix}.json"
+    params_path = script_dir / "lgbm_best_params.json"
     
     if not params_path.exists():
         return None
@@ -731,7 +706,6 @@ def train_single_cv_fold(
     fold_idx: int,
     best_params: Dict[str, Any],
     use_wandb: bool,
-    cv_folds: list,
     use_time_weights: bool = True,
 ) -> Dict[str, Any]:
     """
@@ -742,7 +716,7 @@ def train_single_cv_fold(
         Dictionary containing fold metrics and metadata
     """
     print(f"\n{'='*70}")
-    print(f"CV FOLD {fold_idx + 1}/{len(cv_folds)}")
+    print(f"CV FOLD {fold_idx + 1}/{len(CV_FOLDS)}")
     print(f"Train: {train_years[0]}-{train_years[1]} → Earlystop: {earlystop_years[0]}-{earlystop_years[1]}")
     print(f"{'='*70}")
     
@@ -924,7 +898,7 @@ def aggregate_cv_metrics(cv_results: list[Dict[str, Any]]) -> Dict[str, Any]:
 def phase1_training(
     train_path: Path, earlystop_path: Path, params_path: Optional[Path], feature_cols: list, keep_cols_train: list,
     best_params: Dict[str, Any], timestamp: str, model_dir: Path, output_dir: Path, use_wandb: bool, target_col: str,
-    cv_folds: list, cv_mode: str = "fold3", use_time_weights: bool = True, num_boost_round: Optional[int] = None,
+    cv_mode: str = "fold3", use_time_weights: bool = True, num_boost_round: Optional[int] = None,
 ) -> tuple[Path, Dict[str, Any], Dict[str, Any], float, float, int, int, int, Dict[str, Any], Dict[str, Any]]:
     """
     Phase 1: Training with temporal cross-validation.
@@ -972,8 +946,8 @@ def phase1_training(
             folds_to_run = [2]  # Only fold 3 (0-indexed: 2)
             print(f"  Running only fold 3 (2000-2014 -> 2015-2017)")
         elif cv_mode == "full":
-            folds_to_run = list(range(len(cv_folds)))  # All folds
-            print(f"  Running all {len(cv_folds)} folds")
+            folds_to_run = list(range(len(CV_FOLDS)))  # All folds
+            print(f"  Running all {len(CV_FOLDS)} folds")
         else:
             raise ValueError(f"Invalid cv_mode: {cv_mode}. Must be one of: full, fold3, none")
         
@@ -981,10 +955,10 @@ def phase1_training(
         all_oof_predictions = []
         
         for fold_idx in folds_to_run:
-            train_years, earlystop_years = cv_folds[fold_idx]
+            train_years, earlystop_years = CV_FOLDS[fold_idx]
             fold_result = train_single_cv_fold(
                 cv_train_paths, cv_earlystop_paths, feature_cols, target_col,
-                train_years, earlystop_years, fold_idx, best_params, use_wandb, cv_folds, use_time_weights
+                train_years, earlystop_years, fold_idx, best_params, use_wandb, use_time_weights
             )
             
             # Collect OOF predictions if available (skip if fold was skipped)
@@ -1147,7 +1121,7 @@ def phase1_training(
         })
     
     # =============================================================================
-    # STEP B: FINAL MODEL TRAINING (Full train+earlystop: 2000-2016)
+    # STEP B: FINAL MODEL TRAINING (Full train+earlystop: 2000-2017)
     # =============================================================================
     print("\n" + "="*70 + "\nSTEP B: FINAL MODEL TRAINING\n" + "="*70)
     print(f"Training final model on full dataset: {TRAIN_YEARS[0]}-{EARLYSTOP_YEARS[1]}")
@@ -1301,7 +1275,7 @@ def phase2_testing(
     report_memory_usage("start of Phase 2")
     
     # Check for year overlap between training and test
-    final_train_years = (TRAIN_YEARS[0], EARLYSTOP_YEARS[1])  # Full training period: 2000-2016
+    final_train_years = (TRAIN_YEARS[0], EARLYSTOP_YEARS[1])  # Full training period: 2000-2017
     test_year_range = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))
     
     if check_year_overlap(final_train_years, test_year_range, "Test"):
@@ -1596,26 +1570,13 @@ def phase2_testing(
         wandb.finish()
 
 
-def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True, num_boost_round: Optional[int] = None, split_variant: str = "main") -> None:
+def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True, num_boost_round: Optional[int] = None) -> None:
     start_time = time.time()
-    
-    # Get split configuration
-    if split_variant not in SPLIT_CONFIGS:
-        raise ValueError(f"Invalid split_variant: {split_variant}. Must be one of: {list(SPLIT_CONFIGS.keys())}")
-    
-    config = SPLIT_CONFIGS[split_variant]
-    TRAIN_YEARS = config["train_years"]
-    EARLYSTOP_YEARS = config["earlystop_years"]
-    TEST_START = config["test_start"]
-    TEST_END = config["test_end"]
-    TEST_YEARS = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))
-    CV_FOLDS = config["cv_folds"]
-    
     repo_root = Path(__file__).resolve().parents[4]
-    train_path = resolve_parquet_file("train_colombia_win5.parquet", split_variant)
-    earlystop_path = resolve_parquet_file("earlystop_colombia_win5.parquet", split_variant)
-    test_path = resolve_parquet_file("test_colombia_win5.parquet", split_variant)
-    params_path = resolve_best_params_json(split_variant)
+    train_path = resolve_parquet_file("train_colombia_win5.parquet")
+    earlystop_path = resolve_parquet_file("earlystop_colombia_win5.parquet")
+    test_path = resolve_parquet_file("test_colombia_win5.parquet")
+    params_path = resolve_best_params_json()
     
     # Load parameters before wandb.init() so we can log them
     best_params, best_cv_score = load_best_params(params_path)
@@ -1640,7 +1601,7 @@ def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True, 
     
     HYPERPARAMETER_OVERRIDES = {
         "num_boost_round": MAX_NUM_BOOST_ROUND,  # Increase max boosting rounds to 4500
-        "learning_rate": 0.03,                  # Override: 0.02 -> 0.03
+        "learning_rate": 0.035,                  # Override: 0.02 -> 0.035
     }
     
     # Apply overrides to best_params
@@ -1664,14 +1625,13 @@ def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True, 
             wandb.init(
             project="ml-training-colombia", 
             entity=os.environ.get("WANDB_ENTITY"), 
-            name=f"modelC_lgbm_win5_{split_variant}_{timestamp}",
+            name=f"modelC_lgbm_win5_{timestamp}",
             config={
                 "model": "LightGBM", 
                 "task": "transition_01_win5_prediction", 
                 "target_column": TARGET_COL,
                 "lookahead_years": 5,
                 "random_state": RANDOM_STATE,
-                "split_variant": split_variant,
                 "use_time_weights": use_time_weights,
                 "temporal_split": {
                     "train_years": list(TRAIN_YEARS), 
@@ -1688,18 +1648,8 @@ def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True, 
     else:
         print("W&B not available (module not installed)")
     
-    print("="*70 + f"\nLGBM - {split_variant.upper()} SPLIT (5-YEAR LOOKAHEAD)\n" + "="*70)
-    print(f"Split variant: {split_variant}")
-    print(f"Description: {config['description']}")
-    print(f"  Train: {TRAIN_YEARS[0]}-{TRAIN_YEARS[1]}")
-    print(f"  Earlystop: {EARLYSTOP_YEARS[0]}-{EARLYSTOP_YEARS[1]}")
-    print(f"  Test: {TEST_YEARS[0]}-{TEST_YEARS[1]}")
-    print(f"\nPaths:")
-    print(f"  Train: {train_path}")
-    print(f"  Earlystop: {earlystop_path}")
-    print(f"  Test: {test_path}")
-    print(f"  Params: {params_path if params_path else 'Using default manual hyperparameters'}")
-    print(f"  Output: {output_dir}")
+    print("="*70 + "\nLGBM TRANSITION MODEL (COLOMBIA DATASET - 5-YEAR LOOKAHEAD)\n" + "="*70)
+    print(f"Train: {train_path}\nEarlystop: {earlystop_path}\nTest: {test_path}\nParams: {params_path if params_path else 'Using default manual hyperparameters'}\nOutput: {output_dir}")
     print(f"\nConfiguration:")
     print(f"  CV Mode: {cv_mode}")
     print(f"  Use Time Weights: {use_time_weights}")
@@ -1728,7 +1678,7 @@ def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True, 
     print(f"Target column: {target_col}")
     
     (model_path, earlystop_metrics, train_stats, train_time, earlystop_time, train_pos, train_neg, n_train_full, imbalance_info, cv_info) = phase1_training(
-        train_path, earlystop_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col, CV_FOLDS, cv_mode, use_time_weights, num_boost_round=num_boost_round)
+        train_path, earlystop_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col, cv_mode, use_time_weights, num_boost_round=num_boost_round)
     
     phase2_testing(
         test_path, model_path, feature_cols, keep_cols_test, timestamp, output_dir, use_wandb, target_col,
@@ -1751,25 +1701,18 @@ if __name__ == "__main__":
         default=None,
         help="Number of boosting rounds to use when cv_mode='none'. If not provided, uses default from params."
     )
-    parser.add_argument(
-        "--split-variant",
-        type=str,
-        choices=list(SPLIT_CONFIGS.keys()),
-        default=SPLIT_VARIANT,
-        help=f"Temporal split variant to use. Choices: {', '.join(SPLIT_CONFIGS.keys())}. Default: {SPLIT_VARIANT}"
-    )
     args = parser.parse_args()
     
     repo_root = Path(__file__).resolve().parents[4]
     output_dir = repo_root / "outputs/Results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"modelC_lgbm_win5_{args.split_variant}_{timestamp}.txt"
+    output_file = output_dir / f"modelC_lgbm_win5_{timestamp}.txt"
     tee = Tee(output_file)
     sys.stdout = tee
     try:
         # Always use time_weights=True
-        main(timestamp, cv_mode=args.cv_mode, use_time_weights=True, num_boost_round=args.num_boost_round, split_variant=args.split_variant)
+        main(timestamp, cv_mode=args.cv_mode, use_time_weights=True, num_boost_round=args.num_boost_round)
     finally:
         sys.stdout = tee.stdout
         tee.close()
