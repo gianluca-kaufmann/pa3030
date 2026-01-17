@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=calibrate_RF
+#SBATCH --job-name=modelC_results_RF_robustness
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/calibrate_RF_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/calibrate_RF_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/modelC_results_RF_robustness_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/modelC_results_RF_robustness_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -15,10 +15,6 @@ mkdir -p "$SCRATCH/data"
 mkdir -p "$SCRATCH/data/ml"
 mkdir -p "$SCRATCH/outputs"
 mkdir -p "$SCRATCH/outputs/Tables"
-mkdir -p "$SCRATCH/outputs/Figures/calibrate"
-
-# Also create in repo if outputs are stored there
-mkdir -p "outputs/Figures/calibrate"
 
 #------------------------------------------------------------------------------
 # Load modules
@@ -37,21 +33,21 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the calibrate_C script with RF model type (main split)
+# Run the modelC_results script with RF model type (robustness split)
 #------------------------------------------------------------------------------
-echo "Starting calibrate_C script (RF mode, main split)..."
+echo "Starting modelC_results script (RF mode, robustness split)..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/colombia/ML/evaluation/calibrate_C" ] || {
-  echo "ERROR: calibrate_C not found"
-  echo "NOTE: calibrate_C script is in colombia/ML/evaluation/ directory"
-  find scripts -maxdepth 4 -type f -name "calibrate_C"
+[ -f "scripts/colombia/ML/results/modelC_results" ] || {
+  echo "ERROR: modelC_results not found"
+  echo "NOTE: modelC_results script is in colombia/ML/results/ directory"
+  find scripts -maxdepth 4 -type f -name "modelC_results"
   exit 1
 }
-# Run the script (defaults to main split, earlystop source for RF)
-python "scripts/colombia/ML/evaluation/calibrate_C" --model_type rf --split-version main --calib-source earlystop --method platt
+# Run the script with robustness split, prefers calibrated predictions
+python "scripts/colombia/ML/results/modelC_results" --model_type rf --split-version robustness --use_calibrated auto
 
-echo "calibrate_C script (RF mode, main split) finished."
+echo "modelC_results script (RF mode, robustness split) finished."

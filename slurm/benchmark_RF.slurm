@@ -33,9 +33,9 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the benchmark_C script with RF model type
+# Run the benchmark_C script with RF model type (main split)
 #------------------------------------------------------------------------------
-echo "Starting benchmark_C script (RF mode)..."
+echo "Starting benchmark_C script (RF mode, main split)..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
@@ -47,7 +47,7 @@ echo "PWD = $(pwd)"
   find scripts -maxdepth 4 -type f -name "benchmark_C"
   exit 1
 }
-# Run the script
-python "scripts/colombia/ML/evaluation/benchmark_C" --model_type rf
+# Run the script (defaults to main split)
+python "scripts/colombia/ML/evaluation/benchmark_C" --model_type rf --split-version main
 
-echo "benchmark_C script (RF mode) finished."
+echo "benchmark_C script (RF mode, main split) finished."

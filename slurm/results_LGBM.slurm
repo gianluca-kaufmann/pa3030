@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=model1_results
+#SBATCH --job-name=modelC_results_LGBM
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/model1_results_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/model1_results_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/modelC_results_LGBM_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/modelC_results_LGBM_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -33,21 +33,21 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the model1_results script with LGBM model type
+# Run the modelC_results script with LGBM model type (main split)
 #------------------------------------------------------------------------------
-echo "Starting model1_results script (LGBM mode)..."
+echo "Starting modelC_results script (LGBM mode, main split)..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/results/model1_results" ] || {
-  echo "ERROR: model1_results not found"
-  echo "NOTE: model1_results script is in ML/results/ directory"
-  find scripts -maxdepth 4 -type f -name "model1_results"
+[ -f "scripts/colombia/ML/results/modelC_results" ] || {
+  echo "ERROR: modelC_results not found"
+  echo "NOTE: modelC_results script is in colombia/ML/results/ directory"
+  find scripts -maxdepth 4 -type f -name "modelC_results"
   exit 1
 }
-# Run the script
-python "scripts/ML/results/model1_results" --model_type lgbm
+# Run the script (defaults to main split, prefers calibrated predictions)
+python "scripts/colombia/ML/results/modelC_results" --model_type lgbm --split-version main --use_calibrated auto
 
-echo "model1_results script (LGBM mode) finished."
+echo "modelC_results script (LGBM mode, main split) finished."

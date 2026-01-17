@@ -33,9 +33,9 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the modelC_results script
+# Run the modelC_results script with RF model type (main split)
 #------------------------------------------------------------------------------
-echo "Starting modelC_results script (RF mode)..."
+echo "Starting modelC_results script (RF mode, main split)..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
@@ -47,7 +47,7 @@ echo "PWD = $(pwd)"
   find scripts -maxdepth 4 -type f -name "modelC_results"
   exit 1
 }
-# Run the script
-python "scripts/colombia/ML/results/modelC_results" --model_type rf
+# Run the script (defaults to main split, prefers calibrated predictions)
+python "scripts/colombia/ML/results/modelC_results" --model_type rf --split-version main --use_calibrated auto
 
-echo "modelC_results script (RF mode) finished."
+echo "modelC_results script (RF mode, main split) finished."
