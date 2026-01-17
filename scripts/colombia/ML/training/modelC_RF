@@ -5,8 +5,8 @@ evaluated on test.
 Target: transition_01_win5 (1 if transition occurs within next 5 years, else 0)
 
 Supports two split configurations:
-- 'original': Train 2000-2014, Earlystop 2015-2017, Test 2018-2019
-- 'robustness': Train 2000-2013, Earlystop 2014-2016, Test 2017-2019
+- 'main': Train 2000-2013, Earlystop 2014-2016, Test 2017-2019
+- 'robustness': Train 2000-2012, Earlystop 2013-2015, Test 2016-2019
 
 Features:
 - Right-Censoring Protection: Earlystop and test data filtered to LAST_LABEL_YEAR
@@ -66,19 +66,19 @@ LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS  # Last year we can reliably 
 
 # Split configurations - must match preprocessing/tuning scripts
 SPLIT_CONFIGS = {
-    'original': {
-        'train_years': (2000, 2014),
-        'earlystop_years': (2015, min(2017, LAST_LABEL_YEAR)),
-        'test_start': 2018,
-        'test_end': 2019,
-        'description': 'Original split: Train 2000-2014, Earlystop 2015-2017, Test 2018-2019'
-    },
-    'robustness': {
+    'main': {
         'train_years': (2000, 2013),
         'earlystop_years': (2014, min(2016, LAST_LABEL_YEAR)),
         'test_start': 2017,
         'test_end': 2019,
-        'description': 'Robustness split: Train 2000-2013, Earlystop 2014-2016, Test 2017-2019'
+        'description': 'Main split: Train 2000-2013, Earlystop 2014-2016, Test 2017-2019'
+    },
+    'robustness': {
+        'train_years': (2000, 2012),
+        'earlystop_years': (2013, min(2015, LAST_LABEL_YEAR)),
+        'test_start': 2016,
+        'test_end': 2019,
+        'description': 'Robustness split: Train 2000-2012, Earlystop 2013-2015, Test 2016-2019'
     }
 }
 
@@ -253,11 +253,11 @@ def resolve_best_params_json(split_version: str) -> Optional[Path]:
     if params_path.exists():
         return params_path
     
-    # Fallback to non-split-specific file (for backward compatibility with 'original' split)
-    if split_version == 'original':
+    # Fallback to non-split-specific file (for backward compatibility with 'main' split)
+    if split_version == 'main':
         legacy_path = script_dir / "rf_best_params.json"
         if legacy_path.exists():
-            print(f"  Warning: Using legacy rf_best_params.json (consider renaming to rf_best_params_original.json)")
+            print(f"  Warning: Using legacy rf_best_params.json (consider renaming to rf_best_params_main.json)")
             return legacy_path
     
     return None
@@ -737,7 +737,7 @@ def phase1_training(
     Phase 1: Training Random Forest model.
     
     First train on train data only and generate earlystop predictions for calibration.
-    Then train final model on full train+earlystop data (2000-2017).
+    Then train final model on full train+earlystop data.
     
     Returns:
         Tuple including model path, stats, timing, and imbalance info
@@ -896,7 +896,7 @@ def phase1_training(
     print(f"Training final model on full dataset: {TRAIN_YEARS[0]}-{EARLYSTOP_YEARS[1]}")
     report_memory_usage("before final model training")
     
-    # Load full training data (2000-2017) from both files
+    # Load full training data from both files
     print(f"\nLoading full training data ({TRAIN_YEARS[0]}-{EARLYSTOP_YEARS[1]})...")
     X_train_full, y_train_full, train_years_array_full, train_pos_full, train_neg_full, train_years_full = load_numpy_arrays_from_multiple_files(
         [train_path, earlystop_path], feature_cols, target_col, "full_train", 
@@ -1036,7 +1036,7 @@ def phase2_testing(
     report_memory_usage("start of Phase 2")
     
     # Check for year overlap between training and test
-    final_train_years = (TRAIN_YEARS[0], EARLYSTOP_YEARS[1])  # Full training period: 2000-2017
+    final_train_years = (TRAIN_YEARS[0], EARLYSTOP_YEARS[1])  # Full training period
     test_year_range = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))
     
     if check_year_overlap(final_train_years, test_year_range, "Test"):
@@ -1307,7 +1307,7 @@ def phase2_testing(
         wandb.finish()
 
 
-def main(timestamp: str, split_version: str = 'original') -> None:
+def main(timestamp: str, split_version: str = 'main') -> None:
     global TRAIN_YEARS, EARLYSTOP_YEARS, TEST_START, TEST_END, TEST_YEARS
     
     start_time = time.time()
@@ -1457,8 +1457,8 @@ if __name__ == "__main__":
         "--split-version",
         type=str,
         choices=list(SPLIT_CONFIGS.keys()),
-        default="original",
-        help=f"Split configuration to use. Choices: {', '.join(SPLIT_CONFIGS.keys())} (default: original)"
+        default="main",
+        help=f"Split configuration to use. Choices: {', '.join(SPLIT_CONFIGS.keys())} (default: main)"
     )
     args = parser.parse_args()
     

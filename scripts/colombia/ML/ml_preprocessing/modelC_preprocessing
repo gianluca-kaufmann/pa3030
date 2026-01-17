@@ -5,8 +5,8 @@ Temporal split script for modelC training/earlystop/test splits (Colombia datase
 with 5-year lookahead target.
 
 Supports two split configurations:
-- 'original': TRAIN (2000–2017), EARLYSTOP (2015–2017), TEST (2018–2019)
-- 'robustness': TRAIN (2000–2016), EARLYSTOP (2014–2016), TEST (2017–2019)
+- 'main': TRAIN (2000–2016), EARLYSTOP (2014–2016), TEST (2017–2019)
+- 'robustness': TRAIN (2000–2015), EARLYSTOP (2013–2015), TEST (2016–2019)
 
 Rules
 -----
@@ -54,19 +54,19 @@ import wandb
 # Configuration
 RANDOM_STATE = 42
 
-# Split configurations - supports both original and robustness splits
+# Split configurations - supports both main and robustness splits
 SPLIT_CONFIGS = {
-    'original': {
-        'train_years': (2000, 2017),
-        'earlystop_years': (2015, 2017),
-        'test_years': (2018, 2019),
-        'description': 'Original split: 18y train, 2y test (90/10)'
-    },
-    'robustness': {
+    'main': {
         'train_years': (2000, 2016),
         'earlystop_years': (2014, 2016),
         'test_years': (2017, 2019),
-        'description': 'Robustness split: 17y train, 3y test (85/15)'
+        'description': 'Main split: 14y train, 3y test'
+    },
+    'robustness': {
+        'train_years': (2000, 2015),
+        'earlystop_years': (2013, 2015),
+        'test_years': (2016, 2019),
+        'description': 'Robustness split: 13y train, 4y test'
     }
 }
 
@@ -169,7 +169,7 @@ def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: s
         ]})
 
 
-def main(split_version: str = 'original') -> None:
+def main(split_version: str = 'main') -> None:
     start_time = time.time()
 
     # Get split configuration
@@ -371,7 +371,7 @@ def main(split_version: str = 'original') -> None:
         print("STEP 4: Creating temporal splits")
         print("="*70)
         
-        # TRAIN: full risk set 2000–2017
+        # TRAIN: full risk set
         train_sql = f"""
         COPY (
             SELECT
@@ -387,7 +387,7 @@ def main(split_version: str = 'original') -> None:
         con.execute(train_sql)
         print(f"TRAIN written in {time.time() - train_start:.1f}s")
 
-        # EARLYSTOP: full risk set 2015–2017 (for early stopping during CV only, not evaluation)
+        # EARLYSTOP: full risk set (for early stopping during CV only, not evaluation)
         earlystop_sql = f"""
         COPY (
             SELECT
@@ -403,7 +403,7 @@ def main(split_version: str = 'original') -> None:
         con.execute(earlystop_sql)
         print(f"EARLYSTOP written in {time.time() - earlystop_start:.1f}s")
 
-        # TEST: full risk set 2018–2019 (right-censored)
+        # TEST: full risk set (right-censored)
         test_sql = f"""
         COPY (
             SELECT
@@ -483,8 +483,8 @@ if __name__ == "__main__":
         "--split-version",
         type=str,
         choices=list(SPLIT_CONFIGS.keys()),
-        default="original",
-        help=f"Split configuration to use. Choices: {', '.join(SPLIT_CONFIGS.keys())} (default: original)"
+        default="main",
+        help=f"Split configuration to use. Choices: {', '.join(SPLIT_CONFIGS.keys())} (default: main)"
     )
     args = parser.parse_args()
     
