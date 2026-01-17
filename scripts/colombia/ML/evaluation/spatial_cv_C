@@ -85,42 +85,66 @@ KMEANS_SAMPLE_RATE = 0.1  # Sample 10% of coordinates for KMeans fitting
 KMEANS_BATCH_SIZE = 100_000  # Batch size for assigning clusters to full data
 
 
-def resolve_parquet_file(filename: str) -> Path:
-    """Locate parquet file (prefer $SCRATCH if present)."""
+def resolve_parquet_file(filename: str, split_version: str = 'main') -> Path:
+    """Locate parquet file (prefer $SCRATCH if present).
+    
+    Args:
+        filename: Name of the parquet file to locate
+        split_version: Split version ('main' or 'robustness')
+    
+    Returns:
+        Path to the file
+        
+    Raises:
+        FileNotFoundError: If file not found
+    """
     repo_root = Path(__file__).resolve().parents[4]
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
 
     candidates = []
     if scratch_root is not None:
-        # Check outputs/Results first (standard Euler location from preprocessing script)
-        candidates.append(scratch_root / f"outputs/Results/{filename}")
-        # Also check data/ml location
-        candidates.append(scratch_root / f"data/ml/{filename}")
-    candidates.append(repo_root / f"outputs/Results/{filename}")
-    candidates.append(repo_root / f"data/ml/{filename}")
+        # Check split-specific subdirectory first
+        candidates.append(scratch_root / f"outputs/Results/{split_version}/{filename}")
+        # Also check data/ml split-specific location
+        candidates.append(scratch_root / f"data/ml/{split_version}/{filename}")
+    # Check split-specific subdirectory in repo
+    candidates.append(repo_root / f"outputs/Results/{split_version}/{filename}")
+    candidates.append(repo_root / f"data/ml/{split_version}/{filename}")
 
     for cand in candidates:
         if cand.exists():
             return cand
 
     # Provide detailed error message with all checked paths
-    error_msg = f"{filename} not found in expected locations.\n"
+    error_msg = f"{filename} not found for split '{split_version}'.\n"
     error_msg += "\nChecked locations:\n"
     for cand in candidates:
         error_msg += f"  - {cand}\n"
     if scratch_root:
         error_msg += f"\nSCRATCH root: {scratch_root}\n"
     error_msg += f"Repository root: {repo_root}\n"
+    error_msg += f"\nHint: Run modelC_preprocessing with --split-version {split_version} first.\n"
     raise FileNotFoundError(error_msg)
 
 
-def find_latest_benchmark_file(output_dir: Path, model_type: str) -> Path:
-    """Find the most recent modelC_{model_type}_win5_benchmark JSON file."""
+def find_latest_benchmark_file(output_dir: Path, model_type: str, split_version: str = 'main') -> Path:
+    """Find the most recent modelC_{model_type}_win5_benchmark JSON file.
+    
+    Args:
+        output_dir: Base output directory
+        model_type: Model type (lgbm, rf, or brf)
+        split_version: Split version ('main' or 'robustness')
+        
+    Returns:
+        Path to the most recent benchmark file
+    """
+    # Search in split-specific subdirectory
+    split_output_dir = output_dir / split_version
     pattern = f"modelC_{model_type}_win5_benchmark_*.json"
-    files = list(output_dir.glob(pattern))
+    files = list(split_output_dir.glob(pattern))
     
     if not files:
-        raise FileNotFoundError(f"No benchmark files found in {output_dir} matching pattern {pattern}")
+        raise FileNotFoundError(f"No benchmark files found in {split_output_dir} matching pattern {pattern}")
     
     # Return most recent file (by modification time)
     latest = max(files, key=lambda p: p.stat().st_mtime)
@@ -861,7 +885,8 @@ def aggregate_spatial_cv_metrics(cv_results: list[Dict[str, Any]]) -> Dict[str, 
 
 
 def main(protocol: Literal["pooled_years", "deployment_like"] = "pooled_years",
-         model_type: Literal["lgbm", "rf", "brf"] = "lgbm") -> None:
+         model_type: Literal["lgbm", "rf", "brf"] = "lgbm",
+         split_version: str = 'main') -> None:
     """Main function for spatial cross-validation.
     
     Args:
@@ -872,11 +897,14 @@ def main(protocol: Literal["pooled_years", "deployment_like"] = "pooled_years",
             - "lgbm": LightGBM (default)
             - "rf": RandomForestClassifier
             - "brf": BalancedRandomForestClassifier
+        split_version: Split version ('main' or 'robustness')
     """
     start_time = time.time()
     repo_root = Path(__file__).resolve().parents[4]
     output_dir = repo_root / "outputs/Results/ml_models"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Create split-specific output directory
+    split_output_dir = output_dir / split_version
+    split_output_dir.mkdir(parents=True, exist_ok=True)
     
     # Initialize wandb
     use_wandb = False
@@ -909,7 +937,7 @@ def main(protocol: Literal["pooled_years", "deployment_like"] = "pooled_years",
             wandb.init(
                 project="ml-evaluation-spatial",
                 entity=os.environ.get("WANDB_ENTITY"),
-                name=f"spatial_cv_modelC_{model_type}_{protocol}_{timestamp}",
+                name=f"spatial_cv_modelC_{model_type}_{protocol}_{split_version}_{timestamp}",
                 config={
                     "model": model_display_name,
                     "model_type": model_type,
@@ -921,6 +949,7 @@ def main(protocol: Literal["pooled_years", "deployment_like"] = "pooled_years",
                     "spatial_split_method": "KMeans clustering",
                     "protocol": protocol,
                     "cv_type": "spatial",
+                    "split_version": split_version,
                     "train_year_range": list(train_year_range),
                     "test_year_range": list(test_year_range) if test_year_range else None,
                 }
@@ -933,17 +962,18 @@ def main(protocol: Literal["pooled_years", "deployment_like"] = "pooled_years",
         print("W&B not available (module not installed)")
     
     print("=" * 70)
-    print(f"SPATIAL CROSS-VALIDATION: modelC_{model_type.upper()}")
+    print(f"SPATIAL CROSS-VALIDATION: modelC_{model_type.upper()} (Split: {split_version})")
     print(f"Protocol: {protocol_description}")
     print("=" * 70)
-    print(f"\nOutput directory: {output_dir}")
+    print(f"\nOutput directory: {split_output_dir}")
+    print(f"Split version: {split_version}")
     
     # Step 1: Find latest benchmark file
     print("\n" + "=" * 70)
     print("STEP 1: FIND LATEST BENCHMARK FILE")
     print("=" * 70)
     try:
-        benchmark_path = find_latest_benchmark_file(output_dir, model_type)
+        benchmark_path = find_latest_benchmark_file(output_dir, model_type, split_version)
         print(f"\nFound benchmark file: {benchmark_path.name}")
     except FileNotFoundError as e:
         print(f"\nERROR: {e}")
@@ -983,9 +1013,9 @@ def main(protocol: Literal["pooled_years", "deployment_like"] = "pooled_years",
     print("STEP 3: LOAD DATA WITH COORDINATES")
     print("=" * 70)
     try:
-        train_path = resolve_parquet_file("train_colombia_win5.parquet")
-        earlystop_path = resolve_parquet_file("earlystop_colombia_win5.parquet")
-        test_path = resolve_parquet_file("test_colombia_win5.parquet")
+        train_path = resolve_parquet_file("train_colombia_win5.parquet", split_version)
+        earlystop_path = resolve_parquet_file("earlystop_colombia_win5.parquet", split_version)
+        test_path = resolve_parquet_file("test_colombia_win5.parquet", split_version)
         
         if protocol == "pooled_years":
             # Load all data for spatial splitting (2000-2017 mixed across folds)
@@ -1139,6 +1169,8 @@ def main(protocol: Literal["pooled_years", "deployment_like"] = "pooled_years",
             })
             
             cv_predictions_path = output_dir / f"modelC_{model_type}_win5_spatial_cv_predictions_{timestamp}.parquet"
+            # Save to split-specific directory
+            cv_predictions_path = split_output_dir / f"modelC_{model_type}_win5_spatial_cv_predictions_{timestamp}.parquet"
             cv_predictions_df.to_parquet(cv_predictions_path, index=False, engine="pyarrow")
             print(f"\nCV predictions saved: {cv_predictions_path.name}")
             print(f"  Total samples: {len(cv_predictions_df):,}")
@@ -1207,7 +1239,7 @@ def main(protocol: Literal["pooled_years", "deployment_like"] = "pooled_years",
     print("\n" + "=" * 70)
     print("STEP 7: SAVE RESULTS")
     print("=" * 70)
-    results_path = output_dir / f"modelC_{model_type}_win5_spatial_cv_{timestamp}.json"
+    results_path = split_output_dir / f"modelC_{model_type}_win5_spatial_cv_{timestamp}.json"
     
     results = {
         "metadata": {
@@ -1225,6 +1257,7 @@ def main(protocol: Literal["pooled_years", "deployment_like"] = "pooled_years",
             "protocol_description": protocol_description,
             "temporal_split": cv_type_description,
             "random_seed": random_seed,
+            "split_version": split_version,
             "train_year_range": list(train_year_range),
             "test_year_range": list(test_year_range) if test_year_range else list(train_year_range),
             "spatial_cv_year_end": SPATIAL_CV_YEAR_END,
@@ -1294,20 +1327,29 @@ if __name__ == "__main__":
         default="lgbm",
         help="Model type: 'lgbm' (LightGBM), 'rf' (RandomForest), or 'brf' (BalancedRandomForest)"
     )
+    parser.add_argument(
+        "--split-version",
+        type=str,
+        choices=["main", "robustness"],
+        default="main",
+        help="Split version: 'main' or 'robustness' (default: main)"
+    )
     args = parser.parse_args()
     
     repo_root = Path(__file__).resolve().parents[4]
     output_dir = repo_root / "outputs/Results/ml_models"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Create split-specific output directory
+    split_output_dir = output_dir / args.split_version
+    split_output_dir.mkdir(parents=True, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"spatial_cv_modelC_{args.model_type}_{args.protocol}_{timestamp}.txt"
+    output_file = split_output_dir / f"spatial_cv_modelC_{args.model_type}_{args.protocol}_{timestamp}.txt"
     
     tee = Tee(output_file)
     sys.stdout = tee
     
     try:
-        main(protocol=args.protocol, model_type=args.model_type)
+        main(protocol=args.protocol, model_type=args.model_type, split_version=args.split_version)
     finally:
         sys.stdout = tee.stdout
         tee.close()

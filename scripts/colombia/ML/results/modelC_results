@@ -1972,24 +1972,32 @@ def main() -> None:
         action='store_true',
         help='Skip SHAP analysis (default: False)'
     )
+    parser.add_argument(
+        '--split-version',
+        type=str,
+        choices=['main', 'robustness'],
+        default='main',
+        help='Split version: \'main\' or \'robustness\' (default: main)'
+    )
     
     args = parser.parse_args()
     
     model_type = args.model_type.lower()
     use_calibrated = args.use_calibrated.lower()
+    split_version = args.split_version
     
     # Get repo root and scratch root for auto-discovery
     repo_root = get_repo_root()
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
     
-    # Check both $SCRATCH and repo root for ml_models directory
+    # Check both $SCRATCH and repo root for ml_models directory (with split subdirectory)
     ml_models_candidates = []
     if scratch_root is not None:
-        ml_models_candidates.append(scratch_root / "outputs/Results/ml_models")
-    ml_models_candidates.append(repo_root / "outputs/Results/ml_models")
+        ml_models_candidates.append(scratch_root / "outputs/Results/ml_models" / split_version)
+    ml_models_candidates.append(repo_root / "outputs/Results/ml_models" / split_version)
     
     # Print all candidate directories for debugging
-    print(f"Searching for ml_models files in:")
+    print(f"Searching for ml_models files (split_version={split_version}) in:")
     for cand in ml_models_candidates:
         exists = "✓" if cand.exists() else "✗"
         print(f"  {exists} {cand}")
@@ -2061,16 +2069,18 @@ def main() -> None:
         
         print(f"  Found: {parquet_path}")
     
-    # Auto-discover test parquet if not provided
+    # Auto-discover test parquet if not provided (use split-specific subdirectory)
     if args.test_parquet:
         test_parquet_path = Path(args.test_parquet).resolve()
     else:
         print("Auto-discovering test parquet file...")
-        # Try to find test_colombia_win5.parquet in data/ml directory
+        # Try to find test_colombia_win5.parquet in split-specific data/ml directory
         candidates = []
         if scratch_root is not None:
-            candidates.append(scratch_root / "data/ml/test_colombia_win5.parquet")
-        candidates.append(repo_root / "data/ml/test_colombia_win5.parquet")
+            candidates.append(scratch_root / f"outputs/Results/{split_version}/test_colombia_win5.parquet")
+            candidates.append(scratch_root / f"data/ml/{split_version}/test_colombia_win5.parquet")
+        candidates.append(repo_root / f"outputs/Results/{split_version}/test_colombia_win5.parquet")
+        candidates.append(repo_root / f"data/ml/{split_version}/test_colombia_win5.parquet")
         
         test_parquet_path = None
         for cand in candidates:
@@ -2085,15 +2095,15 @@ def main() -> None:
             print(f"  For accurate results, provide --test_parquet path to original test data")
             test_parquet_path = None
     
-    # Auto-discover model pickle file for SHAP (unless --skip_shap)
+    # Auto-discover model pickle file for SHAP (unless --skip_shap, with split subdirectory)
     model_path = None
     if not args.skip_shap:
         print("\nAuto-discovering trained model file for SHAP analysis...")
         model_pattern = f"modelC_{model_type}_win5_*.pkl"
         model_candidates = []
         if scratch_root is not None:
-            model_candidates.append(scratch_root / "data/ml/models")
-        model_candidates.append(repo_root / "data/ml/models")
+            model_candidates.append(scratch_root / "data/ml/models" / split_version)
+        model_candidates.append(repo_root / "data/ml/models" / split_version)
         
         model_path = find_latest_file_in_dirs(model_pattern, model_candidates)
         if model_path is None:
@@ -2102,21 +2112,21 @@ def main() -> None:
         else:
             print(f"  Found: {model_path}")
     
-    # Auto-discover data sources for SHAP (earlystop, train)
+    # Auto-discover data sources for SHAP (earlystop, train, with split subdirectory)
     shap_data_sources = {}
     if not args.skip_shap and model_path is not None:
         print("\nAuto-discovering data sources for SHAP analysis...")
         
-        # Try to find earlystop_colombia_win5.parquet
+        # Try to find earlystop_colombia_win5.parquet in split-specific directories
         earlystop_candidates = []
         if scratch_root is not None:
             earlystop_candidates.extend([
-                scratch_root / "outputs/Results/earlystop_colombia_win5.parquet",
-                scratch_root / "data/ml/earlystop_colombia_win5.parquet"
+                scratch_root / f"outputs/Results/{split_version}/earlystop_colombia_win5.parquet",
+                scratch_root / f"data/ml/{split_version}/earlystop_colombia_win5.parquet"
             ])
         earlystop_candidates.extend([
-            repo_root / "outputs/Results/earlystop_colombia_win5.parquet",
-            repo_root / "data/ml/earlystop_colombia_win5.parquet"
+            repo_root / f"outputs/Results/{split_version}/earlystop_colombia_win5.parquet",
+            repo_root / f"data/ml/{split_version}/earlystop_colombia_win5.parquet"
         ])
         
         for cand in earlystop_candidates:
@@ -2125,16 +2135,16 @@ def main() -> None:
                 print(f"  Found earlystop: {cand}")
                 break
         
-        # Try to find train_colombia_win5.parquet
+        # Try to find train_colombia_win5.parquet in split-specific directories
         train_candidates = []
         if scratch_root is not None:
             train_candidates.extend([
-                scratch_root / "outputs/Results/train_colombia_win5.parquet",
-                scratch_root / "data/ml/train_colombia_win5.parquet"
+                scratch_root / f"outputs/Results/{split_version}/train_colombia_win5.parquet",
+                scratch_root / f"data/ml/{split_version}/train_colombia_win5.parquet"
             ])
         train_candidates.extend([
-            repo_root / "outputs/Results/train_colombia_win5.parquet",
-            repo_root / "data/ml/train_colombia_win5.parquet"
+            repo_root / f"outputs/Results/{split_version}/train_colombia_win5.parquet",
+            repo_root / f"data/ml/{split_version}/train_colombia_win5.parquet"
         ])
         
         for cand in train_candidates:
@@ -2161,10 +2171,11 @@ def main() -> None:
         output_dir = Path(args.out_dir).resolve()
     else:
         # Prefer $SCRATCH for outputs on cluster, otherwise use repo root
+        # Use split-specific subdirectory
         if scratch_root is not None:
-            output_dir = scratch_root / f"outputs/Results/results_modelC_{model_type}"
+            output_dir = scratch_root / f"outputs/Results/results_modelC_{model_type}" / split_version
         else:
-            output_dir = repo_root / f"outputs/Results/results_modelC_{model_type}"
+            output_dir = repo_root / f"outputs/Results/results_modelC_{model_type}" / split_version
     
     country_boundary_path = Path(args.country_boundary).resolve() if args.country_boundary else None
     
@@ -2181,9 +2192,10 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     
     print("=" * 70)
-    print(f"MODEL C ({model_type.upper()}) RESULTS REPORTING")
+    print(f"MODEL C ({model_type.upper()}) RESULTS REPORTING (Split: {split_version})")
     print("=" * 70)
     print(f"\nModel type: {model_type}")
+    print(f"Split version: {split_version}")
     print(f"Use calibrated: {use_calibrated}")
     print(f"Metrics JSON: {metrics_path}")
     print(f"Scored parquet: {parquet_path}")
