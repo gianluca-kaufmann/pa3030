@@ -282,20 +282,14 @@ def resolve_metadata_file(filename: str) -> Optional[Path]:
 
 
 def resolve_best_params_json(split_version: str) -> Optional[Path]:
-    """Locate lgbm_best_params_{split_version}.json (in same directory as this script). Returns None if not found."""
+    """Locate lgbm_best_params.json (in same directory as this script). Returns None if not found.
+    Both 'main' and 'robustness' splits use the same hyperparameter file."""
     script_dir = Path(__file__).resolve().parent
     
-    # Try split-specific params file first
-    params_path = script_dir / f"lgbm_best_params_{split_version}.json"
+    # Always use the same hyperparameter file for both splits
+    params_path = script_dir / "lgbm_best_params.json"
     if params_path.exists():
         return params_path
-    
-    # Fallback to non-split-specific file (for backward compatibility with 'main' split)
-    if split_version == 'main':
-        legacy_path = script_dir / "lgbm_best_params.json"
-        if legacy_path.exists():
-            print(f"  Warning: Using legacy lgbm_best_params.json (consider renaming to lgbm_best_params_main.json)")
-            return legacy_path
     
     return None
 
@@ -1641,7 +1635,7 @@ def main(timestamp: str, split_version: str = 'main', cv_mode: str = "fold3", us
         if best_cv_score:
             print(f"Best CV score: {best_cv_score:.4f}")
     else:
-        print(f"\nUsing default manual hyperparameters (lgbm_best_params_{split_version}.json not found)")
+        print(f"\nUsing default manual hyperparameters (lgbm_best_params.json not found)")
     
     # =============================================================================
     # HYPERPARAMETER OVERRIDE SECTION
@@ -1708,7 +1702,7 @@ def main(timestamp: str, split_version: str = 'main', cv_mode: str = "fold3", us
     
     print("="*70 + "\nLGBM TRANSITION MODEL (COLOMBIA DATASET - 5-YEAR LOOKAHEAD)\n" + "="*70)
     print(f"Split version: {split_version}")
-    print(f"Train: {train_path}\nEarlystop: {earlystop_path}\nTest: {test_path}\nParams: {params_path if params_path else f'Using default manual hyperparameters (lgbm_best_params_{split_version}.json not found)'}\nOutput: {output_dir}")
+    print(f"Train: {train_path}\nEarlystop: {earlystop_path}\nTest: {test_path}\nParams: {params_path if params_path else 'Using default manual hyperparameters (lgbm_best_params.json not found)'}\nOutput: {output_dir}")
     print(f"\nConfiguration:")
     print(f"  CV Mode: {cv_mode}")
     print(f"  Use Time Weights: {use_time_weights}")
