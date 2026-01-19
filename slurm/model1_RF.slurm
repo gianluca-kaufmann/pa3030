@@ -47,6 +47,10 @@ echo "PWD = $(pwd)"
   find scripts -maxdepth 4 -type f -name "model1_RF"
   exit 1
 }
+
+# OOM-safe configuration for large datasets (500M rows)
+export MAX_NEG_TRAIN=50000000      # Cap negative samples at 50M for training (keeps all positives)
+
 # Run the script
 python "scripts/ML/training/model1_RF"
 

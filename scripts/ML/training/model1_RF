@@ -70,7 +70,8 @@ TEST_END = 2019
 TEST_YEARS = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))    # Test: 2018-2019 (capped at LAST_LABEL_YEAR, matches preprocessing main split)
 
 # Batch size for data loading (can be overridden via BATCH_SIZE env var)
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "200000"))
+# Reduced default for OOM safety with large datasets
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "100000"))
 
 # Maximum negative samples for training (0 = no cap, can be overridden via MAX_NEG_TRAIN env var)
 MAX_NEG_TRAIN = int(os.environ.get("MAX_NEG_TRAIN", "0"))
@@ -509,10 +510,9 @@ def load_numpy_arrays_two_pass(
             del batch_table, target_array, year_array, wdpa_prev_array, target_valid, year_valid
             del feature_table, X_batch, y_batch, batch
             
-            if batch_num % 25 == 0:
-                gc.collect()
-            
+            # More aggressive garbage collection for large datasets
             if batch_num % 10 == 0:
+                gc.collect()
                 loaded_so_far = idx_pos + (len(neg_reservoir) if neg_reservoir is not None else idx_neg)
                 print(f"  {batch_num} batches, {loaded_so_far:,}/{n_samples:,} samples loaded")
                 report_memory_usage(f"load batch {batch_num}")
@@ -776,10 +776,9 @@ def load_numpy_arrays_from_multiple_files(
                 del batch_table, target_array, year_array, wdpa_prev_array, target_valid, year_valid
                 del feature_table, X_batch, y_batch, batch
                 
-                if batch_num % 25 == 0:
-                    gc.collect()
-                
+                # More aggressive garbage collection for large datasets
                 if batch_num % 10 == 0:
+                    gc.collect()
                     loaded_so_far = idx_pos + (len(neg_reservoir) if neg_reservoir is not None else idx_neg)
                     print(f"  {batch_num} batches, {loaded_so_far:,}/{n_samples:,} samples loaded")
                     report_memory_usage(f"load batch {batch_num}")
@@ -916,39 +915,69 @@ def phase1_training(
     
     intermediate_train_time = time.time() - intermediate_train_start
     print(f"Intermediate training done in {intermediate_train_time:.1f}s")
+    report_memory_usage("after intermediate training")
     
     del X_train_only, y_train_only, train_years_array_only; gc.collect()
+    report_memory_usage("after freeing train data")
     
-    # Load earlystop data and generate predictions
-    print(f"\nLoading earlystop data ({EARLYSTOP_YEARS[0]}-{EARLYSTOP_YEARS[1]}) for predictions...")
+    # Generate earlystop predictions in batches (OOM-proof)
+    print(f"\nGenerating earlystop predictions in batches (OOM-proof)...")
+    print(f"  Year range: {EARLYSTOP_YEARS[0]}-{EARLYSTOP_YEARS[1]} (capped at LAST_LABEL_YEAR={LAST_LABEL_YEAR})")
     earlystop_year_range = (EARLYSTOP_YEARS[0], min(EARLYSTOP_YEARS[1], LAST_LABEL_YEAR))
-    X_earlystop, y_earlystop, earlystop_years_array, earlystop_pos, earlystop_neg, earlystop_years = load_numpy_arrays_two_pass(
-        earlystop_path, feature_cols, target_col, "earlystop", 
-        year_range=earlystop_year_range
-    )
-    n_earlystop = len(y_earlystop)
     
-    print(f"\nGenerating predictions on earlystop set ({n_earlystop:,} samples)...")
-    earlystop_pred_start = time.time()
-    y_earlystop_proba = rf_model_intermediate.predict_proba(X_earlystop)[:, 1].astype(np.float32)
-    earlystop_pred_time = time.time() - earlystop_pred_start
-    print(f"Earlystop predictions generated in {earlystop_pred_time:.1f}s")
-    
-    # Save earlystop scored predictions for calibration
-    print(f"\nSaving earlystop scored predictions for calibration...")
-    earlystop_scored_path = output_dir / f"model1_rf_win5_earlystop_scored_{timestamp}.parquet"
-    
-    # Load earlystop metadata to save with predictions
+    # Pass 1: Count earlystop rows to track progress
+    print(f"  Pass 1: Counting earlystop rows...")
     parquet_file = pq.ParquetFile(earlystop_path)
-    batch_size = BATCH_SIZE
+    n_earlystop = 0
+    earlystop_years_set = set()
+    earlystop_pos = 0
+    earlystop_neg = 0
+    
+    try:
+        for batch in parquet_file.iter_batches(batch_size=BATCH_SIZE, columns=[target_col, 'year', 'WDPA_prev'], use_threads=True):
+            batch_table = batch
+            null_mask = batch_table[target_col].is_null().to_numpy(zero_copy_only=False)
+            valid_mask = ~null_mask
+            if valid_mask.any():
+                year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+                wdpa_prev_array = batch_table['WDPA_prev'].to_numpy(zero_copy_only=False)
+                target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+                year_mask = (year_array >= earlystop_year_range[0]) & (year_array <= earlystop_year_range[1])
+                risk_set_mask = (wdpa_prev_array == 0)
+                final_mask = valid_mask & year_mask & risk_set_mask
+                if final_mask.any():
+                    n_earlystop += int(final_mask.sum())
+                    earlystop_years_set.update(year_array[final_mask].tolist())
+                    target_valid = target_array[final_mask]
+                    earlystop_pos += int((target_valid > 0).sum())
+                    earlystop_neg += int((target_valid == 0).sum())
+                del year_array, wdpa_prev_array, target_array
+            del batch_table, batch
+    finally:
+        del parquet_file; gc.collect()
+    
+    earlystop_years = sorted(earlystop_years_set)
+    print(f"  Found {n_earlystop:,} earlystop samples: {earlystop_neg:,} neg, {earlystop_pos:,} pos")
+    print(f"  Years: {earlystop_years[0]}-{earlystop_years[-1]}")
+    
+    if n_earlystop == 0:
+        raise ValueError("No earlystop samples found")
+    
+    # Pass 2: Process batches and generate predictions (OOM-proof)
+    print(f"  Pass 2: Generating predictions in batches...")
+    earlystop_scored_path = output_dir / f"model1_rf_win5_earlystop_scored_{timestamp}.parquet"
+    parquet_file = pq.ParquetFile(earlystop_path)
     writer = None
     idx_offset = 0
+    batch_num = 0
+    earlystop_pred_start = time.time()
     
     # Add WDPA_prev to columns we need to read for filtering
     keep_cols_with_wdpa = keep_cols_train + ['WDPA_prev'] if 'WDPA_prev' not in keep_cols_train else keep_cols_train
     
     try:
-        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=keep_cols_with_wdpa, use_threads=True):
+        for batch in parquet_file.iter_batches(batch_size=BATCH_SIZE, columns=keep_cols_with_wdpa, use_threads=True):
+            batch_num += 1
             batch_table = batch
             null_mask = batch_table[target_col].is_null().to_numpy(zero_copy_only=False)
             valid_mask = ~null_mask
@@ -959,7 +988,7 @@ def phase1_training(
             year_array = batch_table['year'].to_numpy(zero_copy_only=False)
             wdpa_prev_array = batch_table['WDPA_prev'].to_numpy(zero_copy_only=False)
             year_mask = (year_array >= earlystop_year_range[0]) & (year_array <= earlystop_year_range[1])
-            risk_set_mask = (wdpa_prev_array == 0)  # Apply risk-set filter: WDPA_prev == 0
+            risk_set_mask = (wdpa_prev_array == 0)
             final_mask = valid_mask & year_mask & risk_set_mask
             if not final_mask.any():
                 del batch_table, year_array, wdpa_prev_array, batch
@@ -969,9 +998,10 @@ def phase1_training(
             target_valid = target_array[final_mask]
             y_batch = (target_valid > 0).astype(np.int8)
             
-            # Get predictions for this batch
-            batch_size_actual = len(y_batch)
-            y_proba_batch = y_earlystop_proba[idx_offset:idx_offset + batch_size_actual]
+            # Extract features and generate predictions for this batch
+            feature_table = batch_table.select(feature_cols)
+            X_batch = extract_features_pyarrow_to_numpy(feature_table, final_mask)
+            y_proba_batch = rf_model_intermediate.predict_proba(X_batch)[:, 1].astype(np.float32)
             
             # Extract metadata arrays
             row_array = batch_table['row'].to_numpy(zero_copy_only=False)[final_mask]
@@ -996,17 +1026,28 @@ def phase1_training(
             
             if writer is None:
                 writer = pq.ParquetWriter(earlystop_scored_path, result_table.schema)
-                print(f"Writing earlystop scored predictions to {earlystop_scored_path.name}")
+                print(f"  Writing earlystop scored predictions to {earlystop_scored_path.name}")
             writer.write_table(result_table)
             
+            batch_size_actual = len(y_batch)
             idx_offset += batch_size_actual
             
-            del batch_table, target_array, year_array, wdpa_prev_array, target_valid, y_batch, y_proba_batch
+            del batch_table, target_array, year_array, wdpa_prev_array, target_valid, y_batch
+            del feature_table, X_batch, y_proba_batch
             del row_array, col_array, year_array_valid, result_arrays, result_table, batch
+            
+            # Aggressive garbage collection for large datasets
+            if batch_num % 10 == 0:
+                gc.collect()
+                print(f"  {batch_num} batches, {idx_offset:,}/{n_earlystop:,} predictions generated")
+                report_memory_usage(f"earlystop batch {batch_num}")
     finally:
         if writer is not None:
             writer.close()
         del parquet_file; gc.collect()
+    
+    earlystop_pred_time = time.time() - earlystop_pred_start
+    print(f"Earlystop predictions generated in {earlystop_pred_time:.1f}s ({batch_num} batches)")
     
     if idx_offset != n_earlystop:
         raise ValueError(f"Mismatch: expected {n_earlystop:,} earlystop samples but processed {idx_offset:,}")
@@ -1014,7 +1055,8 @@ def phase1_training(
     print(f"Earlystop scored predictions saved: {earlystop_scored_path.name}")
     print(f"  {earlystop_neg:,} neg, {earlystop_pos:,} pos, ratio 1:{earlystop_neg/max(earlystop_pos,1):.1f}, years {earlystop_years[0]}-{earlystop_years[-1]}")
     
-    del rf_model_intermediate, X_earlystop, y_earlystop, earlystop_years_array, y_earlystop_proba; gc.collect()
+    del rf_model_intermediate; gc.collect()
+    report_memory_usage("after freeing intermediate model")
     earlystop_time = intermediate_train_time + earlystop_pred_time
     
     # Step 2: Train final model on full train+earlystop data
@@ -1282,10 +1324,9 @@ def phase2_testing(
             del batch_table, target_array, wdpa_prev_array, target_valid, feature_table, X_batch, y_batch, y_proba_batch
             del row_array, col_array, year_array, year_array_valid, result_arrays, result_table, batch
             
-            if batch_num % 25 == 0:
-                gc.collect()
-            
+            # More aggressive garbage collection for large datasets
             if batch_num % 10 == 0:
+                gc.collect()
                 print(f"  {batch_num} batches, {idx_offset:,}/{n_test_total:,} rows")
                 report_memory_usage(f"batch {batch_num}")
     finally:
@@ -1467,13 +1508,35 @@ def main(timestamp: str) -> None:
     print(f"  LOOKAHEAD_YEARS: {LOOKAHEAD_YEARS}")
     print(f"  LAST_LABEL_YEAR: {LAST_LABEL_YEAR} (WDPA_LAST_YEAR - LOOKAHEAD_YEARS)")
     print(f"  Earlystop/Test data filtered to years <= {LAST_LABEL_YEAR} to avoid right-censored labels")
+    print(f"  BATCH_SIZE: {BATCH_SIZE:,} (smaller batch = less memory per iteration)")
     if MAX_NEG_TRAIN > 0:
-        print(f"  MAX_NEG_TRAIN: {MAX_NEG_TRAIN} (negative samples will be downsampled to this cap)")
+        print(f"  MAX_NEG_TRAIN: {MAX_NEG_TRAIN:,} (negative samples will be downsampled to this cap)")
+        print(f"    -> This keeps ALL positives but samples negatives to control memory")
+        print(f"    -> For 500M rows, this is ESSENTIAL to avoid OOM")
     else:
-        print(f"  MAX_NEG_TRAIN: 0 (no downsampling)")
+        print(f"  MAX_NEG_TRAIN: 0 (no downsampling - WARNING: may cause OOM with 500M rows)")
+        print(f"    -> Consider setting MAX_NEG_TRAIN=50000000 for large datasets")
     
     # Print active configuration
     print(f"\nActive configuration: SK_VERBOSE={SK_VERBOSE}")
+    print(f"  CPUs: {get_n_jobs()} (SLURM_CPUS_PER_TASK={os.environ.get('SLURM_CPUS_PER_TASK', 'not set')})")
+    
+    # OOM Safety Check
+    print(f"\n{'='*70}")
+    print("OOM SAFETY STATUS:")
+    if MAX_NEG_TRAIN > 0 and BATCH_SIZE <= 150000:
+        print("  ✓ Configuration is OOM-safe for large datasets (500M rows)")
+        print(f"    - Batch size: {BATCH_SIZE:,} (manageable chunks)")
+        print(f"    - Negative sampling: {MAX_NEG_TRAIN:,} (memory bounded)")
+        print("    - All predictions use batch processing (no large arrays in memory)")
+    elif MAX_NEG_TRAIN == 0:
+        print("  ⚠ WARNING: No negative sampling (MAX_NEG_TRAIN=0)")
+        print("    - With 500M rows, this may cause OOM during training")
+        print("    - Consider setting: export MAX_NEG_TRAIN=50000000")
+    elif BATCH_SIZE > 150000:
+        print(f"  ⚠ WARNING: Large batch size ({BATCH_SIZE:,})")
+        print("    - Consider reducing: export BATCH_SIZE=100000")
+    print(f"{'='*70}\n")
     
     all_cols_train = pq.ParquetFile(train_path).schema_arrow.names
     all_cols_test = pq.ParquetFile(test_path).schema_arrow.names
