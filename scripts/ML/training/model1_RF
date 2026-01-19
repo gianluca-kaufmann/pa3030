@@ -212,12 +212,24 @@ def resolve_parquet_file(filename: str) -> Path:
 
 
 def resolve_best_params_json() -> Optional[Path]:
-    """Locate rf_best_params.json (in same directory as this script). Returns None if not found."""
+    """Locate rf_best_params.json. Checks multiple locations including colombia directory and $SCRATCH."""
+    repo_root = Path(__file__).resolve().parents[3]
     script_dir = Path(__file__).resolve().parent
-    params_path = script_dir / "rf_best_params.json"
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    candidates = []
+    # Check same directory as script first
+    candidates.append(script_dir / "rf_best_params.json")
+    # Check colombia directory (where files are stored locally)
+    candidates.append(repo_root / "scripts/colombia/ML/training/rf_best_params.json")
+    # Check $SCRATCH locations if available (for Euler cluster)
+    if scratch_root is not None:
+        candidates.append(scratch_root / "scripts/colombia/ML/training/rf_best_params.json")
+        candidates.append(scratch_root / "scripts/ML/training/rf_best_params.json")
     
-    if params_path.exists():
-        return params_path
+    for cand in candidates:
+        if cand.exists():
+            return cand
     
     return None
 
