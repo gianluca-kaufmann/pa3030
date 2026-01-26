@@ -5,7 +5,8 @@ Purpose: Extract final CV + test metrics from model1_LGBM training results,
          create a benchmark JSON file with metrics, features, params, seed, and dataset hash.
          Marks in-sample earlystop as NON-EVALUATIVE.
 
-Input:   - model1_{model_type}_win5_metrics_*.json (most recent file from outputs/Results/ml_models)
+Input:   - model1_lgbm_metrics_*.json (for LGBM) or model1_rf_win5_metrics_*.json (for RF)
+           (most recent file from outputs/Results/ml_models)
          - train_win5.parquet, test_win5.parquet
            (for dataset hash computation; earlystop/val excluded)
 
@@ -153,15 +154,20 @@ def compute_dataset_hash(split_version: str = 'main', num_sample_row_groups: int
 
 
 def find_latest_metrics_file(output_dir: Path, model_type: str, split_version: str = 'main') -> Path:
-    """Find the most recent model1_{model_type}_win5_metrics JSON file.
+    """Find the most recent model1 metrics JSON file.
     
+    Matches the filename pattern used by training scripts:
+    - LGBM: model1_lgbm_metrics_*.json (no "win5")
+    - RF: model1_rf_win5_metrics_*.json (with "win5")
+    
+    Files are saved to the root output directory (not split-specific subdirectory).
     Parses timestamp from filename (format: YYYYMMDD_HHMMSS) and sorts by it.
     Falls back to modification time if timestamp cannot be parsed.
     
     Args:
-        output_dir: Directory containing metrics files (split-specific)
+        output_dir: Root directory containing metrics files (outputs/Results/ml_models)
         model_type: Model type (lgbm or rf)
-        split_version: Split version ('main' or 'robustness')
+        split_version: Split version ('main' or 'robustness') - unused, kept for API compatibility
         
     Returns:
         Path to the most recent metrics file
@@ -169,18 +175,28 @@ def find_latest_metrics_file(output_dir: Path, model_type: str, split_version: s
     Raises:
         FileNotFoundError: If no metrics file is found
     """
-    # Search in split-specific subdirectory
-    split_output_dir = output_dir / split_version
-    pattern = f"model1_{model_type}_win5_metrics_*.json"
-    files = list(split_output_dir.glob(pattern))
+    # Training scripts save to root directory, not split-specific subdirectory
+    # LGBM: model1_lgbm_metrics_{timestamp}.json
+    # RF: model1_rf_win5_metrics_{timestamp}.json
+    if model_type == 'lgbm':
+        pattern = f"model1_lgbm_metrics_*.json"
+        timestamp_pattern = re.compile(r'model1_lgbm_metrics_(\d{8}_\d{6})\.json')
+    elif model_type == 'rf':
+        pattern = f"model1_rf_win5_metrics_*.json"
+        timestamp_pattern = re.compile(r'model1_rf_win5_metrics_(\d{8}_\d{6})\.json')
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
+    
+    # Search in root directory (where training scripts save)
+    if not output_dir.exists():
+        raise FileNotFoundError(f"Output directory does not exist: {output_dir}")
+    
+    files = list(output_dir.glob(pattern))
     
     if not files:
-        raise FileNotFoundError(f"No metrics files found in {split_output_dir} matching pattern {pattern}")
-    
-    files = files
-    
-    # Parse timestamp from filename: model1_{model_type}_win5_metrics_YYYYMMDD_HHMMSS.json
-    timestamp_pattern = re.compile(rf'model1_{re.escape(model_type)}_win5_metrics_(\d{{8}}_\d{{6}})\.json')
+        raise FileNotFoundError(
+            f"No metrics files found in {output_dir} matching pattern {pattern}"
+        )
     
     def get_timestamp_key(path: Path) -> tuple:
         """Return (timestamp_datetime, fallback_mtime) for sorting."""
@@ -291,7 +307,7 @@ def create_benchmark_json(metrics_data: Dict[str, Any], dataset_hash: str, sourc
 def main(model_type: str, split_version: str = 'main') -> None:
     repo_root = Path(__file__).resolve().parents[3]
     output_dir = repo_root / "outputs/Results/ml_models"
-    # Create split-specific output directory
+    # Create split-specific output directory for benchmark output
     benchmark_output_dir = repo_root / "outputs/Results/ml_models" / split_version
     benchmark_output_dir.mkdir(parents=True, exist_ok=True)
     

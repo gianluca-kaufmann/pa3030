@@ -7,8 +7,8 @@ Purpose: Generate comprehensive results report from model1_LGBM predictions:
          - Risk map showing South America boundary, top-1% predicted pixels, and observed PA establishments
          - Probability map showing continuous probability predictions across South America
 
-Input:   - model1_{model_type}_win5_metrics_*.json
-         - model1_{model_type}_win5_scored_*.parquet
+Input:   - model1_lgbm_metrics_*.json (for LGBM) or model1_rf_win5_metrics_*.json (for RF)
+         - model1_lgbm_scored_*.parquet (for LGBM) or model1_rf_win5_scored_*.parquet (for RF)
          - test_win5.parquet (optional, auto-discovered if available)
 
 Note:    The risk map uses WDPA_b1 from original test data to correctly identify pixels
@@ -1320,27 +1320,45 @@ def create_probability_map(df: pd.DataFrame, region_boundary_path: Optional[Path
 def find_latest_file(pattern: str, search_dir: Path, split_version: str = 'main', model_type: str = 'lgbm') -> Optional[Path]:
     """Find the most recent file matching a pattern in a directory.
     
+    Training scripts save to the root directory, not split-specific subdirectories.
+    For metrics files, uses the correct pattern based on model type:
+    - LGBM: model1_lgbm_metrics_*.json
+    - RF: model1_rf_win5_metrics_*.json
+    
     Args:
-        pattern: Glob pattern to match
-        search_dir: Base directory to search in
-        split_version: Split version subdirectory to search in ('main' or 'robustness')
+        pattern: Glob pattern to match (may be overridden for metrics files)
+        search_dir: Base directory to search in (root ml_models directory)
+        split_version: Split version ('main' or 'robustness') - unused, kept for API compatibility
+        model_type: Model type ('lgbm' or 'rf') - used to determine correct metrics filename pattern
     
     Returns:
         Path to the most recent matching file, or None if not found
     """
-    # Search in split-specific subdirectory
-    split_search_dir = search_dir / split_version
-    if not split_search_dir.exists():
+    # For metrics files, use the correct pattern based on model type
+    if 'metrics' in pattern and model_type:
+        if model_type == 'lgbm':
+            pattern = "model1_lgbm_metrics_*.json"
+        elif model_type == 'rf':
+            pattern = "model1_rf_win5_metrics_*.json"
+    # For scored parquet files, use the correct pattern based on model type
+    elif 'scored' in pattern and model_type:
+        if model_type == 'lgbm':
+            pattern = "model1_lgbm_scored_*.parquet"
+        elif model_type == 'rf':
+            pattern = "model1_rf_win5_scored_*.parquet"
+    
+    # Training scripts save to root directory, not split-specific subdirectory
+    if not search_dir.exists():
         return None
     try:
-        matches = list(split_search_dir.glob(pattern))
+        matches = list(search_dir.glob(pattern))
         if not matches:
             return None
         # Sort by modification time, most recent first
         matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         return matches[0]
     except (OSError, PermissionError) as e:
-        print(f"  WARNING: Could not search in {split_search_dir}: {e}")
+        print(f"  WARNING: Could not search in {search_dir}: {e}")
         return None
 
 
@@ -1353,13 +1371,13 @@ def main() -> None:
         '--metrics_json',
         type=str,
         default=None,
-        help='Path to model1_{model_type}_win5_metrics_*.json file (default: auto-discover latest in outputs/Results/ml_models/)'
+        help='Path to model1_lgbm_metrics_*.json (LGBM) or model1_rf_win5_metrics_*.json (RF) file (default: auto-discover latest in outputs/Results/ml_models/)'
     )
     parser.add_argument(
         '--scored_parquet',
         type=str,
         default=None,
-        help='Path to model1_{model_type}_win5_scored_*.parquet file (default: auto-discover latest in outputs/Results/ml_models/)'
+        help='Path to model1_lgbm_scored_*.parquet (LGBM) or model1_rf_win5_scored_*.parquet (RF) file (default: auto-discover latest in outputs/Results/ml_models/)'
     )
     parser.add_argument(
         '--model_type',
@@ -1431,17 +1449,19 @@ def main() -> None:
         print(f"WARNING: ml_models directory not found, will use: {ml_models_dir}")
     print()
     
-    # Auto-discover files if not provided (search in split-specific subdirectory)
+    # Auto-discover files if not provided (search in root directory)
     if args.metrics_json:
         metrics_path = Path(args.metrics_json).resolve()
     else:
         print("Auto-discovering metrics JSON file...")
-        # Search in ml_models directory
+        # Search in root ml_models directory (training scripts save there)
+        # find_latest_file will use correct pattern based on model_type
         metrics_path = find_latest_file(f"model1_{args.model_type}_win5_metrics_*.json", ml_models_dir, args.split_version, args.model_type)
         if metrics_path is not None:
             print(f"  Found: {metrics_path}")
         else:
-            print(f"ERROR: Could not find model1_{args.model_type}_win5_metrics_*.json in {ml_models_dir}/{args.split_version}")
+            expected_pattern = "model1_lgbm_metrics_*.json" if args.model_type == 'lgbm' else "model1_rf_win5_metrics_*.json"
+            print(f"ERROR: Could not find {expected_pattern} in {ml_models_dir}")
             print("Please provide --metrics_json path explicitly.")
             sys.exit(1)
     
@@ -1449,12 +1469,14 @@ def main() -> None:
         parquet_path = Path(args.scored_parquet).resolve()
     else:
         print("Auto-discovering scored parquet file...")
-        # Search in ml_models directory
+        # Search in root ml_models directory (training scripts save there)
+        # find_latest_file will use correct pattern based on model_type
         parquet_path = find_latest_file(f"model1_{args.model_type}_win5_scored*.parquet", ml_models_dir, args.split_version, args.model_type)
         if parquet_path is not None:
             print(f"  Found: {parquet_path}")
         else:
-            print(f"ERROR: Could not find model1_{args.model_type}_win5_scored*.parquet in {ml_models_dir}/{args.split_version}")
+            expected_pattern = "model1_lgbm_scored_*.parquet" if args.model_type == 'lgbm' else "model1_rf_win5_scored_*.parquet"
+            print(f"ERROR: Could not find {expected_pattern} in {ml_models_dir}")
             print("Please provide --scored_parquet path explicitly.")
             sys.exit(1)
     
