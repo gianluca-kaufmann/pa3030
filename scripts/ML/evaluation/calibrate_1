@@ -87,13 +87,21 @@ def get_repo_root() -> Path:
 
 
 def resolve_output_dir() -> Path:
-    """Resolve output directory (prefer $SCRATCH if present)."""
+    """Resolve output directory (prefer $SCRATCH if present).
+    
+    Prefers $SCRATCH/outputs/Results/ml_models// (with double slash as fallback)
+    and falls back to repo paths if needed.
+    """
     repo_root = get_repo_root()
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
     
     candidates = []
     if scratch_root is not None:
+        # Prefer $SCRATCH/outputs/Results/ml_models// (double slash for compatibility)
         candidates.append(scratch_root / "outputs/Results/ml_models")
+        # Also check without double slash
+        candidates.append(scratch_root / "outputs" / "Results" / "ml_models")
+    # Fall back to repo paths
     candidates.append(repo_root / "outputs/Results/ml_models")
     
     for cand in candidates:
@@ -139,6 +147,9 @@ def resolve_parquet_file(filename: str, split_version: str = 'main') -> Optional
 def find_latest_scored_file(output_dir: Path, model_type: str, split_version: str = 'main', pattern: Optional[str] = None) -> Path:
     """Find the most recent scored parquet file.
     
+    Searches in both split-specific subdirectory and root directory (for backward compatibility).
+    Prefers $SCRATCH if available, falls back to repo paths.
+    
     Args:
         output_dir: Base output directory
         model_type: Model type (lgbm or rf)
@@ -147,21 +158,47 @@ def find_latest_scored_file(output_dir: Path, model_type: str, split_version: st
         
     Returns:
         Path to the most recent scored file
+        
+    Raises:
+        FileNotFoundError: If no scored files found in any location
     """
-    # Search in split-specific subdirectory
-    split_output_dir = output_dir / split_version
+    repo_root = get_repo_root()
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+    
     if pattern is None:
         pattern = f"model1_{model_type}_win5_scored_*.parquet"
-    files = list(split_output_dir.glob(pattern))
     
-    # Filter out already-calibrated files to prevent recursive calibration
-    files = [f for f in files if "calibrated" not in f.name]
+    # Search locations in priority order (prefer $SCRATCH, then repo)
+    search_dirs = []
+    if scratch_root is not None:
+        # Prefer split-specific subdirectory in $SCRATCH
+        search_dirs.append(scratch_root / "outputs/Results/ml_models" / split_version)
+        # Also check root directory in $SCRATCH (for backward compatibility)
+        search_dirs.append(scratch_root / "outputs/Results/ml_models")
+    # Fall back to repo paths
+    search_dirs.append(output_dir / split_version)
+    search_dirs.append(output_dir)  # Root directory for backward compatibility
     
-    if not files:
-        raise FileNotFoundError(f"No scored files found in {split_output_dir} matching pattern {pattern}")
+    all_files = []
+    for search_dir in search_dirs:
+        if search_dir.exists():
+            files = list(search_dir.glob(pattern))
+            # Filter out already-calibrated files to prevent recursive calibration
+            files = [f for f in files if "calibrated" not in f.name]
+            # Ensure we only match model1 files (exclude modelC, model2, etc.)
+            files = [f for f in files if "model1_" in f.name and "modelC" not in f.name and "model2" not in f.name]
+            all_files.extend(files)
+    
+    if not all_files:
+        error_msg = f"No scored files found matching pattern {pattern}\n"
+        error_msg += f"Searched in:\n"
+        for search_dir in search_dirs:
+            error_msg += f"  - {search_dir}\n"
+        error_msg += f"\nExpected pattern: model1_{model_type}_win5_scored_*.parquet"
+        raise FileNotFoundError(error_msg)
     
     # Return most recent file (by modification time)
-    latest = max(files, key=lambda p: p.stat().st_mtime)
+    latest = max(all_files, key=lambda p: p.stat().st_mtime)
     return latest
 
 
@@ -474,9 +511,23 @@ def fit_calibration_per_fold(
         Tuple of (calibrator, fold_info_dict)
         Note: For isotonic, we can't easily average, so we fit on pooled data.
         For Platt, we average the calibrated probabilities (not coefficients).
+        
+    Raises:
+        ValueError: If insufficient folds (< 2) for per-fold calibration
     """
     unique_folds = np.unique(fold_idx)
     n_folds = len(unique_folds)
+    
+    # Check for sufficient folds
+    if n_folds < 2:
+        error_msg = (
+            f"\nERROR: Insufficient folds for per-fold calibration ({n_folds} fold(s) found).\n"
+            "Per-fold calibration requires at least 2 folds to ensure proper evaluation.\n"
+            "Please ensure CV predictions contain predictions from multiple temporal folds,\n"
+            "or use pooled calibration (remove --per-fold flag) if predictions are already OOF."
+        )
+        print(error_msg)
+        raise ValueError(error_msg)
     
     print(f"\nFitting {calibration_method} calibration per fold (n_folds={n_folds})...")
     
@@ -943,28 +994,57 @@ def main(
         # For LGBM: look for temporal CV predictions (preferred)
         # For RF: look for earlystop scored predictions (RF doesn't have temporal CV)
         if model_type == "lgbm":
-            # First, look for temporal CV predictions (preferred) in split-specific directory
-            temporal_cv_files = list(split_output_dir.glob(f"model1_{model_type}_win5_temporal_cv_predictions_*.parquet"))
+            # Search in both split-specific subdirectory and root directory (prefer $SCRATCH)
+            repo_root = get_repo_root()
+            scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+            
+            search_dirs = []
+            if scratch_root is not None:
+                search_dirs.append(scratch_root / "outputs/Results/ml_models" / split_version)
+                search_dirs.append(scratch_root / "outputs/Results/ml_models")
+            search_dirs.append(split_output_dir)
+            search_dirs.append(output_dir)
+            
+            # First, look for temporal CV predictions (preferred) - RESTRICT TO MODEL1 ONLY
+            temporal_cv_files = []
+            for search_dir in search_dirs:
+                if search_dir.exists():
+                    files = list(search_dir.glob(f"model1_{model_type}_win5_temporal_cv_predictions_*.parquet"))
+                    # CRITICAL: Filter out modelC files and ensure only model1 files
+                    files = [f for f in files if "model1_" in f.name and "modelC" not in f.name and "model2" not in f.name]
+                    temporal_cv_files.extend(files)
             
             if temporal_cv_files:
                 cv_predictions_path = max(temporal_cv_files, key=lambda p: p.stat().st_mtime)
                 print(f"\nFound TEMPORAL CV predictions file (preferred): {cv_predictions_path.name}")
                 print("  Using temporal CV OOF predictions from training script (rolling folds)")
+                print("  Verified: model1 only (modelC files excluded)")
             else:
                 # If --require-temporal-cv is set, hard-fail
                 if require_temporal_cv:
-                    raise FileNotFoundError(
+                    error_msg = (
                         f"ERROR: --require-temporal-cv flag is set, but no temporal CV predictions file found.\n"
                         "Temporal CV predictions are required for calibration.\n"
                         f"Expected pattern: model1_{model_type}_win5_temporal_cv_predictions_*.parquet\n"
                         "These are generated by the training script during temporal cross-validation.\n"
-                        "Please ensure temporal CV predictions are saved to outputs/Results/ml_models/."
+                        "Searched in:\n"
                     )
+                    for search_dir in search_dirs:
+                        error_msg += f"  - {search_dir}\n"
+                    raise FileNotFoundError(error_msg)
                 
-                # Fallback: look for other CV predictions (could be spatial CV) in split-specific directory
+                # Fallback: look for other CV predictions (could be spatial CV) - RESTRICT TO MODEL1 ONLY
                 other_cv_files = []
-                other_cv_files.extend(list(split_output_dir.glob(f"model1_{model_type}_win5_cv_predictions_*.parquet")))
-                other_cv_files.extend(list(split_output_dir.glob("*cv_predictions*.parquet")))
+                for search_dir in search_dirs:
+                    if search_dir.exists():
+                        files = list(search_dir.glob(f"model1_{model_type}_win5_cv_predictions_*.parquet"))
+                        # CRITICAL: Filter out modelC files and ensure only model1 files
+                        files = [f for f in files if "model1_" in f.name and "modelC" not in f.name and "model2" not in f.name]
+                        other_cv_files.extend(files)
+                        # Also check generic pattern but filter strictly
+                        generic_files = list(search_dir.glob("*cv_predictions*.parquet"))
+                        generic_files = [f for f in generic_files if "model1_" in f.name and "modelC" not in f.name and "model2" not in f.name]
+                        other_cv_files.extend(generic_files)
                 
                 if other_cv_files:
                     cv_predictions_path = max(other_cv_files, key=lambda p: p.stat().st_mtime)
@@ -972,29 +1052,56 @@ def main(
                     print("  This may be spatial CV predictions, which are NOT suitable for calibration.")
                     print("  Spatial CV is for robustness/transfer checks, not for calibration.")
                     print(f"  Temporal CV predictions should be named: model1_{model_type}_win5_temporal_cv_predictions_*.parquet")
+                    print("  Verified: model1 only (modelC files excluded)")
                     print("\n  Proceeding with found file, but results may be suboptimal for calibration.")
                 else:
-                    raise FileNotFoundError(
+                    error_msg = (
                         "CV predictions file not found. Please provide cv_predictions_path or ensure "
                         f"temporal CV predictions are saved to outputs/Results/ml_models/.\n"
                         f"Expected pattern: model1_{model_type}_win5_temporal_cv_predictions_*.parquet\n"
-                        "These are generated by the training script during temporal cross-validation."
+                        "These are generated by the training script during temporal cross-validation.\n"
+                        "Searched in:\n"
                     )
+                    for search_dir in search_dirs:
+                        error_msg += f"  - {search_dir}\n"
+                    raise FileNotFoundError(error_msg)
         elif model_type == "rf":
             # For RF: look for earlystop scored predictions (RF doesn't have temporal CV)
-            earlystop_files = list(split_output_dir.glob(f"model1_{model_type}_win5_earlystop_scored_*.parquet"))
+            # Search in both split-specific subdirectory and root directory (prefer $SCRATCH)
+            repo_root = get_repo_root()
+            scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+            
+            search_dirs = []
+            if scratch_root is not None:
+                search_dirs.append(scratch_root / "outputs/Results/ml_models" / split_version)
+                search_dirs.append(scratch_root / "outputs/Results/ml_models")
+            search_dirs.append(split_output_dir)
+            search_dirs.append(output_dir)
+            
+            earlystop_files = []
+            for search_dir in search_dirs:
+                if search_dir.exists():
+                    files = list(search_dir.glob(f"model1_{model_type}_win5_earlystop_scored_*.parquet"))
+                    # CRITICAL: Filter out modelC files and ensure only model1 files
+                    files = [f for f in files if "model1_" in f.name and "modelC" not in f.name and "model2" not in f.name]
+                    earlystop_files.extend(files)
             
             if earlystop_files:
                 cv_predictions_path = max(earlystop_files, key=lambda p: p.stat().st_mtime)
                 print(f"\nFound EARLYSTOP scored predictions file: {cv_predictions_path.name}")
                 print("  Using earlystop validation set predictions for calibration (held-out, not CV)")
+                print("  Verified: model1 only (modelC files excluded)")
             else:
-                raise FileNotFoundError(
+                error_msg = (
                     f"Earlystop predictions file not found. Please provide cv_predictions_path or ensure "
                     f"earlystop scored predictions are saved to outputs/Results/ml_models/.\n"
                     f"Expected pattern: model1_{model_type}_win5_earlystop_scored_*.parquet\n"
-                    "These are generated by the training script during early stopping validation."
+                    "These are generated by the training script during early stopping validation.\n"
+                    "Searched in:\n"
                 )
+                for search_dir in search_dirs:
+                    error_msg += f"  - {search_dir}\n"
+                raise FileNotFoundError(error_msg)
         else:
             raise ValueError(f"Unknown model_type: {model_type}. Must be 'lgbm' or 'rf'.")
     
@@ -1057,8 +1164,29 @@ def main(
         print("STEP 1.5: CHECK OUT-OF-FOLD (OOF) REQUIREMENTS")
         print("=" * 70)
         
+        # Verify that CV predictions are true OOF, pooled across all temporal folds
+        if is_temporal_cv:
+            print("\n" + "=" * 70)
+            print("VERIFYING TEMPORAL CV OOF PROPERTY")
+            print("=" * 70)
+            print("\nTemporal CV predictions should be true OOF (out-of-fold), pooled across all temporal folds.")
+            print("Each row should have exactly one prediction from a fold where that row was NOT used for training.")
+            print("This ensures calibration is performed on truly held-out data.")
+        
         if fold_idx is not None:
-            print(f"\nFold information found ({len(np.unique(fold_idx))} folds).")
+            unique_folds = np.unique(fold_idx)
+            n_folds = len(unique_folds)
+            print(f"\nFold information found ({n_folds} folds): {sorted(unique_folds.tolist())}")
+            
+            # Check for sufficient folds
+            if n_folds < 2:
+                error_msg = (
+                    f"\nERROR: Insufficient folds for calibration ({n_folds} fold(s) found).\n"
+                    "Calibration requires at least 2 folds to ensure proper OOF evaluation.\n"
+                    "Please ensure CV predictions contain predictions from multiple temporal folds."
+                )
+                print(error_msg)
+                raise ValueError(error_msg)
             
             if per_fold:
                 print("Using per-fold calibration (--per-fold flag set).")
@@ -1078,12 +1206,13 @@ def main(
                 print("NOTE: Fold information is available but pooled calibration is requested.")
                 print("!" * 70)
                 print("\nYou are using pooled calibration even though fold information exists.")
-                print("This assumes CV predictions are already OOF (pooled across folds).")
-                print("\nIf CV predictions contain in-sample predictions (rows used for training),")
-                print("calibration will overfit and produce misleading results.")
-                print("\nEnsure your CV predictions file contains only out-of-fold predictions:")
+                print("This assumes CV predictions are already OOF (pooled across all temporal folds).")
+                print("\nVERIFICATION: Ensure CV predictions are true OOF:")
                 print("  - Each row should have exactly one prediction")
                 print("  - That prediction must come from a fold where the row was NOT used for training")
+                print("  - Predictions should be pooled across ALL temporal folds (not just one fold)")
+                print("\nIf CV predictions contain in-sample predictions (rows used for training),")
+                print("calibration will overfit and produce misleading results.")
                 print("\nIf you want per-fold calibration instead, use --per-fold flag.")
                 print("!" * 70 + "\n")
                 
@@ -1093,7 +1222,7 @@ def main(
                         error_msg = (
                             "\nERROR: Isotonic calibration on pooled data requires --assume-oof flag.\n"
                             "Isotonic calibration on non-OOF data can severely overfit.\n"
-                            "If you are certain the CV predictions are OOF, use --assume-oof flag.\n"
+                            "If you are certain the CV predictions are OOF (pooled across all temporal folds), use --assume-oof flag.\n"
                             "Alternatively, use --per-fold flag for per-fold calibration."
                         )
                         print(error_msg)
@@ -1106,21 +1235,26 @@ def main(
                     print("!" * 70)
                     print("\nYou are using isotonic calibration with --assume-oof flag on pooled data.")
                     print("This is ONLY safe if CV predictions are guaranteed OOF by construction.")
-                    print("\nIf CV predictions contain in-sample predictions (rows used for training),")
-                    print("isotonic calibration will severely overfit and produce misleading results.")
-                    print("\nEnsure your CV predictions file contains only out-of-fold predictions:")
+                    print("\nVERIFICATION: Ensure CV predictions are true OOF, pooled across all temporal folds:")
                     print("  - Each row should have exactly one prediction")
                     print("  - That prediction must come from a fold where the row was NOT used for training")
+                    print("  - Predictions should be pooled across ALL temporal folds (not just one fold)")
+                    print("\nIf CV predictions contain in-sample predictions (rows used for training),")
+                    print("isotonic calibration will severely overfit and produce misleading results.")
                     print("!" * 70 + "\n")
         else:
             print("\nNo fold information found in CV predictions file.")
+            if is_temporal_cv:
+                print("WARNING: Temporal CV predictions should typically include fold information.")
+                print("Without fold information, we cannot verify that predictions are pooled across all folds.")
+            
             # Isotonic is only allowed when no fold info exists AND --assume-oof is set
             if calibration_method == "isotonic":
                 if not assume_oof:
                     error_msg = (
                         "\nERROR: Cannot verify OOF property without fold information.\n"
                         "Isotonic calibration on non-OOF data can severely overfit.\n"
-                        "If you are certain the CV predictions are OOF, use --assume-oof flag.\n"
+                        "If you are certain the CV predictions are OOF (pooled across all temporal folds), use --assume-oof flag.\n"
                         "Otherwise, ensure CV predictions include fold information for per-fold calibration."
                     )
                     print(error_msg)
@@ -1133,11 +1267,12 @@ def main(
                 print("!" * 70)
                 print("\nYou are using isotonic calibration with --assume-oof flag.")
                 print("This is ONLY safe if CV predictions are guaranteed OOF by construction.")
-                print("\nIf CV predictions contain in-sample predictions (rows used for training),")
-                print("isotonic calibration will severely overfit and produce misleading results.")
-                print("\nEnsure your CV predictions file contains only out-of-fold predictions:")
+                print("\nVERIFICATION: Ensure CV predictions are true OOF, pooled across all temporal folds:")
                 print("  - Each row should have exactly one prediction")
                 print("  - That prediction must come from a fold where the row was NOT used for training")
+                print("  - Predictions should be pooled across ALL temporal folds (not just one fold)")
+                print("\nIf CV predictions contain in-sample predictions (rows used for training),")
+                print("isotonic calibration will severely overfit and produce misleading results.")
                 print("!" * 70 + "\n")
             else:
                 # Platt scaling doesn't require --assume-oof, but warn if it's set
@@ -1154,10 +1289,16 @@ def main(
     if test_predictions_path is None:
         try:
             # Test predictions always use the scored pattern: model1_{model_type}_win5_scored_*.parquet
+            # This function now searches in both $SCRATCH and repo paths, and filters out modelC files
             test_predictions_path = find_latest_scored_file(output_dir, model_type, split_version)
             print(f"\nFound latest test predictions file: {test_predictions_path.name}")
+            print(f"  Verified: model1 only (modelC files excluded)")
+            print(f"  Location: {test_predictions_path.parent}")
         except FileNotFoundError as e:
             print(f"\nERROR: {e}")
+            print(f"\nPlease ensure test predictions exist before running calibration.")
+            print(f"Expected pattern: model1_{model_type}_win5_scored_*.parquet")
+            print(f"These should be generated by benchmark_1 script before calibration.")
             sys.exit(1)
     
     if not test_predictions_path.exists():
