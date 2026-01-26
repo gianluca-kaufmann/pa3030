@@ -5,7 +5,9 @@ Purpose: Fit isotonic or Platt scaling calibration on CV/earlystop predictions,
          apply to test predictions, and save calibrated scores + reliability plot data.
 
 Input:   - CV/earlystop predictions parquet file (with columns: y_true, y_pred_proba, and optional metadata)
-         - Test predictions parquet file (model1_{model_type}_win5_scored_*.parquet from outputs/Results/ml_models)
+         - Test predictions parquet file (from outputs/Results/ml_models):
+           - LGBM: model1_lgbm_scored_*.parquet (no win5)
+           - RF: model1_rf_win5_scored_*.parquet (with win5)
 
 Supports:
   - LGBM: temporal_cv (default) or earlystop
@@ -147,58 +149,52 @@ def resolve_parquet_file(filename: str, split_version: str = 'main') -> Optional
 def find_latest_scored_file(output_dir: Path, model_type: str, split_version: str = 'main', pattern: Optional[str] = None) -> Path:
     """Find the most recent scored parquet file.
     
-    Searches in both split-specific subdirectory and root directory (for backward compatibility).
-    Prefers $SCRATCH if available, falls back to repo paths.
+    Training scripts save scored files to the root output directory (not split-specific).
+    Pattern matches what training scripts actually create:
+    - LGBM: model1_lgbm_scored_*.parquet (no win5)
+    - RF: model1_rf_win5_scored_*.parquet (with win5)
     
     Args:
-        output_dir: Base output directory
+        output_dir: Base output directory (outputs/Results/ml_models)
         model_type: Model type (lgbm or rf)
-        split_version: Split version ('main' or 'robustness')
-        pattern: Optional glob pattern for scored files (default: model1_{model_type}_win5_scored_*.parquet)
+        split_version: Split version ('main' or 'robustness') - unused, kept for API compatibility
+        pattern: Optional glob pattern for scored files (default: based on model_type)
         
     Returns:
         Path to the most recent scored file
         
     Raises:
-        FileNotFoundError: If no scored files found in any location
+        FileNotFoundError: If no scored files found
     """
-    repo_root = get_repo_root()
-    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
-    
+    # Training scripts save to root directory, not split-specific subdirectory
+    # Use the actual pattern that training scripts create
     if pattern is None:
-        pattern = f"model1_{model_type}_win5_scored_*.parquet"
+        if model_type == 'lgbm':
+            pattern = f"model1_lgbm_scored_*.parquet"  # LGBM doesn't have win5 in scored filename
+        elif model_type == 'rf':
+            pattern = f"model1_rf_win5_scored_*.parquet"  # RF has win5
+        else:
+            raise ValueError(f"Unknown model_type: {model_type}")
     
-    # Search locations in priority order (prefer $SCRATCH, then repo)
-    search_dirs = []
-    if scratch_root is not None:
-        # Prefer split-specific subdirectory in $SCRATCH
-        search_dirs.append(scratch_root / "outputs/Results/ml_models" / split_version)
-        # Also check root directory in $SCRATCH (for backward compatibility)
-        search_dirs.append(scratch_root / "outputs/Results/ml_models")
-    # Fall back to repo paths
-    search_dirs.append(output_dir / split_version)
-    search_dirs.append(output_dir)  # Root directory for backward compatibility
+    # Search only in root output directory (where training scripts save)
+    if not output_dir.exists():
+        raise FileNotFoundError(f"Output directory does not exist: {output_dir}")
     
-    all_files = []
-    for search_dir in search_dirs:
-        if search_dir.exists():
-            files = list(search_dir.glob(pattern))
-            # Filter out already-calibrated files to prevent recursive calibration
-            files = [f for f in files if "calibrated" not in f.name]
-            # Ensure we only match model1 files (exclude modelC, model2, etc.)
-            files = [f for f in files if "model1_" in f.name and "modelC" not in f.name and "model2" not in f.name]
-            all_files.extend(files)
+    files = list(output_dir.glob(pattern))
+    # Filter out already-calibrated files to prevent recursive calibration
+    files = [f for f in files if "calibrated" not in f.name]
+    # Ensure we only match model1 files (exclude modelC, model2, etc.)
+    files = [f for f in files if "model1_" in f.name and "modelC" not in f.name and "model2" not in f.name]
     
-    if not all_files:
-        error_msg = f"No scored files found matching pattern {pattern}\n"
-        error_msg += f"Searched in:\n"
-        for search_dir in search_dirs:
-            error_msg += f"  - {search_dir}\n"
-        error_msg += f"\nExpected pattern: model1_{model_type}_win5_scored_*.parquet"
-        raise FileNotFoundError(error_msg)
+    if not files:
+        raise FileNotFoundError(
+            f"No scored files found matching pattern {pattern} in {output_dir}\n"
+            f"Training scripts save scored files to the root output directory.\n"
+            f"Expected pattern: {pattern}"
+        )
     
     # Return most recent file (by modification time)
-    latest = max(all_files, key=lambda p: p.stat().st_mtime)
+    latest = max(files, key=lambda p: p.stat().st_mtime)
     return latest
 
 
@@ -1311,8 +1307,8 @@ def main(
     
     if test_predictions_path is None:
         try:
-            # Test predictions always use the scored pattern: model1_{model_type}_win5_scored_*.parquet
-            # This function now searches in both $SCRATCH and repo paths, and filters out modelC files
+            # Test predictions use the scored pattern from training scripts:
+            # LGBM: model1_lgbm_scored_*.parquet, RF: model1_rf_win5_scored_*.parquet
             test_predictions_path = find_latest_scored_file(output_dir, model_type, split_version)
             print(f"\nFound latest test predictions file: {test_predictions_path.name}")
             print(f"  Verified: model1 only (modelC files excluded)")
@@ -1320,8 +1316,9 @@ def main(
         except FileNotFoundError as e:
             print(f"\nERROR: {e}")
             print(f"\nPlease ensure test predictions exist before running calibration.")
-            print(f"Expected pattern: model1_{model_type}_win5_scored_*.parquet")
-            print(f"These should be generated by benchmark_1 script before calibration.")
+            expected_pattern = f"model1_lgbm_scored_*.parquet" if model_type == 'lgbm' else f"model1_rf_win5_scored_*.parquet"
+            print(f"Expected pattern: {expected_pattern}")
+            print(f"These should be generated by the training script (model1_LGBM or model1_RF).")
             sys.exit(1)
     
     if not test_predictions_path.exists():
@@ -1695,7 +1692,13 @@ def main(
     test_df_minimal['y_pred_proba_calibrated'] = y_test_calibrated
     test_df_minimal['y_pred_proba'] = y_test_calibrated  # Replace original with calibrated (for compatibility)
     
-    calibrated_test_path = split_output_dir / f"model1_{model_type}_win5_scored_calibrated_{calibration_method}_{timestamp}.parquet"
+    # Use consistent pattern: LGBM has no win5, RF has win5 (matches input pattern)
+    if model_type == 'lgbm':
+        calibrated_test_path = split_output_dir / f"model1_lgbm_scored_calibrated_{calibration_method}_{timestamp}.parquet"
+    elif model_type == 'rf':
+        calibrated_test_path = split_output_dir / f"model1_rf_win5_scored_calibrated_{calibration_method}_{timestamp}.parquet"
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
     try:
         test_df_minimal.to_parquet(calibrated_test_path, index=False)
         print(f"\nCalibrated test predictions saved: {calibrated_test_path.name}")
@@ -1895,7 +1898,7 @@ if __name__ == "__main__":
         "--test-predictions",
         type=Path,
         default=None,
-        help="Path to test predictions parquet file (default: find latest model1_lgbm_win5_scored_*.parquet)"
+        help="Path to test predictions parquet file (default: find latest based on model_type: model1_lgbm_scored_*.parquet or model1_rf_win5_scored_*.parquet)"
     )
     parser.add_argument(
         "--method",

@@ -91,6 +91,10 @@ def compute_precision_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) ->
 def find_scored_files(output_dir: Path, model_name: str) -> Optional[Path]:
     """Find the most recent scored output file for a model.
     
+    Training scripts create different filename patterns:
+    - LGBM: model1_lgbm_scored_*.parquet (no win5)
+    - RF: model1_rf_win5_scored_*.parquet (with win5)
+    
     Args:
         output_dir: Directory containing scored outputs
         model_name: 'rf' or 'lgbm'
@@ -98,7 +102,14 @@ def find_scored_files(output_dir: Path, model_name: str) -> Optional[Path]:
     Returns:
         Path to scored file, or None if not found
     """
-    pattern = f"model1_{model_name}_scored_*.parquet"
+    # Use correct pattern based on model type (matches what training scripts create)
+    if model_name == 'rf':
+        pattern = f"model1_rf_win5_scored_*.parquet"
+    elif model_name == 'lgbm':
+        pattern = f"model1_lgbm_scored_*.parquet"
+    else:
+        raise ValueError(f"Unknown model_name: {model_name}. Must be 'rf' or 'lgbm'")
+    
     files = list(output_dir.glob(pattern))
     
     if not files:
