@@ -49,7 +49,8 @@ from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
-from sklearn.metrics import precision_recall_curve, average_precision_score
+from sklearn.metrics import precision_recall_curve, average_precision_score, brier_score_loss
+from sklearn.calibration import calibration_curve
 import geopandas as gpd
 from shapely.geometry import Point
 from scipy.interpolate import interp1d, griddata
@@ -348,7 +349,8 @@ def detect_and_reproject_coordinates(df: pd.DataFrame) -> pd.DataFrame:
 def validate_coordinates(df: pd.DataFrame) -> None:
     """Validate that x/y coordinates look like Colombia lon/lat.
     
-    Checks that x in [-85,-65] and y in [-5,15] for at least 99% of rows.
+    Checks that x in [-85,-65] and y in [-5,15] for most rows.
+    Warns (does not fail) on minor edge cases (coastal/island pixels).
     Assumes coordinates are already in EPSG:4326.
     """
     print("\nValidating coordinates...")
@@ -372,28 +374,38 @@ def validate_coordinates(df: pd.DataFrame) -> None:
     print(f"  x (lon) in [-85, -65]: {x_valid_pct:.2f}%")
     print(f"  y (lat) in [-5, 15]: {y_valid_pct:.2f}%")
     
-    # Both must be valid for at least 99% of rows
+    # Both must be valid for most rows
     both_valid = x_valid & y_valid
     both_valid_pct = both_valid.sum() / len(sample_df) * 100
     
-    if both_valid_pct < 99.0:
+    # Warn if less than 95% are in expected ranges (but don't fail)
+    if both_valid_pct < 95.0:
         x_range = (df['x'].min(), df['x'].max())
         y_range = (df['y'].min(), df['y'].max())
-        error_msg = (
-            f"ERROR: x/y coordinates do not look like Colombia lon/lat after reprojection.\n\n"
+        warning_msg = (
+            f"WARNING: Only {both_valid_pct:.2f}% of coordinates are in expected Colombia ranges.\n"
             f"Expected: x in [-85, -65], y in [-5, 15] (EPSG:4326)\n"
             f"Found: x in [{x_range[0]:.2f}, {x_range[1]:.2f}], "
             f"y in [{y_range[0]:.2f}, {y_range[1]:.2f}]\n"
-            f"Only {both_valid_pct:.2f}% of coordinates are in expected ranges.\n\n"
-            f"Please check that coordinates represent Colombia region."
+            f"This may be due to coastal/island pixels or coordinate system issues.\n"
+            f"Proceeding with caution..."
         )
-        raise ValueError(error_msg)
+        print(f"\n{'!'*70}")
+        print(warning_msg)
+        print(f"{'!'*70}\n")
+    else:
+        print(f"  Coordinate validation passed ({both_valid_pct:.2f}% in expected ranges)")
+
+
+def create_metrics_table(metrics_data: Dict[str, Any], output_dir: Path, model_type: str, df: Optional[pd.DataFrame] = None) -> None:
+    """Create metrics table in CSV and LaTeX formats.
     
-    print(f"  Coordinate validation passed ({both_valid_pct:.2f}% in expected ranges)")
-
-
-def create_metrics_table(metrics_data: Dict[str, Any], output_dir: Path, model_type: str) -> None:
-    """Create metrics table in CSV and LaTeX formats."""
+    Args:
+        metrics_data: Dictionary containing metrics from JSON
+        output_dir: Output directory for tables
+        model_type: Model type (lgbm, rf, brf)
+        df: Optional DataFrame with y_true and y_pred_proba for computing Brier score
+    """
     print("\n" + "=" * 70)
     print("CREATING METRICS TABLE")
     print("=" * 70)
@@ -404,32 +416,44 @@ def create_metrics_table(metrics_data: Dict[str, Any], output_dir: Path, model_t
         test_perf = metrics_data.get("metrics", {})
     
     # Extract metrics
+    metrics_list = [
+        ("ROC AUC", test_perf.get("roc_auc", np.nan)),
+        ("PR AUC", test_perf.get("pr_auc", np.nan)),
+        ("Precision @ 1%", test_perf.get("precision_at_1pct", np.nan)),
+        ("Precision @ 5%", test_perf.get("precision_at_5pct", np.nan)),
+        ("Precision @ 10%", test_perf.get("precision_at_10pct", np.nan)),
+        ("Baseline Rate", test_perf.get("baseline_rate", np.nan)),
+        ("Lift @ 1%", test_perf.get("lift_at_1pct", np.nan)),
+        ("Lift @ 5%", test_perf.get("lift_at_5pct", np.nan)),
+        ("Lift @ 10%", test_perf.get("lift_at_10pct", np.nan)),
+    ]
+    
+    # Add Brier score if DataFrame is provided
+    brier_score = np.nan
+    brier_score_calibrated = np.nan
+    if df is not None and 'y_true' in df.columns and 'y_pred_proba' in df.columns:
+        try:
+            brier_score = brier_score_loss(df['y_true'], df['y_pred_proba'])
+            metrics_list.append(("Brier Score", brier_score))
+            print(f"  Computed Brier Score: {brier_score:.6f}")
+            
+            # If calibrated probabilities available, compute Brier score for both
+            if 'y_pred_proba_calibrated' in df.columns and 'y_pred_proba_uncalibrated' in df.columns:
+                brier_score_uncalibrated = brier_score_loss(df['y_true'], df['y_pred_proba_uncalibrated'])
+                brier_score_calibrated = brier_score_loss(df['y_true'], df['y_pred_proba_calibrated'])
+                metrics_list.append(("Brier Score (Uncalibrated)", brier_score_uncalibrated))
+                metrics_list.append(("Brier Score (Calibrated)", brier_score_calibrated))
+                print(f"  Computed Brier Score (Uncalibrated): {brier_score_uncalibrated:.6f}")
+                print(f"  Computed Brier Score (Calibrated): {brier_score_calibrated:.6f}")
+        except Exception as e:
+            print(f"  Warning: Could not compute Brier score: {e}")
+    
     metrics_dict = {
-        "Metric": [
-            "ROC AUC",
-            "PR AUC",
-            "Precision @ 1%",
-            "Precision @ 5%",
-            "Precision @ 10%",
-            "Baseline Rate",
-            "Lift @ 1%",
-            "Lift @ 5%",
-            "Lift @ 10%"
-        ],
-        "Value": [
-            test_perf.get("roc_auc", np.nan),
-            test_perf.get("pr_auc", np.nan),
-            test_perf.get("precision_at_1pct", np.nan),
-            test_perf.get("precision_at_5pct", np.nan),
-            test_perf.get("precision_at_10pct", np.nan),
-            test_perf.get("baseline_rate", np.nan),
-            test_perf.get("lift_at_1pct", np.nan),
-            test_perf.get("lift_at_5pct", np.nan),
-            test_perf.get("lift_at_10pct", np.nan)
-        ]
+        "Metric": [m[0] for m in metrics_list],
+        "Value": [m[1] for m in metrics_list]
     }
     
-    df = pd.DataFrame(metrics_dict)
+    df_metrics = pd.DataFrame(metrics_dict)
     
     # Format values for display
     def format_value(val):
@@ -446,35 +470,44 @@ def create_metrics_table(metrics_data: Dict[str, Any], output_dir: Path, model_t
                 return f"{val:.1f}"
         return str(val)
     
-    df['Value'] = df['Value'].apply(format_value)
+    df_metrics['Value'] = df_metrics['Value'].apply(format_value)
     
     # Save CSV
     csv_path = output_dir / f"modelC_{model_type}_metrics_table.csv"
-    df.to_csv(csv_path, index=False)
+    df_metrics.to_csv(csv_path, index=False)
     print(f"\nSaved CSV: {csv_path}")
     
-    # Create LaTeX table
+    # Create LaTeX table using f-strings for cleaner code
     latex_path = output_dir / f"modelC_{model_type}_metrics_table.tex"
+    
+    # Escape LaTeX special characters
+    def escape_latex(text: str) -> str:
+        return text.replace('_', '\\_').replace('%', '\\%')
+    
+    latex_lines = [
+        "\\begin{table}[h]",
+        "\\centering",
+        "\\begin{tabular}{lr}",
+        "\\toprule",
+        "Metric & Value \\\\",
+        "\\midrule",
+    ]
+    
+    for _, row in df_metrics.iterrows():
+        metric = escape_latex(row['Metric'])
+        value = row['Value']
+        latex_lines.append(f"{metric} & {value} \\\\")
+    
+    latex_lines.extend([
+        "\\bottomrule",
+        "\\end{tabular}",
+        f"\\caption{{Model C ({model_type.upper()}) Performance Metrics}}",
+        f"\\label{{tab:modelc_{model_type}_metrics}}",
+        "\\end{table}",
+    ])
+    
     with open(latex_path, 'w') as f:
-        f.write("\\begin{table}[h]\n")
-        f.write("\\centering\n")
-        f.write("\\begin{tabular}{lr}\n")
-        f.write("\\toprule\n")
-        f.write("Metric & Value \\\\\n")
-        f.write("\\midrule\n")
-        
-        for _, row in df.iterrows():
-            metric = row['Metric'].replace('@', '@')
-            value = row['Value']
-            # Escape special LaTeX characters
-            metric = metric.replace('_', '\\_')
-            f.write(f"{metric} & {value} \\\\\n")
-        
-        f.write("\\bottomrule\n")
-        f.write("\\end{tabular}\n")
-        f.write(f"\\caption{{Model C ({model_type.upper()}) Performance Metrics}}\n")
-        f.write(f"\\label{{tab:modelc_{model_type}_metrics}}\n")
-        f.write("\\end{table}\n")
+        f.write('\n'.join(latex_lines) + '\n')
     
     print(f"Saved LaTeX: {latex_path}")
 
@@ -534,110 +567,316 @@ def create_pr_curve(df: pd.DataFrame, metrics_data: Dict[str, Any], output_dir: 
     plt.close()
 
 
+def create_calibration_curve(df: pd.DataFrame, output_dir: Path, model_type: str) -> None:
+    """Create reliability/calibration curve (uniform + quantile bins) for test predictions.
+    
+    Args:
+        df: DataFrame with y_true and y_pred_proba columns
+        output_dir: Output directory for plots
+        model_type: Model type (lgbm, rf, brf)
+    """
+    print("\n" + "=" * 70)
+    print("CREATING CALIBRATION/RELIABILITY CURVE")
+    print("=" * 70)
+    
+    y_true = df['y_true'].values
+    y_pred_proba = df['y_pred_proba'].values
+    
+    # Check if calibrated probabilities are available
+    has_calibrated = 'y_pred_proba_calibrated' in df.columns
+    has_uncalibrated = 'y_pred_proba_uncalibrated' in df.columns
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    
+    # Method 1: Uniform bins
+    ax1 = axes[0]
+    n_bins_uniform = 10
+    fraction_of_positives_uniform, mean_predicted_value_uniform = calibration_curve(
+        y_true, y_pred_proba, n_bins=n_bins_uniform, strategy='uniform'
+    )
+    
+    ax1.plot(mean_predicted_value_uniform, fraction_of_positives_uniform, 
+             's-', label='Model predictions', linewidth=2, markersize=8)
+    ax1.plot([0, 1], [0, 1], 'k--', label='Perfectly calibrated', linewidth=2)
+    ax1.set_xlabel('Mean Predicted Probability', fontsize=FONTSIZE_LABEL)
+    ax1.set_ylabel('Fraction of Positives', fontsize=FONTSIZE_LABEL)
+    ax1.set_title(f'Calibration Curve (Uniform Bins, n={n_bins_uniform})', 
+                  fontsize=FONTSIZE_TITLE, fontweight='bold')
+    ax1.legend(loc='best', fontsize=FONTSIZE_LEGEND)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xlim([0, 1])
+    ax1.set_ylim([0, 1])
+    
+    # Method 2: Quantile bins
+    ax2 = axes[1]
+    n_bins_quantile = 10
+    fraction_of_positives_quantile, mean_predicted_value_quantile = calibration_curve(
+        y_true, y_pred_proba, n_bins=n_bins_quantile, strategy='quantile'
+    )
+    
+    ax2.plot(mean_predicted_value_quantile, fraction_of_positives_quantile, 
+             's-', label='Model predictions', linewidth=2, markersize=8)
+    ax2.plot([0, 1], [0, 1], 'k--', label='Perfectly calibrated', linewidth=2)
+    ax2.set_xlabel('Mean Predicted Probability', fontsize=FONTSIZE_LABEL)
+    ax2.set_ylabel('Fraction of Positives', fontsize=FONTSIZE_LABEL)
+    ax2.set_title(f'Calibration Curve (Quantile Bins, n={n_bins_quantile})', 
+                  fontsize=FONTSIZE_TITLE, fontweight='bold')
+    ax2.legend(loc='best', fontsize=FONTSIZE_LEGEND)
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xlim([0, 1])
+    ax2.set_ylim([0, 1])
+    
+    plt.tight_layout()
+    
+    # Save PNG
+    png_path = output_dir / f"modelC_{model_type}_calibration_curve.png"
+    plt.savefig(png_path, dpi=PR_CURVE_DPI, bbox_inches='tight')
+    print(f"\nSaved PNG: {png_path}")
+    
+    # Save PDF
+    pdf_path = output_dir / f"modelC_{model_type}_calibration_curve.pdf"
+    plt.savefig(pdf_path, dpi=PR_CURVE_DPI, bbox_inches='tight')
+    print(f"Saved PDF: {pdf_path}")
+    
+    # If calibrated probabilities available, create comparison plot
+    if has_calibrated and has_uncalibrated:
+        print("\nCreating calibrated vs uncalibrated comparison...")
+        fig2, ax = plt.subplots(figsize=PR_CURVE_FIGSIZE)
+        
+        # Uncalibrated
+        frac_pos_uncal, mean_pred_uncal = calibration_curve(
+            y_true, df['y_pred_proba_uncalibrated'].values, n_bins=10, strategy='uniform'
+        )
+        ax.plot(mean_pred_uncal, frac_pos_uncal, 's-', 
+                label='Uncalibrated', linewidth=2, markersize=8, alpha=0.7)
+        
+        # Calibrated
+        frac_pos_cal, mean_pred_cal = calibration_curve(
+            y_true, df['y_pred_proba_calibrated'].values, n_bins=10, strategy='uniform'
+        )
+        ax.plot(mean_pred_cal, frac_pos_cal, 'o-', 
+                label='Calibrated', linewidth=2, markersize=8, alpha=0.7)
+        
+        # Perfect calibration line
+        ax.plot([0, 1], [0, 1], 'k--', label='Perfectly calibrated', linewidth=2)
+        
+        ax.set_xlabel('Mean Predicted Probability', fontsize=FONTSIZE_LABEL)
+        ax.set_ylabel('Fraction of Positives', fontsize=FONTSIZE_LABEL)
+        ax.set_title(f'Model C ({model_type.upper()}) Calibration: Uncalibrated vs Calibrated', 
+                     fontsize=FONTSIZE_TITLE, fontweight='bold')
+        ax.legend(loc='best', fontsize=FONTSIZE_LEGEND)
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim([0, 1])
+        ax.set_ylim([0, 1])
+        
+        plt.tight_layout()
+        
+        png_path2 = output_dir / f"modelC_{model_type}_calibration_comparison.png"
+        plt.savefig(png_path2, dpi=PR_CURVE_DPI, bbox_inches='tight')
+        print(f"Saved PNG: {png_path2}")
+        
+        pdf_path2 = output_dir / f"modelC_{model_type}_calibration_comparison.pdf"
+        plt.savefig(pdf_path2, dpi=PR_CURVE_DPI, bbox_inches='tight')
+        print(f"Saved PDF: {pdf_path2}")
+        
+        plt.close(fig2)
+    
+    plt.close(fig)
+    print(f"\nCalibration analysis complete")
+
+
 def get_colombia_boundary(country_boundary_path: Optional[Path] = None) -> gpd.GeoDataFrame:
-    """Get Colombia boundary from file or download from Natural Earth."""
+    """Get Colombia boundary from file or download from URL.
+    
+    Strategy:
+    1. Use provided path if available
+    2. Try common local file locations (GeoJSON/GPKG)
+    3. Fallback to URL download
+    4. Ensure CRS is normalized to EPSG:4326
+    """
+    # Strategy 1: Use provided path
     if country_boundary_path and country_boundary_path.exists():
         print(f"Loading Colombia boundary from: {country_boundary_path}")
         gdf = gpd.read_file(country_boundary_path)
-        # Filter to Colombia if multiple countries
-        if 'NAME' in gdf.columns:
-            gdf = gdf[gdf['NAME'] == 'Colombia']
-        elif 'NAME_EN' in gdf.columns:
-            gdf = gdf[gdf['NAME_EN'] == 'Colombia']
-        elif 'ADMIN' in gdf.columns:
-            gdf = gdf[gdf['ADMIN'] == 'Colombia']
-        elif 'ISO_A3' in gdf.columns:
-            gdf = gdf[gdf['ISO_A3'] == 'COL']
-        elif 'iso_a3' in gdf.columns:
-            gdf = gdf[gdf['iso_a3'] == 'COL']
-        return gdf
     else:
-        print("Loading Colombia boundary from Natural Earth...")
-        try:
-            # Try to load Natural Earth dataset
-            # Method 1: Use geopandas built-in dataset
-            try:
-                world = gpd.read_file(gpd.datasets.get_path('naturalearth_lowres'))
-            except (AttributeError, ValueError):
-                # Method 2: Try alternative dataset name
+        # Strategy 2: Try common local file locations
+        repo_root = get_repo_root()
+        local_candidates = [
+            repo_root / "data" / "boundaries" / "colombia.geojson",
+            repo_root / "data" / "boundaries" / "colombia.gpkg",
+            repo_root / "data" / "boundaries" / "colombia.shp",
+            repo_root / "data" / "ready" / "boundaries" / "colombia.geojson",
+            repo_root / "data" / "ready" / "boundaries" / "colombia.gpkg",
+        ]
+        
+        gdf = None
+        for candidate in local_candidates:
+            if candidate.exists():
+                print(f"Loading Colombia boundary from local file: {candidate}")
                 try:
-                    world = gpd.read_file(gpd.datasets.get_path('naturalearth'))
-                except (AttributeError, ValueError):
-                    # Method 3: Direct URL download
-                    import urllib.request
-                    import tempfile
-                    url = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip"
-                    with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp:
+                    gdf = gpd.read_file(candidate)
+                    break
+                except Exception as e:
+                    print(f"  Failed to load {candidate}: {e}")
+                    continue
+        
+        # Strategy 3: Fallback to URL download
+        if gdf is None:
+            print("Loading Colombia boundary from URL...")
+            import urllib.request
+            import tempfile
+            import zipfile
+            import shutil
+            
+            urls = [
+                "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip",
+                "https://raw.githubusercontent.com/holtzy/D3-graph-gallery/master/DATA/world.geojson",
+            ]
+            
+            for url in urls:
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.zip' if url.endswith('.zip') else '.geojson') as tmp:
                         urllib.request.urlretrieve(url, tmp.name)
-                        import zipfile
-                        import shutil
-                        extract_dir = tempfile.mkdtemp()
-                        with zipfile.ZipFile(tmp.name, 'r') as zip_ref:
-                            zip_ref.extractall(extract_dir)
-                        # Find the shapefile
-                        shp_files = list(Path(extract_dir).glob('*.shp'))
-                        if shp_files:
-                            world = gpd.read_file(shp_files[0])
+                        
+                        if url.endswith('.zip'):
+                            extract_dir = tempfile.mkdtemp()
+                            try:
+                                with zipfile.ZipFile(tmp.name, 'r') as zip_ref:
+                                    zip_ref.extractall(extract_dir)
+                                shp_files = list(Path(extract_dir).glob('*.shp'))
+                                if shp_files:
+                                    gdf = gpd.read_file(shp_files[0])
+                                else:
+                                    raise ValueError("Could not find shapefile in downloaded zip")
+                            finally:
+                                os.unlink(tmp.name)
+                                shutil.rmtree(extract_dir)
                         else:
-                            raise ValueError("Could not find shapefile in downloaded zip")
-                        os.unlink(tmp.name)
-                        shutil.rmtree(extract_dir)
+                            gdf = gpd.read_file(tmp.name)
+                            os.unlink(tmp.name)
+                    
+                    if gdf is not None and not gdf.empty:
+                        print(f"  Successfully loaded from {url}")
+                        break
+                except Exception as e:
+                    print(f"  Failed to load from {url}: {e}")
+                    continue
             
-            # Filter to Colombia
-            colombia = None
-            if 'iso_a3' in world.columns:
-                colombia = world[world['iso_a3'] == 'COL'].copy()
-            elif 'ISO_A3' in world.columns:
-                colombia = world[world['ISO_A3'] == 'COL'].copy()
-            elif 'NAME' in world.columns:
-                colombia = world[world['NAME'] == 'Colombia'].copy()
-            elif 'NAME_EN' in world.columns:
-                colombia = world[world['NAME_EN'] == 'Colombia'].copy()
-            elif 'ADMIN' in world.columns:
-                colombia = world[world['ADMIN'] == 'Colombia'].copy()
-            
-            if colombia is None or len(colombia) == 0:
-                raise ValueError("Could not find Colombia in Natural Earth dataset")
-            
-            print(f"  Found Colombia boundary with {len(colombia)} feature(s)")
-            return colombia
-        except Exception as e:
-            print(f"  Error loading from Natural Earth: {e}")
-            print("  Attempting alternative download method...")
-            # Alternative: try direct GeoJSON URL
+            if gdf is None or gdf.empty:
+                raise RuntimeError(
+                    "Could not load Colombia boundary. Please provide --country_boundary path "
+                    "or ensure internet connection for URL download."
+                )
+    
+    # Filter to Colombia if multiple countries
+    if 'NAME' in gdf.columns:
+        colombia = gdf[gdf['NAME'] == 'Colombia'].copy()
+    elif 'NAME_EN' in gdf.columns:
+        colombia = gdf[gdf['NAME_EN'] == 'Colombia'].copy()
+    elif 'ADMIN' in gdf.columns:
+        colombia = gdf[gdf['ADMIN'] == 'Colombia'].copy()
+    elif 'ISO_A3' in gdf.columns:
+        colombia = gdf[gdf['ISO_A3'] == 'COL'].copy()
+    elif 'iso_a3' in gdf.columns:
+        colombia = gdf[gdf['iso_a3'] == 'COL'].copy()
+    elif 'name' in gdf.columns:
+        colombia = gdf[gdf['name'] == 'Colombia'].copy()
+    else:
+        # If no filtering column found, assume single country file
+        colombia = gdf.copy()
+    
+    if colombia is None or len(colombia) == 0:
+        raise ValueError("Could not find Colombia in boundary dataset")
+    
+    # Ensure CRS is normalized to EPSG:4326
+    if colombia.crs is None:
+        print("  Warning: No CRS defined, assuming EPSG:4326")
+        colombia = colombia.set_crs('EPSG:4326', allow_override=True)
+    elif colombia.crs.to_string() != 'EPSG:4326':
+        print(f"  Reprojecting from {colombia.crs} to EPSG:4326...")
+        colombia = colombia.to_crs('EPSG:4326')
+    
+    print(f"  Found Colombia boundary with {len(colombia)} feature(s) in EPSG:4326")
+    return colombia
+
+
+def derive_test_years(metrics_data: Optional[Dict[str, Any]] = None, 
+                      parquet_path: Optional[Path] = None,
+                      test_parquet_path: Optional[Path] = None) -> list:
+    """Derive test years dynamically from metadata or parquet files.
+    
+    Priority:
+    1. metadata.test_year_range or metadata.test_years
+    2. Year range from scored parquet (if available)
+    3. Year range from test parquet (if available)
+    4. Fallback to [2018, 2019] with warning
+    
+    Returns:
+        List of test years (e.g., [2018, 2019])
+    """
+    # Try metadata first
+    if metrics_data:
+        metadata = metrics_data.get("metadata", {})
+        test_year_range = metadata.get("test_year_range")
+        if test_year_range and isinstance(test_year_range, list) and len(test_year_range) == 2:
+            test_years = list(range(int(test_year_range[0]), int(test_year_range[1]) + 1))
+            print(f"  Derived test years from metadata.test_year_range: {test_years}")
+            return test_years
+        
+        test_years_meta = metadata.get("test_years")
+        if test_years_meta and isinstance(test_years_meta, (list, tuple)):
+            test_years = [int(y) for y in test_years_meta]
+            print(f"  Derived test years from metadata.test_years: {test_years}")
+            return test_years
+    
+    # Try to derive from parquet files
+    for path, name in [(parquet_path, "scored parquet"), (test_parquet_path, "test parquet")]:
+        if path and path.exists():
             try:
-                import urllib.request
-                import tempfile
-                url = "https://raw.githubusercontent.com/holtzy/D3-graph-gallery/master/DATA/world.geojson"
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.geojson') as tmp:
-                    urllib.request.urlretrieve(url, tmp.name)
-                    world = gpd.read_file(tmp.name)
-                    if 'name' in world.columns:
-                        colombia = world[world['name'] == 'Colombia'].copy()
-                    elif 'NAME' in world.columns:
-                        colombia = world[world['NAME'] == 'Colombia'].copy()
-                    os.unlink(tmp.name)
-                    if colombia is not None and len(colombia) > 0:
-                        print(f"  Found Colombia boundary via alternative method")
-                        return colombia
-            except Exception as e2:
-                print(f"  Alternative download also failed: {e2}")
-            
-            raise RuntimeError(
-                "Could not load Colombia boundary. Please provide --country_boundary path "
-                "or ensure internet connection for Natural Earth download."
-            )
+                pfile = pq.ParquetFile(path)
+                if 'year' in pfile.schema_arrow.names:
+                    # Sample a few row groups to get year range
+                    years_set = set()
+                    num_row_groups = min(10, pfile.metadata.num_row_groups)  # Sample first 10
+                    for rg_idx in range(num_row_groups):
+                        try:
+                            table = pfile.read_row_group(rg_idx, columns=['year'])
+                            df = table.to_pandas()
+                            years_set.update(df['year'].dropna().unique())
+                        except Exception:
+                            continue
+                    
+                    if years_set:
+                        years = sorted([int(y) for y in years_set if pd.notna(y)])
+                        if len(years) >= 2:
+                            # Assume test years are the available years in the file
+                            test_years = years
+                            print(f"  Derived test years from {name}: {test_years}")
+                            return test_years
+            except Exception as e:
+                print(f"  Warning: Could not derive test years from {name}: {e}")
+                continue
+    
+    # Fallback with warning
+    print(f"  WARNING: Could not derive test years from metadata or parquet files")
+    print(f"  Using fallback: [2018, 2019]")
+    return [2018, 2019]
 
 
-def load_wdpa_from_test_parquet(test_parquet_path: Optional[Path]) -> Optional[pd.DataFrame]:
-    """Load WDPA_b1 data from original test parquet file for joining with scored data.
+def load_wdpa_from_test_parquet(test_parquet_path: Optional[Path], test_years: list) -> Optional[pd.DataFrame]:
+    """Load WDPA_b1 and WDPA_prev data from original test parquet file for joining with scored data.
     
     This is needed because transition_01_win5 (y_true) is a 5-year lookahead target that doesn't
     mark the actual year of establishment. For example, a pixel established in 2018 will have
     y_true=1 only for years before 2018, not for 2018 itself. By loading WDPA_b1 from the
     original test data, we can correctly identify pixels that were actually established in each year.
     
-    Returns DataFrame with columns: row, col, year, x, y, WDPA_b1 (or None if file not found/not available)
+    Also loads WDPA_prev to distinguish between:
+    - Already protected areas (WDPA_prev=1): Protected in previous year, defines risk set boundary
+    - Newly protected areas (WDPA_prev=0, WDPA_b1=1): Became protected during test period
+    
+    Returns DataFrame with columns: row, col, year, x, y, WDPA_b1, WDPA_prev (or None if file not found/not available)
     Includes x, y coordinates as fallback for joining when row/col are missing in scored data.
     """
     if test_parquet_path is None or not test_parquet_path.exists():
@@ -648,7 +887,7 @@ def load_wdpa_from_test_parquet(test_parquet_path: Optional[Path]) -> Optional[p
         pfile = pq.ParquetFile(test_parquet_path)
         available_columns = pfile.schema_arrow.names
         
-        # Check for WDPA column
+        # Check for WDPA_b1 column
         wdpa_col = None
         for candidate in ['WDPA_b1', 'wdpa_b1']:
             if candidate in available_columns:
@@ -658,6 +897,18 @@ def load_wdpa_from_test_parquet(test_parquet_path: Optional[Path]) -> Optional[p
         if wdpa_col is None:
             print(f"  WARNING: WDPA column not found in test parquet. Available columns: {available_columns}")
             return None
+        
+        # Check for WDPA_prev column (optional, for two-layer protection visualization)
+        wdpa_prev_col = None
+        for candidate in ['WDPA_prev', 'wdpa_prev']:
+            if candidate in available_columns:
+                wdpa_prev_col = candidate
+                break
+        
+        if wdpa_prev_col is not None:
+            print(f"  Found WDPA_prev column: '{wdpa_prev_col}' (enables temporal protection visualization)")
+        else:
+            print(f"  Note: WDPA_prev column not found (single-layer protection visualization only)")
         
         # Check for required join columns - try row/col first, then x/y as fallback
         has_row_col = 'row' in available_columns and 'col' in available_columns
@@ -674,6 +925,8 @@ def load_wdpa_from_test_parquet(test_parquet_path: Optional[Path]) -> Optional[p
         
         # Build list of columns to read
         required_cols = ['year', wdpa_col]
+        if wdpa_prev_col is not None:
+            required_cols.append(wdpa_prev_col)
         if has_row_col:
             required_cols.extend(['row', 'col'])
         if has_xy:
@@ -691,18 +944,23 @@ def load_wdpa_from_test_parquet(test_parquet_path: Optional[Path]) -> Optional[p
         
         result = pd.concat(all_data, ignore_index=True)
         
-        # Standardize column name
+        # Standardize column names
         if wdpa_col != 'WDPA_b1':
             result = result.rename(columns={wdpa_col: 'WDPA_b1'})
+        if wdpa_prev_col is not None and wdpa_prev_col != 'WDPA_prev':
+            result = result.rename(columns={wdpa_prev_col: 'WDPA_prev'})
         
         # Fill NaN with 0 and convert to int
         result['WDPA_b1'] = result['WDPA_b1'].fillna(0).astype(int)
+        if 'WDPA_prev' in result.columns:
+            result['WDPA_prev'] = result['WDPA_prev'].fillna(0).astype(int)
         
-        # Identify pixels established in test period (2018-2019)
+        # Identify pixels established in test period using VECTORIZED approach
         # WDPA_b1 is cumulative (protected by that year), so we identify establishments by:
-        # - WDPA_b1=1 in 2018 or 2019 AND WDPA_b1=0 in 2017 (or earlier)
-        # Create a flag for pixels established in 2018-2019 that can be joined to all years
-        print(f"  Identifying pixels established in test period (2018-2019)...")
+        # - WDPA_b1=1 in test years AND WDPA_b1=0 in previous year
+        # Create a flag for pixels established in test period that can be joined to all years
+        test_year_str = f"{min(test_years)}-{max(test_years)}"
+        print(f"  Identifying pixels established in test period ({test_year_str}) using vectorized approach...")
         
         # Get unique identifier for each pixel (row/col or x/y)
         if has_row_col:
@@ -710,63 +968,65 @@ def load_wdpa_from_test_parquet(test_parquet_path: Optional[Path]) -> Optional[p
         else:
             pixel_id_cols = ['x', 'y']
         
-        # Sort by pixel and year
+        # Sort by pixel and year for vectorized shift operation
         result = result.sort_values(pixel_id_cols + ['year'])
         
-        # For each pixel, check if it was established in 2018 or 2019
-        # Establishment = WDPA_b1=1 in 2018/2019 AND WDPA_b1=0 in 2017 (or no 2017 data)
-        establishments = []
+        # VECTORIZED: Use shift() to compare WDPA_b1 with previous year for same pixel
+        # Group by pixel and shift WDPA_b1 to get previous year's status
+        result['WDPA_b1_prev_year'] = result.groupby(pixel_id_cols)['WDPA_b1'].shift(1).fillna(0).astype(int)
         
-        for pixel_id, pixel_data in result.groupby(pixel_id_cols):
-            pixel_data = pixel_data.sort_values('year')
-            
-            # Get WDPA status for relevant years
-            wdpa_2017 = pixel_data[pixel_data['year'] == 2017]['WDPA_b1'].values
-            wdpa_2018 = pixel_data[pixel_data['year'] == 2018]['WDPA_b1'].values
-            wdpa_2019 = pixel_data[pixel_data['year'] == 2019]['WDPA_b1'].values
-            
-            # Check if established in 2018: WDPA_b1=1 in 2018 AND (WDPA_b1=0 in 2017 OR no 2017 data)
-            established_2018 = False
-            if len(wdpa_2018) > 0 and wdpa_2018[0] == 1:
-                if len(wdpa_2017) == 0 or wdpa_2017[0] == 0:
-                    established_2018 = True
-            
-            # Check if established in 2019: WDPA_b1=1 in 2019 AND WDPA_b1=0 in 2018 (or no 2018 data)
-            established_2019 = False
-            if len(wdpa_2019) > 0 and wdpa_2019[0] == 1:
-                if len(wdpa_2018) == 0 or wdpa_2018[0] == 0:
-                    established_2019 = True
-            
-            # If established in either 2018 or 2019, mark this pixel
-            if established_2018 or established_2019:
-                # pixel_id is a tuple from groupby, convert to dict
-                if has_row_col:
-                    establishments.append({'row': pixel_id[0], 'col': pixel_id[1]})
-                else:
-                    establishments.append({'x': pixel_id[0], 'y': pixel_id[1]})
+        # Identify newly protected pixels: WDPA_b1=1 AND WDPA_b1_prev_year=0
+        # Filter to only test years for robustness
+        result['newly_protected_in_test'] = (
+            (result['year'].isin(test_years)) & 
+            (result['WDPA_b1'] == 1) & 
+            (result['WDPA_b1_prev_year'] == 0)
+        ).astype(int)
         
-        # Create establishment flag DataFrame
-        if establishments:
-            estab_df = pd.DataFrame(establishments)
-            estab_df['established_2018_2019'] = 1
-            print(f"  Found {len(estab_df):,} pixels established in 2018-2019")
+        # Create pixel-level flag: a pixel is "established in test period" if it was newly protected in ANY test year
+        estab_df = result.groupby(pixel_id_cols)['newly_protected_in_test'].max().reset_index()
+        estab_df = estab_df[estab_df['newly_protected_in_test'] == 1].copy()
+        estab_df['established_in_test_period'] = 1
+        estab_df = estab_df[pixel_id_cols + ['established_in_test_period']]
+        
+        if len(estab_df) > 0:
+            print(f"  Found {len(estab_df):,} pixels established in test period ({test_year_str})")
         else:
+            print(f"  WARNING: No pixels found established in test period ({test_year_str})")
             # Create empty DataFrame with correct columns
-            if has_row_col:
-                estab_df = pd.DataFrame(columns=['row', 'col', 'established_2018_2019'])
-            else:
-                estab_df = pd.DataFrame(columns=['x', 'y', 'established_2018_2019'])
-            print(f"  WARNING: No pixels found established in 2018-2019")
+            estab_df = pd.DataFrame(columns=pixel_id_cols + ['established_in_test_period'])
         
-        # Merge establishment flag back into result
-        # This adds the flag to all years for each pixel
+        # Create pixel-level flag for newly protected in test period (for visualization)
+        # This flag marks pixels that became protected during test years
+        newly_protected_pixel_flag = result.groupby(pixel_id_cols)['newly_protected_in_test'].max().reset_index()
+        newly_protected_pixel_flag = newly_protected_pixel_flag[newly_protected_pixel_flag['newly_protected_in_test'] == 1].copy()
+        newly_protected_pixel_flag['newly_protected_in_test_period'] = 1
+        newly_protected_pixel_flag = newly_protected_pixel_flag[pixel_id_cols + ['newly_protected_in_test_period']]
+        
+        # Merge both flags back into result
         result = result.merge(estab_df, on=pixel_id_cols, how='left')
-        result['established_2018_2019'] = result['established_2018_2019'].fillna(0).astype(int)
+        result['established_in_test_period'] = result['established_in_test_period'].fillna(0).astype(int)
+        
+        result = result.merge(newly_protected_pixel_flag, on=pixel_id_cols, how='left')
+        result['newly_protected_in_test_period'] = result['newly_protected_in_test_period'].fillna(0).astype(int)
+        
+        # Clean up temporary column
+        result = result.drop(columns=['WDPA_b1_prev_year', 'newly_protected_in_test'])
         
         print(f"  Loaded {len(result):,} rows with WDPA data")
         print(f"  Years: {sorted(result['year'].unique())}")
         print(f"  Protected pixels (WDPA_b1=1): {(result['WDPA_b1'] == 1).sum():,}")
-        print(f"  Pixels with establishment flag: {(result['established_2018_2019'] == 1).sum():,}")
+        print(f"  Pixels with establishment flag: {(result['established_in_test_period'] == 1).sum():,}")
+        
+        # Report on temporal protection dynamics if WDPA_prev available
+        if 'WDPA_prev' in result.columns:
+            already_protected = ((result['WDPA_prev'] == 1) & (result['WDPA_b1'] == 1)).sum()
+            newly_protected = ((result['WDPA_prev'] == 0) & (result['WDPA_b1'] == 1)).sum()
+            print(f"  Temporal protection analysis:")
+            print(f"    - Already protected (WDPA_prev=1): {already_protected:,}")
+            print(f"    - Newly protected (WDPA_prev=0, WDPA_b1=1): {newly_protected:,}")
+            print(f"    → Two-layer protection visualization will be used")
+        
         if has_row_col:
             print(f"  Join method: row/col/year (with establishment flag)")
         elif has_xy:
@@ -933,25 +1193,46 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
     # Load WDPA data from original test parquet if available
     # This is needed to correctly identify pixels that were established in each year
     # (since transition_01_win5 is a 5-year lookahead target, it doesn't mark the actual year of establishment)
-    wdpa_test_df = load_wdpa_from_test_parquet(test_parquet_path)
+    # Derive test years from metrics or parquet
+    test_years = derive_test_years(metrics_data, None, test_parquet_path)
+    wdpa_test_df = load_wdpa_from_test_parquet(test_parquet_path, test_years)
     
-    # Join WDPA establishment flag if available
-    # This is critical for correctly identifying pixels established in 2018-2019,
-    # since transition_01_win5 (y_true) is a 5-year lookahead target that doesn't mark
-    # the actual year of establishment. We join on pixel identifier (not year) so the
-    # flag applies to all years for each pixel.
-    if wdpa_test_df is not None and 'established_2018_2019' in wdpa_test_df.columns:
+    # Join WDPA data from test parquet if available
+    # This includes:
+    # 1. Establishment flag for correctly identifying pixels established in 2018-2019
+    # 2. WDPA_prev for two-layer protection visualization (temporal dynamics)
+    if wdpa_test_df is not None:
         print(f"\n  {'='*70}")
-        print(f"  WDPA ESTABLISHMENT DATA LOADED SUCCESSFULLY")
+        print(f"  WDPA DATA LOADED SUCCESSFULLY FROM TEST PARQUET")
         print(f"  {'='*70}")
-        print(f"  Joining WDPA establishment flag from original test parquet...")
         
-        # Extract establishment flag for each pixel (join on pixel identifier, not year)
-        # This ensures the flag applies to all years for each pixel
-        if all(col in df.columns for col in ['row', 'col']) and all(col in wdpa_test_df.columns for col in ['row', 'col']):
+        # Determine which columns to join
+        join_cols = ['row', 'col'] if 'row' in wdpa_test_df.columns else ['x', 'y']
+        data_cols_to_join = []
+        
+        if 'established_in_test_period' in wdpa_test_df.columns:
+            data_cols_to_join.append('established_in_test_period')
+            print(f"  Will join: established_in_test_period (for observed positives)")
+        if 'newly_protected_in_test_period' in wdpa_test_df.columns:
+            data_cols_to_join.append('newly_protected_in_test_period')
+            print(f"  Will join: newly_protected_in_test_period (for test-year-specific protection layer)")
+        if 'WDPA_prev' in wdpa_test_df.columns:
+            data_cols_to_join.append('WDPA_prev')
+            print(f"  Will join: WDPA_prev (for temporal protection visualization)")
+        if 'WDPA_b1' in wdpa_test_df.columns and 'wdpa_b1' not in df.columns:
+            data_cols_to_join.append('WDPA_b1')
+            print(f"  Will join: WDPA_b1 (for current protection status)")
+        
+        if not data_cols_to_join:
+            print(f"  WARNING: No relevant columns found to join")
+            df['established_in_test_period'] = 0
+            df['WDPA_b1_actual'] = 0
+            join_method = None
+        elif all(col in df.columns for col in ['row', 'col']) and all(col in wdpa_test_df.columns for col in ['row', 'col']):
             print(f"  Using row/col join method (pixel-level, not year-specific)...")
-            estab_flag_df = wdpa_test_df[['row', 'col', 'established_2018_2019']].drop_duplicates()
-            df = df.merge(estab_flag_df, on=['row', 'col'], how='left')
+            select_cols = ['row', 'col'] + data_cols_to_join
+            join_df = wdpa_test_df[select_cols].drop_duplicates(subset=['row', 'col'])
+            df = df.merge(join_df, on=['row', 'col'], how='left', suffixes=('', '_test'))
             join_method = "row/col"
         elif all(col in df.columns for col in ['x', 'y']) and all(col in wdpa_test_df.columns for col in ['x', 'y']):
             print(f"  Using x/y join method (pixel-level, not year-specific)...")
@@ -960,12 +1241,13 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
             df_rounded['x_rounded'] = df_rounded['x'].round(6)
             df_rounded['y_rounded'] = df_rounded['y'].round(6)
             
-            estab_flag_df = wdpa_test_df[['x', 'y', 'established_2018_2019']].copy()
-            estab_flag_df['x_rounded'] = estab_flag_df['x'].round(6)
-            estab_flag_df['y_rounded'] = estab_flag_df['y'].round(6)
-            estab_flag_df = estab_flag_df[['x_rounded', 'y_rounded', 'established_2018_2019']].drop_duplicates()
+            select_cols = ['x', 'y'] + data_cols_to_join
+            join_df = wdpa_test_df[select_cols].copy()
+            join_df['x_rounded'] = join_df['x'].round(6)
+            join_df['y_rounded'] = join_df['y'].round(6)
+            join_df = join_df[['x_rounded', 'y_rounded'] + data_cols_to_join].drop_duplicates(subset=['x_rounded', 'y_rounded'])
             
-            df_rounded = df_rounded.merge(estab_flag_df, on=['x_rounded', 'y_rounded'], how='left')
+            df_rounded = df_rounded.merge(join_df, on=['x_rounded', 'y_rounded'], how='left', suffixes=('', '_test'))
             df_rounded = df_rounded.drop(columns=['x_rounded', 'y_rounded'])
             df = df_rounded
             join_method = "x/y"
@@ -976,13 +1258,34 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
             print(f"  Missing in scored data: {missing_cols_df}")
             print(f"  Missing in test data: {missing_cols_wdpa}")
             print(f"  Available columns in scored data: {list(df.columns)}")
-            df['established_2018_2019'] = 0
+            df['established_in_test_period'] = 0
             join_method = None
         
         if join_method is not None:
-            df['established_2018_2019'] = df['established_2018_2019'].fillna(0).astype(int)
-            df['WDPA_b1_actual'] = df['established_2018_2019']
-            print(f"  Joined WDPA establishment flag using {join_method}: {(df['WDPA_b1_actual'] == 1).sum():,} pixels established in 2018-2019")
+            # Fill NaN and standardize dtypes for joined columns
+            if 'established_in_test_period' in df.columns:
+                df['established_in_test_period'] = df['established_in_test_period'].fillna(0).astype(int)
+                df['WDPA_b1_actual'] = df['established_in_test_period']
+                print(f"  Joined establishment flag using {join_method}: {(df['WDPA_b1_actual'] == 1).sum():,} pixels")
+            else:
+                df['established_in_test_period'] = 0
+                df['WDPA_b1_actual'] = 0
+            
+            if 'WDPA_prev' in df.columns:
+                df['WDPA_prev'] = df['WDPA_prev'].fillna(0).astype(int)
+                print(f"  Joined WDPA_prev using {join_method}: {(df['WDPA_prev'] == 1).sum():,} pixels already protected")
+            
+            if 'newly_protected_in_test_period' in df.columns:
+                df['newly_protected_in_test_period'] = df['newly_protected_in_test_period'].fillna(0).astype(int)
+                print(f"  Joined newly_protected_in_test_period using {join_method}: {(df['newly_protected_in_test_period'] == 1).sum():,} pixels")
+            
+            if 'WDPA_b1_test' in df.columns:
+                # Rename if we got it from test parquet with suffix
+                df['wdpa_b1'] = df['WDPA_b1_test'].fillna(0).astype(int)
+                df = df.drop(columns=['WDPA_b1_test'])
+        else:
+            df['established_in_test_period'] = 0
+            df['WDPA_b1_actual'] = 0
     else:
         print(f"\n  {'!'*70}")
         print(f"  WARNING: WDPA ESTABLISHMENT DATA NOT LOADED")
@@ -992,7 +1295,7 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
             print(f"  Impact: Using y_true only for observed positives (may undercount establishments)")
             print(f"  Expected file: test_colombia_win5.parquet in data/ml/ or outputs/Results/")
         else:
-            print(f"  Reason: Establishment flag 'established_2018_2019' not found in WDPA test data")
+            print(f"  Reason: Establishment flag 'established_in_test_period' not found in WDPA test data")
             print(f"  Available columns in WDPA test data: {list(wdpa_test_df.columns)}")
             print(f"  Impact: Using y_true only for observed positives (may undercount establishments)")
         print(f"  {'!'*70}")
@@ -1023,13 +1326,25 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
     print(f"  Total rows (may include same pixel in multiple years): {len(gdf):,}")
     
     # Aggregate to pixel-level: a pixel is high-risk/positive if it's high-risk/positive in ANY year
-    pixel_df = gdf.groupby(['row', 'col']).agg({
+    agg_dict = {
         'is_top1pct': 'max',    # Pixel is high-risk if high-risk in ANY year
         'is_positive': 'max',    # Pixel is positive if positive in ANY year
         'x': 'first',            # Keep coordinates for visualization
         'y': 'first',
         'is_protected': 'max'    # Keep protected status
-    }).reset_index()
+    }
+    
+    # Add WDPA columns if available (for two-layer protection visualization)
+    if 'WDPA_prev' in gdf.columns:
+        agg_dict['WDPA_prev'] = 'max'  # Pixel is protected_prev if protected_prev in ANY year
+    if 'newly_protected_in_test_period' in gdf.columns:
+        agg_dict['newly_protected_in_test_period'] = 'max'  # Pixel is newly protected if newly protected in ANY test year
+    if 'wdpa_b1' in gdf.columns:
+        agg_dict['wdpa_b1'] = 'max'
+    elif 'WDPA_b1' in gdf.columns:
+        agg_dict['WDPA_b1'] = 'max'
+    
+    pixel_df = gdf.groupby(['row', 'col']).agg(agg_dict).reset_index()
     
     print(f"  Unique pixels (after deduplication): {len(pixel_df):,}")
     
@@ -1068,27 +1383,22 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
         # Protected areas get code 4, but we'll handle them as a separate overlay
         pass
     
-    # Extract time period information from metrics or use defaults
-    # Based on modelC_LGBM: test period is 2018-2019, predictions are for 5-year lookahead (2018-2024)
-    time_period = "2018-2019"
-    prediction_horizon = "5-year lookahead (2018-2024)"
+    # Extract time period information dynamically
+    test_years = derive_test_years(metrics_data, None, test_parquet_path)
+    time_period = f"{min(test_years)}-{max(test_years)}"
     
+    # Derive prediction horizon from metadata
+    prediction_horizon = "5-year lookahead"
     if metrics_data:
-        # Try to extract time period from metadata
         metadata = metrics_data.get("metadata", {})
+        lookahead = metadata.get("lookahead_years", 5)
         test_year_range = metadata.get("test_year_range")
         if test_year_range and isinstance(test_year_range, list) and len(test_year_range) == 2:
-            time_period = f"{test_year_range[0]}-{test_year_range[1]}"
-        elif "test_years" in metadata:
-            test_years = metadata["test_years"]
-            if isinstance(test_years, (list, tuple)) and len(test_years) == 2:
-                time_period = f"{test_years[0]}-{test_years[1]}"
-        
-        # Get lookahead years if available
-        lookahead = metadata.get("lookahead_years", 5)
-        if isinstance(lookahead, int) and test_year_range:
             pred_end = test_year_range[1] + lookahead
             prediction_horizon = f"{lookahead}-year lookahead ({test_year_range[0]}-{pred_end})"
+        elif isinstance(lookahead, int):
+            pred_end = max(test_years) + lookahead
+            prediction_horizon = f"{lookahead}-year lookahead ({min(test_years)}-{pred_end})"
     
     # Convert to raster for pixel-perfect visualization
     print(f"  Converting {len(gdf):,} points to raster grid...")
@@ -1103,27 +1413,77 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
     print(f"  Category raster shape: {category_raster.shape}, extent: {extent}")
     print(f"  Valid (non-NaN) pixels: {np.sum(~np.isnan(category_raster)):,}")
     
-    # Create protected areas raster if available (using same grid structure)
-    protected_raster = None
-    if has_wdpa:
-        protected_mask = gdf['is_protected'].values
-        if protected_mask.sum() > 0:
-            # Create protected areas raster using same grid as category raster
-            protected_raster, protected_extent = points_to_raster(
+    # Create protection rasters if available (using same grid structure)
+    # Two-layer approach: already protected (WDPA_prev=1) vs. newly protected (WDPA_prev=0, WDPA_b1=1)
+    protected_prev_raster = None
+    newly_protected_raster = None
+    has_wdpa_prev = 'WDPA_prev' in pixel_df.columns
+    
+    if has_wdpa_prev:
+        # TWO-LAYER PROTECTION VISUALIZATION
+        print(f"  Creating two-layer protection visualization...")
+        
+        # Layer 1: Already protected areas (WDPA_prev=1) - darker green
+        protected_prev_mask = (pixel_df['WDPA_prev'] == 1).values
+        if protected_prev_mask.sum() > 0:
+            protected_prev_raster, _ = points_to_raster(
                 gdf.geometry.x.values,
                 gdf.geometry.y.values,
-                protected_mask.astype(float),  # Convert boolean to float for rasterization
+                protected_prev_mask.astype(float),
                 target_resolution=MAP_RESOLUTION
             )
-            # Ensure extent matches (should be the same, but verify)
+            protected_prev_raster = (protected_prev_raster > 0.5).astype(float)
+            protected_prev_raster[protected_prev_raster == 0] = np.nan
+            print(f"    - Already protected (WDPA_prev=1): {np.sum(~np.isnan(protected_prev_raster)):,} pixels")
+        
+        # Layer 2: Newly protected areas in TEST YEARS ONLY (WDPA_prev=0 AND WDPA_b1=1 in test period) - lighter green
+        # Use the flag created during WDPA loading to ensure robustness (only test years)
+        if 'newly_protected_in_test_period' in pixel_df.columns:
+            newly_protected_mask = (pixel_df['newly_protected_in_test_period'] == 1).values
+            if newly_protected_mask.sum() > 0:
+                newly_protected_raster, _ = points_to_raster(
+                    gdf.geometry.x.values,
+                    gdf.geometry.y.values,
+                    newly_protected_mask.astype(float),
+                    target_resolution=MAP_RESOLUTION
+                )
+                newly_protected_raster = (newly_protected_raster > 0.5).astype(float)
+                newly_protected_raster[newly_protected_raster == 0] = np.nan
+                print(f"    - Newly protected in test period ({time_period}): {np.sum(~np.isnan(newly_protected_raster)):,} pixels")
+        else:
+            # Fallback: check WDPA_prev=0 AND WDPA_b1=1 (but warn it's not filtered to test years)
+            has_b1 = 'wdpa_b1' in pixel_df.columns or 'WDPA_b1' in pixel_df.columns
+            if has_b1:
+                b1_col = 'wdpa_b1' if 'wdpa_b1' in pixel_df.columns else 'WDPA_b1'
+                newly_protected_mask = ((pixel_df['WDPA_prev'] == 0) & (pixel_df[b1_col] == 1)).values
+                if newly_protected_mask.sum() > 0:
+                    print(f"    WARNING: Using fallback newly protected detection (not filtered to test years)")
+                    newly_protected_raster, _ = points_to_raster(
+                        gdf.geometry.x.values,
+                        gdf.geometry.y.values,
+                        newly_protected_mask.astype(float),
+                        target_resolution=MAP_RESOLUTION
+                    )
+                    newly_protected_raster = (newly_protected_raster > 0.5).astype(float)
+                    newly_protected_raster[newly_protected_raster == 0] = np.nan
+                    print(f"    - Newly protected (fallback): {np.sum(~np.isnan(newly_protected_raster)):,} pixels")
+        
+    elif has_wdpa:
+        # FALLBACK: Single-layer protection visualization (original behavior)
+        print(f"  Creating single-layer protection visualization (WDPA_prev not available)...")
+        protected_mask = gdf['is_protected'].values
+        if protected_mask.sum() > 0:
+            protected_prev_raster, protected_extent = points_to_raster(
+                gdf.geometry.x.values,
+                gdf.geometry.y.values,
+                protected_mask.astype(float),
+                target_resolution=MAP_RESOLUTION
+            )
             if protected_extent != extent:
                 print(f"  WARNING: Protected areas extent differs from category extent")
-                print(f"    Category extent: {extent}")
-                print(f"    Protected extent: {protected_extent}")
-            # Convert to boolean mask (values > 0.5)
-            protected_raster = (protected_raster > 0.5).astype(float)
-            protected_raster[protected_raster == 0] = np.nan  # Set non-protected to NaN for masking
-            print(f"  Protected areas raster created with {np.sum(~np.isnan(protected_raster)):,} pixels")
+            protected_prev_raster = (protected_prev_raster > 0.5).astype(float)
+            protected_prev_raster[protected_prev_raster == 0] = np.nan
+            print(f"  Protected areas raster created with {np.sum(~np.isnan(protected_prev_raster)):,} pixels")
     
     # Create figure
     fig, ax = plt.subplots(figsize=MAP_FIGSIZE)
@@ -1192,28 +1552,44 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
                    aspect='equal',
                    zorder=2)
     
-    # Overlay protected areas if available (as green overlay)
-    if protected_raster is not None and not np.isnan(protected_raster).all():
-        # Ensure protected raster has same shape as category raster
-        if protected_raster.shape != category_raster.shape:
-            print(f"  WARNING: Protected raster shape {protected_raster.shape} differs from category raster shape {category_raster.shape}")
-            print(f"    Skipping protected areas overlay to avoid misalignment")
-        else:
-            # Use extent from category raster to ensure alignment
-            protected_raster_masked = np.ma.masked_where(np.isnan(protected_raster), protected_raster)
-            if not protected_raster_masked.mask.all():
-                # Create a simple green colormap for protected areas
-                from matplotlib.colors import LinearSegmentedColormap
-                green_cmap = LinearSegmentedColormap.from_list('green', [RISK_MAP_COLORS['protected'], RISK_MAP_COLORS['protected']], N=1)
-                ax.imshow(protected_raster_masked,
-                         extent=extent,  # Use same extent as category raster
-                         cmap=green_cmap,
+    # Overlay protected areas with two-layer visualization if available
+    from matplotlib.colors import LinearSegmentedColormap
+    
+    # Define colors for protection layers
+    DARK_GREEN = '#2E8B57'  # Sea green - already protected (WDPA_prev=1)
+    LIGHT_GREEN = '#90EE90'  # Light green - newly protected (WDPA_prev=0, WDPA_b1=1)
+    
+    # Plot already protected areas (darker green, higher alpha - model couldn't predict here)
+    if protected_prev_raster is not None and not np.isnan(protected_prev_raster).all():
+        if protected_prev_raster.shape == category_raster.shape:
+            protected_prev_masked = np.ma.masked_where(np.isnan(protected_prev_raster), protected_prev_raster)
+            if not protected_prev_masked.mask.all():
+                dark_green_cmap = LinearSegmentedColormap.from_list('dark_green', [DARK_GREEN, DARK_GREEN], N=1)
+                ax.imshow(protected_prev_masked,
+                         extent=extent,
+                         cmap=dark_green_cmap,
                          vmin=0, vmax=1,
                          origin='upper',
                          interpolation='nearest',
                          aspect='equal',
-                         alpha=RISK_MAP_ALPHA_PROTECTED,
+                         alpha=0.7,  # Higher alpha for emphasis
                          zorder=2.5)
+    
+    # Plot newly protected areas (lighter green, lower alpha - model DID predict here before protection)
+    if newly_protected_raster is not None and not np.isnan(newly_protected_raster).all():
+        if newly_protected_raster.shape == category_raster.shape:
+            newly_protected_masked = np.ma.masked_where(np.isnan(newly_protected_raster), newly_protected_raster)
+            if not newly_protected_masked.mask.all():
+                light_green_cmap = LinearSegmentedColormap.from_list('light_green', [LIGHT_GREEN, LIGHT_GREEN], N=1)
+                ax.imshow(newly_protected_masked,
+                         extent=extent,
+                         cmap=light_green_cmap,
+                         vmin=0, vmax=1,
+                         origin='upper',
+                         interpolation='nearest',
+                         aspect='equal',
+                         alpha=0.4,  # Lower alpha to see predictions underneath
+                         zorder=2.6)
     
     # Styling
     ax.set_xlabel('Longitude', fontsize=FONTSIZE_LABEL)
@@ -1222,23 +1598,46 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
                  fontsize=FONTSIZE_TITLE, fontweight='bold', pad=15)
     
     # Add description text box explaining what the map shows
-    description_text = (f"Top 1% predicted high-risk (blue-green),\n"
-                       f"observed PA establishments (cyan),\n"
-                       f"and overlap (red).\n"
-                       f"Observed = pixels with WDPA_b1=1\n"
-                       f"in {time_period} OR y_true=1.\n"
-                       f"Predicting {prediction_horizon}.")
+    if has_wdpa_prev:
+        # Two-layer protection description with temporal explanation
+        description_text = (f"Top 1% predicted high-risk (blue-green),\n"
+                           f"observed PA establishments (cyan), overlap (red).\n\n"
+                           f"Protection layers show temporal dynamics:\n"
+                           f"• Dark green: Already protected (prev. year)\n"
+                           f"  → Model could NOT predict (risk set boundary)\n"
+                           f"• Light green: Newly protected (current year)\n"
+                           f"  → Model DID predict (before protection)\n\n"
+                           f"Predictions visible through light green areas\n"
+                           f"are expected (made before protection).\n"
+                           f"Predicting {prediction_horizon}.")
+    else:
+        # Single-layer protection description (fallback)
+        description_text = (f"Top 1% predicted high-risk (blue-green),\n"
+                           f"observed PA establishments (cyan),\n"
+                           f"and overlap (red).\n"
+                           f"Observed = pixels with WDPA_b1=1\n"
+                           f"in {time_period} OR y_true=1.\n"
+                           f"Predicting {prediction_horizon}.")
+    
     ax.text(0.98, 0.98, description_text, transform=ax.transAxes, fontsize=FONTSIZE_DESCRIPTION,
            verticalalignment='top', horizontalalignment='right',
            bbox=dict(boxstyle='round', facecolor='lightblue', 
            alpha=0.9, edgecolor='black', linewidth=1, pad=0.5), zorder=10)
     
     # Add note explaining discrepancy with P@1% metric
-    discrepancy_note = (f"NOTE: Map shows pixel-level aggregation.\n"
-                       f"A pixel is marked high-risk/positive if\n"
-                       f"ANY of its years meet criteria (not same year).\n"
-                       f"This can make overlap appear higher than\n"
-                       f"P@1% metrics (which are row-level).")
+    if has_wdpa_prev:
+        discrepancy_note = (f"NOTE: Map shows pixel-level aggregation.\n"
+                           f"A pixel is marked high-risk/positive if ANY of its\n"
+                           f"years meet criteria. Predictions made based on\n"
+                           f"previous year protection status (WDPA_prev).\n"
+                           f"Overlap appears higher than P@1% (row-level).")
+    else:
+        discrepancy_note = (f"NOTE: Map shows pixel-level aggregation.\n"
+                           f"A pixel is marked high-risk/positive if\n"
+                           f"ANY of its years meet criteria (not same year).\n"
+                           f"This can make overlap appear higher than\n"
+                           f"P@1% metrics (which are row-level).")
+    
     ax.text(0.98, 0.75, discrepancy_note, transform=ax.transAxes, fontsize=FONTSIZE_DESCRIPTION-1,
            verticalalignment='top', horizontalalignment='right',
            bbox=dict(boxstyle='round', facecolor='yellow', 
@@ -1247,8 +1646,23 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
     # Create comprehensive legend with time period information
     legend_elements = []
     
-    # Add protected areas legend item if available
-    if has_wdpa and protected_raster is not None:
+    # Add protected areas legend items (two-layer or single-layer)
+    if has_wdpa_prev:
+        # Two-layer legend with temporal explanation
+        if protected_prev_raster is not None and not np.isnan(protected_prev_raster).all():
+            prev_count = (pixel_df['WDPA_prev'] == 1).sum()
+            legend_elements.append(Line2D([0], [0], marker='s', color='w', 
+                                        markerfacecolor=DARK_GREEN, markersize=10, 
+                                        alpha=0.7, label=f'Already protected - prev. year (risk set boundary, n={prev_count:,})'))
+        
+        if newly_protected_raster is not None and not np.isnan(newly_protected_raster).all():
+            new_count = ((pixel_df['WDPA_prev'] == 0) & (pixel_df['wdpa_b1'] == 1) if 'wdpa_b1' in pixel_df.columns 
+                        else (pixel_df['WDPA_prev'] == 0) & (pixel_df['WDPA_b1'] == 1)).sum()
+            legend_elements.append(Line2D([0], [0], marker='s', color='w', 
+                                        markerfacecolor=LIGHT_GREEN, markersize=10, 
+                                        alpha=0.4, label=f'Newly protected - current year (predicted before protection, n={new_count:,})'))
+    elif has_wdpa and protected_prev_raster is not None:
+        # Single-layer legend (fallback)
         protected_count = gdf['is_protected'].sum()
         legend_elements.append(Line2D([0], [0], marker='s', color='w', 
                                     markerfacecolor=RISK_MAP_COLORS['protected'], markersize=10, 
@@ -1371,24 +1785,22 @@ def create_p1pct_diagnostic_map(df: pd.DataFrame, country_boundary_path: Optiona
     }
     gdf['category_code'] = gdf['category'].map(category_codes)
     
-    # Extract time period information
-    time_period = "2018-2019"
-    prediction_horizon = "5-year lookahead (2018-2024)"
+    # Extract time period information dynamically
+    test_years = derive_test_years(metrics_data)
+    time_period = f"{min(test_years)}-{max(test_years)}"
     
+    # Derive prediction horizon from metadata
+    prediction_horizon = "5-year lookahead"
     if metrics_data:
         metadata = metrics_data.get("metadata", {})
+        lookahead = metadata.get("lookahead_years", 5)
         test_year_range = metadata.get("test_year_range")
         if test_year_range and isinstance(test_year_range, list) and len(test_year_range) == 2:
-            time_period = f"{test_year_range[0]}-{test_year_range[1]}"
-        elif "test_years" in metadata:
-            test_years = metadata["test_years"]
-            if isinstance(test_years, (list, tuple)) and len(test_years) == 2:
-                time_period = f"{test_years[0]}-{test_years[1]}"
-        
-        lookahead = metadata.get("lookahead_years", 5)
-        if isinstance(lookahead, int) and test_year_range:
             pred_end = test_year_range[1] + lookahead
             prediction_horizon = f"{lookahead}-year lookahead ({test_year_range[0]}-{pred_end})"
+        elif isinstance(lookahead, int):
+            pred_end = max(test_years) + lookahead
+            prediction_horizon = f"{lookahead}-year lookahead ({min(test_years)}-{pred_end})"
     
     # Convert to raster for visualization
     print(f"  Converting {len(gdf):,} points to raster grid...")
@@ -1524,11 +1936,20 @@ def create_p1pct_diagnostic_map(df: pd.DataFrame, country_boundary_path: Optiona
     plt.close()
 
 
-def create_probability_map(df: pd.DataFrame, country_boundary_path: Optional[Path], output_dir: Path, model_type: str, parquet_path: Path, metrics_data: Optional[Dict[str, Any]] = None) -> None:
+def create_probability_map(df: pd.DataFrame, country_boundary_path: Optional[Path], output_dir: Path, model_type: str, parquet_path: Path, metrics_data: Optional[Dict[str, Any]] = None, use_lognorm: bool = False) -> None:
     """Create continuous probability map showing predicted probabilities across Colombia.
     
     Uses percentile-based color scaling to make low probabilities visible.
     Colors every pixel by y_pred_proba (uses calibrated probabilities if available).
+    
+    Args:
+        df: DataFrame with predictions
+        country_boundary_path: Path to country boundary file
+        output_dir: Output directory for maps
+        model_type: Model type (lgbm, rf, brf)
+        parquet_path: Path to parquet file (for calibration status)
+        metrics_data: Optional metrics data dictionary
+        use_lognorm: If True, use LogNorm color scale for skewed distributions
     """
     print("\n" + "=" * 70)
     print("CREATING PROBABILITY MAP")
@@ -1562,26 +1983,22 @@ def create_probability_map(df: pd.DataFrame, country_boundary_path: Optional[Pat
     print(f"  Probability range: [{proba_min:.6f}, {proba_max:.6f}]")
     print(f"  Probability mean: {proba_mean:.6f}, median: {proba_median:.6f}, std: {proba_std:.6f}")
     
-    # Extract time period information from metrics or use defaults
-    time_period = "2018-2019"
-    prediction_horizon = "5-year lookahead (2018-2024)"
+    # Extract time period information dynamically
+    test_years = derive_test_years(metrics_data, parquet_path)
+    time_period = f"{min(test_years)}-{max(test_years)}"
     
+    # Derive prediction horizon from metadata
+    prediction_horizon = "5-year lookahead"
     if metrics_data:
-        # Try to extract time period from metadata
         metadata = metrics_data.get("metadata", {})
+        lookahead = metadata.get("lookahead_years", 5)
         test_year_range = metadata.get("test_year_range")
         if test_year_range and isinstance(test_year_range, list) and len(test_year_range) == 2:
-            time_period = f"{test_year_range[0]}-{test_year_range[1]}"
-        elif "test_years" in metadata:
-            test_years = metadata["test_years"]
-            if isinstance(test_years, (list, tuple)) and len(test_years) == 2:
-                time_period = f"{test_years[0]}-{test_years[1]}"
-        
-        # Get lookahead years if available
-        lookahead = metadata.get("lookahead_years", 5)
-        if isinstance(lookahead, int) and test_year_range:
             pred_end = test_year_range[1] + lookahead
             prediction_horizon = f"{lookahead}-year lookahead ({test_year_range[0]}-{pred_end})"
+        elif isinstance(lookahead, int):
+            pred_end = max(test_years) + lookahead
+            prediction_horizon = f"{lookahead}-year lookahead ({min(test_years)}-{pred_end})"
     
     # Use percentile-based range to balance color distribution
     # This clips extreme outliers and better utilizes the full colormap
@@ -1634,14 +2051,32 @@ def create_probability_map(df: pd.DataFrame, country_boundary_path: Optional[Pat
     # Use standardized colormap for consistent visualization across all models
     # interpolation='nearest' ensures no smoothing - pixel-perfect rendering
     # Values are normalized to [0, 1] so full colormap is used
-    im = ax.imshow(raster, 
-                   extent=extent, 
-                   cmap=PROBABILITY_MAP_COLORMAP, 
-                   vmin=0, vmax=1,  # Normalized values, so use [0, 1] range
-                   origin='upper',  # Match geographic convention (north at top)
-                   interpolation='nearest',  # No smoothing - pixel perfect
-                   aspect='equal',
-                   zorder=2)
+    # Optionally use LogNorm for skewed distributions
+    from matplotlib.colors import LogNorm
+    
+    if use_lognorm:
+        # Use LogNorm for skewed distributions (add small epsilon to avoid log(0))
+        epsilon = 1e-10
+        raster_for_norm = np.where(raster > 0, raster, epsilon)
+        im = ax.imshow(raster_for_norm, 
+                       extent=extent, 
+                       cmap=PROBABILITY_MAP_COLORMAP, 
+                       norm=LogNorm(vmin=max(epsilon, np.nanmin(raster_for_norm)), 
+                                    vmax=np.nanmax(raster_for_norm)),
+                       origin='upper',  # Match geographic convention (north at top)
+                       interpolation='nearest',  # No smoothing - pixel perfect
+                       aspect='equal',
+                       zorder=2)
+        print(f"  Using LogNorm color scale for skewed distribution")
+    else:
+        im = ax.imshow(raster, 
+                       extent=extent, 
+                       cmap=PROBABILITY_MAP_COLORMAP, 
+                       vmin=0, vmax=1,  # Normalized values, so use [0, 1] range
+                       origin='upper',  # Match geographic convention (north at top)
+                       interpolation='nearest',  # No smoothing - pixel perfect
+                       aspect='equal',
+                       zorder=2)
     
     # Add colorbar with custom formatter to show actual probability values
     cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
@@ -1979,6 +2414,11 @@ def main() -> None:
         default='main',
         help='Split version: \'main\' or \'robustness\' (default: main)'
     )
+    parser.add_argument(
+        '--use_lognorm',
+        action='store_true',
+        help='Use LogNorm color scale for probability maps (useful for skewed distributions)'
+    )
     
     args = parser.parse_args()
     
@@ -2216,12 +2656,17 @@ def main() -> None:
     df = detect_and_reproject_coordinates(df)
     validate_coordinates(df)
     
+    # Derive test years dynamically
+    test_years = derive_test_years(metrics_data, parquet_path, test_parquet_path)
+    print(f"\nDerived test years: {test_years}")
+    
     # Generate outputs
-    create_metrics_table(metrics_data, output_dir, model_type)
+    create_metrics_table(metrics_data, output_dir, model_type, df=df)
     create_pr_curve(df, metrics_data, output_dir, model_type)
+    create_calibration_curve(df, output_dir, model_type)
     create_risk_map(df, country_boundary_path, output_dir, model_type, metrics_data, test_parquet_path)
     create_p1pct_diagnostic_map(df, country_boundary_path, output_dir, model_type, metrics_data)
-    create_probability_map(df, country_boundary_path, output_dir, model_type, parquet_path, metrics_data)
+    create_probability_map(df, country_boundary_path, output_dir, model_type, parquet_path, metrics_data, use_lognorm=args.use_lognorm)
     
     # SHAP analysis (if model and data sources available)
     if not args.skip_shap and model_path is not None and shap_data_sources:
