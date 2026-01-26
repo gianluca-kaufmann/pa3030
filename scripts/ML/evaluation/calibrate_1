@@ -1059,42 +1059,69 @@ def main(
         
         if fold_idx is not None:
             print(f"\nFold information found ({len(np.unique(fold_idx))} folds).")
-        
-        if per_fold:
-            print("Using per-fold calibration (--per-fold flag set).")
-            # Per-fold calibration: isotonic cannot be averaged, so force Platt if isotonic requested
-            if calibration_method == "isotonic":
-                print("\n" + "!" * 70)
-                print("WARNING: Isotonic calibration cannot be averaged across folds.")
-                print("!" * 70)
-                print(f"\nCalibration method was set to '{calibration_method}', but --per-fold flag is set.")
-                print("Isotonic calibration requires guaranteed OOF predictions and cannot be averaged across folds.")
-                print("Automatically switching to Platt scaling (--method platt) for per-fold calibration.")
-                print("!" * 70 + "\n")
-                calibration_method = "platt"
-        else:
-            print("Using pooled calibration (--per-fold flag not set).")
-            print("\n" + "!" * 70)
-            print("NOTE: Fold information is available but pooled calibration is requested.")
-            print("!" * 70)
-            print("\nYou are using pooled calibration even though fold information exists.")
-            print("This assumes CV predictions are already OOF (pooled across folds).")
-            print("\nIf CV predictions contain in-sample predictions (rows used for training),")
-            print("calibration will overfit and produce misleading results.")
-            print("\nEnsure your CV predictions file contains only out-of-fold predictions:")
-            print("  - Each row should have exactly one prediction")
-            print("  - That prediction must come from a fold where the row was NOT used for training")
-            print("\nIf you want per-fold calibration instead, use --per-fold flag.")
-            print("!" * 70 + "\n")
             
-            # For pooled calibration with fold info, isotonic is allowed if assume_oof is set
+            if per_fold:
+                print("Using per-fold calibration (--per-fold flag set).")
+                # Per-fold calibration: isotonic cannot be averaged, so force Platt if isotonic requested
+                if calibration_method == "isotonic":
+                    print("\n" + "!" * 70)
+                    print("WARNING: Isotonic calibration cannot be averaged across folds.")
+                    print("!" * 70)
+                    print(f"\nCalibration method was set to '{calibration_method}', but --per-fold flag is set.")
+                    print("Isotonic calibration requires guaranteed OOF predictions and cannot be averaged across folds.")
+                    print("Automatically switching to Platt scaling (--method platt) for per-fold calibration.")
+                    print("!" * 70 + "\n")
+                    calibration_method = "platt"
+            else:
+                print("Using pooled calibration (--per-fold flag not set).")
+                print("\n" + "!" * 70)
+                print("NOTE: Fold information is available but pooled calibration is requested.")
+                print("!" * 70)
+                print("\nYou are using pooled calibration even though fold information exists.")
+                print("This assumes CV predictions are already OOF (pooled across folds).")
+                print("\nIf CV predictions contain in-sample predictions (rows used for training),")
+                print("calibration will overfit and produce misleading results.")
+                print("\nEnsure your CV predictions file contains only out-of-fold predictions:")
+                print("  - Each row should have exactly one prediction")
+                print("  - That prediction must come from a fold where the row was NOT used for training")
+                print("\nIf you want per-fold calibration instead, use --per-fold flag.")
+                print("!" * 70 + "\n")
+                
+                # For pooled calibration with fold info, isotonic is allowed if assume_oof is set
+                if calibration_method == "isotonic":
+                    if not assume_oof:
+                        error_msg = (
+                            "\nERROR: Isotonic calibration on pooled data requires --assume-oof flag.\n"
+                            "Isotonic calibration on non-OOF data can severely overfit.\n"
+                            "If you are certain the CV predictions are OOF, use --assume-oof flag.\n"
+                            "Alternatively, use --per-fold flag for per-fold calibration."
+                        )
+                        print(error_msg)
+                        raise ValueError(error_msg)
+                    
+                    # Big warning for isotonic + assume_oof
+                    print("Proceeding with --assume-oof flag (user confirmed OOF property).")
+                    print("\n" + "!" * 70)
+                    print("WARNING: ISOTONIC CALIBRATION WITH --assume-oof FLAG (POOLED)")
+                    print("!" * 70)
+                    print("\nYou are using isotonic calibration with --assume-oof flag on pooled data.")
+                    print("This is ONLY safe if CV predictions are guaranteed OOF by construction.")
+                    print("\nIf CV predictions contain in-sample predictions (rows used for training),")
+                    print("isotonic calibration will severely overfit and produce misleading results.")
+                    print("\nEnsure your CV predictions file contains only out-of-fold predictions:")
+                    print("  - Each row should have exactly one prediction")
+                    print("  - That prediction must come from a fold where the row was NOT used for training")
+                    print("!" * 70 + "\n")
+        else:
+            print("\nNo fold information found in CV predictions file.")
+            # Isotonic is only allowed when no fold info exists AND --assume-oof is set
             if calibration_method == "isotonic":
                 if not assume_oof:
                     error_msg = (
-                        "\nERROR: Isotonic calibration on pooled data requires --assume-oof flag.\n"
+                        "\nERROR: Cannot verify OOF property without fold information.\n"
                         "Isotonic calibration on non-OOF data can severely overfit.\n"
                         "If you are certain the CV predictions are OOF, use --assume-oof flag.\n"
-                        "Alternatively, use --per-fold flag for per-fold calibration."
+                        "Otherwise, ensure CV predictions include fold information for per-fold calibration."
                     )
                     print(error_msg)
                     raise ValueError(error_msg)
@@ -1102,9 +1129,9 @@ def main(
                 # Big warning for isotonic + assume_oof
                 print("Proceeding with --assume-oof flag (user confirmed OOF property).")
                 print("\n" + "!" * 70)
-                print("WARNING: ISOTONIC CALIBRATION WITH --assume-oof FLAG (POOLED)")
+                print("WARNING: ISOTONIC CALIBRATION WITH --assume-oof FLAG")
                 print("!" * 70)
-                print("\nYou are using isotonic calibration with --assume-oof flag on pooled data.")
+                print("\nYou are using isotonic calibration with --assume-oof flag.")
                 print("This is ONLY safe if CV predictions are guaranteed OOF by construction.")
                 print("\nIf CV predictions contain in-sample predictions (rows used for training),")
                 print("isotonic calibration will severely overfit and produce misleading results.")
@@ -1112,39 +1139,12 @@ def main(
                 print("  - Each row should have exactly one prediction")
                 print("  - That prediction must come from a fold where the row was NOT used for training")
                 print("!" * 70 + "\n")
-    else:
-        print("\nNo fold information found in CV predictions file.")
-        # Isotonic is only allowed when no fold info exists AND --assume-oof is set
-        if calibration_method == "isotonic":
-            if not assume_oof:
-                error_msg = (
-                    "\nERROR: Cannot verify OOF property without fold information.\n"
-                    "Isotonic calibration on non-OOF data can severely overfit.\n"
-                    "If you are certain the CV predictions are OOF, use --assume-oof flag.\n"
-                    "Otherwise, ensure CV predictions include fold information for per-fold calibration."
-                )
-                print(error_msg)
-                raise ValueError(error_msg)
-            
-            # Big warning for isotonic + assume_oof
-            print("Proceeding with --assume-oof flag (user confirmed OOF property).")
-            print("\n" + "!" * 70)
-            print("WARNING: ISOTONIC CALIBRATION WITH --assume-oof FLAG")
-            print("!" * 70)
-            print("\nYou are using isotonic calibration with --assume-oof flag.")
-            print("This is ONLY safe if CV predictions are guaranteed OOF by construction.")
-            print("\nIf CV predictions contain in-sample predictions (rows used for training),")
-            print("isotonic calibration will severely overfit and produce misleading results.")
-            print("\nEnsure your CV predictions file contains only out-of-fold predictions:")
-            print("  - Each row should have exactly one prediction")
-            print("  - That prediction must come from a fold where the row was NOT used for training")
-            print("!" * 70 + "\n")
-        else:
-            # Platt scaling doesn't require --assume-oof, but warn if it's set
-            if assume_oof:
-                print("Proceeding with --assume-oof flag (using pooled calibration).")
             else:
-                print("Proceeding with pooled calibration (no fold information available).")
+                # Platt scaling doesn't require --assume-oof, but warn if it's set
+                if assume_oof:
+                    print("Proceeding with --assume-oof flag (using pooled calibration).")
+                else:
+                    print("Proceeding with pooled calibration (no fold information available).")
     
     # Step 2: Load test predictions
     print("\n" + "=" * 70)
