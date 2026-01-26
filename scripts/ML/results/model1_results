@@ -1430,38 +1430,47 @@ def main() -> None:
     print()
     
     # Check both $SCRATCH and repo root for ml_models directory
+    # Build list of candidate directories to search (prioritize $SCRATCH, then repo root)
     ml_models_candidates = []
     if scratch_root is not None:
         ml_models_candidates.append(scratch_root / "outputs/Results/ml_models")
     ml_models_candidates.append(repo_root / "outputs/Results/ml_models")
     
-    # Find the first existing ml_models directory
-    ml_models_dir = None
-    for candidate in ml_models_candidates:
-        if candidate.exists():
-            ml_models_dir = candidate
-            print(f"Using ml_models directory: {ml_models_dir}")
-            break
+    # Also check if repo_root can be determined from script location (like training scripts do)
+    script_repo_root = Path(__file__).resolve().parents[3]
+    script_ml_models = script_repo_root / "outputs/Results/ml_models"
+    # Add if not already in the list (compare as strings to avoid Path comparison issues)
+    if str(script_ml_models) not in [str(c) for c in ml_models_candidates]:
+        ml_models_candidates.append(script_ml_models)
     
-    if ml_models_dir is None:
-        # Fallback to repo root if neither exists (will create later)
-        ml_models_dir = repo_root / "outputs/Results/ml_models"
-        print(f"WARNING: ml_models directory not found, will use: {ml_models_dir}")
+    print("Searching for ml_models directory in:")
+    for cand in ml_models_candidates:
+        exists = "✓" if cand.exists() else "✗"
+        print(f"  {exists} {cand}")
     print()
     
-    # Auto-discover files if not provided (search in root directory)
+    # Auto-discover files if not provided (search ALL candidate directories)
     if args.metrics_json:
         metrics_path = Path(args.metrics_json).resolve()
     else:
         print("Auto-discovering metrics JSON file...")
-        # Search in root ml_models directory (training scripts save there)
+        # Search in all candidate directories (training scripts may save to repo root)
         # find_latest_file will use correct pattern based on model_type
-        metrics_path = find_latest_file(f"model1_{args.model_type}_win5_metrics_*.json", ml_models_dir, args.split_version, args.model_type)
-        if metrics_path is not None:
-            print(f"  Found: {metrics_path}")
-        else:
+        metrics_path = None
+        for search_dir in ml_models_candidates:
+            if not search_dir.exists():
+                continue
+            found = find_latest_file(f"model1_{args.model_type}_win5_metrics_*.json", search_dir, args.split_version, args.model_type)
+            if found is not None:
+                metrics_path = found
+                print(f"  Found: {metrics_path}")
+                break
+        
+        if metrics_path is None:
             expected_pattern = "model1_lgbm_metrics_*.json" if args.model_type == 'lgbm' else "model1_rf_win5_metrics_*.json"
-            print(f"ERROR: Could not find {expected_pattern} in {ml_models_dir}")
+            print(f"ERROR: Could not find {expected_pattern} in any of the following directories:")
+            for cand in ml_models_candidates:
+                print(f"  - {cand}")
             print("Please provide --metrics_json path explicitly.")
             sys.exit(1)
     
@@ -1469,16 +1478,32 @@ def main() -> None:
         parquet_path = Path(args.scored_parquet).resolve()
     else:
         print("Auto-discovering scored parquet file...")
-        # Search in root ml_models directory (training scripts save there)
+        # Search in all candidate directories (training scripts may save to repo root)
         # find_latest_file will use correct pattern based on model_type
-        parquet_path = find_latest_file(f"model1_{args.model_type}_win5_scored*.parquet", ml_models_dir, args.split_version, args.model_type)
-        if parquet_path is not None:
-            print(f"  Found: {parquet_path}")
-        else:
+        parquet_path = None
+        for search_dir in ml_models_candidates:
+            if not search_dir.exists():
+                continue
+            found = find_latest_file(f"model1_{args.model_type}_win5_scored*.parquet", search_dir, args.split_version, args.model_type)
+            if found is not None:
+                parquet_path = found
+                print(f"  Found: {parquet_path}")
+                break
+        
+        if parquet_path is None:
             expected_pattern = "model1_lgbm_scored_*.parquet" if args.model_type == 'lgbm' else "model1_rf_win5_scored_*.parquet"
-            print(f"ERROR: Could not find {expected_pattern} in {ml_models_dir}")
+            print(f"ERROR: Could not find {expected_pattern} in any of the following directories:")
+            for cand in ml_models_candidates:
+                print(f"  - {cand}")
             print("Please provide --scored_parquet path explicitly.")
             sys.exit(1)
+    
+    # Determine ml_models_dir for output (use the directory where we found the files, or repo root as fallback)
+    ml_models_dir = repo_root / "outputs/Results/ml_models"
+    if metrics_path:
+        ml_models_dir = metrics_path.parent
+    print(f"Using ml_models directory: {ml_models_dir}")
+    print()
     
     # Auto-discover test parquet if not provided
     if args.test_parquet:
