@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=results_model1
+#SBATCH --job-name=benchmark_1_RF_robustness
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/results_model1_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/results_model1_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/benchmark_1_RF_robustness_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/benchmark_1_RF_robustness_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -33,21 +33,21 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the model1_results script (main split)
+# Run the benchmark_1 script with RF model type (robustness split)
 #------------------------------------------------------------------------------
-echo "Starting model1_results script (main split)..."
+echo "Starting benchmark_1 script (RF mode, robustness split)..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/results/model1_results" ] || {
-  echo "ERROR: model1_results not found"
-  echo "NOTE: model1_results script is in ML/results/ directory"
-  find scripts -maxdepth 4 -type f -name "model1_results"
+[ -f "scripts/ML/evaluation/benchmark_1" ] || {
+  echo "ERROR: benchmark_1 not found"
+  echo "NOTE: benchmark_1 script is in ML/evaluation/ directory"
+  find scripts -maxdepth 4 -type f -name "benchmark_1"
   exit 1
 }
-# Run the script (defaults to main split, LGBM model type, prefers calibrated predictions if available)
-python "scripts/ML/results/model1_results" --model_type lgbm --split-version main
+# Run the script (robustness split, RF model type)
+python "scripts/ML/evaluation/benchmark_1" --model_type rf --split-version robustness
 
-echo "model1_results script (main split) finished."
+echo "benchmark_1 script (RF mode, robustness split) finished."

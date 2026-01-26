@@ -47,7 +47,7 @@ echo "PWD = $(pwd)"
   find scripts -maxdepth 4 -type f -name "benchmark_1"
   exit 1
 }
-# Run the script (robustness split)
-python "scripts/ML/evaluation/benchmark_1" --split-version robustness
+# Run the script (robustness split, LGBM model type)
+python "scripts/ML/evaluation/benchmark_1" --model_type lgbm --split-version robustness
 
 echo "benchmark_1 script (robustness split) finished."

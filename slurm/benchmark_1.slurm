@@ -47,7 +47,7 @@ echo "PWD = $(pwd)"
   find scripts -maxdepth 4 -type f -name "benchmark_1"
   exit 1
 }
-# Run the script (defaults to main split)
-python "scripts/ML/evaluation/benchmark_1" --split-version main
+# Run the script (defaults to main split, LGBM model type)
+python "scripts/ML/evaluation/benchmark_1" --model_type lgbm --split-version main
 
 echo "benchmark_1 script (main split) finished."

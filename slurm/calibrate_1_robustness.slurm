@@ -51,7 +51,7 @@ echo "PWD = $(pwd)"
   find scripts -maxdepth 4 -type f -name "calibrate_1"
   exit 1
 }
-# Run the script (robustness split, temporal_cv source for LGBM, platt method)
-python "scripts/ML/evaluation/calibrate_1" --split-version robustness --method platt
+# Run the script (robustness split, LGBM model type, temporal_cv source, platt method)
+python "scripts/ML/evaluation/calibrate_1" --model_type lgbm --split-version robustness --method platt
 
 echo "calibrate_1 script (robustness split) finished."

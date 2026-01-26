@@ -7,8 +7,8 @@ Purpose: Generate comprehensive results report from model1_LGBM predictions:
          - Risk map showing South America boundary, top-1% predicted pixels, and observed PA establishments
          - Probability map showing continuous probability predictions across South America
 
-Input:   - model1_lgbm_win5_metrics_*.json
-         - model1_lgbm_win5_scored_*.parquet
+Input:   - model1_{model_type}_win5_metrics_*.json
+         - model1_{model_type}_win5_scored_*.parquet
          - test_win5.parquet (optional, auto-discovered if available)
 
 Note:    The risk map uses WDPA_b1 from original test data to correctly identify pixels
@@ -123,7 +123,7 @@ def check_calibration_status(parquet_path: Path, available_columns: list) -> Non
         print(f"{'!'*70}")
         print(f"  File: {parquet_path.name}")
         print(f"  No calibration metadata found (no 'y_pred_proba_uncalibrated'/'y_pred_proba_calibrated' columns)")
-        print(f"  For calibrated results, use: model1_lgbm_win5_scored_calibrated_*.parquet")
+        print(f"  For calibrated results, use: model1_<model_type>_win5_scored_calibrated_*.parquet")
         print(f"{'!'*70}\n")
 
 
@@ -1317,7 +1317,7 @@ def create_probability_map(df: pd.DataFrame, region_boundary_path: Optional[Path
     plt.close()
 
 
-def find_latest_file(pattern: str, search_dir: Path, split_version: str = 'main') -> Optional[Path]:
+def find_latest_file(pattern: str, search_dir: Path, split_version: str = 'main', model_type: str = 'lgbm') -> Optional[Path]:
     """Find the most recent file matching a pattern in a directory.
     
     Args:
@@ -1353,13 +1353,20 @@ def main() -> None:
         '--metrics_json',
         type=str,
         default=None,
-        help='Path to model1_lgbm_win5_metrics_*.json file (default: auto-discover latest in outputs/Results/ml_models/)'
+        help='Path to model1_{model_type}_win5_metrics_*.json file (default: auto-discover latest in outputs/Results/ml_models/)'
     )
     parser.add_argument(
         '--scored_parquet',
         type=str,
         default=None,
-        help='Path to model1_lgbm_win5_scored_*.parquet file (default: auto-discover latest in outputs/Results/ml_models/)'
+        help='Path to model1_{model_type}_win5_scored_*.parquet file (default: auto-discover latest in outputs/Results/ml_models/)'
+    )
+    parser.add_argument(
+        '--model_type',
+        type=str,
+        choices=['lgbm', 'rf'],
+        default='lgbm',
+        help='Model type: lgbm or rf (default: lgbm)'
     )
     parser.add_argument(
         '--out_dir',
@@ -1430,11 +1437,11 @@ def main() -> None:
     else:
         print("Auto-discovering metrics JSON file...")
         # Search in ml_models directory
-        metrics_path = find_latest_file("model1_lgbm_win5_metrics_*.json", ml_models_dir, args.split_version)
+        metrics_path = find_latest_file(f"model1_{args.model_type}_win5_metrics_*.json", ml_models_dir, args.split_version, args.model_type)
         if metrics_path is not None:
             print(f"  Found: {metrics_path}")
         else:
-            print(f"ERROR: Could not find model1_lgbm_win5_metrics_*.json in {ml_models_dir}/{args.split_version}")
+            print(f"ERROR: Could not find model1_{args.model_type}_win5_metrics_*.json in {ml_models_dir}/{args.split_version}")
             print("Please provide --metrics_json path explicitly.")
             sys.exit(1)
     
@@ -1443,11 +1450,11 @@ def main() -> None:
     else:
         print("Auto-discovering scored parquet file...")
         # Search in ml_models directory
-        parquet_path = find_latest_file("model1_lgbm_win5_scored*.parquet", ml_models_dir, args.split_version)
+        parquet_path = find_latest_file(f"model1_{args.model_type}_win5_scored*.parquet", ml_models_dir, args.split_version, args.model_type)
         if parquet_path is not None:
             print(f"  Found: {parquet_path}")
         else:
-            print(f"ERROR: Could not find model1_lgbm_win5_scored*.parquet in {ml_models_dir}/{args.split_version}")
+            print(f"ERROR: Could not find model1_{args.model_type}_win5_scored*.parquet in {ml_models_dir}/{args.split_version}")
             print("Please provide --scored_parquet path explicitly.")
             sys.exit(1)
     

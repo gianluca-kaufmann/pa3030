@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=results_model1
+#SBATCH --job-name=results_model1_RF_robustness
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/results_model1_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/results_model1_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/results_model1_RF_robustness_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/results_model1_RF_robustness_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -33,9 +33,9 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the model1_results script (main split)
+# Run the model1_results script with RF model type (robustness split)
 #------------------------------------------------------------------------------
-echo "Starting model1_results script (main split)..."
+echo "Starting model1_results script (RF mode, robustness split)..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
@@ -47,7 +47,7 @@ echo "PWD = $(pwd)"
   find scripts -maxdepth 4 -type f -name "model1_results"
   exit 1
 }
-# Run the script (defaults to main split, LGBM model type, prefers calibrated predictions if available)
-python "scripts/ML/results/model1_results" --model_type lgbm --split-version main
+# Run the script (robustness split, RF model type, prefers calibrated predictions if available)
+python "scripts/ML/results/model1_results" --model_type rf --split-version robustness
 
-echo "model1_results script (main split) finished."
+echo "model1_results script (RF mode, robustness split) finished."

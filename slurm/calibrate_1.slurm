@@ -51,7 +51,7 @@ echo "PWD = $(pwd)"
   find scripts -maxdepth 4 -type f -name "calibrate_1"
   exit 1
 }
-# Run the script (defaults to main split, temporal_cv source for LGBM, platt method)
-python "scripts/ML/evaluation/calibrate_1" --split-version main --method platt
+# Run the script (defaults to main split, LGBM model type, temporal_cv source, platt method)
+python "scripts/ML/evaluation/calibrate_1" --model_type lgbm --split-version main --method platt
 
 echo "calibrate_1 script (main split) finished."

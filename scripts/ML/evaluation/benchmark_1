@@ -5,7 +5,7 @@ Purpose: Extract final CV + test metrics from model1_LGBM training results,
          create a benchmark JSON file with metrics, features, params, seed, and dataset hash.
          Marks in-sample earlystop as NON-EVALUATIVE.
 
-Input:   - model1_lgbm_win5_metrics_*.json (most recent file from outputs/Results/ml_models)
+Input:   - model1_{model_type}_win5_metrics_*.json (most recent file from outputs/Results/ml_models)
          - train_win5.parquet, test_win5.parquet
            (for dataset hash computation; earlystop/val excluded)
 
@@ -152,14 +152,15 @@ def compute_dataset_hash(split_version: str = 'main', num_sample_row_groups: int
     return hashlib.sha256(hash_str.encode('utf-8')).hexdigest()
 
 
-def find_latest_metrics_file(output_dir: Path, split_version: str = 'main') -> Path:
-    """Find the most recent model1_lgbm_win5_metrics JSON file.
+def find_latest_metrics_file(output_dir: Path, model_type: str, split_version: str = 'main') -> Path:
+    """Find the most recent model1_{model_type}_win5_metrics JSON file.
     
     Parses timestamp from filename (format: YYYYMMDD_HHMMSS) and sorts by it.
     Falls back to modification time if timestamp cannot be parsed.
     
     Args:
         output_dir: Directory containing metrics files (split-specific)
+        model_type: Model type (lgbm or rf)
         split_version: Split version ('main' or 'robustness')
         
     Returns:
@@ -170,7 +171,7 @@ def find_latest_metrics_file(output_dir: Path, split_version: str = 'main') -> P
     """
     # Search in split-specific subdirectory
     split_output_dir = output_dir / split_version
-    pattern = "model1_lgbm_win5_metrics_*.json"
+    pattern = f"model1_{model_type}_win5_metrics_*.json"
     files = list(split_output_dir.glob(pattern))
     
     if not files:
@@ -178,8 +179,8 @@ def find_latest_metrics_file(output_dir: Path, split_version: str = 'main') -> P
     
     files = files
     
-    # Parse timestamp from filename: model1_lgbm_win5_metrics_YYYYMMDD_HHMMSS.json
-    timestamp_pattern = re.compile(r'model1_lgbm_win5_metrics_(\d{8}_\d{6})\.json')
+    # Parse timestamp from filename: model1_{model_type}_win5_metrics_YYYYMMDD_HHMMSS.json
+    timestamp_pattern = re.compile(rf'model1_{re.escape(model_type)}_win5_metrics_(\d{{8}}_\d{{6}})\.json')
     
     def get_timestamp_key(path: Path) -> tuple:
         """Return (timestamp_datetime, fallback_mtime) for sorting."""
@@ -287,7 +288,7 @@ def create_benchmark_json(metrics_data: Dict[str, Any], dataset_hash: str, sourc
     return benchmark
 
 
-def main(split_version: str = 'main') -> None:
+def main(model_type: str, split_version: str = 'main') -> None:
     repo_root = Path(__file__).resolve().parents[3]
     output_dir = repo_root / "outputs/Results/ml_models"
     # Create split-specific output directory
@@ -295,9 +296,10 @@ def main(split_version: str = 'main') -> None:
     benchmark_output_dir.mkdir(parents=True, exist_ok=True)
     
     print("=" * 70)
-    print(f"BENCHMARK EVALUATION: model1_LGBM (Split: {split_version})")
+    print(f"BENCHMARK EVALUATION: model1_{model_type.upper()} (Split: {split_version})")
     print("=" * 70)
     print(f"\nOutput directory: {benchmark_output_dir}")
+    print(f"Model type: {model_type}")
     print(f"Split version: {split_version}")
     if output_dir.exists():
         print(f"  ✓ Directory exists")
@@ -309,7 +311,7 @@ def main(split_version: str = 'main') -> None:
     print("STEP 1: FIND LATEST METRICS FILE")
     print("=" * 70)
     try:
-        metrics_path = find_latest_metrics_file(output_dir, split_version)
+        metrics_path = find_latest_metrics_file(output_dir, model_type, split_version)
         print(f"\nFound latest metrics file: {metrics_path.name}")
     except FileNotFoundError as e:
         print(f"\nERROR: {e}")
@@ -369,7 +371,7 @@ def main(split_version: str = 'main') -> None:
     print("STEP 5: SAVE BENCHMARK JSON")
     print("=" * 70)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    benchmark_path = benchmark_output_dir / f"model1_lgbm_win5_benchmark_{timestamp}.json"
+    benchmark_path = benchmark_output_dir / f"model1_{model_type}_win5_benchmark_{timestamp}.json"
     
     try:
         with open(benchmark_path, 'w') as f:
@@ -467,7 +469,14 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(
-        description="Benchmark evaluation script for model1_LGBM"
+        description="Benchmark evaluation script for model1 (LGBM, RF)"
+    )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        choices=["lgbm", "rf"],
+        default=os.environ.get("MODEL_TYPE", "lgbm"),
+        help="Model type: lgbm or rf (default: lgbm, or from MODEL_TYPE env var)"
     )
     parser.add_argument(
         "--split-version",
@@ -478,6 +487,11 @@ if __name__ == "__main__":
     )
     
     args = parser.parse_args()
+    model_type = args.model_type.lower()
+    
+    if model_type not in ["lgbm", "rf"]:
+        print(f"ERROR: Invalid model_type '{model_type}'. Must be one of: lgbm, rf")
+        sys.exit(1)
     
     repo_root = Path(__file__).resolve().parents[3]
     output_dir = repo_root / "outputs/Results/ml_models"
@@ -486,13 +500,13 @@ if __name__ == "__main__":
     split_output_dir.mkdir(parents=True, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = split_output_dir / f"benchmark_model1_lgbm_{timestamp}.txt"
+    output_file = split_output_dir / f"benchmark_model1_{model_type}_{timestamp}.txt"
     
     tee = Tee(output_file)
     sys.stdout = tee
     
     try:
-        main(args.split_version)
+        main(model_type, args.split_version)
     finally:
         sys.stdout = tee.stdout
         tee.close()

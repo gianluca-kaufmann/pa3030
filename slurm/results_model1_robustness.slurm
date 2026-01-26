@@ -47,7 +47,7 @@ echo "PWD = $(pwd)"
   find scripts -maxdepth 4 -type f -name "model1_results"
   exit 1
 }
-# Run the script (robustness split, prefers calibrated predictions if available)
-python "scripts/ML/results/model1_results" --split-version robustness
+# Run the script (robustness split, LGBM model type, prefers calibrated predictions if available)
+python "scripts/ML/results/model1_results" --model_type lgbm --split-version robustness
 
 echo "model1_results script (robustness split) finished."

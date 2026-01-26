@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=results_model1
+#SBATCH --job-name=calibrate_1_RF
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/results_model1_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/results_model1_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/calibrate_1_RF_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/calibrate_1_RF_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -15,6 +15,10 @@ mkdir -p "$SCRATCH/data"
 mkdir -p "$SCRATCH/data/ml"
 mkdir -p "$SCRATCH/outputs"
 mkdir -p "$SCRATCH/outputs/Tables"
+mkdir -p "$SCRATCH/outputs/Figures/calibrate"
+
+# Also create in repo if outputs are stored there
+mkdir -p "outputs/Figures/calibrate"
 
 #------------------------------------------------------------------------------
 # Load modules
@@ -33,21 +37,23 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the model1_results script (main split)
+# Run the calibrate_1 script with RF model type (main split)
 #------------------------------------------------------------------------------
-echo "Starting model1_results script (main split)..."
+echo "Starting calibrate_1 script (RF mode, main split)..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/results/model1_results" ] || {
-  echo "ERROR: model1_results not found"
-  echo "NOTE: model1_results script is in ML/results/ directory"
-  find scripts -maxdepth 4 -type f -name "model1_results"
+[ -f "scripts/ML/evaluation/calibrate_1" ] || {
+  echo "ERROR: calibrate_1 not found"
+  echo "NOTE: calibrate_1 script is in ML/evaluation/ directory"
+  find scripts -maxdepth 4 -type f -name "calibrate_1"
   exit 1
 }
-# Run the script (defaults to main split, LGBM model type, prefers calibrated predictions if available)
-python "scripts/ML/results/model1_results" --model_type lgbm --split-version main
+# Run the script (main split, RF model type, earlystop source for RF, platt method)
+# Note: RF doesn't have temporal CV, so we need to check if calibrate_1 supports earlystop
+# For now, using default (will need to check if RF training produces earlystop predictions)
+python "scripts/ML/evaluation/calibrate_1" --model_type rf --split-version main --method platt
 
-echo "model1_results script (main split) finished."
+echo "calibrate_1 script (RF mode, main split) finished."
