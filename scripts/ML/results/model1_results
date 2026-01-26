@@ -552,7 +552,7 @@ def get_south_america_boundary(region_boundary_path: Optional[Path] = None) -> g
             )
 
 
-def load_wdpa_from_test_parquet(test_parquet_path: Optional[Path]) -> Optional[pd.DataFrame]:
+def load_wdpa_from_test_parquet(test_parquet_path: Optional[Path], split_version: str = 'main') -> Optional[pd.DataFrame]:
     """Load WDPA_b1 data from original test parquet file for joining with scored data.
     
     This is needed because transition_01_win5 (y_true) is a 5-year lookahead target that doesn't
@@ -1317,19 +1317,30 @@ def create_probability_map(df: pd.DataFrame, region_boundary_path: Optional[Path
     plt.close()
 
 
-def find_latest_file(pattern: str, search_dir: Path) -> Optional[Path]:
-    """Find the most recent file matching a pattern in a directory."""
-    if not search_dir.exists():
+def find_latest_file(pattern: str, search_dir: Path, split_version: str = 'main') -> Optional[Path]:
+    """Find the most recent file matching a pattern in a directory.
+    
+    Args:
+        pattern: Glob pattern to match
+        search_dir: Base directory to search in
+        split_version: Split version subdirectory to search in ('main' or 'robustness')
+    
+    Returns:
+        Path to the most recent matching file, or None if not found
+    """
+    # Search in split-specific subdirectory
+    split_search_dir = search_dir / split_version
+    if not split_search_dir.exists():
         return None
     try:
-        matches = list(search_dir.glob(pattern))
+        matches = list(split_search_dir.glob(pattern))
         if not matches:
             return None
         # Sort by modification time, most recent first
         matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         return matches[0]
     except (OSError, PermissionError) as e:
-        print(f"  WARNING: Could not search in {search_dir}: {e}")
+        print(f"  WARNING: Could not search in {split_search_dir}: {e}")
         return None
 
 
@@ -1368,6 +1379,13 @@ def main() -> None:
         default=None,
         help='Path to original test_win5.parquet file (for loading WDPA_b1 data). If not provided, will try to auto-discover.'
     )
+    parser.add_argument(
+        '--split-version',
+        type=str,
+        choices=["main", "robustness"],
+        default="main",
+        help="Split version: 'main' or 'robustness' (default: main)"
+    )
     
     args = parser.parse_args()
     
@@ -1383,6 +1401,7 @@ def main() -> None:
         print(f"SCRATCH directory: {scratch_root}")
     else:
         print("SCRATCH directory: Not set (running locally)")
+    print(f"Split version: {args.split_version}")
     print()
     
     # Check both $SCRATCH and repo root for ml_models directory
@@ -1405,25 +1424,17 @@ def main() -> None:
         print(f"WARNING: ml_models directory not found, will use: {ml_models_dir}")
     print()
     
-    # Auto-discover files if not provided
+    # Auto-discover files if not provided (search in split-specific subdirectory)
     if args.metrics_json:
         metrics_path = Path(args.metrics_json).resolve()
     else:
         print("Auto-discovering metrics JSON file...")
-        # Search in all candidate directories
-        metrics_path = None
-        for search_dir in ml_models_candidates:
-            if search_dir.exists():
-                found = find_latest_file("model1_lgbm_win5_metrics_*.json", search_dir)
-                if found is not None:
-                    metrics_path = found
-                    print(f"  Found: {metrics_path}")
-                    break
-        
-        if metrics_path is None:
-            print(f"ERROR: Could not find model1_lgbm_win5_metrics_*.json in any of:")
-            for cand in ml_models_candidates:
-                print(f"  - {cand}")
+        # Search in ml_models directory
+        metrics_path = find_latest_file("model1_lgbm_win5_metrics_*.json", ml_models_dir, args.split_version)
+        if metrics_path is not None:
+            print(f"  Found: {metrics_path}")
+        else:
+            print(f"ERROR: Could not find model1_lgbm_win5_metrics_*.json in {ml_models_dir}/{args.split_version}")
             print("Please provide --metrics_json path explicitly.")
             sys.exit(1)
     
@@ -1431,20 +1442,12 @@ def main() -> None:
         parquet_path = Path(args.scored_parquet).resolve()
     else:
         print("Auto-discovering scored parquet file...")
-        # Search in all candidate directories
-        parquet_path = None
-        for search_dir in ml_models_candidates:
-            if search_dir.exists():
-                found = find_latest_file("model1_lgbm_win5_scored*.parquet", search_dir)
-                if found is not None:
-                    parquet_path = found
-                    print(f"  Found: {parquet_path}")
-                    break
-        
-        if parquet_path is None:
-            print(f"ERROR: Could not find model1_lgbm_win5_scored*.parquet in any of:")
-            for cand in ml_models_candidates:
-                print(f"  - {cand}")
+        # Search in ml_models directory
+        parquet_path = find_latest_file("model1_lgbm_win5_scored*.parquet", ml_models_dir, args.split_version)
+        if parquet_path is not None:
+            print(f"  Found: {parquet_path}")
+        else:
+            print(f"ERROR: Could not find model1_lgbm_win5_scored*.parquet in {ml_models_dir}/{args.split_version}")
             print("Please provide --scored_parquet path explicitly.")
             sys.exit(1)
     
@@ -1453,12 +1456,14 @@ def main() -> None:
         test_parquet_path = Path(args.test_parquet).resolve()
     else:
         print("Auto-discovering test parquet file...")
-        # Try to find test_win5.parquet in data/ml directory
+        # Try to find test_win5.parquet in data/ml directory (with split version)
         # Check both $SCRATCH and repo root
         candidates = []
         if scratch_root is not None:
-            candidates.append(scratch_root / "data/ml/test_win5.parquet")
-        candidates.append(repo_root / "data/ml/test_win5.parquet")
+            candidates.append(scratch_root / f"outputs/Results/{args.split_version}/test_win5.parquet")
+            candidates.append(scratch_root / f"data/ml/{args.split_version}/test_win5.parquet")
+        candidates.append(repo_root / f"outputs/Results/{args.split_version}/test_win5.parquet")
+        candidates.append(repo_root / f"data/ml/{args.split_version}/test_win5.parquet")
         
         test_parquet_path = None
         for cand in candidates:

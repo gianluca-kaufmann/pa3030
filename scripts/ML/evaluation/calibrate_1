@@ -102,15 +102,28 @@ def resolve_output_dir() -> Path:
     return output_dir
 
 
-def resolve_parquet_file(filename: str) -> Optional[Path]:
-    """Locate parquet file (prefer $SCRATCH if present)."""
+def resolve_parquet_file(filename: str, split_version: str = 'main') -> Optional[Path]:
+    """Locate parquet file (prefer $SCRATCH if present).
+    
+    Args:
+        filename: Name of the parquet file to locate
+        split_version: Split version ('main' or 'robustness')
+    
+    Returns:
+        Path to the file if found, None otherwise
+    """
     repo_root = get_repo_root()
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
 
     candidates = []
     if scratch_root is not None:
-        candidates.append(scratch_root / f"data/ml/{filename}")
-    candidates.append(repo_root / f"data/ml/{filename}")
+        # Check split-specific subdirectory first
+        candidates.append(scratch_root / f"outputs/Results/{split_version}/{filename}")
+        # Also check data/ml split-specific location
+        candidates.append(scratch_root / f"data/ml/{split_version}/{filename}")
+    # Check split-specific subdirectory in repo
+    candidates.append(repo_root / f"outputs/Results/{split_version}/{filename}")
+    candidates.append(repo_root / f"data/ml/{split_version}/{filename}")
 
     for cand in candidates:
         if cand.exists():
@@ -119,12 +132,26 @@ def resolve_parquet_file(filename: str) -> Optional[Path]:
     return None
 
 
-def find_latest_scored_file(output_dir: Path, pattern: str = "model1_lgbm_win5_scored_*.parquet") -> Path:
-    """Find the most recent scored parquet file."""
-    files = list(output_dir.glob(pattern))
+def find_latest_scored_file(output_dir: Path, pattern: str = "model1_lgbm_win5_scored_*.parquet", split_version: str = 'main') -> Path:
+    """Find the most recent scored parquet file.
+    
+    Args:
+        output_dir: Base output directory
+        pattern: Glob pattern for scored files
+        split_version: Split version ('main' or 'robustness')
+        
+    Returns:
+        Path to the most recent scored file
+    """
+    # Search in split-specific subdirectory
+    split_output_dir = output_dir / split_version
+    files = list(split_output_dir.glob(pattern))
+    
+    # Filter out already-calibrated files to prevent recursive calibration
+    files = [f for f in files if "calibrated" not in f.name]
     
     if not files:
-        raise FileNotFoundError(f"No scored files found in {output_dir} matching pattern {pattern}")
+        raise FileNotFoundError(f"No scored files found in {split_output_dir} matching pattern {pattern}")
     
     # Return most recent file (by modification time)
     latest = max(files, key=lambda p: p.stat().st_mtime)
@@ -869,7 +896,8 @@ def main(
     assume_oof: bool = False,
     per_fold: bool = False,
     require_temporal_cv: bool = False,
-    plot_binning: Literal["uniform", "quantile", "both"] = "both"
+    plot_binning: Literal["uniform", "quantile", "both"] = "both",
+    split_version: str = 'main'
 ) -> None:
     """Main calibration function.
     
@@ -877,14 +905,20 @@ def main(
         cv_predictions_path: Path to CV predictions parquet file. If None, attempts to find latest.
         test_predictions_path: Path to test predictions parquet file. If None, finds latest.
         calibration_method: Either "isotonic" or "platt"
+        split_version: Split version ('main' or 'robustness')
     """
-    output_dir = resolve_output_dir()
+    repo_root = get_repo_root()
+    output_dir = repo_root / "outputs/Results/ml_models"
+    # Create split-specific output directory
+    split_output_dir = output_dir / split_version
+    split_output_dir.mkdir(parents=True, exist_ok=True)
     
     print("=" * 70)
-    print("CALIBRATION: model1_LGBM")
+    print(f"CALIBRATION: model1_LGBM (Split: {split_version})")
     print("=" * 70)
-    print(f"\nCalibration method: {calibration_method}")
-    print(f"Output directory: {output_dir}")
+    print(f"\nSplit version: {split_version}")
+    print(f"Calibration method: {calibration_method}")
+    print(f"Output directory: {split_output_dir}")
     
     # Step 1: Load CV predictions
     print("\n" + "=" * 70)
@@ -897,8 +931,8 @@ def main(
         print("\nSearching for CV predictions file...")
         print("  Priority: temporal CV predictions (from training) > spatial CV predictions")
         
-        # First, look for temporal CV predictions (preferred)
-        temporal_cv_files = list(output_dir.glob("model1_lgbm_win5_temporal_cv_predictions_*.parquet"))
+        # First, look for temporal CV predictions (preferred) in split-specific directory
+        temporal_cv_files = list(split_output_dir.glob("model1_lgbm_win5_temporal_cv_predictions_*.parquet"))
         
         if temporal_cv_files:
             cv_predictions_path = max(temporal_cv_files, key=lambda p: p.stat().st_mtime)
@@ -915,10 +949,10 @@ def main(
                     "Please ensure temporal CV predictions are saved to outputs/Results/ml_models/."
                 )
             
-            # Fallback: look for other CV predictions (could be spatial CV)
+            # Fallback: look for other CV predictions (could be spatial CV) in split-specific directory
             other_cv_files = []
-            other_cv_files.extend(list(output_dir.glob("model1_lgbm_win5_cv_predictions_*.parquet")))
-            other_cv_files.extend(list(output_dir.glob("*cv_predictions*.parquet")))
+            other_cv_files.extend(list(split_output_dir.glob("model1_lgbm_win5_cv_predictions_*.parquet")))
+            other_cv_files.extend(list(split_output_dir.glob("*cv_predictions*.parquet")))
             
             if other_cv_files:
                 cv_predictions_path = max(other_cv_files, key=lambda p: p.stat().st_mtime)
@@ -1075,7 +1109,9 @@ def main(
     
     if test_predictions_path is None:
         try:
-            test_predictions_path = find_latest_scored_file(output_dir)
+            # Test predictions always use the scored pattern: model1_lgbm_win5_scored_*.parquet
+            test_pattern = "model1_lgbm_win5_scored_*.parquet"
+            test_predictions_path = find_latest_scored_file(output_dir, pattern=test_pattern, split_version=split_version)
             print(f"\nFound latest test predictions file: {test_predictions_path.name}")
         except FileNotFoundError as e:
             print(f"\nERROR: {e}")
@@ -1234,25 +1270,7 @@ def main(
     print("=" * 70)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    repo_root = get_repo_root()
-    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
-    
-    # Resolve figures directory (prefer $SCRATCH if present)
-    figures_candidates = []
-    if scratch_root is not None:
-        figures_candidates.append(scratch_root / "outputs/Figures")
-    figures_candidates.append(repo_root / "outputs/Figures")
-    
-    figures_dir = None
-    for cand in figures_candidates:
-        if cand.exists():
-            figures_dir = cand
-            break
-    
-    if figures_dir is None:
-        # If neither exists, use repo_root version and create it
-        figures_dir = repo_root / "outputs/Figures"
-    
+    figures_dir = repo_root / "outputs/Figures/calibrate"
     figures_dir.mkdir(parents=True, exist_ok=True)
     
     plot_paths = []  # Initialize outside try block for summary
@@ -1464,7 +1482,7 @@ def main(
     test_df_minimal['y_pred_proba_calibrated'] = y_test_calibrated
     test_df_minimal['y_pred_proba'] = y_test_calibrated  # Replace original with calibrated (for compatibility)
     
-    calibrated_test_path = output_dir / f"model1_lgbm_win5_scored_calibrated_{calibration_method}_{timestamp}.parquet"
+    calibrated_test_path = split_output_dir / f"model1_lgbm_win5_scored_calibrated_{calibration_method}_{timestamp}.parquet"
     try:
         test_df_minimal.to_parquet(calibrated_test_path, index=False)
         print(f"\nCalibrated test predictions saved: {calibrated_test_path.name}")
@@ -1474,7 +1492,7 @@ def main(
         sys.exit(1)
     
     # Save reliability plot data
-    reliability_plot_path = output_dir / f"model1_lgbm_win5_reliability_plot_{calibration_method}_{timestamp}.json"
+    reliability_plot_path = split_output_dir / f"model1_lgbm_win5_reliability_plot_{calibration_method}_{timestamp}.json"
     reliability_plot_data = {
         "metadata": {
             "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1522,7 +1540,7 @@ def main(
         sys.exit(1)
     
     # Save calibration metadata
-    calibration_metadata_path = output_dir / f"model1_lgbm_win5_calibration_{calibration_method}_{timestamp}.json"
+    calibration_metadata_path = split_output_dir / f"model1_lgbm_win5_calibration_{calibration_method}_{timestamp}.json"
     calibration_metadata = {
         "metadata": {
             "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1584,7 +1602,7 @@ def main(
         sys.exit(1)
     
     # Save Brier score summary
-    brier_summary_path = output_dir / f"model1_lgbm_win5_brier_summary_{calibration_method}_{timestamp}.txt"
+    brier_summary_path = split_output_dir / f"model1_lgbm_win5_brier_summary_{calibration_method}_{timestamp}.txt"
     try:
         save_brier_score_summary(
             brier_summary_path,
@@ -1693,13 +1711,24 @@ if __name__ == "__main__":
         default="both",
         help="Binning method for reliability plots: 'uniform', 'quantile', or 'both' (default: both)"
     )
+    parser.add_argument(
+        "--split-version",
+        type=str,
+        choices=["main", "robustness"],
+        default="main",
+        help="Split version: 'main' or 'robustness' (default: main)"
+    )
     
     args = parser.parse_args()
     
-    output_dir = resolve_output_dir()
+    repo_root = get_repo_root()
+    output_dir = repo_root / "outputs/Results/ml_models"
+    # Create split-specific output directory
+    split_output_dir = output_dir / args.split_version
+    split_output_dir.mkdir(parents=True, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"calibration_model1_lgbm_{args.method}_{timestamp}.txt"
+    output_file = split_output_dir / f"calibration_model1_lgbm_{args.method}_{timestamp}.txt"
     
     tee = Tee(output_file)
     sys.stdout = tee
@@ -1712,7 +1741,8 @@ if __name__ == "__main__":
             assume_oof=args.assume_oof,
             per_fold=args.per_fold,
             require_temporal_cv=args.require_temporal_cv,
-            plot_binning=args.plot_binning
+            plot_binning=args.plot_binning,
+            split_version=args.split_version
         )
     finally:
         sys.stdout = tee.stdout
