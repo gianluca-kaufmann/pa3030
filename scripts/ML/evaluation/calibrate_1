@@ -1009,10 +1009,15 @@ def main(
             temporal_cv_files = []
             for search_dir in search_dirs:
                 if search_dir.exists():
+                    # Look for files with _win5_ pattern (preferred)
                     files = list(search_dir.glob(f"model1_{model_type}_win5_temporal_cv_predictions_*.parquet"))
                     # CRITICAL: Filter out modelC files and ensure only model1 files
                     files = [f for f in files if "model1_" in f.name and "modelC" not in f.name and "model2" not in f.name]
                     temporal_cv_files.extend(files)
+                    # Also look for files without _win5_ pattern (for backward compatibility)
+                    files_alt = list(search_dir.glob(f"model1_{model_type}_temporal_cv_predictions_*.parquet"))
+                    files_alt = [f for f in files_alt if "model1_" in f.name and "modelC" not in f.name and "model2" not in f.name and "win5" not in f.name]
+                    temporal_cv_files.extend(files_alt)
             
             if temporal_cv_files:
                 cv_predictions_path = max(temporal_cv_files, key=lambda p: p.stat().st_mtime)
@@ -1048,12 +1053,21 @@ def main(
                 
                 if other_cv_files:
                     cv_predictions_path = max(other_cv_files, key=lambda p: p.stat().st_mtime)
-                    print(f"\nWARNING: Found CV predictions file (NOT temporal CV): {cv_predictions_path.name}")
-                    print("  This may be spatial CV predictions, which are NOT suitable for calibration.")
-                    print("  Spatial CV is for robustness/transfer checks, not for calibration.")
-                    print(f"  Temporal CV predictions should be named: model1_{model_type}_win5_temporal_cv_predictions_*.parquet")
-                    print("  Verified: model1 only (modelC files excluded)")
-                    print("\n  Proceeding with found file, but results may be suboptimal for calibration.")
+                    # Check if the file actually contains "temporal_cv_predictions" (may be missing _win5_)
+                    if "temporal_cv_predictions" in cv_predictions_path.name:
+                        print(f"\nFound TEMPORAL CV predictions file: {cv_predictions_path.name}")
+                        print("  Using temporal CV OOF predictions from training script (rolling folds)")
+                        if "_win5_" not in cv_predictions_path.name:
+                            print("  NOTE: File name is missing '_win5_' pattern but contains 'temporal_cv_predictions'.")
+                            print(f"  Expected pattern: model1_{model_type}_win5_temporal_cv_predictions_*.parquet")
+                        print("  Verified: model1 only (modelC files excluded)")
+                    else:
+                        print(f"\nWARNING: Found CV predictions file (NOT temporal CV): {cv_predictions_path.name}")
+                        print("  This may be spatial CV predictions, which are NOT suitable for calibration.")
+                        print("  Spatial CV is for robustness/transfer checks, not for calibration.")
+                        print(f"  Temporal CV predictions should be named: model1_{model_type}_win5_temporal_cv_predictions_*.parquet")
+                        print("  Verified: model1 only (modelC files excluded)")
+                        print("\n  Proceeding with found file, but results may be suboptimal for calibration.")
                 else:
                     error_msg = (
                         "CV predictions file not found. Please provide cv_predictions_path or ensure "
@@ -1176,19 +1190,19 @@ def main(
         if fold_idx is not None:
             unique_folds = np.unique(fold_idx)
             n_folds = len(unique_folds)
-            print(f"\nFold information found ({n_folds} folds): {sorted(unique_folds.tolist())}")
-            
-            # Check for sufficient folds
-            if n_folds < 2:
-                error_msg = (
-                    f"\nERROR: Insufficient folds for calibration ({n_folds} fold(s) found).\n"
-                    "Calibration requires at least 2 folds to ensure proper OOF evaluation.\n"
-                    "Please ensure CV predictions contain predictions from multiple temporal folds."
-                )
-                print(error_msg)
-                raise ValueError(error_msg)
+            print(f"\nFold information found ({n_folds} fold(s)): {sorted(unique_folds.tolist())}")
             
             if per_fold:
+                # Check for sufficient folds only when per-fold calibration is requested
+                if n_folds < 2:
+                    error_msg = (
+                        f"\nERROR: Insufficient folds for per-fold calibration ({n_folds} fold(s) found).\n"
+                        "Per-fold calibration requires at least 2 folds to ensure proper evaluation.\n"
+                        "Please ensure CV predictions contain predictions from multiple temporal folds,\n"
+                        "or use pooled calibration (remove --per-fold flag) if predictions are already OOF."
+                    )
+                    print(error_msg)
+                    raise ValueError(error_msg)
                 print("Using per-fold calibration (--per-fold flag set).")
                 # Per-fold calibration: isotonic cannot be averaged, so force Platt if isotonic requested
                 if calibration_method == "isotonic":
@@ -1202,19 +1216,28 @@ def main(
                     calibration_method = "platt"
             else:
                 print("Using pooled calibration (--per-fold flag not set).")
-                print("\n" + "!" * 70)
-                print("NOTE: Fold information is available but pooled calibration is requested.")
-                print("!" * 70)
-                print("\nYou are using pooled calibration even though fold information exists.")
-                print("This assumes CV predictions are already OOF (pooled across all temporal folds).")
-                print("\nVERIFICATION: Ensure CV predictions are true OOF:")
-                print("  - Each row should have exactly one prediction")
-                print("  - That prediction must come from a fold where the row was NOT used for training")
-                print("  - Predictions should be pooled across ALL temporal folds (not just one fold)")
-                print("\nIf CV predictions contain in-sample predictions (rows used for training),")
-                print("calibration will overfit and produce misleading results.")
-                print("\nIf you want per-fold calibration instead, use --per-fold flag.")
-                print("!" * 70 + "\n")
+                if n_folds == 1:
+                    print("\n" + "!" * 70)
+                    print("NOTE: Only 1 fold found - using pooled calibration on single fold.")
+                    print("!" * 70)
+                    print("\nYou are using pooled calibration with a single fold.")
+                    print("This is valid for calibration - the single fold's predictions will be used to fit the calibrator.")
+                    print("If you have multiple folds available, consider running all folds for better calibration.")
+                    print("!" * 70 + "\n")
+                else:
+                    print("\n" + "!" * 70)
+                    print("NOTE: Fold information is available but pooled calibration is requested.")
+                    print("!" * 70)
+                    print("\nYou are using pooled calibration even though fold information exists.")
+                    print("This assumes CV predictions are already OOF (pooled across all temporal folds).")
+                    print("\nVERIFICATION: Ensure CV predictions are true OOF:")
+                    print("  - Each row should have exactly one prediction")
+                    print("  - That prediction must come from a fold where the row was NOT used for training")
+                    print("  - Predictions should be pooled across ALL temporal folds (not just one fold)")
+                    print("\nIf CV predictions contain in-sample predictions (rows used for training),")
+                    print("calibration will overfit and produce misleading results.")
+                    print("\nIf you want per-fold calibration instead, use --per-fold flag.")
+                    print("!" * 70 + "\n")
                 
                 # For pooled calibration with fold info, isotonic is allowed if assume_oof is set
                 if calibration_method == "isotonic":
