@@ -1719,7 +1719,14 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
     plt.close()
 
 
-def create_p1pct_diagnostic_map(df: pd.DataFrame, country_boundary_path: Optional[Path], output_dir: Path, model_type: str, metrics_data: Optional[Dict[str, Any]] = None) -> None:
+def create_p1pct_diagnostic_map(
+    df: pd.DataFrame,
+    country_boundary_path: Optional[Path],
+    output_dir: Path,
+    model_type: str,
+    metrics_data: Optional[Dict[str, Any]] = None,
+    test_years: Optional[list] = None,
+) -> None:
     """Create diagnostic map showing row-level P@1% metric visualization.
     
     This map uses the EXACT same logic as the P@1% metric computation:
@@ -1792,9 +1799,12 @@ def create_p1pct_diagnostic_map(df: pd.DataFrame, country_boundary_path: Optiona
     }
     gdf['category_code'] = gdf['category'].map(category_codes)
     
-    # Extract time period information dynamically
-    test_years = derive_test_years(metrics_data)
-    time_period = f"{min(test_years)}-{max(test_years)}"
+    # Extract time period information (prefer explicitly provided test_years)
+    if test_years is not None and len(test_years) > 0:
+        test_years_list = sorted(int(y) for y in test_years)
+    else:
+        test_years_list = derive_test_years(metrics_data)
+    time_period = f"{min(test_years_list)}-{max(test_years_list)}"
     
     # Derive prediction horizon from metadata
     prediction_horizon = "5-year lookahead"
@@ -1806,8 +1816,8 @@ def create_p1pct_diagnostic_map(df: pd.DataFrame, country_boundary_path: Optiona
             pred_end = test_year_range[1] + lookahead
             prediction_horizon = f"{lookahead}-year lookahead ({test_year_range[0]}-{pred_end})"
         elif isinstance(lookahead, int):
-            pred_end = max(test_years) + lookahead
-            prediction_horizon = f"{lookahead}-year lookahead ({min(test_years)}-{pred_end})"
+            pred_end = max(test_years_list) + lookahead
+            prediction_horizon = f"{lookahead}-year lookahead ({min(test_years_list)}-{pred_end})"
     
     # Convert to raster for visualization
     print(f"  Converting {len(gdf):,} points to raster grid...")
@@ -2748,7 +2758,7 @@ def main() -> None:
     create_pr_curve(df, metrics_data, output_dir, model_type)
     create_calibration_curve(df, output_dir, model_type)
     create_risk_map(df, country_boundary_path, output_dir, model_type, metrics_data, test_parquet_path)
-    create_p1pct_diagnostic_map(df, country_boundary_path, output_dir, model_type, metrics_data)
+    create_p1pct_diagnostic_map(df, country_boundary_path, output_dir, model_type, metrics_data, test_years=test_years)
     create_probability_map(df, country_boundary_path, output_dir, model_type, parquet_path, metrics_data, use_lognorm=args.use_lognorm)
     
     # SHAP analysis (if model and data sources available)
