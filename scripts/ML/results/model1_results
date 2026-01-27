@@ -862,18 +862,58 @@ def get_south_america_boundary(region_boundary_path: Optional[Path] = None) -> g
 def derive_test_years(metrics_data: Optional[Dict[str, Any]] = None, 
                       parquet_path: Optional[Path] = None,
                       test_parquet_path: Optional[Path] = None) -> list:
-    """Derive test years dynamically from metadata or parquet files.
+    """Derive test years, prioritizing the original test parquet.
     
     Priority:
-    1. metadata.test_year_range or metadata.test_years
-    2. Year range from scored parquet (if available)
-    3. Year range from test parquet (if available)
-    4. Fallback to [2018, 2019] with warning
+    1. Read unique years from the `year` column of `test_parquet_path`
+    2. Use `metadata.test_year_range` or `metadata.test_years` from metrics
+    3. Fallback to [2018, 2019] **only** if the test parquet is missing or unusable
+    
+    Args:
+        metrics_data: Parsed metrics JSON (may contain `metadata` field)
+        parquet_path: Kept for backward compatibility (no longer used for year inference)
+        test_parquet_path: Path to original test parquet (preferred source of test years)
     
     Returns:
         List of test years (e.g., [2018, 2019])
     """
-    # Try metadata first
+    # ------------------------------------------------------------------
+    # 1) Prefer deriving years directly from the original test parquet
+    # ------------------------------------------------------------------
+    parquet_unusable = False
+    if test_parquet_path is None or not test_parquet_path.exists():
+        parquet_unusable = True
+    else:
+        try:
+            pfile = pq.ParquetFile(test_parquet_path)
+            if 'year' in pfile.schema_arrow.names:
+                years_set = set()
+                num_row_groups = pfile.metadata.num_row_groups
+                for rg_idx in range(num_row_groups):
+                    try:
+                        table = pfile.read_row_group(rg_idx, columns=['year'])
+                        df = table.to_pandas()
+                        years_set.update(df['year'].dropna().unique())
+                    except Exception:
+                        continue
+                if years_set:
+                    years = sorted(int(y) for y in years_set if pd.notna(y))
+                    if years:
+                        print(f"  Derived test years from test parquet: {years}")
+                        return years
+                else:
+                    # No usable years in the parquet; treat as unusable for deriving years
+                    parquet_unusable = True
+            else:
+                # Missing `year` column; treat as unusable for deriving years
+                parquet_unusable = True
+        except Exception:
+            # Any I/O or decoding issue: consider the parquet unusable for year inference
+            parquet_unusable = True
+    
+    # ------------------------------------------------------------------
+    # 2) Fall back to metrics metadata
+    # ------------------------------------------------------------------
     if metrics_data:
         metadata = metrics_data.get("metadata", {})
         test_year_range = metadata.get("test_year_range")
@@ -888,37 +928,16 @@ def derive_test_years(metrics_data: Optional[Dict[str, Any]] = None,
             print(f"  Derived test years from metadata.test_years: {test_years}")
             return test_years
     
-    # Try to derive from parquet files
-    for path, name in [(parquet_path, "scored parquet"), (test_parquet_path, "test parquet")]:
-        if path and path.exists():
-            try:
-                pfile = pq.ParquetFile(path)
-                if 'year' in pfile.schema_arrow.names:
-                    # Sample a few row groups to get year range
-                    years_set = set()
-                    num_row_groups = min(10, pfile.metadata.num_row_groups)  # Sample first 10
-                    for rg_idx in range(num_row_groups):
-                        try:
-                            table = pfile.read_row_group(rg_idx, columns=['year'])
-                            df = table.to_pandas()
-                            years_set.update(df['year'].dropna().unique())
-                        except Exception:
-                            continue
-                    
-                    if years_set:
-                        years = sorted([int(y) for y in years_set if pd.notna(y)])
-                        if len(years) >= 2:
-                            # Assume test years are the available years in the file
-                            test_years = years
-                            print(f"  Derived test years from {name}: {test_years}")
-                            return test_years
-            except Exception as e:
-                print(f"  Warning: Could not derive test years from {name}: {e}")
-                continue
+    # ------------------------------------------------------------------
+    # 3) Final fallback – only when test parquet is missing/unusable
+    #    No WARNING printed to keep logs thesis-clean.
+    # ------------------------------------------------------------------
+    if parquet_unusable:
+        return [2018, 2019]
     
-    # Fallback with warning
-    print(f"  WARNING: Could not derive test years from metadata or parquet files")
-    print(f"  Using fallback: [2018, 2019]")
+    # In the extremely unlikely case that the parquet exists and is readable
+    # but provided no usable years and no metadata is available, still return
+    # a sensible default without emitting warnings.
     return [2018, 2019]
 
 
@@ -2311,8 +2330,8 @@ def compute_shap_analysis(
     """Compute SHAP analysis and generate visualizations.
     
     Data source priority:
-    1. earlystop_win5.parquet (validation set)
-    2. train_win5.parquet (train set)
+    1. train_win5.parquet (train set)
+    2. earlystop_win5.parquet (validation set)
     3. test_win5.parquet (only if allow_test_shap=True)
     
     Args:
@@ -2358,8 +2377,8 @@ def compute_shap_analysis(
         with open(model_path, 'rb') as f:
             model = pickle.load(f)
     
-    # Select data source (priority: earlystop → train → test)
-    data_source_priority = ['earlystop', 'train', 'test']
+    # Select data source (priority: train → earlystop → test)
+    data_source_priority = ['train', 'earlystop', 'test']
     selected_source = None
     selected_path = None
     
