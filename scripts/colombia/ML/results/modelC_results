@@ -2262,13 +2262,23 @@ def compute_shap_analysis(
         shap_values = explainer.shap_values(X_shap, check_additivity=False)
     print(f"  SHAP values computed: shape {shap_values.shape}")
     
-    # For binary classification, shap_values might be a list [neg_class, pos_class]
-    # or a single array for positive class - handle both cases
+    # For binary classification, shap_values can be:
+    # - a list [neg_class, pos_class]
+    # - a 2D array (n_samples, n_features) for the positive class
+    # - a 3D array (n_samples, n_features, n_classes) for tree ensembles (e.g. RF)
+    # In all cases we want the SHAP values for the positive class only.
     if isinstance(shap_values, list):
-        # Use positive class SHAP values (index 1)
+        # Typical LightGBM / tree-ensemble multi-output: list per class
         shap_values_pos = shap_values[1] if len(shap_values) > 1 else shap_values[0]
     else:
-        shap_values_pos = shap_values
+        # Array output; handle possible extra class dimension
+        if shap_values.ndim == 3:
+            # Shape (n_samples, n_features, n_classes) -> select positive class (index 1 if available)
+            class_idx = 1 if shap_values.shape[-1] > 1 else shap_values.shape[-1] - 1
+            shap_values_pos = shap_values[:, :, class_idx]
+        else:
+            # Already (n_samples, n_features) for the positive class
+            shap_values_pos = shap_values
     
     # Generate SHAP summary plot
     print(f"  Generating SHAP summary plot...")
