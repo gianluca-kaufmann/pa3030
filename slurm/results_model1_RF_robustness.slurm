@@ -48,6 +48,7 @@ echo "PWD = $(pwd)"
   exit 1
 }
 # Run the script (robustness split, RF model type, prefers calibrated predictions if available)
-python "scripts/ML/results/model1_results" --model_type rf --split-version robustness
+# --allow_test_shap: use test set for SHAP when earlystop/train unavailable
+python "scripts/ML/results/model1_results" --model_type rf --split-version robustness --allow_test_shap
 
 echo "model1_results script (RF mode, robustness split) finished."

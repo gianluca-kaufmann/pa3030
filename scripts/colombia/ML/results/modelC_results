@@ -2270,9 +2270,34 @@ def compute_shap_analysis(
     # Percentage of positive SHAP values per feature
     pct_shap_positive = (shap_values_pos > 0).mean(axis=0) * 100
     
+    # Ensure all arrays are 1D and aligned to avoid pandas "Per-column arrays must each be 1-dimensional" errors
+    mean_abs_shap = np.asarray(mean_abs_shap).ravel()
+    mean_shap = np.asarray(mean_shap).ravel()
+    pct_shap_positive = np.asarray(pct_shap_positive).ravel()
+    
+    # Flatten / sanitize feature names (RF can sometimes store nested structures)
+    if isinstance(feature_cols, np.ndarray):
+        feature_cols_safe = feature_cols.ravel().tolist()
+    else:
+        feature_cols_safe = list(feature_cols)
+    feature_cols_safe = [str(f) for f in feature_cols_safe]
+    
+    n_features = mean_abs_shap.shape[0]
+    if len(feature_cols_safe) != n_features:
+        print("\n" + "!" * 70)
+        print("WARNING: Mismatch between number of SHAP features and feature names")
+        print(f"  len(feature_cols)={len(feature_cols_safe)}, n_features_from_shap={n_features}")
+        print("  Truncating to the minimum length for SHAP importance table.")
+        print("!" * 70)
+        min_len = min(len(feature_cols_safe), n_features)
+        feature_cols_safe = feature_cols_safe[:min_len]
+        mean_abs_shap = mean_abs_shap[:min_len]
+        mean_shap = mean_shap[:min_len]
+        pct_shap_positive = pct_shap_positive[:min_len]
+    
     # Create DataFrame with top 20 features
     shap_importance_df = pd.DataFrame({
-        'feature': feature_cols,
+        'feature': feature_cols_safe,
         'mean_abs_shap': mean_abs_shap,
         'mean_shap': mean_shap,
         'pct_shap_positive': pct_shap_positive
