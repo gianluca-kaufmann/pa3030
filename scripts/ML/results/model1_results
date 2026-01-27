@@ -36,7 +36,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Sequence
 
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend
@@ -1197,7 +1197,15 @@ def points_to_raster(x: np.ndarray, y: np.ndarray, values: np.ndarray,
     return raster, extent
 
 
-def create_risk_map(df: pd.DataFrame, region_boundary_path: Optional[Path], output_dir: Path, model_type: str, metrics_data: Optional[Dict[str, Any]] = None, test_parquet_path: Optional[Path] = None) -> None:
+def create_risk_map(
+    df: pd.DataFrame,
+    region_boundary_path: Optional[Path],
+    output_dir: Path,
+    model_type: str,
+    metrics_data: Optional[Dict[str, Any]] = None,
+    test_parquet_path: Optional[Path] = None,
+    test_years: Optional[Sequence[int]] = None,
+) -> None:
     """Create risk map showing South America boundary, top-1% predicted pixels, and observed positives.
     
     Uses distinct colors for three categories:
@@ -1210,6 +1218,17 @@ def create_risk_map(df: pd.DataFrame, region_boundary_path: Optional[Path], outp
     correctly shown even though transition_01_win5 doesn't mark the actual year of establishment.
     
     Optionally shows existing protected areas (as of end of 2017) if wdpa_b1 column is present.
+
+    Args:
+        df: Scored prediction DataFrame.
+        region_boundary_path: Optional path to South America boundary.
+        output_dir: Directory where figures will be written.
+        model_type: Model name (rf, lgbm, brf).
+        metrics_data: Optional metrics/metadata dictionary.
+        test_parquet_path: Path to original test parquet (e.g. *test_win5.parquet*).
+        test_years: Explicit list of test years. If not provided, they will be
+            derived from `test_parquet_path` (and, if needed, from metadata)
+            using `derive_test_years`.
     """
     print("\n" + "=" * 70)
     print("CREATING RISK MAP")
@@ -1251,8 +1270,9 @@ def create_risk_map(df: pd.DataFrame, region_boundary_path: Optional[Path], outp
     # Load WDPA data from original test parquet if available
     # This is needed to correctly identify pixels that were established in each year
     # (since transition_01_win5 is a 5-year lookahead target, it doesn't mark the actual year of establishment)
-    # Derive test years from metrics or parquet
-    test_years = derive_test_years(metrics_data, None, test_parquet_path)
+    # Prefer explicitly provided test years; otherwise derive them from the test parquet
+    if test_years is None or len(test_years) == 0:
+        test_years = derive_test_years(metrics_data, None, test_parquet_path)
     wdpa_test_df = load_wdpa_from_test_parquet(test_parquet_path, test_years)
     
     # Join WDPA data from test parquet if available
@@ -1260,6 +1280,10 @@ def create_risk_map(df: pd.DataFrame, region_boundary_path: Optional[Path], outp
     # 1. Establishment flag for correctly identifying pixels established in 2018-2019
     # 2. WDPA_prev for two-layer protection visualization (temporal dynamics)
     # 3. newly_protected_in_test_period for test-year-specific protection layer
+    wdpa_join_method: Optional[str] = None
+    wdpa_has_b1_actual: bool = False
+    wdpa_has_established_flag: bool = False
+    
     if wdpa_test_df is not None:
         print(f"\n  {'='*70}")
         print(f"  WDPA DATA LOADED SUCCESSFULLY FROM TEST PARQUET")
@@ -1272,6 +1296,9 @@ def create_risk_map(df: pd.DataFrame, region_boundary_path: Optional[Path], outp
         if 'established_2018_2019' in wdpa_test_df.columns:
             data_cols_to_join.append('established_2018_2019')
             print(f"  Will join: established_2018_2019 (for observed positives)")
+        if 'established_in_test_period' in wdpa_test_df.columns:
+            data_cols_to_join.append('established_in_test_period')
+            print(f"  Will join: established_in_test_period (for observed positives aggregated over test years)")
         if 'newly_protected_in_test_period' in wdpa_test_df.columns:
             data_cols_to_join.append('newly_protected_in_test_period')
             print(f"  Will join: newly_protected_in_test_period (for test-year-specific protection layer)")
@@ -1326,6 +1353,7 @@ def create_risk_map(df: pd.DataFrame, region_boundary_path: Optional[Path], outp
             if 'established_2018_2019' in df.columns:
                 df['established_2018_2019'] = df['established_2018_2019'].fillna(0).astype(int)
                 df['WDPA_b1_actual'] = df['established_2018_2019']
+                wdpa_has_b1_actual = True
                 print(f"  Joined establishment flag using {join_method}: {(df['WDPA_b1_actual'] == 1).sum():,} pixels")
             else:
                 df['established_2018_2019'] = 0
@@ -1343,9 +1371,15 @@ def create_risk_map(df: pd.DataFrame, region_boundary_path: Optional[Path], outp
                 # Rename if we got it from test parquet with suffix
                 df['wdpa_b1'] = df['WDPA_b1_test'].fillna(0).astype(int)
                 df = df.drop(columns=['WDPA_b1_test'])
+            
+            if 'established_in_test_period' in df.columns:
+                df['established_in_test_period'] = df['established_in_test_period'].fillna(0).astype(int)
+                wdpa_has_established_flag = True
+                print(f"  Joined established_in_test_period using {join_method}: {(df['established_in_test_period'] == 1).sum():,} pixels")
         else:
             df['established_2018_2019'] = 0
             df['WDPA_b1_actual'] = 0
+        wdpa_join_method = join_method
     else:
         print(f"\n  {'!'*70}")
         print(f"  WARNING: WDPA ESTABLISHMENT DATA NOT LOADED")
@@ -1357,7 +1391,7 @@ def create_risk_map(df: pd.DataFrame, region_boundary_path: Optional[Path], outp
         else:
             print(f"  Reason: Establishment flag 'established_2018_2019' not found in WDPA test data")
             print(f"  Available columns in WDPA test data: {list(wdpa_test_df.columns)}")
-            print(f"  Impact: Using y_true only for observed positives (may undercount establishments)")
+        print(f"  Impact: Using y_true only for observed positives (may undercount establishments)")
         print(f"  {'!'*70}")
         df['WDPA_b1_actual'] = 0
     
@@ -1366,18 +1400,35 @@ def create_risk_map(df: pd.DataFrame, region_boundary_path: Optional[Path], outp
     print(f"  Top-1% threshold: {top1pct_threshold:.6f}")
     
     # Identify categories
-    # Use WDPA_b1_actual = 1 OR y_true = 1 as indicator of observed positives
-    # This fixes the issue where pixels established in 2018 have y_true=0 (due to 5-year lookahead logic)
-    # but should still be shown as observed positives
+    # Use WDPA_b1_actual = 1 OR y_true = 1 as indicator of observed positives when
+    # WDPA_b1-based establishment data was successfully joined. Otherwise, fall back
+    # to the aggregated establishment flag (established_in_test_period) if available,
+    # and finally to y_true only.
     gdf['is_top1pct'] = df['y_pred_proba'] >= top1pct_threshold
-    gdf['is_positive'] = (df['y_true'] == 1) | (df['WDPA_b1_actual'] == 1)
+    
+    if wdpa_has_b1_actual and 'WDPA_b1_actual' in df.columns:
+        observed_flag = (df['WDPA_b1_actual'] == 1)
+    elif wdpa_has_established_flag and 'established_in_test_period' in df.columns:
+        observed_flag = (df['established_in_test_period'] == 1)
+    else:
+        observed_flag = (df['y_true'] == 1)
+    
+    gdf['is_positive'] = (df['y_true'] == 1) | observed_flag
     
     # Log statistics
     y_true_positives = (df['y_true'] == 1).sum()
-    wdpa_positives = (df['WDPA_b1_actual'] == 1).sum()
     combined_positives = gdf['is_positive'].sum()
-    print(f"  Observed PA establishments: y_true={y_true_positives:,}, WDPA_b1_actual={wdpa_positives:,}, combined={combined_positives:,}")
-    print(f"  Note: Combined uses WDPA_b1_actual=1 OR y_true=1 to correctly identify pixels established in each year")
+    
+    if wdpa_has_b1_actual and 'WDPA_b1_actual' in df.columns:
+        wdpa_positives = (df['WDPA_b1_actual'] == 1).sum()
+        print(f"  Observed PA establishments: y_true={y_true_positives:,}, WDPA_b1_actual={wdpa_positives:,}, combined={combined_positives:,}")
+        print(f"  Note: Combined uses WDPA_b1_actual=1 OR y_true=1 to correctly identify pixels established in each year")
+    elif wdpa_has_established_flag and 'established_in_test_period' in df.columns:
+        estab_positives = (df['established_in_test_period'] == 1).sum()
+        print(f"  Observed PA establishments: y_true={y_true_positives:,}, established_in_test_period={estab_positives:,}, combined={combined_positives:,}")
+        print(f"  Note: Combined uses established_in_test_period=1 OR y_true=1 to identify pixels established in the test period")
+    else:
+        print(f"  Observed PA establishments (y_true only): y_true={y_true_positives:,}, combined={combined_positives:,}")
     
     # Create three distinct categories
     gdf['category'] = 'none'
@@ -2017,11 +2068,32 @@ def create_p1pct_diagnostic_map(
     plt.close()
 
 
-def create_probability_map(df: pd.DataFrame, region_boundary_path: Optional[Path], output_dir: Path, model_type: str, parquet_path: Path, metrics_data: Optional[Dict[str, Any]] = None) -> None:
+def create_probability_map(
+    df: pd.DataFrame,
+    region_boundary_path: Optional[Path],
+    output_dir: Path,
+    model_type: str,
+    parquet_path: Path,
+    metrics_data: Optional[Dict[str, Any]] = None,
+    test_years: Optional[Sequence[int]] = None,
+    test_parquet_path: Optional[Path] = None,
+) -> None:
     """Create continuous probability map showing predicted probabilities across South America.
     
     Uses percentile-based color scaling to make low probabilities visible.
     Colors every pixel by y_pred_proba (uses calibrated probabilities if available).
+
+    Args:
+        df: DataFrame with predictions.
+        region_boundary_path: Path to South America boundary.
+        output_dir: Output directory for maps.
+        model_type: Model type (rf, lgbm, brf).
+        parquet_path: Path to scored parquet file (for calibration status, etc.).
+        metrics_data: Optional metrics/metadata dictionary.
+        test_years: Explicit list of test years. If not provided, years will be
+            derived dynamically from parquet/metadata using `derive_test_years`.
+        test_parquet_path: Optional path to original test parquet (e.g. *test_win5.parquet*),
+            used when deriving `test_years` if they are not passed explicitly.
     """
     print("\n" + "=" * 70)
     print("CREATING PROBABILITY MAP")
@@ -2055,26 +2127,28 @@ def create_probability_map(df: pd.DataFrame, region_boundary_path: Optional[Path
     print(f"  Probability range: [{proba_min:.6f}, {proba_max:.6f}]")
     print(f"  Probability mean: {proba_mean:.6f}, median: {proba_median:.6f}, std: {proba_std:.6f}")
     
-    # Extract time period information from metrics or use defaults
-    time_period = "2018-2019"
-    prediction_horizon = "5-year lookahead (2018-2024)"
+    # Extract time period information dynamically
+    # Prefer explicitly provided test years; if not available, derive them from parquet/metadata
+    if test_years is not None and len(test_years) > 0:
+        test_years_list = sorted(int(y) for y in test_years)
+    else:
+        # When not explicitly provided, allow derive_test_years to inspect
+        # scored parquet and/or original test parquet (if given)
+        test_years_list = derive_test_years(metrics_data, parquet_path, test_parquet_path)
+    time_period = f"{min(test_years_list)}-{max(test_years_list)}"
     
+    # Derive prediction horizon from metadata
+    prediction_horizon = "5-year lookahead"
     if metrics_data:
-        # Try to extract time period from metadata
         metadata = metrics_data.get("metadata", {})
+        lookahead = metadata.get("lookahead_years", 5)
         test_year_range = metadata.get("test_year_range")
         if test_year_range and isinstance(test_year_range, list) and len(test_year_range) == 2:
-            time_period = f"{test_year_range[0]}-{test_year_range[1]}"
-        elif "test_years" in metadata:
-            test_years = metadata["test_years"]
-            if isinstance(test_years, (list, tuple)) and len(test_years) == 2:
-                time_period = f"{test_years[0]}-{test_years[1]}"
-        
-        # Get lookahead years if available
-        lookahead = metadata.get("lookahead_years", 5)
-        if isinstance(lookahead, int) and test_year_range:
             pred_end = test_year_range[1] + lookahead
             prediction_horizon = f"{lookahead}-year lookahead ({test_year_range[0]}-{pred_end})"
+        elif isinstance(lookahead, int):
+            pred_end = max(test_years_list) + lookahead
+            prediction_horizon = f"{lookahead}-year lookahead ({min(test_years_list)}-{pred_end})"
     
     # Use percentile-based range to balance color distribution
     # This clips extreme outliers and better utilizes the full colormap
@@ -2444,6 +2518,52 @@ def find_latest_file(pattern: str, search_dir: Path, split_version: str = 'main'
         return None
 
 
+def find_latest_file_in_dirs(
+    pattern: str,
+    search_dirs: list[Path],
+    exclude_substr: Optional[str] = None
+) -> Optional[Path]:
+    """Find the most recent file matching a pattern across multiple directories.
+    
+    This is used for calibrated scored files, which are saved in split-specific
+    subdirectories (e.g., outputs/Results/ml_models/main/), in addition to the
+    root ml_models directory where training scripts write uncalibrated scores.
+    
+    Args:
+        pattern: Glob pattern to match files (no automatic rewriting).
+        search_dirs: List of directories to search in.
+        exclude_substr: Optional substring to exclude from matches (case-insensitive).
+    
+    Returns:
+        Path to most recent matching file, or None if no matches.
+    """
+    # IMPORTANT: Respect directory precedence.
+    # We want split-specific directories to take priority over root when both
+    # contain matches, and we must never accidentally select a cross-split file
+    # just because it is newer.
+    for search_dir in search_dirs:
+        if not search_dir.exists():
+            continue
+        try:
+            matches = list(search_dir.glob(pattern))
+        except (OSError, PermissionError) as e:
+            print(f"  WARNING: Could not search in {search_dir}: {e}")
+            continue
+        
+        if exclude_substr:
+            matches = [m for m in matches if exclude_substr.lower() not in m.name.lower()]
+        
+        if not matches:
+            continue
+        
+        # Within this directory, pick the most recent file, but never fall back
+        # to later directories if we already have at least one match here.
+        matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        return matches[0]
+    
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate comprehensive results report for model1_LGBM",
@@ -2492,6 +2612,11 @@ def main() -> None:
         choices=["main", "robustness"],
         default="main",
         help="Split version: 'main' or 'robustness' (default: main)"
+    )
+    parser.add_argument(
+        '--allow-uncalibrated',
+        action='store_true',
+        help='Allow using uncalibrated scored parquet if no calibrated LGBM file is found (LGBM only)'
     )
     parser.add_argument(
         '--allow_test_shap',
@@ -2595,25 +2720,76 @@ def main() -> None:
         parquet_path = Path(args.scored_parquet).resolve()
     else:
         print("Auto-discovering scored parquet file...")
-        # Search in all candidate directories (training scripts may save to repo root)
-        # find_latest_file will use correct pattern based on model_type
         parquet_path = None
-        for search_dir in ml_models_candidates:
-            if not search_dir.exists():
-                continue
-            found = find_latest_file(f"model1_{args.model_type}_win5_scored*.parquet", search_dir, args.split_version, args.model_type)
-            if found is not None:
-                parquet_path = found
-                print(f"  Found: {parquet_path}")
-                break
         
-        if parquet_path is None:
-            expected_pattern = "model1_lgbm_scored_*.parquet" if args.model_type == 'lgbm' else "model1_rf_win5_scored_*.parquet"
-            print(f"ERROR: Could not find {expected_pattern} in any of the following directories:")
-            for cand in ml_models_candidates:
-                print(f"  - {cand}")
-            print("Please provide --scored_parquet path explicitly.")
-            sys.exit(1)
+        if args.model_type == 'lgbm':
+            # For LGBM, prefer calibrated scores written by `calibrate_1`:
+            #   outputs/Results/ml_models/<split-version>/model1_lgbm_scored_calibrated_*.parquet
+            # Fall back to raw scores only when --allow-uncalibrated is set.
+            search_dirs_scored: list[Path] = []
+            for base in ml_models_candidates:
+                # Calibrated files live in split-specific subdirs; raw scores are in the root.
+                search_dirs_scored.append(base / args.split_version)
+                search_dirs_scored.append(base)
+            
+            calibrated_pattern = "model1_lgbm_scored_calibrated_*.parquet"
+            raw_pattern = "model1_lgbm_scored_*.parquet"
+            
+            calibrated_path = find_latest_file_in_dirs(calibrated_pattern, search_dirs_scored)
+            raw_path = find_latest_file_in_dirs(raw_pattern, search_dirs_scored, exclude_substr="calibrated")
+            
+            if calibrated_path is not None:
+                parquet_path = calibrated_path
+                print(f"  Found calibrated scored file (preferred): {parquet_path}")
+            elif raw_path is not None:
+                if args.allow_uncalibrated:
+                    parquet_path = raw_path
+                    print("  No calibrated scored file found.")
+                    print("  Using uncalibrated scores because --allow-uncalibrated was provided:")
+                    print(f"    {parquet_path}")
+                else:
+                    print("ERROR: No calibrated LGBM scored file found.")
+                    print("  Expected pattern (calibrated, preferred): model1_lgbm_scored_calibrated_*.parquet")
+                    print("  A raw (uncalibrated) scored file was found:")
+                    print(f"    {raw_path}")
+                    print("  To proceed with uncalibrated scores, rerun with --allow-uncalibrated,")
+                    print("  or pass --scored_parquet explicitly to override.")
+                    sys.exit(1)
+            else:
+                print("ERROR: Could not find any LGBM scored parquet files.")
+                print("  Looked for:")
+                print("    - model1_lgbm_scored_calibrated_*.parquet")
+                print("    - model1_lgbm_scored_*.parquet (excluding 'calibrated')")
+                print("  in the following directories:")
+                for cand in search_dirs_scored:
+                    print(f"    - {cand}")
+                print("Please provide --scored_parquet path explicitly.")
+                sys.exit(1)
+        else:
+            # RF currently has only uncalibrated scored files; keep existing behaviour.
+            # Search in all candidate directories (training scripts may save to repo root)
+            parquet_path = None
+            for search_dir in ml_models_candidates:
+                if not search_dir.exists():
+                    continue
+                found = find_latest_file(
+                    f"model1_{args.model_type}_win5_scored*.parquet",
+                    search_dir,
+                    args.split_version,
+                    args.model_type,
+                )
+                if found is not None:
+                    parquet_path = found
+                    print(f"  Found: {parquet_path}")
+                    break
+            
+            if parquet_path is None:
+                expected_pattern = "model1_rf_win5_scored_*.parquet"
+                print(f"ERROR: Could not find {expected_pattern} in any of the following directories:")
+                for cand in ml_models_candidates:
+                    print(f"  - {cand}")
+                print("Please provide --scored_parquet path explicitly.")
+                sys.exit(1)
     
     # Determine ml_models_dir for output (use the directory where we found the files, or repo root as fallback)
     ml_models_dir = repo_root / "outputs/Results/ml_models"
@@ -2708,17 +2884,43 @@ def main() -> None:
                 wandb.log(numeric_metrics)
     df = load_scored_parquet(parquet_path)
     
+    # If we're using a calibrated scored parquet (written by `calibrate_1`),
+    # enforce that key metadata columns are preserved. These are required for
+    # correct spatial and temporal joins in downstream analyses.
+    parquet_name_lower = parquet_path.name.lower()
+    if ("calibrated" in parquet_name_lower) or ("y_pred_proba_calibrated" in df.columns):
+        required_metadata_cols = ['year', 'row', 'col', 'x', 'y']
+        missing_meta = [col for col in required_metadata_cols if col not in df.columns]
+        if missing_meta:
+            print("\nERROR: Calibrated scored parquet is missing required metadata columns.\n")
+            print("  Expected `calibrate_1` to preserve the following columns when")
+            print("  writing calibrated scores so that results scripts can perform")
+            print("  spatial joins and temporal diagnostics correctly.")
+            print(f"  Missing columns: {missing_meta}")
+            print(f"  File: {parquet_path}")
+            sys.exit(1)
+    
     # Detect and reproject coordinates if needed
     df = detect_and_reproject_coordinates(df)
     validate_coordinates(df)
     
+    # Derive test years once (prefer information from the original test parquet)
+    test_years = derive_test_years(metrics_data, None, test_parquet_path)
+    print(f"\nDerived test years: {test_years}")
+    
     # Generate outputs
     create_metrics_table(metrics_data, output_dir, args.model_type)
     create_pr_curve(df, metrics_data, output_dir, args.model_type)
-    create_risk_map(df, region_boundary_path, output_dir, args.model_type, metrics_data, test_parquet_path)
-    # Derive test years once and pass explicitly to the row-level P@1% diagnostic map
-    test_years = derive_test_years(metrics_data, parquet_path, test_parquet_path)
-    print(f"\nDerived test years for P@1% diagnostic map: {test_years}")
+    create_risk_map(
+        df,
+        region_boundary_path,
+        output_dir,
+        args.model_type,
+        metrics_data,
+        test_parquet_path,
+        test_years=test_years,
+    )
+    # Pass explicit test years to the row-level P@1% diagnostic map
     create_p1pct_diagnostic_map(
         df,
         region_boundary_path,
@@ -2727,7 +2929,17 @@ def main() -> None:
         metrics_data,
         test_years=test_years,
     )
-    create_probability_map(df, region_boundary_path, output_dir, args.model_type, parquet_path, metrics_data)
+    # Also pass explicit test years to the probability map
+    create_probability_map(
+        df,
+        region_boundary_path,
+        output_dir,
+        args.model_type,
+        parquet_path,
+        metrics_data,
+        test_years=test_years,
+        test_parquet_path=test_parquet_path,
+    )
     
     # Auto-discover model pickle file for SHAP (unless --skip_shap)
     model_path = None
