@@ -879,37 +879,41 @@ def derive_test_years(metrics_data: Optional[Dict[str, Any]] = None,
     """
     # ------------------------------------------------------------------
     # 1) Prefer deriving years directly from the original test parquet
+    #    (read only the `year` column, across all row groups)
     # ------------------------------------------------------------------
     parquet_unusable = False
     if test_parquet_path is None or not test_parquet_path.exists():
         parquet_unusable = True
     else:
+        # Open the parquet file once; if this fails, we consider it unreadable.
         try:
             pfile = pq.ParquetFile(test_parquet_path)
-            if 'year' in pfile.schema_arrow.names:
-                years_set = set()
-                num_row_groups = pfile.metadata.num_row_groups
-                for rg_idx in range(num_row_groups):
-                    try:
-                        table = pfile.read_row_group(rg_idx, columns=['year'])
-                        df = table.to_pandas()
-                        years_set.update(df['year'].dropna().unique())
-                    except Exception:
-                        continue
-                if years_set:
-                    years = sorted(int(y) for y in years_set if pd.notna(y))
-                    if years:
-                        print(f"  Derived test years from test parquet: {years}")
-                        return years
-                else:
-                    # No usable years in the parquet; treat as unusable for deriving years
-                    parquet_unusable = True
-            else:
-                # Missing `year` column; treat as unusable for deriving years
-                parquet_unusable = True
         except Exception:
-            # Any I/O or decoding issue: consider the parquet unusable for year inference
             parquet_unusable = True
+        else:
+            years_set: set = set()
+            num_row_groups = pfile.metadata.num_row_groups or 0
+            for rg_idx in range(num_row_groups):
+                try:
+                    # Read only the `year` column for this row group
+                    table = pfile.read_row_group(rg_idx, columns=['year'])
+                    df = table.to_pandas()
+                    if 'year' not in df.columns:
+                        continue
+                    years_set.update(df['year'].dropna().unique())
+                except Exception:
+                    # If a specific row group is problematic, skip it and
+                    # continue aggregating from the others.
+                    continue
+
+            if years_set:
+                years = sorted(int(y) for y in years_set if pd.notna(y))
+                if years:
+                    print(f"  Derived test years from test parquet: {years}")
+                    return years
+            else:
+                # No usable years in the parquet; treat as unusable for deriving years
+                parquet_unusable = True
     
     # ------------------------------------------------------------------
     # 2) Fall back to metrics metadata
