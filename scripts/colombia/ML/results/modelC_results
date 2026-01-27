@@ -2244,7 +2244,12 @@ def compute_shap_analysis(
     # Compute SHAP values
     print(f"  Computing SHAP values using TreeExplainer...")
     explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X_shap, check_additivity=False, approximate=True)
+    # LightGBM models do not support approximate=True; enable it only for RF-type models
+    model_type_lower = str(model_type).lower()
+    if model_type_lower in {"rf", "brf"}:
+        shap_values = explainer.shap_values(X_shap, check_additivity=False, approximate=True)
+    else:
+        shap_values = explainer.shap_values(X_shap, check_additivity=False)
     print(f"  SHAP values computed: shape {shap_values.shape}")
     
     # For binary classification, shap_values might be a list [neg_class, pos_class]
