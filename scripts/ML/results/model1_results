@@ -2199,7 +2199,8 @@ def compute_shap_analysis(
     output_dir: Path,
     model_type: str,
     timestamp: str,
-    allow_test_shap: bool = False
+    allow_test_shap: bool = False,
+    shap_n_samples: int = 500,
 ) -> None:
     """Compute SHAP analysis and generate visualizations.
     
@@ -2216,6 +2217,7 @@ def compute_shap_analysis(
         model_type: Model type (lgbm, rf)
         timestamp: Timestamp for output files
         allow_test_shap: If True, allow SHAP on test set (only if earlystop/train unavailable)
+        shap_n_samples: Maximum number of rows to sample for SHAP (default: 500)
     """
     if not SHAP_AVAILABLE:
         raise RuntimeError(
@@ -2273,7 +2275,7 @@ def compute_shap_analysis(
     
     print(f"  Using data source: {selected_source} ({selected_path.name})")
     
-    # Load feature data (sample 5000 rows with fixed seed)
+    # Load feature data (sample up to shap_n_samples rows with fixed seed)
     print(f"  Loading feature data from {selected_source}...")
     
     # Read full dataset first to allow proper sampling
@@ -2281,9 +2283,9 @@ def compute_shap_analysis(
     n_total = len(df_full)
     print(f"  Total rows in {selected_source}: {n_total:,}")
     
-    # Sample exactly 5000 rows (or all if less than 5000)
-    n_sample = min(5000, n_total)
-    print(f"  Sampling {n_sample:,} rows for SHAP analysis (seed=42)...")
+    # Sample up to shap_n_samples rows (or all if less)
+    n_sample = min(shap_n_samples, n_total)
+    print(f"  Sampling {n_sample:,} rows for SHAP analysis (seed=42, max={shap_n_samples})...")
     df_sample = df_full.sample(n=n_sample, random_state=42)
     
     # Convert to float32 for SHAP (memory efficiency)
@@ -2296,7 +2298,7 @@ def compute_shap_analysis(
     # Compute SHAP values
     print(f"  Computing SHAP values using TreeExplainer...")
     explainer = shap.TreeExplainer(model)
-    shap_values = explainer.shap_values(X_shap, check_additivity=False)
+    shap_values = explainer.shap_values(X_shap, check_additivity=False, approximate=True)
     print(f"  SHAP values computed: shape {shap_values.shape}")
     
     # For binary classification, shap_values might be a list [neg_class, pos_class]
@@ -2448,6 +2450,12 @@ def main() -> None:
         '--allow_test_shap',
         action='store_true',
         help='Allow SHAP analysis on test set if earlystop/train data unavailable (default: False)'
+    )
+    parser.add_argument(
+        '--shap_n_samples',
+        type=int,
+        default=500,
+        help='Maximum number of rows to sample for SHAP analysis (default: 500)'
     )
     parser.add_argument(
         '--skip_shap',
@@ -2779,7 +2787,8 @@ def main() -> None:
                     output_dir=output_dir,
                     model_type=args.model_type,
                     timestamp=timestamp,
-                    allow_test_shap=args.allow_test_shap
+                    allow_test_shap=args.allow_test_shap,
+                    shap_n_samples=args.shap_n_samples,
                 )
             except RuntimeError as e:
                 # Handle SHAP not installed more gracefully
