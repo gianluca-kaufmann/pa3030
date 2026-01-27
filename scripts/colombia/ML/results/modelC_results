@@ -64,6 +64,12 @@ except ImportError:
     SHAP_AVAILABLE = False
     shap = None
 
+# Optional Weights & Biases integration for streaming logs and metrics
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 
 # =============================================================================
 # VISUALIZATION CONSTANTS - Ensures consistent styling across all models
@@ -2448,12 +2454,32 @@ def main() -> None:
         action='store_true',
         help='Use LogNorm color scale for probability maps (useful for skewed distributions)'
     )
-    
     args = parser.parse_args()
     
     model_type = args.model_type.lower()
     use_calibrated = args.use_calibrated.lower()
     split_version = args.split_version
+    
+    # Optional W&B run (for streaming logs and metrics)
+    use_wandb = False
+    if wandb is not None:
+        try:
+            run_name = f"results_modelC_{model_type}_{split_version}"
+            wandb.init(
+                project="ml-results-modelC",
+                entity=os.environ.get("WANDB_ENTITY"),
+                name=run_name,
+                config={
+                    "script": "modelC_results",
+                    "model_type": model_type,
+                    "split_version": split_version,
+                    "use_calibrated": use_calibrated,
+                },
+            )
+            use_wandb = True
+            print("W&B connected")
+        except Exception as err:
+            print(f"W&B failed: {err}")
     
     # Get repo root and scratch root for auto-discovery
     repo_root = get_repo_root()
@@ -2683,6 +2709,17 @@ def main() -> None:
     print("LOADING DATA")
     print("=" * 70)
     metrics_data = load_metrics_json(metrics_path)
+    if use_wandb:
+        # Log top-level test performance metrics if available
+        test_perf = metrics_data.get("test_performance") or metrics_data.get("metrics") or {}
+        if isinstance(test_perf, dict):
+            numeric_metrics = {
+                f"results/{k}": v
+                for k, v in test_perf.items()
+                if isinstance(v, (int, float))
+            }
+            if numeric_metrics:
+                wandb.log(numeric_metrics)
     df = load_scored_parquet(parquet_path)
     
     # Detect and reproject coordinates if needed

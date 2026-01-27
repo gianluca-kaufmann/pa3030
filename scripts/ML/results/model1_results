@@ -59,6 +59,12 @@ except ImportError:
     SHAP_AVAILABLE = False
     shap = None
 
+# Optional Weights & Biases integration for streaming logs and metrics
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 
 # =============================================================================
 # VISUALIZATION CONSTANTS - Ensures consistent styling across all models
@@ -2448,8 +2454,27 @@ def main() -> None:
         action='store_true',
         help='Skip SHAP analysis (default: False)'
     )
-    
     args = parser.parse_args()
+    
+    # Optional W&B run (for streaming logs and metrics)
+    use_wandb = False
+    if wandb is not None:
+        try:
+            run_name = f"results_model1_{args.model_type}_{args.split_version}"
+            wandb.init(
+                project="ml-results-model1",
+                entity=os.environ.get("WANDB_ENTITY"),
+                name=run_name,
+                config={
+                    "script": "model1_results",
+                    "model_type": args.model_type,
+                    "split_version": args.split_version,
+                },
+            )
+            use_wandb = True
+            print("W&B connected")
+        except Exception as err:
+            print(f"W&B failed: {err}")
     
     # Get repo root and scratch root for auto-discovery
     repo_root = get_repo_root()
@@ -2615,6 +2640,17 @@ def main() -> None:
     print("LOADING DATA")
     print("=" * 70)
     metrics_data = load_metrics_json(metrics_path)
+    if use_wandb:
+        # Log top-level test performance metrics if available
+        test_perf = metrics_data.get("test_performance") or metrics_data.get("metrics") or {}
+        if isinstance(test_perf, dict):
+            numeric_metrics = {
+                f"results/{k}": v
+                for k, v in test_perf.items()
+                if isinstance(v, (int, float))
+            }
+            if numeric_metrics:
+                wandb.log(numeric_metrics)
     df = load_scored_parquet(parquet_path)
     
     # Detect and reproject coordinates if needed
