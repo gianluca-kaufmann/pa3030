@@ -35,7 +35,6 @@ except ImportError:
     wandb = None
 import pyarrow as pa
 import pyarrow.parquet as pq
-import lightgbm as lgb
 from sklearn.metrics import roc_auc_score, average_precision_score
 
 
@@ -82,28 +81,32 @@ CV_FOLDS = [
 
 # Utility Functions
 
-def get_n_jobs() -> int:
-    """Get number of CPUs (-1 for all available, may limit for memory efficiency)."""
+def get_num_threads() -> int:
+    """Get thread count from SLURM (fallback to os.cpu_count())."""
     slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
-    n_jobs = -1
     if slurm_cpus:
         try:
-            n_jobs = int(slurm_cpus)
+            n = int(slurm_cpus)
+            if n > 0:
+                return n
         except ValueError:
-            n_jobs = -1
-    
-    # Check for memory-constrained mode
-    memory_constrained = os.environ.get("MEMORY_CONSTRAINED", "").lower() in ("1", "true", "yes")
-    if memory_constrained and n_jobs < 0:
-        # Limit to fewer cores in memory-constrained environments
-        try:
-            import os as os_module
-            n_jobs = max(1, os_module.cpu_count() // 2)
-            print(f"  [MEMORY_CONSTRAINED mode] Limiting to {n_jobs} cores")
-        except:
-            n_jobs = 4
-    
-    return n_jobs
+            pass
+    return max(1, os.cpu_count() or 1)
+
+
+def configure_threading_env(num_threads: int) -> None:
+    """Set BLAS/OMP thread env vars (must be called before importing LightGBM)."""
+    n = str(max(1, int(num_threads)))
+    for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[k] = n
+
+
+# Configure threading from SLURM before importing LightGBM
+NUM_THREADS = get_num_threads()
+configure_threading_env(NUM_THREADS)
+
+# Import LightGBM only after thread env vars are set
+import lightgbm as lgb
 
 
 def report_memory_usage(label: str = "") -> None:
@@ -266,7 +269,7 @@ def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
         print("  lgbm_best_params.json not found, using default manual hyperparameters")
         guardrail_params = {"max_depth": 8, "num_leaves": 255, "min_child_samples": 50, "subsample": 0.7,
                            "subsample_freq": 1, "colsample_bytree": 0.7, "learning_rate": 0.03, "n_estimators": 3000,
-                           "reg_alpha": 1.0, "reg_lambda": 1.0, "metric": "average_precision", "num_threads": get_n_jobs(), "verbose": -1}
+                           "reg_alpha": 1.0, "reg_lambda": 1.0, "metric": "average_precision", "num_threads": NUM_THREADS, "verbose": -1}
         final_params = {**FIXED_PARAMS, **guardrail_params}
         return final_params, None
     
@@ -288,7 +291,7 @@ def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
     # Guardrails: only fill missing keys, don't overwrite existing ones
     guardrail_params = {"max_depth": 8, "num_leaves": 255, "min_child_samples": 50, "subsample": 0.7,
                        "subsample_freq": 1, "colsample_bytree": 0.7, "learning_rate": 0.03, "n_estimators": 3000,
-                       "reg_alpha": 1.0, "reg_lambda": 1.0, "metric": "average_precision", "num_threads": get_n_jobs(), "verbose": -1}
+                       "reg_alpha": 1.0, "reg_lambda": 1.0, "metric": "average_precision", "num_threads": NUM_THREADS, "verbose": -1}
     
     # Only add guardrail params if key is missing
     for key, value in guardrail_params.items():
@@ -1597,6 +1600,8 @@ def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True, 
     
     # Load parameters before wandb.init() so we can log them
     best_params, best_cv_score = load_best_params(params_path)
+    # Force threading from SLURM allocation (avoid hardcoded / mismatched defaults)
+    best_params["num_threads"] = NUM_THREADS
     if params_path:
         print(f"\nLoaded params from {params_path}")
         if best_cv_score:

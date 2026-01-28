@@ -48,6 +48,6 @@ echo "PWD = $(pwd)"
   exit 1
 }
 # Run the script
-python "scripts/ML/training/model1_LGBM"
+srun --cpu-bind=cores --distribution=block:block python -u "scripts/ML/training/model1_LGBM"
 
 echo "model1_LGBM script finished."
