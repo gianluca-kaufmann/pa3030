@@ -1147,21 +1147,20 @@ def points_to_raster(x: np.ndarray, y: np.ndarray, values: np.ndarray,
 
 
 def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], output_dir: Path, model_type: str, metrics_data: Optional[Dict[str, Any]] = None, test_parquet_path: Optional[Path] = None) -> None:
-    """Create risk map showing Colombia boundary, top-1% predicted pixels, and observed positives.
+    """Create SIMPLIFIED risk map showing model predictions vs actual PA establishments.
     
-    Uses distinct colors for three categories:
-    - Yellow: Predicted high-risk only (not observed)
-    - Blue: Observed positives only (not predicted as high-risk)
-    - Orange: Overlap (predicted high-risk AND observed)
-    
-    Observed positives are identified as pixels where WDPA_b1=1 (actually established in that year)
-    OR y_true=1 (from 5-year lookahead target). This ensures pixels established in 2018 are
-    correctly shown even though transition_01_win5 doesn't mark the actual year of establishment.
-    
-    Optionally shows existing protected areas (as of end of 2017) if wdpa_b1 column is present.
+    SIMPLIFIED DESIGN (radically simplified from previous complex version):
+    - Shows only 3 categories with clear, distinct colors:
+      * Predicted high-risk (top 1%) - RED
+      * Actual PA establishments - BLUE  
+      * Overlap (correct predictions) - GREEN
+    - Minimal text and legend
+    - No protection layer overlays
+    - No temporal dynamics visualization
+    - Focus: Answer one question clearly: "Where did the model predict vs where did PAs actually establish?"
     """
     print("\n" + "=" * 70)
-    print("CREATING RISK MAP")
+    print("CREATING SIMPLIFIED RISK MAP")
     print("=" * 70)
     
     # Get Colombia boundary
@@ -1178,545 +1177,188 @@ def create_risk_map(df: pd.DataFrame, country_boundary_path: Optional[Path], out
     geometry = [Point(xy) for xy in zip(df['x'], df['y'])]
     gdf = gpd.GeoDataFrame(df, geometry=geometry, crs='EPSG:4326')
     
-    print(f"  Prediction points: {len(gdf):,}")
-    print(f"  Prediction bounds: {gdf.total_bounds}")
+    print(f"  Total rows (pixel-years): {len(gdf):,}")
     
-    # Check if protected area data is available
-    has_wdpa = 'wdpa_b1' in df.columns
-    if has_wdpa:
-        # Fill NaN with 0 (not protected) and convert to boolean
-        wdpa_values = df['wdpa_b1'].fillna(0)
-        # Handle both integer and float types
-        wdpa_values = wdpa_values.astype(float)
-        protected_count = (wdpa_values == 1).sum()
-        print(f"  Protected area coverage (as of end 2017): {protected_count:,} pixels ({protected_count/len(df)*100:.2f}%)")
-        print(f"  wdpa_b1 value range: [{wdpa_values.min()}, {wdpa_values.max()}], unique values: {sorted(wdpa_values.unique())[:10]}")
-        gdf['is_protected'] = (wdpa_values == 1).values
-    else:
-        print("  Note: wdpa_b1 column not found - protected areas will not be shown")
-        print(f"  Available columns: {list(df.columns)}")
-        gdf['is_protected'] = False
-    
-    # Load WDPA data from original test parquet if available
-    # This is needed to correctly identify pixels that were established in each year
-    # (since transition_01_win5 is a 5-year lookahead target, it doesn't mark the actual year of establishment)
-    # Derive test years from metrics or parquet
+    # Extract time period for labels
     test_years = derive_test_years(metrics_data, None, test_parquet_path)
+    time_period = f"{min(test_years)}-{max(test_years)}" if test_years else "2018-2019"
+    
+    # Step 1: Load WDPA data to identify ACTUAL establishments during test period
+    # CRITICAL: Prioritize actual test-period establishments over y_true (which is 5-year lookahead)
     wdpa_test_df = load_wdpa_from_test_parquet(test_parquet_path, test_years)
     
-    # Join WDPA data from test parquet if available
-    # This includes:
-    # 1. Establishment flag for correctly identifying pixels established in 2018-2019
-    # 2. WDPA_prev for two-layer protection visualization (temporal dynamics)
-    if wdpa_test_df is not None:
-        print(f"\n  {'='*70}")
-        print(f"  WDPA DATA LOADED SUCCESSFULLY FROM TEST PARQUET")
-        print(f"  {'='*70}")
+    has_actual_establishments = False
+    if wdpa_test_df is not None and 'established_in_test_period' in wdpa_test_df.columns:
+        print(f"  ✓ WDPA data loaded - using ACTUAL test-period establishments")
         
-        # Determine which columns to join
-        join_cols = ['row', 'col'] if 'row' in wdpa_test_df.columns else ['x', 'y']
-        data_cols_to_join = []
+        # Determine join columns
+        join_cols = ['row', 'col'] if all(col in df.columns for col in ['row', 'col']) and all(col in wdpa_test_df.columns for col in ['row', 'col']) else ['x', 'y']
         
-        if 'established_in_test_period' in wdpa_test_df.columns:
-            data_cols_to_join.append('established_in_test_period')
-            print(f"  Will join: established_in_test_period (for observed positives)")
-        if 'newly_protected_in_test_period' in wdpa_test_df.columns:
-            data_cols_to_join.append('newly_protected_in_test_period')
-            print(f"  Will join: newly_protected_in_test_period (for test-year-specific protection layer)")
-        if 'WDPA_prev' in wdpa_test_df.columns:
-            data_cols_to_join.append('WDPA_prev')
-            print(f"  Will join: WDPA_prev (for temporal protection visualization)")
-        if 'WDPA_b1' in wdpa_test_df.columns and 'wdpa_b1' not in df.columns:
-            data_cols_to_join.append('WDPA_b1')
-            print(f"  Will join: WDPA_b1 (for current protection status)")
-        
-        if not data_cols_to_join:
-            print(f"  WARNING: No relevant columns found to join")
-            df['established_in_test_period'] = 0
-            df['WDPA_b1_actual'] = 0
-            join_method = None
-        elif all(col in df.columns for col in ['row', 'col']) and all(col in wdpa_test_df.columns for col in ['row', 'col']):
-            print(f"  Using row/col join method (pixel-level, not year-specific)...")
-            select_cols = ['row', 'col'] + data_cols_to_join
-            join_df = wdpa_test_df[select_cols].drop_duplicates(subset=['row', 'col'])
-            df = df.merge(join_df, on=['row', 'col'], how='left', suffixes=('', '_test'))
-            join_method = "row/col"
-        elif all(col in df.columns for col in ['x', 'y']) and all(col in wdpa_test_df.columns for col in ['x', 'y']):
-            print(f"  Using x/y join method (pixel-level, not year-specific)...")
-            # Round coordinates to avoid floating point precision issues
-            df_rounded = df.copy()
-            df_rounded['x_rounded'] = df_rounded['x'].round(6)
-            df_rounded['y_rounded'] = df_rounded['y'].round(6)
-            
-            select_cols = ['x', 'y'] + data_cols_to_join
-            join_df = wdpa_test_df[select_cols].copy()
+        if join_cols == ['row', 'col']:
+            # Row/col join (preferred)
+            join_df = wdpa_test_df[['row', 'col', 'established_in_test_period']].drop_duplicates(subset=['row', 'col'])
+            df = df.merge(join_df, on=['row', 'col'], how='left')
+            df['established_in_test_period'] = df['established_in_test_period'].fillna(0).astype(int)
+            has_actual_establishments = True
+            print(f"    Joined via row/col: {(df['established_in_test_period'] == 1).sum():,} actual establishments")
+        elif join_cols == ['x', 'y']:
+            # X/y join with rounding (fallback)
+            df['x_rounded'] = df['x'].round(6)
+            df['y_rounded'] = df['y'].round(6)
+            join_df = wdpa_test_df[['x', 'y', 'established_in_test_period']].copy()
             join_df['x_rounded'] = join_df['x'].round(6)
             join_df['y_rounded'] = join_df['y'].round(6)
-            join_df = join_df[['x_rounded', 'y_rounded'] + data_cols_to_join].drop_duplicates(subset=['x_rounded', 'y_rounded'])
-            
-            df_rounded = df_rounded.merge(join_df, on=['x_rounded', 'y_rounded'], how='left', suffixes=('', '_test'))
-            df_rounded = df_rounded.drop(columns=['x_rounded', 'y_rounded'])
-            df = df_rounded
-            join_method = "x/y"
-        else:
-            missing_cols_df = [col for col in ['row', 'col', 'x', 'y'] if col not in df.columns]
-            missing_cols_wdpa = [col for col in ['row', 'col', 'x', 'y'] if col not in wdpa_test_df.columns]
-            print(f"  WARNING: Cannot join WDPA establishment flag - missing required columns")
-            print(f"  Missing in scored data: {missing_cols_df}")
-            print(f"  Missing in test data: {missing_cols_wdpa}")
-            print(f"  Available columns in scored data: {list(df.columns)}")
-            df['established_in_test_period'] = 0
-            join_method = None
-        
-        if join_method is not None:
-            # Fill NaN and standardize dtypes for joined columns
-            if 'established_in_test_period' in df.columns:
-                df['established_in_test_period'] = df['established_in_test_period'].fillna(0).astype(int)
-                df['WDPA_b1_actual'] = df['established_in_test_period']
-                print(f"  Joined establishment flag using {join_method}: {(df['WDPA_b1_actual'] == 1).sum():,} pixels")
-            else:
-                df['established_in_test_period'] = 0
-                df['WDPA_b1_actual'] = 0
-            
-            if 'WDPA_prev' in df.columns:
-                df['WDPA_prev'] = df['WDPA_prev'].fillna(0).astype(int)
-                print(f"  Joined WDPA_prev using {join_method}: {(df['WDPA_prev'] == 1).sum():,} pixels already protected")
-            
-            if 'newly_protected_in_test_period' in df.columns:
-                df['newly_protected_in_test_period'] = df['newly_protected_in_test_period'].fillna(0).astype(int)
-                print(f"  Joined newly_protected_in_test_period using {join_method}: {(df['newly_protected_in_test_period'] == 1).sum():,} pixels")
-            
-            if 'WDPA_b1_test' in df.columns:
-                # Rename if we got it from test parquet with suffix
-                df['wdpa_b1'] = df['WDPA_b1_test'].fillna(0).astype(int)
-                df = df.drop(columns=['WDPA_b1_test'])
-        else:
-            df['established_in_test_period'] = 0
-            df['WDPA_b1_actual'] = 0
+            join_df = join_df[['x_rounded', 'y_rounded', 'established_in_test_period']].drop_duplicates(subset=['x_rounded', 'y_rounded'])
+            df = df.merge(join_df, on=['x_rounded', 'y_rounded'], how='left')
+            df = df.drop(columns=['x_rounded', 'y_rounded'])
+            df['established_in_test_period'] = df['established_in_test_period'].fillna(0).astype(int)
+            has_actual_establishments = True
+            print(f"    Joined via x/y: {(df['established_in_test_period'] == 1).sum():,} actual establishments")
+    
+    # Define observed establishments: PREFER actual test-period data, ONLY fall back to y_true if unavailable
+    if has_actual_establishments:
+        df['is_observed'] = (df['established_in_test_period'] == 1).astype(int)
+        print(f"  ✓ Using actual test-period establishments (established_in_test_period)")
     else:
-        print(f"\n  {'!'*70}")
-        print(f"  WARNING: WDPA ESTABLISHMENT DATA NOT LOADED")
-        print(f"  {'!'*70}")
-        if wdpa_test_df is None:
-            print(f"  Reason: WDPA test data file not available or failed to load")
-            print(f"  Impact: Using y_true only for observed positives (may undercount establishments)")
-            print(f"  Expected file: test_colombia_win5.parquet in data/ml/ or outputs/Results/")
-        else:
-            print(f"  Reason: Establishment flag 'established_in_test_period' not found in WDPA test data")
-            print(f"  Available columns in WDPA test data: {list(wdpa_test_df.columns)}")
-            print(f"  Impact: Using y_true only for observed positives (may undercount establishments)")
-        print(f"  {'!'*70}")
-        df['WDPA_b1_actual'] = 0
+        df['is_observed'] = (df['y_true'] == 1).astype(int)
+        print(f"  ⚠ Falling back to y_true (5-year lookahead) - actual establishment data not available")
     
-    # Calculate top-1% threshold
-    top1pct_threshold = np.percentile(df['y_pred_proba'], 99)
-    print(f"  Top-1% threshold: {top1pct_threshold:.6f}")
+    # Update gdf with observed flag
+    gdf['is_observed'] = df['is_observed'].values
     
-    # Identify categories
-    # Use WDPA_b1_actual = 1 OR y_true = 1 as indicator of observed positives
-    # This fixes the issue where pixels established in 2018 have y_true=0 (due to 5-year lookahead logic)
-    # but should still be shown as observed positives
-    gdf['is_top1pct'] = df['y_pred_proba'] >= top1pct_threshold
-    gdf['is_positive'] = (df['y_true'] == 1) | (df['WDPA_b1_actual'] == 1)
+    # Step 2: Filter coordinate outliers BEFORE any analysis (Colombia bounds)
+    print(f"\n  Filtering coordinate outliers (Colombia bounds)...")
+    initial_count = len(gdf)
+    gdf = gdf[(gdf.geometry.x >= -82) & (gdf.geometry.x <= -66) & 
+              (gdf.geometry.y >= -5) & (gdf.geometry.y <= 14)].copy()
+    filtered_count = len(gdf)
+    if initial_count != filtered_count:
+        print(f"    Removed {initial_count - filtered_count:,} outliers ({initial_count:,} → {filtered_count:,})")
     
-    # Log statistics
-    y_true_positives = (df['y_true'] == 1).sum()
-    wdpa_positives = (df['WDPA_b1_actual'] == 1).sum()
-    combined_positives = gdf['is_positive'].sum()
-    print(f"  Observed PA establishments: y_true={y_true_positives:,}, WDPA_b1_actual={wdpa_positives:,}, combined={combined_positives:,}")
-    print(f"  Note: Combined uses WDPA_b1_actual=1 OR y_true=1 to correctly identify pixels established in each year")
+    # Step 3: Aggregate to PIXEL level (not row/pixel-year level)
+    # CRITICAL: Map shows risky LOCATIONS, so aggregate across test years before selecting top-1%
+    print(f"\n  Aggregating to pixel level (test years: {test_years})...")
     
-    # CRITICAL FIX: Deduplicate to pixel-level before counting to avoid multi-year inflation
-    # Some pixels appear in multiple years (2018, 2019), causing overlap counts to be inflated
-    # when counted per-row instead of per-pixel
-    print(f"\n  Deduplicating to pixel-level before counting overlaps...")
-    print(f"  Total rows (may include same pixel in multiple years): {len(gdf):,}")
+    # For predictions: take MAX probability across test years (most risky prediction for that location)
+    # For observations: take MAX (observed if established in ANY test year)
+    pixel_agg = gdf.groupby(['row', 'col']).agg({
+        'y_pred_proba': 'max',  # Highest predicted probability for this pixel across test years
+        'is_observed': 'max',   # 1 if established in any test year, 0 otherwise
+        'x': 'first',
+        'y': 'first'
+    }).reset_index()
     
-    # Aggregate to pixel-level: a pixel is high-risk/positive if it's high-risk/positive in ANY year
-    agg_dict = {
-        'is_top1pct': 'max',    # Pixel is high-risk if high-risk in ANY year
-        'is_positive': 'max',    # Pixel is positive if positive in ANY year
-        'x': 'first',            # Keep coordinates for visualization
-        'y': 'first',
-        'is_protected': 'max'    # Keep protected status
-    }
+    print(f"    {len(gdf):,} rows → {len(pixel_agg):,} unique pixels")
     
-    # Add WDPA columns if available (for two-layer protection visualization)
-    if 'WDPA_prev' in gdf.columns:
-        agg_dict['WDPA_prev'] = 'max'  # Pixel is protected_prev if protected_prev in ANY year
-    if 'newly_protected_in_test_period' in gdf.columns:
-        agg_dict['newly_protected_in_test_period'] = 'max'  # Pixel is newly protected if newly protected in ANY test year
-    if 'wdpa_b1' in gdf.columns:
-        agg_dict['wdpa_b1'] = 'max'
-    elif 'WDPA_b1' in gdf.columns:
-        agg_dict['WDPA_b1'] = 'max'
+    # Step 4: Calculate top-1% threshold at PIXEL level
+    top1pct_threshold = np.percentile(pixel_agg['y_pred_proba'], 99)
+    pixel_agg['is_predicted'] = (pixel_agg['y_pred_proba'] >= top1pct_threshold).astype(int)
     
-    pixel_df = gdf.groupby(['row', 'col']).agg(agg_dict).reset_index()
+    print(f"  ✓ Top-1% threshold (pixel-level): {top1pct_threshold:.6f}")
     
-    print(f"  Unique pixels (after deduplication): {len(pixel_df):,}")
+    # Step 5: Compute statistics on FINAL filtered pixel data
+    predicted_count = pixel_agg['is_predicted'].sum()
+    observed_count = pixel_agg['is_observed'].sum()
+    overlap_count = ((pixel_agg['is_predicted'] == 1) & (pixel_agg['is_observed'] == 1)).sum()
     
-    # Create categories at pixel-level
-    pixel_df['category'] = 'none'
-    pixel_df.loc[pixel_df['is_top1pct'] & ~pixel_df['is_positive'], 'category'] = 'predicted_only'
-    pixel_df.loc[~pixel_df['is_top1pct'] & pixel_df['is_positive'], 'category'] = 'observed_only'
-    pixel_df.loc[pixel_df['is_top1pct'] & pixel_df['is_positive'], 'category'] = 'overlap'
+    print(f"\n  FINAL STATISTICS (pixel-level, after filtering):")
+    print(f"    Total pixels: {len(pixel_agg):,}")
+    print(f"    Predicted high-risk (top 1%): {predicted_count:,}")
+    print(f"    Actual PA establishments: {observed_count:,}")
+    print(f"    Overlap (correct predictions): {overlap_count:,}")
+    if predicted_count > 0:
+        hit_rate = overlap_count / predicted_count * 100
+        print(f"    Hit rate: {overlap_count:,}/{predicted_count:,} = {hit_rate:.1f}%")
+    else:
+        hit_rate = 0.0
+        print(f"    Hit rate: N/A (no predictions)")
     
-    # Count pixels in each category (now at pixel-level, not row-level)
-    predicted_only_count = (pixel_df['category'] == 'predicted_only').sum()
-    observed_only_count = (pixel_df['category'] == 'observed_only').sum()
-    overlap_count = (pixel_df['category'] == 'overlap').sum()
+    # Create GeoDataFrame for plotting from pixel-level data
+    geometry = [Point(xy) for xy in zip(pixel_agg['x'], pixel_agg['y'])]
+    gdf = gpd.GeoDataFrame(pixel_agg, geometry=geometry, crs='EPSG:4326')
     
-    # Update gdf to use pixel-level data for visualization
-    # Create GeoDataFrame from pixel-level data
-    geometry_px = [Point(xy) for xy in zip(pixel_df['x'], pixel_df['y'])]
-    gdf = gpd.GeoDataFrame(pixel_df, geometry=geometry_px, crs='EPSG:4326')
-    
-    print(f"  Predicted high-risk only: {predicted_only_count:,}")
-    print(f"  Observed PA establishments only: {observed_only_count:,}")
-    print(f"  Overlap (predicted + observed PA): {overlap_count:,}")
-    
-    # Create categorical raster: convert category names to numeric codes
-    # 0 = none, 1 = predicted_only, 2 = observed_only, 3 = overlap, 4 = protected
-    category_codes = {
-        'none': 0,
-        'predicted_only': 1,
-        'observed_only': 2,
-        'overlap': 3
-    }
-    gdf['category_code'] = gdf['category'].map(category_codes)
-    
-    # Handle protected areas separately - they overlay on top
-    if has_wdpa:
-        # Protected areas get code 4, but we'll handle them as a separate overlay
-        pass
-    
-    # Extract time period information dynamically
-    test_years = derive_test_years(metrics_data, None, test_parquet_path)
-    time_period = f"{min(test_years)}-{max(test_years)}"
-    
-    # Derive prediction horizon from metadata
-    prediction_horizon = "5-year lookahead"
-    if metrics_data:
-        metadata = metrics_data.get("metadata", {})
-        lookahead = metadata.get("lookahead_years", 5)
-        test_year_range = metadata.get("test_year_range")
-        if test_year_range and isinstance(test_year_range, list) and len(test_year_range) == 2:
-            pred_end = test_year_range[1] + lookahead
-            prediction_horizon = f"{lookahead}-year lookahead ({test_year_range[0]}-{pred_end})"
-        elif isinstance(lookahead, int):
-            pred_end = max(test_years) + lookahead
-            prediction_horizon = f"{lookahead}-year lookahead ({min(test_years)}-{pred_end})"
-    
-    # Convert to raster for pixel-perfect visualization
-    print(f"  Converting {len(gdf):,} points to raster grid...")
-    
-    # Create main category raster
-    category_raster, extent = points_to_raster(
-        gdf.geometry.x.values,
-        gdf.geometry.y.values,
-        gdf['category_code'].values,
-        target_resolution=MAP_RESOLUTION
-    )
-    print(f"  Category raster shape: {category_raster.shape}, extent: {extent}")
-    print(f"  Valid (non-NaN) pixels: {np.sum(~np.isnan(category_raster)):,}")
-    
-    # Create protection rasters if available (using same grid structure)
-    # Two-layer approach: already protected (WDPA_prev=1) vs. newly protected (WDPA_prev=0, WDPA_b1=1)
-    protected_prev_raster = None
-    newly_protected_raster = None
-    has_wdpa_prev = 'WDPA_prev' in pixel_df.columns
-    
-    if has_wdpa_prev:
-        # TWO-LAYER PROTECTION VISUALIZATION
-        print(f"  Creating two-layer protection visualization...")
-        
-        # Layer 1: Already protected areas (WDPA_prev=1) - darker green
-        protected_prev_mask = (pixel_df['WDPA_prev'] == 1).values
-        if protected_prev_mask.sum() > 0:
-            protected_prev_raster, _ = points_to_raster(
-                gdf.geometry.x.values,
-                gdf.geometry.y.values,
-                protected_prev_mask.astype(float),
-                target_resolution=MAP_RESOLUTION
-            )
-            protected_prev_raster = (protected_prev_raster > 0.5).astype(float)
-            protected_prev_raster[protected_prev_raster == 0] = np.nan
-            print(f"    - Already protected (WDPA_prev=1): {np.sum(~np.isnan(protected_prev_raster)):,} pixels")
-        
-        # Layer 2: Newly protected areas in TEST YEARS ONLY (WDPA_prev=0 AND WDPA_b1=1 in test period) - lighter green
-        # Use the flag created during WDPA loading to ensure robustness (only test years)
-        if 'newly_protected_in_test_period' in pixel_df.columns:
-            newly_protected_mask = (pixel_df['newly_protected_in_test_period'] == 1).values
-            if newly_protected_mask.sum() > 0:
-                newly_protected_raster, _ = points_to_raster(
-                    gdf.geometry.x.values,
-                    gdf.geometry.y.values,
-                    newly_protected_mask.astype(float),
-                    target_resolution=MAP_RESOLUTION
-                )
-                newly_protected_raster = (newly_protected_raster > 0.5).astype(float)
-                newly_protected_raster[newly_protected_raster == 0] = np.nan
-                print(f"    - Newly protected in test period ({time_period}): {np.sum(~np.isnan(newly_protected_raster)):,} pixels")
-        else:
-            # Fallback: check WDPA_prev=0 AND WDPA_b1=1 (but warn it's not filtered to test years)
-            has_b1 = 'wdpa_b1' in pixel_df.columns or 'WDPA_b1' in pixel_df.columns
-            if has_b1:
-                b1_col = 'wdpa_b1' if 'wdpa_b1' in pixel_df.columns else 'WDPA_b1'
-                newly_protected_mask = ((pixel_df['WDPA_prev'] == 0) & (pixel_df[b1_col] == 1)).values
-                if newly_protected_mask.sum() > 0:
-                    print(f"    WARNING: Using fallback newly protected detection (not filtered to test years)")
-                    newly_protected_raster, _ = points_to_raster(
-                        gdf.geometry.x.values,
-                        gdf.geometry.y.values,
-                        newly_protected_mask.astype(float),
-                        target_resolution=MAP_RESOLUTION
-                    )
-                    newly_protected_raster = (newly_protected_raster > 0.5).astype(float)
-                    newly_protected_raster[newly_protected_raster == 0] = np.nan
-                    print(f"    - Newly protected (fallback): {np.sum(~np.isnan(newly_protected_raster)):,} pixels")
-        
-    elif has_wdpa:
-        # FALLBACK: Single-layer protection visualization (original behavior)
-        print(f"  Creating single-layer protection visualization (WDPA_prev not available)...")
-        protected_mask = gdf['is_protected'].values
-        if protected_mask.sum() > 0:
-            protected_prev_raster, protected_extent = points_to_raster(
-                gdf.geometry.x.values,
-                gdf.geometry.y.values,
-                protected_mask.astype(float),
-                target_resolution=MAP_RESOLUTION
-            )
-            if protected_extent != extent:
-                print(f"  WARNING: Protected areas extent differs from category extent")
-            protected_prev_raster = (protected_prev_raster > 0.5).astype(float)
-            protected_prev_raster[protected_prev_raster == 0] = np.nan
-            print(f"  Protected areas raster created with {np.sum(~np.isnan(protected_prev_raster)):,} pixels")
-    
-    # Create figure
-    fig, ax = plt.subplots(figsize=MAP_FIGSIZE)
+    # Step 6: Create visualization
+    print(f"\n  Creating visualization...")
+    fig, ax = plt.subplots(figsize=(12, 10))
     
     # Plot Colombia boundary
-    colombia_gdf.plot(ax=ax, color='white', edgecolor='none', linewidth=1.5, zorder=1)
+    colombia_gdf.plot(ax=ax, color='#f0f0f0', edgecolor='gray', linewidth=0.5, alpha=0.3, zorder=1)
     
-    # Define colors for each category using standardized color scheme
-    from matplotlib.colors import ListedColormap, BoundaryNorm
+    # VISUALIZATION: Plot 3 distinct categories with clear, accessible colors
+    # Color semantics:
+    # - Model predicted risk, but NO establishment → Orange (false positive / future risk)
+    # - Establishment occurred, but NOT predicted → Blue (missed by model)
+    # - BOTH predicted AND established → Green (correct prediction / hit)
     
-    # Use standardized colors from constants
-    category_colors_rgba = {
-        0: RISK_MAP_COLORS['none'],  # none - darkest purple
-        1: RISK_MAP_COLORS['predicted_only'],  # predicted_only - blue-green
-        2: RISK_MAP_COLORS['observed_only'],  # observed_only - bright cyan
-        3: RISK_MAP_COLORS['overlap']  # overlap - bright red
-    }
+    # Use colorblind-friendly colors
+    COLOR_PREDICTED_ONLY = '#E69F00'  # Orange - predictions only (false positive or future risk)
+    COLOR_OBSERVED_ONLY = '#0072B2'   # Blue - actual establishments missed by model
+    COLOR_OVERLAP = '#009E73'         # Green - correct predictions (hits)
     
-    # Convert to hex for legend (take only RGB, ignore alpha)
-    def rgba_to_hex(rgba):
-        """Convert RGBA tuple to hex color string."""
-        r, g, b = int(rgba[0] * 255), int(rgba[1] * 255), int(rgba[2] * 255)
-        return f'#{r:02x}{g:02x}{b:02x}'
+    # Separate data into mutually exclusive categories
+    predicted_only = gdf[(gdf['is_predicted'] == 1) & (gdf['is_observed'] == 0)]
+    observed_only = gdf[(gdf['is_predicted'] == 0) & (gdf['is_observed'] == 1)]
+    overlap = gdf[(gdf['is_predicted'] == 1) & (gdf['is_observed'] == 1)]
     
-    category_colors_hex = {
-        0: rgba_to_hex(category_colors_rgba[0]),
-        1: rgba_to_hex(category_colors_rgba[1]),
-        2: rgba_to_hex(category_colors_rgba[2]),
-        3: rgba_to_hex(category_colors_rgba[3])
-    }
+    # Verify counts match (sanity check)
+    assert len(predicted_only) == predicted_count - overlap_count, "Predicted-only count mismatch!"
+    assert len(observed_only) == observed_count - overlap_count, "Observed-only count mismatch!"
+    assert len(overlap) == overlap_count, "Overlap count mismatch!"
     
-    # Create colormap and normalization (excluding background for main plot)
-    # Background will be plotted separately with transparency
-    colors_list_no_bg = [category_colors_rgba[i] for i in range(1, 4)]  # Skip category 0
-    cmap_cat = ListedColormap(colors_list_no_bg)
-    bounds = [0.5, 1.5, 2.5, 3.5]  # Adjusted bounds for categories 1, 2, 3
-    norm_cat = BoundaryNorm(bounds, cmap_cat.N)
+    # Plot each category (plot overlap last so it's on top and most visible)
+    if len(predicted_only) > 0:
+        predicted_only.plot(ax=ax, color=COLOR_PREDICTED_ONLY, markersize=4, 
+                           alpha=0.7, zorder=2, label=f'Predicted risk only (n={len(predicted_only):,})')
     
-    # Create separate raster for background (category 0) with transparency
-    background_raster = np.where(category_raster == 0, 1, np.nan)
-    background_raster_masked = np.ma.masked_where(np.isnan(background_raster), background_raster)
+    if len(observed_only) > 0:
+        observed_only.plot(ax=ax, color=COLOR_OBSERVED_ONLY, markersize=4, 
+                          alpha=0.7, zorder=3, label=f'Established (not predicted) (n={len(observed_only):,})')
     
-    # Plot background separately with very low alpha (barely visible)
-    if not background_raster_masked.mask.all():
-        ax.imshow(background_raster_masked,
-                 extent=extent,
-                 cmap=ListedColormap([category_colors_rgba[0]]),  # Single color for background
-                 vmin=0, vmax=1,
-                 origin='upper',
-                 interpolation='nearest',
-                 aspect='equal',
-                 alpha=RISK_MAP_ALPHA_BACKGROUND,
-                 zorder=1)
-    
-    # Plot main category raster (categories 1, 2, 3) with full opacity
-    # Create a masked array that excludes background pixels (category 0)
-    category_raster_no_bg = np.where(category_raster == 0, np.nan, category_raster)
-    category_raster_masked = np.ma.masked_where(np.isnan(category_raster_no_bg), category_raster_no_bg)
-    
-    im = ax.imshow(category_raster_masked,
-                   extent=extent,
-                   cmap=cmap_cat,
-                   norm=norm_cat,
-                   origin='upper',
-                   interpolation='nearest',  # No smoothing - pixel perfect
-                   aspect='equal',
-                   zorder=2)
-    
-    # Overlay protected areas with two-layer visualization if available
-    from matplotlib.colors import LinearSegmentedColormap
-    
-    # Define colors for protection layers
-    DARK_GREEN = '#2E8B57'  # Sea green - already protected (WDPA_prev=1)
-    LIGHT_GREEN = '#90EE90'  # Light green - newly protected (WDPA_prev=0, WDPA_b1=1)
-    
-    # Plot already protected areas (darker green, higher alpha - model couldn't predict here)
-    if protected_prev_raster is not None and not np.isnan(protected_prev_raster).all():
-        if protected_prev_raster.shape == category_raster.shape:
-            protected_prev_masked = np.ma.masked_where(np.isnan(protected_prev_raster), protected_prev_raster)
-            if not protected_prev_masked.mask.all():
-                dark_green_cmap = LinearSegmentedColormap.from_list('dark_green', [DARK_GREEN, DARK_GREEN], N=1)
-                ax.imshow(protected_prev_masked,
-                         extent=extent,
-                         cmap=dark_green_cmap,
-                         vmin=0, vmax=1,
-                         origin='upper',
-                         interpolation='nearest',
-                         aspect='equal',
-                         alpha=0.7,  # Higher alpha for emphasis
-                         zorder=2.5)
-    
-    # Plot newly protected areas (lighter green, lower alpha - model DID predict here before protection)
-    if newly_protected_raster is not None and not np.isnan(newly_protected_raster).all():
-        if newly_protected_raster.shape == category_raster.shape:
-            newly_protected_masked = np.ma.masked_where(np.isnan(newly_protected_raster), newly_protected_raster)
-            if not newly_protected_masked.mask.all():
-                light_green_cmap = LinearSegmentedColormap.from_list('light_green', [LIGHT_GREEN, LIGHT_GREEN], N=1)
-                ax.imshow(newly_protected_masked,
-                         extent=extent,
-                         cmap=light_green_cmap,
-                         vmin=0, vmax=1,
-                         origin='upper',
-                         interpolation='nearest',
-                         aspect='equal',
-                         alpha=0.4,  # Lower alpha to see predictions underneath
-                         zorder=2.6)
+    if len(overlap) > 0:
+        overlap.plot(ax=ax, color=COLOR_OVERLAP, markersize=6, 
+                    alpha=0.9, zorder=4, label=f'Correct predictions (n={len(overlap):,})')
     
     # Styling
     ax.set_xlabel('Longitude', fontsize=FONTSIZE_LABEL)
     ax.set_ylabel('Latitude', fontsize=FONTSIZE_LABEL)
-    ax.set_title(f'Model C ({model_type.upper()}) Risk Map: Predicted High-Risk Pixels and Observed PA Establishments', 
+    
+    # Title shows what the map represents
+    establishment_source = "Actual Establishments" if has_actual_establishments else "5-yr Lookahead Targets"
+    ax.set_title(f'Model C ({model_type.upper()}): Predicted Risk vs {establishment_source} ({time_period})', 
                  fontsize=FONTSIZE_TITLE, fontweight='bold', pad=15)
     
-    # Add description text box explaining what the map shows
-    if has_wdpa_prev:
-        # Two-layer protection description with temporal explanation
-        description_text = (f"Top 1% predicted high-risk (blue-green),\n"
-                           f"observed PA establishments (cyan), overlap (red).\n\n"
-                           f"Protection layers show temporal dynamics:\n"
-                           f"• Dark green: Already protected (prev. year)\n"
-                           f"  → Model could NOT predict (risk set boundary)\n"
-                           f"• Light green: Newly protected (current year)\n"
-                           f"  → Model DID predict (before protection)\n\n"
-                           f"Predictions visible through light green areas\n"
-                           f"are expected (made before protection).\n"
-                           f"Predicting {prediction_horizon}.")
-    else:
-        # Single-layer protection description (fallback)
-        description_text = (f"Top 1% predicted high-risk (blue-green),\n"
-                           f"observed PA establishments (cyan),\n"
-                           f"and overlap (red).\n"
-                           f"Observed = pixels with WDPA_b1=1\n"
-                           f"in {time_period} OR y_true=1.\n"
-                           f"Predicting {prediction_horizon}.")
+    # Legend
+    legend = ax.legend(loc='upper left', fontsize=FONTSIZE_LEGEND, 
+                      framealpha=0.95, markerscale=2)
     
-    ax.text(0.98, 0.98, description_text, transform=ax.transAxes, fontsize=FONTSIZE_DESCRIPTION,
-           verticalalignment='top', horizontalalignment='right',
-           bbox=dict(boxstyle='round', facecolor='lightblue', 
-           alpha=0.9, edgecolor='black', linewidth=1, pad=0.5), zorder=10)
-    
-    # Add note explaining discrepancy with P@1% metric
-    if has_wdpa_prev:
-        discrepancy_note = (f"NOTE: Map shows pixel-level aggregation.\n"
-                           f"A pixel is marked high-risk/positive if ANY of its\n"
-                           f"years meet criteria. Predictions made based on\n"
-                           f"previous year protection status (WDPA_prev).\n"
-                           f"Overlap appears higher than P@1% (row-level).")
-    else:
-        discrepancy_note = (f"NOTE: Map shows pixel-level aggregation.\n"
-                           f"A pixel is marked high-risk/positive if\n"
-                           f"ANY of its years meet criteria (not same year).\n"
-                           f"This can make overlap appear higher than\n"
-                           f"P@1% metrics (which are row-level).")
-    
-    ax.text(0.98, 0.75, discrepancy_note, transform=ax.transAxes, fontsize=FONTSIZE_DESCRIPTION-1,
-           verticalalignment='top', horizontalalignment='right',
-           bbox=dict(boxstyle='round', facecolor='yellow', 
-           alpha=0.85, edgecolor='black', linewidth=1, pad=0.5), zorder=10)
-    
-    # Create comprehensive legend with time period information
-    legend_elements = []
-    
-    # Add protected areas legend items (two-layer or single-layer)
-    if has_wdpa_prev:
-        # Two-layer legend with temporal explanation
-        if protected_prev_raster is not None and not np.isnan(protected_prev_raster).all():
-            prev_count = (pixel_df['WDPA_prev'] == 1).sum()
-            legend_elements.append(Line2D([0], [0], marker='s', color='w', 
-                                        markerfacecolor=DARK_GREEN, markersize=10, 
-                                        alpha=0.7, label=f'Already protected - prev. year (risk set boundary, n={prev_count:,})'))
-        
-        if newly_protected_raster is not None and not np.isnan(newly_protected_raster).all():
-            new_count = ((pixel_df['WDPA_prev'] == 0) & (pixel_df['wdpa_b1'] == 1) if 'wdpa_b1' in pixel_df.columns 
-                        else (pixel_df['WDPA_prev'] == 0) & (pixel_df['WDPA_b1'] == 1)).sum()
-            legend_elements.append(Line2D([0], [0], marker='s', color='w', 
-                                        markerfacecolor=LIGHT_GREEN, markersize=10, 
-                                        alpha=0.4, label=f'Newly protected - current year (predicted before protection, n={new_count:,})'))
-    elif has_wdpa and protected_prev_raster is not None:
-        # Single-layer legend (fallback)
-        protected_count = gdf['is_protected'].sum()
-        legend_elements.append(Line2D([0], [0], marker='s', color='w', 
-                                    markerfacecolor=RISK_MAP_COLORS['protected'], markersize=10, 
-                                    alpha=RISK_MAP_ALPHA_PROTECTED, label=f'Existing protected areas (as of end 2017, n={protected_count:,})'))
-    
-    # Add category legend items - overlap (bright red) first since it's most important
-    if overlap_count > 0:
-        legend_elements.append(Line2D([0], [0], marker='s', color='w', 
-                                    markerfacecolor=category_colors_hex[3], markersize=10, 
-                                    alpha=1.0, label=f'Overlap: predicted + observed PA (n={overlap_count:,})'))
-    if predicted_only_count > 0:
-        legend_elements.append(Line2D([0], [0], marker='s', color='w', 
-                                    markerfacecolor=category_colors_hex[1], markersize=10, 
-                                    alpha=1.0, label=f'Predicted high-risk only (n={predicted_only_count:,})'))
-    if observed_only_count > 0:
-        legend_elements.append(Line2D([0], [0], marker='s', color='w', 
-                                    markerfacecolor=category_colors_hex[2], markersize=10, 
-                                    alpha=1.0, label=f'Observed PA establishments only (n={observed_only_count:,})'))
-    
-    # Add time period information as text in legend
-    legend = ax.legend(handles=legend_elements, loc='upper left', fontsize=FONTSIZE_LEGEND, 
-                      framealpha=0.95, fancybox=True, shadow=True)
-    
-    # Add time period text box below legend
-    time_text = f"Observation period: {time_period}\nPrediction horizon: {prediction_horizon}"
-    ax.text(0.02, 0.02, time_text, transform=ax.transAxes, fontsize=FONTSIZE_STATS,
+    # Stats box with key metrics
+    stats_lines = [
+        f"Pixels: {len(pixel_agg):,}",
+        f"Top 1% threshold: {top1pct_threshold:.4f}",
+        f"Hit rate: {overlap_count:,}/{predicted_count:,} = {hit_rate:.1f}%"
+    ]
+    stats_text = "\n".join(stats_lines)
+    ax.text(0.02, 0.02, stats_text, transform=ax.transAxes, fontsize=FONTSIZE_STATS,
            verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat', 
-           alpha=0.8, edgecolor='black', linewidth=1), zorder=10)
+           alpha=0.9, edgecolor='black', linewidth=1), zorder=10)
     
-    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
-    
-    # Set aspect ratio to maintain geographic proportions
+    ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5)
     ax.set_aspect('equal', adjustable='box')
     
     plt.tight_layout()
     
-    # Save PNG with standardized DPI
+    # Save PNG
     png_path = output_dir / f"modelC_{model_type}_risk_map_top1pct.png"
-    plt.savefig(png_path, dpi=MAP_DPI, bbox_inches='tight')
-    print(f"\nSaved PNG: {png_path}")
+    plt.savefig(png_path, dpi=300, bbox_inches='tight')
+    print(f"\n✓ Saved simplified risk map (PNG): {png_path}")
     
-    # Save PDF with standardized DPI
+    # Save PDF
     pdf_path = output_dir / f"modelC_{model_type}_risk_map_top1pct.pdf"
-    plt.savefig(pdf_path, dpi=MAP_DPI, bbox_inches='tight')
-    print(f"Saved PDF: {pdf_path}")
+    plt.savefig(pdf_path, dpi=300, bbox_inches='tight')
+    print(f"✓ Saved simplified risk map (PDF): {pdf_path}")
     
     plt.close()
+    print(f"✓ Simplified risk map complete!")
 
 
 def create_p1pct_diagnostic_map(
