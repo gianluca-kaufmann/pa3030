@@ -35,6 +35,7 @@ import argparse
 import json
 import os
 import sys
+import zlib
 from pathlib import Path
 from typing import Dict, Any, Optional, Sequence
 
@@ -72,6 +73,12 @@ except ImportError:
 
 # Map figure dimensions (inches)
 MAP_FIGSIZE = (14, 11)
+
+# Unified map extent (longitude, latitude) - identical viewing window across all map outputs
+X_LIMITS = (-85, -32)
+Y_LIMITS = (-56, 13)
+# Data aspect ratio (height/width in degrees) - figure dimensions will match this exactly
+MAP_EXTENT_ASPECT = (Y_LIMITS[1] - Y_LIMITS[0]) / (X_LIMITS[1] - X_LIMITS[0])
 
 # Map resolution for rasterization (degrees, approximately 1 km at South America latitude)
 MAP_RESOLUTION = 0.009
@@ -1119,8 +1126,9 @@ def load_wdpa_from_test_parquet(test_parquet_path: Optional[Path], test_years: l
         return None
 
 
-def points_to_raster(x: np.ndarray, y: np.ndarray, values: np.ndarray, 
-                     target_resolution: Optional[float] = None) -> tuple[np.ndarray, tuple]:
+def points_to_raster(x: np.ndarray, y: np.ndarray, values: np.ndarray,
+                     target_resolution: Optional[float] = None,
+                     agg_func: str = 'mean') -> tuple[np.ndarray, tuple]:
     """Convert point data to a raster grid for pixel-perfect visualization.
     
     Uses histogram-based binning for maximum precision and performance.
@@ -1132,6 +1140,8 @@ def points_to_raster(x: np.ndarray, y: np.ndarray, values: np.ndarray,
         y: Y coordinates (latitude in degrees, or northing in meters, etc.)
         values: Values to rasterize
         target_resolution: Target resolution in same units as coordinates. If None, auto-detects from data.
+        agg_func: Aggregation for points in same cell: 'mean' (default) or 'max'.
+                  Use 'max' for categorical rasters so overlap wins (e.g. risk map).
     
     Returns:
         Tuple of (raster_array, extent) where extent is (xmin, xmax, ymin, ymax)
@@ -1196,14 +1206,14 @@ def points_to_raster(x: np.ndarray, y: np.ndarray, values: np.ndarray,
     # Create raster array
     raster = np.full((nrows, ncols), np.nan, dtype=np.float32)
     
-    # For points that map to the same grid cell, use the mean value
+    # For points that map to the same grid cell, aggregate (mean or max)
     # Use pandas for efficient grouping
     df_grid = pd.DataFrame({
         'x_idx': x_idx,
         'y_idx': y_idx,
         'value': values
     })
-    grid_agg = df_grid.groupby(['y_idx', 'x_idx'])['value'].mean().reset_index()
+    grid_agg = df_grid.groupby(['y_idx', 'x_idx'])['value'].agg(agg_func).reset_index()
     
     # Fill raster array
     raster[grid_agg['y_idx'].values, grid_agg['x_idx'].values] = grid_agg['value'].values
@@ -1266,9 +1276,17 @@ def create_risk_map(
     print(f"  South America boundary CRS: {sa_gdf.crs}")
     print(f"  South America boundary bounds: {sa_gdf.total_bounds}")
     
+    # Reproject to EPSG:3857 (Web Mercator) for accurate visualization
+    sa_gdf_proj = sa_gdf.to_crs('EPSG:3857')
+    print(f"  Reprojected to EPSG:3857 (Web Mercator)")
+    print(f"  Projected bounds (meters): {sa_gdf_proj.total_bounds}")
+    
     # Create GeoDataFrame from predictions
     geometry = [Point(xy) for xy in zip(df['x'], df['y'])]
     gdf = gpd.GeoDataFrame(df, geometry=geometry, crs='EPSG:4326')
+    
+    # Reproject predictions to EPSG:3857
+    gdf = gdf.to_crs('EPSG:3857')
     
     print(f"  Total rows (pixel-years): {len(gdf):,}")
     
@@ -1320,11 +1338,12 @@ def create_risk_map(
     # Update gdf with observed flag
     gdf['is_observed'] = df['is_observed'].values
     
-    # Step 2: Filter coordinate outliers BEFORE any analysis
+    # Step 2: Filter coordinate outliers BEFORE any analysis (using projected bounds)
     print(f"\n  Filtering coordinate outliers...")
     initial_count = len(gdf)
-    gdf = gdf[(gdf.geometry.x >= -85) & (gdf.geometry.x <= -30) & 
-              (gdf.geometry.y >= -60) & (gdf.geometry.y <= 15)].copy()
+    proj_bounds = sa_gdf_proj.total_bounds  # (minx, miny, maxx, maxy) in meters
+    gdf = gdf[(gdf.geometry.x >= proj_bounds[0]) & (gdf.geometry.x <= proj_bounds[2]) & 
+              (gdf.geometry.y >= proj_bounds[1]) & (gdf.geometry.y <= proj_bounds[3])].copy()
     filtered_count = len(gdf)
     if initial_count != filtered_count:
         print(f"    Removed {initial_count - filtered_count:,} outliers ({initial_count:,} → {filtered_count:,})")
@@ -1350,11 +1369,13 @@ def create_risk_map(
     
     print(f"  ✓ Top-1% threshold (pixel-level): {top1pct_threshold:.6f}")
     
-    # Step 5: Compute statistics on FINAL filtered pixel data
-    predicted_count = pixel_agg['is_predicted'].sum()
-    observed_count = pixel_agg['is_observed'].sum()
-    overlap_count = ((pixel_agg['is_predicted'] == 1) & (pixel_agg['is_observed'] == 1)).sum()
-    
+    # Step 5: Compute statistics from pixel_agg (unique physical pixels by row,col)
+    predicted_count = int(pixel_agg['is_predicted'].sum())
+    observed_count = int(pixel_agg['is_observed'].sum())
+    overlap_count = int(((pixel_agg['is_predicted'] == 1) & (pixel_agg['is_observed'] == 1)).sum())
+    predicted_only_count = predicted_count - overlap_count
+    observed_only_count = observed_count - overlap_count
+
     print(f"\n  FINAL STATISTICS (pixel-level, after filtering):")
     print(f"    Total pixels: {len(pixel_agg):,}")
     print(f"    Predicted high-risk (top 1%): {predicted_count:,}")
@@ -1366,65 +1387,81 @@ def create_risk_map(
     else:
         hit_rate = 0.0
         print(f"    Hit rate: N/A (no predictions)")
+
+    # Step 6: Build category raster (pixel-perfect, same resolution as probability map)
+    # Category: 0=background, 1=predicted_only, 2=observed_only, 3=overlap (agg_func='max' so overlap wins)
+    # Need to get projected coordinates for rasterization
+    pixel_geom = [Point(xy) for xy in zip(pixel_agg['x'], pixel_agg['y'])]
+    pixel_gdf = gpd.GeoDataFrame(pixel_agg, geometry=pixel_geom, crs='EPSG:4326')
+    pixel_gdf_proj = pixel_gdf.to_crs('EPSG:3857')
     
-    # Create GeoDataFrame for plotting from pixel-level data
-    geometry = [Point(xy) for xy in zip(pixel_agg['x'], pixel_agg['y'])]
-    gdf = gpd.GeoDataFrame(pixel_agg, geometry=geometry, crs='EPSG:4326')
+    category_codes = np.where(
+        (pixel_agg['is_predicted'] == 1) & (pixel_agg['is_observed'] == 1), 3,
+        np.where(pixel_agg['is_observed'] == 1, 2,
+                 np.where(pixel_agg['is_predicted'] == 1, 1, 0)))
+    print(f"\n  Creating rasterized risk map...")
+    category_raster, extent = points_to_raster(
+        pixel_gdf_proj.geometry.x.values,
+        pixel_gdf_proj.geometry.y.values,
+        category_codes.astype(np.float32),
+        target_resolution=1000.0,  # 1000 meters resolution
+        agg_func='max'
+    )
+    print(f"  Category raster shape: {category_raster.shape}, extent: {extent}")
+
+    # Calculate figure dimensions dynamically from projected bounds
+    proj_bounds = sa_gdf_proj.total_bounds  # (minx, miny, maxx, maxy) in meters
+    proj_width = proj_bounds[2] - proj_bounds[0]
+    proj_height = proj_bounds[3] - proj_bounds[1]
+    proj_aspect = proj_height / proj_width
     
-    # Step 6: Create visualization
-    print(f"\n  Creating visualization...")
-    fig, ax = plt.subplots(figsize=(12, 10))
+    fig_width = 14
+    fig_height = fig_width * proj_aspect
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
+    # Clean white background: plot South America boundary as solid base
+    sa_gdf_proj.plot(ax=ax, color='white', edgecolor='none', linewidth=1.5, zorder=1)
+
+    # ListedColormap for 3 categories (Predicted, Observed, Overlap)
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+    COLOR_PREDICTED_ONLY = '#E69F00'  # Orange
+    COLOR_OBSERVED_ONLY = '#0072B2'   # Blue
+    COLOR_OVERLAP = '#009E73'         # Green
+    cmap_categories = ListedColormap([COLOR_PREDICTED_ONLY, COLOR_OBSERVED_ONLY, COLOR_OVERLAP])
+    norm_categories = BoundaryNorm([0.5, 1.5, 2.5, 3.5], cmap_categories.N)
+
+    # Category raster (1, 2, 3) - pixel-perfect resolution
+    cat_no_bg = np.where((category_raster >= 1) & (category_raster <= 3), category_raster, np.nan)
+    cat_masked = np.ma.masked_where(np.isnan(cat_no_bg), cat_no_bg)
+    ax.imshow(cat_masked, extent=extent, cmap=cmap_categories, norm=norm_categories,
+              origin='upper', interpolation='nearest', aspect='equal', zorder=2)
     
-    # Plot South America boundary
-    sa_gdf.plot(ax=ax, color='#f0f0f0', edgecolor='gray', linewidth=0.5, alpha=0.3, zorder=1)
-    
-    # VISUALIZATION: Plot 3 distinct categories with clear, accessible colors
-    # Color semantics:
-    # - Model predicted risk, but NO establishment → Red (false positive / future risk)
-    # - Establishment occurred, but NOT predicted → Blue (missed by model)
-    # - BOTH predicted AND established → Green (correct prediction / hit)
-    
-    # Use colorblind-friendly colors
-    COLOR_PREDICTED_ONLY = '#E69F00'  # Orange - predictions only (false positive or future risk)
-    COLOR_OBSERVED_ONLY = '#0072B2'   # Blue - actual establishments missed by model
-    COLOR_OVERLAP = '#009E73'         # Green - correct predictions (hits)
-    
-    # Separate data into mutually exclusive categories
-    predicted_only = gdf[(gdf['is_predicted'] == 1) & (gdf['is_observed'] == 0)]
-    observed_only = gdf[(gdf['is_predicted'] == 0) & (gdf['is_observed'] == 1)]
-    overlap = gdf[(gdf['is_predicted'] == 1) & (gdf['is_observed'] == 1)]
-    
-    # Verify counts match (sanity check)
-    assert len(predicted_only) == predicted_count - overlap_count, "Predicted-only count mismatch!"
-    assert len(observed_only) == observed_count - overlap_count, "Observed-only count mismatch!"
-    assert len(overlap) == overlap_count, "Overlap count mismatch!"
-    
-    # Plot each category (plot overlap last so it's on top and most visible)
-    if len(predicted_only) > 0:
-        predicted_only.plot(ax=ax, color=COLOR_PREDICTED_ONLY, markersize=4, 
-                           alpha=0.7, zorder=2, label=f'Predicted risk only (n={len(predicted_only):,})')
-    
-    if len(observed_only) > 0:
-        observed_only.plot(ax=ax, color=COLOR_OBSERVED_ONLY, markersize=4, 
-                          alpha=0.7, zorder=3, label=f'Established (not predicted) (n={len(observed_only):,})')
-    
-    if len(overlap) > 0:
-        overlap.plot(ax=ax, color=COLOR_OVERLAP, markersize=6, 
-                    alpha=0.9, zorder=4, label=f'Correct predictions (n={len(overlap):,})')
-    
+    # Set axis limits from projected bounds
+    ax.set_xlim(proj_bounds[0], proj_bounds[2])
+    ax.set_ylim(proj_bounds[1], proj_bounds[3])
+    ax.set_aspect('equal', adjustable='box')
+
     # Styling
-    ax.set_xlabel('Longitude', fontsize=FONTSIZE_LABEL)
-    ax.set_ylabel('Latitude', fontsize=FONTSIZE_LABEL)
-    
-    # Title shows what the map represents
+    ax.set_xlabel('Easting (m, EPSG:3857)', fontsize=FONTSIZE_LABEL)
+    ax.set_ylabel('Northing (m, EPSG:3857)', fontsize=FONTSIZE_LABEL)
     establishment_source = "Actual Establishments" if has_actual_establishments else "5-yr Lookahead Targets"
-    ax.set_title(f'Model 1 ({model_type.upper()}): Predicted Risk vs {establishment_source} ({time_period})', 
+    ax.set_title(f'Model 1 ({model_type.upper()}): Predicted Risk vs {establishment_source} ({time_period})',
                  fontsize=FONTSIZE_TITLE, fontweight='bold', pad=15)
-    
-    # Legend
-    legend = ax.legend(loc='upper left', fontsize=FONTSIZE_LEGEND, 
-                      framealpha=0.95, markerscale=2)
-    
+
+    # Legend with counts from pixel_agg (unique physical pixels)
+    legend_elements = []
+    if predicted_only_count > 0:
+        legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=COLOR_PREDICTED_ONLY,
+                                      markersize=10, alpha=0.9, label=f'Predicted risk only (n={predicted_only_count:,})'))
+    if observed_only_count > 0:
+        legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=COLOR_OBSERVED_ONLY,
+                                      markersize=10, alpha=0.9, label=f'Established (not predicted) (n={observed_only_count:,})'))
+    if overlap_count > 0:
+        legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=COLOR_OVERLAP,
+                                      markersize=10, alpha=0.9, label=f'Correct predictions (n={overlap_count:,})'))
+    if legend_elements:
+        ax.legend(handles=legend_elements, loc='upper left', fontsize=FONTSIZE_LEGEND, framealpha=0.95)
+
     # Stats box with key metrics
     stats_lines = [
         f"Pixels: {len(pixel_agg):,}",
@@ -1433,24 +1470,36 @@ def create_risk_map(
     ]
     stats_text = "\n".join(stats_lines)
     ax.text(0.02, 0.02, stats_text, transform=ax.transAxes, fontsize=FONTSIZE_STATS,
-           verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat', 
+           verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat',
            alpha=0.9, edgecolor='black', linewidth=1), zorder=10)
-    
-    ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5)
-    ax.set_aspect('equal', adjustable='box')
-    
-    plt.tight_layout()
-    
-    # Save PNG
+
+    ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5, zorder=3)
+
+    plt.tight_layout(pad=0.5)
+
+    # Save PNG with high DPI for maximum resolution
     png_path = output_dir / f"model1_{model_type}_risk_map_top1pct.png"
-    plt.savefig(png_path, dpi=300, bbox_inches='tight')
+    plt.savefig(png_path, dpi=600, bbox_inches='tight')
     print(f"\n✓ Saved simplified risk map (PNG): {png_path}")
-    
-    # Save PDF
+
+    # Save PDF with low DPI to avoid timeout/zlib/backend errors on large rasters
     pdf_path = output_dir / f"model1_{model_type}_risk_map_top1pct.pdf"
-    plt.savefig(pdf_path, dpi=300, bbox_inches='tight')
-    print(f"✓ Saved simplified risk map (PDF): {pdf_path}")
-    
+    for pdf_dpi in (150, 100):
+        try:
+            if pdf_path.exists():
+                pdf_path.unlink(missing_ok=True)
+            plt.savefig(pdf_path, dpi=pdf_dpi, bbox_inches='tight')
+            print(f"✓ Saved simplified risk map (PDF): {pdf_path} (dpi={pdf_dpi})")
+            break
+        except (TimeoutError, zlib.error, OSError, AttributeError, RuntimeError) as e:
+            if pdf_path.exists():
+                try:
+                    pdf_path.unlink()
+                except OSError:
+                    pass
+            if pdf_dpi == 100:
+                print(f"Warning: Could not save risk map PDF after retries: {e}. Skipping PDF.")
+            continue
     plt.close()
     print(f"✓ Simplified risk map complete!")
 
@@ -1485,9 +1534,17 @@ def create_p1pct_diagnostic_map(
     
     print(f"  South America boundary CRS: {sa_gdf.crs}")
     
+    # Reproject to EPSG:3857 (Web Mercator) for accurate visualization
+    sa_gdf_proj = sa_gdf.to_crs('EPSG:3857')
+    print(f"  Reprojected to EPSG:3857 (Web Mercator)")
+    print(f"  Projected bounds (meters): {sa_gdf_proj.total_bounds}")
+    
     # Create GeoDataFrame from predictions (keep all rows, no deduplication)
     geometry = [Point(xy) for xy in zip(df['x'], df['y'])]
     gdf = gpd.GeoDataFrame(df, geometry=geometry, crs='EPSG:4326')
+    
+    # Reproject predictions to EPSG:3857
+    gdf = gdf.to_crs('EPSG:3857')
     
     print(f"  Total rows (pixel-years): {len(gdf):,}")
     
@@ -1579,22 +1636,29 @@ def create_p1pct_diagnostic_map(
         else:
             prediction_horizon = "5-year lookahead (2018-2024)"
     
-    # Convert to raster for visualization
+    # Convert to raster for visualization (using projected coordinates)
     print(f"  Converting {len(gdf):,} points to raster grid...")
     category_raster, extent = points_to_raster(
         gdf.geometry.x.values,
         gdf.geometry.y.values,
         gdf['category_code'].values,
-        target_resolution=MAP_RESOLUTION
+        target_resolution=1000.0  # 1000 meters resolution
     )
     print(f"  Category raster shape: {category_raster.shape}, extent: {extent}")
     print(f"  Valid (non-NaN) pixels: {np.sum(~np.isnan(category_raster)):,}")
+
+    # Calculate figure dimensions dynamically from projected bounds
+    proj_bounds = sa_gdf_proj.total_bounds  # (minx, miny, maxx, maxy) in meters
+    proj_width = proj_bounds[2] - proj_bounds[0]
+    proj_height = proj_bounds[3] - proj_bounds[1]
+    proj_aspect = proj_height / proj_width
     
-    # Create figure
-    fig, ax = plt.subplots(figsize=MAP_FIGSIZE)
-    
-    # Plot South America boundary
-    sa_gdf.plot(ax=ax, color='white', edgecolor='none', linewidth=1.5, zorder=1)
+    fig_width = 14
+    fig_height = fig_width * proj_aspect
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
+    # Clean white background: plot South America boundary as solid base
+    sa_gdf_proj.plot(ax=ax, color='white', edgecolor='none', linewidth=1.5, zorder=1)
     
     # Define colors for each category
     from matplotlib.colors import ListedColormap, BoundaryNorm
@@ -1624,22 +1688,6 @@ def create_p1pct_diagnostic_map(
     bounds = [0.5, 1.5, 2.5, 3.5]
     norm_cat = BoundaryNorm(bounds, cmap_cat.N)
     
-    # Create separate raster for background
-    background_raster = np.where(category_raster == 0, 1, np.nan)
-    background_raster_masked = np.ma.masked_where(np.isnan(background_raster), background_raster)
-    
-    # Plot background separately
-    if not background_raster_masked.mask.all():
-        ax.imshow(background_raster_masked,
-                 extent=extent,
-                 cmap=ListedColormap([category_colors_rgba[0]]),
-                 vmin=0, vmax=1,
-                 origin='upper',
-                 interpolation='nearest',
-                 aspect='equal',
-                 alpha=RISK_MAP_ALPHA_BACKGROUND,
-                 zorder=1)
-    
     # Plot main category raster
     category_raster_no_bg = np.where(category_raster == 0, np.nan, category_raster)
     category_raster_masked = np.ma.masked_where(np.isnan(category_raster_no_bg), category_raster_no_bg)
@@ -1653,10 +1701,15 @@ def create_p1pct_diagnostic_map(
                    aspect='equal',
                    zorder=2)
     
+    # Set axis limits from projected bounds
+    ax.set_xlim(proj_bounds[0], proj_bounds[2])
+    ax.set_ylim(proj_bounds[1], proj_bounds[3])
+    ax.set_aspect('equal', adjustable='box')
+
     # Styling
-    ax.set_xlabel('Longitude', fontsize=FONTSIZE_LABEL)
-    ax.set_ylabel('Latitude', fontsize=FONTSIZE_LABEL)
-    ax.set_title(f'Model 1 ({model_type.upper()}) Row-Level P@1% Diagnostic Map', 
+    ax.set_xlabel('Easting (m, EPSG:3857)', fontsize=FONTSIZE_LABEL)
+    ax.set_ylabel('Northing (m, EPSG:3857)', fontsize=FONTSIZE_LABEL)
+    ax.set_title(f'Model 1 ({model_type.upper()}) Row-Level P@1% Diagnostic Map',
                  fontsize=FONTSIZE_TITLE, fontweight='bold', pad=15)
     
     # Add description text box
@@ -1695,21 +1748,31 @@ def create_p1pct_diagnostic_map(
            verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat', 
            alpha=0.8, edgecolor='black', linewidth=1), zorder=10)
     
-    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
-    ax.set_aspect('equal', adjustable='box')
-    
-    plt.tight_layout()
-    
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5, zorder=3)
+
+    plt.tight_layout(pad=0.5)
+
     # Save PNG
     png_path = output_dir / f"model1_{model_type}_p1pct_diagnostic.png"
     plt.savefig(png_path, dpi=MAP_DPI, bbox_inches='tight')
     print(f"\nSaved PNG: {png_path}")
-    
-    # Save PDF
+
+    # Save PDF (use lower DPI to avoid timeout/zlib errors on large raster; retry on failure)
     pdf_path = output_dir / f"model1_{model_type}_p1pct_diagnostic.pdf"
-    plt.savefig(pdf_path, dpi=MAP_DPI, bbox_inches='tight')
-    print(f"Saved PDF: {pdf_path}")
-    
+    for pdf_dpi in (300, 150):
+        try:
+            plt.savefig(pdf_path, dpi=pdf_dpi, bbox_inches='tight')
+            print(f"Saved PDF: {pdf_path} (dpi={pdf_dpi})")
+            break
+        except (TimeoutError, zlib.error, OSError) as e:
+            if pdf_path.exists():
+                try:
+                    pdf_path.unlink()
+                except OSError:
+                    pass
+            if pdf_dpi == 150:
+                print(f"Warning: Could not save PDF after retry: {e}. Skipping PDF.")
+            continue
     plt.close()
 
 
@@ -1753,9 +1816,17 @@ def create_probability_map(
     
     print(f"  South America boundary CRS: {sa_gdf.crs}")
     
+    # Reproject to EPSG:3857 (Web Mercator) for accurate visualization
+    sa_gdf_proj = sa_gdf.to_crs('EPSG:3857')
+    print(f"  Reprojected to EPSG:3857 (Web Mercator)")
+    print(f"  Projected bounds (meters): {sa_gdf_proj.total_bounds}")
+    
     # Create GeoDataFrame from predictions
     geometry = [Point(xy) for xy in zip(df['x'], df['y'])]
     gdf = gpd.GeoDataFrame(df, geometry=geometry, crs='EPSG:4326')
+    
+    # Reproject predictions to EPSG:3857
+    gdf = gdf.to_crs('EPSG:3857')
     
     print(f"  Prediction points: {len(gdf):,}")
     
@@ -1825,16 +1896,18 @@ def create_probability_map(
     print(f"  Normalized value range: [{proba_normalized.min():.4f}, {proba_normalized.max():.4f}]")
     print(f"  Normalized value mean: {proba_normalized.mean():.4f}, median: {np.median(proba_normalized):.4f}")
     
-    # Filter coordinate outliers before rasterization
+    # Filter coordinate outliers before rasterization (using projected bounds)
     print(f"  Filtering coordinate outliers...")
-    initial_count = len(df)
-    df = df[(df['x'] >= -85) & (df['x'] <= -30) & (df['y'] >= -60) & (df['y'] <= 15)]
-    filtered_count = len(df)
+    initial_count = len(gdf)
+    proj_bounds = sa_gdf_proj.total_bounds  # (minx, miny, maxx, maxy) in meters
+    gdf = gdf[(gdf.geometry.x >= proj_bounds[0]) & (gdf.geometry.x <= proj_bounds[2]) & 
+              (gdf.geometry.y >= proj_bounds[1]) & (gdf.geometry.y <= proj_bounds[3])].copy()
+    filtered_count = len(gdf)
     if initial_count != filtered_count:
         print(f"  Filtered out {initial_count - filtered_count:,} coordinate outliers ({initial_count:,} -> {filtered_count:,})")
     
-    # Update gdf to match filtered df (keep geometry in sync)
-    gdf = gdf[gdf.index.isin(df.index)].copy()
+    # Update df to match filtered gdf (keep in sync)
+    df = df[df.index.isin(gdf.index)].copy()
     
     # Recompute proba_normalized from filtered data (using same percentile thresholds from original data)
     proba_values_filtered = df['y_pred_proba'].values
@@ -1847,36 +1920,49 @@ def create_probability_map(
     else:
         proba_normalized = proba_normalized_linear
     
-    # Convert points to raster for pixel-perfect visualization
+    # Convert points to raster for pixel-perfect visualization (using projected coordinates)
     print(f"  Converting {len(gdf):,} points to raster grid...")
     raster, extent = points_to_raster(
         gdf.geometry.x.values, 
         gdf.geometry.y.values, 
         proba_normalized,  # Use normalized values to ensure full colormap usage
-        target_resolution=MAP_RESOLUTION
+        target_resolution=1000.0  # 1000 meters resolution
     )
     print(f"  Raster shape: {raster.shape}, extent: {extent}")
     print(f"  Valid (non-NaN) pixels: {np.sum(~np.isnan(raster)):,}")
+
+    # Calculate figure dimensions dynamically from projected bounds
+    proj_bounds = sa_gdf_proj.total_bounds  # (minx, miny, maxx, maxy) in meters
+    proj_width = proj_bounds[2] - proj_bounds[0]
+    proj_height = proj_bounds[3] - proj_bounds[1]
+    proj_aspect = proj_height / proj_width
     
-    # Create figure
-    fig, ax = plt.subplots(figsize=MAP_FIGSIZE)
-    
-    # Plot South America boundary
-    sa_gdf.plot(ax=ax, color='white', edgecolor='none', linewidth=1.5, zorder=1)
+    fig_width = 14
+    fig_height = fig_width * proj_aspect
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
+    # Clean white background: plot South America boundary as solid base
+    sa_gdf_proj.plot(ax=ax, color='white', edgecolor='none', linewidth=1.5, zorder=1)
     
     # Plot probability raster with pixel-perfect rendering
     # Use standardized colormap for consistent visualization across all models
     # interpolation='nearest' ensures no smoothing - pixel-perfect rendering
     # Values are normalized to [0, 1] so full colormap is used
-    im = ax.imshow(raster, 
-                   extent=extent, 
-                   cmap=PROBABILITY_MAP_COLORMAP, 
+    # aspect='equal' ensures pixels align perfectly with geographic boundary
+    im = ax.imshow(raster,
+                   extent=extent,
+                   cmap=PROBABILITY_MAP_COLORMAP,
                    vmin=0, vmax=1,  # Normalized values, so use [0, 1] range
                    origin='upper',  # Match geographic convention (north at top)
                    interpolation='nearest',  # No smoothing - pixel perfect
                    aspect='equal',
                    zorder=2)
     
+    # Set axis limits from projected bounds
+    ax.set_xlim(proj_bounds[0], proj_bounds[2])
+    ax.set_ylim(proj_bounds[1], proj_bounds[3])
+    ax.set_aspect('equal', adjustable='box')
+
     # Add colorbar with custom formatter to show actual probability values
     cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label('Predicted Probability', 
@@ -1890,8 +1976,8 @@ def create_probability_map(
     cbar.ax.tick_params(labelsize=FONTSIZE_LEGEND)
     
     # Styling
-    ax.set_xlabel('Longitude', fontsize=FONTSIZE_LABEL)
-    ax.set_ylabel('Latitude', fontsize=FONTSIZE_LABEL)
+    ax.set_xlabel('Easting (m, EPSG:3857)', fontsize=FONTSIZE_LABEL)
+    ax.set_ylabel('Northing (m, EPSG:3857)', fontsize=FONTSIZE_LABEL)
     
     # Check if calibrated probabilities were used
     calibration_note = ""
@@ -1917,23 +2003,31 @@ def create_probability_map(
            verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', 
            alpha=0.9, edgecolor='black', linewidth=1), zorder=10)
     
-    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
-    
-    # Set aspect ratio to maintain geographic proportions
-    ax.set_aspect('equal', adjustable='box')
-    
-    plt.tight_layout()
-    
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5, zorder=3)
+
+    plt.tight_layout(pad=0.5)
+
     # Save PNG with standardized DPI
     png_path = output_dir / f"model1_{model_type}_probability_map.png"
     plt.savefig(png_path, dpi=MAP_DPI, bbox_inches='tight')
     print(f"\nSaved PNG: {png_path}")
-    
-    # Save PDF with standardized DPI
+
+    # Save PDF (lower DPI + retry to avoid timeout/zlib errors on large raster)
     pdf_path = output_dir / f"model1_{model_type}_probability_map.pdf"
-    plt.savefig(pdf_path, dpi=MAP_DPI, bbox_inches='tight')
-    print(f"Saved PDF: {pdf_path}")
-    
+    for pdf_dpi in (300, 150):
+        try:
+            plt.savefig(pdf_path, dpi=pdf_dpi, bbox_inches='tight')
+            print(f"Saved PDF: {pdf_path} (dpi={pdf_dpi})")
+            break
+        except (TimeoutError, zlib.error, OSError) as e:
+            if pdf_path.exists():
+                try:
+                    pdf_path.unlink()
+                except OSError:
+                    pass
+            if pdf_dpi == 150:
+                print(f"Warning: Could not save PDF after retry: {e}. Skipping PDF.")
+            continue
     plt.close()
 
 
@@ -2584,26 +2678,29 @@ def main() -> None:
     model_path = None
     if not args.skip_shap:
         print("\nAuto-discovering trained model file for SHAP analysis...")
-        # For RF models, search for both .pkl and .joblib files with expected window suffix
-        if args.model_type == 'rf':
-            model_patterns = [
-                f"model1_{args.model_type}_win5_*.pkl",
-                f"model1_{args.model_type}_win5_*.joblib"
-            ]
-        else:
-            # For LGBM, allow both window-specific and generic model filenames
-            model_patterns = [
-                f"model1_{args.model_type}_win5_*.pkl",
-                f"model1_{args.model_type}_*.pkl",
-            ]
-        
+        # Inclusive patterns: model-specific and generic .pkl / .joblib
+        model_patterns = [
+            f"model1_{args.model_type}_win5_*.pkl",
+            f"model1_{args.model_type}_win5_*.joblib",
+            f"model1_{args.model_type}_*.pkl",
+            f"model1_{args.model_type}_*.joblib",
+            "*model*.pkl",
+            "*.joblib",
+        ]
+
+        # Check $SCRATCH first, then local repo (./data/ml/models/) so SHAP works without SCRATCH
         model_candidates = []
         if scratch_root is not None:
             model_candidates.append(scratch_root / "data/ml/models" / args.split_version)
             model_candidates.append(scratch_root / "data/ml/models")
         model_candidates.append(repo_root / "data/ml/models" / args.split_version)
         model_candidates.append(repo_root / "data/ml/models")
-        
+        # Local paths when $SCRATCH is missing: cwd and repo-relative
+        cwd_models = Path.cwd() / "data" / "ml" / "models"
+        for extra in (cwd_models, cwd_models / args.split_version):
+            if extra.exists() and extra not in model_candidates:
+                model_candidates.append(extra)
+
         model_path = None
         for search_dir in model_candidates:
             if search_dir.exists():
