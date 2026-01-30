@@ -59,7 +59,6 @@ from sklearn.calibration import calibration_curve
 import geopandas as gpd
 from shapely.geometry import Point
 from scipy.interpolate import interp1d, griddata
-from joblib import Parallel, delayed
 
 # Try to import shap - if not available, raise clear error when SHAP analysis is requested
 try:
@@ -3138,10 +3137,10 @@ def main() -> None:
     # Load South America boundary once and reuse for all map outputs (avoids 5x load/download)
     sa_gdf = get_south_america_boundary(region_boundary_path)
     thresholds = [1, 5, 10]
-    # Parallel risk map generation (1%, 5%, 10%) - each threshold is independent
-    n_jobs = min(3, len(thresholds))
-    Parallel(n_jobs=n_jobs, backend="loky", verbose=5)(
-        delayed(create_risk_map)(
+    # Risk map generation (1%, 5%, 10%) - run sequentially to avoid OOM on Euler
+    # (Parallel with loky duplicates df per worker; 47M+ rows causes SIGKILL -9)
+    for threshold_pct in thresholds:
+        create_risk_map(
             df,
             region_boundary_path,
             output_dir,
@@ -3154,8 +3153,6 @@ def main() -> None:
             future_years=future_years,
             sa_gdf=sa_gdf,
         )
-        for threshold_pct in thresholds
-    )
     # Pass explicit test years to the row-level P@1% diagnostic map
     create_p1pct_diagnostic_map(
         df,
