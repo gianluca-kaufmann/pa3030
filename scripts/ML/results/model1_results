@@ -59,6 +59,7 @@ from sklearn.calibration import calibration_curve
 import geopandas as gpd
 from shapely.geometry import Point
 from scipy.interpolate import interp1d, griddata
+from joblib import Parallel, delayed
 
 # Try to import shap - if not available, raise clear error when SHAP analysis is requested
 try:
@@ -90,6 +91,10 @@ MAP_EXTENT_ASPECT = (Y_LIMITS[1] - Y_LIMITS[0]) / (X_LIMITS[1] - X_LIMITS[0])
 
 # Map resolution for rasterization (degrees, approximately 1 km at South America latitude)
 MAP_RESOLUTION = 0.009
+
+# Module-level cache for parquet loaders (avoids re-reading same files when create_risk_map is called 3x)
+_WDPA_TEST_CACHE: Dict[tuple, Any] = {}
+_FUTURE_PA_CACHE: Dict[tuple, Any] = {}
 
 # Default future period for temporal validation (risk maps); try val_win5.parquet first, then merged_panel_final.parquet
 DEFAULT_FUTURE_PARQUET_FILENAME = "val_win5.parquet"
@@ -349,15 +354,18 @@ def check_calibration_status(parquet_path: Path, available_columns: list) -> Non
         print(f"{'!'*70}\n")
 
 
-def load_scored_parquet(parquet_path: Path) -> pd.DataFrame:
+def load_scored_parquet(parquet_path: Path, test_years: Optional[Sequence[int]] = None) -> pd.DataFrame:
     """Load scored parquet file with only needed columns using pyarrow.
     
     Reads: y_true, y_pred_proba, x, y (with column name resolution)
     Optionally reads: wdpa_b1 (protected area coverage as of end of 2017)
     Also reads: year, row, col if available (needed for joining with WDPA data)
+    
+    If test_years is provided and the file has a year column, uses predicate pushdown
+    to load only rows matching those years (reduces I/O and RAM for large datasets).
     """
     print(f"Reading parquet file: {parquet_path}")
-    pfile = pq.ParquetFile(parquet_path)
+    pfile = pq.ParquetFile(parquet_path)  # Used only for schema / calibration check
     
     # Read schema to get available columns
     # ParquetSchema doesn't have field() method, use schema_arrow to get Arrow schema
@@ -417,21 +425,20 @@ def load_scored_parquet(parquet_path: Path) -> pd.DataFrame:
         error_msg += "\nPlease ensure the parquet file contains one of the expected column names."
         raise ValueError(error_msg)
     
-    # Read all row groups with resolved column names (plus optional wdpa_b1 and metadata)
+    # Read with pd.read_parquet (multi-threaded, predicate pushdown when possible)
     columns_to_read = list(resolved_columns.values()) + optional_metadata_cols
     if wdpa_col:
         columns_to_read.append(wdpa_col)
     
-    all_data = []
-    num_row_groups = pfile.metadata.num_row_groups
-    print(f"  Reading {num_row_groups} row groups...")
-    
-    for rg_idx in range(num_row_groups):
-        table = pfile.read_row_group(rg_idx, columns=columns_to_read)
-        df = table.to_pandas()
-        all_data.append(df)
-    
-    result = pd.concat(all_data, ignore_index=True)
+    # Predicate pushdown: filter by year to reduce I/O and RAM (critical for 47M+ rows)
+    read_kwargs: Dict[str, Any] = {"columns": columns_to_read}
+    if test_years is not None and len(test_years) > 0 and "year" in optional_metadata_cols:
+        year_col = "year"  # We use logical name; parquet has same physical name
+        read_kwargs["filters"] = [(year_col, "in", list(test_years))]
+        print(f"  Reading parquet (columns={len(columns_to_read)}, filter year in {test_years})...")
+    else:
+        print(f"  Reading parquet (columns={len(columns_to_read)})...")
+    result = pd.read_parquet(parquet_path, **read_kwargs)
     
     # Rename columns to standard names
     rename_dict = {v: k for k, v in resolved_columns.items()}
@@ -1033,35 +1040,19 @@ def derive_test_years(metrics_data: Optional[Dict[str, Any]] = None,
     if test_parquet_path is None or not test_parquet_path.exists():
         parquet_unusable = True
     else:
-        # Open the parquet file once; if this fails, we consider it unreadable.
         try:
-            pfile = pq.ParquetFile(test_parquet_path)
+            # Read only year column (fast, multi-threaded)
+            df = pd.read_parquet(test_parquet_path, columns=['year'])
+            if 'year' in df.columns:
+                years_set = set(df['year'].dropna().unique())
+                if years_set:
+                    years = sorted(int(y) for y in years_set if pd.notna(y))
+                    if years:
+                        print(f"  Derived test years from test parquet: {years}")
+                        return years
         except Exception:
-            parquet_unusable = True
-        else:
-            years_set: set = set()
-            num_row_groups = pfile.metadata.num_row_groups or 0
-            for rg_idx in range(num_row_groups):
-                try:
-                    # Read only the `year` column for this row group
-                    table = pfile.read_row_group(rg_idx, columns=['year'])
-                    df = table.to_pandas()
-                    if 'year' not in df.columns:
-                        continue
-                    years_set.update(df['year'].dropna().unique())
-                except Exception:
-                    # If a specific row group is problematic, skip it and
-                    # continue aggregating from the others.
-                    continue
-
-            if years_set:
-                years = sorted(int(y) for y in years_set if pd.notna(y))
-                if years:
-                    print(f"  Derived test years from test parquet: {years}")
-                    return years
-            else:
-                # No usable years in the parquet; treat as unusable for deriving years
-                parquet_unusable = True
+            pass
+        parquet_unusable = True
     
     # ------------------------------------------------------------------
     # 2) Fall back to metrics metadata
@@ -1095,6 +1086,7 @@ def derive_test_years(metrics_data: Optional[Dict[str, Any]] = None,
 
 def load_future_pa_establishments(future_parquet_path: Optional[Path], future_years: list) -> Optional[pd.DataFrame]:
     """Load future PA establishments (e.g., 2020-2024) from validation/future parquet for temporal validation.
+    Results are cached to avoid re-reading when create_risk_map is called multiple times.
     
     This function identifies pixels that were established AFTER the test period to assess the model's
     forward-looking predictive power. For example, if the model predicted high-risk areas in 2017-2019,
@@ -1109,6 +1101,10 @@ def load_future_pa_establishments(future_parquet_path: Optional[Path], future_ye
     """
     if future_parquet_path is None or not future_parquet_path.exists():
         return None
+    
+    cache_key = (str(future_parquet_path), tuple(sorted(future_years)))
+    if cache_key in _FUTURE_PA_CACHE:
+        return _FUTURE_PA_CACHE[cache_key]
     
     print(f"\nLoading future PA establishments from: {future_parquet_path}")
     try:
@@ -1145,17 +1141,12 @@ def load_future_pa_establishments(future_parquet_path: Optional[Path], future_ye
         if has_xy:
             required_cols.extend(['x', 'y'])
         
-        # Read data
-        all_data = []
-        num_row_groups = pfile.metadata.num_row_groups
-        print(f"  Reading {num_row_groups} row groups...")
-        
-        for rg_idx in range(num_row_groups):
-            table = pfile.read_row_group(rg_idx, columns=required_cols)
-            df = table.to_pandas()
-            all_data.append(df)
-        
-        result = pd.concat(all_data, ignore_index=True)
+        # Predicate pushdown: load year in future_years + year before (needed for shift())
+        years_to_load = [min(future_years) - 1] + list(future_years)
+        read_kwargs: Dict[str, Any] = {"columns": required_cols}
+        read_kwargs["filters"] = [("year", "in", years_to_load)]
+        print(f"  Reading parquet (columns={len(required_cols)}, filter year in {years_to_load})...")
+        result = pd.read_parquet(future_parquet_path, **read_kwargs)
         
         # Standardize column names
         if wdpa_col != 'WDPA_b1':
@@ -1201,6 +1192,7 @@ def load_future_pa_establishments(future_parquet_path: Optional[Path], future_ye
         
         print(f"  Join method: {'row/col' if has_row_col else 'x/y'}")
         
+        _FUTURE_PA_CACHE[cache_key] = estab_df
         return estab_df
     
     except Exception as e:
@@ -1225,6 +1217,10 @@ def load_wdpa_from_test_parquet(test_parquet_path: Optional[Path], test_years: l
     """
     if test_parquet_path is None or not test_parquet_path.exists():
         return None
+    
+    cache_key = (str(test_parquet_path), tuple(sorted(test_years)))
+    if cache_key in _WDPA_TEST_CACHE:
+        return _WDPA_TEST_CACHE[cache_key]
     
     print(f"\nLoading WDPA data from original test parquet: {test_parquet_path}")
     try:
@@ -1276,17 +1272,12 @@ def load_wdpa_from_test_parquet(test_parquet_path: Optional[Path], test_years: l
         if has_xy:
             required_cols.extend(['x', 'y'])
         
-        # Read data
-        all_data = []
-        num_row_groups = pfile.metadata.num_row_groups
-        print(f"  Reading {num_row_groups} row groups...")
-        
-        for rg_idx in range(num_row_groups):
-            table = pfile.read_row_group(rg_idx, columns=required_cols)
-            df = table.to_pandas()
-            all_data.append(df)
-        
-        result = pd.concat(all_data, ignore_index=True)
+        # Predicate pushdown: load test_years + year before (needed for shift())
+        years_to_load = [min(test_years) - 1] + list(test_years)
+        read_kwargs: Dict[str, Any] = {"columns": required_cols}
+        read_kwargs["filters"] = [("year", "in", years_to_load)]
+        print(f"  Reading parquet (columns={len(required_cols)}, filter year in {years_to_load})...")
+        result = pd.read_parquet(test_parquet_path, **read_kwargs)
         
         # Standardize column names
         if wdpa_col != 'WDPA_b1':
@@ -1375,6 +1366,7 @@ def load_wdpa_from_test_parquet(test_parquet_path: Optional[Path], test_years: l
         elif has_xy:
             print(f"  Join method: x/y/year (with establishment flag)")
         
+        _WDPA_TEST_CACHE[cache_key] = result
         return result
     
     except Exception as e:
@@ -1450,29 +1442,33 @@ def points_to_raster(x: np.ndarray, y: np.ndarray, values: np.ndarray,
     ncols = len(x_edges) - 1
     nrows = len(y_edges) - 1
     
-    # Use histogram2d to bin points and get indices, then aggregate values
-    # This is more efficient than griddata for large datasets
+    # Use digitize for binning (no pandas - pure NumPy for 47M+ row scalability)
     x_idx = np.digitize(x, x_edges) - 1
     y_idx = np.digitize(y, y_edges) - 1
     
     # Clip indices to valid range
-    x_idx = np.clip(x_idx, 0, ncols - 1)
-    y_idx = np.clip(y_idx, 0, nrows - 1)
+    x_idx = np.clip(x_idx, 0, ncols - 1).astype(np.intp)
+    y_idx = np.clip(y_idx, 0, nrows - 1).astype(np.intp)
     
-    # Create raster array
-    raster = np.full((nrows, ncols), np.nan, dtype=np.float32)
+    # Flat index for 1D aggregation arrays
+    flat_idx = y_idx * ncols + x_idx
+    n_cells = nrows * ncols
     
-    # For points that map to the same grid cell, aggregate (mean or max)
-    # Use pandas for efficient grouping
-    df_grid = pd.DataFrame({
-        'x_idx': x_idx,
-        'y_idx': y_idx,
-        'value': values
-    })
-    grid_agg = df_grid.groupby(['y_idx', 'x_idx'])['value'].agg(agg_func).reset_index()
+    # Aggregate using np.add.at (mean) or np.maximum.at (max) - no pandas groupby
+    values = np.asarray(values, dtype=np.float64)
     
-    # Fill raster array
-    raster[grid_agg['y_idx'].values, grid_agg['x_idx'].values] = grid_agg['value'].values
+    if agg_func == 'mean':
+        sum_arr = np.zeros(n_cells, dtype=np.float64)
+        count_arr = np.zeros(n_cells, dtype=np.float64)
+        np.add.at(sum_arr, flat_idx, values)
+        np.add.at(count_arr, flat_idx, 1.0)
+        raster_flat = np.where(count_arr > 0, sum_arr / count_arr, np.nan)
+    else:  # 'max'
+        raster_flat = np.full(n_cells, -np.inf, dtype=np.float64)
+        np.maximum.at(raster_flat, flat_idx, values)
+        raster_flat = np.where(np.isfinite(raster_flat), raster_flat, np.nan)
+    
+    raster = raster_flat.reshape(nrows, ncols).astype(np.float32)
     
     # Flip raster vertically because imshow with origin='upper' expects row 0 at top (highest y)
     # Currently, y_idx=0 corresponds to y_min (lowest), but we want it at the bottom
@@ -1497,6 +1493,7 @@ def create_risk_map(
     threshold_pct: float = 1.0,
     future_parquet_path: Optional[Path] = None,
     future_years: Optional[Sequence[int]] = None,
+    sa_gdf: Optional[gpd.GeoDataFrame] = None,
 ) -> None:
     """Create SIMPLIFIED risk map showing model predictions vs actual PA establishments.
     
@@ -1528,8 +1525,9 @@ def create_risk_map(
     print("CREATING SIMPLIFIED RISK MAP")
     print("=" * 70)
     
-    # Get South America boundary
-    sa_gdf = get_south_america_boundary(region_boundary_path)
+    # Get South America boundary (use cached if provided)
+    if sa_gdf is None:
+        sa_gdf = get_south_america_boundary(region_boundary_path)
     
     # Ensure CRS is set (assume EPSG:4326 if not set)
     if sa_gdf.crs is None:
@@ -1882,6 +1880,7 @@ def create_p1pct_diagnostic_map(
     model_type: str,
     metrics_data: Optional[Dict[str, Any]] = None,
     test_years: Optional[list] = None,
+    sa_gdf: Optional[gpd.GeoDataFrame] = None,
 ) -> None:
     """Create diagnostic map showing row-level P@1% metric visualization.
     
@@ -1896,8 +1895,9 @@ def create_p1pct_diagnostic_map(
     print("CREATING ROW-LEVEL P@1% DIAGNOSTIC MAP")
     print("=" * 70)
     
-    # Get South America boundary
-    sa_gdf = get_south_america_boundary(region_boundary_path)
+    # Get South America boundary (use cached if provided)
+    if sa_gdf is None:
+        sa_gdf = get_south_america_boundary(region_boundary_path)
     
     # Ensure CRS is set (assume EPSG:4326 if not set)
     if sa_gdf.crs is None:
@@ -2171,6 +2171,7 @@ def create_probability_map(
     metrics_data: Optional[Dict[str, Any]] = None,
     test_years: Optional[Sequence[int]] = None,
     test_parquet_path: Optional[Path] = None,
+    sa_gdf: Optional[gpd.GeoDataFrame] = None,
 ) -> None:
     """Create continuous probability map showing predicted probabilities across South America.
     
@@ -2193,8 +2194,9 @@ def create_probability_map(
     print("CREATING PROBABILITY MAP")
     print("=" * 70)
     
-    # Get South America boundary
-    sa_gdf = get_south_america_boundary(region_boundary_path)
+    # Get South America boundary (use cached if provided)
+    if sa_gdf is None:
+        sa_gdf = get_south_america_boundary(region_boundary_path)
     
     # Ensure CRS is set (assume EPSG:4326 if not set)
     if sa_gdf.crs is None:
@@ -3104,7 +3106,10 @@ def main() -> None:
             }
             if numeric_metrics:
                 wandb.log(numeric_metrics)
-    df = load_scored_parquet(parquet_path)
+    # Derive test years early for predicate pushdown (reduces I/O for 47M+ row parquets)
+    test_years = derive_test_years(metrics_data, None, test_parquet_path)
+    print(f"\nDerived test years: {test_years}")
+    df = load_scored_parquet(parquet_path, test_years=test_years)
     
     # If we're using a calibrated scored parquet (written by `calibrate_1`),
     # enforce that key metadata columns are preserved. These are required for
@@ -3126,17 +3131,17 @@ def main() -> None:
     df = detect_and_reproject_coordinates(df)
     validate_coordinates(df)
     
-    # Derive test years once (prefer information from the original test parquet)
-    test_years = derive_test_years(metrics_data, None, test_parquet_path)
-    print(f"\nDerived test years: {test_years}")
-    
     # Generate outputs
     create_metrics_table(metrics_data, output_dir, args.model_type)
     create_pr_curve(df, metrics_data, output_dir, args.model_type)
     create_cumulative_gains_chart(df, output_dir, args.model_type)
+    # Load South America boundary once and reuse for all map outputs (avoids 5x load/download)
+    sa_gdf = get_south_america_boundary(region_boundary_path)
     thresholds = [1, 5, 10]
-    for threshold_pct in thresholds:
-        create_risk_map(
+    # Parallel risk map generation (1%, 5%, 10%) - each threshold is independent
+    n_jobs = min(3, len(thresholds))
+    Parallel(n_jobs=n_jobs, backend="loky", verbose=5)(
+        delayed(create_risk_map)(
             df,
             region_boundary_path,
             output_dir,
@@ -3147,7 +3152,10 @@ def main() -> None:
             threshold_pct=threshold_pct,
             future_parquet_path=future_parquet_path,
             future_years=future_years,
+            sa_gdf=sa_gdf,
         )
+        for threshold_pct in thresholds
+    )
     # Pass explicit test years to the row-level P@1% diagnostic map
     create_p1pct_diagnostic_map(
         df,
@@ -3156,6 +3164,7 @@ def main() -> None:
         args.model_type,
         metrics_data,
         test_years=test_years,
+        sa_gdf=sa_gdf,
     )
     # Also pass explicit test years to the probability map
     create_probability_map(
@@ -3167,6 +3176,7 @@ def main() -> None:
         metrics_data,
         test_years=test_years,
         test_parquet_path=test_parquet_path,
+        sa_gdf=sa_gdf,
     )
     
     # Resolve model file for SHAP: explicit --model_pkl, or auto-discover Model 1 only (never Model C)
