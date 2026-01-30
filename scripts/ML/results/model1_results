@@ -6,10 +6,13 @@ Purpose: Generate comprehensive results report from model1_LGBM predictions:
          - Precision-Recall curve (PNG + PDF) with baseline prevalence
          - Risk map showing South America boundary, top-1% predicted pixels, and observed PA establishments
          - Probability map showing continuous probability predictions across South America
+         - Temporal validation: Risk maps include future PA establishments (2020-2024) when val_win5.parquet or merged_panel_final.parquet is available (auto-discovered by default)
 
 Input:   - model1_lgbm_metrics_*.json (for LGBM) or model1_rf_win5_metrics_*.json (for RF)
          - model1_lgbm_scored_*.parquet (for LGBM) or model1_rf_win5_scored_*.parquet (for RF)
          - test_win5.parquet (optional, auto-discovered if available)
+         - val_win5.parquet or merged_panel_final.parquet (optional, auto-discovered for temporal validation; merged_panel in $SCRATCH/data/ or repo/data/)
+         - Model file for SHAP: auto-discovered model1_*.pkl only (Model C is never used). Use --model_pkl to pass the exact .pkl that produced the scored parquet so explanations match results.
 
 Note:    The risk map uses WDPA_b1 from original test data to correctly identify pixels
          established in each year. Since transition_01_win5 (y_true) is a 5-year lookahead
@@ -17,6 +20,10 @@ Note:    The risk map uses WDPA_b1 from original test data to correctly identify
          established in 2018 have y_true=1 only for years before 2018, not for 2018 itself.
          By loading WDPA_b1 from the original test data, we ensure all establishments
          are correctly shown.
+         
+         When a future parquet is found (val_win5.parquet or merged_panel_final.parquet, or --future_parquet), risk maps include
+         future PA establishments (yellow layer) and report Future Capture Rate and Combined
+         Recall. Use --no_future to disable temporal validation.
 
 Output:  - outputs/Results/results_model1_lgbm/
            - model1_metrics_table.csv
@@ -34,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import zlib
 from pathlib import Path
@@ -82,6 +90,11 @@ MAP_EXTENT_ASPECT = (Y_LIMITS[1] - Y_LIMITS[0]) / (X_LIMITS[1] - X_LIMITS[0])
 
 # Map resolution for rasterization (degrees, approximately 1 km at South America latitude)
 MAP_RESOLUTION = 0.009
+
+# Default future period for temporal validation (risk maps); try val_win5.parquet first, then merged_panel_final.parquet
+DEFAULT_FUTURE_PARQUET_FILENAME = "val_win5.parquet"
+FALLBACK_FUTURE_PARQUET_FILENAME = "merged_panel_final.parquet"
+DEFAULT_FUTURE_YEARS_STR = "2020,2021,2022,2023,2024"
 
 # Map DPI for output files
 MAP_DPI = 600
@@ -213,6 +226,78 @@ def resolve_parquet_file(filename: str, split_version: str = 'main') -> Path:
         error_msg += f"\nSCRATCH root: {scratch_root}\n"
     error_msg += f"Repository root: {repo_root}\n"
     error_msg += f"Split version: {split_version}\n"
+    raise FileNotFoundError(error_msg)
+
+
+def resolve_future_parquet(split_version: str = 'main') -> Path:
+    """Locate future-period parquet for temporal validation (2020-2024 PA establishments).
+
+    Tries in order:
+    1. val_win5.parquet in same locations as test data (resolve_parquet_file).
+    2. merged_panel_final.parquet in same ML locations.
+    3. merged_panel_final.parquet in $SCRATCH/data/ and repo/data/ (Euler: /cluster/scratch/.../data/).
+
+    Args:
+        split_version: Split version ('main' or 'robustness').
+
+    Returns:
+        Path to the found parquet file.
+
+    Raises:
+        FileNotFoundError: If neither file is found in any expected location.
+    """
+    repo_root = get_repo_root()
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+    tried = []
+
+    # 1) val_win5.parquet (same locations as test_win5)
+    try:
+        p = resolve_parquet_file(DEFAULT_FUTURE_PARQUET_FILENAME, split_version)
+        return p
+    except FileNotFoundError:
+        pass
+    for base in ([scratch_root] if scratch_root else []):
+        for sub in [f"data/ml/{split_version}", "data/ml", f"outputs/Results/{split_version}"]:
+            tried.append(base / sub / DEFAULT_FUTURE_PARQUET_FILENAME)
+    for sub in [f"data/ml/{split_version}", "data/ml", f"outputs/Results/{split_version}", "outputs/Results"]:
+        tried.append(repo_root / sub / DEFAULT_FUTURE_PARQUET_FILENAME)
+
+    # 2) merged_panel_final.parquet in ML locations
+    try:
+        p = resolve_parquet_file(FALLBACK_FUTURE_PARQUET_FILENAME, split_version)
+        return p
+    except FileNotFoundError:
+        pass
+    for base in ([scratch_root] if scratch_root else []):
+        for sub in [f"data/ml/{split_version}", "data/ml", f"outputs/Results/{split_version}"]:
+            tried.append(base / sub / FALLBACK_FUTURE_PARQUET_FILENAME)
+    for sub in [f"data/ml/{split_version}", "data/ml", f"outputs/Results/{split_version}", "outputs/Results"]:
+        tried.append(repo_root / sub / FALLBACK_FUTURE_PARQUET_FILENAME)
+
+    # 3) merged_panel_final.parquet in $SCRATCH/data/ and repo/data/
+    if scratch_root is not None:
+        cand = scratch_root / "data" / FALLBACK_FUTURE_PARQUET_FILENAME
+        tried.append(cand)
+        if cand.exists():
+            return cand
+    cand = repo_root / "data" / FALLBACK_FUTURE_PARQUET_FILENAME
+    tried.append(cand)
+    if cand.exists():
+        return cand
+
+    error_msg = (
+        f"{DEFAULT_FUTURE_PARQUET_FILENAME} and {FALLBACK_FUTURE_PARQUET_FILENAME} not found in expected locations.\n"
+        "Checked: val_win5.parquet and merged_panel_final.parquet in ML paths; "
+        "merged_panel_final.parquet in $SCRATCH/data/ and repo/data/.\n"
+    )
+    error_msg += "\nTried (examples):\n"
+    for c in tried[:20]:
+        error_msg += f"  - {c}\n"
+    if len(tried) > 20:
+        error_msg += f"  ... and {len(tried) - 20} more.\n"
+    if scratch_root:
+        error_msg += f"\nSCRATCH root: {scratch_root}\n"
+    error_msg += f"Repository root: {repo_root}\n"
     raise FileNotFoundError(error_msg)
 
 
@@ -1008,6 +1093,121 @@ def derive_test_years(metrics_data: Optional[Dict[str, Any]] = None,
     return [2018, 2019]
 
 
+def load_future_pa_establishments(future_parquet_path: Optional[Path], future_years: list) -> Optional[pd.DataFrame]:
+    """Load future PA establishments (e.g., 2020-2024) from validation/future parquet for temporal validation.
+    
+    This function identifies pixels that were established AFTER the test period to assess the model's
+    forward-looking predictive power. For example, if the model predicted high-risk areas in 2017-2019,
+    this shows whether those predictions captured PAs established in 2020-2024.
+    
+    Args:
+        future_parquet_path: Path to parquet file containing future period data (e.g., val_win5.parquet)
+        future_years: List of years to consider as "future" (e.g., [2020, 2021, 2022, 2023, 2024])
+    
+    Returns:
+        DataFrame with columns: row, col, x, y, established_in_future_period (or None if not available)
+    """
+    if future_parquet_path is None or not future_parquet_path.exists():
+        return None
+    
+    print(f"\nLoading future PA establishments from: {future_parquet_path}")
+    try:
+        pfile = pq.ParquetFile(future_parquet_path)
+        available_columns = pfile.schema_arrow.names
+        
+        # Check for WDPA_b1 column
+        wdpa_col = None
+        for candidate in ['WDPA_b1', 'wdpa_b1']:
+            if candidate in available_columns:
+                wdpa_col = candidate
+                break
+        
+        if wdpa_col is None:
+            print(f"  WARNING: WDPA column not found. Available columns: {available_columns}")
+            return None
+        
+        # Check for required join columns
+        has_row_col = 'row' in available_columns and 'col' in available_columns
+        has_xy = 'x' in available_columns and 'y' in available_columns
+        
+        if not has_row_col and not has_xy:
+            print(f"  WARNING: Missing required join columns. Need either (row, col) or (x, y)")
+            return None
+        
+        if 'year' not in available_columns:
+            print(f"  WARNING: Missing 'year' column")
+            return None
+        
+        # Build columns to read
+        required_cols = ['year', wdpa_col]
+        if has_row_col:
+            required_cols.extend(['row', 'col'])
+        if has_xy:
+            required_cols.extend(['x', 'y'])
+        
+        # Read data
+        all_data = []
+        num_row_groups = pfile.metadata.num_row_groups
+        print(f"  Reading {num_row_groups} row groups...")
+        
+        for rg_idx in range(num_row_groups):
+            table = pfile.read_row_group(rg_idx, columns=required_cols)
+            df = table.to_pandas()
+            all_data.append(df)
+        
+        result = pd.concat(all_data, ignore_index=True)
+        
+        # Standardize column names
+        if wdpa_col != 'WDPA_b1':
+            result = result.rename(columns={wdpa_col: 'WDPA_b1'})
+        
+        # Fill NaN with 0 and convert to int
+        result['WDPA_b1'] = result['WDPA_b1'].fillna(0).astype(int)
+        
+        # Identify pixels established in future period
+        future_year_str = f"{min(future_years)}-{max(future_years)}"
+        print(f"  Identifying pixels established in future period ({future_year_str})...")
+        
+        # Get unique identifier for each pixel
+        if has_row_col:
+            pixel_id_cols = ['row', 'col']
+        else:
+            pixel_id_cols = ['x', 'y']
+        
+        # Sort by pixel and year
+        result = result.sort_values(pixel_id_cols + ['year'])
+        
+        # VECTORIZED: Use shift() to compare WDPA_b1 with previous year
+        result['WDPA_b1_prev_year'] = result.groupby(pixel_id_cols)['WDPA_b1'].shift(1).fillna(0).astype(int)
+        
+        # Identify newly protected pixels in future years
+        result['newly_protected_in_future'] = (
+            (result['year'].isin(future_years)) & 
+            (result['WDPA_b1'] == 1) & 
+            (result['WDPA_b1_prev_year'] == 0)
+        ).astype(int)
+        
+        # Create pixel-level flag
+        estab_df = result.groupby(pixel_id_cols)['newly_protected_in_future'].max().reset_index()
+        estab_df = estab_df[estab_df['newly_protected_in_future'] == 1].copy()
+        estab_df['established_in_future_period'] = 1
+        estab_df = estab_df[pixel_id_cols + ['established_in_future_period']]
+        
+        if len(estab_df) > 0:
+            print(f"  ✓ Found {len(estab_df):,} pixels established in future period ({future_year_str})")
+        else:
+            print(f"  WARNING: No pixels found established in future period ({future_year_str})")
+            estab_df = pd.DataFrame(columns=pixel_id_cols + ['established_in_future_period'])
+        
+        print(f"  Join method: {'row/col' if has_row_col else 'x/y'}")
+        
+        return estab_df
+    
+    except Exception as e:
+        print(f"  WARNING: Failed to load future PA establishments: {e}")
+        return None
+
+
 def load_wdpa_from_test_parquet(test_parquet_path: Optional[Path], test_years: list) -> Optional[pd.DataFrame]:
     """Load WDPA_b1 and WDPA_prev data from original test parquet file for joining with scored data.
     
@@ -1295,14 +1495,17 @@ def create_risk_map(
     test_parquet_path: Optional[Path] = None,
     test_years: Optional[Sequence[int]] = None,
     threshold_pct: float = 1.0,
+    future_parquet_path: Optional[Path] = None,
+    future_years: Optional[Sequence[int]] = None,
 ) -> None:
     """Create SIMPLIFIED risk map showing model predictions vs actual PA establishments.
     
     SIMPLIFIED DESIGN (radically simplified from previous complex version):
-    - Shows only 3 categories with clear, distinct colors:
+    - Shows 3-4 categories with clear, distinct colors:
       * Predicted high-risk (top threshold_pct%) - BLUE
-      * Actual PA establishments - ORANGE-RED
+      * Actual PA establishments (test period) - ORANGE-RED
       * Overlap (correct predictions) - GREEN
+      * Future PA establishments (if provided) - YELLOW
     - Minimal text and legend
     - No protection layer overlays
     - No temporal dynamics visualization
@@ -1318,6 +1521,8 @@ def create_risk_map(
         test_years: Explicit list of test years. If not provided, they will be
             derived from `test_parquet_path` (and, if needed, from metadata)
             using `derive_test_years`.
+        future_parquet_path: Optional path to future period parquet (e.g., validation set for 2020-2024).
+        future_years: List of years to consider as "future" for temporal validation (e.g., [2020, 2021, 2022, 2023, 2024]).
     """
     print("\n" + "=" * 70)
     print("CREATING SIMPLIFIED RISK MAP")
@@ -1395,6 +1600,45 @@ def create_risk_map(
     # Update gdf with observed flag
     gdf['is_observed'] = df['is_observed'].values
     
+    # Step 1b: Load FUTURE PA establishments (2020-2024) if provided for temporal validation
+    has_future_establishments = False
+    if future_parquet_path is not None and future_years is not None and len(future_years) > 0:
+        future_df = load_future_pa_establishments(future_parquet_path, future_years)
+        
+        if future_df is not None and 'established_in_future_period' in future_df.columns:
+            print(f"  ✓ Future PA establishments loaded - temporal validation enabled")
+            
+            # Determine join columns (same logic as test period)
+            join_cols = ['row', 'col'] if all(col in df.columns for col in ['row', 'col']) and all(col in future_df.columns for col in ['row', 'col']) else ['x', 'y']
+            
+            if join_cols == ['row', 'col']:
+                # Row/col join (preferred)
+                join_df = future_df[['row', 'col', 'established_in_future_period']].drop_duplicates(subset=['row', 'col'])
+                df = df.merge(join_df, on=['row', 'col'], how='left')
+                df['established_in_future_period'] = df['established_in_future_period'].fillna(0).astype(int)
+                has_future_establishments = True
+                print(f"    Joined via row/col: {(df['established_in_future_period'] == 1).sum():,} future establishments")
+            elif join_cols == ['x', 'y']:
+                # X/y join with rounding (fallback)
+                df['x_rounded'] = df['x'].round(6)
+                df['y_rounded'] = df['y'].round(6)
+                join_df = future_df[['x', 'y', 'established_in_future_period']].copy()
+                join_df['x_rounded'] = join_df['x'].round(6)
+                join_df['y_rounded'] = join_df['y'].round(6)
+                join_df = join_df[['x_rounded', 'y_rounded', 'established_in_future_period']].drop_duplicates(subset=['x_rounded', 'y_rounded'])
+                df = df.merge(join_df, on=['x_rounded', 'y_rounded'], how='left')
+                df = df.drop(columns=['x_rounded', 'y_rounded'])
+                df['established_in_future_period'] = df['established_in_future_period'].fillna(0).astype(int)
+                has_future_establishments = True
+                print(f"    Joined via x/y: {(df['established_in_future_period'] == 1).sum():,} future establishments")
+    
+    # Initialize future establishments flag if not loaded
+    if not has_future_establishments:
+        df['established_in_future_period'] = 0
+    
+    # Update gdf with future establishments flag
+    gdf['is_future'] = df['established_in_future_period'].values
+    
     # Step 2: Filter coordinate outliers BEFORE any analysis (using projected bounds)
     print(f"\n  Filtering coordinate outliers...")
     initial_count = len(gdf)
@@ -1415,9 +1659,11 @@ def create_risk_map(
     
     # For predictions: take MAX probability across test years (most risky prediction for that location)
     # For observations: take MAX (observed if established in ANY test year)
+    # For future: take MAX (future establishment if established in ANY future year)
     pixel_agg = gdf.groupby(['row', 'col']).agg({
         'y_pred_proba': 'max',  # Highest predicted probability for this pixel across test years
         'is_observed': 'max',   # 1 if established in any test year, 0 otherwise
+        'is_future': 'max',     # 1 if established in any future year, 0 otherwise
         'x_proj': 'first',      # Projected coordinates (meters)
         'y_proj': 'first'
     }).reset_index()
@@ -1426,6 +1672,7 @@ def create_risk_map(
     
     # Total actual establishments (computed once for Recall across all thresholds)
     total_actual_establishments = int(pixel_agg['is_observed'].sum())
+    total_future_establishments = int(pixel_agg['is_future'].sum())
     
     # Step 4: Calculate top-X% threshold at PIXEL level
     top_pct_threshold = np.percentile(pixel_agg['y_pred_proba'], 100 - threshold_pct)
@@ -1439,13 +1686,23 @@ def create_risk_map(
     overlap_count = int(((pixel_agg['is_predicted'] == 1) & (pixel_agg['is_observed'] == 1)).sum())
     predicted_only_count = predicted_count - overlap_count
     observed_only_count = observed_count - overlap_count
+    future_count = int(pixel_agg['is_future'].sum())
+    future_overlap_count = int(((pixel_agg['is_predicted'] == 1) & (pixel_agg['is_future'] == 1)).sum())
 
     recall_pct = (overlap_count / total_actual_establishments * 100) if total_actual_establishments > 0 else 0.0
+    
+    # Calculate Future Capture Rate: % of future (2020-2024) PAs that fell in predicted high-risk areas
+    future_capture_rate = (future_overlap_count / total_future_establishments * 100) if total_future_establishments > 0 else 0.0
+    
+    # Calculate Combined Recall: % of ALL PAs (test + future) captured by predictions
+    total_combined_establishments = total_actual_establishments + total_future_establishments
+    combined_overlap_count = overlap_count + future_overlap_count
+    combined_recall_pct = (combined_overlap_count / total_combined_establishments * 100) if total_combined_establishments > 0 else 0.0
 
     print(f"\n  FINAL STATISTICS (pixel-level, after filtering):")
     print(f"    Total pixels: {len(pixel_agg):,}")
     print(f"    Predicted high-risk (top {threshold_pct}%): {predicted_count:,}")
-    print(f"    Actual PA establishments: {observed_count:,}")
+    print(f"    Actual PA establishments (test period): {observed_count:,}")
     print(f"    Overlap (correct predictions): {overlap_count:,}")
     if predicted_count > 0:
         hit_rate = overlap_count / predicted_count * 100
@@ -1453,14 +1710,31 @@ def create_risk_map(
     else:
         hit_rate = 0.0
         print(f"    Hit rate: N/A (no predictions)")
-    print(f"    Recall: {overlap_count:,}/{total_actual_establishments:,} = {recall_pct:.1f}%")
+    print(f"    Recall (test period): {overlap_count:,}/{total_actual_establishments:,} = {recall_pct:.1f}%")
+    
+    # Print future PA statistics if available
+    if has_future_establishments and total_future_establishments > 0:
+        future_year_str = f"{min(future_years)}-{max(future_years)}"
+        print(f"\n  TEMPORAL VALIDATION (Future PA Establishments {future_year_str}):")
+        print(f"    Future PA establishments: {future_count:,}")
+        print(f"    Future establishments in predicted areas: {future_overlap_count:,}")
+        print(f"    Future Capture Rate: {future_overlap_count:,}/{total_future_establishments:,} = {future_capture_rate:.1f}%")
+        print(f"\n  COMBINED STATISTICS (Test + Future):")
+        print(f"    Total PA establishments (test + future): {total_combined_establishments:,}")
+        print(f"    Total captured by predictions: {combined_overlap_count:,}")
+        print(f"    Combined Recall: {combined_overlap_count:,}/{total_combined_establishments:,} = {combined_recall_pct:.1f}%")
 
     # Step 6: Build category raster (pixel-perfect, same resolution as probability map)
-    # Category: 0=background, 1=predicted_only, 2=observed_only, 3=overlap (agg_func='max' so overlap wins)
+    # Category: 0=background, 1=predicted_only, 2=observed_only, 3=overlap, 4=future_only
+    # Priority: future (4) > overlap (3) > observed (2) > predicted (1) > background (0)
+    # This ensures future PAs are visible even if they overlap with other categories
     category_codes = np.where(
-        (pixel_agg['is_predicted'] == 1) & (pixel_agg['is_observed'] == 1), 3,
-        np.where(pixel_agg['is_observed'] == 1, 2,
-                 np.where(pixel_agg['is_predicted'] == 1, 1, 0)))
+        pixel_agg['is_future'] == 1, 4,  # Future PAs take highest priority (yellow)
+        np.where(
+            (pixel_agg['is_predicted'] == 1) & (pixel_agg['is_observed'] == 1), 3,  # Overlap (green)
+            np.where(pixel_agg['is_observed'] == 1, 2,  # Observed only (orange)
+                     np.where(pixel_agg['is_predicted'] == 1, 1, 0))))  # Predicted only (blue) or background
+    
     print(f"\n  Creating rasterized risk map...")
     category_raster, extent = points_to_raster(
         pixel_agg['x_proj'].values,
@@ -1500,15 +1774,24 @@ def create_risk_map(
               vmin=0, vmax=1, origin='upper', interpolation='nearest', 
               aspect='equal', zorder=1)
 
-    # ListedColormap for 3 categories (Predicted, Observed, Overlap)
+    # ListedColormap for 3-4 categories (Predicted, Observed, Overlap, Future)
     COLOR_PREDICTED_ONLY = '#5B9BD5'  # Lighter, more visible blue
     COLOR_OBSERVED_ONLY = '#D95A3C'   # Warm orange-red
     COLOR_OVERLAP = '#2EBD8A'         # Slightly lighter green, more saturated
-    cmap_categories = ListedColormap([COLOR_PREDICTED_ONLY, COLOR_OBSERVED_ONLY, COLOR_OVERLAP])
-    norm_categories = BoundaryNorm([0.5, 1.5, 2.5, 3.5], cmap_categories.N)
+    COLOR_FUTURE = '#FFD700'          # Bright yellow for future PAs
+    
+    # Use 4 colors if future establishments exist, otherwise 3
+    if has_future_establishments and future_count > 0:
+        cmap_categories = ListedColormap([COLOR_PREDICTED_ONLY, COLOR_OBSERVED_ONLY, COLOR_OVERLAP, COLOR_FUTURE])
+        norm_categories = BoundaryNorm([0.5, 1.5, 2.5, 3.5, 4.5], cmap_categories.N)
+        max_category = 4
+    else:
+        cmap_categories = ListedColormap([COLOR_PREDICTED_ONLY, COLOR_OBSERVED_ONLY, COLOR_OVERLAP])
+        norm_categories = BoundaryNorm([0.5, 1.5, 2.5, 3.5], cmap_categories.N)
+        max_category = 3
 
-    # Category raster (1, 2, 3) - pixel-perfect resolution
-    cat_no_bg = np.where((category_raster >= 1) & (category_raster <= 3), category_raster, np.nan)
+    # Category raster - pixel-perfect resolution
+    cat_no_bg = np.where((category_raster >= 1) & (category_raster <= max_category), category_raster, np.nan)
     cat_masked = np.ma.masked_where(np.isnan(cat_no_bg), cat_no_bg)
     ax.imshow(cat_masked, extent=extent, cmap=cmap_categories, norm=norm_categories,
               origin='upper', interpolation='nearest', aspect='equal', zorder=2)
@@ -1536,6 +1819,10 @@ def create_risk_map(
     if overlap_count > 0:
         legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=COLOR_OVERLAP,
                                       markersize=10, alpha=0.9, label=f'Correct predictions (n={overlap_count:,})'))
+    if has_future_establishments and future_count > 0:
+        future_year_str = f"{min(future_years)}-{max(future_years)}"
+        legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=COLOR_FUTURE,
+                                      markersize=10, alpha=0.9, label=f'Future PAs {future_year_str} (n={future_count:,})'))
     if legend_elements:
         ax.legend(handles=legend_elements, loc='upper left', fontsize=FONTSIZE_LEGEND, framealpha=0.95)
 
@@ -1544,8 +1831,14 @@ def create_risk_map(
         f"Pixels: {len(pixel_agg):,}",
         f"Top {int(threshold_pct)}% threshold: {top_pct_threshold:.4f}",
         f"Hit rate: {overlap_count:,}/{predicted_count:,} = {hit_rate:.1f}%",
-        f"Recall: {overlap_count:,}/{total_actual_establishments:,} = {recall_pct:.1f}%"
+        f"Recall (test): {overlap_count:,}/{total_actual_establishments:,} = {recall_pct:.1f}%"
     ]
+    
+    # Add future metrics if available
+    if has_future_establishments and total_future_establishments > 0:
+        stats_lines.append(f"Future Capture Rate: {future_overlap_count:,}/{total_future_establishments:,} = {future_capture_rate:.1f}%")
+        stats_lines.append(f"Combined Recall: {combined_overlap_count:,}/{total_combined_establishments:,} = {combined_recall_pct:.1f}%")
+    
     stats_text = "\n".join(stats_lines)
     ax.text(0.02, 0.02, stats_text, transform=ax.transAxes, fontsize=FONTSIZE_STATS,
            verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat',
@@ -2474,6 +2767,23 @@ def main() -> None:
         help='Path to original test_win5.parquet file (for loading WDPA_b1 data). If not provided, will try to auto-discover.'
     )
     parser.add_argument(
+        '--future_parquet',
+        type=str,
+        default=None,
+        help=f'Path to future period parquet for temporal validation. If not provided, auto-discovers val_win5.parquet or merged_panel_final.parquet (including $SCRATCH/data/). Use --no_future to disable.'
+    )
+    parser.add_argument(
+        '--future_years',
+        type=str,
+        default=DEFAULT_FUTURE_YEARS_STR,
+        help=f'Comma-separated future years for temporal validation (default: {DEFAULT_FUTURE_YEARS_STR}).'
+    )
+    parser.add_argument(
+        '--no_future',
+        action='store_true',
+        help='Disable temporal validation (do not load or show future PA establishments on risk maps).'
+    )
+    parser.add_argument(
         '--split-version',
         type=str,
         choices=["main", "robustness"],
@@ -2500,6 +2810,12 @@ def main() -> None:
         '--skip_shap',
         action='store_true',
         help='Skip SHAP analysis (default: False)'
+    )
+    parser.add_argument(
+        '--model_pkl',
+        type=str,
+        default=None,
+        help='Path to the exact .pkl/.joblib that produced the scored parquet. If provided, SHAP uses this model (ensures explanations match results). If not set, auto-discovers model1_* only (never Model C).'
     )
     args = parser.parse_args()
     
@@ -2680,6 +2996,45 @@ def main() -> None:
             print(f"  For accurate results, provide --test_parquet path to original test data")
             test_parquet_path = None
     
+    # Future parquet and years for temporal validation (default: auto-discover val_win5.parquet, years 2020-2024)
+    future_parquet_path = None
+    future_years = None
+    
+    def _parse_future_years(s: str):
+        try:
+            return [int(y.strip()) for y in s.split(',')]
+        except ValueError:
+            return None
+    
+    if args.no_future:
+        print("Temporal validation disabled (--no_future).")
+    else:
+        if args.future_parquet:
+            future_parquet_path = Path(args.future_parquet).resolve()
+            print(f"Using provided future parquet: {future_parquet_path}")
+            if not future_parquet_path.exists():
+                print(f"  WARNING: Future parquet not found: {future_parquet_path}")
+                print(f"  Temporal validation will be disabled")
+                future_parquet_path = None
+        else:
+            print("Auto-discovering future parquet for temporal validation (val_win5.parquet or merged_panel_final.parquet)...")
+            try:
+                future_parquet_path = resolve_future_parquet(args.split_version)
+                print(f"  ✓ Resolved path: {future_parquet_path}")
+            except FileNotFoundError as e:
+                print(f"  ✗ {e}")
+                print("  Risk maps will not include future PA layer. Provide --future_parquet or add val_win5.parquet / merged_panel_final.parquet to enable.")
+                future_parquet_path = None
+        
+        if future_parquet_path is not None:
+            future_years = _parse_future_years(args.future_years)
+            if future_years is None or len(future_years) == 0:
+                print(f"  WARNING: Invalid --future_years '{args.future_years}'; temporal validation disabled")
+                future_parquet_path = None
+                future_years = None
+            else:
+                print(f"  Future years for temporal validation: {future_years}")
+    
     # Resolve paths
     metrics_path = metrics_path.resolve()
     parquet_path = parquet_path.resolve()
@@ -2790,6 +3145,8 @@ def main() -> None:
             test_parquet_path,
             test_years=test_years,
             threshold_pct=threshold_pct,
+            future_parquet_path=future_parquet_path,
+            future_years=future_years,
         )
     # Pass explicit test years to the row-level P@1% diagnostic map
     create_p1pct_diagnostic_map(
@@ -2812,50 +3169,95 @@ def main() -> None:
         test_parquet_path=test_parquet_path,
     )
     
-    # Auto-discover model pickle file for SHAP (unless --skip_shap)
+    # Resolve model file for SHAP: explicit --model_pkl, or auto-discover Model 1 only (never Model C)
     model_path = None
     if not args.skip_shap:
-        print("\nAuto-discovering trained model file for SHAP analysis...")
-        # Inclusive patterns: model-specific and generic .pkl / .joblib
-        model_patterns = [
-            f"model1_{args.model_type}_win5_*.pkl",
-            f"model1_{args.model_type}_win5_*.joblib",
-            f"model1_{args.model_type}_*.pkl",
-            f"model1_{args.model_type}_*.joblib",
-            "*model*.pkl",
-            "*.joblib",
-        ]
+        if args.model_pkl:
+            model_path = Path(args.model_pkl).resolve()
+            if not model_path.exists():
+                print(f"  ERROR: --model_pkl file not found: {model_path}")
+                model_path = None
+            elif "modelC" in model_path.name:
+                print(f"  ERROR: --model_pkl must be the Model 1 artifact that produced the scored parquet, not Model C: {model_path.name}")
+                model_path = None
+            else:
+                print(f"Using provided model for SHAP: {model_path}")
+        else:
+            print("\nAuto-discovering trained model file for SHAP analysis (Model 1 only)...")
+            # Only Model 1 patterns: never use *model*.pkl so we never pick modelC_lgbm_*.pkl
+            model_patterns = [
+                f"model1_{args.model_type}_win5_*.pkl",
+                f"model1_{args.model_type}_win5_*.joblib",
+                f"model1_{args.model_type}_*.pkl",
+                f"model1_{args.model_type}_*.joblib",
+            ]
 
-        # Check $SCRATCH first, then local repo (./data/ml/models/) so SHAP works without SCRATCH
-        model_candidates = []
-        if scratch_root is not None:
-            model_candidates.append(scratch_root / "data/ml/models" / args.split_version)
-            model_candidates.append(scratch_root / "data/ml/models")
-        model_candidates.append(repo_root / "data/ml/models" / args.split_version)
-        model_candidates.append(repo_root / "data/ml/models")
-        # Local paths when $SCRATCH is missing: cwd and repo-relative
-        cwd_models = Path.cwd() / "data" / "ml" / "models"
-        for extra in (cwd_models, cwd_models / args.split_version):
-            if extra.exists() and extra not in model_candidates:
-                model_candidates.append(extra)
+            # Check $SCRATCH first, then local repo (./data/ml/models/) so SHAP works without SCRATCH
+            model_candidates = []
+            if scratch_root is not None:
+                model_candidates.append(scratch_root / "data/ml/models" / args.split_version)
+                model_candidates.append(scratch_root / "data/ml/models")
+            model_candidates.append(repo_root / "data/ml/models" / args.split_version)
+            model_candidates.append(repo_root / "data/ml/models")
+            # Also search where metrics/parquet live (ml_models) in case .pkl is saved there
+            for base in ml_models_candidates:
+                if base.exists():
+                    model_candidates.append(base)
+                    model_candidates.append(base / args.split_version)
+            # Local paths when $SCRATCH is missing: cwd and repo-relative
+            cwd_models = Path.cwd() / "data" / "ml" / "models"
+            for extra in (cwd_models, cwd_models / args.split_version):
+                if extra.exists() and extra not in model_candidates:
+                    model_candidates.append(extra)
 
-        model_path = None
-        for search_dir in model_candidates:
-            if search_dir.exists():
+            # Prefer a model whose filename contains the same timestamp as the metrics/parquet run
+            run_ts = metrics_data.get("metadata", {}).get("timestamp", "") or ""
+            if not run_ts and parquet_path:
+                # e.g. model1_lgbm_scored_calibrated_20260119_234939.parquet -> 20260119_234939
+                m = re.search(r"(\d{8}_\d{6})", parquet_path.name)
+                if m:
+                    run_ts = m.group(1)
+
+            all_matches: list[Path] = []
+            for search_dir in model_candidates:
+                if not search_dir.exists():
+                    continue
                 for model_pattern in model_patterns:
-                    matches = list(search_dir.glob(model_pattern))
-                    if matches:
-                        matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-                        model_path = matches[0]
-                        print(f"  Found: {model_path}")
-                        break
-                if model_path is not None:
-                    break
-        
-        if model_path is None:
-            pattern_str = " or ".join(model_patterns)
-            print(f"  WARNING: Could not find trained model file matching {pattern_str}")
-            print(f"  SHAP analysis will be skipped")
+                    try:
+                        matches = list(search_dir.glob(model_pattern))
+                    except (OSError, PermissionError):
+                        continue
+                    for p in matches:
+                        if "modelC" in p.name:
+                            continue
+                        all_matches.append(p)
+
+            # Deduplicate by resolved path (same file may appear from multiple search dirs)
+            seen = set()
+            unique_matches = []
+            for p in all_matches:
+                key = p.resolve()
+                if key not in seen:
+                    seen.add(key)
+                    unique_matches.append(p)
+            all_matches = unique_matches
+
+            if all_matches:
+                # Prefer file whose name contains run_ts (same run as parquet/metrics)
+                if run_ts:
+                    ts_matches = [p for p in all_matches if run_ts in p.name]
+                    if ts_matches:
+                        ts_matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                        model_path = ts_matches[0]
+                if model_path is None:
+                    all_matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+                    model_path = all_matches[0]
+                print(f"  Found: {model_path}")
+            else:
+                pattern_str = " or ".join(model_patterns)
+                print(f"  WARNING: Could not find trained model file matching {pattern_str} (Model 1 only; Model C is never used for this script)")
+                print(f"  To run SHAP with the exact model that produced the parquet, pass --model_pkl /path/to/model1_*.pkl")
+                print(f"  SHAP analysis will be skipped")
     
     # Auto-discover data sources for SHAP (earlystop, train)
     shap_data_sources = {}

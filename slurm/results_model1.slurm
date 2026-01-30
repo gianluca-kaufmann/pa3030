@@ -48,6 +48,7 @@ echo "PWD = $(pwd)"
   exit 1
 }
 # Run the script (defaults to main split, LGBM model type, prefers calibrated predictions if available)
+# Temporal validation: risk maps include future PA layer (2020-2024) when val_win5.parquet is found (auto-discovered). Use --no_future to disable.
 # --allow_test_shap: use test set for SHAP when earlystop/train unavailable
 python "scripts/ML/results/model1_results" --model_type lgbm --split-version main --allow_test_shap
 
