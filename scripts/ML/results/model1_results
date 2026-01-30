@@ -632,6 +632,62 @@ def create_pr_curve(df: pd.DataFrame, metrics_data: Dict[str, Any], output_dir: 
     plt.close()
 
 
+def create_cumulative_gains_chart(df: pd.DataFrame, output_dir: Path, model_type: str) -> None:
+    """Create cumulative gains chart (search efficiency): % area searched vs % PAs captured.
+    
+    Sorts by predicted probability descending; plots cumulative recall (fraction of all
+    positive pixels captured) as the fraction of area searched increases. Includes a
+    45-degree random-guess baseline.
+    
+    Args:
+        df: DataFrame with y_true and y_pred_proba columns
+        output_dir: Output directory for plots
+        model_type: Model type (lgbm, rf)
+    """
+    print("\n" + "=" * 70)
+    print("CREATING CUMULATIVE GAINS CHART (SEARCH EFFICIENCY)")
+    print("=" * 70)
+    
+    y_true = df['y_true'].values
+    y_pred_proba = df['y_pred_proba'].values
+    n = len(y_true)
+    total_positives = float(y_true.sum())
+    
+    if total_positives <= 0:
+        print("  Skipping cumulative gains: no positive labels in data.")
+        return
+    
+    # Sort by predicted probability descending (highest risk first)
+    order = np.argsort(-y_pred_proba)
+    y_true_sorted = y_true[order]
+    cumulative_captured = np.cumsum(y_true_sorted)
+    
+    # x: % of area searched (0 to 100); y: % of PAs captured (recall)
+    pct_area_searched = (np.arange(1, n + 1, dtype=float) / n) * 100
+    pct_pas_captured = (cumulative_captured / total_positives) * 100
+    
+    fig, ax = plt.subplots(figsize=PR_CURVE_FIGSIZE)
+    ax.plot(pct_area_searched, pct_pas_captured, linewidth=2, label='Model')
+    ax.plot([0, 100], [0, 100], 'k--', linewidth=1.5, label='Random guess')
+    ax.set_xlabel('% of Area Searched', fontsize=FONTSIZE_LABEL)
+    ax.set_ylabel('% of PAs Captured', fontsize=FONTSIZE_LABEL)
+    ax.set_title(f'Model 1 ({model_type.upper()}) Cumulative Gains (Search Efficiency)', fontsize=FONTSIZE_TITLE, fontweight='bold')
+    ax.legend(loc='best', fontsize=FONTSIZE_LEGEND)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim([0, 100])
+    ax.set_ylim([0, 100])
+    ax.set_aspect('equal', adjustable='box')
+    plt.tight_layout()
+    
+    png_path = output_dir / f"model1_{model_type}_cumulative_gains.png"
+    plt.savefig(png_path, dpi=PR_CURVE_DPI, bbox_inches='tight')
+    print(f"\nSaved PNG: {png_path}")
+    pdf_path = output_dir / f"model1_{model_type}_cumulative_gains.pdf"
+    plt.savefig(pdf_path, dpi=PR_CURVE_DPI, bbox_inches='tight')
+    print(f"Saved PDF: {pdf_path}")
+    plt.close()
+
+
 def create_calibration_curve(df: pd.DataFrame, output_dir: Path, model_type: str) -> None:
     """Create reliability/calibration curve (uniform + quantile bins) for test predictions.
     
@@ -1238,13 +1294,14 @@ def create_risk_map(
     metrics_data: Optional[Dict[str, Any]] = None,
     test_parquet_path: Optional[Path] = None,
     test_years: Optional[Sequence[int]] = None,
+    threshold_pct: float = 1.0,
 ) -> None:
     """Create SIMPLIFIED risk map showing model predictions vs actual PA establishments.
     
     SIMPLIFIED DESIGN (radically simplified from previous complex version):
     - Shows only 3 categories with clear, distinct colors:
-      * Predicted high-risk (top 1%) - RED
-      * Actual PA establishments - BLUE  
+      * Predicted high-risk (top threshold_pct%) - BLUE
+      * Actual PA establishments - ORANGE-RED
       * Overlap (correct predictions) - GREEN
     - Minimal text and legend
     - No protection layer overlays
@@ -1352,22 +1409,29 @@ def create_risk_map(
     # CRITICAL: Map shows risky LOCATIONS, so aggregate across test years before selecting top-1%
     print(f"\n  Aggregating to pixel level (test years: {test_years})...")
     
+    # Extract projected coordinates from filtered gdf (already in EPSG:3857)
+    gdf['x_proj'] = gdf.geometry.x
+    gdf['y_proj'] = gdf.geometry.y
+    
     # For predictions: take MAX probability across test years (most risky prediction for that location)
     # For observations: take MAX (observed if established in ANY test year)
     pixel_agg = gdf.groupby(['row', 'col']).agg({
         'y_pred_proba': 'max',  # Highest predicted probability for this pixel across test years
         'is_observed': 'max',   # 1 if established in any test year, 0 otherwise
-        'x': 'first',
-        'y': 'first'
+        'x_proj': 'first',      # Projected coordinates (meters)
+        'y_proj': 'first'
     }).reset_index()
     
     print(f"    {len(gdf):,} rows → {len(pixel_agg):,} unique pixels")
     
-    # Step 4: Calculate top-1% threshold at PIXEL level
-    top1pct_threshold = np.percentile(pixel_agg['y_pred_proba'], 99)
-    pixel_agg['is_predicted'] = (pixel_agg['y_pred_proba'] >= top1pct_threshold).astype(int)
+    # Total actual establishments (computed once for Recall across all thresholds)
+    total_actual_establishments = int(pixel_agg['is_observed'].sum())
     
-    print(f"  ✓ Top-1% threshold (pixel-level): {top1pct_threshold:.6f}")
+    # Step 4: Calculate top-X% threshold at PIXEL level
+    top_pct_threshold = np.percentile(pixel_agg['y_pred_proba'], 100 - threshold_pct)
+    pixel_agg['is_predicted'] = (pixel_agg['y_pred_proba'] >= top_pct_threshold).astype(int)
+    
+    print(f"  ✓ Top-{threshold_pct}% threshold (pixel-level): {top_pct_threshold:.6f}")
     
     # Step 5: Compute statistics from pixel_agg (unique physical pixels by row,col)
     predicted_count = int(pixel_agg['is_predicted'].sum())
@@ -1376,9 +1440,11 @@ def create_risk_map(
     predicted_only_count = predicted_count - overlap_count
     observed_only_count = observed_count - overlap_count
 
+    recall_pct = (overlap_count / total_actual_establishments * 100) if total_actual_establishments > 0 else 0.0
+
     print(f"\n  FINAL STATISTICS (pixel-level, after filtering):")
     print(f"    Total pixels: {len(pixel_agg):,}")
-    print(f"    Predicted high-risk (top 1%): {predicted_count:,}")
+    print(f"    Predicted high-risk (top {threshold_pct}%): {predicted_count:,}")
     print(f"    Actual PA establishments: {observed_count:,}")
     print(f"    Overlap (correct predictions): {overlap_count:,}")
     if predicted_count > 0:
@@ -1387,27 +1453,34 @@ def create_risk_map(
     else:
         hit_rate = 0.0
         print(f"    Hit rate: N/A (no predictions)")
+    print(f"    Recall: {overlap_count:,}/{total_actual_establishments:,} = {recall_pct:.1f}%")
 
     # Step 6: Build category raster (pixel-perfect, same resolution as probability map)
     # Category: 0=background, 1=predicted_only, 2=observed_only, 3=overlap (agg_func='max' so overlap wins)
-    # Need to get projected coordinates for rasterization
-    pixel_geom = [Point(xy) for xy in zip(pixel_agg['x'], pixel_agg['y'])]
-    pixel_gdf = gpd.GeoDataFrame(pixel_agg, geometry=pixel_geom, crs='EPSG:4326')
-    pixel_gdf_proj = pixel_gdf.to_crs('EPSG:3857')
-    
     category_codes = np.where(
         (pixel_agg['is_predicted'] == 1) & (pixel_agg['is_observed'] == 1), 3,
         np.where(pixel_agg['is_observed'] == 1, 2,
                  np.where(pixel_agg['is_predicted'] == 1, 1, 0)))
     print(f"\n  Creating rasterized risk map...")
     category_raster, extent = points_to_raster(
-        pixel_gdf_proj.geometry.x.values,
-        pixel_gdf_proj.geometry.y.values,
+        pixel_agg['x_proj'].values,
+        pixel_agg['y_proj'].values,
         category_codes.astype(np.float32),
         target_resolution=1000.0,  # 1000 meters resolution
         agg_func='max'
     )
     print(f"  Category raster shape: {category_raster.shape}, extent: {extent}")
+    
+    # Create background mask from all data points (shows where data exists; protected areas = holes)
+    print(f"  Creating background mask from data coverage...")
+    background_mask, _ = points_to_raster(
+        pixel_agg['x_proj'].values,
+        pixel_agg['y_proj'].values,
+        np.ones(len(pixel_agg), dtype=np.float32),  # All pixels = 1
+        target_resolution=1000.0,
+        agg_func='max'
+    )
+    print(f"  Background mask created - protected areas will appear as natural holes")
 
     # Calculate figure dimensions dynamically from projected bounds
     proj_bounds = sa_gdf_proj.total_bounds  # (minx, miny, maxx, maxy) in meters
@@ -1419,14 +1492,18 @@ def create_risk_map(
     fig_height = fig_width * proj_aspect
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
 
-    # Clean white background: plot South America boundary as solid base
-    sa_gdf_proj.plot(ax=ax, color='white', edgecolor='none', linewidth=1.5, zorder=1)
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+
+    # Plot background mask from actual data (shows data coverage; protected areas = natural holes)
+    background_masked = np.ma.masked_where(np.isnan(background_mask), background_mask)
+    ax.imshow(background_masked, extent=extent, cmap=ListedColormap(['#F5F5F5']),
+              vmin=0, vmax=1, origin='upper', interpolation='nearest', 
+              aspect='equal', zorder=1)
 
     # ListedColormap for 3 categories (Predicted, Observed, Overlap)
-    from matplotlib.colors import ListedColormap, BoundaryNorm
-    COLOR_PREDICTED_ONLY = '#E69F00'  # Orange
-    COLOR_OBSERVED_ONLY = '#0072B2'   # Blue
-    COLOR_OVERLAP = '#009E73'         # Green
+    COLOR_PREDICTED_ONLY = '#5B9BD5'  # Lighter, more visible blue
+    COLOR_OBSERVED_ONLY = '#D95A3C'   # Warm orange-red
+    COLOR_OVERLAP = '#2EBD8A'         # Slightly lighter green, more saturated
     cmap_categories = ListedColormap([COLOR_PREDICTED_ONLY, COLOR_OBSERVED_ONLY, COLOR_OVERLAP])
     norm_categories = BoundaryNorm([0.5, 1.5, 2.5, 3.5], cmap_categories.N)
 
@@ -1465,8 +1542,9 @@ def create_risk_map(
     # Stats box with key metrics
     stats_lines = [
         f"Pixels: {len(pixel_agg):,}",
-        f"Top 1% threshold: {top1pct_threshold:.4f}",
-        f"Hit rate: {overlap_count:,}/{predicted_count:,} = {hit_rate:.1f}%"
+        f"Top {int(threshold_pct)}% threshold: {top_pct_threshold:.4f}",
+        f"Hit rate: {overlap_count:,}/{predicted_count:,} = {hit_rate:.1f}%",
+        f"Recall: {overlap_count:,}/{total_actual_establishments:,} = {recall_pct:.1f}%"
     ]
     stats_text = "\n".join(stats_lines)
     ax.text(0.02, 0.02, stats_text, transform=ax.transAxes, fontsize=FONTSIZE_STATS,
@@ -1478,12 +1556,12 @@ def create_risk_map(
     plt.tight_layout(pad=0.5)
 
     # Save PNG with high DPI for maximum resolution
-    png_path = output_dir / f"model1_{model_type}_risk_map_top1pct.png"
+    png_path = output_dir / f"model1_{model_type}_risk_map_top{int(threshold_pct)}pct.png"
     plt.savefig(png_path, dpi=600, bbox_inches='tight')
     print(f"\n✓ Saved simplified risk map (PNG): {png_path}")
 
     # Save PDF with low DPI to avoid timeout/zlib/backend errors on large rasters
-    pdf_path = output_dir / f"model1_{model_type}_risk_map_top1pct.pdf"
+    pdf_path = output_dir / f"model1_{model_type}_risk_map_top{int(threshold_pct)}pct.pdf"
     for pdf_dpi in (150, 100):
         try:
             if pdf_path.exists():
@@ -1646,6 +1724,16 @@ def create_p1pct_diagnostic_map(
     )
     print(f"  Category raster shape: {category_raster.shape}, extent: {extent}")
     print(f"  Valid (non-NaN) pixels: {np.sum(~np.isnan(category_raster)):,}")
+    
+    # Create background mask from all data points (shows where data exists; protected areas = holes)
+    print(f"  Creating background mask from data coverage...")
+    background_mask, _ = points_to_raster(
+        gdf.geometry.x.values,
+        gdf.geometry.y.values,
+        np.ones(len(gdf), dtype=np.float32),  # All points = 1
+        target_resolution=1000.0
+    )
+    print(f"  Background mask created - protected areas will appear as natural holes")
 
     # Calculate figure dimensions dynamically from projected bounds
     proj_bounds = sa_gdf_proj.total_bounds  # (minx, miny, maxx, maxy) in meters
@@ -1657,12 +1745,15 @@ def create_p1pct_diagnostic_map(
     fig_height = fig_width * proj_aspect
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
 
-    # Clean white background: plot South America boundary as solid base
-    sa_gdf_proj.plot(ax=ax, color='white', edgecolor='none', linewidth=1.5, zorder=1)
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+
+    # Plot background mask from actual data (shows data coverage; protected areas = natural holes)
+    background_masked = np.ma.masked_where(np.isnan(background_mask), background_mask)
+    ax.imshow(background_masked, extent=extent, cmap=ListedColormap(['#F5F5F5']),
+              vmin=0, vmax=1, origin='upper', interpolation='nearest', 
+              aspect='equal', zorder=1)
     
     # Define colors for each category
-    from matplotlib.colors import ListedColormap, BoundaryNorm
-    
     category_colors_rgba = {
         0: RISK_MAP_COLORS['none'],
         1: RISK_MAP_COLORS['predicted_only'],
@@ -1757,21 +1848,23 @@ def create_p1pct_diagnostic_map(
     plt.savefig(png_path, dpi=MAP_DPI, bbox_inches='tight')
     print(f"\nSaved PNG: {png_path}")
 
-    # Save PDF (use lower DPI to avoid timeout/zlib errors on large raster; retry on failure)
+    # Save PDF (use low DPI first - diagnostic map has very large raster, avoids timeout/backend errors)
     pdf_path = output_dir / f"model1_{model_type}_p1pct_diagnostic.pdf"
-    for pdf_dpi in (300, 150):
+    for pdf_dpi in (150, 100):
         try:
+            if pdf_path.exists():
+                pdf_path.unlink(missing_ok=True)
             plt.savefig(pdf_path, dpi=pdf_dpi, bbox_inches='tight')
             print(f"Saved PDF: {pdf_path} (dpi={pdf_dpi})")
             break
-        except (TimeoutError, zlib.error, OSError) as e:
+        except (TimeoutError, zlib.error, OSError, AttributeError, RuntimeError) as e:
             if pdf_path.exists():
                 try:
                     pdf_path.unlink()
                 except OSError:
                     pass
-            if pdf_dpi == 150:
-                print(f"Warning: Could not save PDF after retry: {e}. Skipping PDF.")
+            if pdf_dpi == 100:
+                print(f"Warning: Could not save PDF after retries: {e}. Skipping PDF.")
             continue
     plt.close()
 
@@ -2198,6 +2291,47 @@ def compute_shap_analysis(
     shap_csv_path = output_dir / f"model1_{model_type}_shap_top20_{timestamp}.csv"
     shap_importance_df.to_csv(shap_csv_path, index=False)
     print(f"  Saved top 20 features: {shap_csv_path.name}")
+    
+    # SHAP dependence plots for top 5 features (feature value vs SHAP value)
+    top5_indices = np.argsort(mean_abs_shap)[-5:][::-1]
+    for feat_idx in top5_indices:
+        feat_name = feature_cols[feat_idx]
+        safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in str(feat_name))
+        plt.figure(figsize=(8, 6))
+        shap.dependence_plot(feat_idx, shap_values_pos, X_shap, feature_names=feature_cols, show=False)
+        plt.tight_layout()
+        dep_path = output_dir / f"model1_{model_type}_shap_dep_{safe_name}.png"
+        plt.savefig(dep_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  Saved SHAP dependence: {dep_path.name}")
+    
+    # Thematic feature importance: group features by prefix and aggregate mean_abs_shap
+    FEATURE_THEME_PREFIXES = (
+        ('dist_', 'Proximity'),
+        ('topo_', 'Terrain'),
+        ('socio_', 'Socio-economic'),
+    )
+    theme_sums = {}
+    for i, fname in enumerate(feature_cols):
+        theme = "Other"
+        for prefix, theme_label in FEATURE_THEME_PREFIXES:
+            if fname.startswith(prefix):
+                theme = theme_label
+                break
+        theme_sums[theme] = theme_sums.get(theme, 0.0) + mean_abs_shap[i]
+    theme_order = sorted(theme_sums.keys(), key=lambda k: theme_sums[k], reverse=True)
+    themes = [theme_order[i] for i in range(len(theme_order))]
+    sums = [theme_sums[t] for t in themes]
+    fig, ax = plt.subplots(figsize=(8, max(4, len(themes) * 0.4)))
+    ax.barh(themes, sums, color=plt.cm.viridis(np.linspace(0.2, 0.8, len(themes))))
+    ax.set_xlabel('Sum of mean |SHAP|', fontsize=FONTSIZE_LABEL)
+    ax.set_title(f'Model 1 ({model_type.upper()}) SHAP importance by theme', fontsize=FONTSIZE_TITLE, fontweight='bold')
+    ax.invert_yaxis()
+    plt.tight_layout()
+    thematic_path = output_dir / f"model1_{model_type}_shap_thematic_{timestamp}.png"
+    plt.savefig(thematic_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved thematic SHAP: {thematic_path.name}")
     
     print(f"\n  Top 10 features by mean absolute SHAP:")
     for idx, row in shap_importance_df.head(10).iterrows():
@@ -2644,15 +2778,19 @@ def main() -> None:
     # Generate outputs
     create_metrics_table(metrics_data, output_dir, args.model_type)
     create_pr_curve(df, metrics_data, output_dir, args.model_type)
-    create_risk_map(
-        df,
-        region_boundary_path,
-        output_dir,
-        args.model_type,
-        metrics_data,
-        test_parquet_path,
-        test_years=test_years,
-    )
+    create_cumulative_gains_chart(df, output_dir, args.model_type)
+    thresholds = [1, 5, 10]
+    for threshold_pct in thresholds:
+        create_risk_map(
+            df,
+            region_boundary_path,
+            output_dir,
+            args.model_type,
+            metrics_data,
+            test_parquet_path,
+            test_years=test_years,
+            threshold_pct=threshold_pct,
+        )
     # Pass explicit test years to the row-level P@1% diagnostic map
     create_p1pct_diagnostic_map(
         df,
