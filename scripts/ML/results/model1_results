@@ -39,6 +39,7 @@ Output:  - outputs/Results/results_model1_lgbm/
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import re
@@ -2501,25 +2502,46 @@ def compute_shap_analysis(
     
     print(f"  Using data source: {selected_source} ({selected_path.name})")
     
-    # Load feature data (sample up to shap_n_samples rows with fixed seed)
+    # Load feature data (sample up to shap_n_samples rows with fixed seed).
+    # Use row-group reservoir sampling to avoid loading the full parquet into memory (prevents OOM on large train sets).
     print(f"  Loading feature data from {selected_source}...")
-    
-    # Read full dataset first to allow proper sampling
-    df_full = pd.read_parquet(selected_path, columns=feature_cols)
-    n_total = len(df_full)
+    pf = pq.ParquetFile(selected_path)
+    n_total = pf.metadata.num_rows
     print(f"  Total rows in {selected_source}: {n_total:,}")
-    
-    # Sample up to shap_n_samples rows (or all if less)
     n_sample = min(shap_n_samples, n_total)
     print(f"  Sampling {n_sample:,} rows for SHAP analysis (seed=42, max={shap_n_samples})...")
-    df_sample = df_full.sample(n=n_sample, random_state=42)
     
-    # Convert to float32 for SHAP (memory efficiency)
-    X_shap = df_sample[feature_cols].astype(np.float32).values
+    rng = np.random.default_rng(42)
+    n_features = len(feature_cols)
+    reservoir = np.zeros((n_sample, n_features), dtype=np.float32)
+    reservoir_fill = 0
+    rows_seen = 0
+    
+    for i in range(pf.num_row_groups):
+        rg = pf.read_row_group(i)
+        # Load only feature columns for this row group to minimize memory
+        sub = rg.select(feature_cols)
+        chunk = sub.to_pandas().astype(np.float32)
+        chunk_np = chunk.values
+        chunk_len = len(chunk_np)
+        del sub, chunk
+        for k in range(chunk_len):
+            rows_seen += 1
+            if rows_seen <= n_sample:
+                reservoir[reservoir_fill] = chunk_np[k]
+                reservoir_fill += 1
+            else:
+                r = rng.integers(0, rows_seen)
+                if r < n_sample:
+                    reservoir[r] = chunk_np[k]
+        del chunk_np
+        gc.collect()
+    
+    X_shap = reservoir[:reservoir_fill].copy()
+    del reservoir
+    gc.collect()
     print(f"  Feature matrix shape: {X_shap.shape}")
     print(f"  Memory: {X_shap.nbytes / 1024**2:.1f} MB")
-    
-    del df_full, df_sample
     
     # Compute SHAP values
     print(f"  Computing SHAP values using TreeExplainer...")
