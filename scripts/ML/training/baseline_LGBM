@@ -577,8 +577,11 @@ def main() -> None:
     
     print(f"Total pixels in 2000: {len(df_2000_clean):,}")
     
-    # Feature selection via case-insensitive regex denylist (hard-fail if any forbidden remains)
-    feature_cols = get_feature_columns(df_2000_clean)
+    # Feature selection via case-insensitive regex denylist (hard-fail if any forbidden remains).
+    # Pass a view without denylist columns so get_feature_columns does not raise; keep df_2000_clean for target and pixel_ids.
+    cols_to_drop_for_features = [c for c in df_2000_clean.columns if FEATURE_DENYLIST_REGEX.search(c)]
+    df_for_feature_selection = df_2000_clean.drop(columns=cols_to_drop_for_features)
+    feature_cols = get_feature_columns(df_for_feature_selection)
     print(f"\nUsing {len(feature_cols)} features (denylist: any col matching {FEATURE_DENYLIST_REGEX.pattern!r})")
     print("Final feature list:")
     for i, feat in enumerate(sorted(feature_cols), 1):
