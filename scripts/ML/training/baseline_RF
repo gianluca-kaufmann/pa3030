@@ -8,7 +8,7 @@ Purpose: Estimate how "protection-like" each pixel looked in year 2000.
          each unprotected pixel becomes a suitability score. We then check
          whether high-suitability pixels actually became protected by 2024.
 
-Input:   `data/ml/merged_panel_2000_2024.parquet`
+Input:   `merged_panel_final.parquet` (same locations as model1_preprocessing, e.g. $SCRATCH/outputs/Results or data/ml)
 Output:  - Trained Random Forest model (baseline_rf_2000.pkl)
          - Suitability scores (baseline_scores_2000_rf.parquet)
          - Evaluation metrics (baseline_rf_metrics.json)
@@ -240,15 +240,13 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
     
-    # Input path (prefer SCRATCH on Euler; check multiple possible locations)
+    # Input path: merged_panel_final.parquet (same locations as model1_preprocessing)
     candidate_inputs = []
-    if scratch_root is not None and scratch_root.exists():
-        # Euler cluster: outputs/Results/merged_panel_2000_2024.parquet
-        candidate_inputs.append(scratch_root / "outputs/Results/merged_panel_2000_2024.parquet")
-        # Alternative: data/ml/merged_panel_2000_2024.parquet
-        candidate_inputs.append(scratch_root / "data/ml/merged_panel_2000_2024.parquet")
-    # Local fallback
-    candidate_inputs.append(repo_root / "data/ml/merged_panel_2000_2024.parquet")
+    if scratch_root is not None:
+        candidate_inputs.append(scratch_root / "outputs/Results/merged_panel_final.parquet")
+        candidate_inputs.append(scratch_root / "data/ml/merged_panel_final.parquet")
+    candidate_inputs.append(repo_root / "outputs/Results/merged_panel_final.parquet")
+    candidate_inputs.append(repo_root / "data/ml/merged_panel_final.parquet")
     
     input_path = candidate_inputs[-1]  # Default to last (local repo path)
     for cand in candidate_inputs:
@@ -258,7 +256,7 @@ def main() -> None:
     
     if input_path is None or not input_path.exists():
         error_msg = (
-            "Could not find merged_panel_2000_2024.parquet in any expected location.\n"
+            "Could not find merged_panel_final.parquet in any expected location.\n"
             f"Checked:\n"
         )
         for cand in candidate_inputs:
