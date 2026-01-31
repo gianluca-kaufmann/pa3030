@@ -36,7 +36,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -61,10 +61,22 @@ try:
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+    from matplotlib.lines import Line2D
     MATPLOTLIB_AVAILABLE = True
 except ImportError:
     MATPLOTLIB_AVAILABLE = False
     plt = None
+    ListedColormap = BoundaryNorm = Line2D = None
+
+try:
+    import geopandas as gpd
+    from shapely.geometry import Point
+    GEOPANDAS_AVAILABLE = True
+except ImportError:
+    GEOPANDAS_AVAILABLE = False
+    gpd = None
+    Point = None
 
 
 class Tee:
@@ -452,31 +464,269 @@ def create_pr_roc_plots(
     plt.close()
 
 
-def create_suitability_map(outcome_df: pd.DataFrame, output_dir: Path, prefix: str = "baseline_lgbm") -> None:
-    """Simple suitability/probability map: scatter or hexbin of x,y colored by score (thesis artifact)."""
-    if not MATPLOTLIB_AVAILABLE:
-        print("Skipping suitability map (matplotlib not available)")
+# Map constants (high-res suitability and risk maps)
+_MAP_DPI = 600
+_TARGET_RESOLUTION_M = 1000.0
+_SUITABILITY_COLORMAP = 'plasma'
+_SUITABILITY_PERCENTILE_MIN = 25
+_SUITABILITY_PERCENTILE_MAX = 98
+_COLOR_PROTECTED = '#2E8B57'
+_SUITABILITY_RISK_THRESHOLD_PCT = 10.0  # Top 10% suitability for risk map
+
+
+def _get_south_america_boundary(repo_root: Path) -> Optional[object]:
+    """Get South America boundary. Returns None if geopandas unavailable or boundary not found."""
+    if not GEOPANDAS_AVAILABLE:
+        return None
+    south_america_iso_codes = ['ARG', 'BOL', 'BRA', 'CHL', 'COL', 'ECU', 'GUF', 'GUY', 'PRY', 'PER', 'SUR', 'URY', 'VEN']
+    for cand in [repo_root / "data" / "boundaries" / "south_america.geojson", repo_root / "data" / "boundaries" / "south_america.gpkg"]:
+        if cand.exists():
+            try:
+                gdf = gpd.read_file(cand)
+                if gdf.crs is None:
+                    gdf.set_crs('EPSG:4326', inplace=True)
+                if 'iso_a3' in gdf.columns:
+                    return gdf[gdf['iso_a3'].isin(south_america_iso_codes)].dissolve().explode(index_parts=False)
+                elif 'ISO_A3' in gdf.columns:
+                    return gdf[gdf['ISO_A3'].isin(south_america_iso_codes)].dissolve().explode(index_parts=False)
+                return gdf
+            except Exception:
+                continue
+    return None
+
+
+def _points_to_raster(x: np.ndarray, y: np.ndarray, values: np.ndarray, target_resolution: float = 1000.0,
+                      agg_func: str = 'mean', extent_hint: Optional[Tuple[float, float, float, float]] = None
+                      ) -> Tuple[np.ndarray, Tuple[float, float, float, float]]:
+    """Convert point data to raster grid. Coordinates in meters (EPSG:3857)."""
+    if extent_hint is not None:
+        x_min, x_max, y_min, y_max = extent_hint
+    else:
+        x_min, x_max = float(x.min()), float(x.max())
+        y_min, y_max = float(y.min()), float(y.max())
+    x_res = y_res = target_resolution
+    padding = max(x_res, y_res) * 0.1
+    x_edges = np.arange(x_min - padding, x_max + padding + x_res, x_res)
+    y_edges = np.arange(y_min - padding, y_max + padding + y_res, y_res)
+    ncols, nrows = len(x_edges) - 1, len(y_edges) - 1
+    x_idx = np.clip(np.digitize(x, x_edges) - 1, 0, ncols - 1).astype(np.intp)
+    y_idx = np.clip(np.digitize(y, y_edges) - 1, 0, nrows - 1).astype(np.intp)
+    flat_idx = y_idx * ncols + x_idx
+    values = np.asarray(values, dtype=np.float64)
+    if agg_func == 'mean':
+        sum_arr = np.zeros(nrows * ncols, dtype=np.float64)
+        count_arr = np.zeros(nrows * ncols, dtype=np.float64)
+        np.add.at(sum_arr, flat_idx, values)
+        np.add.at(count_arr, flat_idx, 1.0)
+        raster_flat = np.where(count_arr > 0, sum_arr / count_arr, np.nan)
+    else:
+        raster_flat = np.full(nrows * ncols, -np.inf, dtype=np.float64)
+        np.maximum.at(raster_flat, flat_idx, values)
+        raster_flat = np.where(np.isfinite(raster_flat), raster_flat, np.nan)
+    raster = np.flipud(raster_flat.reshape(nrows, ncols).astype(np.float32))
+    return raster, (float(x_edges[0]), float(x_edges[-1]), float(y_edges[0]), float(y_edges[-1]))
+
+
+def _load_protected_areas_until_2024(parquet_path: Path, year_max: int = 2024) -> Optional[pd.DataFrame]:
+    """Load all pixels protected in any year through year_max from merged panel."""
+    if duckdb is None:
+        return None
+    escaped = str(parquet_path).replace("'", "''")
+    con = duckdb.connect()
+    try:
+        con.execute("SET threads TO 4")
+        return con.execute(f"""
+            SELECT row, col, MAX(x) AS x, MAX(y) AS y
+            FROM read_parquet('{escaped}')
+            WHERE year <= {year_max} AND WDPA_b1 = 1
+            GROUP BY row, col
+        """).fetchdf()
+    finally:
+        con.close()
+
+
+def _create_high_res_suitability_map(outcome_df: pd.DataFrame, output_dir: Path, input_path: Path,
+                                     prefix: str, repo_root: Path) -> None:
+    """Create high-resolution suitability map (raster)."""
+    if not MATPLOTLIB_AVAILABLE or not GEOPANDAS_AVAILABLE or "x" not in outcome_df.columns or "score" not in outcome_df.columns:
+        print("Skipping suitability map (matplotlib/geopandas not available or missing columns)")
         return
-    if "x" not in outcome_df.columns or "y" not in outcome_df.columns:
-        print("Skipping suitability map (x,y not in outcome)")
+    sa_gdf = _get_south_america_boundary(repo_root)
+    proj_bounds = sa_gdf.to_crs('EPSG:3857').total_bounds if sa_gdf is not None else None
+    if proj_bounds is None:
+        print("Skipping suitability map (South America boundary not found)")
         return
-    # Subsample if huge for faster plotting
-    df = outcome_df
-    if len(df) > 500_000:
-        df = df.sample(n=500_000, random_state=RANDOM_STATE)
-    x, y, score = df["x"].values, df["y"].values, df["score"].values
-    fig, ax = plt.subplots(figsize=(12, 10))
-    hb = ax.hexbin(x, y, C=score, reduce_C_function=np.mean, gridsize=80, cmap="plasma", mincnt=1)
-    plt.colorbar(hb, ax=ax, label="Suitability score")
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
-    ax.set_title(f"{prefix} Suitability Map (hexbin)")
-    ax.set_aspect("equal", adjustable="box")
-    plt.tight_layout()
+    geometry = [Point(xy) for xy in zip(outcome_df['x'], outcome_df['y'])]
+    gdf = gpd.GeoDataFrame(outcome_df, geometry=geometry, crs='EPSG:3857')
+    if proj_bounds is not None:
+        gdf = gdf[(gdf.geometry.x >= proj_bounds[0]) & (gdf.geometry.x <= proj_bounds[2]) &
+                  (gdf.geometry.y >= proj_bounds[1]) & (gdf.geometry.y <= proj_bounds[3])].copy()
+    outcome_filtered = outcome_df.loc[gdf.index].copy()
+    score_values = outcome_filtered['score'].values
+    score_pmin, score_pmax = np.percentile(score_values, _SUITABILITY_PERCENTILE_MIN), np.percentile(score_values, _SUITABILITY_PERCENTILE_MAX)
+    score_span = score_pmax - score_pmin
+    score_norm = np.sqrt(np.clip(score_values, score_pmin, score_pmax) - score_pmin) / score_span if score_span > 0 else np.zeros_like(score_values)
+    raster, extent = _points_to_raster(gdf.geometry.x.values, gdf.geometry.y.values, score_norm, _TARGET_RESOLUTION_M, agg_func='mean')
+    fig_width = 14
+    fig_height = fig_width * (proj_bounds[3] - proj_bounds[1]) / (proj_bounds[2] - proj_bounds[0]) if proj_bounds is not None else 11
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    if sa_gdf is not None:
+        sa_gdf.to_crs('EPSG:3857').plot(ax=ax, color='white', edgecolor='none', linewidth=1.5, zorder=1)
+    im = ax.imshow(raster, extent=extent, cmap=_SUITABILITY_COLORMAP, vmin=0, vmax=1, origin='upper', interpolation='nearest', aspect='equal', zorder=2)
+    if proj_bounds is not None:
+        ax.set_xlim(proj_bounds[0], proj_bounds[2])
+        ax.set_ylim(proj_bounds[1], proj_bounds[3])
+    ax.set_aspect('equal', adjustable='box')
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label('Suitability score', fontsize=12, rotation=270, labelpad=20)
+    cbar.set_ticks([0.0, 1.0])
+    cbar.set_ticklabels(['Low', 'High'])
+    ax.set_xlabel('Easting (m, EPSG:3857)', fontsize=12)
+    ax.set_ylabel('Northing (m, EPSG:3857)', fontsize=12)
+    ax.set_title(f'{prefix} Suitability Map', fontsize=15, fontweight='bold', pad=15)
+    ax.text(0.02, 0.98, f"Min: {score_values.min():.4f} | Max: {score_values.max():.4f}\nMean: {score_values.mean():.4f} | Pixels: {len(outcome_filtered):,}",
+            transform=ax.transAxes, fontsize=9, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor='black', linewidth=1), zorder=10)
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5, zorder=3)
+    plt.tight_layout(pad=0.5)
     for ext in ("png", "pdf"):
-        p = output_dir / f"{prefix}_suitability_map.{ext}"
-        plt.savefig(p, dpi=150, bbox_inches="tight")
-        print(f"Saved {p}")
+        try:
+            plt.savefig(output_dir / f"{prefix}_suitability_map.{ext}", dpi=_MAP_DPI if ext == "png" else 150, bbox_inches='tight')
+            print(f"Saved {output_dir / f'{prefix}_suitability_map.{ext}'}")
+        except Exception as e:
+            print(f"Warning: Could not save {ext}: {e}")
+    plt.close()
+
+
+def _create_suitability_map_with_pa(outcome_df: pd.DataFrame, output_dir: Path, input_path: Path,
+                                    prefix: str, repo_root: Path) -> None:
+    """Create suitability map with protected areas (through 2024) overlay."""
+    if not MATPLOTLIB_AVAILABLE or not GEOPANDAS_AVAILABLE or "x" not in outcome_df.columns or "score" not in outcome_df.columns:
+        return
+    sa_gdf = _get_south_america_boundary(repo_root)
+    proj_bounds = sa_gdf.to_crs('EPSG:3857').total_bounds if sa_gdf is not None else None
+    if proj_bounds is None:
+        return
+    geometry = [Point(xy) for xy in zip(outcome_df['x'], outcome_df['y'])]
+    gdf = gpd.GeoDataFrame(outcome_df, geometry=geometry, crs='EPSG:3857')
+    if proj_bounds is not None:
+        gdf = gdf[(gdf.geometry.x >= proj_bounds[0]) & (gdf.geometry.x <= proj_bounds[2]) &
+                  (gdf.geometry.y >= proj_bounds[1]) & (gdf.geometry.y <= proj_bounds[3])].copy()
+    outcome_filtered = outcome_df.loc[gdf.index].copy()
+    score_values = outcome_filtered['score'].values
+    score_pmin, score_pmax = np.percentile(score_values, _SUITABILITY_PERCENTILE_MIN), np.percentile(score_values, _SUITABILITY_PERCENTILE_MAX)
+    score_span = score_pmax - score_pmin
+    score_norm = np.sqrt(np.clip(score_values, score_pmin, score_pmax) - score_pmin) / score_span if score_span > 0 else np.zeros_like(score_values)
+    raster, extent = _points_to_raster(gdf.geometry.x.values, gdf.geometry.y.values, score_norm, _TARGET_RESOLUTION_M, agg_func='mean')
+    pa_raster, n_pa_pixels = None, 0
+    if input_path.exists() and duckdb is not None:
+        pa_df = _load_protected_areas_until_2024(input_path, 2024)
+        if pa_df is not None and len(pa_df) > 0:
+            pa_geom = [Point(xy) for xy in zip(pa_df['x'], pa_df['y'])]
+            pa_gdf = gpd.GeoDataFrame(pa_df, geometry=pa_geom, crs='EPSG:3857')
+            if proj_bounds is not None:
+                pa_gdf = pa_gdf[(pa_gdf.geometry.x >= proj_bounds[0]) & (pa_gdf.geometry.x <= proj_bounds[2]) &
+                                (pa_gdf.geometry.y >= proj_bounds[1]) & (pa_gdf.geometry.y <= proj_bounds[3])]
+            if len(pa_gdf) > 0:
+                n_pa_pixels = len(pa_gdf)
+                pa_raster, _ = _points_to_raster(pa_gdf.geometry.x.values, pa_gdf.geometry.y.values,
+                                                 np.ones(len(pa_gdf), dtype=np.float32), _TARGET_RESOLUTION_M, agg_func='max', extent_hint=(extent[0], extent[1], extent[2], extent[3]))
+    fig_width = 14
+    fig_height = fig_width * (proj_bounds[3] - proj_bounds[1]) / (proj_bounds[2] - proj_bounds[0]) if proj_bounds is not None else 11
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    if sa_gdf is not None:
+        sa_gdf.to_crs('EPSG:3857').plot(ax=ax, color='white', edgecolor='none', zorder=1)
+    im = ax.imshow(raster, extent=extent, cmap=_SUITABILITY_COLORMAP, vmin=0, vmax=1, origin='upper', interpolation='nearest', aspect='equal', zorder=2)
+    if pa_raster is not None:
+        pa_masked = np.ma.masked_where(np.isnan(pa_raster) | (pa_raster < 0.5), pa_raster)
+        ax.imshow(pa_masked, extent=extent, cmap=ListedColormap([_COLOR_PROTECTED]), vmin=0, vmax=1, origin='upper', interpolation='nearest', aspect='equal', alpha=0.6, zorder=3)
+    if proj_bounds is not None:
+        ax.set_xlim(proj_bounds[0], proj_bounds[2])
+        ax.set_ylim(proj_bounds[1], proj_bounds[3])
+    ax.set_aspect('equal', adjustable='box')
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label('Suitability score', fontsize=12, rotation=270, labelpad=20)
+    ax.set_xlabel('Easting (m, EPSG:3857)', fontsize=12)
+    ax.set_ylabel('Northing (m, EPSG:3857)', fontsize=12)
+    ax.set_title(f'{prefix} Suitability Map + Protected Areas (through 2024)', fontsize=15, fontweight='bold', pad=15)
+    if n_pa_pixels > 0:
+        ax.legend(handles=[Line2D([0], [0], marker='s', color='w', markerfacecolor=_COLOR_PROTECTED, markersize=10, alpha=0.9, label=f'Protected areas until 2024 (n={n_pa_pixels:,})')], loc='upper left', fontsize=10, framealpha=0.95)
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5, zorder=4)
+    plt.tight_layout(pad=0.5)
+    for ext in ("png", "pdf"):
+        try:
+            plt.savefig(output_dir / f"{prefix}_suitability_map_with_pa.{ext}", dpi=_MAP_DPI if ext == "png" else 150, bbox_inches='tight')
+            print(f"Saved {output_dir / f'{prefix}_suitability_map_with_pa.{ext}'}")
+        except Exception as e:
+            print(f"Warning: Could not save {ext}: {e}")
+    plt.close()
+
+
+def _create_suitability_risk_map(outcome_df: pd.DataFrame, output_dir: Path, input_path: Path,
+                                 prefix: str, repo_root: Path) -> None:
+    """Create risk map: top 10% suitability + protected areas until 2024 overlay."""
+    if not MATPLOTLIB_AVAILABLE or not GEOPANDAS_AVAILABLE or "x" not in outcome_df.columns or "score" not in outcome_df.columns:
+        print("Skipping risk map (matplotlib/geopandas not available or missing columns)")
+        return
+    sa_gdf = _get_south_america_boundary(repo_root)
+    proj_bounds = sa_gdf.to_crs('EPSG:3857').total_bounds if sa_gdf is not None else None
+    if proj_bounds is None:
+        print("Skipping risk map (South America boundary not found)")
+        return
+    geometry = [Point(xy) for xy in zip(outcome_df['x'], outcome_df['y'])]
+    gdf = gpd.GeoDataFrame(outcome_df.copy(), geometry=geometry, crs='EPSG:3857')
+    if proj_bounds is not None:
+        gdf = gdf[(gdf.geometry.x >= proj_bounds[0]) & (gdf.geometry.x <= proj_bounds[2]) &
+                  (gdf.geometry.y >= proj_bounds[1]) & (gdf.geometry.y <= proj_bounds[3])].copy()
+    top_threshold = np.percentile(gdf['score'].values, 100 - _SUITABILITY_RISK_THRESHOLD_PCT)
+    gdf['is_predicted'] = (gdf['score'] >= top_threshold).astype(int)
+    predicted_count = int(gdf['is_predicted'].sum())
+    category_raster, extent = _points_to_raster(gdf.geometry.x.values, gdf.geometry.y.values, gdf['is_predicted'].values.astype(np.float32), _TARGET_RESOLUTION_M, agg_func='max')
+    background_mask, _ = _points_to_raster(gdf.geometry.x.values, gdf.geometry.y.values, np.ones(len(gdf), dtype=np.float32), _TARGET_RESOLUTION_M, agg_func='max')
+    pa_raster, pa_extent, n_pa_pixels = None, None, 0
+    if input_path.exists() and duckdb is not None:
+        pa_df = _load_protected_areas_until_2024(input_path, 2024)
+        if pa_df is not None and len(pa_df) > 0 and 'x' in pa_df.columns and 'y' in pa_df.columns:
+            pa_geom = [Point(xy) for xy in zip(pa_df['x'], pa_df['y'])]
+            pa_gdf = gpd.GeoDataFrame(pa_df, geometry=pa_geom, crs='EPSG:3857')
+            if proj_bounds is not None:
+                pa_gdf = pa_gdf[(pa_gdf.geometry.x >= proj_bounds[0]) & (pa_gdf.geometry.x <= proj_bounds[2]) &
+                                (pa_gdf.geometry.y >= proj_bounds[1]) & (pa_gdf.geometry.y <= proj_bounds[3])]
+            if len(pa_gdf) > 0:
+                n_pa_pixels = len(pa_gdf)
+                pa_raster, pa_extent = _points_to_raster(pa_gdf.geometry.x.values, pa_gdf.geometry.y.values,
+                                                         np.ones(len(pa_gdf), dtype=np.float32), _TARGET_RESOLUTION_M,
+                                                         agg_func='max', extent_hint=(extent[0], extent[1], extent[2], extent[3]))
+    fig_width = 14
+    fig_height = fig_width * (proj_bounds[3] - proj_bounds[1]) / (proj_bounds[2] - proj_bounds[0]) if proj_bounds is not None else 11
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    background_masked = np.ma.masked_where(np.isnan(background_mask), background_mask)
+    ax.imshow(background_masked, extent=extent, cmap=ListedColormap(['#F5F5F5']), vmin=0, vmax=1, origin='upper', interpolation='nearest', aspect='equal', zorder=1)
+    COLOR_PREDICTED = '#5B9BD5'
+    cat_no_bg = np.where((category_raster >= 1) & (category_raster <= 1), category_raster, np.nan)
+    ax.imshow(np.ma.masked_where(np.isnan(cat_no_bg), cat_no_bg), extent=extent, cmap=ListedColormap([COLOR_PREDICTED]), vmin=0.5, vmax=1.5, origin='upper', interpolation='nearest', aspect='equal', zorder=2)
+    if pa_raster is not None and pa_extent is not None:
+        pa_masked = np.ma.masked_where(np.isnan(pa_raster) | (pa_raster < 0.5), pa_raster)
+        ax.imshow(pa_masked, extent=pa_extent, cmap=ListedColormap([_COLOR_PROTECTED]), vmin=0, vmax=1, origin='upper', interpolation='nearest', aspect='equal', alpha=0.6, zorder=3)
+    if proj_bounds is not None:
+        ax.set_xlim(proj_bounds[0], proj_bounds[2])
+        ax.set_ylim(proj_bounds[1], proj_bounds[3])
+    ax.set_aspect('equal', adjustable='box')
+    ax.set_xlabel('Easting (m, EPSG:3857)', fontsize=12)
+    ax.set_ylabel('Northing (m, EPSG:3857)', fontsize=12)
+    ax.set_title(f'{prefix} Suitability Risk Map: Top {int(_SUITABILITY_RISK_THRESHOLD_PCT)}% + Protected Areas (through 2024)', fontsize=15, fontweight='bold', pad=15)
+    legend_elements = [Line2D([0], [0], marker='s', color='w', markerfacecolor=COLOR_PREDICTED, markersize=10, alpha=0.9, label=f'Top {int(_SUITABILITY_RISK_THRESHOLD_PCT)}% suitability (n={predicted_count:,})')]
+    if n_pa_pixels > 0:
+        legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=_COLOR_PROTECTED, markersize=10, alpha=0.9, label=f'Protected areas until 2024 (n={n_pa_pixels:,})'))
+    ax.legend(handles=legend_elements, loc='upper left', fontsize=10, framealpha=0.95)
+    ax.text(0.02, 0.02, f"Pixels: {len(gdf):,}\nTop {int(_SUITABILITY_RISK_THRESHOLD_PCT)}% threshold: {top_threshold:.4f}", transform=ax.transAxes, fontsize=9, verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.9, edgecolor='black', linewidth=1), zorder=10)
+    ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5, zorder=4)
+    plt.tight_layout(pad=0.5)
+    for ext in ("png", "pdf"):
+        try:
+            plt.savefig(output_dir / f"{prefix}_risk_map_top{int(_SUITABILITY_RISK_THRESHOLD_PCT)}pct.{ext}", dpi=_MAP_DPI if ext == "png" else 150, bbox_inches='tight')
+            print(f"Saved {output_dir / f'{prefix}_risk_map_top{int(_SUITABILITY_RISK_THRESHOLD_PCT)}pct.{ext}'}")
+        except Exception as e:
+            print(f"Warning: Could not save {ext}: {e}")
     plt.close()
 
 
@@ -1088,10 +1338,12 @@ def main() -> None:
         json.dump(metrics_serializable, f, indent=2)
     print(f"Metrics saved to: {metrics_path}")
     
-    # Thesis artifacts: LaTeX table, PR/ROC plots, suitability map
+    # Thesis artifacts: LaTeX table, PR/ROC plots, high-res suitability + risk maps
     write_metrics_latex_table(metrics_serializable, output_dir, prefix="baseline_lgbm")
     create_pr_roc_plots(y_future, y_score, output_dir, prefix="baseline_lgbm")
-    create_suitability_map(outcome_df, output_dir, prefix="baseline_lgbm")
+    _create_high_res_suitability_map(outcome_df, output_dir, input_path, "baseline_lgbm", repo_root)
+    _create_suitability_map_with_pa(outcome_df, output_dir, input_path, "baseline_lgbm", repo_root)
+    _create_suitability_risk_map(outcome_df, output_dir, input_path, "baseline_lgbm", repo_root)
     
     # -------------------------------------------------------------------------
     # Summary
