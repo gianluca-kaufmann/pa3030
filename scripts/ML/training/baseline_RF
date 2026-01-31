@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Baseline Suitability Model for Protected Area Prediction
+"""Baseline Suitability Model for Protected Area Prediction (Random Forest)
 
 Purpose: Estimate how "protection-like" each pixel looked in year 2000.
          A model trained only on 2000 (protected vs unprotected) learns the
@@ -8,18 +8,32 @@ Purpose: Estimate how "protection-like" each pixel looked in year 2000.
          each unprotected pixel becomes a suitability score. We then check
          whether high-suitability pixels actually became protected by 2024.
 
-Input:   `merged_panel_final.parquet` (same locations as model1_preprocessing, e.g. $SCRATCH/outputs/Results or data/ml)
+Features:
+- Leakage prevention: exclude denylist matches and target (is_protected_2000); hard-fail
+  only if any excluded column survives in final feature list; excluded_cols and
+  final_feature_cols logged and in metrics; leakage audit (top correlations with target).
+- Splits: random split + spatial blocked train/test (val held out, not used for model selection).
+- Future status: DuckDB parquet aggregation (threads from SLURM/cpu_count); pandas fallback
+  if DuckDB missing; backend and duckdb/matplotlib availability recorded in metrics.
+- Tie handling: deterministic precision@k under ties; tie diagnostics for suitability.
+- Thesis artifacts: metrics JSON, LaTeX table, PR/ROC plots, suitability map (Easting/Northing axes);
+  dataset/schema hashes and config snapshot in metrics.
+
+Input:   `merged_panel_final.parquet` (same locations as model1_preprocessing)
 Output:  - Trained Random Forest model (baseline_rf_2000.pkl)
          - Suitability scores (baseline_scores_2000_rf.parquet)
          - Evaluation metrics (baseline_rf_metrics.json)
+         - LaTeX table, PR/ROC plots, suitability map (outputs/Results/ml_baselines)
          - Scored outcome table (baseline_scored_outcomes_rf.parquet)
 """
 
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import os
+import re
 import sys
 import time
 import pickle
@@ -36,8 +50,24 @@ from sklearn.metrics import (
     confusion_matrix,
     roc_auc_score,
     average_precision_score,
+    precision_recall_curve,
+    roc_curve,
 )
 from sklearn.model_selection import train_test_split
+
+try:
+    import duckdb
+except ImportError:
+    duckdb = None
+
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    plt = None
 
 
 class Tee:
@@ -64,36 +94,55 @@ class Tee:
 # =============================================================================
 RANDOM_STATE = 42
 TEST_SIZE = 0.2
+VAL_SIZE = 0.15  # Fraction for spatial val (blocked split)
 
-# Columns to exclude from features (prevent data leakage)
-EXCLUDE_COLS = {
-    # Target and derived fields
-    "WDPA_b1",          # Target variable (protection status)
-    "is_protected_2000", # Target variable (derived from WDPA_b1)
-    "dist_wdpa",        # Derived from WDPA (distance to protected area)
-    "dist_wdpa_decay",  # Derived from WDPA (decay function)
-    # Identifiers and coordinates
-    "row",
-    "col",
-    "x",
-    "y",
-    "year",
-}
+# Case-insensitive regex denylist: exclude any column whose name matches (prevents leakage)
+FEATURE_DENYLIST_REGEX = re.compile(
+    r'(wdpa|transition|protected|label|target|dist_wdpa|row|col|\bx\b|\by\b|year)',
+    re.IGNORECASE
+)
 
-# Random Forest parameters
+# Random Forest parameters (verbose=0 for speed)
 RF_PARAMS = {
     'n_estimators': 500,
-    'max_depth': None,           # Unlimited depth
-    'min_samples_split': 20,     # Minimum samples required to split
-    'min_samples_leaf': 10,      # Minimum samples required at leaf node
-    'max_features': 'sqrt',      # Number of features to consider for best split
+    'max_depth': None,
+    'min_samples_split': 20,
+    'min_samples_leaf': 10,
+    'max_features': 'sqrt',
     'bootstrap': True,
-    'oob_score': True,           # Out-of-bag score for validation
+    'oob_score': True,
     'random_state': RANDOM_STATE,
     'n_jobs': -1,
-    'verbose': 1,
-    'class_weight': 'balanced',  # Handle class imbalance
+    'verbose': 0,
+    'class_weight': 'balanced',
 }
+
+# Target column name (always excluded from features)
+TARGET_COL_NAME = "is_protected_2000"
+
+# Leakage audit: cap rows for stratified subsample (0 = no cap, use full data when use_full_data_audit=True)
+LEAKAGE_AUDIT_MAX_ROWS = 1_000_000
+LEAKAGE_AUDIT_SEED = 42
+LEAKAGE_AUDIT_USE_FULL_DATA = False
+
+
+def get_n_jobs() -> int:
+    """Number of CPUs for DuckDB/parallel work: SLURM_CPUS_PER_TASK or os.cpu_count()."""
+    n = os.environ.get("SLURM_CPUS_PER_TASK")
+    if n is not None:
+        try:
+            return max(1, int(n))
+        except ValueError:
+            pass
+    try:
+        return max(1, os.cpu_count() or 4)
+    except Exception:
+        return 4
+
+
+def list_digest(names: list[str]) -> str:
+    """Stable hash digest of a list of strings (for W&B / metrics, avoid logging full lists)."""
+    return hashlib.sha256("|".join(sorted(names)).encode("utf-8")).hexdigest()[:16]
 
 
 # =============================================================================
@@ -142,89 +191,356 @@ def convert_numpy_types(obj):
             return str(obj)  # Last resort: convert to string
 
 
-def compute_precision_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) -> float:
-    """Compute precision at top k% of predictions.
-    
-    Args:
-        y_true: True labels (0 or 1)
-        y_proba: Predicted probabilities for positive class
-        k: Percentage (e.g., 1 for top 1%, 5 for top 5%)
-    
-    Returns:
-        Precision among top k% predictions
+def compute_precision_at_k(
+    y_true: np.ndarray,
+    y_proba: np.ndarray,
+    k: float,
+    tie_break_order: Optional[np.ndarray] = None,
+) -> float:
+    """Compute precision at top k% of predictions (deterministic under ties).
+
+    Tie-breaking: when scores are tied, order by tie_break_order (ascending)
+    so that the same subset is chosen every run. If tie_break_order is None,
+    uses np.arange(len(y_true)) so that earlier indices win.
     """
     n_samples = len(y_true)
     n_top_k = max(1, int(n_samples * k / 100))
-    
-    # Get indices of top k% predictions
-    top_k_idx = np.argsort(y_proba)[-n_top_k:]
-    
-    # Calculate precision among top k%
-    return y_true[top_k_idx].sum() / n_top_k
+    if tie_break_order is None:
+        tie_break_order = np.arange(n_samples, dtype=np.int64)
+    lex_order = np.lexsort((tie_break_order, -y_proba))
+    top_k_idx = lex_order[:n_top_k]
+    return float(y_true[top_k_idx].sum() / n_top_k)
+
+
+def tie_diagnostics(y_proba: np.ndarray, name: str = "score") -> dict:
+    """Compute tie diagnostics for suitability/probability scores."""
+    uniq, counts = np.unique(y_proba, return_counts=True)
+    n_unique = len(uniq)
+    tied = counts > 1
+    n_tied_groups = int(tied.sum())
+    max_tie_size = int(counts.max()) if len(counts) else 0
+    n_in_largest = int(counts.max()) if len(counts) else 0
+    pct_largest = (n_in_largest / len(y_proba) * 100) if len(y_proba) else 0.0
+    return {
+        f"{name}_n_unique": n_unique,
+        f"{name}_n_tied_groups": n_tied_groups,
+        f"{name}_max_tie_size": max_tie_size,
+        f"{name}_pct_in_largest_tie": round(pct_largest, 4),
+    }
 
 
 def load_year_data(parquet_path: Path, year: int, columns: Optional[list] = None) -> pd.DataFrame:
-    """Load data for a specific year from parquet file efficiently.
-    
-    Uses row group filtering to minimize memory usage.
-    """
+    """Load data for a specific year from parquet (row-group filter + multi-threaded read)."""
     print(f"Loading data for year {year} from {parquet_path} ...")
-    
-    # Read parquet file with filter
     filters = [('year', '==', year)]
     load_start = time.time()
     df = pd.read_parquet(parquet_path, filters=filters, columns=columns)
-    load_time = time.time() - load_start
-    
-    print(f"  Loaded {len(df):,} rows in {load_time:.1f}s")
+    print(f"  Loaded {len(df):,} rows in {time.time() - load_start:.1f}s")
     return df
 
 
-def load_future_protection_status(parquet_path: Path, years_after: range) -> pd.DataFrame:
-    """Load WDPA status for years after 2000 to compute ever_protected_after_2000.
-    
-    Returns DataFrame with row, col, and ever_protected_after_2000 columns.
+def load_future_protection_status_duckdb(
+    parquet_path: Path, year_min: int, year_max: int, num_threads: Optional[int] = None
+) -> pd.DataFrame:
+    """Compute ever_protected_after_2000 via DuckDB parquet aggregation (no full load).
+    num_threads: from get_n_jobs() if None.
     """
-    print(f"\nLoading future protection status (years {years_after.start}-{years_after.stop - 1}) ...")
-    
-    # Only load necessary columns
-    columns = ['row', 'col', 'year', 'WDPA_b1']
-    
-    # Load all future years
+    if duckdb is None:
+        raise RuntimeError("duckdb is required for load_future_protection_status_duckdb; install duckdb")
+    threads = num_threads if num_threads is not None else get_n_jobs()
+    print(f"\nComputing future protection status (years {year_min}-{year_max}) via DuckDB ({threads} threads) ...")
+    escaped = str(parquet_path).replace("'", "''")
     load_start = time.time()
-    filters = [('year', '>=', years_after.start), ('year', '<=', years_after.stop - 1)]
-    df = pd.read_parquet(parquet_path, filters=filters, columns=columns)
+    con = duckdb.connect()
+    try:
+        con.execute(f"SET threads TO {threads}")
+        q = f"""
+        SELECT row, col, MAX(WDPA_b1) AS max_wdpa
+        FROM read_parquet('{escaped}')
+        WHERE year >= {year_min} AND year <= {year_max}
+        GROUP BY row, col
+        """
+        protection_max = con.execute(q).fetchdf()
+    finally:
+        con.close()
+    protection_max = protection_max.rename(columns={"max_wdpa": "ever_protected_after_2000"})
+    protection_max["ever_protected_after_2000"] = (
+        (protection_max["ever_protected_after_2000"] > 0).astype(np.int8)
+    )
     load_time = time.time() - load_start
-    
-    print(f"  Loaded {len(df):,} rows across {df['year'].nunique()} years in {load_time:.1f}s")
-    
-    # Compute max WDPA_b1 per pixel (ever protected after 2000)
-    print("  Computing ever_protected_after_2000 ...")
-    compute_start = time.time()
-    protection_max = df.groupby(['row', 'col'])['WDPA_b1'].max().reset_index()
-    protection_max.columns = ['row', 'col', 'ever_protected_after_2000']
-    
-    # Convert to binary
-    protection_max['ever_protected_after_2000'] = (
-        protection_max['ever_protected_after_2000'] > 0
-    ).astype(np.int8)
-    compute_time = time.time() - compute_start
-    
-    del df
-    gc.collect()
-    
-    print(f"  Computed for {len(protection_max):,} unique pixels in {compute_time:.1f}s")
+    print(f"  Computed for {len(protection_max):,} unique pixels in {load_time:.1f}s")
     return protection_max
 
 
-def get_feature_columns(df: pd.DataFrame) -> list:
-    """Get valid feature columns, excluding identifiers and leakage columns."""
+def load_future_protection_status_pandas(parquet_path: Path, year_min: int, year_max: int) -> pd.DataFrame:
+    """Fallback: compute ever_protected via pandas (loads filtered rows). Use when DuckDB unavailable."""
+    print(f"\nComputing future protection status (years {year_min}-{year_max}) via PANDAS FALLBACK ...")
+    load_start = time.time()
+    cols = ['row', 'col', 'year', 'WDPA_b1']
+    df = pd.read_parquet(
+        parquet_path,
+        filters=[('year', '>=', year_min), ('year', '<=', year_max)],
+        columns=cols,
+    )
+    protection_max = df.groupby(['row', 'col'])['WDPA_b1'].max().reset_index()
+    protection_max.columns = ['row', 'col', 'ever_protected_after_2000']
+    protection_max['ever_protected_after_2000'] = (
+        (protection_max['ever_protected_after_2000'] > 0).astype(np.int8)
+    )
+    del df
+    gc.collect()
+    print(f"  Computed for {len(protection_max):,} unique pixels in {time.time() - load_start:.1f}s (pandas fallback)")
+    return protection_max
+
+
+def get_feature_columns(
+    df: pd.DataFrame,
+    target_col: str = TARGET_COL_NAME,
+    denylist_regex: re.Pattern = FEATURE_DENYLIST_REGEX,
+) -> tuple[list[str], list[str]]:
+    """Build feature list by excluding denylist matches and target. Hard-fail only if a denylist/target column survives in the final list.
+
+    Returns:
+        (final_feature_cols, excluded_cols)
+    """
     numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
-    feature_cols = [
-        col for col in numeric_cols
-        if col.lower() not in {c.lower() for c in EXCLUDE_COLS}
+    excluded_cols = [
+        c for c in numeric_cols
+        if denylist_regex.search(c) or c == target_col
     ]
-    return feature_cols
+    final_feature_cols = [c for c in numeric_cols if c not in set(excluded_cols)]
+    # Sanity: raise only if something forbidden is still in the feature list
+    survivors = [
+        c for c in final_feature_cols
+        if denylist_regex.search(c) or c == target_col
+    ]
+    if survivors:
+        raise ValueError(
+            f"Leakage prevention: these columns must be excluded but appear in final feature list: {survivors}. "
+            "Check denylist regex and target_col."
+        )
+    return final_feature_cols, excluded_cols
+
+
+def leakage_audit(
+    df: pd.DataFrame,
+    feature_cols: list,
+    target_series: pd.Series,
+    top_n: int = 20,
+    max_rows: int = 0,
+    seed: int = 42,
+    use_full_data: bool = False,
+) -> dict:
+    """Leakage audit: top absolute correlations of features with target.
+
+    By default runs on a stratified subsample (cap max_rows) for speed; record
+    audit_sample_size and audit_seed in returned dict. Set use_full_data=True
+    or max_rows=0 with use_full_data=True to run on full data.
+    """
+    n_total = len(df)
+    if use_full_data or max_rows <= 0 or n_total <= max_rows:
+        sample_df = df
+        sample_target = target_series
+        audit_sample_size = n_total
+        audit_seed = None  # full data, no subsample seed
+    else:
+        # Stratified subsample: sample from each class proportionally (cap at max_rows)
+        pos_idx = np.where(target_series.values > 0)[0]
+        neg_idx = np.where(target_series.values == 0)[0]
+        n_pos, n_neg = len(pos_idx), len(neg_idx)
+        rng = np.random.RandomState(seed)
+        n_pos_sample = min(n_pos, max(1, int(max_rows * n_pos / n_total)))
+        n_neg_sample = min(n_neg, max(0, max_rows - n_pos_sample))
+        n_pos_sample = min(n_pos_sample, n_pos)
+        n_neg_sample = min(n_neg_sample, n_neg)
+        idx_pos = rng.choice(pos_idx, size=n_pos_sample, replace=False)
+        idx_neg = rng.choice(neg_idx, size=n_neg_sample, replace=False)
+        idx = np.concatenate([idx_pos, idx_neg])
+        rng.shuffle(idx)
+        sample_df = df.iloc[idx]
+        sample_target = target_series.iloc[idx]
+        audit_sample_size = len(idx)
+        audit_seed = seed
+    X = sample_df[feature_cols]
+    corrs = X.corrwith(sample_target).abs().sort_values(ascending=False)
+    top = corrs.head(top_n)
+    out = {
+        "top_correlations": {str(k): float(v) for k, v in top.items()},
+        "max_correlation": float(corrs.max()) if len(corrs) else 0.0,
+        "audit_sample_size": audit_sample_size,
+        "audit_n_total": n_total,
+    }
+    if audit_seed is not None:
+        out["audit_seed"] = audit_seed
+    return out
+
+
+def spatial_blocked_split(
+    row: np.ndarray,
+    col: np.ndarray,
+    n_tiles_per_axis: int = 8,
+    train_frac: float = 0.7,
+    val_frac: float = 0.15,
+    test_frac: float = 0.15,
+    random_state: int = 42,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Assign each sample to train/val/test by spatial blocks (tile grid on row,col). Fully vectorized. Returns is_train, is_val, is_test."""
+    r_min, r_max = row.min(), row.max()
+    c_min, c_max = col.min(), col.max()
+    r_span = max(1, r_max - r_min + 1)
+    c_span = max(1, c_max - c_min + 1)
+    r_step = max(1, r_span // n_tiles_per_axis)
+    c_step = max(1, c_span // n_tiles_per_axis)
+    row_bin = (row - r_min) // r_step
+    col_bin = (col - c_min) // c_step
+    row_bin = np.clip(row_bin, 0, n_tiles_per_axis - 1)
+    col_bin = np.clip(col_bin, 0, n_tiles_per_axis - 1)
+    tile_id = row_bin.astype(np.int64) * n_tiles_per_axis + col_bin.astype(np.int64)
+    unique_tiles = np.unique(tile_id)
+    rng = np.random.RandomState(random_state)
+    rng.shuffle(unique_tiles)
+    n_tiles = len(unique_tiles)
+    n_train = max(1, int(n_tiles * train_frac))
+    n_val = max(0, int(n_tiles * val_frac))
+    n_test = max(0, n_tiles - n_train - n_val)
+    # Vectorized: map tile_id -> rank in shuffled order, then rank -> split
+    max_tile = int(tile_id.max())
+    tile_id_to_rank = np.full(max_tile + 1, -1, dtype=np.int32)
+    tile_id_to_rank[unique_tiles] = np.arange(n_tiles, dtype=np.int32)
+    split_rank = tile_id_to_rank[tile_id]
+    is_train = (split_rank < n_train)
+    is_val = (split_rank >= n_train) & (split_rank < n_train + n_val)
+    is_test = (split_rank >= n_train + n_val)
+    return is_train, is_val, is_test
+
+
+def compute_dataset_schema_hash(parquet_path: Path, num_sample_row_groups: int = 3) -> str:
+    """Content-stable hash from parquet schema + row count + sampled row-group metadata."""
+    try:
+        import pyarrow.parquet as pq
+        pf = pq.ParquetFile(parquet_path)
+        meta = pf.metadata
+        schema = pf.schema_arrow
+        parts = [
+            "columns=" + ",".join(sorted(f.name for f in schema)),
+            f"total_rows={meta.num_rows}",
+            f"num_row_groups={meta.num_row_groups}",
+        ]
+        for i in range(min(num_sample_row_groups, meta.num_row_groups)):
+            rg = meta.row_group(i)
+            parts.append(f"rg{i}:rows={rg.num_rows}:cols={rg.num_columns}")
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+    except Exception as e:
+        return f"hash_error:{type(e).__name__}"
+
+
+def write_metrics_latex_table(metrics: dict, output_dir: Path, prefix: str = "baseline_rf") -> None:
+    """Write LaTeX table of key metrics (thesis artifact)."""
+    def fmt(v):
+        if isinstance(v, (int, float)):
+            return f"{v:.4f}" if isinstance(v, float) and abs(v) < 100 else f"{v:.2f}"
+        return str(v) if v is not None else ""
+    m2000 = metrics.get("model_performance_2000", {})
+    m_future = metrics.get("future_prediction_2001_2024", {})
+    m_spatial = metrics.get("model_performance_2000_spatial", {})
+    rows = [
+        ("ROC-AUC (2000, random)", fmt(m2000.get("roc_auc"))),
+        ("PR-AUC (2000, random)", fmt(m2000.get("pr_auc"))),
+        ("ROC-AUC (2000, spatial)", fmt(m_spatial.get("roc_auc"))),
+        ("PR-AUC (2000, spatial)", fmt(m_spatial.get("pr_auc"))),
+        ("ROC-AUC (future 2001-2024)", fmt(m_future.get("roc_auc"))),
+        ("PR-AUC (future 2001-2024)", fmt(m_future.get("pr_auc"))),
+        ("Precision @ 1\\% (future)", fmt(m_future.get("precision_at_1pct"))),
+        ("Precision @ 5\\% (future)", fmt(m_future.get("precision_at_5pct"))),
+        ("Precision @ 10\\% (future)", fmt(m_future.get("precision_at_10pct"))),
+    ]
+    latex_lines = [
+        "\\begin{table}[h]", "\\centering", "\\begin{tabular}{lr}", "\\toprule",
+        "Metric & Value \\\\", "\\midrule",
+    ]
+    for label, val in rows:
+        label_tex = label.replace("_", "\\_")
+        latex_lines.append(f"{label_tex} & {val} \\\\")
+    latex_lines.extend(["\\bottomrule", "\\end{tabular}", "\\caption{Baseline RF Suitability Metrics}", "\\label{tab:baseline_rf_metrics}", "\\end{table}"])
+    path = output_dir / f"{prefix}_metrics_table.tex"
+    path.write_text("\n".join(latex_lines) + "\n", encoding="utf-8")
+    print(f"LaTeX table saved: {path}")
+
+
+def create_pr_roc_plots(
+    y_true: np.ndarray,
+    y_proba: np.ndarray,
+    output_dir: Path,
+    prefix: str = "baseline_rf",
+) -> None:
+    """Create PR and ROC curves (thesis artifacts)."""
+    if not MATPLOTLIB_AVAILABLE:
+        print("Skipping PR/ROC plots (matplotlib not available)")
+        return
+    figsize = (8, 6)
+    precision, recall, _ = precision_recall_curve(y_true, y_proba)
+    pr_auc = average_precision_score(y_true, y_proba)
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.plot(recall, precision, lw=2, label=f"AP = {pr_auc:.4f}")
+    ax.axhline(y=y_true.mean(), color="r", linestyle="--", lw=2, label=f"Baseline = {y_true.mean():.4f}")
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.set_title(f"{prefix} Precision-Recall Curve")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    plt.tight_layout()
+    for ext in ("png", "pdf"):
+        p = output_dir / f"{prefix}_pr_curve.{ext}"
+        plt.savefig(p, dpi=300 if ext == "png" else 150, bbox_inches="tight")
+        print(f"Saved {p}")
+    plt.close()
+    fpr, tpr, _ = roc_curve(y_true, y_proba)
+    roc_auc = roc_auc_score(y_true, y_proba)
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.plot(fpr, tpr, lw=2, label=f"AUC = {roc_auc:.4f}")
+    ax.plot([0, 1], [0, 1], "k--", lw=1, label="Random")
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title(f"{prefix} ROC Curve")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    plt.tight_layout()
+    for ext in ("png", "pdf"):
+        p = output_dir / f"{prefix}_roc_curve.{ext}"
+        plt.savefig(p, dpi=300 if ext == "png" else 150, bbox_inches="tight")
+        print(f"Saved {p}")
+    plt.close()
+
+
+def create_suitability_map(outcome_df: pd.DataFrame, output_dir: Path, prefix: str = "baseline_rf") -> None:
+    """Simple suitability map: hexbin of x,y colored by score (thesis artifact)."""
+    if not MATPLOTLIB_AVAILABLE:
+        print("Skipping suitability map (matplotlib not available)")
+        return
+    if "x" not in outcome_df.columns or "y" not in outcome_df.columns:
+        print("Skipping suitability map (x,y not in outcome)")
+        return
+    df = outcome_df
+    if len(df) > 500_000:
+        df = df.sample(n=500_000, random_state=RANDOM_STATE)
+    x, y, score = df["x"].values, df["y"].values, df["score"].values
+    fig, ax = plt.subplots(figsize=(12, 10))
+    hb = ax.hexbin(x, y, C=score, reduce_C_function=np.mean, gridsize=80, cmap="plasma", mincnt=1)
+    plt.colorbar(hb, ax=ax, label="Suitability score")
+    ax.set_xlabel("Easting (x, projected)")
+    ax.set_ylabel("Northing (y, projected)")
+    ax.set_title(f"{prefix} Suitability Map (hexbin)")
+    ax.set_aspect("equal", adjustable="box")
+    plt.tight_layout()
+    for ext in ("png", "pdf"):
+        p = output_dir / f"{prefix}_suitability_map.{ext}"
+        plt.savefig(p, dpi=150, bbox_inches="tight")
+        print(f"Saved {p}")
+    plt.close()
 
 
 # =============================================================================
@@ -324,19 +640,21 @@ def main() -> None:
     
     print(f"Total pixels in 2000: {len(df_2000_clean):,}")
     
-    # Get feature columns
-    feature_cols = get_feature_columns(df_2000_clean)
-    excluded_cols = sorted(EXCLUDE_COLS & set(df_2000_clean.columns))
-    
-    print(f"\nUsing {len(feature_cols)} features")
-    print(f"Excluded columns ({len(excluded_cols)}): {excluded_cols}")
-    print(f"\nFeature list:")
+    # Feature selection: exclude denylist matches and target; hard-fail only if any excluded survives in final list
+    feature_cols, excluded_cols = get_feature_columns(df_2000_clean, target_col=target_col)
+    print(f"\nExcluded columns ({len(excluded_cols)}): {sorted(excluded_cols)}")
+    print(f"Final feature list ({len(feature_cols)}):")
     for i, feat in enumerate(sorted(feature_cols), 1):
         print(f"  {i:3d}. {feat}")
     
-    # Target distribution
+    # Target distribution and hard guardrails
     n_protected = (df_2000_clean[target_col] > 0).sum()
     n_unprotected = (df_2000_clean[target_col] == 0).sum()
+    if n_protected == 0 or n_unprotected == 0:
+        raise SystemExit(
+            "Abort: year-2000 data has n_protected=0 or n_unprotected=0. "
+            "Likely wrong or risk-set filtered input. Check merged_panel_final.parquet (year=2000)."
+        )
     pct_protected = n_protected / len(df_2000_clean) * 100
     
     print(f"\n" + "-" * 40)
@@ -345,16 +663,40 @@ def main() -> None:
     print(f"  Unprotected: {n_unprotected:>12,}  ({100 - pct_protected:.2f}%)")
     print("-" * 40)
     
-    # Log data statistics to wandb
+    # Leakage audit: stratified subsample (configurable cap) or full data via flag
+    target_series = df_2000_clean[target_col]
+    audit = leakage_audit(
+        df_2000_clean,
+        feature_cols,
+        target_series,
+        top_n=20,
+        max_rows=LEAKAGE_AUDIT_MAX_ROWS,
+        seed=LEAKAGE_AUDIT_SEED,
+        use_full_data=LEAKAGE_AUDIT_USE_FULL_DATA,
+    )
+    print("\nLeakage audit (top absolute correlations with target):")
+    print(f"  Sample size: {audit.get('audit_sample_size', len(df_2000_clean)):,} of {audit.get('audit_n_total', len(df_2000_clean)):,}")
+    if audit.get("audit_seed") is not None:
+        print(f"  Audit seed: {audit['audit_seed']}")
+    print(f"  Max correlation: {audit['max_correlation']:.4f}")
+    for fname, corr in list(audit["top_correlations"].items())[:10]:
+        print(f"  {fname}: {corr:.4f}")
+    
+    # Log data statistics: counts + digests only (full lists stay in metrics JSON)
     wandb.log({
         "data/n_features": len(feature_cols),
+        "data/n_excluded_cols": len(excluded_cols),
+        "data/excluded_cols_digest": list_digest(excluded_cols),
+        "data/n_final_feature_cols": len(feature_cols),
+        "data/final_feature_cols_digest": list_digest(feature_cols),
         "data/n_total_pixels_2000": int(len(df_2000_clean)),
         "data/n_protected_2000": int(n_protected),
         "data/n_unprotected_2000": int(n_unprotected),
         "data/pct_protected_2000": float(pct_protected),
         "data/class_ratio_2000": float(n_unprotected / max(n_protected, 1)),
-        "data/features": feature_cols,  # Log feature names
-        "data/excluded_columns": excluded_cols,
+        "data/leakage_audit_max_correlation": float(audit["max_correlation"]),
+        "data/leakage_audit_sample_size": int(audit.get("audit_sample_size", 0)),
+        "data/leakage_audit_seed": audit.get("audit_seed"),
     })
     
     # -------------------------------------------------------------------------
@@ -512,6 +854,47 @@ def main() -> None:
     print(feature_importance.head(20).to_string(index=False))
     
     # -------------------------------------------------------------------------
+    # Step 4b: Spatial (blocked) split — train/test (val held out, not used for model selection)
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 4b: SPATIAL BLOCKED SPLIT — TRAIN / TEST (VAL HELD OUT)")
+    print("=" * 70)
+    row_arr = pixel_ids['row'].values
+    col_arr = pixel_ids['col'].values
+    split_start = time.time()
+    is_train_sp, is_val_sp, is_test_sp = spatial_blocked_split(
+        row_arr, col_arr,
+        n_tiles_per_axis=8,
+        train_frac=0.7, val_frac=0.15, test_frac=0.15,
+        random_state=RANDOM_STATE,
+    )
+    split_elapsed = time.time() - split_start
+    print(f"Spatial split step: {split_elapsed:.2f}s")
+    wandb.log({"timing/spatial_split_seconds": split_elapsed})
+    X_train_sp = X.iloc[is_train_sp][feature_cols]
+    y_train_sp = y[is_train_sp]
+    X_test_sp = X.iloc[is_test_sp][feature_cols]
+    y_test_sp = y[is_test_sp]
+    n_val_held = is_val_sp.sum()
+    print(f"Spatial train: {len(X_train_sp):,}  test: {len(X_test_sp):,}  (val held out: {n_val_held:,}, not used)")
+    model_spatial = RandomForestClassifier(**RF_PARAMS)
+    model_spatial.fit(X_train_sp, y_train_sp)
+    y_proba_sp = model_spatial.predict_proba(X_test_sp)[:, 1]
+    roc_auc_spatial = float(roc_auc_score(y_test_sp, y_proba_sp))
+    pr_auc_spatial = float(average_precision_score(y_test_sp, y_proba_sp))
+    cm_sp = confusion_matrix(y_test_sp, model_spatial.predict(X_test_sp))
+    tn_sp, fp_sp, fn_sp, tp_sp = cm_sp.ravel()
+    print(f"\nSpatial test — ROC-AUC: {roc_auc_spatial:.4f}  PR-AUC: {pr_auc_spatial:.4f}")
+    wandb.log({
+        "metrics_2000_spatial/roc_auc": roc_auc_spatial,
+        "metrics_2000_spatial/pr_auc": pr_auc_spatial,
+        "metrics_2000_spatial/true_negatives": int(tn_sp),
+        "metrics_2000_spatial/false_positives": int(fp_sp),
+        "metrics_2000_spatial/false_negatives": int(fn_sp),
+        "metrics_2000_spatial/true_positives": int(tp_sp),
+    })
+    
+    # -------------------------------------------------------------------------
     # Step 5: Score all unprotected 2000 pixels
     # -------------------------------------------------------------------------
     print("\n" + "=" * 70)
@@ -568,8 +951,21 @@ def main() -> None:
     print("STEP 6: BUILD 2000→2024 OUTCOME")
     print("=" * 70)
     
-    # Load future protection status
-    future_protection = load_future_protection_status(input_path, years_after=range(2001, 2025))
+    # Future protection: DuckDB (preferred) or pandas fallback; record backend in metrics
+    future_protection_backend = "duckdb"
+    if duckdb is not None:
+        try:
+            future_protection = load_future_protection_status_duckdb(
+                input_path, 2001, 2024, num_threads=get_n_jobs()
+            )
+        except Exception as e:
+            print(f"  DuckDB failed ({e}); falling back to pandas.")
+            future_protection_backend = "pandas_fallback"
+            future_protection = load_future_protection_status_pandas(input_path, 2001, 2024)
+    else:
+        print("  DuckDB not available; using pandas fallback.")
+        future_protection_backend = "pandas_fallback"
+        future_protection = load_future_protection_status_pandas(input_path, 2001, 2024)
     
     # Join with suitability scores
     print("\nJoining scores with future protection status ...")
@@ -610,6 +1006,18 @@ def main() -> None:
     y_future = outcome_df['ever_protected_after_2000'].values
     y_score = outcome_df['score'].values
     
+    # Tie diagnostics for suitability scores (deterministic precision@k)
+    tie_diag = tie_diagnostics(y_score, name="suitability")
+    print("\nTie diagnostics (suitability scores):")
+    for k, v in tie_diag.items():
+        print(f"  {k}: {v}")
+    
+    # Deterministic tie-breaking for precision@k: secondary sort by (row, col)
+    r = outcome_df['row'].values.astype(np.int64)
+    c = outcome_df['col'].values.astype(np.int64)
+    col_max = c.max()
+    tie_break_order = r * (col_max + 1) + c
+    
     # ROC-AUC and PR-AUC
     future_roc_auc = roc_auc_score(y_future, y_score)
     future_pr_auc = average_precision_score(y_future, y_score)
@@ -618,14 +1026,14 @@ def main() -> None:
     print(f"  ROC-AUC: {future_roc_auc:.4f}")
     print(f"  PR-AUC:  {future_pr_auc:.4f}")
     
-    # Precision at top k%
-    print("\nPrecision @ Top-K:")
+    # Precision at top k% (deterministic under ties)
+    print("\nPrecision @ Top-K (tie-breaking: row, col):")
     print("(Among top k% highest suitability scores, what fraction became protected?)")
     print()
     
     prec_at_k = {}
     for k in [1, 5, 10]:
-        prec = compute_precision_at_k(y_future, y_score, k)
+        prec = compute_precision_at_k(y_future, y_score, k, tie_break_order=tie_break_order)
         prec_at_k[k] = prec
         n_top_k = max(1, int(len(y_future) * k / 100))
         n_protected_in_top_k = int(n_top_k * prec)
@@ -643,7 +1051,7 @@ def main() -> None:
         lift = prec / baseline_rate if baseline_rate > 0 else 0
         print(f"  Top {k:>2}%: {lift:.2f}x")
     
-    # Log future prediction metrics
+    # Log future prediction metrics and tie diagnostics
     wandb.log({
         "metrics_future/roc_auc": float(future_roc_auc),
         "metrics_future/pr_auc": float(future_pr_auc),
@@ -654,6 +1062,7 @@ def main() -> None:
         "metrics_future/lift_at_1pct": float(prec_at_k[1] / baseline_rate) if baseline_rate > 0 else 0,
         "metrics_future/lift_at_5pct": float(prec_at_k[5] / baseline_rate) if baseline_rate > 0 else 0,
         "metrics_future/lift_at_10pct": float(prec_at_k[10] / baseline_rate) if baseline_rate > 0 else 0,
+        **tie_diag,
     })
     
     # -------------------------------------------------------------------------
@@ -668,7 +1077,28 @@ def main() -> None:
     outcome_df.to_parquet(outcomes_path, index=False)
     print(f"\nScored outcomes saved to: {outcomes_path}")
     
-    # Compile metrics
+    # Dataset/schema hashes and config snapshot (thesis artifacts)
+    dataset_hash = compute_dataset_schema_hash(input_path)
+    config_snapshot = {
+        "random_state": RANDOM_STATE,
+        "test_size": TEST_SIZE,
+        "val_size": VAL_SIZE,
+        "feature_denylist_regex": FEATURE_DENYLIST_REGEX.pattern,
+        "rf_params": {k: (int(v) if isinstance(v, (np.integer, np.int64)) else float(v) if isinstance(v, (np.floating, np.float64)) else v) for k, v in RF_PARAMS.items()},
+    }
+    
+    # Fallback flags (record loudly in metrics)
+    metrics_fallbacks = {
+        "future_protection_backend": future_protection_backend,
+        "duckdb_available": duckdb is not None,
+        "matplotlib_available": MATPLOTLIB_AVAILABLE,
+    }
+    if future_protection_backend != "duckdb":
+        print(f"\n  WARNING: future_protection_backend = {future_protection_backend} (recorded in metrics)")
+    if not MATPLOTLIB_AVAILABLE:
+        print("  WARNING: matplotlib not available — PR/ROC/suitability map skipped (recorded in metrics)")
+    
+    # Compile metrics (random + spatial + future + tie diagnostics + hashes + excluded/final features)
     metrics = {
         "metadata": {
             "timestamp": timestamp,
@@ -678,17 +1108,35 @@ def main() -> None:
             "n_features": len(feature_cols),
             "n_estimators": RF_PARAMS['n_estimators'],
         },
+        "dataset": {
+            "schema_hash": dataset_hash,
+            "input_path": str(input_path),
+        },
+        "config_snapshot": config_snapshot,
+        "fallbacks": metrics_fallbacks,
+        "feature_selection": {
+            "excluded_cols": excluded_cols,
+            "final_feature_cols": feature_cols,
+        },
         "year_2000_data": {
             "n_total_pixels": n_protected + n_unprotected,
             "n_protected": int(n_protected),
             "n_unprotected": int(n_unprotected),
             "pct_protected": float(pct_protected),
         },
+        "leakage_audit": audit,
         "model_performance_2000": {
             "roc_auc": float(roc_auc),
             "pr_auc": float(pr_auc),
             "confusion_matrix": {
                 "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)
+            },
+        },
+        "model_performance_2000_spatial": {
+            "roc_auc": roc_auc_spatial,
+            "pr_auc": pr_auc_spatial,
+            "confusion_matrix": {
+                "tn": int(tn_sp), "fp": int(fp_sp), "fn": int(fn_sp), "tp": int(tp_sp)
             },
         },
         "future_prediction_2001_2024": {
@@ -705,16 +1153,21 @@ def main() -> None:
             "lift_at_5pct": float(prec_at_k[5] / baseline_rate) if baseline_rate > 0 else 0,
             "lift_at_10pct": float(prec_at_k[10] / baseline_rate) if baseline_rate > 0 else 0,
         },
+        "tie_diagnostics": tie_diag,
         "top_features": feature_importance.head(20).to_dict('records'),
     }
     
     # Save metrics
     metrics_path = output_dir / "baseline_rf_metrics.json"
     with open(metrics_path, 'w') as f:
-        # Convert NumPy types to native Python types for JSON serialization
         metrics_serializable = convert_numpy_types(metrics)
         json.dump(metrics_serializable, f, indent=2)
     print(f"Metrics saved to: {metrics_path}")
+    
+    # Thesis artifacts: LaTeX table, PR/ROC plots, suitability map
+    write_metrics_latex_table(metrics_serializable, output_dir, prefix="baseline_rf")
+    create_pr_roc_plots(y_future, y_score, output_dir, prefix="baseline_rf")
+    create_suitability_map(outcome_df, output_dir, prefix="baseline_rf")
     
     # -------------------------------------------------------------------------
     # Summary
@@ -726,15 +1179,21 @@ def main() -> None:
     print("=" * 70)
     print(f"Model:                       Random Forest ({RF_PARAMS['n_estimators']} estimators)")
     print(f"Features used:               {len(feature_cols)}")
-    print(f"\n2000 Classification (protected vs unprotected):")
+    print(f"\n2000 Classification — random split:")
     print(f"  ROC-AUC:                   {roc_auc:.4f}")
     print(f"  PR-AUC:                    {pr_auc:.4f}")
+    print(f"\n2000 Classification — spatial split:")
+    print(f"  ROC-AUC:                   {roc_auc_spatial:.4f}")
+    print(f"  PR-AUC:                    {pr_auc_spatial:.4f}")
     print(f"\nFuture Protection Prediction (unprotected 2000 → protected by 2024):")
     print(f"  ROC-AUC:                   {future_roc_auc:.4f}")
     print(f"  PR-AUC:                    {future_pr_auc:.4f}")
-    print(f"  Precision @ top 1%:        {prec_at_k[1]:.4f} ({prec_at_k[1]/baseline_rate:.1f}x lift)")
-    print(f"  Precision @ top 5%:        {prec_at_k[5]:.4f} ({prec_at_k[5]/baseline_rate:.1f}x lift)")
-    print(f"  Precision @ top 10%:       {prec_at_k[10]:.4f} ({prec_at_k[10]/baseline_rate:.1f}x lift)")
+    if baseline_rate > 0:
+        print(f"  Precision @ top 1%:        {prec_at_k[1]:.4f} ({prec_at_k[1]/baseline_rate:.1f}x lift)")
+        print(f"  Precision @ top 5%:        {prec_at_k[5]:.4f} ({prec_at_k[5]/baseline_rate:.1f}x lift)")
+        print(f"  Precision @ top 10%:       {prec_at_k[10]:.4f} ({prec_at_k[10]/baseline_rate:.1f}x lift)")
+    else:
+        print("  Precision @ top 1/5/10%:    N/A (no positives)")
     print(f"\nTotal time: {total_time:.1f}s ({total_time/60:.1f} min)")
     print("=" * 70)
     print("Done.")
