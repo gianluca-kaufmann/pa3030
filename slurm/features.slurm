@@ -41,13 +41,13 @@ echo "Starting feature_engineering script..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/merging/feature_engineering" ] || {
+[ -f "scripts/3_merging/feature_engineering" ] || {
   echo "ERROR: feature_engineering not found"
-  echo "NOTE: feature_engineering script is in merging/ directory"
+  echo "NOTE: feature_engineering script is in 3_merging/ directory"
   find scripts -maxdepth 4 -type f -name "feature_engineering"
   exit 1
 }
 # Run the script
-python "scripts/merging/feature_engineering"
+python "scripts/3_merging/feature_engineering"
 
 echo "feature_engineering script finished."

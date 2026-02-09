@@ -41,13 +41,13 @@ echo "Starting compute_panel_statistics script..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/merging/consistency_checks/compute_panel_statistics" ] || {
+[ -f "scripts/3_merging/consistency_checks/compute_panel_statistics" ] || {
   echo "ERROR: compute_panel_statistics not found"
-  echo "NOTE: compute_panel_statistics script is in merging/consistency_checks/ directory"
+  echo "NOTE: compute_panel_statistics script is in 3_merging/consistency_checks/ directory"
   find scripts -maxdepth 4 -type f -name "compute_panel_statistics"
   exit 1
 }
 # Run the script
-python "scripts/merging/consistency_checks/compute_panel_statistics"
+python "scripts/3_merging/consistency_checks/compute_panel_statistics"
 
 echo "compute_panel_statistics script finished."
