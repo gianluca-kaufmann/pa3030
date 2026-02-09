@@ -20,6 +20,13 @@ Processing order (per year):
            using the same logic as `dist_wdpa`. These are computed once on a reference footprint
            (default: most recent year) and merged into all years by (row, col). The original binary
            columns are dropped and replaced with distance columns: `dist_oil_gas`, `dist_powerplant`, `dist_road`.
+       - Static smoothed features (computed once on reference footprint, then merged):
+         - For `elevation_b1` and `slope_b1`, compute uniform-filter smoothing over window sizes 4,
+           16, and 64 once on the reference footprint (same logic as the time-varying smoothed
+           layers). The resulting columns (`elevation_b1_smooth4`, `elevation_b1_smooth16`,
+           `elevation_b1_smooth64`, `slope_b1_smooth4`, `slope_b1_smooth16`, `slope_b1_smooth64`)
+           are merged into all years by (row, col). Raw `elevation_b1` and `slope_b1` are kept
+           unchanged. NaN counts are logged after merge as a safety check.
        - Smoothed (moving-average) features:
          - For selected variables (e.g. `NDVI_b1`, `GPW_b1`, `HNTL_b1`, `gdp_b1`, ...),
            compute uniform-filter smoothing over window sizes 16 and 64, creating new columns like
@@ -69,6 +76,8 @@ STATIC_DISTANCE_MAPPING = {
     'oil_gas_b1': 'dist_oil_gas',
     'powerplants_b1': 'dist_powerplant'
 }
+STATIC_SMOOTH_VARIABLES = ['elevation_b1', 'slope_b1']
+STATIC_SMOOTH_SIZES = [4, 16, 64]
 
 
 def reconstruct_grid(df: pd.DataFrame, value_col: str) -> Tuple[np.ndarray, int, int, int, int]:
@@ -157,6 +166,44 @@ def merge_static_distances(df: pd.DataFrame, static_lookup: pd.DataFrame) -> pd.
     return df
 
 
+def compute_static_smooth_features_once(df_ref: pd.DataFrame) -> pd.DataFrame:
+    """Compute smoothed elevation/slope once on a reference footprint.
+
+    Returns a lookup DataFrame with columns: row, col, and *_smooth{4,16,64}.
+    This is computed once and merged into all years by (row, col).
+    """
+    logger.info("  Computing static smooth features on reference footprint...")
+
+    lookup_df = df_ref[['row', 'col']].drop_duplicates().copy()
+
+    for variable in STATIC_SMOOTH_VARIABLES:
+        if variable not in df_ref.columns:
+            logger.warning(f"    Column {variable} not found, skipping...")
+            continue
+        for window_size in STATIC_SMOOTH_SIZES:
+            col_name = f"{variable}_smooth{window_size}"
+            logger.info(f"    Processing {col_name}...")
+            lookup_df[col_name] = compute_smooth_feature(df_ref, variable, window_size).values
+            gc.collect()
+
+    return lookup_df
+
+
+def merge_static_smooth(df: pd.DataFrame, smooth_lookup: pd.DataFrame) -> pd.DataFrame:
+    """Merge precomputed static smooth features and log NaN counts as safety check."""
+    df = df.merge(smooth_lookup, on=['row', 'col'], how='left')
+
+    smooth_cols = [c for c in smooth_lookup.columns if c not in ('row', 'col')]
+    for col in smooth_cols:
+        n_nan = df[col].isna().sum()
+        if n_nan > 0:
+            logger.warning(f"    {col}: {n_nan:,} NaN values after merge")
+        else:
+            logger.info(f"    {col}: 0 NaN values after merge")
+
+    return df
+
+
 def compute_smooth_feature(df: pd.DataFrame, variable: str, window_size: int) -> pd.Series:
     """Compute smoothed feature with given window size."""
     grid, min_row, max_row, min_col, max_col = reconstruct_grid(df, variable)
@@ -230,7 +277,7 @@ def compute_lag_feature(input_path: Path, year: int) -> pd.DataFrame:
     return result
 
 
-def process_year(input_path: Path, year: int, temp_dir: Path, is_first_year: bool, static_lookup: pd.DataFrame) -> tuple[Path | None, dict]:
+def process_year(input_path: Path, year: int, temp_dir: Path, is_first_year: bool, static_lookup: pd.DataFrame, smooth_lookup: pd.DataFrame) -> tuple[Path | None, dict]:
     """Process a single year and return temp file path + metrics."""
     start_time = time.time()
     logger.info(f"\nProcessing year {year}...")
@@ -260,6 +307,7 @@ def process_year(input_path: Path, year: int, temp_dir: Path, is_first_year: boo
     logger.info(f"  Computing spatial features on full grid ({n_rows_initial:,} rows)...")
     df_year = compute_distance_features(df_year)
     df_year = merge_static_distances(df_year, static_lookup)
+    df_year = merge_static_smooth(df_year, smooth_lookup)
     df_year = compute_all_smooth_features(df_year)
     
     # Step 3: Apply Risk Set filter (keep only WDPA_prev == 0)
@@ -349,6 +397,8 @@ def main() -> None:
             "smooth_variables": SMOOTH_VARIABLES,
             "smooth_sizes": SMOOTH_SIZES,
             "static_distance_mapping": STATIC_DISTANCE_MAPPING,
+            "static_smooth_variables": STATIC_SMOOTH_VARIABLES,
+            "static_smooth_sizes": STATIC_SMOOTH_SIZES,
         }
     )
     
@@ -412,8 +462,8 @@ def main() -> None:
     
     logger.info(f"Using year {ref_year} as reference footprint for static distances")
     
-    # Load reference year data (only columns needed for static distance computation)
-    static_cols = ['row', 'col'] + list(STATIC_DISTANCE_MAPPING.keys())
+    # Load reference year data (columns needed for static distance + static smooth computation)
+    static_cols = ['row', 'col'] + list(STATIC_DISTANCE_MAPPING.keys()) + STATIC_SMOOTH_VARIABLES
     df_ref = pd.read_parquet(
         input_path, 
         columns=static_cols,
@@ -435,6 +485,11 @@ def main() -> None:
     # Compute static distances once
     static_lookup = compute_static_distance_features_once(df_ref)
     logger.info(f"  Computed static distances for {len(static_lookup):,} pixels")
+
+    # Compute static smooth features once
+    smooth_lookup = compute_static_smooth_features_once(df_ref)
+    logger.info(f"  Computed static smooth features for {len(smooth_lookup):,} pixels")
+
     del df_ref
     gc.collect()
     
@@ -446,7 +501,7 @@ def main() -> None:
     for i, year in enumerate(years):
         try:
             is_first_year = (i == 0)
-            temp_file, metrics = process_year(input_path, year, temp_dir, is_first_year, static_lookup)
+            temp_file, metrics = process_year(input_path, year, temp_dir, is_first_year, static_lookup, smooth_lookup)
             if temp_file is not None:
                 temp_files.append(temp_file)
                 wandb.log(metrics)
@@ -463,8 +518,8 @@ def main() -> None:
             wandb.finish(exit_code=1)
             raise
     
-    # Clean up static lookup
-    del static_lookup
+    # Clean up static lookups
+    del static_lookup, smooth_lookup
     gc.collect()
     
     # Combine all years using streaming
