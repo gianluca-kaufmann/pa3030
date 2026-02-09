@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=model1_preprocessing
+#SBATCH --job-name=model1_splits
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/model1_preprocessing_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/model1_preprocessing_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/model1_splits_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/model1_splits_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -33,21 +33,21 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the model1_preprocessing script
+# Run the model1_splits script
 #------------------------------------------------------------------------------
-echo "Starting model1_preprocessing script..."
+echo "Starting model1_splits script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/ml_preprocessing/model1_preprocessing" ] || {
-  echo "ERROR: model1_preprocessing not found"
-  echo "NOTE: model1_preprocessing script is in ML/ml_preprocessing/ directory"
-  find scripts -maxdepth 4 -type f -name "model1_preprocessing"
+[ -f "scripts/model1/splits/model1_splits" ] || {
+  echo "ERROR: model1_splits not found"
+  echo "NOTE: model1_splits script is in model1/splits/ directory"
+  find scripts -maxdepth 4 -type f -name "model1_splits"
   exit 1
 }
 # Run the script
-python "scripts/ML/ml_preprocessing/model1_preprocessing"
+python "scripts/model1/splits/model1_splits"
 
-echo "model1_preprocessing script finished."
+echo "model1_splits script finished."

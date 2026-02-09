@@ -41,13 +41,13 @@ echo "Starting model1_LGBM script..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/ML/training/model1_LGBM" ] || {
+[ -f "scripts/model1/training/model1_LGBM" ] || {
   echo "ERROR: model1_LGBM not found"
-  echo "NOTE: model1_LGBM script is in ML/training/ directory"
+  echo "NOTE: model1_LGBM script is in model1/training/ directory"
   find scripts -maxdepth 4 -type f -name "model1_LGBM"
   exit 1
 }
 # Run the script
-srun --cpu-bind=cores --distribution=block:block python -u "scripts/ML/training/model1_LGBM"
+srun --cpu-bind=cores --distribution=block:block python -u "scripts/model1/training/model1_LGBM"
 
 echo "model1_LGBM script finished."
