@@ -41,7 +41,7 @@ echo "Starting inspect_panel script..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/3_merging/consistency checks/inspect_panel.py" ] || {
+[ -f "scripts/3_merging/consistency checks/inspect_panel" ] || {
   echo "ERROR: inspect_panel not found"
   echo "NOTE: inspect_panel script is in 3_merging/consistency checks/ directory"
   find scripts -maxdepth 4 -type f -name "inspect_panel"
