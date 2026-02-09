@@ -52,6 +52,12 @@ Yearly datasets (year in filename, time-varying):
 Outputs:
 - Parquet panel: ``outputs/Results/merged_panel_<start>_<end>.parquet`` storing coordinates plus all bands (backbone=1 only).
 
+Policy variables (optional, country-year, lagged):
+  If ``data/ready/policy/`` contains the outputs of ``policy_preprocessing`` (country raster,
+  mapping JSON, and policy table), the merge automatically appends four lagged (t-1)
+  country-year columns to every pixel: ``wgi_ge``, ``wgi_rl``, ``vdem_ldi``,
+  ``dpi_exec_ideology``.  If these files are absent, the merge runs as before.
+
 Key choices:
 - Portable path resolution from ``Path(__file__)`` with automatic ``$SCRATCH`` override for HPC runs.
 - Backbone-based masking: only pixels with backbone=1 are included in the Parquet output.
@@ -84,6 +90,7 @@ Short overview of what the script does:
    - Immediately free memory for arrays and Arrow tables.
 """
 
+import json
 import re
 import sys
 import time
@@ -93,6 +100,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
+import pandas as pd
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.warp import reproject
@@ -130,6 +138,18 @@ OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
 # YEARS will be determined dynamically from available data
 TILE_SIZE = 512
+
+# --- Policy variables (country-year, lagged) ---
+# These files are produced by scripts/preprocessing/policy_preprocessing.
+# If they do not exist, the script runs as before (graceful degradation).
+# Use DATA_ROOT / "ready" / ... so the path resolves identically in both
+# local  (PROJECT_ROOT/data/ready/policy) and
+# cluster ($SCRATCH/data/ready/policy) environments.
+POLICY_DIR = DATA_ROOT / "ready" / "policy"
+COUNTRY_RASTER_PATH = POLICY_DIR / "country_iso3.tif"
+COUNTRY_MAPPING_PATH = POLICY_DIR / "country_iso3_mapping.json"
+POLICY_TABLE_PATH = POLICY_DIR / "policy_table.parquet"
+POLICY_COLS = ["wgi_ge", "wgi_rl", "vdem_ldi", "dpi_exec_ideology"]
 
 
 def log_progress(message: str, start_time: Optional[float] = None):
@@ -622,6 +642,47 @@ def main():
     
     ref_src.close()  # Close the reference file
     
+    # --- Load policy variables (country-year, lagged) ---
+    policy_enabled = (
+        COUNTRY_RASTER_PATH.exists()
+        and COUNTRY_MAPPING_PATH.exists()
+        and POLICY_TABLE_PATH.exists()
+    )
+    country_mask_full = None
+    policy_lookup: Dict[Tuple[int, int], list] = {}
+
+    if policy_enabled:
+        log_progress("Loading policy variables (country-year, lagged)...")
+        # 1. Country raster — uint8, same grid as backbone
+        with rasterio.open(COUNTRY_RASTER_PATH) as csrc:
+            country_mask_full = csrc.read(1)
+        log_progress(f"  Country raster loaded: {country_mask_full.shape}")
+
+        # 2. Country-id -> ISO3 mapping
+        with open(COUNTRY_MAPPING_PATH) as f:
+            country_id_to_iso3 = {int(k): v for k, v in json.load(f).items()}
+        iso3_to_id = {v: k for k, v in country_id_to_iso3.items()}
+
+        # 3. Policy table -> fast (country_id, year) lookup
+        policy_df = pd.read_parquet(POLICY_TABLE_PATH)
+        policy_df["_cid"] = policy_df["iso3"].map(iso3_to_id)
+        for _, row in policy_df.iterrows():
+            cid = row["_cid"]
+            if pd.notna(cid):
+                vals = [
+                    float(row[c]) if pd.notna(row[c]) else float("nan")
+                    for c in POLICY_COLS
+                ]
+                policy_lookup[(int(cid), int(row["year"]))] = vals
+
+        n_countries = len(country_id_to_iso3)
+        n_entries = len(policy_lookup)
+        log_progress(f"  Policy lookup: {n_entries} entries for {n_countries} countries")
+        log_progress(f"  Policy columns: {POLICY_COLS}")
+    else:
+        log_progress("Policy files not found — skipping policy variables.")
+        log_progress(f"  Checked: {POLICY_DIR}")
+
     # Build catalog and detect year range
     catalog = discover_raster_catalog()
     YEARS = detect_year_range(catalog)
@@ -644,6 +705,8 @@ def main():
             "scratch_mode": "SCRATCH" in os.environ,
             "int16_auto_unscaling_enabled": True,
             "int16_scaled_datasets": list(INT16_SCALED_DATASETS),
+            "policy_enabled": policy_enabled,
+            "policy_columns": POLICY_COLS if policy_enabled else [],
         }
     )
     print("Weights & Biases connected successfully!")
@@ -780,6 +843,10 @@ def main():
     # Combine band names: static first, then yearly (ensures consistent column order)
     all_band_names = static_band_names + yearly_band_names
     dataset_band_counts = {**static_band_counts, **yearly_band_counts}
+
+    # Append policy columns (if enabled)
+    if policy_enabled:
+        all_band_names = all_band_names + POLICY_COLS
     
     if not all_band_names:
         print("ERROR: Failed to determine band structure.")
@@ -788,6 +855,8 @@ def main():
     log_progress(f"\nBand structure summary:")
     log_progress(f"  Static bands: {len(static_band_names)}")
     log_progress(f"  Yearly bands: {len(yearly_band_names)}")
+    if policy_enabled:
+        log_progress(f"  Policy bands: {len(POLICY_COLS)}")
     log_progress(f"  Total bands: {len(all_band_names)}")
     log_progress(f"  All band names: {all_band_names}")
     
@@ -879,6 +948,30 @@ def main():
                 
                 # Stack into single band array
                 band_stack = np.concatenate([a if a.ndim == 3 else a[np.newaxis, ...] for a in all_window_arrays], axis=0)
+
+                # --- Append policy bands (country-year, lagged) ---
+                if policy_enabled and country_mask_full is not None:
+                    country_window = country_mask_full[
+                        int(w.row_off):int(w.row_off + w.height),
+                        int(w.col_off):int(w.col_off + w.width),
+                    ]
+                    lag_year = year - 1  # 1-year lag to avoid leakage
+                    policy_bands = np.full(
+                        (len(POLICY_COLS), window_height, window_width),
+                        np.nan, dtype=np.float32,
+                    )
+                    for cid in np.unique(country_window):
+                        if cid == 0:
+                            continue
+                        key = (int(cid), lag_year)
+                        if key in policy_lookup:
+                            vals = policy_lookup[key]
+                            mask = country_window == cid
+                            for i, v in enumerate(vals):
+                                if not np.isnan(v):
+                                    policy_bands[i][mask] = v
+                    band_stack = np.concatenate([band_stack, policy_bands], axis=0)
+                    del policy_bands
                 
                 # Safety check: ensure band count matches expected
                 if band_stack.shape[0] != len(current_band_names):
