@@ -135,7 +135,6 @@ $SCRATCH/data/
 │   │   ├── WDPA/
 │   │   ├── WorldClim/
 │   │   ├── elevation/
-│   │   ├── slope/
 │   │   ├── NDVI/
 │   │   ├── GPW/
 │   │   ├── HNTL/
