@@ -3,7 +3,7 @@
 Merge South America 1 km rasters into a yearly panel with streaming I/O and low memory use.
 
 Summary:
-- Reads per-dataset rasters from ``data`` (or ``$SCRATCH/data/ml/ready`` on cluster for storage-optimized inputs).
+- Reads per-dataset rasters from ``data`` (or ``$SCRATCH/data/south_america/ready`` on cluster for storage-optimized inputs).
 - Processes one year at a time, reusing earlier data when a dataset is missing for a given year.
 - Masks out all pixels where backbone = 0 (outside South America) to reduce output size.
 - Streams window batches to a single Parquet panel while cleaning up memory eagerly.
@@ -53,7 +53,7 @@ Outputs:
 - Parquet panel: ``outputs/south_america/results/merged_panel_<start>_<end>.parquet`` storing coordinates plus all bands (backbone=1 only).
 
 Policy variables (optional, country-year, lagged):
-  If ``data/ready/policy/`` contains the outputs of ``policy_preprocessing`` (country raster,
+  If ``data/shared/`` contains the outputs of ``policy_preprocessing`` (country raster,
   mapping JSON, and policy table), the merge automatically appends four lagged (t-1)
   country-year columns to every pixel: ``wgi_ge``, ``wgi_rl``, ``vdem_ldi``,
   ``dpi_exec_ideology``.  If these files are absent, the merge runs as before.
@@ -120,8 +120,8 @@ if "SCRATCH" in os.environ:
     READY_ROOT = DATA_ROOT / "ready"
 else:
     DATA_ROOT = PROJECT_ROOT / "data"
-    # Locally, read from original data directory
-    READY_ROOT = DATA_ROOT
+    # Locally, read from region-specific data directory
+    READY_ROOT = DATA_ROOT / "south_america" / "ready"
 
 # Datasets that may be Int16-scaled (×100) if using storage-optimized inputs
 # These need to be unscaled (÷100) when reading
@@ -143,9 +143,9 @@ TILE_SIZE = 512
 # These files are produced by scripts/preprocessing/policy_preprocessing.
 # If they do not exist, the script runs as before (graceful degradation).
 # Use DATA_ROOT / "ready" / ... so the path resolves identically in both
-# local  (PROJECT_ROOT/data/ready/policy) and
-# cluster ($SCRATCH/data/ready/policy) environments.
-POLICY_DIR = DATA_ROOT / "ready" / "policy"
+# local  (PROJECT_ROOT/data/shared) and
+# cluster ($SCRATCH/data/shared) environments.
+POLICY_DIR = DATA_ROOT / "shared"
 COUNTRY_RASTER_PATH = POLICY_DIR / "country_iso3.tif"
 COUNTRY_MAPPING_PATH = POLICY_DIR / "country_iso3_mapping.json"
 POLICY_TABLE_PATH = POLICY_DIR / "policy_table.parquet"
@@ -182,7 +182,7 @@ def open_reference_backbone() -> Tuple[Path, rasterio.DatasetReader, np.ndarray]
         print("\nChecked locations:")
         for p in backbone_paths:
             print(f"   - {p} (exists: {p.exists()})")
-        print("\nPlease ensure backbone.tif exists in data/ready/backbone/")
+        print("\nPlease ensure backbone.tif exists in data/south_america/ready/backbone/")
         sys.exit(1)
     
     src = rasterio.open(backbone_path)

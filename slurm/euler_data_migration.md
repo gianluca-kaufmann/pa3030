@@ -95,7 +95,7 @@ Policy files go FLAT into `data/shared/` (no nested `policy/` subfolder).
 cd $SCRATCH
 
 mv data/ready/policy/* data/shared/
-rmdir data/ready/policy
+rmdir data/ready/policy 2>/dev/null
 ```
 
 **Verify:**
@@ -125,8 +125,7 @@ for dir in data/ready/*/; do
 done
 
 # Also move any loose files sitting directly in data/ready/
-mv data/ready/*.tif data/south_america/ready/ 2>/dev/null
-mv data/ready/*.parquet data/south_america/ready/ 2>/dev/null
+find data/ready -maxdepth 1 -type f -exec mv -t data/south_america/ready/ {} + 2>/dev/null
 ```
 
 **Verify:**
@@ -148,6 +147,7 @@ mv data/ml/merged_panel_final.parquet data/south_america/ml/
 mv data/ml/main/train_win5.parquet data/south_america/ml/main/
 mv data/ml/main/earlystop_win5.parquet data/south_america/ml/main/
 mv data/ml/main/test_win5.parquet data/south_america/ml/main/
+mv data/ml/main/merged_panel_final_win5.parquet data/south_america/ml/main/
 
 # Also move any SA metadata JSON files in main/
 mv data/ml/main/train_win5_metadata.json data/south_america/ml/main/ 2>/dev/null
@@ -155,9 +155,9 @@ mv data/ml/main/earlystop_win5_metadata.json data/south_america/ml/main/ 2>/dev/
 mv data/ml/main/test_win5_metadata.json data/south_america/ml/main/ 2>/dev/null
 
 # ---- Robustness split ----
-mv data/ml/robustness/train_win5.parquet data/south_america/ml/robustness/
-mv data/ml/robustness/earlystop_win5.parquet data/south_america/ml/robustness/
-mv data/ml/robustness/test_win5.parquet data/south_america/ml/robustness/
+mv data/ml/robustness/train_win5.parquet data/south_america/ml/robustness/ 2>/dev/null
+mv data/ml/robustness/earlystop_win5.parquet data/south_america/ml/robustness/ 2>/dev/null
+mv data/ml/robustness/test_win5.parquet data/south_america/ml/robustness/ 2>/dev/null
 
 mv data/ml/robustness/train_win5_metadata.json data/south_america/ml/robustness/ 2>/dev/null
 mv data/ml/robustness/earlystop_win5_metadata.json data/south_america/ml/robustness/ 2>/dev/null

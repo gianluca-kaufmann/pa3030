@@ -5,13 +5,13 @@ Extract satellite embeddings for backbone==1 pixels and write to Parquet format.
 Data sources:
 - Consumes yearly merged GeoTIFF mosaics produced by the per-year embedding pipeline or embeddings_preprocessing. The files are
   expected under (checked in priority order):
-  - ``data/ml/embeddings_aligned/<year>.tif`` (from embeddings_preprocessing, preferred)
-  - ``data/ml/embeddings/SatelliteEmbeddings_SA_1km_<year>_merged.tif`` (storage-optimized)
-  - ``data/ready/embeddings/SatelliteEmbeddings_SA_1km_<year>_merged.tif`` (from merge_embeddings_tiles)
+  - ``data/south_america/embeddings/ready/embeddings_aligned/<year>.tif`` (from embeddings_preprocessing, preferred)
+  - ``data/south_america/embeddings/ml/embeddings/SatelliteEmbeddings_SA_1km_<year>_merged.tif`` (storage-optimized)
+  - ``data/south_america/embeddings/ready/raw_tiles/SatelliteEmbeddings_SA_1km_<year>_merged.tif`` (from merge_embeddings_tiles)
   - ``data/embeddings/SatelliteEmbeddings_SA_1km_<year>_merged.tif`` (original fallback)
-- Uses ``data/ready/backbone/backbone.tif`` as the mask (extracts only pixels where backbone==1)
-- Loads aligned WDPA yearly rasters from ``data/ml/wdpa_aligned/<year>.tif`` (from embeddings_preprocessing, preferred) or ``data/ml/wdpa_aligned/WDPA_SA_1km_<year>.tif`` (fallback)
-- For 2017: Aligns ``data/ready/WDPA/WDPA_SA_1km_2017.tif`` to backbone grid if not already aligned
+- Uses ``data/south_america/ready/backbone/backbone.tif`` as the mask (extracts only pixels where backbone==1)
+- Loads aligned WDPA yearly rasters from ``data/south_america/embeddings/ready/wdpa_aligned/<year>.tif`` (from embeddings_preprocessing, preferred) or ``data/south_america/embeddings/ready/wdpa_aligned/WDPA_SA_1km_<year>.tif`` (fallback)
+- For 2017: Aligns ``data/south_america/ready/WDPA/WDPA_SA_1km_2017.tif`` to backbone grid if not already aligned
 
 Data location strategy:
 - Resolves the repository root from the script's location so paths remain portable. When the
@@ -33,9 +33,9 @@ Processing mechanism:
 - Streams data to per-year Parquet shards with columns: row, col, x, y, year, WDPA_b1, emb_01..emb_64
 
 Output artefact:
-- Writes per-year Parquet shards: ``SatelliteEmbeddings_SA_1km_<year>.parquet`` to ``data/ml``
+- Writes per-year Parquet shards: ``SatelliteEmbeddings_SA_1km_<year>.parquet`` to ``data/south_america/embeddings/ml``
 - Uses DuckDB to merge all per-year shards into a single final Parquet file:
-  ``SatelliteEmbeddings_SA_1km_2018-2024.parquet`` in ``data/ml``
+  ``SatelliteEmbeddings_SA_1km_2018-2024.parquet`` in ``data/south_america/embeddings/ml``
 - Note: 2017 is included in the merged file with NULL embeddings (for WDPA_prev computation)
 """
 
@@ -70,9 +70,9 @@ else:
 # Check multiple possible locations for merged embedding files
 # Priority: 1) ml/embeddings_aligned (from embeddings_preprocessing), 2) ml/embeddings (storage-optimized), 
 #           3) ready/embeddings (from merge_embeddings_tiles), 4) embeddings (original)
-EMBEDDINGS_ALIGNED_DIR = DATA_ROOT / "ml" / "embeddings_aligned"
-ML_EMBEDDINGS_DIR = DATA_ROOT / "ml" / "embeddings"
-READY_EMBEDDINGS_DIR = DATA_ROOT / "ready" / "embeddings"
+EMBEDDINGS_ALIGNED_DIR = DATA_ROOT / "south_america" / "embeddings" / "ready" / "embeddings_aligned"
+ML_EMBEDDINGS_DIR = DATA_ROOT / "south_america" / "embeddings" / "ml" / "embeddings"
+READY_EMBEDDINGS_DIR = DATA_ROOT / "south_america" / "embeddings" / "ready" / "raw_tiles"
 ORIG_EMBEDDINGS_DIR = DATA_ROOT / "embeddings"
 
 # Select the best available source
@@ -95,15 +95,15 @@ else:
     USING_OPTIMIZED = False
 
 # Backbone path
-BACKBONE_PATH = DATA_ROOT / "ready" / "backbone" / "backbone.tif"
+BACKBONE_PATH = DATA_ROOT / "south_america" / "ready" / "backbone" / "backbone.tif"
 
 # WDPA aligned directory
-WDPA_ALIGNED_DIR = DATA_ROOT / "ml" / "wdpa_aligned"
+WDPA_ALIGNED_DIR = DATA_ROOT / "south_america" / "embeddings" / "ready" / "wdpa_aligned"
 
 # WDPA input directory (for 2017 alignment)
-WDPA_INPUT_DIR = DATA_ROOT / "ready" / "WDPA"
+WDPA_INPUT_DIR = DATA_ROOT / "south_america" / "ready" / "WDPA"
 
-ML_OUTPUT_DIR = PROJECT_ROOT / "data" / "ml"
+ML_OUTPUT_DIR = PROJECT_ROOT / "data" / "south_america" / "embeddings" / "ml"
 
 # Years to merge (embeddings: 2018-2024, WDPA: 2017-2024)
 EMBEDDING_YEARS = [2018, 2019, 2020, 2021, 2022, 2023, 2024]
@@ -132,7 +132,7 @@ def load_backbone() -> Tuple[rasterio.DatasetReader, np.ndarray, dict]:
     
     if not BACKBONE_PATH.exists():
         print(f"ERROR: Backbone file not found: {BACKBONE_PATH}")
-        print("Please ensure backbone.tif exists in data/ready/backbone/")
+        print("Please ensure backbone.tif exists in data/south_america/ready/backbone/")
         sys.exit(1)
     
     backbone_src = rasterio.open(str(BACKBONE_PATH))
@@ -188,7 +188,7 @@ def find_yearly_files() -> Dict[int, Path]:
 
 def align_wdpa_2017(backbone_profile: dict) -> Path:
     """
-    Align/copy WDPA_SA_1km_2017.tif to data/ml/wdpa_aligned/ using backbone grid.
+    Align/copy WDPA_SA_1km_2017.tif to data/south_america/embeddings/ready/wdpa_aligned/ using backbone grid.
     Returns path to aligned file.
     Checks for aligned format from embeddings_preprocessing first (<year>.tif).
     """
@@ -216,7 +216,7 @@ def align_wdpa_2017(backbone_profile: dict) -> Path:
     
     if not wdpa_2017_input.exists():
         print(f"ERROR: WDPA 2017 input file not found: {wdpa_2017_input}")
-        print("Please ensure WDPA_SA_1km_2017.tif exists in data/ready/WDPA/")
+        print("Please ensure WDPA_SA_1km_2017.tif exists in data/south_america/ready/WDPA/")
         sys.exit(1)
     
     # Use aligned format (matching embeddings_preprocessing output)
@@ -305,7 +305,7 @@ def find_wdpa_yearly_files(backbone_profile: dict) -> Dict[int, Path]:
     
     if missing_years:
         print(f"\nERROR: Missing WDPA files for years: {missing_years}")
-        print("Please ensure all WDPA aligned rasters exist in data/ml/wdpa_aligned/")
+        print("Please ensure all WDPA aligned rasters exist in data/south_america/embeddings/ready/wdpa_aligned/")
         sys.exit(1)
     
     log_progress(f"Found all {len(wdpa_files)} yearly WDPA files")
