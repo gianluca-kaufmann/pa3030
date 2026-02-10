@@ -67,6 +67,129 @@ The pipeline consists of the following stages:
 
 ---
 
+Data structure on the Euler cluster:
+
+```
+$SCRATCH/data/
+├── shared/                              # Cross-region, global reference data
+│   ├── country_iso3.tif
+│   ├── country_iso3_mapping.json
+│   ├── policy_table.parquet
+│   ├── DPI/
+│   ├── VDem/
+│   └── WGI/
+│
+├── south_america/                       # ── PRIMARY REGION ──
+│   ├── ready/                           # SA-wide preprocessed rasters
+│   │   ├── backbone/
+│   │   ├── WDPA/
+│   │   ├── WorldClim/
+│   │   ├── elevation/
+│   │   ├── slope/
+│   │   ├── NDVI/
+│   │   ├── GPW/
+│   │   ├── HNTL/
+│   │   ├── GSN/
+│   │   ├── landcover/
+│   │   ├── deforestation/
+│   │   ├── wildfire/
+│   │   ├── oil_gas/
+│   │   ├── powerplants/
+│   │   └── road_infrastructure/
+│   │
+│   ├── ml/                              # SA continental ML data
+│   │   ├── merged_panel_2000_2024.parquet
+│   │   ├── merged_panel_final.parquet
+│   │   ├── main/
+│   │   │   ├── train_win5.parquet
+│   │   │   ├── earlystop_win5.parquet
+│   │   │   ├── test_win5.parquet
+│   │   │   └── merged_panel_final_win5.parquet
+│   │   ├── robustness/                  # (same split files)
+│   │   ├── models/
+│   │   │   ├── main/
+│   │   │   └── robustness/
+│   │   └── tuning/
+│   │
+│   ├── colombia/                        # Country sub-pipeline (uses SA ready/)
+│   │   └── ml/
+│   │       ├── merged_panel_colombia_final.parquet
+│   │       ├── main/
+│   │       ├── robustness/
+│   │       ├── models/
+│   │       │   └── main/
+│   │       └── tuning/
+│   │
+│   └── embeddings/                      # Alternative feature pipeline
+│       ├── ready/
+│       │   ├── raw_tiles/               # Original embedding tiles
+│       │   ├── embeddings_aligned/      # Aligned to backbone grid
+│       │   └── wdpa_aligned/            # WDPA aligned for embeddings
+│       └── ml/
+│           ├── models/
+│           └── tuning/
+│
+├── usa/                                 # ── NEW REGION (same structure as SA top-level) ──
+│   ├── ready/                           # USA preprocessed rasters
+│   │   ├── backbone/
+│   │   ├── WDPA/
+│   │   ├── WorldClim/
+│   │   ├── elevation/
+│   │   ├── slope/
+│   │   ├── NDVI/
+│   │   ├── GPW/
+│   │   ├── HNTL/
+│   │   ├── landcover/
+│   │   ├── deforestation/
+│   │   ├── wildfire/
+│   │   ├── oil_gas/
+│   │   ├── powerplants/
+│   │   └── road_infrastructure/
+│   │
+│   └── ml/                              # USA ML data
+│       ├── merged_panel_final.parquet
+│       ├── main/
+│       │   ├── train_win5.parquet
+│       │   ├── earlystop_win5.parquet
+│       │   └── test_win5.parquet
+│       ├── robustness/
+│       ├── models/
+│       │   ├── main/
+│       │   └── robustness/
+│       └── tuning/
+│
+├── se_asia/                             # ── NEW REGION (same structure) ──
+│   ├── ready/                           # SE Asia preprocessed rasters
+│   │   ├── backbone/
+│   │   ├── WDPA/
+│   │   ├── WorldClim/
+│   │   ├── ...                          # (same feature set as above)
+│   │   └── road_infrastructure/
+│   │
+│   └── ml/
+│       ├── merged_panel_final.parquet
+│       ├── main/
+│       ├── robustness/
+│       ├── models/
+│       └── tuning/
+│
+├── tropical_africa/                     # ── NEW REGION (same structure) ──
+│   ├── ready/
+│   │   ├── backbone/
+│   │   ├── WDPA/
+│   │   ├── ...                          # (same feature set as above)
+│   │   └── road_infrastructure/
+│   │
+│   └── ml/
+│       ├── merged_panel_final.parquet
+│       ├── main/
+│       ├── robustness/
+│       ├── models/
+│       └── tuning/
+│
+└── logs/
+```
+
 ## Model Variants
 
 | Model | Region | Features | Dataset Size | Use Case |

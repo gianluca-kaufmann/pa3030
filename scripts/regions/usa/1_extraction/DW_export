@@ -1,0 +1,134 @@
+"""
+Dataset: GOOGLE/DYNAMICWORLD/V1 land-cover class probabilities.
+Temporal coverage: Annual composites for the USA from 2017 through 2024.
+Overview: Authenticates with Google Earth Engine, computes yearly Dynamic World probability medians, and exports 1 km rasters to Google Drive.
+Resampling & reprojection: Each scene is bilinearly resampled and reprojected to EPSG:3857 at 1,000 m prior to the annual median aggregation.
+Outputs: One float32 GeoTIFF per year (2017-2024) containing the nine Dynamic World probability bands clipped to the USA.
+Usage: export EE_PROJECT_ID=<your-project-id> && python "scripts/regions/usa/1_extraction/DW_export".
+"""
+
+import os
+
+import ee
+
+PROJECT_ID = os.environ.get("EE_PROJECT_ID")
+
+
+def initialize_earth_engine(project_id=None) -> None:
+    """Authenticate and initialize Earth Engine with an optional project."""
+    try:
+        if project_id:
+            ee.Initialize(project=project_id)
+        else:
+            ee.Initialize()
+        print("Earth Engine initialized.")
+    except Exception as exc:
+        print(f"Initialization failed: {exc}")
+        print("Attempting interactive authentication...")
+        ee.Authenticate()
+        if project_id:
+            ee.Initialize(project=project_id)
+        else:
+            ee.Initialize()
+        print("Earth Engine initialized after authentication.")
+
+
+initialize_earth_engine(PROJECT_ID)
+
+# ----------------------------
+# 1) Study area (USA)
+# ----------------------------
+countries = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+region_fc = countries.filter(ee.Filter.eq('country_na', 'United States'))
+region = region_fc.geometry()
+export_region = region.bounds()
+
+# ----------------------------
+# 2) Settings
+# ----------------------------
+CRS = 'EPSG:3857'
+KM = 1000
+DW = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+bands = [
+    'water', 'trees', 'grass', 'flooded_vegetation',
+    'crops', 'shrub_and_scrub', 'built', 'bare', 'snow_and_ice'
+]
+
+def rename(img: ee.Image, prefix: str) -> ee.Image:
+    """Rename selected bands with a prefix."""
+    new_names = [f"{prefix}_{b}" for b in bands]
+    return img.select(bands).rename(new_names)
+
+# ----------------------------
+# 3) Downsample-to-1km per scene, then median over window
+# ----------------------------
+def window_frac_1km(start: str, end: str, prefix: str) -> ee.Image:
+    # Filter to window + AOI + 9 prob bands
+    coll = (
+        DW.filterDate(start, end)
+          .filterBounds(region)
+          .select(bands)
+          .map(lambda img: (
+              img
+                .resample('bilinear')                         # bilinear on probabilities
+                .reproject(crs=CRS, scale=KM)                 # force 1 km @ EPSG:3857
+          ))
+    )
+    # Median across the year → stable ~1km fractions
+    img = ee.ImageCollection(coll).median().clip(region).unmask(0).toFloat()
+    return rename(img, prefix)
+
+# ----------------------------
+# 4) Process data for years 2017-2024
+# ----------------------------
+years = [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024]
+images = {}
+
+for year in years:
+    start_date = f'{year}-01-01'
+    end_date = f'{year+1}-01-01'
+    prefix = f'dw{year}'
+    
+    print(f'Processing year {year}...')
+    images[year] = window_frac_1km(start_date, end_date, prefix)
+
+# (Optional) sanity print for first year
+print('Bands:', images[2017].bandNames().getInfo())
+
+# ----------------------------
+# 5) Export to Google Drive for all years
+# ----------------------------
+tasks = []
+for year in years:
+    task = ee.batch.Export.image.toDrive(
+        image=images[year],
+        description=f'DW_fractions_USA_1km_{year}',
+        folder='GEE_exports',
+        fileNamePrefix=f'DW_fractions_USA_1km_{year}',
+        region=export_region,
+        crs=CRS,
+        scale=KM,
+        maxPixels=1e13
+    )
+    task.start()
+    tasks.append(task)
+    print(f'Export started for {year}:', task.id)
+
+# ----------------------------
+# (Optional) Export to Cloud Storage instead of Drive
+# ----------------------------
+# tasks_gcs = []
+# for year in years:
+#     task_gcs = ee.batch.Export.image.toCloudStorage(
+#         image=images[year],
+#         description=f'DW_fractions_USA_1km_{year}_gcs',
+#         bucket='your-gcs-bucket',
+#         fileNamePrefix=f'gee/DW_fractions_USA_1km_{year}',
+#         region=export_region,
+#         crs=CRS,
+#         scale=KM,
+#         maxPixels=1e13
+#     )
+#     task_gcs.start()
+#     tasks_gcs.append(task_gcs)
+#     print(f'GCS export started for {year}:', task_gcs.id)

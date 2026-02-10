@@ -1,0 +1,1121 @@
+#!/usr/bin/python3
+"""
+Storage Optimization Script for GeoTIFF Rasters.
+
+Optimizes GeoTIFFs from data/usa/ready and saves them to their respective folders in data/ (e.g., data/WDPA, data/HNTL) using rasterio + GDAL.
+
+Strategy:
+
+1. Multi-band splitting (WorldClim, GSN):
+   - If a file has multiple bands, split into separate single-band files (*_bN.tif)
+   - Each band is processed independently
+
+2. Int16 scaling (WorldClim 1-11, GSN 1-5, powerplants, oil_gas):
+   - Check if abs(max_value) <= 327.67
+   - If true: scale ×100, round, and store as Int16 (PREDICTOR=2)
+   - If false: fallback to Float32 (PREDICTOR=3)
+
+3. Dtype preservation (all other datasets):
+   - Preserve original integer dtypes (Byte/Int16/UInt16) with PREDICTOR=2
+   - Only use Float32 (PREDICTOR=3) if source was float
+   - Prevents unnecessary upcasting of integer files (landcover, roads, backbone, etc.)
+
+All outputs use: TILED=YES, COMPRESS=DEFLATE, CRS from backbone raster
+
+Requirements:
+- gdal_translate (for compression)
+- rasterio (for splitting and scaling operations)
+- numpy (for array operations)
+
+Usage:
+    python storage_optimise [--dry-run] [--dataset DATASET]
+
+Options:
+    --dry-run       Print what would be done without executing
+    --dataset NAME  Process only the specified dataset (e.g., WorldClim, GSN)
+"""
+
+import os
+import sys
+import argparse
+import subprocess
+import json
+import re
+import time
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
+import tempfile
+import shutil
+
+# Try to import required packages
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+    print("ERROR: numpy is required. Install with: pip install numpy")
+    import sys
+    sys.exit(1)
+
+try:
+    import rasterio
+    HAS_RASTERIO = True
+except ImportError:
+    HAS_RASTERIO = False
+    print("ERROR: rasterio is required. Install with: pip install rasterio")
+    import sys
+    sys.exit(1)
+
+try:
+    import wandb
+    HAS_WANDB = True
+except ImportError:
+    HAS_WANDB = False
+    print("Warning: wandb not available. Run 'pip install wandb' for experiment tracking.")
+
+# Determine paths - use $SCRATCH on cluster
+if "SCRATCH" in os.environ:
+    DATA_ROOT = Path(os.environ["SCRATCH"]) / "data"
+else:
+    SCRIPT_DIR = Path(__file__).resolve().parent
+    PROJECT_ROOT = SCRIPT_DIR.parent.parent
+    DATA_ROOT = PROJECT_ROOT / "data"
+
+INPUT_ROOT = DATA_ROOT / "usa" / "ready"
+OUTPUT_ROOT = DATA_ROOT
+
+# Datasets that should have multi-band files split into single-band files
+MULTIBAND_SPLIT = {"WorldClim", "GSN"}
+
+# Datasets eligible for Int16 scaling (small value ranges)
+# These will be checked for abs(max) <= 327.67
+INT16_CANDIDATES = {
+    "WorldClim": list(range(1, 12)),  # Bands 1-11
+    "GSN": list(range(1, 6)),          # Bands 1-5
+    "powerplants": None,               # All bands (None = check all)
+    "oil_gas": None,                   # All bands
+}
+
+# Maximum absolute value for Int16 scaling (scaled by 100)
+# Int16 range: -32768 to 32767, so max unscaled value = 327.67
+INT16_MAX_UNSCALED = 327.67
+SCALE_FACTOR = 100
+
+# Integer dtype mapping for GDAL translate
+INTEGER_DTYPES = {
+    'uint8': ('Byte', 2),
+    'int8': ('Byte', 2),
+    'int16': ('Int16', 2),
+    'uint16': ('UInt16', 2),
+    'int32': ('Int32', 2),
+    'uint32': ('UInt32', 2),
+}
+
+# Global variables for GDAL command paths (set in main())
+GDAL_TRANSLATE_PATH = "gdal_translate"
+GDALINFO_PATH = "gdalinfo"
+
+
+@dataclass
+class FileStats:
+    """Statistics for a raster file."""
+    path: Path
+    min_val: float
+    max_val: float
+    mean_val: float
+    std_val: float
+    nodata: Optional[float]
+    dtype: str
+    bands: int
+    width: int
+    height: int
+
+
+@dataclass
+class OptimizationResult:
+    """Result of optimization for a single file."""
+    input_path: Path
+    output_path: Path
+    original_dtype: str
+    output_dtype: str
+    scaled: bool
+    scale_factor: Optional[int]
+    input_size_mb: float
+    output_size_mb: float
+    compression_ratio: float
+    success: bool
+    error: Optional[str] = None
+
+
+def log(message: str, level: str = "INFO"):
+    """Simple logging to stdout."""
+    print(f"[{level}] {message}")
+
+
+def get_raster_stats_gdalinfo(path: Path) -> Optional[FileStats]:
+    """Get raster statistics using gdalinfo."""
+    try:
+        # Run gdalinfo with statistics
+        result = subprocess.run(
+            [GDALINFO_PATH, "-json", "-stats", str(path)],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        info = json.loads(result.stdout)
+        
+        bands = len(info.get("bands", []))
+        size = info.get("size", [0, 0])
+        width, height = size[0], size[1]
+        
+        # Get stats from first band (representative)
+        band_info = info.get("bands", [{}])[0]
+        
+        min_val = band_info.get("minimum", band_info.get("computedMin", 0))
+        max_val = band_info.get("maximum", band_info.get("computedMax", 0))
+        mean_val = band_info.get("mean", 0)
+        std_val = band_info.get("stdDev", 0)
+        nodata = band_info.get("noDataValue")
+        dtype = band_info.get("type", "Unknown")
+        
+        return FileStats(
+            path=path,
+            min_val=float(min_val) if min_val is not None else 0,
+            max_val=float(max_val) if max_val is not None else 0,
+            mean_val=float(mean_val) if mean_val is not None else 0,
+            std_val=float(std_val) if std_val is not None else 0,
+            nodata=float(nodata) if nodata is not None else None,
+            dtype=dtype,
+            bands=bands,
+            width=width,
+            height=height
+        )
+    except subprocess.CalledProcessError as e:
+        log(f"gdalinfo failed for {path}: {e.stderr}", "ERROR")
+        return None
+    except json.JSONDecodeError as e:
+        log(f"Failed to parse gdalinfo JSON for {path}: {e}", "ERROR")
+        return None
+    except Exception as e:
+        log(f"Error getting stats for {path}: {e}", "ERROR")
+        return None
+
+
+def get_all_band_stats(path: Path) -> List[Tuple[float, float]]:
+    """Get min/max for all bands in a raster using gdalinfo."""
+    try:
+        result = subprocess.run(
+            [GDALINFO_PATH, "-json", "-stats", str(path)],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        info = json.loads(result.stdout)
+        
+        band_stats = []
+        for band in info.get("bands", []):
+            min_val = band.get("minimum", band.get("computedMin", 0))
+            max_val = band.get("maximum", band.get("computedMax", 0))
+            band_stats.append((
+                float(min_val) if min_val is not None else 0,
+                float(max_val) if max_val is not None else 0
+            ))
+        return band_stats
+    except Exception as e:
+        log(f"Error getting band stats for {path}: {e}", "ERROR")
+        return []
+
+
+def split_multiband_file(input_path: Path, output_dir: Path, backbone_crs=None) -> List[Path]:
+    """
+    Split a multi-band raster into separate single-band files.
+    Uses backbone CRS if provided, otherwise preserves input CRS.
+    
+    Args:
+        backbone_crs: CRS object from backbone raster to use for all outputs
+    
+    Returns:
+        List of output file paths (one per band)
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_paths = []
+    
+    with rasterio.open(input_path) as src:
+        num_bands = src.count
+        
+        # If single band, no need to split
+        if num_bands == 1:
+            return [input_path]
+        
+        log(f"  Splitting {num_bands} bands from {input_path.name}")
+        
+        for band_idx in range(1, num_bands + 1):
+            # Create output filename with band suffix
+            stem = input_path.stem
+            suffix = input_path.suffix
+            output_name = f"{stem}_b{band_idx}{suffix}"
+            output_path = output_dir / output_name
+            
+            # Extract single band
+            band_data = src.read(band_idx)
+            
+            # Copy profile and update for single band
+            profile = src.profile.copy()
+            profile.update({'count': 1})
+            
+            # Use backbone CRS if provided, otherwise keep source CRS
+            if backbone_crs is not None:
+                profile['crs'] = backbone_crs
+            
+            # Write single-band file
+            with rasterio.open(output_path, 'w', **profile) as dst:
+                dst.write(band_data, 1)
+            
+            output_paths.append(output_path)
+            log(f"    Extracted band {band_idx} -> {output_name}")
+    
+    return output_paths
+
+
+def should_use_int16(
+    path: Path,
+    dataset: str,
+    band_idx: Optional[int] = None
+) -> Tuple[bool, str]:
+    """
+    Determine if a raster should be converted to Int16 with scaling.
+    
+    Returns:
+        (use_int16, reason)
+    """
+    # Check if dataset is a candidate for Int16
+    if dataset not in INT16_CANDIDATES:
+        return False, f"Dataset '{dataset}' not in Int16 candidates list"
+    
+    eligible_bands = INT16_CANDIDATES[dataset]
+    
+    # Get band statistics
+    band_stats = get_all_band_stats(path)
+    if not band_stats:
+        return False, "Could not retrieve band statistics"
+    
+    # For split bands, only check the specific band
+    if band_idx is not None:
+        if band_idx > len(band_stats):
+            return False, f"Band index {band_idx} out of range"
+        
+        min_val, max_val = band_stats[band_idx - 1]
+        
+        # Check if this band is eligible
+        if eligible_bands is not None and band_idx not in eligible_bands:
+            return False, f"Band {band_idx} not in eligible list for {dataset}"
+        
+        max_abs = max(abs(min_val), abs(max_val))
+        if max_abs > INT16_MAX_UNSCALED:
+            return False, f"Band {band_idx}: abs(max)={max_abs:.2f} > {INT16_MAX_UNSCALED}"
+        
+        return True, f"Band {band_idx}: abs(max)={max_abs:.2f} <= {INT16_MAX_UNSCALED}"
+    
+    # Check all bands if no specific band index
+    for i, (min_val, max_val) in enumerate(band_stats, start=1):
+        # Skip bands not in eligible list (if list is specified)
+        if eligible_bands is not None and i not in eligible_bands:
+            continue
+        
+        # Check if values fit in Int16 after scaling
+        max_abs = max(abs(min_val), abs(max_val))
+        if max_abs > INT16_MAX_UNSCALED:
+            return False, f"Band {i}: abs(max)={max_abs:.2f} > {INT16_MAX_UNSCALED}"
+    
+    return True, f"All eligible bands have abs(max) <= {INT16_MAX_UNSCALED}"
+
+
+def optimize_to_int16(
+    input_path: Path,
+    output_path: Path,
+    nodata: Optional[float] = None,
+    dry_run: bool = False,
+    backbone_crs = None
+) -> bool:
+    """
+    Convert raster to Int16 with ×100 scaling using rasterio + gdal_translate.
+    
+    Pipeline:
+    1. rasterio: Scale values ×100 and round (replaces gdal_calc.py)
+    2. gdal_translate: Convert to Int16 with compression
+    
+    Args:
+        backbone_crs: CRS object from backbone raster to use for output (if provided)
+    """
+    if dry_run:
+        log(f"  [DRY-RUN] Would scale ×100 and convert to Int16: {input_path.name}")
+        return True
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Use temp file for intermediate result
+    with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    
+    try:
+        # Step 1: Scale with rasterio (replaces gdal_calc.py)
+        log(f"  Scaling ×100: {input_path.name}")
+        with rasterio.open(input_path) as src:
+            # Read all bands
+            data = src.read()
+            
+            # Scale by 100 and round
+            scaled_data = np.round(data * SCALE_FACTOR).astype(np.float32)
+            
+            # Handle nodata
+            scaled_nodata = None
+            if nodata is not None:
+                scaled_nodata = nodata * SCALE_FACTOR
+                # Replace nodata values
+                if src.nodata is not None:
+                    mask = data == src.nodata
+                    scaled_data[mask] = scaled_nodata
+            
+            # Write to temp file
+            profile = src.profile.copy()
+            profile.update({
+                'dtype': rasterio.float32,
+                'compress': 'deflate',
+                'nodata': scaled_nodata
+            })
+            
+            # Use backbone CRS if provided, otherwise keep source CRS
+            if backbone_crs is not None:
+                profile['crs'] = backbone_crs
+            
+            with rasterio.open(tmp_path, 'w', **profile) as dst:
+                dst.write(scaled_data)
+        
+        # Step 2: Convert to Int16 with optimal compression (CRS preserved from temp file)
+        translate_cmd = [
+            GDAL_TRANSLATE_PATH,
+            "-ot", "Int16",
+            "-co", "TILED=YES",
+            "-co", "COMPRESS=DEFLATE",
+            "-co", "PREDICTOR=2",
+            str(tmp_path),
+            str(output_path)
+        ]
+        if nodata is not None:
+            translate_cmd.extend(["-a_nodata", str(int(nodata * SCALE_FACTOR))])
+        
+        log(f"  Converting to Int16: {output_path.name}")
+        result = subprocess.run(translate_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            log(f"  gdal_translate failed: {result.stderr}", "ERROR")
+            return False
+        
+        return True
+        
+    finally:
+        # Clean up temp file
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def optimize_preserve_dtype(
+    input_path: Path,
+    output_path: Path,
+    nodata: Optional[float] = None,
+    dry_run: bool = False,
+    backbone_crs = None
+) -> bool:
+    """
+    Optimize raster while preserving original dtype (for integer types) or using Float32 (for float types).
+    Preserves Byte/Int16/UInt16 types with PREDICTOR=2, uses Float32 with PREDICTOR=3 for float types.
+    
+    Args:
+        backbone_crs: CRS object from backbone raster (not used here, CRS preserved from input)
+    """
+    if dry_run:
+        log(f"  [DRY-RUN] Would optimize preserving dtype: {input_path.name}")
+        return True
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # If backbone_crs is provided, we need to update the CRS via rasterio first
+    if backbone_crs is not None:
+        # Use temp file to update CRS
+        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        
+        try:
+            # Copy file with updated CRS
+            with rasterio.open(input_path) as src:
+                profile = src.profile.copy()
+                profile['crs'] = backbone_crs
+                
+                with rasterio.open(tmp_path, 'w', **profile) as dst:
+                    for i in range(1, src.count + 1):
+                        dst.write(src.read(i), i)
+            
+            # Now use the temp file as input
+            actual_input_path = tmp_path
+        except Exception as e:
+            log(f"  Warning: Could not update CRS: {e}", "WARNING")
+            actual_input_path = input_path
+            tmp_path = None
+    else:
+        actual_input_path = input_path
+        tmp_path = None
+    
+    try:
+        # Detect source dtype
+        try:
+            with rasterio.open(actual_input_path) as src:
+                source_dtype = src.dtypes[0]
+                source_dtype_lower = source_dtype.lower()
+        except Exception as e:
+            log(f"  Could not read source dtype: {e}", "ERROR")
+            return False
+        
+        # Determine output dtype and predictor
+        if source_dtype_lower in INTEGER_DTYPES:
+            # Preserve integer type
+            output_dtype, predictor = INTEGER_DTYPES[source_dtype_lower]
+            log(f"  Preserving integer dtype: {source_dtype} -> {output_dtype}")
+        else:
+            # Use Float32 for float types
+            output_dtype = "Float32"
+            predictor = 3
+            log(f"  Converting float dtype: {source_dtype} -> {output_dtype}")
+        
+        translate_cmd = [
+            GDAL_TRANSLATE_PATH,
+            "-ot", output_dtype,
+            "-co", "TILED=YES",
+            "-co", "COMPRESS=DEFLATE",
+            "-co", f"PREDICTOR={predictor}",
+            str(actual_input_path),
+            str(output_path)
+        ]
+        if nodata is not None:
+            translate_cmd.extend(["-a_nodata", str(nodata)])
+        
+        result = subprocess.run(translate_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            log(f"  gdal_translate failed: {result.stderr}", "ERROR")
+            return False
+        
+        return True
+    
+    finally:
+        # Clean up temp file if it was created
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink()
+
+
+def optimize_to_float32(
+    input_path: Path,
+    output_path: Path,
+    nodata: Optional[float] = None,
+    dry_run: bool = False,
+    backbone_crs = None
+) -> bool:
+    """
+    Convert raster to Float32 with compression using gdal_translate.
+    Used as fallback when Int16 scaling check fails for Int16 candidates.
+    
+    Args:
+        backbone_crs: CRS object from backbone raster (not used here, CRS preserved from input)
+    """
+    if dry_run:
+        log(f"  [DRY-RUN] Would convert to Float32: {input_path.name}")
+        return True
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # If backbone_crs is provided, we need to update the CRS via rasterio first
+    if backbone_crs is not None:
+        # Use temp file to update CRS
+        with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        
+        try:
+            # Copy file with updated CRS
+            with rasterio.open(input_path) as src:
+                profile = src.profile.copy()
+                profile['crs'] = backbone_crs
+                
+                with rasterio.open(tmp_path, 'w', **profile) as dst:
+                    for i in range(1, src.count + 1):
+                        dst.write(src.read(i), i)
+            
+            # Now use the temp file as input
+            actual_input_path = tmp_path
+        except Exception as e:
+            log(f"  Warning: Could not update CRS: {e}", "WARNING")
+            actual_input_path = input_path
+            tmp_path = None
+    else:
+        actual_input_path = input_path
+        tmp_path = None
+    
+    try:
+        translate_cmd = [
+            GDAL_TRANSLATE_PATH,
+            "-ot", "Float32",
+            "-co", "TILED=YES",
+            "-co", "COMPRESS=DEFLATE",
+            "-co", "PREDICTOR=3",
+            str(actual_input_path),
+            str(output_path)
+        ]
+        if nodata is not None:
+            translate_cmd.extend(["-a_nodata", str(nodata)])
+        
+        log(f"  Converting to Float32: {output_path.name}")
+        result = subprocess.run(translate_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            log(f"  gdal_translate failed: {result.stderr}", "ERROR")
+            return False
+        
+        return True
+    
+    finally:
+        # Clean up temp file if it was created
+        if tmp_path is not None and tmp_path.exists():
+            tmp_path.unlink()
+
+
+def process_single_band_file(
+    input_path: Path,
+    output_path: Path,
+    dataset: str,
+    band_idx: Optional[int] = None,
+    dry_run: bool = False,
+    backbone_crs = None
+) -> OptimizationResult:
+    """Process a single-band raster file (or specific band of multi-band file).
+    
+    Args:
+        backbone_crs: CRS object from backbone raster to use for output
+    """
+    # Get input stats
+    stats = get_raster_stats_gdalinfo(input_path)
+    if stats is None:
+        return OptimizationResult(
+            input_path=input_path,
+            output_path=output_path,
+            original_dtype="Unknown",
+            output_dtype="Unknown",
+            scaled=False,
+            scale_factor=None,
+            input_size_mb=0,
+            output_size_mb=0,
+            compression_ratio=0,
+            success=False,
+            error="Failed to get input statistics"
+        )
+    
+    input_size_mb = input_path.stat().st_size / (1024 * 1024)
+    
+    # Log input stats
+    band_str = f" band {band_idx}" if band_idx else ""
+    log(f"  Input{band_str}: dtype={stats.dtype}, size={stats.width}x{stats.height}, "
+        f"bands={stats.bands}, range=[{stats.min_val:.2f}, {stats.max_val:.2f}]")
+    
+    # Determine optimization strategy
+    use_int16, reason = should_use_int16(input_path, dataset, band_idx=band_idx)
+    
+    if use_int16:
+        # Int16 candidates with small enough range: scale ×100
+        log(f"  Strategy: Int16 (×100 scaling) - {reason}")
+        success = optimize_to_int16(input_path, output_path, stats.nodata, dry_run, backbone_crs)
+        output_dtype = "Int16"
+        scaled = True
+        scale_factor = SCALE_FACTOR
+    elif dataset in INT16_CANDIDATES:
+        # Int16 candidate but range too large: fallback to Float32
+        log(f"  Strategy: Float32 (Int16 range check failed) - {reason}")
+        success = optimize_to_float32(input_path, output_path, stats.nodata, dry_run, backbone_crs)
+        output_dtype = "Float32"
+        scaled = False
+        scale_factor = None
+    else:
+        # Not an Int16 candidate: preserve original dtype
+        log(f"  Strategy: Preserve dtype - {reason}")
+        success = optimize_preserve_dtype(input_path, output_path, stats.nodata, dry_run, backbone_crs)
+        # Get actual output dtype
+        if success and not dry_run and output_path.exists():
+            try:
+                with rasterio.open(output_path) as dst:
+                    output_dtype = dst.dtypes[0]
+            except:
+                output_dtype = stats.dtype
+        else:
+            output_dtype = stats.dtype
+        scaled = False
+        scale_factor = None
+    
+    # Get output stats
+    output_size_mb = 0
+    compression_ratio = 0
+    if success and not dry_run and output_path.exists():
+        output_size_mb = output_path.stat().st_size / (1024 * 1024)
+        compression_ratio = input_size_mb / output_size_mb if output_size_mb > 0 else 0
+        log(f"  Output: {output_size_mb:.2f} MB (compression ratio: {compression_ratio:.2f}x)")
+    
+    return OptimizationResult(
+        input_path=input_path,
+        output_path=output_path,
+        original_dtype=stats.dtype,
+        output_dtype=str(output_dtype),
+        scaled=scaled,
+        scale_factor=scale_factor,
+        input_size_mb=input_size_mb,
+        output_size_mb=output_size_mb,
+        compression_ratio=compression_ratio,
+        success=success
+    )
+
+
+def process_file(
+    input_path: Path,
+    output_path: Path,
+    dataset: str,
+    dry_run: bool = False,
+    backbone_crs = None
+) -> List[OptimizationResult]:
+    """
+    Process a single raster file. May return multiple results if multi-band splitting occurs.
+    
+    Args:
+        backbone_crs: CRS object from backbone raster to use for all outputs
+    
+    Returns:
+        List of OptimizationResult (one per output file)
+    """
+    log(f"Processing: {input_path.relative_to(INPUT_ROOT)}")
+    
+    # Check if this dataset needs multi-band splitting
+    if dataset in MULTIBAND_SPLIT:
+        # Get band count
+        try:
+            with rasterio.open(input_path) as src:
+                num_bands = src.count
+        except Exception as e:
+            log(f"  ERROR: Could not read file: {e}", "ERROR")
+            return [OptimizationResult(
+                input_path=input_path,
+                output_path=output_path,
+                original_dtype="Unknown",
+                output_dtype="Unknown",
+                scaled=False,
+                scale_factor=None,
+                input_size_mb=0,
+                output_size_mb=0,
+                compression_ratio=0,
+                success=False,
+                error=f"Could not read file: {e}"
+            )]
+        
+        if num_bands > 1:
+            log(f"  Multi-band file detected ({num_bands} bands), splitting...")
+            
+            # Create temp directory for split bands
+            temp_dir = output_path.parent / "_temp_split"
+            split_paths = split_multiband_file(input_path, temp_dir, backbone_crs)
+            
+            # Process each split band
+            results = []
+            for band_idx, split_path in enumerate(split_paths, start=1):
+                # Construct output path with band suffix
+                stem = output_path.stem
+                suffix = output_path.suffix
+                band_output_path = output_path.parent / f"{stem}_b{band_idx}{suffix}"
+                
+                log(f"\n  Processing band {band_idx}/{num_bands}:")
+                result = process_single_band_file(
+                    split_path, band_output_path, dataset, band_idx=band_idx, dry_run=dry_run, backbone_crs=backbone_crs
+                )
+                results.append(result)
+            
+            # Clean up temp directory
+            if not dry_run:
+                try:
+                    import shutil
+                    shutil.rmtree(temp_dir)
+                except Exception as e:
+                    log(f"  Warning: Could not clean up temp directory: {e}", "WARNING")
+            
+            return results
+    
+    # Single-band or no splitting needed
+    return [process_single_band_file(input_path, output_path, dataset, dry_run=dry_run, backbone_crs=backbone_crs)]
+
+
+def discover_rasters(input_root: Path, dataset_filter: Optional[str] = None) -> Dict[str, List[Path]]:
+    """
+    Discover all rasters in input directory, grouped by dataset.
+    
+    Note: embeddings directory is excluded from optimization.
+    
+    Returns:
+        {dataset_name: [list of tif paths]}
+    """
+    catalog: Dict[str, List[Path]] = {}
+    
+    if not input_root.exists():
+        log(f"Input directory does not exist: {input_root}", "ERROR")
+        return catalog
+    
+    for subdir in sorted([p for p in input_root.iterdir() if p.is_dir()]):
+        dataset = subdir.name
+        
+        # Skip embeddings directory entirely (excluded from optimization)
+        if dataset == "embeddings":
+            log(f"Skipping embeddings directory (excluded from optimization)")
+            continue
+        
+        # Apply filter if specified
+        if dataset_filter and dataset.lower() != dataset_filter.lower():
+            continue
+        
+        tif_files = sorted(subdir.rglob("*.tif"))
+        if tif_files:
+            catalog[dataset] = tif_files
+            log(f"Found {len(tif_files)} files in {dataset}")
+    
+    return catalog
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Optimize GeoTIFF storage using Int16 scaling or Float32 compression."
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print what would be done without executing"
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Process only the specified dataset (e.g., WorldClim, GSN)"
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging"
+    )
+    args = parser.parse_args()
+    
+    start_time = time.time()
+    
+    log("=" * 60)
+    log("GeoTIFF Storage Optimization Script")
+    log("=" * 60)
+    log(f"Input root:  {INPUT_ROOT}")
+    log(f"Output root: {OUTPUT_ROOT}")
+    log(f"Dry run:     {args.dry_run}")
+    if args.dataset:
+        log(f"Dataset filter: {args.dataset}")
+    log("")
+    
+    # Initialize wandb if available
+    if HAS_WANDB:
+        log("🔄 Initializing Weights & Biases connection...")
+        
+        wandb_api_key = os.environ.get("WANDB_API_KEY")
+        wandb_entity = os.environ.get("WANDB_ENTITY")
+        
+        if not wandb_api_key:
+            log("Warning: WANDB_API_KEY not found in environment variables", "WARNING")
+        
+        if not wandb_entity:
+            log("Warning: WANDB_ENTITY not found in environment variables", "WARNING")
+        
+        wandb.init(
+            project="storage-optimization",
+            entity=wandb_entity,
+            save_code=True,
+            config={
+                "input_root": str(INPUT_ROOT),
+                "output_root": str(OUTPUT_ROOT),
+                "dry_run": args.dry_run,
+                "dataset_filter": args.dataset,
+                "int16_candidates": list(INT16_CANDIDATES.keys()),
+                "int16_max_unscaled": INT16_MAX_UNSCALED,
+                "scale_factor": SCALE_FACTOR,
+                "scratch_mode": "SCRATCH" in os.environ,
+            }
+        )
+        log("Weights & Biases connected successfully!")
+        wandb.log({"status": "started", "start_time": start_time})
+    else:
+        log("Weights & Biases not available (wandb not installed)")
+    log("")
+    
+    # Check GDAL availability
+    global GDAL_TRANSLATE_PATH, GDALINFO_PATH
+    gdal_translate_path = None
+    try:
+        result = subprocess.run(["gdal_translate", "--version"], capture_output=True, text=True, check=True)
+        log(f"GDAL version: {result.stdout.strip()}")
+        gdal_translate_path = "gdal_translate"
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        # Try to find gdal_translate in common locations
+        common_paths = [
+            "/usr/bin/gdal_translate",
+            "/usr/local/bin/gdal_translate",
+            "/opt/homebrew/bin/gdal_translate",  # macOS Homebrew
+        ]
+        for path in common_paths:
+            if Path(path).exists():
+                try:
+                    result = subprocess.run([path, "--version"], capture_output=True, text=True, check=True)
+                    log(f"GDAL version: {result.stdout.strip()}")
+                    gdal_translate_path = path
+                    break
+                except subprocess.CalledProcessError:
+                    continue
+        
+        if gdal_translate_path is None:
+            log("=" * 60, "ERROR")
+            log("gdal_translate not found. Please install GDAL.", "ERROR")
+            log("", "ERROR")
+            log("On macOS:", "ERROR")
+            log("  brew install gdal", "ERROR")
+            log("", "ERROR")
+            log("On Euler cluster:", "ERROR")
+            log("  Add to your SLURM script:", "ERROR")
+            log("    module load gdal", "ERROR")
+            log("  Or check available modules:", "ERROR")
+            log("    module avail gdal", "ERROR")
+            log("", "ERROR")
+            log("Alternatively, ensure GDAL is installed in your Python environment:", "ERROR")
+            log("  pip install gdal", "ERROR")
+            log("  (Note: GDAL Python bindings may not include command-line tools)", "ERROR")
+            log("=" * 60, "ERROR")
+            if HAS_WANDB:
+                wandb.log({"status": "failed", "error": "gdal_translate_not_found"})
+                wandb.finish()
+            sys.exit(1)
+    
+    # Set global variables for use in optimization functions
+    GDAL_TRANSLATE_PATH = gdal_translate_path
+    # Derive gdalinfo path from gdal_translate path
+    if gdal_translate_path == "gdal_translate":
+        GDALINFO_PATH = "gdalinfo"
+    else:
+        # Replace 'gdal_translate' with 'gdalinfo' in the path
+        GDALINFO_PATH = str(Path(gdal_translate_path).parent / "gdalinfo")
+        # Verify gdalinfo exists at that location, otherwise fall back to "gdalinfo"
+        if not Path(GDALINFO_PATH).exists():
+            GDALINFO_PATH = "gdalinfo"
+    
+    # Check rasterio availability (replaces gdal_calc.py)
+    log(f"rasterio version: {rasterio.__version__}")
+    log(f"numpy version: {np.__version__}")
+    
+    log("")
+    
+    # Load backbone CRS to reuse in all outputs (avoids PROJ database errors)
+    backbone_crs = None
+    backbone_paths = [
+        INPUT_ROOT / "backbone" / "backbone.tif",
+        DATA_ROOT / "backbone" / "backbone.tif",
+    ]
+    for backbone_path in backbone_paths:
+        if backbone_path.exists():
+            try:
+                with rasterio.open(backbone_path) as src:
+                    backbone_crs = src.crs
+                    log(f"Loaded backbone CRS from {backbone_path}")
+                    log(f"  CRS: {backbone_crs}")
+                    break
+            except Exception as e:
+                log(f"Warning: Could not read backbone CRS from {backbone_path}: {e}", "WARNING")
+    
+    if backbone_crs is None:
+        log("Warning: Could not load backbone CRS. Outputs will preserve input CRS.", "WARNING")
+    
+    log("")
+    
+    # Discover rasters
+    catalog = discover_rasters(INPUT_ROOT, args.dataset)
+    
+    if not catalog:
+        log("No rasters found to process.", "ERROR")
+        if HAS_WANDB:
+            wandb.log({"status": "failed", "error": "no_rasters_found"})
+            wandb.finish()
+        sys.exit(1)
+    
+    total_files = sum(len(files) for files in catalog.values())
+    log(f"\nTotal files to process: {total_files}")
+    
+    if HAS_WANDB:
+        wandb.config.update({
+            "datasets": list(catalog.keys()),
+            "num_datasets": len(catalog),
+            "total_files": total_files,
+        })
+    log("")
+    
+    # Process each dataset
+    results: List[OptimizationResult] = []
+    
+    for dataset_idx, (dataset, files) in enumerate(sorted(catalog.items()), start=1):
+        log(f"\n{'='*40}")
+        log(f"Dataset {dataset_idx}/{len(catalog)}: {dataset}")
+        log(f"{'='*40}")
+        
+        dataset_start_time = time.time()
+        dataset_results: List[OptimizationResult] = []
+        
+        for file_idx, input_path in enumerate(files, start=1):
+            # Construct output path: data/usa/ready/{dataset}/file.tif -> data/{dataset}/file.tif
+            # For embeddings: data/usa/ready/embeddings/embeddings_YYYY/file.tif -> data/embeddings/embeddings_YYYY/file.tif
+            rel_path = input_path.relative_to(INPUT_ROOT)
+            output_path = OUTPUT_ROOT / rel_path
+            # Ensure output directory exists
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Extract simple dataset name for processing logic (without embeddings/ prefix)
+            simple_dataset = dataset.split('/')[-1] if '/' in dataset else dataset
+            
+            # Process file (may return multiple results if splitting occurs)
+            file_results = process_file(input_path, output_path, simple_dataset, args.dry_run, backbone_crs)
+            
+            # Add all results to main list
+            for result in file_results:
+                results.append(result)
+                dataset_results.append(result)
+                
+                # Log per-file to wandb
+                if HAS_WANDB and not args.dry_run:
+                    output_name = result.output_path.name
+                    wandb.log({
+                        f"file/{dataset}/{output_name}/success": 1 if result.success else 0,
+                        f"file/{dataset}/{output_name}/scaled": 1 if result.scaled else 0,
+                        f"file/{dataset}/{output_name}/input_mb": result.input_size_mb,
+                        f"file/{dataset}/{output_name}/output_mb": result.output_size_mb,
+                        f"file/{dataset}/{output_name}/compression_ratio": result.compression_ratio,
+                    })
+            
+            log("")
+        
+        # Dataset summary
+        dataset_elapsed = time.time() - dataset_start_time
+        dataset_successful = [r for r in dataset_results if r.success]
+        dataset_scaled = [r for r in dataset_successful if r.scaled]
+        dataset_input_mb = sum(r.input_size_mb for r in dataset_results)
+        dataset_output_mb = sum(r.output_size_mb for r in dataset_successful)
+        
+        log(f"Dataset {dataset} complete:")
+        log(f"  Files: {len(dataset_results)}, Successful: {len(dataset_successful)}, "
+            f"Int16-scaled: {len(dataset_scaled)}, Time: {dataset_elapsed:.1f}s")
+        
+        if HAS_WANDB and not args.dry_run:
+            wandb.log({
+                f"dataset/{dataset}/files": len(dataset_results),
+                f"dataset/{dataset}/successful": len(dataset_successful),
+                f"dataset/{dataset}/int16_scaled": len(dataset_scaled),
+                f"dataset/{dataset}/float32": len(dataset_successful) - len(dataset_scaled),
+                f"dataset/{dataset}/input_mb": dataset_input_mb,
+                f"dataset/{dataset}/output_mb": dataset_output_mb,
+                f"dataset/{dataset}/compression_ratio": dataset_input_mb / dataset_output_mb if dataset_output_mb > 0 else 0,
+                f"dataset/{dataset}/time_seconds": dataset_elapsed,
+            })
+    
+    # Summary
+    log("\n" + "=" * 60)
+    log("SUMMARY")
+    log("=" * 60)
+    
+    successful = [r for r in results if r.success]
+    failed = [r for r in results if not r.success]
+    scaled = [r for r in successful if r.scaled]
+    
+    total_input_mb = sum(r.input_size_mb for r in results)
+    total_output_mb = sum(r.output_size_mb for r in successful)
+    overall_compression = total_input_mb / total_output_mb if total_output_mb > 0 else 0
+    space_saved_mb = total_input_mb - total_output_mb
+    
+    log(f"Files processed: {len(results)}")
+    log(f"  Successful:    {len(successful)}")
+    log(f"  Failed:        {len(failed)}")
+    log(f"  Int16 scaled:  {len(scaled)}")
+    log(f"  Float32:       {len(successful) - len(scaled)}")
+    log("")
+    
+    if not args.dry_run and total_output_mb > 0:
+        log(f"Total input size:  {total_input_mb:.2f} MB")
+        log(f"Total output size: {total_output_mb:.2f} MB")
+        log(f"Overall compression: {overall_compression:.2f}x")
+        log(f"Space saved: {space_saved_mb:.2f} MB")
+    
+    # Log summary to wandb
+    if HAS_WANDB:
+        total_elapsed = time.time() - start_time
+        wandb.log({
+            "summary/files_processed": len(results),
+            "summary/successful": len(successful),
+            "summary/failed": len(failed),
+            "summary/int16_scaled": len(scaled),
+            "summary/float32": len(successful) - len(scaled),
+            "summary/total_input_mb": total_input_mb,
+            "summary/total_output_mb": total_output_mb,
+            "summary/overall_compression_ratio": overall_compression,
+            "summary/space_saved_mb": space_saved_mb,
+            "summary/space_saved_gb": space_saved_mb / 1024,
+            "summary/total_time_seconds": total_elapsed,
+            "summary/total_time_minutes": total_elapsed / 60,
+            "summary/files_per_second": len(results) / total_elapsed if total_elapsed > 0 else 0,
+            "summary/status": "completed" if not failed else "completed_with_errors",
+        })
+    
+    if failed:
+        log("\nFailed files:", "WARNING")
+        for r in failed:
+            log(f"  {r.input_path}: {r.error}", "WARNING")
+    
+    # Detailed per-file summary
+    log("\n" + "-" * 60)
+    log("Per-file details:")
+    log("-" * 60)
+    log(f"{'File':<50} {'In DType':<10} {'Out DType':<10} {'Scaled':<8} {'Ratio':<8}")
+    log("-" * 60)
+    
+    for r in results:
+        try:
+            filename = str(r.input_path.relative_to(INPUT_ROOT))
+        except ValueError:
+            filename = str(r.input_path)   # temp split files live outside INPUT_ROOT
+        filename = filename[-48:]          # keep rightmost part for readability
+        scaled_str = f"×{r.scale_factor}" if r.scaled else "No"
+        ratio_str = f"{r.compression_ratio:.2f}x" if r.compression_ratio > 0 else "-"
+        status = "✓" if r.success else "✗"
+        log(f"{filename:<50} {r.original_dtype:<10} {r.output_dtype:<10} {scaled_str:<8} {ratio_str:<8} {status}")
+    
+    log("\n" + "=" * 60)
+    log("Optimization complete!")
+    if not args.dry_run:
+        total_elapsed = time.time() - start_time
+        log(f"Total time: {total_elapsed/60:.1f} minutes ({total_elapsed:.1f}s)")
+        if total_output_mb > 0:
+            log(f"Overall compression: {overall_compression:.2f}x")
+            log(f"Storage saved: {space_saved_mb/1024:.2f} GB")
+    log("=" * 60)
+    
+    # Finish wandb
+    if HAS_WANDB:
+        log("\n📊 View results at: " + wandb.run.get_url())
+        wandb.finish()
+    
+    # Return non-zero exit code if any failures
+    sys.exit(0 if not failed else 1)
+
+
+if __name__ == "__main__":
+    main()
+

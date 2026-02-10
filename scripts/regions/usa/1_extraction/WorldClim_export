@@ -1,0 +1,125 @@
+"""
+Dataset: WORLDCLIM/V1/BIO bioclimatic variables (19-band climatology).
+Temporal coverage: Long-term 1960-1991 climatological averages for the USA (no interannual variation).
+Overview: Authenticates with Google Earth Engine, retrieves the static WorldClim BIO stack, resamples to 1 km, and exports to Google Drive.
+Resampling & reprojection: Bands are bilinearly resampled and reprojected to EPSG:3857 at 1,000 m before clipping to the USA.
+Outputs: A single float32 GeoTIFF containing the 19 bioclimatic variables (bio01-bio19) clipped to the USA.
+Usage: export EE_PROJECT_ID=<your-project-id> && python "scripts/regions/usa/1_extraction/WorldClim_export".
+"""
+
+import os
+
+import ee
+
+PROJECT_ID = os.environ.get("EE_PROJECT_ID")
+
+
+def initialize_earth_engine(project_id=None) -> None:
+    """Authenticate and initialize Earth Engine with an optional project."""
+    try:
+        if project_id:
+            ee.Initialize(project=project_id)
+        else:
+            ee.Initialize()
+        print("Earth Engine initialized.")
+    except Exception as exc:
+        print(f"Initialization failed: {exc}")
+        print("Attempting interactive authentication...")
+        ee.Authenticate()
+        if project_id:
+            ee.Initialize(project=project_id)
+        else:
+            ee.Initialize()
+        print("Earth Engine initialized after authentication.")
+
+
+initialize_earth_engine(PROJECT_ID)
+
+# ----------------------------
+# 1) Study area (USA)
+# ----------------------------
+countries = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+region_fc = countries.filter(ee.Filter.eq('country_na', 'United States'))
+region = region_fc.geometry()
+export_region = region.bounds()
+
+# ----------------------------
+# 2) Settings
+# ----------------------------
+CRS = 'EPSG:3857'
+KM = 1000
+WORLDCLIM = ee.Image('WORLDCLIM/V1/BIO')
+
+# WorldClim BIO bands (19 bioclimatic variables)
+bands = [
+    'bio01', 'bio02', 'bio03', 'bio04', 'bio05', 'bio06', 'bio07', 'bio08', 'bio09',
+    'bio10', 'bio11', 'bio12', 'bio13', 'bio14', 'bio15', 'bio16', 'bio17', 'bio18', 'bio19'
+]
+
+# ----------------------------
+# 3) Process WorldClim data
+# ----------------------------
+def process_worldclim() -> ee.Image:
+    """Process WorldClim BIO data: downsample to 1km and clip to the USA."""
+    # Select all bioclimatic bands
+    img = WORLDCLIM.select(bands)
+    
+    # Downsample to 1km using bilinear resampling
+    img_resampled = (
+        img
+            .resample('bilinear')
+            .reproject(crs=CRS, scale=KM)
+    )
+    
+    # Clip to the USA and convert to float
+    img_clipped = img_resampled.clip(region).unmask(0).toFloat()
+    
+    return img_clipped
+
+# ----------------------------
+# 4) Process the data
+# ----------------------------
+print('Processing WorldClim BIO data (1960-1991 climatological average)...')
+worldclim_image = process_worldclim()
+
+# Sanity check: print band names
+print('Bands:', worldclim_image.bandNames().getInfo())
+
+# ----------------------------
+# 5) Export to Google Drive
+# ----------------------------
+task = ee.batch.Export.image.toDrive(
+    image=worldclim_image,
+    description='WorldClim_BIO_USA_1km',
+    folder='GEE_exports',
+    fileNamePrefix='WorldClim_BIO_USA_1km',
+    region=export_region,
+    crs=CRS,
+    scale=KM,
+    maxPixels=1e13
+)
+task.start()
+print('Export started:', task.id)
+
+# ----------------------------
+# (Optional) Export to Cloud Storage instead of Drive
+# ----------------------------
+# task_gcs = ee.batch.Export.image.toCloudStorage(
+#     image=worldclim_image,
+#     description='WorldClim_BIO_USA_1km_gcs',
+#     bucket='your-gcs-bucket',
+#     fileNamePrefix='gee/WorldClim_BIO_USA_1km',
+#     region=export_region,
+#     crs=CRS,
+#     scale=KM,
+#     maxPixels=1e13
+# )
+# task_gcs.start()
+# print('GCS export started:', task_gcs.id)
+
+print("Export summary:")
+print("- Dataset: WorldClim V1 BIO (climatological average 1960-1991)")
+print("- Region: USA")
+print("- Resolution: 1 km (EPSG:3857)")
+print("- Bands: 19 bioclimatic variables (bio01-bio19)")
+print("- Output: WorldClim_BIO_USA_1km.tif in Google Drive folder 'GEE_exports'")

@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""
+Global Safety Net preprocessing
+==============================
+
+Description:
+    Convert the Global Safety Net vector layers into 1 km rasters that align
+    with the common template grid used across the project.
+
+Source data:
+    - Vector files located under `data/usa/ready/GSN/GlobalSafetyNet/<layer_name>/`
+      as shapefiles or GeoPackages.
+    - Reference raster template in `data/usa/ready/GPW/`, typically
+      `GPW_population_density_USA_1km_2020.tif`.
+
+Objective:
+    Prepare binary or categorical raster masks for each Global Safety Net
+    layer so they can be merged with other datasets in later stages.
+
+Process overview:
+    1. Locate the GPW template raster and read its spatial metadata.
+    2. Discover the Global Safety Net layers expected in the data directory.
+    3. Load, reproject, and clip each layer to the template extent.
+    4. Rasterize geometries onto the 1 km grid (categorical for ecoregions,
+       binary for other layers).
+    5. Save the resulting rasters for downstream processing.
+
+Outputs:
+    - GeoTIFF masks stored in `data/usa/ready/GSN/gsn_<layer_name>_mask_1km.tif`.
+"""
+
+import sys
+import os
+from typing import Optional, Tuple, List
+
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.features import rasterize
+from rasterio.transform import Affine
+import geopandas as gpd
+from shapely.geometry import box
+from pathlib import Path
+
+
+def find_template_raster(base_dir: Path) -> Path:
+    """
+    Locate the GPW 1 km template raster. Prefer year 2020, fall back to any GPW 1 km USA.
+    """
+    template_path = base_dir / "data" / "usa" / "ready" / "GPW" / "GPW_population_density_USA_1km_2020.tif"
+    if template_path.is_file():
+        return template_path
+
+    matches = sorted((base_dir / "data" / "usa" / "ready" / "GPW").glob("GPW_population_density_USA_1km_*.tif"))
+    if matches:
+        return matches[-1]
+
+    raise FileNotFoundError(
+        "No GPW 1 km template raster found in data/usa/ready/GPW. Expected "
+        "GPW_population_density_USA_1km_2020.tif or a matching pattern "
+        "'GPW_population_density_USA_1km_*.tif'."
+    )
+
+
+def read_template_info(template_path: Path) -> Tuple[Affine, int, int, str, Tuple[float, float, float, float]]:
+    with rasterio.open(template_path) as ds:
+        transform: Affine = ds.transform
+        width: int = ds.width
+        height: int = ds.height
+        crs_wkt_or_epsg = ds.crs.to_string() if ds.crs is not None else None
+        bounds = ds.bounds
+    if crs_wkt_or_epsg is None:
+        raise ValueError("Template raster has no CRS defined.")
+    return transform, width, height, crs_wkt_or_epsg, (bounds.left, bounds.bottom, bounds.right, bounds.top)
+
+
+def find_shapefile_in_dir(dir_path: Path) -> Optional[Path]:
+    """Return the first .shp file found within dir_path (non-recursive)."""
+    shp_matches = sorted(dir_path.glob("*.shp"))
+    if shp_matches:
+        return shp_matches[0]
+    # Also support GeoPackage if present
+    gpkg_matches = sorted(dir_path.glob("*.gpkg"))
+    if gpkg_matches:
+        return gpkg_matches[0]
+    return None
+
+
+def get_gsn_layers(base_dir: Path) -> List[Tuple[str, Path]]:
+    """
+    Find the five GlobalSafetyNet layers and return list of tuples (name_key, vector_path).
+    name_key will be used for output filenames.
+    """
+    gsn_base = base_dir / "data" / "usa" / "ready" / "GSN" / "GlobalSafetyNet"
+    if not gsn_base.is_dir():
+        raise FileNotFoundError(f"Could not locate GlobalSafetyNet directory at {gsn_base}")
+    layer_dirs = [
+        "climate_stabilisation_areas",
+        "high_biodiversity_areas",
+        "intact_wilderness_areas",
+        "potential_wildlife_corridors",
+        "terrestrial_ecoregions",
+    ]
+
+    layers: List[Tuple[str, str]] = []
+    for d in layer_dirs:
+        dir_path = gsn_base / d
+        if not dir_path.is_dir():
+            raise FileNotFoundError(f"Expected directory not found: {dir_path}")
+        shp = find_shapefile_in_dir(dir_path)
+        if shp is None:
+            raise FileNotFoundError(f"No shapefile or GeoPackage found in: {dir_path}")
+        key = d
+        layers.append((key, shp))
+    return layers
+
+
+def bbox_polygon(bounds: Tuple[float, float, float, float]):
+    left, bottom, right, top = bounds
+    return box(left, bottom, right, top)
+
+
+def rasterize_gdf(
+    gdf: gpd.GeoDataFrame,
+    transform: Affine,
+    width: int,
+    height: int,
+    burn_value: int = 1,
+    all_touched: bool = False,
+    categorical_column: str = None,
+) -> np.ndarray:
+    """
+    Rasterize the given GeoDataFrame to a mask using provided grid.
+    If categorical_column is provided, rasterize by category values.
+    Otherwise, create binary mask.
+    """
+    if gdf.empty:
+        return np.zeros((height, width), dtype=np.uint8)
+
+    if categorical_column and categorical_column in gdf.columns:
+        # Create categorical raster
+        unique_values = gdf[categorical_column].dropna().unique()
+        value_to_id = {val: i+1 for i, val in enumerate(sorted(unique_values))}
+        
+        shapes = []
+        for _, row in gdf.iterrows():
+            if row.geometry is not None and not row.geometry.is_empty:
+                cat_value = row[categorical_column]
+                if pd.notna(cat_value) and cat_value in value_to_id:
+                    shapes.append((row.geometry, value_to_id[cat_value]))
+        
+        if not shapes:
+            return np.zeros((height, width), dtype=np.uint8)
+            
+        mask = rasterize(
+            shapes=shapes,
+            out_shape=(height, width),
+            transform=transform,
+            fill=0,
+            default_value=0,
+            all_touched=all_touched,
+            dtype="uint8",
+        )
+    else:
+        # Binary rasterization
+        shapes = ((geom, burn_value) for geom in gdf.geometry if geom is not None and not geom.is_empty)
+        mask = rasterize(
+            shapes=shapes,
+            out_shape=(height, width),
+            transform=transform,
+            fill=0,
+            default_value=burn_value,
+            all_touched=all_touched,
+            dtype="uint8",
+        )
+    
+    return mask.astype(np.uint8)
+
+
+def save_geotiff(
+    out_path: Path,
+    array: np.ndarray,
+    transform: Affine,
+    crs: str,
+) -> None:
+    profile = {
+        "driver": "GTiff",
+        "height": array.shape[0],
+        "width": array.shape[1],
+        "count": 1,
+        "dtype": "uint8",
+        "crs": crs,
+        "transform": transform,
+        "compress": "deflate",
+        "predictor": 2,
+        "zlevel": 6,
+        "tiled": True,
+        "blockxsize": 256,
+        "blockysize": 256,
+        "nodata": 0,
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(array, 1)
+
+
+def main() -> int:
+    project_root = Path(__file__).resolve().parents[2]
+
+    # 1) Template raster
+    template_path = find_template_raster(project_root)
+    transform, width, height, template_crs, t_bounds = read_template_info(template_path)
+
+    # 2) Target bbox polygon in template CRS
+    t_bbox_poly = gpd.GeoSeries([bbox_polygon(t_bounds)], crs=template_crs)
+
+    # 3) GSN vector layers
+    layers = get_gsn_layers(project_root)
+
+    # 4) Output dir
+    out_dir = project_root / "data" / "usa" / "ready" / "GSN"
+
+    # 5) Process each layer
+    for key, vec_path in layers:
+        print(f"Processing {key} from {vec_path}")
+        # Read vector
+        gdf = gpd.read_file(vec_path)
+        if gdf.empty:
+            print(f"Warning: {key} is empty. Writing all-zero mask.")
+            mask = np.zeros((height, width), dtype=np.uint8)
+        else:
+            # Reproject to template CRS
+            if gdf.crs is None:
+                raise ValueError(f"Vector layer {vec_path} has undefined CRS.")
+            gdf = gdf.to_crs(template_crs)
+
+            # Clip to template bounds (USA subset extent)
+            try:
+                gdf = gpd.clip(gdf, t_bbox_poly)
+            except Exception as e:
+                print(f"Warning: clip failed for {key} with {e}. Proceeding without clip.")
+
+            # Special handling for ecoregions - rasterize by ecoregion name
+            if key == 'terrestrial_ecoregions' and 'ECO_NAME' in gdf.columns:
+                print(f"Rasterizing {key} by ecoregion name...")
+                mask = rasterize_gdf(gdf, transform, width, height, 
+                                   categorical_column='ECO_NAME', all_touched=False)
+            else:
+                # Standard binary rasterization
+                mask = rasterize_gdf(gdf, transform, width, height, burn_value=1, all_touched=False)
+
+        out_name = f"gsn_{key}_mask_1km.tif"
+        out_path = out_dir / out_name
+        save_geotiff(out_path, mask, transform, template_crs)
+        print(f"Saved {out_path}")
+
+    print("Done.")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)

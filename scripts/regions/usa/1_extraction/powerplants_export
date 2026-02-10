@@ -1,0 +1,173 @@
+"""
+Dataset: WRI/GPPD/power_plants (Global Power Plant Database).
+Temporal coverage: Latest available compilation (accessed 2024) for the USA.
+Overview: Authenticates with Google Earth Engine, rasterises power plant counts and dominant fuel types at 1 km resolution, and exports to Google Drive.
+Resampling & reprojection: Vector features are rasterised, unmasked to zero, and reprojected to EPSG:3857 at 1,000 m before clipping to the USA.
+Outputs: A single float32 GeoTIFF with `powerplant_count` and `fuel_type` bands covering the USA.
+Usage: export EE_PROJECT_ID=<your-project-id> && python "scripts/regions/usa/1_extraction/powerplants_export".
+"""
+
+import os
+
+import ee
+
+PROJECT_ID = os.environ.get("EE_PROJECT_ID")
+
+
+def initialize_earth_engine(project_id=None) -> None:
+    """Authenticate and initialize Earth Engine with an optional project."""
+    try:
+        if project_id:
+            ee.Initialize(project=project_id)
+        else:
+            ee.Initialize()
+        print("Earth Engine initialized.")
+    except Exception as exc:
+        print(f"Initialization failed: {exc}")
+        print("Attempting interactive authentication...")
+        ee.Authenticate()
+        if project_id:
+            ee.Initialize(project=project_id)
+        else:
+            ee.Initialize()
+        print("Earth Engine initialized after authentication.")
+
+
+initialize_earth_engine(PROJECT_ID)
+
+# ----------------------------
+# 1) Study area (USA)
+# ----------------------------
+countries = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+region_fc = countries.filter(ee.Filter.eq('country_na', 'United States'))
+region = region_fc.geometry()
+export_region = region.bounds()
+
+# ----------------------------
+# 2) Settings
+# ----------------------------
+CRS = 'EPSG:3857'
+KM = 1000
+
+# Load the Global Power Plant Database dataset
+GPPD = ee.FeatureCollection('WRI/GPPD/power_plants')
+
+# ----------------------------
+# 3) Process and rasterize (most recent data)
+# ----------------------------
+def process_data() -> ee.Image:
+    """
+    Filter GPPD features within USA bounds, rasterize to 1km resolution.
+    Uses the most recent data available in the dataset.
+    Creates both count and fuel type rasters.
+    """
+    # Filter to features within USA bounds (no year filtering)
+    filtered = GPPD.filterBounds(region)
+    
+    # Rasterize the features - count density of power plants
+    # Add a constant numeric property for counting, then rasterize
+    filtered_with_count = filtered.map(lambda f: f.set('count', 1))
+    
+    rasterized_count = filtered_with_count.reduceToImage(
+        properties=['count'],
+        reducer=ee.Reducer.sum()  # sum of 1s = count of features
+    ).rename('powerplant_count')
+    
+    # Create fuel type raster using fuel1 attribute
+    # Map fuel types to numeric codes for rasterization
+    def map_fuel_type(feature):
+        fuel1 = ee.String(feature.get('fuel1'))
+        # Create numeric codes for different fuel types
+        fuel_code = ee.Algorithms.If(
+            fuel1.equals('Coal'), 1,
+            ee.Algorithms.If(fuel1.equals('Gas'), 2,
+            ee.Algorithms.If(fuel1.equals('Oil'), 3,
+            ee.Algorithms.If(fuel1.equals('Hydro'), 4,
+            ee.Algorithms.If(fuel1.equals('Nuclear'), 5,
+            ee.Algorithms.If(fuel1.equals('Solar'), 6,
+            ee.Algorithms.If(fuel1.equals('Wind'), 7,
+            ee.Algorithms.If(fuel1.equals('Biomass'), 8,
+            ee.Algorithms.If(fuel1.equals('Geothermal'), 9,
+            ee.Algorithms.If(fuel1.equals('Waste'), 10, 0))))))))))  # Other/Unknown = 0
+        return feature.set('fuel_code', fuel_code)
+    
+    filtered_with_fuel = filtered.map(map_fuel_type)
+    
+    # Rasterize fuel types (use mode to get dominant fuel type per pixel)
+    rasterized_fuel = filtered_with_fuel.reduceToImage(
+        properties=['fuel_code'],
+        reducer=ee.Reducer.mode()  # mode gives the most common fuel type per pixel
+    ).rename('fuel_type')
+    
+    # Combine both rasters
+    combined = rasterized_count.addBands(rasterized_fuel)
+    
+    # Reproject to 1km resolution
+    img = (
+        combined
+        .unmask(0)
+        .reproject(crs=CRS, scale=KM)
+        .clip(region)
+        .toFloat()
+    )
+    
+    return img
+
+# ----------------------------
+# 4) Process data (most recent)
+# ----------------------------
+print('Processing most recent data...')
+image = process_data()
+
+# (Optional) sanity print
+print('Sample bands:', image.bandNames().getInfo())
+print('Sample projection:', image.projection().getInfo())
+
+# Print fuel type mapping for reference
+print('\nFuel type codes:')
+print('0: Other/Unknown')
+print('1: Coal')
+print('2: Gas')
+print('3: Oil')
+print('4: Hydro')
+print('5: Nuclear')
+print('6: Solar')
+print('7: Wind')
+print('8: Biomass')
+print('9: Geothermal')
+print('10: Waste')
+
+# ----------------------------
+# 5) Export to Google Drive (most recent data)
+# ----------------------------
+task = ee.batch.Export.image.toDrive(
+    image=image,
+    description='GPPD_powerplants_with_fuel_USA_1km',
+    folder='GEE_exports',
+    fileNamePrefix='GPPD_powerplants_with_fuel_USA_1km',
+    region=export_region,
+    crs=CRS,
+    scale=KM,
+    maxPixels=1e13
+)
+task.start()
+print('Export started:', task.id)
+
+print('\nExport task started.')
+print('Check progress at: https://code.earthengine.google.com/tasks')
+
+# ----------------------------
+# (Optional) Export to Cloud Storage instead of Drive
+# ----------------------------
+# task_gcs = ee.batch.Export.image.toCloudStorage(
+#     image=image,
+#     description='GPPD_powerplants_USA_1km_gcs',
+#     bucket='your-gcs-bucket',
+#     fileNamePrefix='gee/GPPD_powerplants_USA_1km',
+#     region=export_region,
+#     crs=CRS,
+#     scale=KM,
+#     maxPixels=1e13
+# )
+# task_gcs.start()
+# print('GCS export started:', task_gcs.id)
