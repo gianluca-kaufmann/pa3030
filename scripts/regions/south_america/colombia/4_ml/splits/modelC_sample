@@ -1,0 +1,479 @@
+#!/usr/bin/env python3
+
+"""
+Sampling script for modelC tuning sample (Colombia dataset).
+
+Supports two split configurations:
+- 'main': Train <= 2013, Earlystop 2014-2016
+- 'robustness': Train <= 2012, Earlystop 2013-2015
+
+Rules
+-----
+- Keep all positives (transition_01_win5 == 1) in TRAIN set only
+- Cap total negatives in TRAIN set at ~1,000,000 (sample uniformly across years)
+- EARLYSTOP set is kept as-is (true unbalanced, no sampling)
+- Year 2000 excluded to avoid treating existing PAs as transitions
+- Output: data/ml/tuning/{split_version}/modelC_tuning_colombia.parquet
+
+Notes
+-----
+- Sampling is applied ONLY to train set (year <= TRAIN_YEAR_MAX)
+- Earlystop set remains completely unbalanced
+- Uniform sampling across train years ensures balanced temporal distribution
+- Random sampling for simplicity (no hard negatives)
+- Used by both Random Forest and LightGBM hyperparameter tuning scripts
+- Uses 5-year lookahead target (transition_01_win5) from merged_panel_colombia_final_win5.parquet
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+from pathlib import Path
+
+import duckdb
+import wandb
+
+# Configuration
+RANDOM_STATE = 42
+MAX_TOTAL_NEGATIVES = 1_000_000  # Cap total negatives in TRAIN set at 1M
+WANDB_PROJECT = "ml-preprocessing"
+
+# Split configurations - must match tuning/training scripts
+SPLIT_CONFIGS = {
+    'main': {
+        'train_year_max': 2013,
+        'earlystop_year_min': 2014,
+        'earlystop_year_max': 2016,
+        'description': 'Main split: Train <=2013, Earlystop 2014-2016'
+    },
+    'robustness': {
+        'train_year_max': 2012,
+        'earlystop_year_min': 2013,
+        'earlystop_year_max': 2015,
+        'description': 'Robustness split: Train <=2012, Earlystop 2013-2015'
+    }
+}
+
+
+def resolve_input(split_version: str) -> Path:
+    """Locate merged_panel_colombia_final_win5.parquet from split-specific directory (prefer $SCRATCH if present)."""
+    repo_root = Path(__file__).resolve().parents[4]
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    candidates = []
+    if scratch_root is not None:
+        # Check split-specific subdirectory in outputs/south_america/colombia/results first
+        candidates.append(scratch_root / f"outputs/south_america/colombia/results/{split_version}/merged_panel_colombia_final_win5.parquet")
+        # Fallback to old location (for backward compatibility)
+        candidates.append(scratch_root / "outputs/south_america/colombia/results/merged_panel_colombia_final_win5.parquet")
+        # Also check data/ml location
+        candidates.append(scratch_root / f"data/ml/{split_version}/merged_panel_colombia_final_win5.parquet")
+    # Check split-specific subdirectory in repo
+    candidates.append(repo_root / f"outputs/south_america/colombia/results/{split_version}/merged_panel_colombia_final_win5.parquet")
+    # Fallback to old location (for backward compatibility)
+    candidates.append(repo_root / "outputs/south_america/colombia/results/merged_panel_colombia_final_win5.parquet")
+    candidates.append(repo_root / f"data/ml/{split_version}/merged_panel_colombia_final_win5.parquet")
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    # Provide detailed error message with all checked paths
+    error_msg = f"merged_panel_colombia_final_win5.parquet not found for split '{split_version}'.\n"
+    error_msg += "\nChecked locations:\n"
+    for cand in candidates:
+        error_msg += f"  - {cand}\n"
+    if scratch_root:
+        error_msg += f"\nSCRATCH root: {scratch_root}\n"
+    error_msg += f"Repository root: {repo_root}\n"
+    error_msg += f"\nHint: Run modelC_preprocessing with --split-version {split_version} first.\n"
+    raise FileNotFoundError(error_msg)
+
+
+def configure_duckdb(con: duckdb.DuckDBPyConnection) -> None:
+    """Apply sensible local/Euler defaults."""
+    is_euler = bool(os.environ.get("SCRATCH"))
+    slurm_cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", "0"))
+    num_threads = slurm_cpus if slurm_cpus > 0 else (48 if is_euler else 4)
+
+    # Match DuckDB memory to Slurm allocation when present
+    slurm_mem_per_cpu_mb = os.environ.get("SLURM_MEM_PER_CPU")
+    if slurm_mem_per_cpu_mb and slurm_cpus:
+        total_mem_mb = int(slurm_mem_per_cpu_mb) * slurm_cpus
+        memory_limit_gb = max(1, total_mem_mb // 1024)
+    else:
+        memory_limit_gb = 128 if is_euler else 16
+
+    con.execute(f"SET threads={num_threads}")
+    con.execute("SET preserve_insertion_order=false")
+    con.execute(f"SET memory_limit='{memory_limit_gb}GB'")
+
+    temp_dir = os.environ.get("SCRATCH") or (Path(__file__).parent / "temp")
+    # Ensure temp directory exists (DuckDB won't create parent directories)
+    if isinstance(temp_dir, str):
+        temp_dir = Path(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    duckdb_temp_dir = temp_dir / "duckdb_temp"
+    duckdb_temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir_sql = str(duckdb_temp_dir).replace("'", "''")
+    con.execute(f"SET temp_directory='{temp_dir_sql}'")
+
+    if is_euler:
+        con.execute("PRAGMA max_temp_directory_size='200GB'")
+
+    print(f"DuckDB configured: {num_threads} threads, {memory_limit_gb}GB memory")
+    print(f"Running on: {'Euler cluster' if is_euler else 'local machine'}")
+
+
+def log_year_counts(con: duckdb.DuckDBPyConnection, parquet_path: Path, label: str, use_wandb: bool = False, year_filter: str | None = None) -> None:
+    """Log per-year counts and ratios."""
+    escaped = str(parquet_path).replace("'", "''")
+    where_clause = f"WHERE {year_filter}" if year_filter else ""
+    rows = con.execute(
+        f"""
+        SELECT
+            year,
+            SUM(transition_01_win5) AS positives,
+            SUM(CASE WHEN transition_01_win5 = 0 THEN 1 ELSE 0 END) AS negatives,
+            COUNT(*) AS total,
+            CASE WHEN COUNT(*) > 0 THEN SUM(transition_01_win5)::DOUBLE / COUNT(*) ELSE 0 END AS pos_ratio,
+            CASE WHEN SUM(transition_01_win5) > 0 
+                 THEN SUM(CASE WHEN transition_01_win5 = 0 THEN 1 ELSE 0 END)::DOUBLE / SUM(transition_01_win5)
+                 ELSE 0 END AS neg_pos_ratio
+        FROM read_parquet('{escaped}')
+        {where_clause}
+        GROUP BY year
+        ORDER BY year
+        """
+    ).fetchall()
+
+    print(f"\n{label} per-year counts:")
+    for year, pos, neg, total, pos_ratio, neg_pos_ratio in rows:
+        print(f"  {year}: total={total:,} pos={pos:,} neg={neg:,} | pos_ratio={pos_ratio:.5f} neg/pos={neg_pos_ratio:.1f}")
+
+    if use_wandb:
+        wandb.log({f"{label.lower().replace(' ', '_')}/per_year_transition_01_win5": [
+            dict(year=y, positives=p, negatives=n, total=t, pos_ratio=r, neg_pos_ratio=npr) 
+            for y, p, n, t, r, npr in rows
+        ]})
+
+
+def main(split_version: str = 'main') -> None:
+    start_time = time.time()
+
+    # Get split configuration
+    if split_version not in SPLIT_CONFIGS:
+        raise ValueError(f"Invalid split_version: {split_version}. Must be one of: {list(SPLIT_CONFIGS.keys())}")
+    
+    config = SPLIT_CONFIGS[split_version]
+    TRAIN_YEAR_MAX = config['train_year_max']
+    EARLYSTOP_YEAR_MIN = config['earlystop_year_min']
+    EARLYSTOP_YEAR_MAX = config['earlystop_year_max']
+    
+    print(f"\n{'='*70}")
+    print(f"SPLIT VERSION: {split_version.upper()}")
+    print(f"{'='*70}")
+    print(f"Configuration: {config['description']}")
+    print(f"  TRAIN: year <= {TRAIN_YEAR_MAX}")
+    print(f"  EARLYSTOP: {EARLYSTOP_YEAR_MIN} <= year <= {EARLYSTOP_YEAR_MAX}")
+    print(f"{'='*70}\n")
+
+    wandb_api_key = os.environ.get("WANDB_API_KEY")
+    wandb_entity = os.environ.get("WANDB_ENTITY")
+    if not wandb_api_key:
+        print("Warning: WANDB_API_KEY not found in environment")
+    if not wandb_entity:
+        print("Warning: WANDB_ENTITY not found in environment (will use default)")
+    
+    use_wandb = False
+    try:
+        print("Initializing Weights & Biases...")
+        wandb.init(
+            project=WANDB_PROJECT,
+            entity=wandb_entity,
+            name=f"modelC_sample_{split_version}_{time.strftime('%Y%m%d_%H%M%S')}",
+            config={
+                "random_state": RANDOM_STATE,
+                "split_version": split_version,
+                "max_total_negatives": MAX_TOTAL_NEGATIVES,
+                "sampling_method": "uniform_across_years_train_only",
+                "exclude_year": 2000,
+                "train_year_max": TRAIN_YEAR_MAX,
+                "earlystop_year_min": EARLYSTOP_YEAR_MIN,
+                "earlystop_year_max": EARLYSTOP_YEAR_MAX,
+            },
+        )
+        use_wandb = True
+        print("W&B connected\n")
+    except Exception as err:
+        print(f"W&B initialization failed: {err}\n")
+
+    repo_root = Path(__file__).resolve().parents[4]
+    input_path = resolve_input(split_version)
+    
+    # Determine output location: prefer data/ml/tuning on scratch, else relative to input
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+    if scratch_root is not None:
+        # Use standard ML data location on scratch
+        base_dir = scratch_root / "data/ml"
+    else:
+        # Use repo location
+        base_dir = repo_root / "data/ml"
+    
+    # Create split-specific subdirectory
+    tuning_dir = base_dir / "tuning" / split_version
+    tuning_dir.mkdir(parents=True, exist_ok=True)
+    output_path = tuning_dir / "modelC_tuning_colombia.parquet"
+
+    print(f"\nInput: {input_path}")
+    print(f"Output: {output_path}")
+    print(f"Sampling strategy:")
+    print(f"  TRAIN set (year <= {TRAIN_YEAR_MAX}): Keep all positives, cap negatives at {MAX_TOTAL_NEGATIVES:,}")
+    print(f"  EARLYSTOP set ({EARLYSTOP_YEAR_MIN} <= year <= {EARLYSTOP_YEAR_MAX}): No sampling (true unbalanced)")
+
+    con = duckdb.connect()
+    configure_duckdb(con)
+
+    escaped_in = str(input_path).replace("'", "''")
+    escaped_out = str(output_path).replace("'", "''")
+
+    try:
+        # Sample SQL: 
+        # - TRAIN set (year <= TRAIN_YEAR_MAX): Keep all positives, cap negatives at MAX_TOTAL_NEGATIVES (uniform across years)
+        # - EARLYSTOP set (EARLYSTOP_YEAR_MIN <= year <= EARLYSTOP_YEAR_MAX): Keep all rows as-is (no sampling)
+        sample_sql = f"""
+        COPY (
+            WITH base AS (
+                SELECT *
+                FROM read_parquet('{escaped_in}')
+                WHERE year != 2000
+            ),
+            -- Split into train and earlystop sets
+            train_base AS (
+                SELECT * FROM base WHERE year <= {TRAIN_YEAR_MAX}
+            ),
+            earlystop_base AS (
+                SELECT * FROM base 
+                WHERE year >= {EARLYSTOP_YEAR_MIN} AND year <= {EARLYSTOP_YEAR_MAX}
+            ),
+            -- Calculate sampling budget for TRAIN set only
+            train_year_counts AS (
+                SELECT
+                    year,
+                    SUM(transition_01_win5) AS pos_count,
+                    SUM(CASE WHEN transition_01_win5 = 0 THEN 1 ELSE 0 END) AS neg_count
+                FROM train_base
+                GROUP BY year
+            ),
+            num_train_years AS (
+                SELECT COUNT(*) AS n_years FROM train_year_counts
+            ),
+            -- Calculate per-year negative quota for TRAIN set: distribute MAX_TOTAL_NEGATIVES uniformly across train years
+            train_neg_budget AS (
+                SELECT
+                    yc.year,
+                    yc.pos_count,
+                    yc.neg_count,
+                    LEAST(
+                        yc.neg_count,
+                        CAST(ROUND({MAX_TOTAL_NEGATIVES}::DOUBLE / ny.n_years) AS BIGINT)
+                    ) AS year_neg_budget
+                FROM train_year_counts yc
+                CROSS JOIN num_train_years ny
+            ),
+            -- TRAIN set: Keep all positives
+            train_positives AS (
+                SELECT * FROM train_base WHERE transition_01_win5 = 1
+            ),
+            -- TRAIN set: Prepare negative pool with per-year budgets and random ordering
+            train_neg_candidates AS (
+                SELECT
+                    b.*,
+                    nb.year_neg_budget,
+                    random() AS u
+                FROM train_base b
+                INNER JOIN train_neg_budget nb ON b.year = nb.year
+                WHERE b.transition_01_win5 = 0 AND nb.year_neg_budget > 0
+            ),
+            -- TRAIN set: Rank negatives randomly within each year
+            train_ranked_negs AS (
+                SELECT
+                    *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY year
+                        ORDER BY u
+                    ) AS neg_rank
+                FROM train_neg_candidates
+            ),
+            -- TRAIN set: Sample negatives up to budget per year
+            train_sampled_negs AS (
+                SELECT * EXCLUDE (
+                    year_neg_budget,
+                    u,
+                    neg_rank
+                )
+                FROM train_ranked_negs
+                WHERE neg_rank <= year_neg_budget
+            ),
+            -- Combine sampled train set
+            train_sampled AS (
+                SELECT * FROM train_positives
+                UNION ALL
+                SELECT * FROM train_sampled_negs
+            )
+            -- Final output: sampled train + unsampled earlystop
+            SELECT * FROM train_sampled
+            UNION ALL
+            SELECT * FROM earlystop_base
+        )
+        TO '{escaped_out}' (FORMAT PARQUET, COMPRESSION ZSTD)
+        """
+
+        print(f"\nCreating ModelC tuning sample...")
+        print(f"  TRAIN set (year <= {TRAIN_YEAR_MAX}): All positives kept; negatives capped at {MAX_TOTAL_NEGATIVES:,} total (uniform across years)")
+        print(f"  EARLYSTOP set ({EARLYSTOP_YEAR_MIN} <= year <= {EARLYSTOP_YEAR_MAX}): No sampling (all rows kept as-is)")
+        
+        # Set random seed for reproducible sampling
+        seed_value = RANDOM_STATE / 100.0
+        con.execute(f"SELECT setseed({seed_value})")
+        
+        sample_start = time.time()
+        con.execute(sample_sql)
+        print(f"Sample written in {time.time() - sample_start:.1f}s")
+
+        # Log counts for train and earlystop separately
+        print("\n" + "=" * 70)
+        print(f"TRAIN SET (year <= {TRAIN_YEAR_MAX}) - SAMPLED")
+        print("=" * 70)
+        log_year_counts(con, output_path, "TRAIN_SAMPLE", use_wandb, year_filter=f"year <= {TRAIN_YEAR_MAX}")
+        
+        print("\n" + "=" * 70)
+        print(f"EARLYSTOP SET ({EARLYSTOP_YEAR_MIN} <= year <= {EARLYSTOP_YEAR_MAX}) - UNSAMPLED")
+        print("=" * 70)
+        log_year_counts(con, output_path, "EARLYSTOP_UNSAMPLED", use_wandb, year_filter=f"year >= {EARLYSTOP_YEAR_MIN} AND year <= {EARLYSTOP_YEAR_MAX}")
+
+        # Check total rows
+        total_rows = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{escaped_out}')"
+        ).fetchone()[0]
+        
+        print(f"\nTotal rows: {total_rows:,}")
+        
+        # Check per-year distribution
+        print(f"\nPer-year distribution:")
+        year_stats = con.execute(
+            f"""
+            SELECT
+                year,
+                SUM(transition_01_win5) AS pos_count,
+                SUM(CASE WHEN transition_01_win5 = 0 THEN 1 ELSE 0 END) AS neg_count
+            FROM read_parquet('{escaped_out}')
+            GROUP BY year
+            ORDER BY year
+            """
+        ).fetchall()
+        
+        for year, pos, neg in year_stats:
+            print(f"  {year}: pos={pos:,} neg={neg:,} total={pos+neg:,}")
+        
+        # Overall statistics for train and earlystop separately
+        train_stats = con.execute(
+            f"""
+            SELECT
+                SUM(transition_01_win5) AS total_pos,
+                SUM(CASE WHEN transition_01_win5 = 0 THEN 1 ELSE 0 END) AS total_neg
+            FROM read_parquet('{escaped_out}')
+            WHERE year <= {TRAIN_YEAR_MAX}
+            """
+        ).fetchone()
+        train_pos, train_neg = train_stats
+        train_neg_pos_ratio = train_neg / train_pos if train_pos > 0 else 1.0
+        
+        earlystop_stats = con.execute(
+            f"""
+            SELECT
+                SUM(transition_01_win5) AS total_pos,
+                SUM(CASE WHEN transition_01_win5 = 0 THEN 1 ELSE 0 END) AS total_neg
+            FROM read_parquet('{escaped_out}')
+            WHERE year >= {EARLYSTOP_YEAR_MIN} AND year <= {EARLYSTOP_YEAR_MAX}
+            """
+        ).fetchone()
+        earlystop_pos, earlystop_neg = earlystop_stats
+        earlystop_neg_pos_ratio = earlystop_neg / earlystop_pos if earlystop_pos > 0 else 1.0
+        
+        overall_pos = train_pos + earlystop_pos
+        overall_neg = train_neg + earlystop_neg
+        overall_neg_pos_ratio = overall_neg / overall_pos if overall_pos > 0 else 1.0
+        
+        print(f"\n" + "=" * 70)
+        print("OVERALL CLASS BALANCE")
+        print("=" * 70)
+        print(f"\nTRAIN set (year <= {TRAIN_YEAR_MAX}) - SAMPLED:")
+        print(f"  Positives: {train_pos:,}")
+        print(f"  Negatives: {train_neg:,} (capped at {MAX_TOTAL_NEGATIVES:,})")
+        print(f"  Ratio (neg/pos): {train_neg_pos_ratio:.2f}")
+        print(f"  Total size: {train_pos + train_neg:,} rows")
+        
+        print(f"\nEARLYSTOP set ({EARLYSTOP_YEAR_MIN} <= year <= {EARLYSTOP_YEAR_MAX}) - UNSAMPLED:")
+        print(f"  Positives: {earlystop_pos:,}")
+        print(f"  Negatives: {earlystop_neg:,} (true unbalanced)")
+        print(f"  Ratio (neg/pos): {earlystop_neg_pos_ratio:.2f}")
+        print(f"  Total size: {earlystop_pos + earlystop_neg:,} rows")
+        
+        print(f"\nCOMBINED:")
+        print(f"  Positives: {overall_pos:,}")
+        print(f"  Negatives: {overall_neg:,}")
+        print(f"  Ratio (neg/pos): {overall_neg_pos_ratio:.2f}")
+        print(f"  Total size: {overall_pos + overall_neg:,} rows")
+
+        if use_wandb:
+            wandb.log({
+                "sample/total_rows": total_rows,
+                "sample/train_positives": train_pos,
+                "sample/train_negatives": train_neg,
+                "sample/train_neg_pos_ratio": train_neg_pos_ratio,
+                "sample/earlystop_positives": earlystop_pos,
+                "sample/earlystop_negatives": earlystop_neg,
+                "sample/earlystop_neg_pos_ratio": earlystop_neg_pos_ratio,
+                "sample/total_positives": overall_pos,
+                "sample/total_negatives": overall_neg,
+                "sample/neg_pos_ratio": overall_neg_pos_ratio,
+                "sample/max_total_negatives": MAX_TOTAL_NEGATIVES,
+                "timing/total_seconds": time.time() - start_time,
+            })
+        
+        print(f"\nDone. Total time: {time.time() - start_time:.1f}s")
+
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {e}"
+        print(f"\nERROR: {error_msg}")
+        if use_wandb:
+            wandb.log({"status": "failed", "error": error_msg})
+        raise
+    finally:
+        if use_wandb:
+            wandb.finish()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="ModelC sampling: create tuning dataset with balanced sampling"
+    )
+    parser.add_argument(
+        "--split-version",
+        type=str,
+        choices=list(SPLIT_CONFIGS.keys()),
+        default="main",
+        help=f"Split configuration to use. Choices: {', '.join(SPLIT_CONFIGS.keys())} (default: main)"
+    )
+    args = parser.parse_args()
+    
+    try:
+        main(split_version=args.split_version)
+    except Exception as e:
+        print(f"\nScript failed: {e}", file=sys.stderr)
+        sys.exit(1)
+

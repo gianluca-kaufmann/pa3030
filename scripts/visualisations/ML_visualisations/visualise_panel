@@ -1,0 +1,1855 @@
+#!/usr/bin/env python3
+"""
+Panel dataset diagnostic visualizations & Data Integrity Debugger.
+
+Added Features:
+- Temporal Feature Comparison: Subplots comparing geography of 2011 vs 2013 vs 2015.
+- Robust Data Integrity Scan: Automated detection of row-count crashes.
+- Missing Pixel Diagnostic: Intelligent detection and visualization of missing pixels in 2012-2014.
+
+Usage notes:
+- Sampling method (DuckDB `USING SAMPLE`):
+  - Default: bernoulli
+  - Override: set `PANEL_VIS_SAMPLE_METHOD=system` (or any value not containing 'bern')
+  - Example:
+    - `PANEL_VIS_SAMPLE_METHOD=bernoulli python3 scripts/ML/visualisations/visualise_panel`
+"""
+
+import os
+import socket
+import getpass
+import warnings
+import re
+import gc
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, List, Tuple, Dict
+from collections import defaultdict
+import glob
+
+import duckdb
+import matplotlib
+matplotlib.use("Agg")  # Headless-safe
+import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+from matplotlib.ticker import FuncFormatter
+import numpy as np
+import pandas as pd
+import seaborn as sns
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
+warnings.filterwarnings('ignore')
+
+# ==========================================================================================
+# PATH SETUP
+# ==========================================================================================
+ROOT_DIR = Path(__file__).resolve().parents[3]
+OUTPUT_DIR = ROOT_DIR / "outputs" / "south_america" / "figures" / "panel_visualisation"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+SCRATCH = os.environ.get("SCRATCH")
+
+def _sql_escape_string_literal(value: str) -> str:
+    """Escape a string for use inside single-quoted SQL string literals."""
+    return value.replace("'", "''")
+
+def quote_ident(name: str) -> str:
+    """DuckDB identifier quoting (double quotes)."""
+    return '"' + name.replace('"', '""') + '"'
+
+# Backwards-compatible alias (older code in this file used `q(...)`)
+q = quote_ident
+
+# SQL-expression overrides for specific features (used to sanitize known data issues in plots).
+# Key: feature name as it appears in the parquet schema
+# Value: SQL expression (unaliased) that evaluates to that feature.
+FEATURE_SQL_OVERRIDES: Dict[str, str] = {}
+
+def feature_sql(feature: str) -> str:
+    """Return SQL expression for a feature, applying any configured override."""
+    return FEATURE_SQL_OVERRIDES.get(feature, q(feature))
+
+def _resolve_panel_path_spec_to_abs(spec: str) -> str:
+    """
+    Resolve PANEL_FILE spec to an absolute path/pattern relative to repo root.
+
+    - If spec is absolute: keep as-is.
+    - If spec is relative (incl. './...'): interpret relative to ROOT_DIR.
+    """
+    spec = spec.strip()
+    if not spec:
+        return spec
+    p = Path(spec)
+    if p.is_absolute():
+        return str(p)
+    # Interpret relative paths as relative to repo root for reproducibility
+    return str((ROOT_DIR / p).resolve())
+
+def resolve_panel_spec() -> str:
+    """
+    Decide what parquet path/pattern DuckDB should read.
+
+    Supports:
+    - A single file path
+    - A directory (reads '*.parquet' within it)
+    - A glob pattern (e.g. '**/*scored*.parquet')
+    """
+    env_spec = (os.environ.get("PANEL_FILE") or "").strip()
+    if env_spec:
+        abs_spec = _resolve_panel_path_spec_to_abs(env_spec)
+        # If it's a directory, turn into a parquet glob
+        if Path(abs_spec).exists() and Path(abs_spec).is_dir():
+            abs_spec = str(Path(abs_spec) / "*.parquet")
+        # If it looks like a glob, ensure it matches something (best-effort)
+        if any(ch in abs_spec for ch in ["*", "?", "["]):
+            matches = glob.glob(abs_spec, recursive=True)
+            if len(matches) == 0:
+                raise FileNotFoundError(f"PANEL_FILE glob matched 0 files: {abs_spec}")
+        else:
+            if not Path(abs_spec).exists():
+                raise FileNotFoundError(f"PANEL_FILE not found: {abs_spec}")
+        return abs_spec
+
+    # Fallbacks (Euler scratch first, then repo)
+    candidate_paths = [
+        Path(SCRATCH) / "data" / "ml" / "merged_panel_final.parquet" if SCRATCH else None,
+        ROOT_DIR / "data" / "ml" / "merged_panel_final.parquet",
+    ]
+    panel_file = next((p for p in candidate_paths if p and p.exists()), None)
+    if not panel_file:
+        raise FileNotFoundError(f"Parquet not found. Searched: {[str(p) for p in candidate_paths if p]}")
+    return str(panel_file)
+
+PANEL_SPEC = resolve_panel_spec()
+
+# ==========================================================================================
+# HELPERS
+# ==========================================================================================
+def _parse_csv_list(raw: Optional[str]) -> List[str]:
+    """Parse comma-separated env-var lists (trims whitespace, drops empties)."""
+    if raw is None:
+        return []
+    return [x.strip() for x in str(raw).split(",") if x.strip()]
+
+def _parse_csv_int_list(raw: Optional[str]) -> List[int]:
+    """Parse comma-separated env-var lists into ints (raises on invalid entries)."""
+    out: List[int] = []
+    for token in _parse_csv_list(raw):
+        try:
+            out.append(int(token))
+        except Exception as e:
+            raise ValueError(f"Invalid integer in CSV list: {token!r}") from e
+    return out
+
+def resolve_temporal_sample_pcts() -> Tuple[float, float]:
+    """
+    Resolve temporal plot sampling rates.
+
+    Env vars:
+    - PANEL_VIS_TEMPORAL_SAMPLE_PCT: default 2.0
+    - PANEL_VIS_DENSITY_SAMPLE_PCT: default = PANEL_VIS_TEMPORAL_SAMPLE_PCT
+    """
+    temporal = float(os.environ.get("PANEL_VIS_TEMPORAL_SAMPLE_PCT", "2.0"))
+    density = float(os.environ.get("PANEL_VIS_DENSITY_SAMPLE_PCT", str(temporal)))
+    return temporal, density
+
+def resolve_sample_method() -> str:
+    # Default to Bernoulli sampling (more stable for approximate sampling across partitions).
+    raw = (os.environ.get("PANEL_VIS_SAMPLE_METHOD") or "bernoulli").lower()
+    return "bernoulli" if "bern" in raw else "system"
+
+def resolve_coord_cols(cols: List[str]) -> Tuple[str, str]:
+    """
+    Choose best-available coordinate columns for plotting.
+
+    Preference order:
+    - x/y
+    - lon/lat
+    - longitude/latitude
+    - easting/northing
+    - col/row (fallback to binned grid indices)
+    """
+    cset = set(cols)
+    for x, y in [("x", "y"), ("lon", "lat"), ("longitude", "latitude"), ("easting", "northing"), ("col", "row")]:
+        if x in cset and y in cset:
+            return x, y
+    # Last resort: keep current behavior (will raise a clearer error later)
+    return "col", "row"
+
+def _neutral_diverging_cmap() -> LinearSegmentedColormap:
+    """Diverging cmap with an explicit neutral midpoint (light gray/white)."""
+    return LinearSegmentedColormap.from_list(
+        "coolwarm_neutral_mid",
+        ["#3b4cc0", "#f2f2f2", "#b40426"],
+        N=256,
+    )
+
+def _is_numeric_duckdb_type(type_str: str) -> bool:
+    """Best-effort numeric type detection from DuckDB DESCRIBE column_type."""
+    t = (type_str or "").upper()
+    numeric_markers = [
+        "TINYINT", "SMALLINT", "INTEGER", "INT", "BIGINT", "HUGEINT",
+        "UTINYINT", "USMALLINT", "UINTEGER", "UBIGINT",
+        "FLOAT", "DOUBLE", "REAL", "DECIMAL",
+    ]
+    return any(m in t for m in numeric_markers)
+
+def panel_read_expr() -> str:
+    """
+    DuckDB relation expression for the panel parquet(s).
+
+    Key behavior:
+    - Always uses union_by_name=true to prevent schema-mismatch crashes when PANEL_FILE is a glob.
+    """
+    escaped = _sql_escape_string_literal(PANEL_SPEC)
+    return f"read_parquet('{escaped}', union_by_name=true)"
+
+def _parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
+
+def _configure_dist_wdpa_zero_recode(con, cols: List[str], label_col: Optional[str]) -> None:
+    """
+    Sanity check for dist_wdpa==0 and optionally treat them as missing in plots,
+    but ONLY under WDPA_prev==0 (risk set).
+
+    Behavior (env-configurable):
+    - PANEL_VIS_RECODE_DIST_WDPA_ZERO: 'auto' (default) | 1/true | 0/false
+    - PANEL_VIS_DIST_WDPA_ZERO_ABS_THRESHOLD: default 1000
+    - PANEL_VIS_DIST_WDPA_ZERO_RATIO_THRESHOLD: default 1e-4
+    """
+    if "dist_wdpa" not in cols or "WDPA_prev" not in cols:
+        return
+
+    # Counts
+    n_prev0_total = con.execute(
+        f"SELECT COUNT(*) FROM {panel_read_expr()} WHERE {q('WDPA_prev')} = 0"
+    ).fetchone()[0]
+    n_prev0_dist0 = con.execute(
+        f"SELECT COUNT(*) FROM {panel_read_expr()} WHERE {q('WDPA_prev')} = 0 AND {q('dist_wdpa')} = 0"
+    ).fetchone()[0]
+
+    n_pos_dist0 = None
+    if label_col and label_col in cols:
+        n_pos_total = con.execute(
+            f"SELECT COUNT(*) FROM {panel_read_expr()} WHERE {q(label_col)} = 1"
+        ).fetchone()[0]
+        n_pos_dist0 = con.execute(
+            f"SELECT COUNT(*) FROM {panel_read_expr()} WHERE {q(label_col)} = 1 AND {q('dist_wdpa')} = 0"
+        ).fetchone()[0]
+    else:
+        n_pos_total = None
+
+    ratio_prev0 = float(n_prev0_dist0) / max(int(n_prev0_total), 1)
+    if n_pos_total is not None:
+        ratio_pos = float(n_pos_dist0) / max(int(n_pos_total), 1)
+    else:
+        ratio_pos = None
+
+    print("\nWDPA distance sanity checks:")
+    print(f"  WDPA_prev==0 AND dist_wdpa==0: {n_prev0_dist0:,} / {n_prev0_total:,} ({ratio_prev0:.6%})")
+    if n_pos_total is not None and n_pos_dist0 is not None:
+        print(f"  transition_01==1 AND dist_wdpa==0: {n_pos_dist0:,} / {n_pos_total:,} ({ratio_pos:.6%})")
+
+    # Decide recode
+    mode = (os.environ.get("PANEL_VIS_RECODE_DIST_WDPA_ZERO") or "auto").strip().lower()
+    abs_thresh = int(os.environ.get("PANEL_VIS_DIST_WDPA_ZERO_ABS_THRESHOLD", "1000"))
+    ratio_thresh = float(os.environ.get("PANEL_VIS_DIST_WDPA_ZERO_RATIO_THRESHOLD", "1e-4"))
+
+    if mode in ("1", "true", "yes", "y", "on"):
+        enable = True
+        reason = "forced on by PANEL_VIS_RECODE_DIST_WDPA_ZERO"
+    elif mode in ("0", "false", "no", "n", "off"):
+        enable = False
+        reason = "forced off by PANEL_VIS_RECODE_DIST_WDPA_ZERO"
+    else:
+        enable = (n_prev0_dist0 >= abs_thresh) or (ratio_prev0 >= ratio_thresh)
+        reason = f"auto (abs>={abs_thresh} or ratio>={ratio_thresh})"
+
+    if enable:
+        # Treat dist_wdpa==0 as missing ONLY when WDPA_prev==0.
+        # This avoids turning legitimate zero distances into missing in other parts of the data.
+        FEATURE_SQL_OVERRIDES["dist_wdpa"] = (
+            f"CASE WHEN {q('WDPA_prev')} = 0 THEN NULLIF({q('dist_wdpa')}, 0) ELSE {q('dist_wdpa')} END"
+        )
+        print(f"  -> Applying plot-only recode for dist_wdpa zeros under WDPA_prev==0 ({reason}).")
+    else:
+        print(f"  -> Not recoding dist_wdpa zeros ({reason}).")
+
+def wb_log(data: dict):
+    if wandb and wandb.run: wandb.log(data)
+
+def wb_log_image(key: str, path: Path, caption: str):
+    if wandb and wandb.run:
+        try:
+            wandb.log({key: wandb.Image(str(path), caption=caption)})
+        except Exception as e:
+            print(f"W&B Image Log Error: {e}")
+
+def wb_log_artifact_pngs(output_dir: Path, artifact_name: Optional[str] = None):
+    """Log all PNGs in output_dir as a W&B Artifact for versioned lineage."""
+    if not (wandb and wandb.run):
+        return
+    pngs = sorted(output_dir.glob("*.png"))
+    if not pngs:
+        return
+    name = artifact_name or f"panel_visualisation_pngs_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    try:
+        art = wandb.Artifact(name=name, type="panel_visualisation")
+        for p in pngs:
+            art.add_file(str(p))
+        wandb.log_artifact(art)
+    except Exception as e:
+        print(f"W&B Artifact Log Error: {e}")
+
+# ==========================================================================================
+# DUCKDB CONFIGURATION
+# ==========================================================================================
+def get_con():
+    con = duckdb.connect()
+    is_euler = bool(os.environ.get("SCRATCH"))
+    cpus = int(os.environ.get("SLURM_CPUS_PER_TASK", "0"))
+    threads = cpus if cpus > 0 else (48 if is_euler else 4)
+    
+    mem_mb = os.environ.get("SLURM_MEM_PER_CPU")
+    limit_gb = (int(mem_mb) * cpus // 1024) if (mem_mb and cpus) else (128 if is_euler else 16)
+    
+    con.execute(f"SET threads={threads}")
+    con.execute(f"SET memory_limit='{limit_gb}GB'")
+    
+    tmp = Path(os.environ.get("SCRATCH", ROOT_DIR)) / "duckdb_temp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    tmp_sql = _sql_escape_string_literal(str(tmp))
+    con.execute(f"SET temp_directory='{tmp_sql}'")
+    return con
+
+# ==========================================================================================
+# TEMPORAL FEATURE COMPARISON (DEBUGGER)
+# ==========================================================================================
+def plot_temporal_feature_comparison(
+    con,
+    feature: str,
+    years=None,
+    show_density_diff: Optional[bool] = None,
+):
+    """
+    Compare geography of a feature across years, with a strict global color scale.
+
+    - Global color scale: 2nd/98th percentiles computed on the combined 3-year sample.
+    - Optional density-difference panel (2011 vs 2013) to highlight spatial loss during collapse.
+    """
+    print(f"Creating Temporal Comparison for {feature}...")
+    years = [2011, 2013, 2015] if years is None else list(years)
+    # Always use bernoulli for temporal integrity plots for consistency across runs/partitions.
+    method = "bernoulli"
+    sample_pct, dens_sample_pct = resolve_temporal_sample_pcts()
+    show_density_diff = bool(int(os.environ.get("PANEL_VIS_SHOW_DENSITY_DIFF", "1"))) if show_density_diff is None else show_density_diff
+    
+    # 0. Pick coordinates (avoid row/col if x/y or lon/lat exist)
+    schema = con.execute(f"DESCRIBE SELECT * FROM {panel_read_expr()} LIMIT 0").df()
+    cols = schema["column_name"].tolist()
+    cx, cy = resolve_coord_cols(cols)
+
+    # 1. Strict global color scale from combined 3-year sample (2nd/98th percentiles)
+    year_list = ",".join(str(int(y)) for y in years)
+    feat_expr = feature_sql(feature)
+    clip_query = f"""
+        SELECT
+            approx_quantile(val, 0.02) AS vmin,
+            approx_quantile(val, 0.98) AS vmax,
+            MIN(val) AS actual_min,
+            MAX(val) AS actual_max
+        FROM (
+            SELECT {feat_expr} AS val
+            FROM {panel_read_expr()}
+            WHERE year IN ({year_list}) AND {feat_expr} IS NOT NULL
+            USING SAMPLE {sample_pct}% ({method})
+        ) t
+    """
+    result = con.execute(clip_query).fetchone()
+    vmin, vmax, actual_min, actual_max = result
+    # Guard against degenerate / invalid color scales (prevents confusing empty plots or crashes).
+    if vmin is None or vmax is None:
+        print(
+            f"WARNING: Temporal comparison for {feature!r} (years={years}) "
+            f"returned vmin/vmax=None (vmin={vmin}, vmax={vmax}); skipping plot."
+        )
+        return
+    try:
+        vmin_f = float(vmin)
+        vmax_f = float(vmax)
+        actual_min_f = float(actual_min) if actual_min is not None else None
+        actual_max_f = float(actual_max) if actual_max is not None else None
+    except Exception as e:
+        print(
+            f"WARNING: Temporal comparison for {feature!r} (years={years}) "
+            f"could not cast vmin/vmax to float (vmin={vmin!r}, vmax={vmax!r}): {e}; skipping plot."
+        )
+        return
+    if (not np.isfinite(vmin_f)) or (not np.isfinite(vmax_f)) or (vmin_f > vmax_f):
+        print(
+            f"WARNING: Temporal comparison for {feature!r} (years={years}) has invalid scale "
+            f"(vmin={vmin_f}, vmax={vmax_f}); skipping plot."
+        )
+        return
+    
+    # Handle binary/sparse features where percentiles might be equal
+    # For binary features (e.g., oil_gas_b1, powerplants_b1), use actual min/max if percentiles are flat
+    if vmin_f == vmax_f:
+        if actual_min_f is not None and actual_max_f is not None and actual_min_f != actual_max_f:
+            # Use actual min/max for binary/sparse features
+            vmin, vmax = actual_min_f, actual_max_f
+            print(
+                f"Note: {feature!r} percentiles are flat (vmin=vmax={vmin_f}), "
+                f"using actual range [{actual_min_f}, {actual_max_f}] for visualization."
+            )
+        elif actual_min_f is not None and actual_max_f is not None and actual_min_f == actual_max_f:
+            # Feature is completely flat - create a small range around the value for visualization
+            center = actual_min_f
+            vmin = center - max(abs(center) * 0.01, 0.1) if center != 0 else -0.1
+            vmax = center + max(abs(center) * 0.01, 0.1) if center != 0 else 0.1
+            print(
+                f"Note: {feature!r} is completely flat (all values={center}), "
+                f"using artificial range [{vmin}, {vmax}] for visualization."
+            )
+        else:
+            print(
+                f"WARNING: Temporal comparison for {feature!r} (years={years}) has flat percentiles "
+                f"(vmin=vmax={vmin_f}) and no valid min/max; skipping plot."
+            )
+            return
+    else:
+        vmin, vmax = vmin_f, vmax_f
+
+    n_years = len(list(years))
+    # Layout: 1 row with per-year feature maps (+ optional density-diff column).
+    #
+    # NOTE: This function is designed to support 4+ years (wide panels). We scale
+    # figure width by column count and clamp to a configurable max to avoid
+    # absurdly-wide PNGs.
+    ncols = n_years + (1 if show_density_diff else 0)
+    fig_w_per_col = float(os.environ.get("PANEL_VIS_TEMP_FIG_W_PER_COL", "5.5"))
+    fig_w_min = float(os.environ.get("PANEL_VIS_TEMP_FIG_W_MIN", "12.0"))
+    fig_w_max = float(os.environ.get("PANEL_VIS_TEMP_FIG_W_MAX", "40.0"))
+    fig_h = float(os.environ.get("PANEL_VIS_TEMP_FIG_H", "6.0"))
+    fig_w = min(fig_w_max, max(fig_w_min, fig_w_per_col * float(ncols)))
+
+    # Compute global coordinate bounds once from coord-only sample (no feature filter)
+    # This ensures consistent axes across all subplots regardless of feature missingness
+    year_list = ",".join(str(int(y)) for y in years)
+    coord_bounds_query = f"""
+        SELECT 
+            MIN({q(cx)}) AS xmin,
+            MAX({q(cx)}) AS xmax,
+            MIN({q(cy)}) AS ymin,
+            MAX({q(cy)}) AS ymax
+        FROM {panel_read_expr()}
+        WHERE year IN ({year_list})
+        USING SAMPLE {sample_pct}% ({method})
+    """
+    coord_bounds = con.execute(coord_bounds_query).fetchone()
+    if coord_bounds and all(v is not None for v in coord_bounds):
+        xmin_global, xmax_global, ymin_global, ymax_global = [float(v) for v in coord_bounds]
+    else:
+        # Fallback: use a dummy query to get any available bounds
+        fallback_bounds = con.execute(
+            f"SELECT MIN({q(cx)}) AS xmin, MAX({q(cx)}) AS xmax, MIN({q(cy)}) AS ymin, MAX({q(cy)}) AS ymax FROM {panel_read_expr()} USING SAMPLE 0.1% ({method})"
+        ).fetchone()
+        if fallback_bounds and all(v is not None for v in fallback_bounds):
+            xmin_global, xmax_global, ymin_global, ymax_global = [float(v) for v in fallback_bounds]
+        else:
+            # Last resort: don't set limits
+            xmin_global = xmax_global = ymin_global = ymax_global = None
+
+    fig, axes = plt.subplots(1, ncols, figsize=(fig_w, fig_h), sharex=True, sharey=True)
+    if ncols == 1:
+        axes = [axes]
+    axes_feat = list(axes[:n_years])
+    ax_dens = axes[-1] if show_density_diff else None
+    
+    year_dfs: Dict[int, pd.DataFrame] = {}
+    for i, year in enumerate(years):
+        df = con.execute(f"""
+            SELECT {q(cy)} AS y, {q(cx)} AS x, {feat_expr} AS val
+            FROM {panel_read_expr()} 
+            WHERE year = {int(year)} AND {feat_expr} IS NOT NULL
+            USING SAMPLE {sample_pct}% ({method})
+        """).df()
+        year_dfs[int(year)] = df
+        
+        ax = axes_feat[i]
+        if not df.empty:
+            sc = ax.scatter(df['x'], df['y'], c=df['val'], s=0.1,
+                            cmap='viridis', vmin=vmin, vmax=vmax, rasterized=True)
+            ax.set_title(f"Year {year} (n={len(df):,})", fontsize=12)
+        else:
+            ax.set_title(f"Year {year} (EMPTY)", color='red')
+        
+        # Apply global coordinate limits to ensure consistent axes
+        if xmin_global is not None and xmax_global is not None:
+            ax.set_xlim(xmin_global, xmax_global)
+        if ymin_global is not None and ymax_global is not None:
+            ax.set_ylim(ymin_global, ymax_global)
+            
+        ax.set_aspect('equal')
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+
+    # 2. Optional density difference (2011 vs 2013)
+    if show_density_diff:
+        ax = ax_dens
+        if len(years) > 1:
+            y0, y1 = int(years[0]), int(years[1])
+        else:
+            y0 = y1 = int(years[0])
+        # IMPORTANT: density diff should reflect the risk set footprint (not just non-null feature rows)
+        a = con.execute(
+            f"""
+            SELECT {q(cy)} AS y, {q(cx)} AS x
+            FROM {panel_read_expr()}
+            WHERE year = {y0}
+            USING SAMPLE {dens_sample_pct}% ({method})
+            """
+        ).df()
+        b = con.execute(
+            f"""
+            SELECT {q(cy)} AS y, {q(cx)} AS x
+            FROM {panel_read_expr()}
+            WHERE year = {y1}
+            USING SAMPLE {dens_sample_pct}% ({method})
+            """
+        ).df()
+        if a.empty or b.empty:
+            ax.set_title(f"Density diff ({y0} vs {y1}) (EMPTY)", color="red")
+        else:
+            x_all = pd.concat([a["x"], b["x"]], ignore_index=True)
+            y_all = pd.concat([a["y"], b["y"]], ignore_index=True)
+            xmin, xmax = float(x_all.min()), float(x_all.max())
+            ymin, ymax = float(y_all.min()), float(y_all.max())
+
+            bins = int(os.environ.get("PANEL_VIS_DENSITY_BINS", "260"))
+            ha, xe, ye = np.histogram2d(a["x"].to_numpy(), a["y"].to_numpy(), bins=bins, range=[[xmin, xmax], [ymin, ymax]])
+            hb, _, _ = np.histogram2d(b["x"].to_numpy(), b["y"].to_numpy(), bins=[xe, ye])
+
+            da = ha / max(ha.sum(), 1.0)
+            db = hb / max(hb.sum(), 1.0)
+            diff = (da - db).T  # transpose for imshow orientation (y as rows)
+
+            # Use fixed symmetric color range for static layers (tolerates tiny fluctuations)
+            # Default: ±1e-4, configurable via env var
+            fixed_range = float(os.environ.get("PANEL_VIS_DENSITY_DIFF_RANGE", "1e-4"))
+            norm = TwoSlopeNorm(vmin=-fixed_range, vcenter=0.0, vmax=fixed_range)
+            im = ax.imshow(
+                diff,
+                origin="lower",
+                extent=[xmin, xmax, ymin, ymax],
+                cmap=_neutral_diverging_cmap(),
+                norm=norm,
+                interpolation="nearest",
+                rasterized=True,
+            )
+            ax.set_title(f"Density diff: {y0} - {y1}", fontsize=12)
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label("Δ density (normalized)")
+            # Add caption explaining static layer differences
+            ax.text(0.5, -0.08, "Static layer – differences reflect sampling & risk-set filtering", 
+                   transform=ax.transAxes, ha='center', fontsize=9, style='italic', color='gray')
+            # Apply global coordinate limits (use computed bounds or fallback to data bounds)
+            if xmin_global is not None and xmax_global is not None:
+                ax.set_xlim(xmin_global, xmax_global)
+            else:
+                ax.set_xlim(xmin, xmax)
+            if ymin_global is not None and ymax_global is not None:
+                ax.set_ylim(ymin_global, ymax_global)
+            else:
+                ax.set_ylim(ymin, ymax)
+        # Even if empty, apply global limits if available
+        if xmin_global is not None and xmax_global is not None:
+            ax.set_xlim(xmin_global, xmax_global)
+        if ymin_global is not None and ymax_global is not None:
+            ax.set_ylim(ymin_global, ymax_global)
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+
+    title = f"Temporal Integrity Check: {feature} ({' vs '.join(map(str, years))})"
+    plt.suptitle(title, fontsize=15, fontweight='bold')
+    # Reserve space for a single shared colorbar for the feature maps.
+    fig.subplots_adjust(right=0.92)
+    cbar_ax = fig.add_axes([0.94, 0.15, 0.015, 0.7])
+    fig.colorbar(
+        plt.cm.ScalarMappable(norm=plt.Normalize(vmin, vmax), cmap="viridis"),
+        cax=cbar_ax,
+        label=feature,
+    )
+    
+    out_path = OUTPUT_DIR / f"integrity_temporal_comparison_{feature}.png"
+    plt.savefig(out_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    wb_log_image(f"plots/temporal_comp_{feature}", out_path, f"Temporal comparison for {feature}")
+
+# ==========================================================================================
+# STANDARD PLOTS (OPTIMIZED)
+# ==========================================================================================
+def plot_time_series(con, label_col):
+    print("Creating time series...")
+    query = f"""
+        SELECT year, COUNT(*) AS rows, 
+        {f"SUM(CASE WHEN {q(label_col)} = 1 THEN 1 ELSE 0 END)" if label_col else "0"} AS pos
+        FROM {panel_read_expr()} GROUP BY year ORDER BY year
+    """
+    df = con.execute(query).df()
+    
+    # Exclude year 2000 to prevent it from overshadowing other years
+    df_filtered = df[df['year'] != 2000].copy()
+    
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+    ax1.plot(df_filtered['year'], df_filtered['rows'], color='tab:blue', marker='o', label='Total Rows')
+    ax1.set_ylabel('Risk Set Size', color='tab:blue')
+    ax1.set_ylim(bottom=0)
+    if label_col:
+        ax2 = ax1.twinx()
+        ax2.bar(df_filtered['year'], df_filtered['pos'], color='tab:orange', alpha=0.4, label='Positives')
+        ax2.set_ylabel('Positives', color='tab:orange')
+        # Use linear scale (log scale removed)
+        ax2.set_ylim(bottom=0)
+    plt.title("Risk set size by year (shrinks as pixels become protected) - Year 2000 excluded")
+    out = OUTPUT_DIR / "time_series.png"
+    plt.savefig(out, dpi=300); plt.close()
+    return out
+
+def plot_spatial_map(con, label_col):
+    if not label_col: return None
+    print("Creating spatial map...")
+    # Spatial map: force Bernoulli sampling for stability/consistency across partitions.
+    method = "bernoulli"
+    schema = con.execute(f"DESCRIBE SELECT * FROM {panel_read_expr()} LIMIT 0").df()
+    cols = schema["column_name"].tolist()
+    cx, cy = resolve_coord_cols(cols)
+
+    # Get all available years from the data (year-complete)
+    years_query = f"""
+        SELECT DISTINCT year
+        FROM {panel_read_expr()}
+        WHERE {q(label_col)} IS NOT NULL
+        ORDER BY year
+    """
+    years_df = con.execute(years_query).df()
+    if years_df.empty:
+        print("WARNING: No years found with label data; skipping spatial map.")
+        return None
+    
+    all_years = sorted(years_df['year'].tolist())
+    # Optional: allow filtering via env var, but default to all years
+    map_years_raw = os.environ.get("PANEL_VIS_MAP_YEARS", "").strip()
+    if map_years_raw:
+        try:
+            requested_years = [int(y.strip()) for y in map_years_raw.split(",") if y.strip()]
+            # Filter to only years that exist in data
+            map_years = [y for y in requested_years if y in all_years]
+            if not map_years:
+                print(f"WARNING: None of requested years {requested_years} found in data; using all years.")
+                map_years = all_years
+        except Exception:
+            map_years = all_years
+    else:
+        map_years = all_years
+
+    # Optional risk-set predicate (only if WDPA_prev exists)
+    has_wdpa_prev = "WDPA_prev" in set(cols)
+    bg_mode_raw = (os.environ.get("PANEL_VIS_BG_MODE") or "all").strip().lower()
+    risk_pred = ""
+    if bg_mode_raw in ("risk_set", "riskset", "risk") and has_wdpa_prev:
+        risk_pred = f" AND {q('WDPA_prev')} = 0"
+    elif bg_mode_raw in ("risk_set", "riskset", "risk") and not has_wdpa_prev:
+        print("WARNING: PANEL_VIS_BG_MODE=risk_set requested but 'WDPA_prev' not in schema; ignoring risk_set filter.")
+
+    pos_sample_pct = float(os.environ.get("PANEL_VIS_POS_SAMPLE_PCT", "10.0"))
+
+    # Create compact grid layout (one panel per year, no overlay)
+    n_years = len(map_years)
+    if n_years == 0:
+        print("WARNING: No years to plot; skipping spatial map.")
+        return None
+    
+    # Calculate grid dimensions for compact layout
+    ncols = int(np.ceil(np.sqrt(n_years)))
+    nrows = int(np.ceil(n_years / ncols))
+    
+    # Adjust figure size based on number of panels
+    fig_w_per_col = float(os.environ.get("PANEL_VIS_SPATIAL_FIG_W_PER_COL", "4.0"))
+    fig_h_per_row = float(os.environ.get("PANEL_VIS_SPATIAL_FIG_H_PER_ROW", "3.5"))
+    fig_w = min(20.0, max(8.0, fig_w_per_col * ncols))
+    fig_h = min(16.0, max(6.0, fig_h_per_row * nrows))
+    
+    fig, axes = plt.subplots(nrows, ncols, figsize=(fig_w, fig_h), sharex=True, sharey=True)
+    if n_years == 1:
+        axes = [axes]
+    elif nrows == 1:
+        axes = axes if isinstance(axes, np.ndarray) else [axes]
+    else:
+        axes = axes.ravel()
+    
+    for i, year in enumerate(map_years):
+        ax = axes[i]
+        
+        # Plot only positives for this year (no background overlay to avoid blurriness)
+        pos = con.execute(
+            f"""
+            WITH pos AS (
+              SELECT {q(cx)} AS x, {q(cy)} AS y
+              FROM {panel_read_expr()}
+              WHERE year = {int(year)} AND {q(label_col)} = 1{risk_pred}
+            )
+            SELECT DISTINCT x, y
+            FROM pos
+            USING SAMPLE {pos_sample_pct}% (bernoulli)
+            """
+        ).df()
+
+        if not pos.empty:
+            ax.scatter(pos["x"], pos["y"], s=0.5, c="red", alpha=0.6, rasterized=True)
+            ax.set_title(f"Year {year}: {len(pos):,} positives", fontsize=10)
+        else:
+            ax.set_title(f"Year {year}: no positives", fontsize=10, color='gray')
+        
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+
+    # Hide unused panels
+    for j in range(n_years, len(axes)):
+        axes[j].axis("off")
+
+    plt.suptitle(
+        f"Spatial positives by year (year-complete, one panel per year) | "
+        f"years={map_years} | pos_sample={pos_sample_pct}% ({method})",
+        fontsize=12,
+        fontweight="bold",
+    )
+    out = OUTPUT_DIR / "spatial_map.png"
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.savefig(out, dpi=300); plt.close()
+    return out
+
+def plot_continent_feature_maps(con, cols: List[str], col_type_map: Dict[str, str]):
+    """
+    Create continent-wide maps with a different feature visualized each year.
+    
+    Features are selected from those NOT already used in temporal comparisons:
+    - Avoids: dist_wdpa, dist_oil_gas, dist_powerplant, dist_road, GSN_b1, 
+              NDVI_b1_smooth64, HNTL_b1_smooth64
+    - Prefers: elevation, WorldClim, deforestation, gdp, GPW, landcover, 
+               VIIRS, wildfire, WDPA_b1
+    """
+    print("Creating continent-wide feature maps (one feature per year)...")
+    
+    # Get all available years
+    years_query = f"""
+        SELECT DISTINCT year
+        FROM {panel_read_expr()}
+        ORDER BY year
+    """
+    years_df = con.execute(years_query).df()
+    if years_df.empty:
+        print("WARNING: No years found; skipping continent feature maps.")
+        return None
+    
+    all_years = sorted(years_df['year'].tolist())
+    
+    # Features already used in temporal comparisons (to avoid)
+    excluded_features = {
+        "dist_wdpa", "dist_oil_gas", "dist_powerplant", "dist_road",
+        "GSN_b1", "NDVI_b1_smooth64", "HNTL_b1_smooth64",
+        # Also exclude base versions if smoothed versions are used
+        "NDVI_b1", "HNTL_b1"
+    }
+    
+    # Priority list of features to visualize (in order of preference)
+    # These are features NOT currently visualized in temporal comparisons
+    feature_priority = [
+        "elevation_b1",
+        "GPW_b1",  # Population density
+        "gdp_b1",  # GDP
+        "WorldClim_b1",  # Temperature/annual mean
+        "WorldClim_b12",  # Annual precipitation
+        "deforestation_b1",
+        "landcover_b1",
+        "wildfire_b1",
+        "VIIRS_b1",  # Fire detection
+        "WDPA_b1",  # Protected areas
+        "elevation_b2",
+        "WorldClim_b2",  # Mean diurnal range
+        "WorldClim_b4",  # Temperature seasonality
+        "deforestation_b2",
+        "wildfire_b2",
+    ]
+    
+    # Filter to only features that exist in the dataset and are numeric
+    available_features = []
+    for feat in feature_priority:
+        if feat in cols and feat not in excluded_features:
+            t = str(col_type_map.get(feat, ""))
+            if _is_numeric_duckdb_type(t):
+                available_features.append(feat)
+    
+    # If we don't have enough priority features, add other numeric features
+    if len(available_features) < len(all_years):
+        for col in cols:
+            if col not in excluded_features and col not in available_features:
+                t = str(col_type_map.get(col, ""))
+                if _is_numeric_duckdb_type(t):
+                    # Skip coordinate and metadata columns
+                    if col not in {'year', 'x', 'y', 'row', 'col', 'lon', 'lat', 
+                                   'longitude', 'latitude', 'easting', 'northing',
+                                   'transition_01', 'WDPA_prev'}:
+                        available_features.append(col)
+                        if len(available_features) >= len(all_years):
+                            break
+    
+    if len(available_features) == 0:
+        print("WARNING: No suitable features found for continent maps; skipping.")
+        return None
+    
+    # Assign features to years (cycle if more years than features)
+    year_feature_map = {}
+    for i, year in enumerate(all_years):
+        feat_idx = i % len(available_features)
+        year_feature_map[year] = available_features[feat_idx]
+    
+    print(f"  Mapping {len(all_years)} years to {len(set(year_feature_map.values()))} unique features")
+    
+    # Get coordinate columns
+    cx, cy = resolve_coord_cols(cols)
+    
+    # Sampling configuration
+    method = "bernoulli"
+    sample_pct = float(os.environ.get("PANEL_VIS_CONTINENT_SAMPLE_PCT", "2.0"))
+    
+    # Calculate grid dimensions
+    n_years = len(all_years)
+    ncols = int(np.ceil(np.sqrt(n_years)))
+    nrows = int(np.ceil(n_years / ncols))
+    
+    # Figure size
+    fig_w_per_col = float(os.environ.get("PANEL_VIS_CONTINENT_FIG_W_PER_COL", "4.5"))
+    fig_h_per_row = float(os.environ.get("PANEL_VIS_CONTINENT_FIG_H_PER_ROW", "4.0"))
+    fig_w = min(24.0, max(10.0, fig_w_per_col * ncols))
+    fig_h = min(20.0, max(8.0, fig_h_per_row * nrows))
+    
+    fig, axes = plt.subplots(nrows, ncols, figsize=(fig_w, fig_h), sharex=True, sharey=True)
+    if n_years == 1:
+        axes = [axes]
+    elif nrows == 1:
+        axes = axes if isinstance(axes, np.ndarray) else [axes]
+    else:
+        axes = axes.ravel()
+    
+    # Get global coordinate bounds for consistent axes
+    coord_bounds_query = f"""
+        SELECT 
+            MIN({q(cx)}) AS xmin,
+            MAX({q(cx)}) AS xmax,
+            MIN({q(cy)}) AS ymin,
+            MAX({q(cy)}) AS ymax
+        FROM {panel_read_expr()}
+        USING SAMPLE {sample_pct}% ({method})
+    """
+    coord_bounds = con.execute(coord_bounds_query).fetchone()
+    if coord_bounds and all(v is not None for v in coord_bounds):
+        xmin_global, xmax_global, ymin_global, ymax_global = [float(v) for v in coord_bounds]
+    else:
+        xmin_global = xmax_global = ymin_global = ymax_global = None
+    
+    # Precompute color scales for each unique feature (ensures consistency if same feature appears in multiple years)
+    unique_features = list(set(year_feature_map.values()))
+    feature_scales = {}
+    print(f"  Precomputing color scales for {len(unique_features)} unique features...")
+    for feature in unique_features:
+        feat_expr = feature_sql(feature)
+        # Compute global scale (2nd/98th percentiles across all years for this feature)
+        global_scale_query = f"""
+            SELECT
+                approx_quantile(val, 0.02) AS vmin,
+                approx_quantile(val, 0.98) AS vmax
+            FROM (
+                SELECT {feat_expr} AS val
+                FROM {panel_read_expr()}
+                WHERE {feat_expr} IS NOT NULL
+                USING SAMPLE {sample_pct}% ({method})
+            ) t
+        """
+        scale_result = con.execute(global_scale_query).fetchone()
+        if scale_result and scale_result[0] is not None and scale_result[1] is not None:
+            vmin, vmax = float(scale_result[0]), float(scale_result[1])
+            # Handle flat features
+            if vmin == vmax:
+                actual_range = con.execute(f"""
+                    SELECT MIN({feat_expr}) AS vmin, MAX({feat_expr}) AS vmax
+                    FROM {panel_read_expr()}
+                    WHERE {feat_expr} IS NOT NULL
+                    USING SAMPLE {sample_pct}% ({method})
+                """).fetchone()
+                if actual_range and actual_range[0] is not None and actual_range[1] is not None:
+                    vmin, vmax = float(actual_range[0]), float(actual_range[1])
+                    if vmin == vmax:
+                        vmin, vmax = vmin - 0.1, vmax + 0.1
+            feature_scales[feature] = (vmin, vmax)
+        else:
+            # Will fall back to per-year range if needed
+            feature_scales[feature] = None
+    
+    # Plot each year with its assigned feature
+    for i, year in enumerate(all_years):
+        ax = axes[i]
+        feature = year_feature_map[year]
+        feat_expr = feature_sql(feature)
+        
+        # Get data for this year and feature
+        df = con.execute(f"""
+            SELECT {q(cy)} AS y, {q(cx)} AS x, {feat_expr} AS val
+            FROM {panel_read_expr()} 
+            WHERE year = {int(year)} AND {feat_expr} IS NOT NULL
+            USING SAMPLE {sample_pct}% ({method})
+        """).df()
+        
+        if not df.empty:
+            # Use precomputed scale if available, otherwise fall back to year-specific range
+            scale = feature_scales.get(feature)
+            if scale is not None:
+                vmin, vmax = scale
+            else:
+                # Fallback to data range for this year
+                vmin, vmax = float(df['val'].min()), float(df['val'].max())
+                if vmin == vmax:
+                    vmin, vmax = vmin - 0.1, vmax + 0.1
+            
+            # Plot scatter
+            sc = ax.scatter(df['x'], df['y'], c=df['val'], s=0.1,
+                           cmap='viridis', vmin=vmin, vmax=vmax, rasterized=True)
+            ax.set_title(f"Year {year}: {feature}\n(n={len(df):,})", fontsize=10, fontweight='bold')
+        else:
+            ax.set_title(f"Year {year}: {feature}\n(EMPTY)", color='red', fontsize=10, fontweight='bold')
+        
+        # Apply global coordinate limits
+        if xmin_global is not None and xmax_global is not None:
+            ax.set_xlim(xmin_global, xmax_global)
+        if ymin_global is not None and ymax_global is not None:
+            ax.set_ylim(ymin_global, ymax_global)
+        
+        ax.set_aspect('equal')
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+    
+    # Hide unused panels
+    for j in range(n_years, len(axes)):
+        axes[j].axis("off")
+    
+    plt.suptitle(
+        f"Continent-wide Feature Maps (one feature per year) | "
+        f"sample={sample_pct}% ({method})",
+        fontsize=14,
+        fontweight="bold",
+    )
+    
+    # Add shared colorbar (using viridis for all)
+    fig.subplots_adjust(right=0.92)
+    cbar_ax = fig.add_axes([0.94, 0.15, 0.015, 0.7])
+    # Use a representative scale for the colorbar (will vary by panel, but shows the concept)
+    fig.colorbar(
+        plt.cm.ScalarMappable(norm=plt.Normalize(0, 1), cmap="viridis"),
+        cax=cbar_ax,
+        label="Feature value (varies by panel)",
+    )
+    
+    out = OUTPUT_DIR / "continent_feature_maps.png"
+    plt.tight_layout(rect=[0, 0, 0.92, 0.96])
+    plt.savefig(out, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    wb_log_image("plots/continent_feature_maps", out, 
+                 f"Continent-wide feature maps: {len(set(year_feature_map.values()))} unique features across {len(all_years)} years")
+    print(f"  Saved: {out}")
+    return out
+
+# ==========================================================================================
+# CLASS SEPARATION + FEATURE SELECTION
+# ==========================================================================================
+def _is_near_flat(var_samp: float, q02: float, q98: float) -> bool:
+    """Exclude exactly-flat or effectively-flat features (e.g., var_samp≈0, tiny percentile spread)."""
+    if q02 is None or q98 is None or np.isnan(q02) or np.isnan(q98):
+        return True
+    if var_samp is not None and (not np.isnan(var_samp)) and var_samp <= 0:
+        return True
+    spread = float(q98) - float(q02)
+    # Scale-aware threshold: require some meaningful spread relative to magnitude
+    scale = max(abs(float(q02)), abs(float(q98)), 1.0)
+    return spread <= (1e-6 * scale)
+
+_FEATURE_ROOT_SUFFIX_RE = re.compile(r"(?:_smooth\d+|_b\d+)$")
+
+def _feature_root_name(name: str) -> str:
+    """
+    Root grouping key for feature variants.
+
+    Strips trailing suffixes repeatedly:
+    - '_smooth\\d+' (smoothed variants)
+    - '_b\\d+'      (band variants)
+    """
+    root = str(name)
+    while True:
+        new = _FEATURE_ROOT_SUFFIX_RE.sub("", root)
+        if new == root:
+            return root
+        root = new
+
+def _spread_02_98_map(
+    con,
+    features: List[str],
+    sample_pct: float,
+    method: str,
+) -> Dict[str, float]:
+    """
+    Robust variance proxy per feature: (q98 - q02) on a sampled scan.
+    Returns feature -> spread; missing/invalid spreads map to -inf.
+    """
+    if not features:
+        return {}
+    sample_pct = float(sample_pct)
+    method = str(method)
+
+    select_exprs: List[str] = []
+    for c in features:
+        base_expr = feature_sql(c)
+        val = f"CAST(({base_expr}) AS DOUBLE)"
+        val_clean = f"CASE WHEN {val} IS NOT NULL AND {val} = {val} AND abs({val}) < 1e308 THEN {val} ELSE NULL END"
+        select_exprs.append(f"approx_quantile({val_clean}, 0.02) AS {q(c + '__q02')}")
+        select_exprs.append(f"approx_quantile({val_clean}, 0.98) AS {q(c + '__q98')}")
+
+    query = f"""
+        SELECT
+            {", ".join(select_exprs)}
+        FROM {panel_read_expr()}
+        USING SAMPLE {sample_pct}% ({method})
+    """
+    row = con.execute(query).fetchone()
+    if row is None:
+        return {c: float("-inf") for c in features}
+    colnames = [d[0] for d in con.description]
+    stats_map = dict(zip(colnames, row))
+
+    out: Dict[str, float] = {}
+    for c in features:
+        q02 = stats_map.get(c + "__q02")
+        q98 = stats_map.get(c + "__q98")
+        try:
+            if q02 is None or q98 is None or np.isnan(q02) or np.isnan(q98):
+                out[c] = float("-inf")
+            else:
+                out[c] = float(q98) - float(q02)
+        except Exception:
+            out[c] = float("-inf")
+    return out
+
+def _deduplicate_features(cols: List[str], con=None) -> List[str]:
+    """
+    Deduplicate feature variants for plotting.
+
+    Groups by root name (stripping '_smooth\\d+' and '_b\\d+').
+    Keeps:
+    - The raw/root column if present (exact match), else
+    - The variant with the highest robust spread (q98-q02), estimated on a small sample scan.
+    """
+    cols = [c for c in (cols or []) if c]
+    if not cols:
+        return []
+
+    cols_set = set(cols)
+    groups = defaultdict(list)
+    for c in cols:
+        groups[_feature_root_name(c)].append(c)
+
+    chosen: Dict[str, str] = {}
+    need_spread: List[str] = []
+    for root, cands in groups.items():
+        if root in cols_set:
+            chosen[root] = root
+        elif len(cands) == 1:
+            chosen[root] = cands[0]
+        else:
+            need_spread.extend(cands)
+
+    spread_map: Dict[str, float] = {}
+    if con is not None and need_spread:
+        dedup_sample_pct = float(os.environ.get("PANEL_VIS_DEDUP_SAMPLE_PCT", "0.5"))
+        spread_map = _spread_02_98_map(
+            con,
+            list(dict.fromkeys(need_spread)),
+            sample_pct=dedup_sample_pct,
+            method=resolve_sample_method(),
+        )
+
+    for root, cands in groups.items():
+        if root in chosen:
+            continue
+        if con is None:
+            chosen[root] = sorted(cands)[0]
+        else:
+            chosen[root] = max(cands, key=lambda c: spread_map.get(c, float("-inf")))
+
+    out: List[str] = []
+    seen = set()
+    for c in cols:
+        root = _feature_root_name(c)
+        if chosen.get(root) == c and c not in seen:
+            out.append(c)
+            seen.add(c)
+    return out
+
+def _select_top_variance_features(
+    con,
+    numeric_cols: List[str],
+    max_features: int = 4,
+    sample_pct: float = 2.0,
+    method: Optional[str] = None,
+) -> List[str]:
+    """
+    Pick top-variance features, strictly skipping flat/near-flat ones.
+    Returns up to max_features.
+    """
+    if not numeric_cols:
+        return []
+    method = method or resolve_sample_method()
+    sample_pct = float(sample_pct)
+
+    # IMPORTANT: compute all aggregates in a single scan (avoid per-column scans).
+    # NOTE: DuckDB can throw OutOfRange for VARSAMP on extreme-value columns; for robustness
+    # we rank by robust percentile spread instead of variance.
+    select_exprs = []
+    for c in numeric_cols:
+        base_expr = feature_sql(c)
+        val = f"CAST(({base_expr}) AS DOUBLE)"
+        # Filter NaN/Inf and extreme magnitudes to keep quantiles stable
+        val_clean = f"CASE WHEN {val} IS NOT NULL AND {val} = {val} AND abs({val}) < 1e308 THEN {val} ELSE NULL END"
+        select_exprs.append(f"approx_quantile({val_clean}, 0.02) AS {q(c + '__q02')}")
+        select_exprs.append(f"approx_quantile({val_clean}, 0.98) AS {q(c + '__q98')}")
+
+    query = f"""
+        SELECT
+            {", ".join(select_exprs)}
+        FROM {panel_read_expr()}
+        USING SAMPLE {sample_pct}% ({method})
+    """
+    row = con.execute(query).fetchone()
+    if row is None:
+        return []
+    colnames = [d[0] for d in con.description]
+    stats_map = dict(zip(colnames, row))
+
+    records = []
+    for c in numeric_cols:
+        q02 = stats_map.get(c + "__q02")
+        q98 = stats_map.get(c + "__q98")
+        spread = (float(q98) - float(q02)) if (q02 is not None and q98 is not None and not np.isnan(q02) and not np.isnan(q98)) else np.nan
+        records.append({"feature": c, "q02": q02, "q98": q98, "spread_02_98": spread})
+    stats = pd.DataFrame.from_records(records)
+    stats["is_flat"] = stats.apply(lambda r: _is_near_flat(None, r["q02"], r["q98"]), axis=1)
+    stats = stats[~stats["is_flat"]].copy()
+    stats = stats.sort_values("spread_02_98", ascending=False)
+    return stats["feature"].head(max_features).tolist()
+
+def _auto_scale_transform(values: np.ndarray, skew_thresh: float = 2.0):
+    """
+    Decide scaling mode for plotting feature distributions.
+    Returns (mode, forward, inverse, formatter) where mode in {'linear','log1p','symlog'}.
+    """
+    s = pd.Series(values).dropna()
+    if s.empty:
+        return "linear", (lambda x: x), (lambda x: x), None
+    skew = float(s.skew())
+    if abs(skew) < float(skew_thresh):
+        return "linear", (lambda x: x), (lambda x: x), None
+
+    vmin = float(s.min())
+    if vmin >= 0:
+        fwd = np.log1p
+        inv = np.expm1
+        fmt = FuncFormatter(lambda t, pos: f"{inv(t):.3g}")
+        return "log1p", fwd, inv, fmt
+    # Mixed-sign: prefer symlog on axis (keeps units)
+    return "symlog", (lambda x: x), (lambda x: x), None
+
+def plot_class_separation(con, label_col: str, numeric_cols: List[str]):
+    if not label_col:
+        return None
+    print("Creating class separation plot...")
+    method = resolve_sample_method()
+    sample_pct = float(os.environ.get("PANEL_VIS_CLASSSEP_SAMPLE_PCT", "1.0"))
+    skew_thresh = float(os.environ.get("PANEL_VIS_SKEW_THRESH", "2.0"))
+    scale_mode = (os.environ.get("PANEL_VIS_SCALE_MODE") or "auto").lower()
+
+    # Prevent redundant plots across smoothed/band variants.
+    numeric_cols = _deduplicate_features(numeric_cols, con=con)
+    feats = _select_top_variance_features(con, numeric_cols, max_features=4, sample_pct=sample_pct, method=method)
+    if not feats:
+        print("Class separation: no non-flat numeric features found; skipping.")
+        return None
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    axes = axes.ravel()
+    for i, feat in enumerate(feats):
+        ax = axes[i]
+        feat_expr = feature_sql(feat)
+        df = con.execute(
+            f"""
+            SELECT {q(label_col)} AS label, {feat_expr} AS val
+            FROM {panel_read_expr()}
+            WHERE {q(label_col)} IS NOT NULL AND {feat_expr} IS NOT NULL
+            USING SAMPLE {sample_pct}% ({method})
+            """
+        ).df()
+        if df.empty:
+            ax.set_title(f"{feat} (EMPTY)", color="red")
+            continue
+
+        vals = df["val"].to_numpy(dtype=float, copy=False)
+        mode, fwd, inv, fmt = _auto_scale_transform(vals, skew_thresh=skew_thresh) if scale_mode == "auto" else ("linear", (lambda x: x), (lambda x: x), None)
+        df["val_plot"] = fwd(df["val"].astype(float))
+
+        sns.histplot(
+            data=df,
+            x="val_plot",
+            hue="label",
+            stat="density",
+            common_norm=False,
+            element="step",
+            fill=False,
+            bins=60,
+            ax=ax,
+        )
+        title_suffix = f" ({mode})" if mode != "linear" else ""
+        ax.set_title(f"{feat}{title_suffix}")
+        ax.set_ylabel("Density")
+
+        # Keep readable axis labels in original units (especially for log1p)
+        ax.set_xlabel(feat)
+        if mode == "log1p" and fmt is not None:
+            ax.xaxis.set_major_formatter(fmt)
+            ax.set_xlabel(f"{feat} (ticks in original units)")
+        elif mode == "symlog":
+            # symlog keeps original units; only tweak scaling if needed
+            linthresh = float(os.environ.get("PANEL_VIS_SYMLOG_LINTHRESH", "1.0"))
+            ax.set_xscale("symlog", linthresh=linthresh)
+
+    # Hide unused panels if we got <4 features
+    for j in range(len(feats), 4):
+        axes[j].axis("off")
+
+    plt.suptitle("Class Separation (top non-flat variance features)", fontsize=16, fontweight="bold")
+    out = OUTPUT_DIR / "class_separation.png"
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig(out, dpi=300)
+    plt.close()
+    wb_log_image("plots/class_separation", out, "Class separation distributions (top variance non-flat features)")
+    return out
+
+# ==========================================================================================
+# MISSING PIXEL DIAGNOSTIC (2012-2014)
+# ==========================================================================================
+def diagnose_missing_pixels(con, cols: List[str], label_col: Optional[str]):
+    """
+    Intelligent diagnostic for missing pixels in 2012-2014.
+    
+    MEMORY MANAGEMENT:
+    - Uses SQL-based overlap computation (avoids loading full pixel sets into Python)
+    - Aggressive sampling for visualization (default 2%)
+    - Explicit garbage collection after each step
+    - Processes data one year at a time where possible
+    
+    Checks:
+    1. Unique pixel count per year (coverage analysis)
+    2. Year-over-year pixel loss/gain
+    3. Spatial pattern of missingness (visualization) - MEMORY-EFFICIENT
+    4. Risk set vs. full panel coverage
+    5. Feature-specific missingness patterns
+    
+    Environment variables:
+    - PANEL_VIS_OVERLAP_SAMPLE_PCT: Sampling for overlap analysis (default: 2.0%)
+    - PANEL_VIS_MISSING_SAMPLE_PCT: Sampling for spatial visualization (default: 2.0%)
+    """
+    print("\n" + "="*70)
+    print("MISSING PIXEL DIAGNOSTIC (2012-2014)")
+    print("="*70)
+    
+    cx, cy = resolve_coord_cols(cols)
+    has_wdpa_prev = "WDPA_prev" in set(cols)
+    
+    # 1. Count unique pixels per year (full panel)
+    print("\n1. Pixel Coverage by Year (Full Panel):")
+    print("-" * 70)
+    coverage_query = f"""
+        SELECT 
+            year,
+            COUNT(DISTINCT ({q(cx)}, {q(cy)})) AS unique_pixels,
+            COUNT(*) AS total_rows
+        FROM {panel_read_expr()}
+        GROUP BY year
+        ORDER BY year
+    """
+    coverage_df = con.execute(coverage_query).df()
+    
+    if coverage_df.empty:
+        print("WARNING: No data found in panel.")
+        return
+    
+    # Calculate year-over-year changes
+    coverage_df['pixel_change'] = coverage_df['unique_pixels'].diff()
+    coverage_df['pixel_change_pct'] = (coverage_df['pixel_change'] / coverage_df['unique_pixels'].shift(1) * 100).round(2)
+    
+    # Identify baseline year (use median of years outside 2012-2014)
+    baseline_years = coverage_df[~coverage_df['year'].isin([2012, 2013, 2014])]
+    if not baseline_years.empty:
+        baseline_median = baseline_years['unique_pixels'].median()
+    else:
+        baseline_median = coverage_df['unique_pixels'].median()
+    
+    print(f"Baseline (median pixels outside 2012-2014): {baseline_median:,.0f}")
+    print()
+    
+    for _, row in coverage_df.iterrows():
+        year = int(row['year'])
+        pixels = int(row['unique_pixels'])
+        rows = int(row['total_rows'])
+        change = row['pixel_change']
+        change_pct = row['pixel_change_pct']
+        
+        # Flag problematic years
+        is_problematic = year in [2012, 2013, 2014]
+        deviation = ((pixels - baseline_median) / baseline_median * 100) if baseline_median > 0 else 0
+        
+        status = ""
+        if is_problematic and deviation < -5:
+            status = "  LOW COVERAGE"
+        elif is_problematic and deviation < -10:
+            status = " CRITICAL"
+        
+        change_str = f" ({change:+,.0f}, {change_pct:+.1f}%)" if not pd.isna(change) else ""
+        print(f"  Year {year}: {pixels:>12,} pixels, {rows:>12,} rows{change_str}{status}")
+    
+    # Store data needed for later sections before cleanup
+    available_years = set(coverage_df['year'].values)
+    problem_years_data = coverage_df[coverage_df['year'].isin([2012, 2013, 2014])].copy()
+    
+    # Cleanup after step 1
+    del coverage_df
+    gc.collect()
+    
+    # 2. Risk set coverage (if WDPA_prev exists)
+    if has_wdpa_prev:
+        print("\n2. Risk Set Coverage (WDPA_prev=0) by Year:")
+        print("-" * 70)
+        risk_set_query = f"""
+            SELECT 
+                year,
+                COUNT(DISTINCT ({q(cx)}, {q(cy)})) AS unique_pixels,
+                COUNT(*) AS total_rows
+            FROM {panel_read_expr()}
+            WHERE {q('WDPA_prev')} = 0
+            GROUP BY year
+            ORDER BY year
+        """
+        risk_set_df = con.execute(risk_set_query).df()
+        
+        if not risk_set_df.empty:
+            baseline_risk = risk_set_df[~risk_set_df['year'].isin([2012, 2013, 2014])]
+            baseline_risk_median = baseline_risk['unique_pixels'].median() if not baseline_risk.empty else risk_set_df['unique_pixels'].median()
+            print(f"Baseline (median risk set pixels outside 2012-2014): {baseline_risk_median:,.0f}")
+            print()
+            
+            for _, row in risk_set_df.iterrows():
+                year = int(row['year'])
+                pixels = int(row['unique_pixels'])
+                rows = int(row['total_rows'])
+                
+                is_problematic = year in [2012, 2013, 2014]
+                deviation = ((pixels - baseline_risk_median) / baseline_risk_median * 100) if baseline_risk_median > 0 else 0
+                
+                status = ""
+                if is_problematic and deviation < -5:
+                    status = "  LOW COVERAGE"
+                elif is_problematic and deviation < -10:
+                    status = " CRITICAL"
+                
+                    print(f"  Year {year}: {pixels:>12,} pixels, {rows:>12,} rows{status}")
+        
+        # Cleanup after step 2
+        del risk_set_df
+        gc.collect()
+    
+    # 3. Year-over-year pixel set overlap analysis (MEMORY-EFFICIENT: SQL-based with sampling)
+    print("\n3. Year-over-Year Pixel Set Overlap (sampled for memory efficiency):")
+    print("-" * 70)
+    problem_years = [2012, 2013, 2014]
+    reference_years = [2011, 2015]  # Years before and after the problem period
+    
+    # Use sampling for overlap analysis to avoid OOM
+    overlap_sample_pct = float(os.environ.get("PANEL_VIS_OVERLAP_SAMPLE_PCT", "2.0"))
+    method = resolve_sample_method()
+    
+    for ref_year in reference_years:
+        if ref_year not in available_years:
+            continue
+        
+        # Get reference count (full count, not sampled)
+        ref_count_query = f"""
+            SELECT COUNT(DISTINCT ({q(cx)}, {q(cy)})) AS cnt
+            FROM {panel_read_expr()}
+            WHERE year = {ref_year}
+        """
+        ref_count = con.execute(ref_count_query).fetchone()[0]
+        
+        print(f"\n  Reference year {ref_year}: {ref_count:,} unique pixels (full count)")
+        
+        for prob_year in problem_years:
+            if prob_year not in available_years:
+                continue
+            
+            # Get problem year count (full count)
+            prob_count_query = f"""
+                SELECT COUNT(DISTINCT ({q(cx)}, {q(cy)})) AS cnt
+                FROM {panel_read_expr()}
+                WHERE year = {prob_year}
+            """
+            prob_count = con.execute(prob_count_query).fetchone()[0]
+            
+            # Compute overlap using SQL JOIN on sampled data (memory-efficient)
+            # This avoids loading full pixel sets into Python memory
+            overlap_query = f"""
+                WITH ref_sampled AS (
+                    SELECT DISTINCT {q(cx)} AS x, {q(cy)} AS y
+                    FROM {panel_read_expr()}
+                    WHERE year = {ref_year}
+                    USING SAMPLE {overlap_sample_pct}% ({method})
+                ),
+                prob_sampled AS (
+                    SELECT DISTINCT {q(cx)} AS x, {q(cy)} AS y
+                    FROM {panel_read_expr()}
+                    WHERE year = {prob_year}
+                    USING SAMPLE {overlap_sample_pct}% ({method})
+                ),
+                ref_count AS (
+                    SELECT COUNT(*) AS cnt FROM ref_sampled
+                ),
+                prob_count AS (
+                    SELECT COUNT(*) AS cnt FROM prob_sampled
+                ),
+                overlap_count AS (
+                    SELECT COUNT(*) AS cnt
+                    FROM ref_sampled r
+                    INNER JOIN prob_sampled p ON r.x = p.x AND r.y = p.y
+                )
+                SELECT 
+                    (SELECT cnt FROM ref_count) AS ref_sampled_count,
+                    (SELECT cnt FROM prob_count) AS prob_sampled_count,
+                    (SELECT cnt FROM overlap_count) AS overlap_sampled_count
+            """
+            overlap_result = con.execute(overlap_query).fetchone()
+            
+            if overlap_result and len(overlap_result) >= 3:
+                ref_sampled_count = overlap_result[0] or 0
+                prob_sampled_count = overlap_result[1] or 0
+                overlap_sampled_count = overlap_result[2] or 0
+                
+                # Estimate full counts from sampled ratios
+                if ref_sampled_count > 0:
+                    overlap_est = int((overlap_sampled_count / ref_sampled_count) * ref_count)
+                    missing_est = ref_count - overlap_est
+                    overlap_pct = (overlap_est / ref_count * 100) if ref_count > 0 else 0
+                    missing_pct = (missing_est / ref_count * 100) if ref_count > 0 else 0
+                    
+                    print(f"    Year {prob_year}: {prob_count:>8,} pixels | "
+                          f"Overlap: ~{overlap_est:>8,} ({overlap_pct:>5.1f}%) | "
+                          f"Missing: ~{missing_est:>8,} ({missing_pct:>5.1f}%) [sampled {overlap_sample_pct}%]")
+                else:
+                    print(f"    Year {prob_year}: {prob_count:>8,} pixels | "
+                          f"Overlap: N/A (no sampled reference pixels) | "
+                          f"Missing: N/A [sampled {overlap_sample_pct}%]")
+            else:
+                print(f"    Year {prob_year}: {prob_count:>8,} pixels | "
+                      f"Overlap: N/A (query error) | Missing: N/A")
+            
+            # Force cleanup
+            del overlap_result
+            gc.collect()
+    
+    # 4. Spatial visualization of missing pixels (MEMORY-EFFICIENT: process one year at a time)
+    print("\n4. Generating spatial missingness visualization...")
+    method = "bernoulli"
+    # Use more aggressive sampling for visualization to prevent OOM
+    sample_pct = float(os.environ.get("PANEL_VIS_MISSING_SAMPLE_PCT", "2.0"))
+    
+    # Get reference year pixels (2011) - sampled
+    ref_year = 2011
+    if ref_year in available_years:
+        # Load reference pixels once (sampled)
+        ref_pixels = con.execute(
+            f"""
+            SELECT DISTINCT {q(cx)} AS x, {q(cy)} AS y
+            FROM {panel_read_expr()}
+            WHERE year = {ref_year}
+            USING SAMPLE {sample_pct}% ({method})
+            """
+        ).df()
+        
+        if not ref_pixels.empty:
+            # Get bounds for consistent axes
+            x_min, x_max = float(ref_pixels['x'].min()), float(ref_pixels['x'].max())
+            y_min, y_max = float(ref_pixels['y'].min()), float(ref_pixels['y'].max())
+            ref_count_vis = len(ref_pixels)
+            
+            # Clear reference pixels from memory after getting bounds
+            del ref_pixels
+            gc.collect()
+            
+            fig, axes = plt.subplots(2, 2, figsize=(16, 14), sharex=True, sharey=True)
+            axes = axes.ravel()
+            
+            for idx, year in enumerate([2011, 2012, 2013, 2014]):
+                ax = axes[idx]
+                
+                # Load year pixels (sampled) - process one at a time
+                year_pixels = con.execute(
+                    f"""
+                    SELECT DISTINCT {q(cx)} AS x, {q(cy)} AS y
+                    FROM {panel_read_expr()}
+                    WHERE year = {year}
+                    USING SAMPLE {sample_pct}% ({method})
+                    """
+                ).df()
+                
+                if not year_pixels.empty:
+                    year_count_vis = len(year_pixels)
+                    
+                    # Re-load reference for comparison (small sampled set)
+                    ref_pixels_vis = con.execute(
+                        f"""
+                        SELECT DISTINCT {q(cx)} AS x, {q(cy)} AS y
+                        FROM {panel_read_expr()}
+                        WHERE year = {ref_year}
+                        USING SAMPLE {sample_pct}% ({method})
+                        """
+                    ).df()
+                    
+                    # Use SQL to compute missing pixels directly (avoids large Python sets)
+                    if not ref_pixels_vis.empty and year != ref_year:
+                        missing_query = f"""
+                            WITH ref_sampled AS (
+                                SELECT DISTINCT {q(cx)} AS x, {q(cy)} AS y
+                                FROM {panel_read_expr()}
+                                WHERE year = {ref_year}
+                                USING SAMPLE {sample_pct}% ({method})
+                            ),
+                            year_sampled AS (
+                                SELECT DISTINCT {q(cx)} AS x, {q(cy)} AS y
+                                FROM {panel_read_expr()}
+                                WHERE year = {year}
+                                USING SAMPLE {sample_pct}% ({method})
+                            )
+                            SELECT r.x, r.y
+                            FROM ref_sampled r
+                            LEFT JOIN year_sampled y ON r.x = y.x AND r.y = y.y
+                            WHERE y.x IS NULL
+                            LIMIT 50000
+                        """
+                        missing_pixels = con.execute(missing_query).df()
+                        missing_count_vis = len(missing_pixels)
+                    else:
+                        missing_pixels = pd.DataFrame(columns=['x', 'y'])
+                        missing_count_vis = 0
+                    
+                    # Plot reference pixels in light gray (small sample)
+                    if not ref_pixels_vis.empty:
+                        ax.scatter(ref_pixels_vis['x'], ref_pixels_vis['y'], s=0.1, c='lightgray', 
+                                  alpha=0.15, rasterized=True, label='Reference (2011)')
+                    
+                    # Plot missing pixels in red (if any)
+                    if not missing_pixels.empty:
+                        ax.scatter(missing_pixels['x'], missing_pixels['y'], s=0.2, c='red', 
+                                  alpha=0.5, rasterized=True, label='Missing')
+                    
+                    # Plot year pixels in blue
+                    ax.scatter(year_pixels['x'], year_pixels['y'], s=0.1, c='blue', 
+                              alpha=0.3, rasterized=True, label=f'Year {year}')
+                    
+                    ax.set_title(f"Year {year} Coverage (sampled {sample_pct}%)\n"
+                               f"Visible: {year_count_vis:,} | Missing vs 2011: {missing_count_vis:,}",
+                               fontsize=11, fontweight='bold')
+                    
+                    # Clear variables immediately after plotting
+                    del year_pixels, ref_pixels_vis, missing_pixels
+                    gc.collect()
+                else:
+                    ax.set_title(f"Year {year} (NO DATA)", color='red', fontsize=11, fontweight='bold')
+                
+                ax.set_xlim(x_min, x_max)
+                ax.set_ylim(y_min, y_max)
+                ax.set_aspect('equal')
+                ax.set_xticks([])
+                ax.set_yticks([])
+                ax.legend(loc='upper right', fontsize=8)
+            
+            plt.suptitle(f"Missing Pixel Spatial Analysis (2012-2014 vs 2011 Reference) [sampled {sample_pct}%]", 
+                        fontsize=14, fontweight='bold')
+            out_path = OUTPUT_DIR / "missing_pixels_spatial.png"
+            plt.tight_layout(rect=[0, 0, 1, 0.96])
+            plt.savefig(out_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            # Force cleanup
+            del fig, axes
+            gc.collect()
+            
+            wb_log_image("diagnostics/missing_pixels_spatial", out_path, 
+                        "Spatial pattern of missing pixels in 2012-2014")
+            print(f"  Saved: {out_path}")
+    
+    # 5. Feature-specific missingness check
+    print("\n5. Feature-Specific Missingness (2012-2014):")
+    print("-" * 70)
+    
+    # Sample a few key features to check
+    key_features = ["dist_wdpa", "HNTL_b1", "NDVI_b1", "oil_gas_b1", "powerplants_b1"]
+    available_features = [f for f in key_features if f in cols]
+    
+    if available_features:
+        for feat in available_features[:5]:  # Limit to 5 features
+            feat_expr = feature_sql(feat)
+            missing_query = f"""
+                SELECT 
+                    year,
+                    COUNT(*) AS total_rows,
+                    COUNT({feat_expr}) AS non_null_rows,
+                    COUNT(*) - COUNT({feat_expr}) AS null_rows,
+                    (COUNT(*) - COUNT({feat_expr})) * 100.0 / COUNT(*) AS null_pct
+                FROM {panel_read_expr()}
+                WHERE year IN (2011, 2012, 2013, 2014, 2015)
+                GROUP BY year
+                ORDER BY year
+            """
+            feat_missing = con.execute(missing_query).df()
+            
+            if not feat_missing.empty:
+                print(f"\n  Feature: {feat}")
+                for _, row in feat_missing.iterrows():
+                    year = int(row['year'])
+                    null_pct = float(row['null_pct'])
+                    null_rows = int(row['null_rows'])
+                    total = int(row['total_rows'])
+                    
+                    is_problematic = year in [2012, 2013, 2014] and null_pct > 10
+                    status = "" if is_problematic else ""
+                    
+                    print(f"    Year {year}: {null_pct:>5.1f}% missing ({null_rows:,}/{total:,}){status}")
+            
+            # Cleanup after each feature
+            del feat_missing
+            gc.collect()
+    
+    # 6. Summary and recommendations
+    print("\n" + "="*70)
+    print("DIAGNOSTIC SUMMARY")
+    print("="*70)
+    if not problem_years_data.empty:
+        max_deviation = ((problem_years_data['unique_pixels'] - baseline_median) / baseline_median * 100).min()
+        
+        if max_deviation < -10:
+            print("CRITICAL: Significant pixel loss detected in 2012-2014 (>10% below baseline)")
+            print("   Recommendation: Investigate data collection/processing pipeline for these years.")
+        elif max_deviation < -5:
+            print("WARNING: Moderate pixel loss detected in 2012-2014 (5-10% below baseline)")
+            print("   Recommendation: Review data sources and temporal coverage for these years.")
+        else:
+            print("No significant pixel loss detected in 2012-2014")
+    
+    print("="*70 + "\n")
+
+# ==========================================================================================
+# CORRELATION MATRIX
+# ==========================================================================================
+def _cluster_order_features(corr: pd.DataFrame) -> List[str]:
+    """Return feature order using hierarchical clustering on 1-|corr| distance."""
+    try:
+        from scipy.cluster.hierarchy import linkage, leaves_list
+        from scipy.spatial.distance import squareform
+    except Exception:
+        return list(corr.columns)
+
+    c = corr.fillna(0.0).to_numpy()
+    dist = 1.0 - np.abs(c)
+    np.fill_diagonal(dist, 0.0)
+    d = squareform(dist, checks=False)
+    Z = linkage(d, method="average")
+    order = leaves_list(Z)
+    return list(corr.columns[order])
+
+def plot_correlation_matrix(con, numeric_cols: List[str], max_features: int = 30):
+    print("Creating correlation matrix...")
+    method = resolve_sample_method()
+    sample_pct = float(os.environ.get("PANEL_VIS_CORR_SAMPLE_PCT", "5.0"))
+    max_features = int(os.environ.get("PANEL_VIS_CORR_MAX_FEATURES", str(max_features)))
+
+    # Downselect to informative, non-flat features for readability
+    numeric_cols = _deduplicate_features(numeric_cols, con=con)
+    feats = _select_top_variance_features(con, numeric_cols, max_features=max_features, sample_pct=max(sample_pct, 0.5), method=method)
+    if len(feats) < 3:
+        print("Correlation matrix: insufficient non-flat features found; skipping.")
+        return None
+
+    sel = ", ".join(f"{feature_sql(c)} AS {q(c)}" for c in feats)
+    df = con.execute(
+        f"""
+        SELECT {sel}
+        FROM {panel_read_expr()}
+        USING SAMPLE {sample_pct}% ({method})
+        """
+    ).df()
+    if df.empty:
+        return None
+
+    corr = df.corr(numeric_only=True).astype(float)
+    order = _cluster_order_features(corr)
+    corr = corr.loc[order, order]
+
+    fig, ax = plt.subplots(figsize=(13, 11))
+    cmap = _neutral_diverging_cmap()
+    sns.heatmap(
+        corr,
+        cmap=cmap,
+        center=0.0,
+        vmin=-1.0,
+        vmax=1.0,
+        square=True,
+        linewidths=0.0,
+        cbar_kws={"label": "Correlation (Pearson, centered at 0)"},
+        ax=ax,
+    )
+    ax.set_title("Correlation matrix (cluster-reordered)", fontsize=14, fontweight="bold")
+    out = OUTPUT_DIR / "correlation_matrix.png"
+    plt.tight_layout()
+    plt.savefig(out, dpi=300)
+    plt.close()
+    wb_log_image("plots/correlation_matrix", out, "Cluster-reordered correlation matrix (neutral midpoint at 0)")
+    return out
+
+# ==========================================================================================
+# MAIN EXECUTION
+# ==========================================================================================
+def main():
+    print(f"Starting diagnostics for: {PANEL_SPEC}")
+    print(f"Absolute Output: {OUTPUT_DIR.resolve()}")
+    print(f"Sampling method (PANEL_VIS_SAMPLE_METHOD): {resolve_sample_method()}")
+    temp_sample_pct, dens_sample_pct = resolve_temporal_sample_pcts()
+    print(f"Temporal sampling (always bernoulli): PANEL_VIS_TEMPORAL_SAMPLE_PCT={temp_sample_pct}%, PANEL_VIS_DENSITY_SAMPLE_PCT={dens_sample_pct}%")
+    
+    con = get_con()
+    
+    # 1. Resolve Label
+    schema = con.execute(f"DESCRIBE SELECT * FROM {panel_read_expr()} LIMIT 0").df()
+    cols = schema['column_name'].tolist()
+    col_type_map = dict(zip(schema["column_name"].tolist(), schema.get("column_type", [])))
+    label_col = os.environ.get("LABEL_COL") or ("transition_01" if "transition_01" in cols else None)
+
+    # 1b. dist_wdpa sanity checks + plot-only recode (optional/auto)
+    _configure_dist_wdpa_zero_recode(con, cols, label_col)
+    
+    # 1c. Missing pixel diagnostic (2012-2014)
+    diagnose_missing_pixels(con, cols, label_col)
+
+    # 2. Start W&B
+    use_wandb = bool(int(os.environ.get("PANEL_VIS_WANDB", "0")))
+    if wandb and use_wandb:
+        try:
+            wandb.init(project="panel_visualisation", name=f"diag_{datetime.now().strftime('%m%d_%H%M')}")
+        except Exception as e:
+            print(f"W&B init failed; continuing without W&B. Error: {e}")
+            # Keep wandb imported, but no active run means wb_log_* become no-ops.
+
+    # 3. Numeric columns for feature-focused plots
+    coord_x, coord_y = resolve_coord_cols(cols)
+    exclude = {'year', coord_x, coord_y, 'row', 'col', 'x', 'y', label_col}
+    numeric_cols = [
+        r["column_name"]
+        for _, r in schema.iterrows()
+        if (r["column_name"] not in exclude) and _is_numeric_duckdb_type(str(r.get("column_type", "")))
+    ]
+
+    # 4. Class separation + correlation structure
+    plot_class_separation(con, label_col, numeric_cols)
+    plot_correlation_matrix(con, numeric_cols)
+
+    # 5. Temporal integrity comparison
+    #
+    # Defaults are chosen to:
+    # - Exercise a realistic 4-year panel (ensures plotting logic supports wide layouts)
+    # - Cover key “policy exposure / accessibility / nightlights / greenness / extractives” signals
+    default_temp_years = [2001, 2010, 2015, 2024]
+    temp_years = _parse_csv_int_list(
+        os.environ.get("PANEL_VIS_TEMP_YEARS") or ",".join(str(y) for y in default_temp_years)
+    )
+
+    default_temp_features = [
+        "dist_wdpa",
+        "dist_oil_gas",
+        "dist_powerplant",
+        "dist_road",
+        "GSN_b1",
+        "NDVI_b1_smooth64",
+        "HNTL_b1_smooth64",
+    ]
+    temp_features_env = (os.environ.get("PANEL_VIS_TEMP_FEATURES") or "").strip()
+    temp_features = _parse_csv_list(temp_features_env) if temp_features_env else list(default_temp_features)
+
+    if temp_features:
+        print(f"Temporal comparisons: years={temp_years}, features={temp_features}")
+    for feat in temp_features:
+        if feat not in cols:
+            print(f"Temporal comparison: skipping missing feature {feat!r} (not in parquet schema).")
+            continue
+        t = str(col_type_map.get(feat, ""))
+        if not _is_numeric_duckdb_type(t):
+            print(f"Temporal comparison: skipping non-numeric feature {feat!r} (duckdb type: {t!r}).")
+            continue
+        plot_temporal_feature_comparison(con, feat, years=temp_years)
+
+    # 6. Standard plots
+    plot_time_series(con, label_col)
+    plot_spatial_map(con, label_col)
+    
+    # 6b. Continent-wide feature maps (one feature per year)
+    plot_continent_feature_maps(con, cols, col_type_map)
+
+    # 7. Log outputs as W&B artifacts for lineage
+    wb_log_artifact_pngs(OUTPUT_DIR)
+    
+    print("="*50)
+    print("DIAGNOSTICS COMPLETE")
+    print("="*50)
+    if wandb and wandb.run:
+        wandb.finish()
+
+if __name__ == "__main__":
+    main()

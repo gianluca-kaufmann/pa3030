@@ -29,7 +29,8 @@ This is framed as a binary transition prediction problem:
 
 **Geography:**
 - Primary region: South America (~350M pixel-years)
-- Reference region: Colombia (used for rapid development and validation)
+- Reference region: Colombia (sub-pipeline under South America, used for rapid development and validation)
+- Planned extensions: USA, South-East Asia, Tropical Africa
 - Resolution: ~1 km × 1 km grid (EPSG:3857)
 
 **Time:**
@@ -180,7 +181,7 @@ The pipeline produces thesis-ready outputs:
 - Scored Parquet files with pixel-level predictions (calibrated and uncalibrated)
 - Ranked pixel lists for prioritization
 
-All outputs stored in `outputs/Results/` and reproducible from scripts in `scripts/`.
+All outputs stored in `outputs/{region}/` and reproducible from scripts in `scripts/regions/{region}/`.
 
 ## 11. Reproducibility and Design Philosophy
 
@@ -228,25 +229,27 @@ These limitations are explicitly discussed in the thesis.
 
 ## 14. Repository Structure
 
+The repository is organized geography-first: each region contains a self-contained pipeline.
+
 ```
 ├── scripts/
-│   ├── data extraction/      # GEE and API exporters
-│   ├── preprocessing/         # Format harmonization
-│   ├── merging/               # Panel construction
-│   ├── ML/                    # Model 1 (South America)
-│   │   ├── ml_preprocessing/
-│   │   ├── training/
-│   │   ├── evaluation/
-│   │   └── results/
-│   ├── colombia/              # Model C (Colombia subset)
-│   │   └── ML/
-│   ├── embeddings/            # Model E (satellite embeddings)
-│   │   └── ML/
-│   └── visualisations/        # Exploratory plots
+│   ├── regions/
+│   │   ├── south_america/           # Primary region
+│   │   │   ├── 1_extraction/        # GEE exports
+│   │   │   ├── 2_preprocessing/     # Format harmonization
+│   │   │   ├── 3_merging/           # Panel construction
+│   │   │   ├── 4_ml/               # Continental ML (splits, training, evaluation, results)
+│   │   │   ├── colombia/            # Country sub-pipeline (own merging + ML)
+│   │   │   └── embeddings/          # Satellite embedding pipeline (own extraction through ML)
+│   │   ├── usa/                     # New regions replicate SA top-level structure
+│   │   ├── se_asia/
+│   │   └── tropical_africa/
+│   └── visualisations/              # Feature-level EDA (cross-region)
 ├── outputs/
-│   ├── Results/               # Model outputs, predictions, metrics
-│   └── Tables/                # Summary statistics
-└── README.md                  # Usage instructions
+│   └── {region}/                    # figures/, tables/, results/ per region
+├── slurm/
+│   └── {region}/                    # SLURM jobs per region
+└── README.md
 ```
 
 ## 15. Roadmap

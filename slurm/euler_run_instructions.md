@@ -15,7 +15,7 @@ ls
 git pull
 
 # Look at the script directly
-nano scripts/merging/merge_total_optimized
+nano scripts/regions/south_america/3_merging/merge
 
 # Submit job
 sbatch slurm/RUN.slurm
@@ -26,16 +26,16 @@ squeue
 
 ```bash
 # scratch outputs
-scp gikaufmann@login.euler.ethz.ch:/cluster/scratch/gikaufmann/outputs/Results/merged_panel_2000_2024.parquet ~/Desktop/
+scp gikaufmann@login.euler.ethz.ch:/cluster/scratch/gikaufmann/outputs/south_america/results/merged_panel_2000_2024.parquet ~/Desktop/
 
 # txt and other outputs
-scp -r gikaufmann@euler.ethz.ch:~/master_thesis/outputs/Tables/merged_panel_validation.txt ~/Desktop/
+scp -r gikaufmann@euler.ethz.ch:~/master_thesis/outputs/south_america/tables/merged_panel_validation.txt ~/Desktop/
 
 # Download from GCS → Desktop
 gsutil -m cp gs://protected-areas/data/ml/merged_panel_final.parquet 
 
 # whole folder
-gsutil -m cp -r gs://protected-areas/outputs/Results /Users/gianluca/Desktop/
+gsutil -m cp -r gs://protected-areas/outputs/south_america/results /Users/gianluca/Desktop/
 ```
 ### Sync Between Euler ↔ GCS
 
@@ -58,7 +58,7 @@ gsutil -m rsync -r outputs \
   gs://protected-areas/outputs
 
 #For single files
-gsutil cp outputs/Figures/similarity_vis_2000.png gs://protected-areas/outputs/Figures/ml/
+gsutil cp outputs/south_america/figures/similarity_vis_2000.png gs://protected-areas/outputs/south_america/figures/ml/
 ```
 
 ### Job troubleshooting

@@ -1,0 +1,849 @@
+#!/usr/bin/env python3
+"""
+Temporal Distribution Analysis for Deforestation Model (Colombia Dataset)
+Diagnoses data quality issues and temporal shifts between train/val/test periods
+Includes deep investigation of prediction errors and cohort analysis
+
+Input:
+    - Train/Earlystop/Test parquet files from data/ml/ (auto-detected, prefer $SCRATCH if present)
+    - Optional: Scored predictions file from outputs/south_america/colombia/results/ml_models/ (auto-detected most recent)
+
+Output:
+    - PNG figures saved to outputs/south_america/colombia/figures/colombia_vis/
+    - JSON reports saved to outputs/south_america/colombia/figures/colombia_vis/
+    - CSV files with detailed statistics
+"""
+
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+import json
+from typing import Optional
+from sklearn.calibration import calibration_curve
+from sklearn.metrics import brier_score_loss
+
+# Path resolution functions
+def get_repo_root() -> Path:
+    """Get repository root directory."""
+    return Path(__file__).resolve().parents[3]
+
+
+def resolve_parquet_file(filename: str) -> Path:
+    """Locate parquet file (prefer $SCRATCH if present)."""
+    repo_root = get_repo_root()
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    candidates = []
+    if scratch_root is not None:
+        candidates.append(scratch_root / f"data/ml/{filename}")
+    candidates.append(repo_root / f"data/ml/{filename}")
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    raise FileNotFoundError(f"{filename} not found in expected locations")
+
+
+def resolve_scored_file() -> Optional[Path]:
+    """Locate most recent scored predictions file (prefer $SCRATCH if present)."""
+    repo_root = get_repo_root()
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    # Check environment variable override
+    env_scored = os.environ.get("COLOMBIA_VIS_SCORED_FILE")
+    if env_scored:
+        scored_path = Path(env_scored)
+        if scored_path.exists():
+            return scored_path
+
+    # Search for most recent scored file
+    candidates = []
+    if scratch_root is not None:
+        candidates.append(scratch_root / "outputs/south_america/colombia/results/ml_models")
+    candidates.append(repo_root / "outputs/south_america/colombia/results/ml_models")
+
+    for ml_models_dir in candidates:
+        if ml_models_dir.exists():
+            scored_files = list(ml_models_dir.glob("modelC_lgbm_win5_scored_*.parquet"))
+            if scored_files:
+                # Return most recently modified
+                return max(scored_files, key=lambda p: p.stat().st_mtime)
+
+    return None
+
+
+def get_output_dir() -> Path:
+    """Get output directory (prefer $SCRATCH if present)."""
+    repo_root = get_repo_root()
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    if scratch_root is not None:
+        output_dir = scratch_root / "outputs/south_america/colombia/figures/colombia_vis"
+    else:
+        output_dir = repo_root / "outputs/south_america/colombia/figures/colombia_vis"
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+
+# Configuration
+REPO_ROOT = get_repo_root()
+OUTPUT_DIR = get_output_dir()
+
+# File paths
+TRAIN_FILE = resolve_parquet_file("train_colombia_win5.parquet")
+EARLYSTOP_FILE = resolve_parquet_file("val_colombia_win5.parquet")
+TEST_FILE = resolve_parquet_file("test_colombia_win5.parquet")
+SCORED_FILE = resolve_scored_file()
+
+print("="*70)
+print("TEMPORAL DISTRIBUTION ANALYSIS (COLOMBIA DATASET)")
+print("="*70)
+print(f"Train: {TRAIN_FILE}")
+print(f"Earlystop:   {EARLYSTOP_FILE}")
+print(f"Test:  {TEST_FILE}")
+if SCORED_FILE:
+    print(f"Scored: {SCORED_FILE}")
+else:
+    print("Scored: Not found (will skip prediction analysis)")
+print(f"Output: {OUTPUT_DIR}")
+
+# ============================================================================
+# 1. BASIC STATISTICS & DATA QUALITY
+# ============================================================================
+print("\n[1/6] Loading datasets and computing basic statistics...")
+
+def load_sample(file, n=100000):
+    """Load a sample for quick analysis"""
+    df = pd.read_parquet(file)
+    if len(df) > n:
+        return df.sample(n=n, random_state=42)
+    return df
+
+train_sample = load_sample(TRAIN_FILE)
+earlystop_sample = load_sample(EARLYSTOP_FILE)
+test_sample = load_sample(TEST_FILE)
+
+# Get full datasets for target distribution (lightweight)
+train_target = pd.read_parquet(TRAIN_FILE, columns=['transition_01_win5', 'year'])
+earlystop_target = pd.read_parquet(EARLYSTOP_FILE, columns=['transition_01_win5', 'year'])
+test_target = pd.read_parquet(TEST_FILE, columns=['transition_01_win5', 'year'])
+
+print(f"\nTrain: {len(train_target):,} rows, {train_target['transition_01_win5'].mean():.4%} positive")
+print(f"Earlystop:   {len(earlystop_target):,} rows, {earlystop_target['transition_01_win5'].mean():.4%} positive")
+print(f"Test:  {len(test_target):,} rows, {test_target['transition_01_win5'].mean():.4%} positive")
+
+# ============================================================================
+# 2. TEMPORAL TRANSITION RATE EVOLUTION
+# ============================================================================
+print("\n[2/6] Analyzing transition rates over time...")
+
+fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+
+# 2a. Transition rate by year
+yearly_stats = []
+for name, df in [('Train', train_target), ('Earlystop', earlystop_target), ('Test', test_target)]:
+    year_group = df.groupby('year')['transition_01_win5'].agg(['mean', 'count', 'sum'])
+    year_group['split'] = name
+    yearly_stats.append(year_group.reset_index())
+
+yearly_df = pd.concat(yearly_stats)
+
+ax = axes[0, 0]
+for split in ['Train', 'Earlystop', 'Test']:
+    data = yearly_df[yearly_df['split'] == split]
+    ax.plot(data['year'], data['mean'], marker='o', label=split, linewidth=2)
+ax.axvline(2014.5, color='red', linestyle='--', alpha=0.5, label='Train/Earlystop split')
+ax.axvline(2017.5, color='orange', linestyle='--', alpha=0.5, label='Earlystop/Test split')
+ax.set_xlabel('Year')
+ax.set_ylabel('Transition Rate')
+ax.set_title('Transition Rate Over Time (5-year lookahead)')
+ax.legend()
+ax.grid(True, alpha=0.3)
+
+# 2b. Sample counts by year
+ax = axes[0, 1]
+for split in ['Train', 'Earlystop', 'Test']:
+    data = yearly_df[yearly_df['split'] == split]
+    ax.bar(data['year'], data['count'], alpha=0.6, label=split)
+ax.set_xlabel('Year')
+ax.set_ylabel('Number of Samples')
+ax.set_title('Sample Distribution by Year')
+ax.legend()
+ax.grid(True, alpha=0.3)
+
+# ============================================================================
+# 3. YEAR-BY-YEAR DETAILED BREAKDOWN
+# ============================================================================
+print("\n[3/9] Analyzing year-by-year patterns with feature statistics...")
+
+# Load full datasets with year and key features
+train_full = pd.read_parquet(TRAIN_FILE, 
+                             columns=['transition_01_win5', 'year', 'deforestation_b1_smooth64', 
+                                     'NDVI_b1_smooth64', 'GPW_b1', 'dist_wdpa'])
+earlystop_full = pd.read_parquet(EARLYSTOP_FILE,
+                           columns=['transition_01_win5', 'year', 'deforestation_b1_smooth64',
+                                   'NDVI_b1_smooth64', 'GPW_b1', 'dist_wdpa'])
+test_full = pd.read_parquet(TEST_FILE,
+                            columns=['transition_01_win5', 'year', 'deforestation_b1_smooth64',
+                                    'NDVI_b1_smooth64', 'GPW_b1', 'dist_wdpa'])
+
+# Combine for temporal analysis
+all_data = pd.concat([
+    train_full.assign(split='Train'),
+    earlystop_full.assign(split='Earlystop'),
+    test_full.assign(split='Test')
+], ignore_index=True)
+
+# Year-by-year statistics
+yearly_detailed = all_data.groupby(['year', 'split']).agg({
+    'transition_01_win5': ['mean', 'sum', 'count'],
+    'deforestation_b1_smooth64': ['mean', 'median', 'std'],
+    'NDVI_b1_smooth64': ['mean', 'median'],
+    'GPW_b1': ['mean', 'median'],
+    'dist_wdpa': ['mean', 'median']
+}).round(4)
+
+print("\nYear-by-year transition rates and feature means:")
+print(yearly_detailed)
+
+# Save detailed stats
+yearly_detailed.to_csv(OUTPUT_DIR / 'yearly_detailed_stats.csv')
+print(f"Saved: {OUTPUT_DIR / 'yearly_detailed_stats.csv'}")
+
+# ============================================================================
+# 4. FEATURE DISTRIBUTION SHIFTS
+# ============================================================================
+print("\n[4/9] Analyzing feature distributions...")
+
+# Get top features from log
+top_features = [
+    'deforestation_b1_smooth64', 'NDVI_b1_smooth64', 'dist_wdpa', 'GPW_b1',
+    'deforestation_b1_smooth16', 'GSN_b2_smooth64', 'dist_oil_gas', 
+    'NDVI_b1_smooth16', 'GSN_b4_smooth64', 'GSN_b2_smooth16'
+]
+
+# Check which features exist
+available_features = [f for f in top_features if f in train_sample.columns][:6]
+
+# Distribution comparison for top features
+feature_stats = []
+for feat in available_features:
+    for name, df in [('Train', train_sample), ('Earlystop', earlystop_sample), ('Test', test_sample)]:
+        if feat in df.columns:
+            feature_stats.append({
+                'feature': feat,
+                'split': name,
+                'mean': df[feat].mean(),
+                'std': df[feat].std(),
+                'median': df[feat].median(),
+                'missing': df[feat].isna().mean()
+            })
+
+feat_df = pd.DataFrame(feature_stats)
+
+# Plot feature mean shifts
+ax = axes[1, 0]
+pivot_mean = feat_df.pivot(index='feature', columns='split', values='mean')
+pivot_mean = pivot_mean[['Train', 'Earlystop', 'Test']]
+pivot_mean.plot(kind='bar', ax=ax, width=0.8)
+ax.set_title('Feature Mean Values Across Splits')
+ax.set_xlabel('Feature')
+ax.set_ylabel('Mean Value')
+ax.legend(title='Split')
+ax.tick_params(axis='x', rotation=45)
+plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right')
+
+# ============================================================================
+# 5. PREDICTION ANALYSIS (if scored file exists)
+# ============================================================================
+print("\n[5/9] Analyzing model predictions on test set...")
+
+# Initialize variables for later sections
+scored = None
+target_col = None
+pred_col = None
+false_positives = pd.DataFrame()
+true_positives = pd.DataFrame()
+
+if SCORED_FILE is not None and SCORED_FILE.exists():
+    scored = pd.read_parquet(SCORED_FILE)
+    
+    # Map column names (scored file uses y_true and y_pred_proba)
+    target_col = 'y_true' if 'y_true' in scored.columns else 'transition_01_win5'
+    pred_col = 'y_pred_proba' if 'y_pred_proba' in scored.columns else 'prediction'
+    
+    # Prediction distribution
+    ax = axes[1, 1]
+    ax.hist(scored[scored[target_col] == 0][pred_col], 
+            bins=50, alpha=0.5, label='Negative class', density=True)
+    ax.hist(scored[scored[target_col] == 1][pred_col], 
+            bins=50, alpha=0.5, label='Positive class', density=True)
+    ax.set_xlabel('Predicted Probability')
+    ax.set_ylabel('Density')
+    ax.set_title('Prediction Distribution on Test Set')
+    ax.legend()
+    ax.set_yscale('log')
+    ax.grid(True, alpha=0.3)
+    
+    # Calibration analysis
+    print("\nPrediction statistics on test set:")
+    print(f"  Prediction range: [{scored[pred_col].min():.4f}, {scored[pred_col].max():.4f}]")
+    print(f"  Mean prediction: {scored[pred_col].mean():.4f}")
+    print(f"  Actual positive rate: {scored[target_col].mean():.4f}")
+    
+    # Compute precision at different thresholds
+    thresholds = np.percentile(scored[pred_col], [99, 95, 90, 75, 50])
+    print("\nPrecision at different threshold percentiles:")
+    for pct, thresh in zip([99, 95, 90, 75, 50], thresholds):
+        mask = scored[pred_col] >= thresh
+        if mask.sum() > 0:
+            precision = scored[mask][target_col].mean()
+            print(f"  Top {100-pct}%: threshold={thresh:.4f}, precision={precision:.4f}, n={mask.sum():,}")
+    
+    # ========================================================================
+    # 5b. DETAILED PREDICTION ERROR ANALYSIS
+    # ========================================================================
+    print("\n[5b/9] Performing detailed prediction error analysis...")
+    
+    # Add error metrics
+    scored['error'] = scored[pred_col] - scored[target_col]
+    scored['abs_error'] = np.abs(scored['error'])
+    scored['predicted_class'] = (scored[pred_col] > 0.5).astype(int)
+    
+    # Confusion matrix components
+    scored['true_positive'] = ((scored['predicted_class'] == 1) & (scored[target_col] == 1)).astype(int)
+    scored['false_positive'] = ((scored['predicted_class'] == 1) & (scored[target_col] == 0)).astype(int)
+    scored['true_negative'] = ((scored['predicted_class'] == 0) & (scored[target_col] == 0)).astype(int)
+    scored['false_negative'] = ((scored['predicted_class'] == 0) & (scored[target_col] == 1)).astype(int)
+    
+    print(f"\nConfusion Matrix (threshold=0.5):")
+    print(f"  True Positives:  {scored['true_positive'].sum():,}")
+    print(f"  False Positives: {scored['false_positive'].sum():,}")
+    print(f"  True Negatives:  {scored['true_negative'].sum():,}")
+    print(f"  False Negatives: {scored['false_negative'].sum():,}")
+    tp_sum = scored['true_positive'].sum()
+    fp_sum = scored['false_positive'].sum()
+    fn_sum = scored['false_negative'].sum()
+    if tp_sum + fp_sum > 0:
+        print(f"  Precision: {tp_sum / (tp_sum + fp_sum):.4f}")
+    if tp_sum + fn_sum > 0:
+        print(f"  Recall: {tp_sum / (tp_sum + fn_sum):.4f}")
+    
+    # Analyze false positives and true positives
+    false_positives = scored[scored['false_positive'] == 1]
+    true_positives = scored[scored['true_positive'] == 1]
+    
+    print(f"\nFalse Positive Analysis:")
+    print(f"  Count: {len(false_positives):,}")
+    if len(false_positives) > 0:
+        print(f"  Mean prediction: {false_positives[pred_col].mean():.4f}")
+        if 'deforestation_b1_smooth64' in false_positives.columns:
+            print(f"  Mean deforestation_b1_smooth64: {false_positives['deforestation_b1_smooth64'].mean():.4f}")
+    
+    print(f"\nTrue Positive Analysis:")
+    print(f"  Count: {len(true_positives):,}")
+    if len(true_positives) > 0:
+        print(f"  Mean prediction: {true_positives[pred_col].mean():.4f}")
+        if 'deforestation_b1_smooth64' in true_positives.columns:
+            print(f"  Mean deforestation_b1_smooth64: {true_positives['deforestation_b1_smooth64'].mean():.4f}")
+    
+else:
+    axes[1, 1].text(0.5, 0.5, 'Scored file not found', 
+                    ha='center', va='center', transform=axes[1, 1].transAxes)
+    axes[1, 1].set_title('Prediction Distribution (N/A)')
+    scored = None
+
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / 'temporal_overview.png', dpi=300, bbox_inches='tight')
+print(f"\nSaved: {OUTPUT_DIR / 'temporal_overview.png'}")
+
+# ============================================================================
+# 6. DETAILED FEATURE DISTRIBUTION COMPARISONS
+# ============================================================================
+print("\n[6/9] Creating detailed feature distribution plots...")
+
+n_features = min(len(available_features), 9)
+fig, axes = plt.subplots(3, 3, figsize=(15, 12))
+axes = axes.flatten()
+
+for idx, feat in enumerate(available_features[:n_features]):
+    ax = axes[idx]
+    
+    # Plot distributions
+    for name, df, color in [('Train', train_sample, 'blue'), 
+                             ('Earlystop', earlystop_sample, 'green'), 
+                             ('Test', test_sample, 'red')]:
+        if feat in df.columns:
+            data = df[feat].dropna()
+            # Use percentiles to avoid outliers
+            p1, p99 = data.quantile([0.01, 0.99])
+            data_clipped = data[(data >= p1) & (data <= p99)]
+            ax.hist(data_clipped, bins=30, alpha=0.4, label=name, 
+                   density=True, color=color)
+    
+    ax.set_title(feat, fontsize=9)
+    ax.set_xlabel('Value', fontsize=8)
+    ax.set_ylabel('Density', fontsize=8)
+    if idx == 0:
+        ax.legend(fontsize=8)
+    ax.tick_params(labelsize=7)
+    ax.grid(True, alpha=0.3)
+
+# Hide empty subplots
+for idx in range(n_features, 9):
+    axes[idx].axis('off')
+
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / 'feature_distributions.png', dpi=300, bbox_inches='tight')
+print(f"Saved: {OUTPUT_DIR / 'feature_distributions.png'}")
+
+# ============================================================================
+# 7. DIAGNOSTIC VISUALIZATIONS (if scored file exists)
+# ============================================================================
+if SCORED_FILE is not None and SCORED_FILE.exists() and scored is not None and target_col is not None and pred_col is not None:
+    print("\n[7/9] Creating diagnostic visualizations...")
+    
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+    
+    # 7a. Calibration curve
+    ax = axes[0, 0]
+    prob_bins = np.linspace(0, 1, 21)
+    bin_centers = (prob_bins[:-1] + prob_bins[1:]) / 2
+    
+    calibration_data = []
+    for i in range(len(prob_bins) - 1):
+        mask = (scored[pred_col] >= prob_bins[i]) & (scored[pred_col] < prob_bins[i+1])
+        if mask.sum() > 0:
+            actual_rate = scored[mask][target_col].mean()
+            count = mask.sum()
+            calibration_data.append({
+                'predicted': bin_centers[i],
+                'actual': actual_rate,
+                'count': count
+            })
+    
+    if calibration_data:
+        calib_df = pd.DataFrame(calibration_data)
+        ax.scatter(calib_df['predicted'], calib_df['actual'], s=calib_df['count']/100, alpha=0.6)
+        ax.plot([0, 1], [0, 1], 'r--', label='Perfect calibration')
+        ax.set_xlabel('Predicted Probability')
+        ax.set_ylabel('Actual Transition Rate')
+        ax.set_title('Calibration Curve (bubble size = sample count)')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    
+    # 7b. Error by prediction confidence
+    ax = axes[0, 1]
+    high_conf = scored[scored[pred_col] > 0.7]
+    med_conf = scored[(scored[pred_col] > 0.3) & (scored[pred_col] <= 0.7)]
+    low_conf = scored[scored[pred_col] <= 0.3]
+    
+    conf_data = pd.DataFrame({
+        'Confidence': ['High (>0.7)', 'Medium (0.3-0.7)', 'Low (≤0.3)'],
+        'Mean_Error': [high_conf['error'].mean() if len(high_conf) > 0 else 0, 
+                      med_conf['error'].mean() if len(med_conf) > 0 else 0, 
+                      low_conf['error'].mean() if len(low_conf) > 0 else 0],
+        'Sample_Size': [len(high_conf), len(med_conf), len(low_conf)]
+    })
+    
+    bars = ax.bar(conf_data['Confidence'], conf_data['Mean_Error'], 
+                  color=['red', 'orange', 'green'], alpha=0.6)
+    ax.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+    ax.set_ylabel('Mean Prediction Error')
+    ax.set_title('Prediction Error by Confidence Level')
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    # Add sample sizes as text
+    for i, (bar, size) in enumerate(zip(bars, conf_data['Sample_Size'])):
+        if size > 0:
+            ax.text(i, bar.get_height()/2, f'n={size:,}', 
+                   ha='center', va='center', fontsize=8)
+    
+    # 7c. Feature values: False Positives vs True Positives
+    ax = axes[0, 2]
+    if len(false_positives) > 0 and len(true_positives) > 0:
+        feature_comparison = pd.DataFrame({
+            'Feature': ['defor_b1_s64', 'NDVI_b1_s64', 'GPW_b1', 'dist_wdpa'],
+            'False_Positive': [
+                false_positives['deforestation_b1_smooth64'].mean() if 'deforestation_b1_smooth64' in false_positives.columns else 0,
+                false_positives['NDVI_b1_smooth64'].mean() if 'NDVI_b1_smooth64' in false_positives.columns else 0,
+                false_positives['GPW_b1'].mean() if 'GPW_b1' in false_positives.columns else 0,
+                false_positives['dist_wdpa'].mean() if 'dist_wdpa' in false_positives.columns else 0
+            ],
+            'True_Positive': [
+                true_positives['deforestation_b1_smooth64'].mean() if 'deforestation_b1_smooth64' in true_positives.columns else 0,
+                true_positives['NDVI_b1_smooth64'].mean() if 'NDVI_b1_smooth64' in true_positives.columns else 0,
+                true_positives['GPW_b1'].mean() if 'GPW_b1' in true_positives.columns else 0,
+                true_positives['dist_wdpa'].mean() if 'dist_wdpa' in true_positives.columns else 0
+            ]
+        })
+        
+        x = np.arange(len(feature_comparison))
+        width = 0.35
+        ax.bar(x - width/2, feature_comparison['False_Positive'], width, label='False Positive', alpha=0.7)
+        ax.bar(x + width/2, feature_comparison['True_Positive'], width, label='True Positive', alpha=0.7)
+        ax.set_xticks(x)
+        ax.set_xticklabels(feature_comparison['Feature'], rotation=45, ha='right')
+        ax.set_ylabel('Mean Feature Value')
+        ax.set_title('Feature Profiles: FP vs TP')
+        ax.legend()
+        ax.grid(True, alpha=0.3, axis='y')
+    
+    # 7d. Prediction vs actual scatter (sampled)
+    ax = axes[1, 0]
+    sample_size = min(10000, len(scored))
+    sample_idx = np.random.choice(len(scored), size=sample_size, replace=False)
+    sample = scored.iloc[sample_idx]
+    
+    colors = ['blue' if x == 0 else 'red' for x in sample[target_col]]
+    ax.scatter(sample[pred_col], sample[target_col] + np.random.normal(0, 0.02, len(sample)),
+              alpha=0.1, s=1, c=colors)
+    ax.set_xlabel('Predicted Probability')
+    ax.set_ylabel('Actual (with jitter)')
+    ax.set_title(f'Predictions vs Actual ({sample_size:,} sample)')
+    ax.grid(True, alpha=0.3)
+    
+    # 7e. Historical deforestation distribution by outcome
+    ax = axes[1, 1]
+    if 'deforestation_b1_smooth64' in scored.columns:
+        ax.hist(scored[scored[target_col] == 0]['deforestation_b1_smooth64'], 
+               bins=50, alpha=0.5, label='No transition', density=True, color='blue')
+        ax.hist(scored[scored[target_col] == 1]['deforestation_b1_smooth64'], 
+               bins=50, alpha=0.5, label='Transition', density=True, color='red')
+        ax.set_xlabel('deforestation_b1_smooth64')
+        ax.set_ylabel('Density')
+        ax.set_title('Historical Deforestation by Outcome (Test Set)')
+        ax.legend()
+        ax.set_xlim(0, 50)  # Focus on main distribution
+        ax.grid(True, alpha=0.3)
+    
+    # 7f. Precision-Recall at different thresholds
+    ax = axes[1, 2]
+    thresholds = np.linspace(0, 1, 101)
+    precisions = []
+    recalls = []
+    
+    for thresh in thresholds:
+        pred_pos = scored[pred_col] >= thresh
+        if pred_pos.sum() > 0:
+            precision = scored[pred_pos][target_col].sum() / pred_pos.sum()
+            recall = scored[pred_pos][target_col].sum() / scored[target_col].sum()
+            precisions.append(precision)
+            recalls.append(recall)
+        else:
+            precisions.append(0)
+            recalls.append(0)
+    
+    ax.plot(recalls, precisions, linewidth=2)
+    ax.set_xlabel('Recall')
+    ax.set_ylabel('Precision')
+    ax.set_title('Precision-Recall Curve')
+    ax.grid(True, alpha=0.3)
+    
+    # Add baseline
+    baseline = scored[target_col].mean()
+    ax.axhline(y=baseline, color='r', linestyle='--', alpha=0.5, label=f'Baseline ({baseline:.4f})')
+    ax.legend()
+    
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / 'error_analysis.png', dpi=300, bbox_inches='tight')
+    print(f"Saved: {OUTPUT_DIR / 'error_analysis.png'}")
+
+# ============================================================================
+# 7b. DEDICATED CALIBRATION CURVE
+# ============================================================================
+if SCORED_FILE is not None and SCORED_FILE.exists() and scored is not None and target_col is not None and pred_col is not None:
+    print("\n[7b/9] Creating dedicated calibration curve...")
+    
+    # Create figure with two subplots: calibration curve on top, histogram below
+    fig = plt.figure(figsize=(10, 10))
+    gs = fig.add_gridspec(3, 1, height_ratios=[3, 1, 0.5], hspace=0.3)
+    
+    ax_cal = fig.add_subplot(gs[0, 0])
+    ax_hist = fig.add_subplot(gs[1, 0])
+    ax_text = fig.add_subplot(gs[2, 0])
+    ax_text.axis('off')
+    
+    # Create calibration bins
+    n_bins = 20
+    prob_bins = np.linspace(0, 1, n_bins + 1)
+    bin_centers = (prob_bins[:-1] + prob_bins[1:]) / 2
+    
+    calibration_data = []
+    for i in range(len(prob_bins) - 1):
+        mask = (scored[pred_col] >= prob_bins[i]) & (scored[pred_col] < prob_bins[i+1])
+        if i == len(prob_bins) - 2:  # Include upper bound for last bin
+            mask = (scored[pred_col] >= prob_bins[i]) & (scored[pred_col] <= prob_bins[i+1])
+        
+        if mask.sum() > 0:
+            actual_rate = scored[mask][target_col].mean()
+            count = mask.sum()
+            # Calculate confidence interval (95% CI for proportion)
+            if count > 0:
+                p = actual_rate
+                se = np.sqrt(p * (1 - p) / count)
+                ci_lower = max(0, p - 1.96 * se)
+                ci_upper = min(1, p + 1.96 * se)
+            else:
+                ci_lower = ci_upper = actual_rate
+            
+            calibration_data.append({
+                'predicted': bin_centers[i],
+                'actual': actual_rate,
+                'count': count,
+                'ci_lower': ci_lower,
+                'ci_upper': ci_upper
+            })
+    
+    if calibration_data:
+        calib_df = pd.DataFrame(calibration_data)
+        
+        # Plot calibration curve with error bars
+        ax_cal.errorbar(calib_df['predicted'], calib_df['actual'], 
+                       yerr=[calib_df['actual'] - calib_df['ci_lower'], 
+                             calib_df['ci_upper'] - calib_df['actual']],
+                       fmt='o', capsize=3, capthick=1.5, markersize=6,
+                       label='Calibration', color='steelblue', alpha=0.7)
+        
+        # Perfect calibration line
+        ax_cal.plot([0, 1], [0, 1], 'r--', linewidth=2, label='Perfect Calibration', alpha=0.8)
+        
+        # Add sample size annotations for bins with sufficient data
+        for _, row in calib_df.iterrows():
+            if row['count'] > 100:  # Only annotate bins with >100 samples
+                ax_cal.annotate(f"n={int(row['count']):,}", 
+                              xy=(row['predicted'], row['actual']),
+                              xytext=(5, 5), textcoords='offset points',
+                              fontsize=7, alpha=0.6)
+        
+        ax_cal.set_xlabel('Mean Predicted Probability', fontsize=12, fontweight='bold')
+        ax_cal.set_ylabel('Observed Transition Rate', fontsize=12, fontweight='bold')
+        ax_cal.set_title('Calibration Curve', fontsize=14, fontweight='bold')
+        ax_cal.legend(loc='upper left', fontsize=10)
+        ax_cal.grid(True, alpha=0.3)
+        ax_cal.set_xlim([-0.02, 1.02])
+        ax_cal.set_ylim([-0.02, 1.02])
+        
+        # Calculate calibration metrics
+        # Use sklearn's calibration_curve for comparison
+        fraction_of_positives, mean_predicted_value = calibration_curve(
+            scored[target_col], scored[pred_col], n_bins=n_bins, strategy='uniform'
+        )
+        
+        # Calculate Brier score
+        brier_score = brier_score_loss(scored[target_col], scored[pred_col])
+        brier_skill = 1 - (brier_score / (scored[target_col].mean() * (1 - scored[target_col].mean())))
+        
+        # Calculate Expected Calibration Error (ECE)
+        ece = np.mean(np.abs(calib_df['predicted'] - calib_df['actual']) * (calib_df['count'] / calib_df['count'].sum()))
+        
+        # Calculate Maximum Calibration Error (MCE)
+        mce = np.max(np.abs(calib_df['predicted'] - calib_df['actual']))
+        
+        # Plot histogram of predictions
+        ax_hist.hist(scored[pred_col], bins=50, alpha=0.6, color='steelblue', edgecolor='black')
+        ax_hist.axvline(scored[target_col].mean(), color='red', linestyle='--', 
+                       linewidth=2, label=f'Actual Rate: {scored[target_col].mean():.4f}')
+        ax_hist.set_xlabel('Predicted Probability', fontsize=11)
+        ax_hist.set_ylabel('Frequency', fontsize=11)
+        ax_hist.set_title('Distribution of Predicted Probabilities', fontsize=12)
+        ax_hist.legend(fontsize=9)
+        ax_hist.grid(True, alpha=0.3, axis='y')
+        
+        # Add metrics text
+        metrics_text = (
+            f"Brier Score: {brier_score:.4f} | "
+            f"Brier Skill Score: {brier_skill:.4f} | "
+            f"ECE: {ece:.4f} | "
+            f"MCE: {mce:.4f}"
+        )
+        ax_text.text(0.5, 0.5, metrics_text, ha='center', va='center', 
+                    fontsize=11, fontweight='bold', 
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        
+        plt.tight_layout()
+        plt.savefig(OUTPUT_DIR / 'calibration_curve.png', dpi=300, bbox_inches='tight')
+        print(f"Saved: {OUTPUT_DIR / 'calibration_curve.png'}")
+        
+        # Print calibration metrics
+        print(f"\nCalibration Metrics:")
+        print(f"  Brier Score: {brier_score:.4f}")
+        print(f"  Brier Skill Score: {brier_skill:.4f}")
+        print(f"  Expected Calibration Error (ECE): {ece:.4f}")
+        print(f"  Maximum Calibration Error (MCE): {mce:.4f}")
+
+# ============================================================================
+# 8. COHORT ANALYSIS (if scored file exists)
+# ============================================================================
+if SCORED_FILE is not None and SCORED_FILE.exists() and scored is not None and target_col is not None and pred_col is not None:
+    print("\n[8/9] Performing cohort analysis...")
+    
+    # Define cohorts by historical deforestation
+    if 'deforestation_b1_smooth64' in scored.columns:
+        try:
+            scored['defor_cohort'] = pd.qcut(scored['deforestation_b1_smooth64'], 
+                                             q=5, labels=['Very Low', 'Low', 'Medium', 'High', 'Very High'],
+                                             duplicates='drop')
+            
+            cohort_stats = scored.groupby('defor_cohort').agg({
+                target_col: ['mean', 'sum', 'count'],
+                pred_col: 'mean',
+                'deforestation_b1_smooth64': 'mean'
+            }).round(4)
+            
+            print("\nCohort Analysis by Historical Deforestation:")
+            print(cohort_stats)
+            
+            # Visualization
+            fig, ax = plt.subplots(figsize=(12, 6))
+            
+            cohort_summary = cohort_stats.reset_index()
+            cohort_summary.columns = ['_'.join(col).strip('_') if isinstance(col, tuple) else col for col in cohort_summary.columns]
+            
+            x = np.arange(len(cohort_summary))
+            width = 0.35
+            
+            pred_col_name = f'{pred_col}_mean' if f'{pred_col}_mean' in cohort_summary.columns else pred_col
+            target_col_name = f'{target_col}_mean' if f'{target_col}_mean' in cohort_summary.columns else target_col
+            
+            if pred_col_name in cohort_summary.columns and target_col_name in cohort_summary.columns:
+                ax.bar(x - width/2, cohort_summary[pred_col_name], width, 
+                      label='Mean Prediction', alpha=0.7, color='blue')
+                ax.bar(x + width/2, cohort_summary[target_col_name], width,
+                      label='Actual Rate', alpha=0.7, color='red')
+                
+                ax.set_xlabel('Historical Deforestation Cohort')
+                ax.set_ylabel('Rate')
+                ax.set_title('Model Predictions vs Actual Transitions by Deforestation History')
+                ax.set_xticks(x)
+                ax.set_xticklabels(cohort_summary['defor_cohort'])
+                ax.legend()
+                ax.grid(True, alpha=0.3, axis='y')
+                
+                plt.tight_layout()
+                plt.savefig(OUTPUT_DIR / 'cohort_analysis.png', dpi=300, bbox_inches='tight')
+                print(f"Saved: {OUTPUT_DIR / 'cohort_analysis.png'}")
+            
+            # Save cohort stats
+            cohort_stats.to_csv(OUTPUT_DIR / 'cohort_analysis.csv')
+            print(f"Saved: {OUTPUT_DIR / 'cohort_analysis.csv'}")
+        except Exception as e:
+            print(f"  Warning: Could not perform cohort analysis: {e}")
+
+# ============================================================================
+# 9. DATA QUALITY CHECKS
+# ============================================================================
+print("\n[9/9] Running data quality checks...")
+
+quality_report = {}
+
+# Check for missing values
+print("\nMissing value rates:")
+for name, df in [('Train', train_sample), ('Earlystop', earlystop_sample), ('Test', test_sample)]:
+    missing = df.isna().mean()
+    missing_feats = missing[missing > 0].sort_values(ascending=False)
+    quality_report[f'{name}_missing'] = missing_feats.to_dict()
+    if len(missing_feats) > 0:
+        print(f"\n{name}:")
+        print(missing_feats.head(10))
+    else:
+        print(f"\n{name}: No missing values")
+
+# Check for constant features
+print("\nFeatures with near-zero variance:")
+for name, df in [('Train', train_sample), ('Earlystop', earlystop_sample), ('Test', test_sample)]:
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    low_var = []
+    for col in numeric_cols:
+        if df[col].std() < 1e-6:
+            low_var.append(col)
+    quality_report[f'{name}_constant'] = low_var
+    if low_var:
+        print(f"\n{name}: {low_var}")
+    else:
+        print(f"\n{name}: No constant features")
+
+# Check for extreme outliers
+print("\nFeatures with extreme outliers (>5 std from mean):")
+for name, df in [('Train', train_sample), ('Earlystop', earlystop_sample), ('Test', test_sample)]:
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    outlier_info = {}
+    for col in numeric_cols:
+        data = df[col].dropna()
+        if len(data) > 0 and data.std() > 0:
+            z_scores = np.abs((data - data.mean()) / data.std())
+            n_outliers = (z_scores > 5).sum()
+            if n_outliers > 0:
+                outlier_info[col] = f"{n_outliers} ({n_outliers/len(data)*100:.2f}%)"
+    quality_report[f'{name}_outliers'] = outlier_info
+    if outlier_info:
+        print(f"\n{name}:")
+        for col, info in list(outlier_info.items())[:10]:
+            print(f"  {col}: {info}")
+    else:
+        print(f"\n{name}: No extreme outliers")
+
+# Save quality report
+with open(OUTPUT_DIR / 'quality_report.json', 'w') as f:
+    json.dump(quality_report, f, indent=2, default=str)
+print(f"\nSaved: {OUTPUT_DIR / 'quality_report.json'}")
+
+# ============================================================================
+# SUMMARY STATISTICS
+# ============================================================================
+print("\n" + "="*70)
+print("SUMMARY")
+print("="*70)
+
+# Compute distribution shifts (Kolmogorov-Smirnov test)
+from scipy import stats
+
+print("\nTop features with largest distribution shifts (KS statistic, Train vs Test):")
+ks_results = []
+for feat in available_features[:10]:
+    if feat in train_sample.columns and feat in test_sample.columns:
+        train_data = train_sample[feat].dropna()
+        test_data = test_sample[feat].dropna()
+        if len(train_data) > 0 and len(test_data) > 0:
+            ks_stat, p_value = stats.ks_2samp(train_data, test_data)
+            ks_results.append({'feature': feat, 'ks_stat': ks_stat, 'p_value': p_value})
+
+ks_df = pd.DataFrame(ks_results).sort_values('ks_stat', ascending=False)
+print(ks_df.to_string(index=False))
+
+# Save summary
+summary = {
+    'transition_rates': {
+        'train': float(train_target['transition_01_win5'].mean()),
+        'earlystop': float(earlystop_target['transition_01_win5'].mean()),
+        'test': float(test_target['transition_01_win5'].mean())
+    },
+    'sample_sizes': {
+        'train': len(train_target),
+        'earlystop': len(earlystop_target),
+        'test': len(test_target)
+    },
+    'distribution_shifts': ks_df.to_dict('records')
+}
+
+with open(OUTPUT_DIR / 'summary_stats.json', 'w') as f:
+    json.dump(summary, f, indent=2)
+
+print(f"\nAnalysis complete! Check {OUTPUT_DIR} for outputs.")
+print("\nGenerated files:")
+print(f"  - temporal_overview.png: Overview of temporal patterns and predictions")
+print(f"  - feature_distributions.png: Detailed feature distribution comparisons")
+print(f"  - yearly_detailed_stats.csv: Year-by-year statistics with features")
+print(f"  - quality_report.json: Data quality checks")
+print(f"  - summary_stats.json: Summary statistics and distribution shifts")
+if SCORED_FILE is not None and SCORED_FILE.exists():
+    print(f"  - error_analysis.png: Diagnostic visualizations for prediction errors")
+    print(f"  - calibration_curve.png: Detailed calibration curve with metrics")
+    print(f"  - cohort_analysis.png: Model performance by deforestation history cohorts")
+    print(f"  - cohort_analysis.csv: Cohort statistics")
+print("="*70)

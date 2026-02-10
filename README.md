@@ -1,6 +1,6 @@
 # Protected Area Designation Prediction using Machine Learning
 
-A large-scale machine learning pipeline for predicting future protected area establishment across South America using historical patterns, environmental features, and socio-economic indicators.
+A large-scale machine learning pipeline for predicting future protected area establishment across multiple geographic regions using historical patterns, environmental features, and socio-economic indicators. Currently implemented for South America (continental + Colombia sub-region), with planned extensions to the USA, South-East Asia, and Tropical Africa.
 
 **For a high-level project overview, see [`context.md`](context.md).**
 
@@ -10,33 +10,41 @@ A large-scale machine learning pipeline for predicting future protected area est
 
 ```
 ├── scripts/
-│   ├── data extraction/       # Google Earth Engine and API exporters
-│   ├── preprocessing/          # Format harmonization, storage optimization
-│   ├── merging/                # Panel dataset construction
-│   ├── visualisations/         # Exploratory plots and data validation
-│   ├── ML/                     # Model 1: Full South America pipeline
-│   │   ├── ml_preprocessing/   # Train/test splits, feature engineering
-│   │   ├── training/           # LightGBM, Random Forest, tuning
-│   │   ├── evaluation/         # Temporal CV, spatial CV, calibration
-│   │   └── results/            # Metrics, maps, and visualizations
-│   ├── colombia/               # Model C: Colombia-only (rapid validation)
-│   │   ├── export/
-│   │   ├── preprocessing/
-│   │   ├── merge/
-│   │   └── ML/
-│   └── embeddings/             # Model E: Satellite embedding features
-│       ├── export/
-│       ├── preprocessing/
-│       ├── merge/
-│       └── ML/
+│   ├── regions/                         # Geography-specific pipelines
+│   │   ├── south_america/               # Primary region
+│   │   │   ├── 1_extraction/            # GEE export scripts
+│   │   │   ├── 2_preprocessing/         # Format harmonization
+│   │   │   ├── 3_merging/               # Panel construction
+│   │   │   ├── 4_ml/                    # Continental ML pipeline
+│   │   │   │   ├── splits/
+│   │   │   │   ├── training/ (+ tuning/)
+│   │   │   │   ├── evaluation/
+│   │   │   │   └── results/
+│   │   │   ├── colombia/                # Country sub-pipeline
+│   │   │   │   ├── preprocessing/
+│   │   │   │   ├── 3_merging/
+│   │   │   │   └── 4_ml/
+│   │   │   └── embeddings/              # Satellite embedding pipeline
+│   │   │       ├── 1_extraction/
+│   │   │       ├── 2_preprocessing/
+│   │   │       ├── 3_merging/
+│   │   │       └── 4_ml/
+│   │   ├── usa/                         # (template for new regions)
+│   │   ├── se_asia/
+│   │   └── tropical_africa/
+│   └── visualisations/                  # Feature-level EDA (cross-region)
 ├── outputs/
-│   ├── Results/                # Model predictions, metrics, maps
-│   │   ├── ml_models/          # JSON metrics, text logs
-│   │   ├── results_model1_lgbm/
-│   │   ├── results_modelC_lgbm/
-│   │   ├── results_modelC_rf/
-│   │   └── results_modelC_brf/
-│   └── Tables/                 # Summary statistics, validation reports
+│   ├── south_america/
+│   │   ├── figures/
+│   │   ├── tables/
+│   │   ├── results/ (lgbm/, rf/, ml_models/)
+│   │   ├── colombia/ (figures/, tables/, results/)
+│   │   └── embeddings/ (figures/, tables/, results/)
+│   ├── usa/
+│   └── ...
+├── slurm/
+│   ├── south_america/ (+ colombia/, embeddings/)
+│   └── ...
 ├── environment.yml             # Conda environment specification
 ├── context.md                  # High-level project overview (start here!)
 └── README.md                   # This file
@@ -117,7 +125,7 @@ The pipeline consists of the following stages:
 - Scored Parquet files with pixel-level predictions (calibrated and uncalibrated)
 - Ranked pixel lists for prioritization
 
-All outputs stored in `outputs/Results/` and reproducible from scripts in `scripts/`.
+All outputs stored in `outputs/{region}/` and reproducible from scripts in `scripts/regions/{region}/`.
 
 ---
 

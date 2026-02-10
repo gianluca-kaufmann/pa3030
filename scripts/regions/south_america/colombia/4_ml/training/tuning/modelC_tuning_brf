@@ -1,0 +1,754 @@
+#!/usr/bin/env python3
+
+"""ModelC Balanced Random Forest Hyperparameter Tuning Script (Colombia Dataset)
+
+Purpose: Perform comprehensive hyperparameter tuning for a Balanced Random Forest model using
+         the Colombia-specific tuning dataset (modelC_tuning_colombia.parquet)
+         with strict temporal split
+         (train: year <= 2014, earlystop: 2015 <= year <= 2017).
+
+Input:   `modelC_tuning_colombia.parquet`
+Output:  - brf_best_params.json (saved to training/ directory for use by modelC_BRF)
+
+Features:
+- Expanded hyperparameter search space for better optimization
+- RandomizedSearchCV with Balanced Random Forest classifier
+- Comprehensive parameter ranges covering common best practices
+"""
+
+from __future__ import annotations
+
+import gc
+import json
+import os
+import sys
+import time
+from copy import deepcopy
+
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import wandb
+from sklearn.model_selection import RandomizedSearchCV, PredefinedSplit, train_test_split
+
+# Dependency guard for imblearn
+try:
+    from imblearn.ensemble import BalancedRandomForestClassifier
+except ImportError:
+    raise RuntimeError(
+        "imblearn is required for BRF. Install imbalanced-learn in the environment."
+    )
+
+
+class Tee:
+    """Write to both stdout/stderr and a file."""
+
+    def __init__(self, file_path: Path, original_stream):
+        self.file = open(file_path, "a", encoding="utf-8")  # Append mode to capture both stdout and stderr
+        self.original_stream = original_stream
+
+    def write(self, text: str) -> None:
+        self.original_stream.write(text)
+        self.original_stream.flush()
+        self.file.write(text)
+        self.file.flush()
+
+    def flush(self) -> None:
+        self.original_stream.flush()
+        self.file.flush()
+
+    def close(self) -> None:
+        self.file.close()
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+
+def get_n_jobs() -> int:
+    """Get number of jobs from SLURM_CPUS_PER_TASK, returning -1 on missing/invalid values."""
+    try:
+        cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+        if cpus is None:
+            return -1
+        return int(cpus)
+    except (ValueError, TypeError):
+        return -1
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+RANDOM_STATE = 42
+
+# Temporal split configuration
+TRAIN_YEAR_MAX = 2014  # train_idx = year <= 2014
+EARLYSTOP_YEAR_MIN = 2015  # earlystop_idx = 2015 <= year <= 2017
+EARLYSTOP_YEAR_MAX = 2017
+MIN_YEAR = int(os.environ.get("TRANSITION_MIN_YEAR", "2001"))  # drop year 2000 by default
+
+# Columns to exclude from features
+EXCLUDE_COLS = {
+    "transition_01",  # Old target variable
+    "transition_01_win5",  # Target variable (5-year lookahead)
+    "WDPA_b1",  # Leakage
+    "WDPA_prev",  # Leakage
+    "x",  # Coordinate
+    "y",  # Coordinate
+    "row",  # Identifier
+    "col",  # Identifier
+    "year",  # Temporal identifier (kept for splitting)
+}
+
+# RandomizedSearchCV configuration
+N_ITER_BRF = int(os.environ.get("N_ITER_BRF", "100"))  # Default 100 iterations for BRF
+
+# Temporal sample weights configuration
+USE_TIME_WEIGHTS = (os.environ.get("USE_TIME_WEIGHTS", "0") == "1")
+
+# Balanced Random Forest parameter grid
+BRF_PARAM_GRID = {
+    # Use 1000 for final training if feasible (not included here to keep tuning faster)
+    "n_estimators": [100, 200],
+    "max_depth": [15, 20, 30, 40, None],
+    "min_samples_leaf": [5, 10, 20, 50],
+    "min_samples_split": [10, 50, 100],
+    "max_features": ["sqrt", "log2", 0.3, 0.5],
+    "bootstrap": [True],
+    "sampling_strategy": ["auto"],
+    "replacement": [False, True],
+    "criterion": ["gini", "log_loss"],
+}
+
+# Parallelism configuration
+# Default (Euler-safe): RandomizedSearchCV(n_jobs=1), BRF(n_jobs=get_n_jobs())
+# Optional: Set TUNING_PARALLEL_MODE=search to parallelize search instead
+TUNING_PARALLEL_MODE = os.environ.get("TUNING_PARALLEL_MODE", "search")
+
+# Balanced Random Forest fixed parameters (n_jobs set conditionally based on parallelism mode)
+BRF_FIXED_PARAMS_BASE = {
+    "random_state": RANDOM_STATE,
+}
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+
+def convert_numpy_types(obj: Any) -> Any:
+    """Recursively convert NumPy types to native Python types for JSON serialization."""
+    if isinstance(
+        obj,
+        (
+            np.integer,
+            np.int_,
+            np.intc,
+            np.intp,
+            np.int8,
+            np.int16,
+            np.int32,
+            np.int64,
+            np.uint8,
+            np.uint16,
+            np.uint32,
+            np.uint64,
+        ),
+    ):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float_, np.float16, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_numpy_types(item) for item in obj]
+    elif obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    else:
+        try:
+            if hasattr(obj, "item"):
+                return obj.item()
+            else:
+                return obj
+        except (ValueError, TypeError, AttributeError):
+            return str(obj)
+
+
+def get_feature_columns(df: pd.DataFrame) -> list:
+    """Get valid feature columns, excluding identifiers and leakage columns.
+    
+    Includes both numeric and boolean feature columns.
+    """
+    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+    bool_cols = df.select_dtypes(include=["bool"]).columns.tolist()
+    candidate_cols = numeric_cols + [c for c in bool_cols if c not in numeric_cols]
+    exclude_lower = {c.lower() for c in EXCLUDE_COLS}
+    feature_cols = [col for col in candidate_cols if col.lower() not in exclude_lower]
+    return feature_cols
+
+
+def compute_temporal_weights(years: np.ndarray, min_year: int, max_year: int) -> np.ndarray:
+    """
+    Compute temporal sample weights linearly scaled from 0.5 at min_year to 1.0 at max_year.
+    
+    Args:
+        years: Array of year values
+        min_year: Minimum year (weight = 0.5)
+        max_year: Maximum year (weight = 1.0)
+    
+    Returns:
+        Array of weights, capped within [0.5, 1.0]
+    """
+    years = np.asarray(years, dtype=float)
+    # Linear scaling: weight = 0.5 + 0.5 * (year - min_year) / (max_year - min_year)
+    if max_year == min_year:
+        # Edge case: all years are the same
+        weights = np.full_like(years, 1.0)
+    else:
+        weights = 0.5 + 0.5 * (years - min_year) / (max_year - min_year)
+    # Cap weights within [0.5, 1.0]
+    weights = np.clip(weights, 0.5, 1.0)
+    return weights
+
+
+def resolve_tuning_parquet() -> Path:
+    """Locate modelC_tuning_colombia.parquet (prefer $SCRATCH if present)."""
+    repo_root = Path(__file__).resolve().parents[4]
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    candidates = []
+    if scratch_root is not None:
+        # Check data/ml/tuning location on scratch (standard location from modelC_sample)
+        candidates.append(scratch_root / "data/ml/tuning/modelC_tuning_colombia.parquet")
+        # Also check outputs/south_america/colombia/results/tuning (if modelC_sample wrote it there)
+        candidates.append(scratch_root / "outputs/south_america/colombia/results/tuning/modelC_tuning_colombia.parquet")
+    candidates.append(repo_root / "data/ml/tuning/modelC_tuning_colombia.parquet")
+    candidates.append(repo_root / "outputs/south_america/colombia/results/tuning/modelC_tuning_colombia.parquet")
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    # Provide detailed error message with all checked paths
+    error_msg = "modelC_tuning_colombia.parquet not found in expected locations.\n"
+    error_msg += "\nChecked locations:\n"
+    for cand in candidates:
+        error_msg += f"  - {cand}\n"
+    if scratch_root:
+        error_msg += f"\nSCRATCH root: {scratch_root}\n"
+    error_msg += f"Repository root: {repo_root}\n"
+    raise FileNotFoundError(error_msg)
+
+
+# =============================================================================
+# Main Pipeline
+# =============================================================================
+
+
+def main(use_wandb: bool = False) -> None:
+    start_time = time.time()
+
+    # -------------------------------------------------------------------------
+    # Setup paths
+    # -------------------------------------------------------------------------
+    repo_root = Path(__file__).resolve().parents[4]
+    script_dir = Path(__file__).resolve().parent
+
+    train_path = resolve_tuning_parquet()
+
+    # Print modification time of input parquet file to detect stale data
+    mod_time = train_path.stat().st_mtime
+    mod_time_str = datetime.fromtimestamp(mod_time).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\nInput parquet file modification time: {mod_time_str}")
+
+    print("=" * 70)
+    print("MODELC BALANCED RANDOM FOREST HYPERPARAMETER TUNING (COLOMBIA DATASET)")
+    print("=" * 70)
+    print(f"\nInput:  {train_path}")
+    print(f"Output: {script_dir}")
+
+    # -------------------------------------------------------------------------
+    # Step 1: Load data
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 1: LOAD DATA")
+    print("=" * 70)
+
+    print(f"\nLoading modelC_tuning_colombia.parquet...")
+    load_start = time.time()
+    df = pd.read_parquet(train_path)
+    load_time = time.time() - load_start
+    print(f"  Loaded {len(df):,} rows in {load_time:.1f}s")
+
+    # Downcast numeric dtypes to reduce memory usage
+    print("\nDowncasting numeric dtypes (float64→float32, int64→int32)...")
+    float_cols = df.select_dtypes(include=["float64"]).columns
+    for col in float_cols:
+        df[col] = df[col].astype("float32")
+
+    int_cols = df.select_dtypes(include=["int64"]).columns
+    for col in int_cols:
+        df[col] = df[col].astype("int32")
+    print("  Downcasting completed")
+
+    target_col = "transition_01_win5"
+
+    # Check target column exists
+    if target_col not in df.columns:
+        raise ValueError(f"Target column '{target_col}' not found in data")
+
+    # Drop rows with missing target
+    df_clean = df.dropna(subset=[target_col])
+    dropped = len(df) - len(df_clean)
+    if dropped > 0:
+        print(f"\nDropped {dropped:,} rows with missing target")
+
+    # Drop year 2000 for transition modeling (avoid treating existing PAs as transitions)
+    if "year" in df_clean.columns:
+        before = len(df_clean)
+        df_clean = df_clean[df_clean["year"] >= MIN_YEAR].copy()
+        removed = before - len(df_clean)
+        if removed > 0:
+            print(f"\nDropped {removed:,} rows with year < {MIN_YEAR} (TRANSITION_MIN_YEAR)")
+
+    print(f"\nDataset after cleaning: {len(df_clean):,} rows")
+
+    # Get feature columns
+    feature_cols = get_feature_columns(df_clean)
+    assert target_col not in feature_cols, "LEAKAGE: target_col included in features"
+    excluded_cols = sorted(EXCLUDE_COLS & set(df_clean.columns))
+
+    print(f"\nUsing {len(feature_cols)} features")
+    print(f"Excluded columns ({len(excluded_cols)}): {excluded_cols}")
+
+    # Target distribution
+    pos = (df_clean[target_col] > 0).sum()
+    neg = (df_clean[target_col] == 0).sum()
+    pos_pct = pos / len(df_clean) * 100
+
+    print("\n" + "-" * 40)
+    print("Dataset target distribution:")
+    print(f"  No transition (0): {neg:>12,}  ({100 - pos_pct:.3f}%)")
+    print(f"  Transition (0→1):  {pos:>12,}  ({pos_pct:.3f}%)")
+    print(f"  Class ratio:       1 : {neg / max(pos, 1):.1f}")
+    print("-" * 40)
+
+    # -------------------------------------------------------------------------
+    # Step 2: Create temporal split
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 2: CREATE TEMPORAL SPLIT")
+    print("=" * 70)
+
+    # Create train and earlystop indices based on year
+    train_idx = df_clean["year"] <= TRAIN_YEAR_MAX
+    earlystop_idx = (df_clean["year"] >= EARLYSTOP_YEAR_MIN) & (df_clean["year"] <= EARLYSTOP_YEAR_MAX)
+
+    df_train = df_clean[train_idx].copy()
+    df_earlystop = df_clean[earlystop_idx].copy()
+
+    print(f"\nTemporal split configuration:")
+    print(f"  Train: year <= {TRAIN_YEAR_MAX}")
+    print(f"  Earlystop:   {EARLYSTOP_YEAR_MIN} <= year <= {EARLYSTOP_YEAR_MAX}")
+
+    print(f"\nTrain set: {len(df_train):,} rows")
+    print(f"Earlystop set:   {len(df_earlystop):,} rows")
+
+    # Validate that both splits are non-empty
+    if len(df_train) == 0 or len(df_earlystop) == 0:
+        available_years = sorted(df_clean["year"].unique())
+        raise ValueError(
+            f"Empty split detected. Train set: {len(df_train):,} rows, "
+            f"Earlystop set: {len(df_earlystop):,} rows.\n"
+            f"Expected train: year <= {TRAIN_YEAR_MAX}, "
+            f"earlystop: {EARLYSTOP_YEAR_MIN} <= year <= {EARLYSTOP_YEAR_MAX}.\n"
+            f"Available years in dataset: {available_years}"
+        )
+
+    # Check years in each split
+    train_years = sorted(df_train["year"].unique())
+    earlystop_years = sorted(df_earlystop["year"].unique())
+    print(f"\nTrain years: {train_years}")
+    print(f"Earlystop years:   {earlystop_years}")
+
+    # Target distribution
+    train_pos = (df_train[target_col] > 0).sum()
+    train_neg = (df_train[target_col] == 0).sum()
+    train_pos_pct = train_pos / len(df_train) * 100
+
+    earlystop_pos = (df_earlystop[target_col] > 0).sum()
+    earlystop_neg = (df_earlystop[target_col] == 0).sum()
+    earlystop_pos_pct = earlystop_pos / len(df_earlystop) * 100
+
+    print("\n" + "-" * 40)
+    print("Train set distribution:")
+    print(f"  No transition (0): {train_neg:>12,}  ({100 - train_pos_pct:.3f}%)")
+    print(f"  Transition (0→1):  {train_pos:>12,}  ({train_pos_pct:.3f}%)")
+    print("\nEarlystop set distribution:")
+    print(f"  No transition (0): {earlystop_neg:>12,}  ({100 - earlystop_pos_pct:.3f}%)")
+    print(f"  Transition (0→1):  {earlystop_pos:>12,}  ({earlystop_pos_pct:.3f}%)")
+    print("-" * 40)
+
+    # -------------------------------------------------------------------------
+    # Step 3: Prepare features and target
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 3: PREPARE FEATURES AND TARGET")
+    print("=" * 70)
+
+    # Training set
+    y_train = (df_train[target_col] > 0).astype(np.int8)
+    X_train = df_train[feature_cols]
+    years_train = df_train["year"].values.copy()
+
+    # Earlystop set
+    y_earlystop = (df_earlystop[target_col] > 0).astype(np.int8)
+    X_earlystop = df_earlystop[feature_cols]
+    years_earlystop = df_earlystop["year"].values.copy()
+
+    print(f"\nTrain feature matrix shape: {X_train.shape}")
+    print(f"Train target shape: {y_train.shape}")
+    print(f"Earlystop feature matrix shape: {X_earlystop.shape}")
+    print(f"Earlystop target shape: {y_earlystop.shape}")
+
+    # Create eval subset for early stopping: simple random sampling (cap 500k rows) preserving class ratio
+    EVAL_SUBSET_MAX_ROWS = 500_000
+    n_earlystop_full = len(X_earlystop)
+    if n_earlystop_full > EVAL_SUBSET_MAX_ROWS:
+        print(f"\nCreating eval subset for early stopping (cap {EVAL_SUBSET_MAX_ROWS:,} rows)...")
+        # Calculate original class ratio before subsampling
+        orig_pos_ratio = y_earlystop.sum() / len(y_earlystop)
+        # Use stratified sampling to preserve class ratio
+        # Get indices for consistent subsampling
+        indices = np.arange(len(X_earlystop))
+        indices_eval, _ = train_test_split(
+            indices,
+            train_size=EVAL_SUBSET_MAX_ROWS,
+            stratify=y_earlystop,
+            random_state=RANDOM_STATE,
+        )
+        # Subsample all arrays using the same indices
+        X_earlystop = X_earlystop.iloc[indices_eval].reset_index(drop=True)
+        y_earlystop = y_earlystop.iloc[indices_eval].reset_index(drop=True)
+        years_earlystop = years_earlystop[indices_eval]
+        print(f"  Full earlystop set: {n_earlystop_full:,} rows")
+        print(f"  Eval subset: {len(X_earlystop):,} rows")
+        # Verify class ratio preservation
+        eval_pos_ratio = y_earlystop.sum() / len(y_earlystop)
+        print(f"  Original class ratio (pos): {orig_pos_ratio:.5f}")
+        print(f"  Eval subset class ratio (pos): {eval_pos_ratio:.5f}")
+    else:
+        print(f"\nEarlystop set ({n_earlystop_full:,} rows) <= {EVAL_SUBSET_MAX_ROWS:,}, using full set for eval")
+
+    # Store sizes for summary (before deleting DataFrames)
+    cleaned_row_count = len(df_clean)
+    n_train = len(X_train)
+    n_earlystop = len(X_earlystop)
+
+    # Free large DataFrames early to reduce peak memory
+    print("\nFreeing large DataFrames to reduce memory usage...")
+    del df_clean, df_train, df_earlystop
+    gc.collect()
+    print("  Memory cleanup completed")
+
+    # Combine train and earlystop for RandomizedSearchCV with PredefinedSplit
+    # -1 indicates train, 0 indicates test/earlystop
+    X_combined = pd.concat([X_train, X_earlystop], ignore_index=True)
+    y_combined = np.concatenate([y_train.values, y_earlystop.values])
+    years_combined = np.concatenate([years_train, years_earlystop])
+    split_indices = np.concatenate(
+        [
+            np.full(n_train, -1, dtype=int),  # -1 for train
+            np.zeros(n_earlystop, dtype=int),  # 0 for earlystop/test
+        ]
+    ).astype(int)  # Ensure int dtype for PredefinedSplit
+    predefined_split = PredefinedSplit(split_indices)
+
+    print(f"\nCombined dataset for CV: {len(X_combined):,} rows")
+    print(f"  Train: {n_train:,} rows (indices -1)")
+    print(f"  Earlystop:   {n_earlystop:,} rows (indices 0)")
+
+    # Compute temporal sample weights if enabled
+    weights_combined = None
+    if USE_TIME_WEIGHTS:
+        weights_combined = compute_temporal_weights(years_combined, MIN_YEAR, EARLYSTOP_YEAR_MAX)
+        print(f"\nTemporal sample weights: ENABLED")
+        print(f"  Weight range: [{weights_combined.min():.3f}, {weights_combined.max():.3f}]")
+        print(f"  Mean weight: {weights_combined.mean():.3f}")
+        print(f"  Scaling: 0.5 at year {MIN_YEAR} -> 1.0 at year {EARLYSTOP_YEAR_MAX}")
+    else:
+        print(f"\nTemporal sample weights: DISABLED")
+
+    # -------------------------------------------------------------------------
+    # Step 4: Prepare parameter grid
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 4: PREPARE PARAMETER GRID")
+    print("=" * 70)
+
+    brf_param_grid = deepcopy(BRF_PARAM_GRID)
+
+    # Calculate total parameter combinations (for information)
+    total_combinations = 1
+    for param, values in brf_param_grid.items():
+        total_combinations *= len(values)
+
+    print("\nParameter grid:")
+    for param, values in sorted(brf_param_grid.items()):
+        print(f"  {param}: {len(values)} options - {values}")
+    
+    print(f"\nTotal possible combinations: {total_combinations:,}")
+    print(f"Searching {N_ITER_BRF} random combinations ({(N_ITER_BRF/total_combinations*100):.6f}% of search space)")
+
+    print("\nFixed parameters:")
+    for param, value in BRF_FIXED_PARAMS_BASE.items():
+        print(f"  {param}: {value}")
+    print(f"  n_jobs: (set dynamically based on parallelism mode)")
+
+    # -------------------------------------------------------------------------
+    # Step 5: Balanced Random Forest hyperparameter tuning
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 5: BALANCED RANDOM FOREST HYPERPARAMETER TUNING")
+    print("=" * 70)
+
+    print(
+        f"\nUsing temporal split: train (year <= {TRAIN_YEAR_MAX}) / "
+        f"earlystop ({EARLYSTOP_YEAR_MIN} <= year <= {EARLYSTOP_YEAR_MAX})"
+    )
+    print(f"Sampling {N_ITER_BRF} parameter combinations with RandomizedSearchCV")
+
+    # Configure parallelism based on TUNING_PARALLEL_MODE
+    if TUNING_PARALLEL_MODE == "search":
+        # Parallelize search, single-thread BRF
+        search_n_jobs = get_n_jobs()
+        brf_n_jobs = 1
+        print(f"\nParallelism mode: search (RandomizedSearchCV n_jobs={search_n_jobs}, BRF n_jobs=1)")
+    else:
+        # Default: Single-thread search, parallel BRF
+        search_n_jobs = 1
+        brf_n_jobs = get_n_jobs()
+        print(f"\nParallelism mode: default (RandomizedSearchCV n_jobs=1, BRF n_jobs={brf_n_jobs})")
+
+    # Create Balanced Random Forest model with appropriate n_jobs
+    BRF_FIXED_PARAMS = {**BRF_FIXED_PARAMS_BASE, "n_jobs": brf_n_jobs}
+    brf_model = BalancedRandomForestClassifier(**BRF_FIXED_PARAMS)
+
+    # Randomized search with fixed train/val split
+    print(f"\nStarting randomized search ({N_ITER_BRF} iterations)...")
+    print("This may take a while...\n")
+
+    random_search_brf = RandomizedSearchCV(
+        estimator=brf_model,
+        param_distributions=brf_param_grid,
+        n_iter=N_ITER_BRF,
+        cv=predefined_split,  # Use fixed train/val split
+        scoring="average_precision",  # PR-AUC (better for imbalanced data)
+        n_jobs=search_n_jobs,  # Set based on parallelism mode
+        verbose=3,  # Log each iteration with detailed progress
+        random_state=RANDOM_STATE,
+        return_train_score=False,
+    )
+
+    tune_start_brf = time.time()
+    if USE_TIME_WEIGHTS:
+        random_search_brf.fit(X_combined, y_combined, sample_weight=weights_combined)
+    else:
+        random_search_brf.fit(X_combined, y_combined)
+    tune_time_brf = time.time() - tune_start_brf
+
+    # best_score_ is the score on the earlystop set
+    best_earlystop_score_brf = random_search_brf.best_score_
+
+    print(
+        f"\nBalanced Random Forest randomized search completed in "
+        f"{tune_time_brf:.1f}s ({tune_time_brf/60:.1f} min)"
+    )
+    print("\nBest parameters:")
+    for param, value in sorted(random_search_brf.best_params_.items()):
+        print(f"  {param}: {value}")
+    print(f"\nBest earlystop score (PR-AUC): {best_earlystop_score_brf:.4f}")
+
+    # Extract feature importances (impurity-based diagnostic)
+    best_estimator = random_search_brf.best_estimator_
+    feature_importances = best_estimator.feature_importances_
+    
+    # Create feature importance DataFrame
+    importance_df = pd.DataFrame({
+        "feature": feature_cols,
+        "importance": feature_importances
+    }).sort_values("importance", ascending=False)
+    
+    print("\n" + "=" * 70)
+    print("TOP 20 FEATURE IMPORTANCES (Impurity-based diagnostic)")
+    print("=" * 70)
+    top_20 = importance_df.head(20)
+    for idx, row in top_20.iterrows():
+        print(f"  {row['feature']:40s} {row['importance']:.6f}")
+    print("=" * 70)
+
+    # Log to wandb
+    if use_wandb:
+        # Log feature importances as a Table (not many scalar keys)
+        feature_importance_table = wandb.Table(
+            columns=["feature", "importance"],
+            data=[[row["feature"], float(row["importance"])] for _, row in importance_df.iterrows()]
+        )
+        
+        wandb.log(
+            {
+                "brf/best_earlystop_score": float(best_earlystop_score_brf),
+                "brf/tuning_time_seconds": tune_time_brf,
+                "brf/best_params": random_search_brf.best_params_,
+                "brf/total_param_combinations": total_combinations,
+                "brf/search_space_coverage_pct": (N_ITER_BRF / total_combinations * 100),
+                "brf/feature_importances": feature_importance_table,
+            }
+        )
+
+    # Extract top 10 features by importance
+    top_10_features = importance_df.head(10)["feature"].tolist()
+    
+    # Save BRF best parameters
+    brf_best_params = {
+        "best_params": random_search_brf.best_params_,
+        "best_earlystop_score": float(best_earlystop_score_brf),
+        "param_grid": brf_param_grid,
+        "fixed_params": BRF_FIXED_PARAMS,
+        "n_iter": N_ITER_BRF,
+        "scoring": "average_precision",
+        "tuning_time_seconds": tune_time_brf,
+        "total_param_combinations": total_combinations,
+        "search_space_coverage_pct": (N_ITER_BRF / total_combinations * 100),
+        "top_10_features_by_importance": top_10_features,
+        "split_info": {
+            "train_years": f"year <= {TRAIN_YEAR_MAX}",
+            "earlystop_years": f"{EARLYSTOP_YEAR_MIN} <= year <= {EARLYSTOP_YEAR_MAX}",
+            "n_train": int(n_train),
+            "n_earlystop": int(n_earlystop),
+        },
+    }
+    brf_best_params = convert_numpy_types(brf_best_params)
+
+    # Save to training directory where modelC_BRF expects it
+    training_dir = script_dir.parent / "training"
+    training_dir.mkdir(parents=True, exist_ok=True)
+    brf_output_path = training_dir / "brf_best_params.json"
+    with open(brf_output_path, "w") as f:
+        json.dump(brf_best_params, f, indent=2)
+    print(f"\nBRF best parameters saved to: {brf_output_path}")
+
+    # Free memory
+    del random_search_brf, brf_model
+    gc.collect()
+
+    # -------------------------------------------------------------------------
+    # Summary
+    # -------------------------------------------------------------------------
+    total_time = time.time() - start_time
+
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"Dataset size (cleaned):        {cleaned_row_count:,} rows")
+    print(f"Features:                      {len(feature_cols)}")
+    print("\nTemporal split:")
+    print(f"  Train: year <= {TRAIN_YEAR_MAX}  ({n_train:,} rows)")
+    print(f"  Earlystop:   {EARLYSTOP_YEAR_MIN} <= year <= {EARLYSTOP_YEAR_MAX}  ({n_earlystop:,} rows)")
+    print("\nBalanced Random Forest hyperparameter tuning:")
+    print(f"  Total parameter combinations: {total_combinations:,}")
+    print(f"  Searched combinations:        {N_ITER_BRF}")
+    print(f"  Search space coverage:        {(N_ITER_BRF/total_combinations*100):.6f}%")
+    print(f"  Best earlystop score (PR-AUC):      {brf_best_params['best_earlystop_score']:.4f}")
+    print(
+        f"  Tuning time:                  "
+        f"{tune_time_brf:.1f}s ({tune_time_brf/60:.1f} min)"
+    )
+    print(f"  Best parameters saved to:     {brf_output_path}")
+    print(f"\nTotal time:                    {total_time:.1f}s ({total_time/60:.1f} min)")
+    print("=" * 70)
+    print("Done.")
+
+    if use_wandb:
+        wandb.log(
+            {
+                "summary/total_time_seconds": total_time,
+                "summary/total_time_minutes": total_time / 60,
+                "summary/brf_best_earlystop_score": float(brf_best_params["best_earlystop_score"]),
+                "summary/total_param_combinations": total_combinations,
+                "status": "success",
+            }
+        )
+        wandb.finish()
+
+
+if __name__ == "__main__":
+    # Set up output file capture
+    repo_root = Path(__file__).resolve().parents[4]
+    output_dir = repo_root / "outputs/south_america/colombia/results/ml_models"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = output_dir / f"modelC_tuning_brf_{timestamp}.txt"
+
+    # Initialize W&B BEFORE redirecting stdout/stderr so it can capture output
+    wandb_api_key = os.environ.get("WANDB_API_KEY")
+    wandb_entity = os.environ.get("WANDB_ENTITY")
+    if not wandb_api_key:
+        print("Warning: WANDB_API_KEY not found in environment")
+    if not wandb_entity:
+        print("Warning: WANDB_ENTITY not found in environment (will use default)")
+
+    use_wandb = False
+    try:
+        print("Initializing Weights & Biases...")
+        wandb.init(
+            project="ml-hyperparameter-tuning",
+            entity=wandb_entity,
+            name=f"modelC_tuning_brf_{timestamp}",
+            config={
+                "random_state": RANDOM_STATE,
+                "temporal_split": {
+                    "train_year_max": TRAIN_YEAR_MAX,
+                    "earlystop_year_min": EARLYSTOP_YEAR_MIN,
+                    "earlystop_year_max": EARLYSTOP_YEAR_MAX,
+                },
+                "n_iter_brf": N_ITER_BRF,
+            },
+        )
+        use_wandb = True
+        print("W&B connected\n")
+    except Exception as err:
+        print(f"W&B initialization failed: {err}\n")
+
+    # Open file in write mode to start fresh, then switch to append for stderr
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(f"Log file started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 70 + "\n\n")
+
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    
+    tee_stdout = Tee(output_file, original_stdout)
+    tee_stderr = Tee(output_file, original_stderr)
+    
+    sys.stdout = tee_stdout
+    sys.stderr = tee_stderr
+
+    try:
+        main(use_wandb=use_wandb)
+    finally:
+        sys.stdout = original_stdout
+        sys.stderr = original_stderr
+        tee_stdout.close()
+        tee_stderr.close()
+        print(f"\nOutput saved to: {output_file}")
+
