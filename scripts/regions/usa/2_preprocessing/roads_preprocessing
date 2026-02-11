@@ -8,7 +8,8 @@ Description:
     a 1 km grid that records the presence of road infrastructure.
 
 Source data:
-    - Input shapefiles located in `data/usa/ready/road_infrastructure/`.
+    - Input shapefiles from `data/shared/road_infrastructure/north_america/`
+      (GRIP4 global road dataset, shared across regions).
     - Reference template raster `data/usa/ready/GPW/GPW_population_density_USA_1km_2020.tif`.
 
 Objective:
@@ -18,8 +19,8 @@ Objective:
 Process overview:
     1. Load the 1 km reference raster and extract its bounds, CRS, and grid
        properties.
-    2. Read all road shapefiles, reproject them to the template CRS, and filter
-       to valid line geometries.
+    2. Read all road shapefiles from the shared GRIP4 data, reproject them to
+       the template CRS, and filter to valid line geometries.
     3. Clip the roads to the template bounds and export the clipped vector data.
     4. Rasterize the clipped roads to a 1 km binary presence grid.
     5. Summarize the resulting raster statistics.
@@ -49,13 +50,14 @@ warnings.filterwarnings("ignore")
 
 
 # Paths
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
 DATA_DIR = PROJECT_ROOT / "data"
-ROADS_DIR = DATA_DIR / "usa" / "ready" / "road_infrastructure"
+ROADS_INPUT_DIR = DATA_DIR / "shared" / "road_infrastructure" / "north_america"
+ROADS_OUTPUT_DIR = DATA_DIR / "usa" / "ready" / "road_infrastructure"
 REF_RASTER = DATA_DIR / "usa" / "ready" / "GPW" / "GPW_population_density_USA_1km_2020.tif"
 
-OUT_VECTOR = ROADS_DIR / "roads_usa.gpkg"
-OUT_RASTER = ROADS_DIR / "roads_usa_1km.tif"
+OUT_VECTOR = ROADS_OUTPUT_DIR / "roads_usa.gpkg"
+OUT_RASTER = ROADS_OUTPUT_DIR / "roads_usa_1km.tif"
 
 
 def _find_shapefiles(directory: Path) -> list[Path]:
@@ -78,9 +80,9 @@ def load_reference_grid():
 
 def load_and_clip_roads(bounds_poly, target_crs) -> gpd.GeoDataFrame:
     """Load all road shapefiles, reproject to target CRS, and clip to bounds_poly."""
-    shp_files = _find_shapefiles(ROADS_DIR)
+    shp_files = _find_shapefiles(ROADS_INPUT_DIR)
     if not shp_files:
-        raise FileNotFoundError(f"No shapefiles found in {ROADS_DIR}")
+        raise FileNotFoundError(f"No shapefiles found in {ROADS_INPUT_DIR}")
 
     frames: list[gpd.GeoDataFrame] = []
     for shp in shp_files:
@@ -112,7 +114,7 @@ def load_and_clip_roads(bounds_poly, target_crs) -> gpd.GeoDataFrame:
 
     # Save clipped vector
     if not roads_clipped.empty:
-        # Dissolve is not required for rasterization, but ensures clean export
+        ROADS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         roads_clipped.to_file(OUT_VECTOR, driver="GPKG")
         print(f"Saved clipped roads vector: {OUT_VECTOR}")
     else:
@@ -164,7 +166,8 @@ def rasterize_roads(roads_gdf: gpd.GeoDataFrame, transform, crs, width: int, hei
 def main():
     print("Road Infrastructure Preprocessing - USA")
     print("=" * 70)
-    print(f"Input roads directory: {ROADS_DIR}")
+    print(f"Input roads directory: {ROADS_INPUT_DIR}")
+    print(f"Output directory: {ROADS_OUTPUT_DIR}")
     print(f"Reference grid: {REF_RASTER}")
 
     # Load reference 1 km grid
