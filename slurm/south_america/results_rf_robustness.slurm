@@ -41,7 +41,7 @@ echo "Starting model1_results script (RF mode, robustness split)..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/regions/south_america/4_ml/results/model1_results" ] || {
+[ -f "scripts/regions/south_america/4_ml/4_results/model1_results" ] || {
   echo "ERROR: model1_results not found"
   echo "NOTE: model1_results script is in ML/results/ directory"
   find scripts -maxdepth 4 -type f -name "model1_results"
@@ -49,6 +49,6 @@ echo "PWD = $(pwd)"
 }
 # Run the script (robustness split, RF model type, prefers calibrated predictions if available)
 # --allow_test_shap: use test set for SHAP when earlystop/train unavailable
-python "scripts/regions/south_america/4_ml/results/model1_results" --model_type rf --split-version robustness --allow_test_shap
+python "scripts/regions/south_america/4_ml/4_results/model1_results" --model_type rf --split-version robustness --allow_test_shap
 
 echo "model1_results script (RF mode, robustness split) finished."

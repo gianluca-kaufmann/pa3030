@@ -45,13 +45,13 @@ echo "Starting calibrate_1 script (robustness split)..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/regions/south_america/4_ml/evaluation/calibrate_1" ] || {
+[ -f "scripts/regions/south_america/4_ml/3_evaluation/calibrate_1" ] || {
   echo "ERROR: calibrate_1 not found"
   echo "NOTE: calibrate_1 script is in ML/evaluation/ directory"
   find scripts -maxdepth 4 -type f -name "calibrate_1"
   exit 1
 }
 # Run the script (robustness split, LGBM model type, temporal_cv source, platt method)
-python "scripts/regions/south_america/4_ml/evaluation/calibrate_1" --model_type lgbm --split-version robustness --method platt
+python "scripts/regions/south_america/4_ml/3_evaluation/calibrate_1" --model_type lgbm --split-version robustness --method platt
 
 echo "calibrate_1 script (robustness split) finished."

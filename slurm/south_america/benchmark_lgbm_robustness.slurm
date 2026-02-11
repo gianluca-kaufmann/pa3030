@@ -41,13 +41,13 @@ echo "Starting benchmark_1 script (robustness split)..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/regions/south_america/4_ml/evaluation/benchmark_1" ] || {
+[ -f "scripts/regions/south_america/4_ml/3_evaluation/benchmark_1" ] || {
   echo "ERROR: benchmark_1 not found"
   echo "NOTE: benchmark_1 script is in ML/evaluation/ directory"
   find scripts -maxdepth 4 -type f -name "benchmark_1"
   exit 1
 }
 # Run the script (robustness split, LGBM model type)
-python "scripts/regions/south_america/4_ml/evaluation/benchmark_1" --model_type lgbm --split-version robustness
+python "scripts/regions/south_america/4_ml/3_evaluation/benchmark_1" --model_type lgbm --split-version robustness
 
 echo "benchmark_1 script (robustness split) finished."
