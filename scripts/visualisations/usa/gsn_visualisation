@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""
+Global Safety Net visualisation for the USA.
+
+Inputs:
+    - GeoTIFF masks in ``data/usa/ready/GSN``, including climate stabilisation
+      areas, high biodiversity areas, intact wilderness areas, potential wildlife
+      corridors, and terrestrial ecoregions.
+
+Process:
+    - Loads each mask, computes coverage statistics, and produces individual and
+      combined visualisations of the Global Safety Net layers.
+
+Outputs:
+    - PNG figures saved to ``outputs/usa/figures/gsn_vis``.
+"""
+
+import numpy as np
+import rasterio
+import matplotlib.pyplot as plt
+from pathlib import Path
+import warnings
+from matplotlib.colors import ListedColormap, BoundaryNorm
+from matplotlib.patches import Patch
+
+warnings.filterwarnings("ignore")
+
+# Paths
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+MASKS_DIR = PROJECT_ROOT / "data" / "usa" / "ready" / "GSN"
+OUTPUT_DIR = PROJECT_ROOT / "outputs" / "usa" / "figures" / "gsn_vis"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# GSN layer definitions
+GSN_LAYERS = {
+    "climate_stabilisation_areas": {
+        "file": "gsn_climate_stabilisation_areas_mask_1km.tif",
+        "title": "Climate Stabilisation Areas",
+        "color": "#1B5E20",
+    },
+    "high_biodiversity_areas": {
+        "file": "gsn_high_biodiversity_areas_mask_1km.tif",
+        "title": "High Biodiversity Areas",
+        "color": "#1B5E20",
+    },
+    "intact_wilderness_areas": {
+        "file": "gsn_intact_wilderness_areas_mask_1km.tif",
+        "title": "Intact Wilderness Areas",
+        "color": "#1B5E20",
+    },
+    "potential_wildlife_corridors": {
+        "file": "gsn_potential_wildlife_corridors_mask_1km.tif",
+        "title": "Potential Wildlife Corridors",
+        "color": "#1B5E20",
+    },
+    "terrestrial_ecoregions": {
+        "file": "gsn_terrestrial_ecoregions_mask_1km.tif",
+        "title": "Terrestrial Ecoregions",
+        "color": "#9B59B6",
+        "is_categorical": True,
+    },
+}
+
+
+def load_gsn_data():
+    """Load all GSN raster masks."""
+    print("Loading Global Safety Net raster masks...")
+    all_data = {}
+
+    for layer_key, layer_info in GSN_LAYERS.items():
+        tif_path = MASKS_DIR / layer_info["file"]
+        if not tif_path.exists():
+            print(f"  Warning: {tif_path.name} not found")
+            continue
+
+        with rasterio.open(tif_path) as src:
+            data = src.read(1).astype(np.uint8)
+
+        total_pixels = data.size
+        is_cat = layer_info.get("is_categorical", False)
+
+        if is_cat:
+            unique_vals = np.unique(data[data > 0])
+            covered = int(np.sum(data > 0))
+            pct = 100 * covered / total_pixels
+            print(f"  {layer_info['title']}: {len(unique_vals)} ecoregions, "
+                  f"{covered:,} pixels ({pct:.2f}%)")
+        else:
+            covered = int(np.sum(data == 1))
+            pct = 100 * covered / total_pixels
+            print(f"  {layer_info['title']}: {covered:,} pixels ({pct:.2f}%)")
+
+        all_data[layer_key] = {
+            "data": data,
+            "covered": covered,
+            "pct": pct,
+            "is_categorical": is_cat,
+        }
+
+    print(f"  Loaded {len(all_data)} layers")
+    return all_data if all_data else None
+
+
+def create_individual_maps(all_data):
+    """Create individual maps for each GSN layer."""
+    print("Creating individual GSN layer maps...")
+
+    for layer_key, layer_info in GSN_LAYERS.items():
+        if layer_key not in all_data:
+            continue
+
+        info = all_data[layer_key]
+        data = info["data"]
+
+        fig, ax = plt.subplots(figsize=(14, 8))
+
+        if info["is_categorical"]:
+            unique_vals = np.unique(data[data > 0])
+            n = len(unique_vals)
+            if n > 0:
+                colors = plt.cm.magma(np.linspace(0.2, 0.9, n))
+                cmap = ListedColormap(["white"] + colors.tolist())
+                bounds = [0] + unique_vals.tolist() + [unique_vals.max() + 1]
+                norm = BoundaryNorm(bounds, cmap.N)
+                im = ax.imshow(data, cmap=cmap, norm=norm, interpolation="nearest")
+                cbar = plt.colorbar(im, ax=ax, shrink=0.6)
+                cbar.set_label("Ecoregion ID", rotation=270, labelpad=15)
+                stats = f"Ecoregions: {n}\nPixels: {info['covered']:,} ({info['pct']:.2f}%)"
+            else:
+                ax.imshow(data, cmap="Greys", vmin=0, vmax=1, interpolation="nearest")
+                stats = "No ecoregion data"
+        else:
+            cmap = ListedColormap(["white", layer_info["color"]])
+            ax.imshow(data, cmap=cmap, vmin=0, vmax=1, interpolation="nearest")
+            stats = f"Pixels: {info['covered']:,} ({info['pct']:.2f}%)"
+
+        ax.set_title(f"{layer_info['title']} — USA", fontsize=14, fontweight="bold")
+        ax.set_axis_off()
+        ax.text(0.02, 0.98, stats, transform=ax.transAxes, fontsize=11,
+                verticalalignment="top",
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+
+        plt.tight_layout()
+        out = OUTPUT_DIR / f"gsn_{layer_key}_individual.png"
+        plt.savefig(out, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"  Saved: {out.name}")
+
+
+def create_combined_overview(all_data):
+    """Create a combined overview showing layer overlap counts."""
+    if len(all_data) < 2:
+        return
+
+    print("Creating combined GSN overview...")
+    ref_shape = list(all_data.values())[0]["data"].shape
+    layer_count = np.zeros(ref_shape, dtype=np.uint8)
+
+    for info in all_data.values():
+        layer_count += (info["data"] > 0).astype(np.uint8)
+
+    fig, ax = plt.subplots(figsize=(14, 8))
+    display = np.minimum(layer_count, 3)
+    cmap = ListedColormap(["white", "#66BB6A", "#2E7D32", "#1B5E20"])
+    im = ax.imshow(display, cmap=cmap, vmin=0, vmax=3, interpolation="nearest")
+
+    ax.set_title("Global Safety Net — Combined Overview (USA)",
+                 fontsize=14, fontweight="bold")
+    ax.set_axis_off()
+
+    legend_elements = [
+        Patch(facecolor="white", edgecolor="grey", label="No protection"),
+        Patch(facecolor="#66BB6A", label="1 layer"),
+        Patch(facecolor="#2E7D32", label="2 layers"),
+        Patch(facecolor="#1B5E20", label="3+ layers"),
+    ]
+    ax.legend(handles=legend_elements, loc="upper right", fontsize=10, framealpha=0.9)
+
+    total_protected = int(np.sum(layer_count > 0))
+    total_pixels = layer_count.size
+    pct = 100 * total_protected / total_pixels
+    ax.text(0.02, 0.02, f"Any protection: {total_protected:,} ({pct:.2f}%)\nLayers loaded: {len(all_data)}",
+            transform=ax.transAxes, fontsize=11, verticalalignment="bottom",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+
+    plt.tight_layout()
+    out = OUTPUT_DIR / "gsn_combined_overview.png"
+    plt.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {out.name}")
+
+
+def create_statistics_plot(all_data):
+    """Create a bar chart of protection coverage per layer."""
+    print("Creating protection statistics plot...")
+
+    names, pcts, colors = [], [], []
+    for layer_key, layer_info in GSN_LAYERS.items():
+        if layer_key in all_data:
+            names.append(layer_info["title"])
+            pcts.append(all_data[layer_key]["pct"])
+            colors.append(layer_info["color"])
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+    bars = ax.bar(names, pcts, color=colors, alpha=0.9, edgecolor="black")
+    for bar, p in zip(bars, pcts):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.1,
+                f"{p:.2f}%", ha="center", va="bottom", fontweight="bold")
+
+    ax.set_title("GSN Protection Coverage by Layer — USA",
+                 fontsize=14, fontweight="bold")
+    ax.set_ylabel("Coverage (%)")
+    plt.xticks(rotation=45, ha="right")
+    ax.grid(axis="y", alpha=0.3)
+
+    plt.tight_layout()
+    out = OUTPUT_DIR / "gsn_protection_statistics.png"
+    plt.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {out.name}")
+
+
+def main():
+    print("Global Safety Net Visualisation — USA")
+    print("=" * 60)
+
+    all_data = load_gsn_data()
+    if all_data is None:
+        print("No data loaded. Exiting.")
+        return
+
+    create_individual_maps(all_data)
+    create_combined_overview(all_data)
+    create_statistics_plot(all_data)
+
+    print("\nVisualisation complete!")
+
+
+if __name__ == "__main__":
+    main()

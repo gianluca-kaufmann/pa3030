@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""
+Road infrastructure visualisation for the USA.
+
+Inputs:
+    - ``data/usa/ready/road_infrastructure/roads_usa.gpkg`` (clipped vector roads)
+    - ``data/usa/ready/road_infrastructure/roads_usa_1km.tif`` (1 km binary raster)
+
+Process:
+    - Loads vector and raster road datasets and produces overview, attribute,
+      and raster presence figures.
+
+Outputs:
+    - PNG figures saved to ``outputs/usa/figures/road_infrastructure_vis``.
+"""
+
+import warnings
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import rasterio
+import pandas as pd
+
+try:
+    import geopandas as gpd
+except Exception as _e:  # pragma: no cover
+    raise SystemExit(
+        "geopandas is required. Install with `pip install geopandas`"
+    ) from _e
+
+warnings.filterwarnings("ignore")
+
+# Paths
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+ROADS_DIR = PROJECT_ROOT / "data" / "usa" / "ready" / "road_infrastructure"
+VECTOR_PREPROCESSED = ROADS_DIR / "roads_usa.gpkg"
+RASTER_PREPROCESSED = ROADS_DIR / "roads_usa_1km.tif"
+OUTPUT_DIR = PROJECT_ROOT / "outputs" / "usa" / "figures" / "road_infrastructure_vis"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _find_shapefiles(directory: Path) -> list[Path]:
+    """Return .shp files in directory (non-recursive)."""
+    return sorted([p for p in directory.iterdir() if p.suffix.lower() == ".shp"])
+
+
+def load_roads() -> gpd.GeoDataFrame:
+    """Load road vectors, preferring the preprocessed GeoPackage."""
+    if VECTOR_PREPROCESSED.exists():
+        try:
+            gdf = gpd.read_file(VECTOR_PREPROCESSED)
+            if gdf.crs is None:
+                gdf = gdf.set_crs(4326, allow_override=True)
+            gdf = gdf.to_crs(3857)
+            gdf = gdf[gdf.geometry.notnull()]
+            gdf = gdf[gdf.geometry.geom_type.isin(["LineString", "MultiLineString"])].copy()
+            if not gdf.empty:
+                return gdf
+        except Exception as e:
+            print(f"Warning: failed to load preprocessed vector: {e}")
+
+    shp_files = _find_shapefiles(ROADS_DIR)
+    if not shp_files:
+        raise FileNotFoundError(f"No shapefiles found in {ROADS_DIR}")
+
+    frames: list[gpd.GeoDataFrame] = []
+    for shp in shp_files:
+        try:
+            gdf = gpd.read_file(shp)
+            if gdf.empty:
+                continue
+            gdf = gdf[gdf.geometry.notnull()].copy()
+            if gdf.crs is None:
+                gdf = gdf.set_crs(4326, allow_override=True)
+            gdf = gdf.to_crs(3857)
+            frames.append(gdf)
+        except Exception as e:
+            print(f"Error reading {shp.name}: {e}")
+
+    if not frames:
+        raise RuntimeError("No valid road geometries loaded.")
+
+    combined = gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), crs=frames[0].crs)
+    combined = combined[combined.geometry.geom_type.isin(["LineString", "MultiLineString"])].copy()
+    if combined.empty:
+        raise RuntimeError("No line geometries after filtering.")
+    return combined
+
+
+def _best_attribute_for_coloring(gdf: gpd.GeoDataFrame) -> str | None:
+    """Pick a reasonable attribute column to colour by, if present."""
+    candidates = ["fclass", "highway", "type", "roadtype", "class", "status", "surface"]
+    cols_lower = {c.lower(): c for c in gdf.columns}
+    for cand in candidates:
+        if cand in cols_lower:
+            col = cols_lower[cand]
+            try:
+                nunique = gdf[col].dropna().astype(str).nunique()
+                if 1 < nunique <= 20:
+                    return col
+            except Exception:
+                continue
+    return None
+
+
+def plot_overview(gdf: gpd.GeoDataFrame) -> None:
+    """Simple overview of the road network."""
+    fig, ax = plt.subplots(figsize=(14, 8))
+    gdf.plot(ax=ax, color="#2c3e50", linewidth=0.25)
+    ax.set_title("Road Network — USA (Overview)", fontsize=14, fontweight="bold")
+    ax.set_axis_off()
+    plt.tight_layout()
+    out = OUTPUT_DIR / "roads_overview.png"
+    plt.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out}")
+
+
+def plot_by_attribute(gdf: gpd.GeoDataFrame, attr: str) -> None:
+    """Plot roads coloured by a chosen attribute."""
+    series = gdf[attr].astype(str).fillna("Unknown")
+    top_values = series.value_counts().head(12).index.tolist()
+    filtered = gdf.copy()
+    filtered[attr] = series.where(series.isin(top_values), other="Other")
+
+    fig, ax = plt.subplots(figsize=(14, 8))
+    filtered.plot(ax=ax, column=attr, linewidth=0.35, legend=True, cmap="tab20")
+    ax.set_title(f"Road Network by {attr} — USA", fontsize=14, fontweight="bold")
+    ax.set_axis_off()
+    plt.tight_layout()
+    out = OUTPUT_DIR / f"roads_by_attribute_{attr}.png"
+    plt.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out}")
+
+
+def plot_raster_presence() -> None:
+    """Plot the 1 km binary presence/absence raster."""
+    if not RASTER_PREPROCESSED.exists():
+        print("No preprocessed raster found; skipping raster presence plot.")
+        return
+
+    with rasterio.open(RASTER_PREPROCESSED) as src:
+        data = src.read(1)
+
+    fig, ax = plt.subplots(figsize=(14, 8))
+    ax.imshow(data, cmap="Greys", vmin=0, vmax=1, interpolation="nearest")
+    ax.set_title("Road Presence (1 km) — USA", fontsize=14, fontweight="bold")
+    ax.set_axis_off()
+
+    road_pix = int((data == 1).sum())
+    total_pix = data.size
+    pct = 100 * road_pix / total_pix
+    ax.text(0.02, 0.98, f"Road pixels: {road_pix:,} ({pct:.2f}%)",
+            transform=ax.transAxes, fontsize=11, verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+
+    plt.tight_layout()
+    out = OUTPUT_DIR / "roads_raster_presence.png"
+    plt.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out}")
+
+
+def main() -> None:
+    print("Road Infrastructure Visualisation — USA")
+    print("=" * 60)
+    print(f"Input directory: {ROADS_DIR}")
+    print(f"Output directory: {OUTPUT_DIR}")
+
+    roads = load_roads()
+    print(f"Loaded {len(roads):,} road features. CRS: {roads.crs}")
+
+    plot_overview(roads)
+
+    attr = _best_attribute_for_coloring(roads)
+    if attr:
+        print(f"Colouring by attribute: {attr}")
+        plot_by_attribute(roads, attr)
+    else:
+        print("No suitable attribute for categorical colouring; skipping.")
+
+    plot_raster_presence()
+    print("\nVisualisation complete!")
+
+
+if __name__ == "__main__":
+    main()

@@ -10,15 +10,15 @@ Description:
 Source data:
     - Vector files located under `data/shared/GlobalSafetyNet/<layer_name>/`
       as shapefiles or GeoPackages (global coverage, shared across regions).
-    - Reference raster template in `data/usa/ready/GPW/`, typically
-      `GPW_population_density_USA_1km_2020.tif`.
+    - Backbone raster: `data/usa/ready/backbone/backbone.tif`
+      (defines target CRS, transform, bounds, and land mask).
 
 Objective:
     Prepare binary or categorical raster masks for each Global Safety Net
     layer so they can be merged with other datasets in later stages.
 
 Process overview:
-    1. Locate the GPW template raster and read its spatial metadata.
+    1. Load the backbone raster and read its spatial metadata.
     2. Discover the Global Safety Net layers expected in the data directory.
     3. Load, reproject, and clip each layer to the template extent.
     4. Rasterize geometries onto the 1 km grid (categorical for ecoregions,
@@ -44,21 +44,12 @@ from pathlib import Path
 
 
 def find_template_raster(base_dir: Path) -> Path:
-    """
-    Locate the GPW 1 km template raster. Prefer year 2020, fall back to any GPW 1 km USA.
-    """
-    template_path = base_dir / "data" / "usa" / "ready" / "GPW" / "GPW_population_density_USA_1km_2020.tif"
+    """Locate the backbone raster used as the common 1 km template grid."""
+    template_path = base_dir / "data" / "usa" / "ready" / "backbone" / "backbone.tif"
     if template_path.is_file():
         return template_path
-
-    matches = sorted((base_dir / "data" / "usa" / "ready" / "GPW").glob("GPW_population_density_USA_1km_*.tif"))
-    if matches:
-        return matches[-1]
-
     raise FileNotFoundError(
-        "No GPW 1 km template raster found in data/usa/ready/GPW. Expected "
-        "GPW_population_density_USA_1km_2020.tif or a matching pattern "
-        "'GPW_population_density_USA_1km_*.tif'."
+        f"Backbone template raster not found: {template_path}"
     )
 
 

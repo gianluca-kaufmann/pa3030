@@ -15,10 +15,7 @@ mkdir -p "$SCRATCH/data"
 mkdir -p "$SCRATCH/data/ml"
 mkdir -p "$SCRATCH/outputs"
 mkdir -p "$SCRATCH/outputs/south_america/tables"
-mkdir -p "$SCRATCH/outputs/south_america/figures/calibrate"
 
-# Also create in repo if outputs are stored there
-mkdir -p "outputs/south_america/figures/calibrate"
 
 #------------------------------------------------------------------------------
 # Load modules
