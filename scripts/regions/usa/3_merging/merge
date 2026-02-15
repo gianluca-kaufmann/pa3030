@@ -577,6 +577,13 @@ def load_dataset_window(
     Load and reproject dataset files for a given window.
     Returns NaN placeholder if no paths provided.
     
+    Band-count enforcement: After loading, verifies that the total number of
+    bands matches ``expected_bands`` (determined during the probe phase).  If a
+    year has more files/bands than the probe year, extra bands are truncated; if
+    fewer, missing bands are padded with NaN.  This prevents the
+    ``Band count mismatch`` error that occurs when different years of the same
+    dataset contain different numbers of raster files.
+    
     Args:
         paths: List of file paths to load
         ref_profile: Reference grid profile
@@ -600,6 +607,53 @@ def load_dataset_window(
     if not arrays:
         placeholder = np.full((expected_bands, window_height, window_width), np.nan, dtype=np.float32)
         return [placeholder]
+    
+    # --- Enforce expected band count ---
+    # Count total bands across all loaded arrays
+    total_bands = 0
+    for a in arrays:
+        if a.ndim == 3:
+            total_bands += a.shape[0]
+        elif a.ndim == 2:
+            total_bands += 1
+        else:
+            # Will be squeezed to 3-D later; count leading dim
+            total_bands += a.shape[0]
+    
+    if total_bands != expected_bands:
+        # Normalize all arrays to 3-D and concatenate into a single block
+        normalised = []
+        for a in arrays:
+            if a.ndim == 3:
+                normalised.append(a)
+            elif a.ndim == 2:
+                normalised.append(a[np.newaxis, ...])
+            else:
+                while a.ndim > 3:
+                    a = a.squeeze(axis=0)
+                normalised.append(a)
+        combined = np.concatenate(normalised, axis=0)
+        
+        if combined.shape[0] > expected_bands:
+            # Truncate extra bands (log once per dataset to avoid spam)
+            log_progress(
+                f"    Warning: {dataset} has {combined.shape[0]} bands, "
+                f"expected {expected_bands} — truncating extra bands"
+            )
+            combined = combined[:expected_bands]
+        else:
+            # Pad with NaN to reach expected count
+            log_progress(
+                f"    Warning: {dataset} has {combined.shape[0]} bands, "
+                f"expected {expected_bands} — padding with NaN"
+            )
+            pad = np.full(
+                (expected_bands - combined.shape[0], window_height, window_width),
+                np.nan, dtype=np.float32,
+            )
+            combined = np.concatenate([combined, pad], axis=0)
+        
+        return [combined]
     
     return arrays
 

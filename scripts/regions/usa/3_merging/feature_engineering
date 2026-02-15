@@ -115,7 +115,7 @@ def compute_distance_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def compute_static_distance_features_once(df_ref: pd.DataFrame) -> pd.DataFrame:
+def compute_static_distance_features_once(df_ref: pd.DataFrame, distance_mapping: dict[str, str] | None = None) -> pd.DataFrame:
     """Compute static distance transforms once on a reference footprint.
     
     Returns a lookup DataFrame with columns: row, col, dist_road, dist_oil_gas, dist_powerplant.
@@ -123,9 +123,12 @@ def compute_static_distance_features_once(df_ref: pd.DataFrame) -> pd.DataFrame:
     """
     logger.info("  Computing static distance transforms on reference footprint...")
     
+    if distance_mapping is None:
+        distance_mapping = STATIC_DISTANCE_MAPPING
+    
     lookup_df = df_ref[['row', 'col']].drop_duplicates().copy()
     
-    for input_col, output_col in STATIC_DISTANCE_MAPPING.items():
+    for input_col, output_col in distance_mapping.items():
         if input_col not in df_ref.columns:
             logger.warning(f"    Column {input_col} not found, skipping...")
             continue
@@ -154,20 +157,23 @@ def compute_static_distance_features_once(df_ref: pd.DataFrame) -> pd.DataFrame:
     return lookup_df
 
 
-def merge_static_distances(df: pd.DataFrame, static_lookup: pd.DataFrame) -> pd.DataFrame:
+def merge_static_distances(df: pd.DataFrame, static_lookup: pd.DataFrame, distance_mapping: dict[str, str] | None = None) -> pd.DataFrame:
     """Merge precomputed static distance features and drop original binary columns."""
+    if distance_mapping is None:
+        distance_mapping = STATIC_DISTANCE_MAPPING
+    
     # Merge static distances
     df = df.merge(static_lookup, on=['row', 'col'], how='left')
     
     # Drop original binary columns if they exist
-    for input_col in STATIC_DISTANCE_MAPPING.keys():
+    for input_col in distance_mapping.keys():
         if input_col in df.columns:
             df = df.drop(columns=[input_col])
     
     return df
 
 
-def compute_static_smooth_features_once(df_ref: pd.DataFrame) -> pd.DataFrame:
+def compute_static_smooth_features_once(df_ref: pd.DataFrame, smooth_variables: list[str] | None = None) -> pd.DataFrame:
     """Compute smoothed elevation/slope once on a reference footprint.
 
     Returns a lookup DataFrame with columns: row, col, and *_smooth{4,16,64}.
@@ -175,9 +181,12 @@ def compute_static_smooth_features_once(df_ref: pd.DataFrame) -> pd.DataFrame:
     """
     logger.info("  Computing static smooth features on reference footprint...")
 
+    if smooth_variables is None:
+        smooth_variables = STATIC_SMOOTH_VARIABLES
+
     lookup_df = df_ref[['row', 'col']].drop_duplicates().copy()
 
-    for variable in STATIC_SMOOTH_VARIABLES:
+    for variable in smooth_variables:
         if variable not in df_ref.columns:
             logger.warning(f"    Column {variable} not found, skipping...")
             continue
@@ -227,11 +236,14 @@ def compute_smooth_feature(df: pd.DataFrame, variable: str, window_size: int) ->
     return result
 
 
-def compute_all_smooth_features(df: pd.DataFrame) -> pd.DataFrame:
+def compute_all_smooth_features(df: pd.DataFrame, smooth_variables: list[str] | None = None) -> pd.DataFrame:
     """Compute all smoothed features."""
     logger.info("  Computing smoothed features...")
     
-    for variable in SMOOTH_VARIABLES:
+    if smooth_variables is None:
+        smooth_variables = SMOOTH_VARIABLES
+    
+    for variable in smooth_variables:
         if variable not in df.columns:
             continue
         for window_size in SMOOTH_SIZES:
@@ -278,7 +290,16 @@ def compute_lag_feature(input_path: Path, year: int) -> pd.DataFrame:
     return result
 
 
-def process_year(input_path: Path, year: int, temp_dir: Path, is_first_year: bool, static_lookup: pd.DataFrame, smooth_lookup: pd.DataFrame) -> tuple[Path | None, dict]:
+def process_year(
+    input_path: Path,
+    year: int,
+    temp_dir: Path,
+    is_first_year: bool,
+    static_lookup: pd.DataFrame,
+    smooth_lookup: pd.DataFrame,
+    distance_mapping: dict[str, str] | None = None,
+    smooth_time_vars: list[str] | None = None,
+) -> tuple[Path | None, dict]:
     """Process a single year and return temp file path + metrics."""
     start_time = time.time()
     logger.info(f"\nProcessing year {year}...")
@@ -307,9 +328,9 @@ def process_year(input_path: Path, year: int, temp_dir: Path, is_first_year: boo
     # Step 2: Compute spatial features on FULL grid (before Risk Set filtering)
     logger.info(f"  Computing spatial features on full grid ({n_rows_initial:,} rows)...")
     df_year = compute_distance_features(df_year)
-    df_year = merge_static_distances(df_year, static_lookup)
+    df_year = merge_static_distances(df_year, static_lookup, distance_mapping)
     df_year = merge_static_smooth(df_year, smooth_lookup)
-    df_year = compute_all_smooth_features(df_year)
+    df_year = compute_all_smooth_features(df_year, smooth_time_vars)
     
     # Step 3: Apply Risk Set filter (keep only WDPA_prev == 0)
     df_year = df_year[df_year['WDPA_prev'] == 0].copy()
@@ -432,14 +453,63 @@ def main() -> None:
     
     # Check that all required columns are present
     schema = pq.read_schema(input_path)
+    available_cols = set(schema.names)
+    logger.info(f"Available columns in input: {sorted(available_cols)}")
+    
     required_cols = ['year', 'row', 'col', 'WDPA_b1']
-    missing_cols = [col for col in required_cols if col not in schema.names]
+    missing_cols = [col for col in required_cols if col not in available_cols]
     if missing_cols:
         raise ValueError(
             f"Input file is missing required columns: {missing_cols}\n"
             f"Available columns: {schema.names}\n"
             f"Expected format: merged panel data with year, row, col, and WDPA_b1 columns."
         )
+    
+    # --- Resolve STATIC_SMOOTH_VARIABLES against actual schema ---
+    # The merge step may name columns differently depending on raster structure:
+    #   - Separate single-band rasters  ->  'elevation', 'slope'
+    #   - Combined multi-band raster    ->  'elevation_b1', 'elevation_b2'  (b2 = slope)
+    resolved_smooth_vars: list[str] = []
+    for var in STATIC_SMOOTH_VARIABLES:
+        if var in available_cols:
+            resolved_smooth_vars.append(var)
+        elif f"{var}_b1" in available_cols:
+            logger.info(f"  Column '{var}' not found; using '{var}_b1' instead")
+            resolved_smooth_vars.append(f"{var}_b1")
+        else:
+            # Check for the SA pattern: elevation_b1/elevation_b2 when we expected elevation/slope
+            logger.warning(f"  Column '{var}' not found in schema — skipping static smooth for it")
+    
+    # Special case: if 'slope' is missing but 'elevation_b2' exists, map it
+    if 'slope' in STATIC_SMOOTH_VARIABLES and 'slope' not in available_cols and 'elevation_b2' in available_cols:
+        if 'elevation_b2' not in resolved_smooth_vars:
+            logger.info("  Column 'slope' not found; using 'elevation_b2' (slope) instead")
+            resolved_smooth_vars.append('elevation_b2')
+    
+    if resolved_smooth_vars != list(STATIC_SMOOTH_VARIABLES):
+        logger.info(f"  Resolved STATIC_SMOOTH_VARIABLES: {STATIC_SMOOTH_VARIABLES} -> {resolved_smooth_vars}")
+    
+    # --- Resolve STATIC_DISTANCE_MAPPING against actual schema ---
+    resolved_distance_mapping: dict[str, str] = {}
+    for input_col, output_col in STATIC_DISTANCE_MAPPING.items():
+        if input_col in available_cols:
+            resolved_distance_mapping[input_col] = output_col
+        else:
+            logger.warning(f"  Column '{input_col}' not found in schema — skipping distance feature '{output_col}'")
+    
+    if resolved_distance_mapping != STATIC_DISTANCE_MAPPING:
+        logger.info(f"  Resolved STATIC_DISTANCE_MAPPING: {resolved_distance_mapping}")
+    
+    # --- Resolve SMOOTH_VARIABLES against actual schema ---
+    resolved_smooth_time_vars: list[str] = []
+    for var in SMOOTH_VARIABLES:
+        if var in available_cols:
+            resolved_smooth_time_vars.append(var)
+        else:
+            logger.warning(f"  Column '{var}' not found in schema — skipping time-varying smooth for it")
+    
+    if resolved_smooth_time_vars != list(SMOOTH_VARIABLES):
+        logger.info(f"  Resolved SMOOTH_VARIABLES: {resolved_smooth_time_vars}")
     
     df_sample = pd.read_parquet(input_path, columns=['year'])
     years = sorted(df_sample['year'].unique())
@@ -464,7 +534,11 @@ def main() -> None:
     logger.info(f"Using year {ref_year} as reference footprint for static distances")
     
     # Load reference year data (columns needed for static distance + static smooth computation)
-    static_cols = ['row', 'col'] + list(STATIC_DISTANCE_MAPPING.keys()) + STATIC_SMOOTH_VARIABLES
+    static_cols = ['row', 'col'] + list(resolved_distance_mapping.keys()) + resolved_smooth_vars
+    # Deduplicate while preserving order
+    static_cols = list(dict.fromkeys(static_cols))
+    logger.info(f"  Static columns to load: {static_cols}")
+    
     df_ref = pd.read_parquet(
         input_path, 
         columns=static_cols,
@@ -483,12 +557,12 @@ def main() -> None:
         df_ref = df_ref[['row', 'col'] + [c for c in static_cols if c in df_ref.columns]].drop_duplicates(subset=['row', 'col'])
         logger.info(f"Using union footprint: {len(df_ref):,} unique pixels")
     
-    # Compute static distances once
-    static_lookup = compute_static_distance_features_once(df_ref)
+    # Compute static distances once (using resolved mapping)
+    static_lookup = compute_static_distance_features_once(df_ref, resolved_distance_mapping)
     logger.info(f"  Computed static distances for {len(static_lookup):,} pixels")
 
-    # Compute static smooth features once
-    smooth_lookup = compute_static_smooth_features_once(df_ref)
+    # Compute static smooth features once (using resolved variables)
+    smooth_lookup = compute_static_smooth_features_once(df_ref, resolved_smooth_vars)
     logger.info(f"  Computed static smooth features for {len(smooth_lookup):,} pixels")
 
     del df_ref
@@ -502,7 +576,12 @@ def main() -> None:
     for i, year in enumerate(years):
         try:
             is_first_year = (i == 0)
-            temp_file, metrics = process_year(input_path, year, temp_dir, is_first_year, static_lookup, smooth_lookup)
+            temp_file, metrics = process_year(
+                input_path, year, temp_dir, is_first_year,
+                static_lookup, smooth_lookup,
+                distance_mapping=resolved_distance_mapping,
+                smooth_time_vars=resolved_smooth_time_vars,
+            )
             if temp_file is not None:
                 temp_files.append(temp_file)
                 wandb.log(metrics)
