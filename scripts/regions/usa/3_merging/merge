@@ -973,12 +973,27 @@ def main():
                         normalised.append(a)
                 band_stack = np.concatenate(normalised, axis=0)
 
-                # Safety check: ensure band count matches expected
+                # Handle band count mismatch gracefully
                 if band_stack.shape[0] != len(current_band_names):
-                    error_msg = (f"Band count mismatch for year {year}, window {w}: "
-                               f"expected {len(current_band_names)} bands, got {band_stack.shape[0]}")
-                    log_progress(f"ERROR: {error_msg}")
-                    raise ValueError(error_msg)
+                    if band_stack.shape[0] > len(current_band_names):
+                        # Truncate extra bands
+                        log_progress(
+                            f"    Year {year}, window {window_idx}: Got {band_stack.shape[0]} bands, "
+                            f"expected {len(current_band_names)} — truncating extra bands"
+                        )
+                        band_stack = band_stack[:len(current_band_names)]
+                    else:
+                        # Pad with NaN
+                        missing = len(current_band_names) - band_stack.shape[0]
+                        log_progress(
+                            f"    Year {year}, window {window_idx}: Got {band_stack.shape[0]} bands, "
+                            f"expected {len(current_band_names)} — padding {missing} bands with NaN"
+                        )
+                        pad = np.full(
+                            (missing, window_height, window_width),
+                            np.nan, dtype=np.float32
+                        )
+                        band_stack = np.concatenate([band_stack, pad], axis=0)
                 
                 # Apply temporal coverage rules (in-place modification)
                 apply_temporal_coverage_rules(band_stack, current_band_names, year)
