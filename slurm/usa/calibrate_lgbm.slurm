@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=calibrate_1
+#SBATCH --job-name=calibrate_2
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/calibrate_1_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/calibrate_1_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/calibrate_2_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/calibrate_2_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -34,21 +34,21 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the calibrate_1 script (main split)
+# Run the calibrate_2 script (main split)
 #------------------------------------------------------------------------------
-echo "Starting calibrate_1 script (main split)..."
+echo "Starting calibrate_2 script (main split)..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/regions/usa/4_ml/3_evaluation/calibrate_1" ] || {
-  echo "ERROR: calibrate_1 not found"
-  echo "NOTE: calibrate_1 script is in ML/evaluation/ directory"
-  find scripts -maxdepth 4 -type f -name "calibrate_1"
+[ -f "scripts/regions/usa/4_ml/3_evaluation/calibrate_2" ] || {
+  echo "ERROR: calibrate_2 not found"
+  echo "NOTE: calibrate_2 script is in ML/evaluation/ directory"
+  find scripts -maxdepth 4 -type f -name "calibrate_2"
   exit 1
 }
 # Run the script (defaults to main split, LGBM model type, temporal_cv source, platt method)
-python "scripts/regions/usa/4_ml/3_evaluation/calibrate_1" --model_type lgbm --split-version main --method platt
+python "scripts/regions/usa/4_ml/3_evaluation/calibrate_2" --model_type lgbm --split-version main --method platt
 
-echo "calibrate_1 script (main split) finished."
+echo "calibrate_2 script (main split) finished."

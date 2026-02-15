@@ -377,7 +377,8 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
             if needs_unscaling:
                 data = data / 100.0
             
-            return data if count > 1 else data[np.newaxis, ...]
+            # src.read() always returns (count, H, W) — already 3D even for single-band
+            return data
         
         # Slow path: reprojection needed
         dst_transform = rasterio.windows.transform(window, ref_profile["transform"])
@@ -905,7 +906,19 @@ def main():
                     continue
                 
                 # Stack into single band array
-                band_stack = np.concatenate([a if a.ndim == 3 else a[np.newaxis, ...] for a in all_window_arrays], axis=0)
+                # Normalise every piece to 3-D (bands, H, W)
+                normalised = []
+                for a in all_window_arrays:
+                    if a.ndim == 3:
+                        normalised.append(a)
+                    elif a.ndim == 2:
+                        normalised.append(a[np.newaxis, ...])
+                    else:
+                        # Squeeze any spurious leading dims (e.g. 4-D from double newaxis)
+                        while a.ndim > 3:
+                            a = a.squeeze(axis=0)
+                        normalised.append(a)
+                band_stack = np.concatenate(normalised, axis=0)
 
                 # Safety check: ensure band count matches expected
                 if band_stack.shape[0] != len(current_band_names):

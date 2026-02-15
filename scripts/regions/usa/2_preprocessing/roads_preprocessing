@@ -37,6 +37,7 @@ import warnings
 import pandas as pd
 import rasterio
 from rasterio.features import rasterize
+from shapely.affinity import translate as _translate
 from shapely.geometry import box
 
 try:
@@ -79,6 +80,38 @@ def load_reference_grid():
     return src, bounds_poly, transform, crs, width, height
 
 
+def _fix_antimeridian_wrap(roads: gpd.GeoDataFrame, bounds_poly) -> gpd.GeoDataFrame:
+    """Shift road geometries when the backbone grid wraps past the antimeridian.
+
+    GEE-exported EPSG:3857 rasters can use continuous positive x-coordinates
+    that exceed the standard ±20 037 508 m range.  Roads reprojected from
+    WGS 84 receive standard (negative) x values for the western hemisphere
+    and therefore fall outside the backbone extent.  Detect this and shift
+    the affected geometries by one full Earth circumference.
+    """
+    HALF_CIRCUMFERENCE = 20_037_508.342789244
+    FULL_CIRCUMFERENCE = 2 * HALF_CIRCUMFERENCE
+
+    bbox = bounds_poly.bounds  # (minx, miny, maxx, maxy)
+    if bbox[2] <= HALF_CIRCUMFERENCE:
+        return roads  # no wrap – nothing to do
+
+    print("Detected antimeridian wrap in backbone – shifting road coordinates …")
+    road_bounds = roads.total_bounds
+    print(f"  Backbone x-range : {bbox[0]:>14,.0f} – {bbox[2]:,.0f}")
+    print(f"  Roads x-range    : {road_bounds[0]:>14,.0f} – {road_bounds[2]:,.0f}")
+
+    needs_shift = roads.bounds["minx"] < bbox[0]
+    if needs_shift.any():
+        roads.loc[needs_shift, "geometry"] = roads.loc[needs_shift, "geometry"].apply(
+            lambda g: _translate(g, xoff=FULL_CIRCUMFERENCE)
+        )
+        shifted_bounds = roads.total_bounds
+        print(f"  Shifted {needs_shift.sum():,} geometries")
+        print(f"  Roads x-range now: {shifted_bounds[0]:>14,.0f} – {shifted_bounds[2]:,.0f}")
+    return roads
+
+
 def load_and_clip_roads(bounds_poly, target_crs) -> gpd.GeoDataFrame:
     """Load all road shapefiles, reproject to target CRS, and clip to bounds_poly."""
     shp_files = _find_shapefiles(ROADS_INPUT_DIR)
@@ -109,9 +142,11 @@ def load_and_clip_roads(bounds_poly, target_crs) -> gpd.GeoDataFrame:
     if roads.empty:
         raise RuntimeError("No line-like road geometries after filtering.")
 
+    # Handle antimeridian-wrapped backbone coordinates (common with GEE exports)
+    roads = _fix_antimeridian_wrap(roads, bounds_poly)
+
     # Clip to USA bounds
-    clip_gdf = gpd.GeoDataFrame(geometry=[bounds_poly], crs=target_crs)
-    roads_clipped = gpd.overlay(roads, clip_gdf, how="intersection")
+    roads_clipped = gpd.clip(roads, bounds_poly)
 
     # Save clipped vector
     if not roads_clipped.empty:

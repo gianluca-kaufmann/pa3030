@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=benchmark_1_RF
+#SBATCH --job-name=benchmark_2_RF
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/benchmark_1_RF_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/benchmark_1_RF_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/benchmark_2_RF_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/benchmark_2_RF_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -33,21 +33,21 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the benchmark_1 script with RF model type (main split)
+# Run the benchmark_2 script with RF model type (main split)
 #------------------------------------------------------------------------------
-echo "Starting benchmark_1 script (RF mode, main split)..."
+echo "Starting benchmark_2 script (RF mode, main split)..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/regions/usa/4_ml/3_evaluation/benchmark_1" ] || {
-  echo "ERROR: benchmark_1 not found"
-  echo "NOTE: benchmark_1 script is in ML/evaluation/ directory"
-  find scripts -maxdepth 4 -type f -name "benchmark_1"
+[ -f "scripts/regions/usa/4_ml/3_evaluation/benchmark_2" ] || {
+  echo "ERROR: benchmark_2 not found"
+  echo "NOTE: benchmark_2 script is in ML/evaluation/ directory"
+  find scripts -maxdepth 4 -type f -name "benchmark_2"
   exit 1
 }
 # Run the script (main split, RF model type)
-python "scripts/regions/usa/4_ml/3_evaluation/benchmark_1" --model_type rf --split-version main
+python "scripts/regions/usa/4_ml/3_evaluation/benchmark_2" --model_type rf --split-version main
 
-echo "benchmark_1 script (RF mode, main split) finished."
+echo "benchmark_2 script (RF mode, main split) finished."
