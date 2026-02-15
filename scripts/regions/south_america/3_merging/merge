@@ -473,16 +473,17 @@ def window_to_arrow(year: int, window: Window, band_stack: np.ndarray, band_name
 
 
 def build_band_names(dataset: str, arrays: List[np.ndarray], paths: List[Path] = None) -> List[str]:
-    """Build band names for a dataset given contributing arrays.
-    
-    When multiple single-band files exist for a dataset (e.g., policy/) and
-    file paths are provided, uses the filename stem (minus year) as the band
-    name for clarity.  Otherwise falls back to generic numbering.
-    """
+    """Build band names for a dataset given contributing arrays (all normalized to 3D)."""
     year_re = re.compile(r'_?(19|20)\d{2}')
     
-    # Try filename-based naming when multiple single-band files exist
-    if paths and len(arrays) > 1 and all(a.ndim == 2 for a in arrays):
+    # Normalize all arrays to 3D
+    arrays_3d = [normalize_to_3d(arr) for arr in arrays]
+    
+    # Count total bands
+    total_bands = sum(arr.shape[0] for arr in arrays_3d)
+    
+    # Try filename-based naming for policy datasets with multiple single-band files
+    if paths and len(arrays_3d) > 1 and all(arr.shape[0] == 1 for arr in arrays_3d):
         candidate_names = []
         for p in paths:
             clean = year_re.sub('', p.stem).strip('_')
@@ -490,21 +491,11 @@ def build_band_names(dataset: str, arrays: List[np.ndarray], paths: List[Path] =
         if len(set(candidate_names)) == len(candidate_names):
             return candidate_names
     
-    # Default logic
-    names: List[str] = []
-    idx = 1
-    for arr in arrays:
-        if arr.ndim == 2:
-            names.append(f"{dataset}")
-        else:
-            for i in range(arr.shape[0]):
-                names.append(f"{dataset}_b{idx}")
-                idx += 1
-    
-    # If all were single-band and duplicates resulted, ensure unique suffixes
-    if len(names) != len(set(names)):
-        names = [f"{dataset}_{i+1}" for i in range(len(names))]
-    return names
+    # Default: generate names based on total band count
+    if total_bands == 1:
+        return [dataset]
+    else:
+        return [f"{dataset}_b{i+1}" for i in range(total_bands)]
 
 
 def apply_temporal_coverage_rules(band_stack: np.ndarray, band_names: List[str], year: int, 
@@ -564,6 +555,27 @@ def classify_datasets(catalog: Dict[str, Dict[Optional[int], List[Path]]]) -> Tu
     return sorted(static), sorted(yearly)
 
 
+def normalize_to_3d(arr: np.ndarray) -> np.ndarray:
+    """Normalize array to 3D (bands, height, width)."""
+    if arr.ndim == 2:
+        return arr[np.newaxis, ...]
+    elif arr.ndim == 3:
+        return arr
+    else:
+        # Squeeze extra dimensions
+        while arr.ndim > 3:
+            arr = arr.squeeze(axis=0)
+        if arr.ndim == 2:
+            return arr[np.newaxis, ...]
+        return arr
+
+
+def count_bands(arr: np.ndarray) -> int:
+    """Count bands in an array (handles 2D and 3D)."""
+    arr_normalized = normalize_to_3d(arr)
+    return arr_normalized.shape[0]
+
+
 def load_dataset_window(
     paths: List[Path],
     ref_profile: dict,
@@ -572,90 +584,53 @@ def load_dataset_window(
     window_height: int,
     window_width: int,
     dataset: Optional[str] = None
-) -> List[np.ndarray]:
+) -> np.ndarray:
     """
     Load and reproject dataset files for a given window.
-    Returns NaN placeholder if no paths provided.
-    
-    Band-count enforcement: After loading, verifies that the total number of
-    bands matches ``expected_bands`` (determined during the probe phase).  If a
-    year has more files/bands than the probe year, extra bands are truncated; if
-    fewer, missing bands are padded with NaN.  This prevents the
-    ``Band count mismatch`` error that occurs when different years of the same
-    dataset contain different numbers of raster files.
+    Returns a 3D array (bands, height, width) with exactly expected_bands.
     
     Args:
         paths: List of file paths to load
         ref_profile: Reference grid profile
         window: Window to read
-        expected_bands: Expected number of bands for placeholder
-        window_height: Window height for placeholder
-        window_width: Window width for placeholder
+        expected_bands: Expected number of bands
+        window_height: Window height
+        window_width: Window width
         dataset: Dataset name (for Int16 unscaling detection)
+    
+    Returns:
+        3D array (expected_bands, window_height, window_width)
     """
     if not paths:
-        # No data available - create NaN placeholder
-        placeholder = np.full((expected_bands, window_height, window_width), np.nan, dtype=np.float32)
-        return [placeholder]
+        # No data available - return NaN placeholder
+        return np.full((expected_bands, window_height, window_width), np.nan, dtype=np.float32)
     
+    # Load all files
     arrays = []
     for p in paths:
         arr = read_reproject_window(p, ref_profile, window, dataset=dataset)
-        arrays.append(arr)
+        arrays.append(normalize_to_3d(arr))
     
-    # If loading failed, create placeholder
     if not arrays:
-        placeholder = np.full((expected_bands, window_height, window_width), np.nan, dtype=np.float32)
-        return [placeholder]
+        return np.full((expected_bands, window_height, window_width), np.nan, dtype=np.float32)
     
-    # --- Enforce expected band count ---
-    # Count total bands across all loaded arrays
-    total_bands = 0
-    for a in arrays:
-        if a.ndim == 3:
-            total_bands += a.shape[0]
-        elif a.ndim == 2:
-            total_bands += 1
-        else:
-            # Will be squeezed to 3-D later; count leading dim
-            total_bands += a.shape[0]
+    # Concatenate all arrays
+    combined = np.concatenate(arrays, axis=0)
     
-    if total_bands != expected_bands:
-        # Normalize all arrays to 3-D and concatenate into a single block
-        normalised = []
-        for a in arrays:
-            if a.ndim == 3:
-                normalised.append(a)
-            elif a.ndim == 2:
-                normalised.append(a[np.newaxis, ...])
-            else:
-                while a.ndim > 3:
-                    a = a.squeeze(axis=0)
-                normalised.append(a)
-        combined = np.concatenate(normalised, axis=0)
-        
-        if combined.shape[0] > expected_bands:
-            # Truncate extra bands (log once per dataset to avoid spam)
-            log_progress(
-                f"    Warning: {dataset} has {combined.shape[0]} bands, "
-                f"expected {expected_bands} — truncating extra bands"
-            )
-            combined = combined[:expected_bands]
-        else:
-            # Pad with NaN to reach expected count
-            log_progress(
-                f"    Warning: {dataset} has {combined.shape[0]} bands, "
-                f"expected {expected_bands} — padding with NaN"
-            )
-            pad = np.full(
-                (expected_bands - combined.shape[0], window_height, window_width),
-                np.nan, dtype=np.float32,
-            )
-            combined = np.concatenate([combined, pad], axis=0)
-        
-        return [combined]
-    
-    return arrays
+    # Ensure we have exactly expected_bands
+    actual_bands = combined.shape[0]
+    if actual_bands == expected_bands:
+        return combined
+    elif actual_bands > expected_bands:
+        # Truncate extra bands
+        return combined[:expected_bands]
+    else:
+        # Pad with NaN
+        pad = np.full(
+            (expected_bands - actual_bands, window_height, window_width),
+            np.nan, dtype=np.float32
+        )
+        return np.concatenate([combined, pad], axis=0)
 
 
 # Removed pandas DataFrame conversions in favor of direct Arrow streaming per window
@@ -810,18 +785,22 @@ def main():
                 available_years = sorted([y for y in entries.keys() if y is not None])
                 candidate_paths = entries[available_years[0]] if available_years else []
                 if not candidate_paths:
-                    log_progress(f"    Warning: {dataset} static override but no files found at all")
+                    log_progress(f"    Warning: {dataset} static override but no files found")
                     continue
+            
             arrays = []
             for p in candidate_paths:
                 arr = read_reproject_window(p, ref_profile, probe_window, dataset=dataset)
-                arrays.append(arr)
+                arrays.append(normalize_to_3d(arr))
             
+            # Count total bands
+            total_bands = sum(arr.shape[0] for arr in arrays)
             band_names = build_band_names(dataset, arrays, paths=candidate_paths)
+            
             if band_names:
                 static_band_names.extend(band_names)
-                static_band_counts[dataset] = len(band_names)
-                log_progress(f"    {dataset}: {len(band_names)} bands (static)")
+                static_band_counts[dataset] = total_bands
+                log_progress(f"    {dataset}: {total_bands} bands (static)")
         except Exception as e:
             log_progress(f"    Warning: Could not probe static dataset {dataset}: {e}")
             continue
@@ -848,13 +827,16 @@ def main():
             arrays = []
             for p in candidate_paths:
                 arr = read_reproject_window(p, ref_profile, probe_window, dataset=dataset)
-                arrays.append(arr)
+                arrays.append(normalize_to_3d(arr))
             
+            # Count total bands
+            total_bands = sum(arr.shape[0] for arr in arrays)
             band_names = build_band_names(dataset, arrays, paths=candidate_paths)
+            
             if band_names:
                 yearly_band_names.extend(band_names)
-                yearly_band_counts[dataset] = len(band_names)
-                log_progress(f"    {dataset}: {len(band_names)} bands (yearly)")
+                yearly_band_counts[dataset] = total_bands
+                log_progress(f"    {dataset}: {total_bands} bands (yearly, probed from year {available_years[0]})")
         except Exception as e:
             log_progress(f"    Warning: Could not probe yearly dataset {dataset}: {e}")
             continue
@@ -924,9 +906,10 @@ def main():
             else:
                 years_avail = sorted([y for y in entries.keys() if y is not None])
                 paths = entries[years_avail[0]] if years_avail else []
+            
             expected_bands = static_band_counts.get(dataset, 1)
-            arrays = load_dataset_window(paths, ref_profile, w, expected_bands, window_height, window_width, dataset=dataset)
-            static_window_arrays.extend(arrays)
+            arr = load_dataset_window(paths, ref_profile, w, expected_bands, window_height, window_width, dataset=dataset)
+            static_window_arrays.append(arr)
         
         # Now process ALL years for this window
         for year in YEARS:
@@ -950,51 +933,29 @@ def main():
                             paths = entries[min(nexts)] if nexts else []
                     
                     expected_bands = yearly_band_counts.get(dataset, 1)
-                    arrays = load_dataset_window(paths, ref_profile, w, expected_bands, window_height, window_width, dataset=dataset)
-                    yearly_window_arrays.extend(arrays)
+                    arr = load_dataset_window(paths, ref_profile, w, expected_bands, window_height, window_width, dataset=dataset)
+                    yearly_window_arrays.append(arr)
                 
-                # COMBINE: Static arrays first, then yearly arrays
+                # COMBINE: Static arrays first, then yearly arrays (all are now 3D)
                 all_window_arrays = static_window_arrays + yearly_window_arrays
                 
                 if not all_window_arrays:
                     continue
                 
-                # Stack into single band array
-                # Normalise every piece to 3-D (bands, H, W)
-                normalised = []
-                for a in all_window_arrays:
-                    if a.ndim == 3:
-                        normalised.append(a)
-                    elif a.ndim == 2:
-                        normalised.append(a[np.newaxis, ...])
-                    else:
-                        # Squeeze any spurious leading dims (e.g. 4-D from double newaxis)
-                        while a.ndim > 3:
-                            a = a.squeeze(axis=0)
-                        normalised.append(a)
-                band_stack = np.concatenate(normalised, axis=0)
+                # Stack into single band array (all arrays are already 3D)
+                band_stack = np.concatenate(all_window_arrays, axis=0)
 
-                # Handle band count mismatch gracefully
+                # Verify band count matches expected
                 if band_stack.shape[0] != len(current_band_names):
-                    if band_stack.shape[0] > len(current_band_names):
-                        # Truncate extra bands
-                        log_progress(
-                            f"    Year {year}, window {window_idx}: Got {band_stack.shape[0]} bands, "
-                            f"expected {len(current_band_names)} — truncating extra bands"
-                        )
-                        band_stack = band_stack[:len(current_band_names)]
-                    else:
-                        # Pad with NaN
-                        missing = len(current_band_names) - band_stack.shape[0]
-                        log_progress(
-                            f"    Year {year}, window {window_idx}: Got {band_stack.shape[0]} bands, "
-                            f"expected {len(current_band_names)} — padding {missing} bands with NaN"
-                        )
-                        pad = np.full(
-                            (missing, window_height, window_width),
-                            np.nan, dtype=np.float32
-                        )
-                        band_stack = np.concatenate([band_stack, pad], axis=0)
+                    log_progress(
+                        f"ERROR: Year {year}, window {window_idx}: "
+                        f"Band count mismatch: got {band_stack.shape[0]}, expected {len(current_band_names)}"
+                    )
+                    log_progress(f"  Static datasets: {static_datasets} ({len(static_window_arrays)} arrays)")
+                    log_progress(f"  Yearly datasets: {yearly_datasets} ({len(yearly_window_arrays)} arrays)")
+                    for i, arr in enumerate(static_window_arrays + yearly_window_arrays):
+                        log_progress(f"    Array {i}: shape {arr.shape}")
+                    continue
                 
                 # Apply temporal coverage rules (in-place modification)
                 apply_temporal_coverage_rules(band_stack, current_band_names, year)
