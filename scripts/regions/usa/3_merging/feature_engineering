@@ -368,9 +368,153 @@ def process_year(
     }
 
 
+def validate_upstream_data(input_path: Path, wdpa_col: str, smooth_vars: list[str],
+                           sample_year: int | None = None) -> dict:
+    """Validate upstream merged panel data for critical quality issues.
+
+    Reads a single year's data (default: first available) and checks for
+    all-NaN columns that would silently break downstream processing.
+
+    Returns a dict of column -> {total, nan_count, nan_pct, ok}.
+    Raises RuntimeError if WDPA is completely NaN (model would be useless).
+    """
+    logger.info("\n" + "=" * 80)
+    logger.info("UPSTREAM DATA VALIDATION")
+    logger.info("=" * 80)
+
+    # Determine which year to sample
+    if sample_year is None:
+        yrs = pd.read_parquet(input_path, columns=['year'])
+        sample_year = int(yrs['year'].max())
+        del yrs
+        gc.collect()
+    logger.info(f"  Sampling year {sample_year} for data-quality checks...")
+
+    check_cols = ['row', 'col', wdpa_col] + [v for v in smooth_vars if v not in ('row', 'col', wdpa_col)]
+    # Only request columns that actually exist in the schema
+    schema_names = set(pq.read_schema(input_path).names)
+    check_cols = [c for c in check_cols if c in schema_names]
+
+    df_check = pd.read_parquet(
+        input_path, columns=check_cols,
+        filters=[('year', '==', sample_year)], engine='pyarrow',
+    )
+
+    n = len(df_check)
+    logger.info(f"  Sample year {sample_year}: {n:,} rows")
+    if n == 0:
+        raise RuntimeError(
+            f"Year {sample_year} returned 0 rows from the merged panel.\n"
+            f"The upstream merge step may have failed."
+        )
+
+    report: dict[str, dict] = {}
+    for col in check_cols:
+        if col in ('row', 'col'):
+            continue
+        n_nan = int(df_check[col].isna().sum())
+        pct = 100.0 * n_nan / n if n else 0.0
+        ok = pct < 99.0  # <99 % NaN is "usable"
+        report[col] = {"total": n, "nan_count": n_nan, "nan_pct": pct, "ok": ok}
+        status = "OK" if ok else "BROKEN"
+        logger.info(f"    {col}: {n_nan:,}/{n:,} NaN ({pct:.1f}%) — {status}")
+
+    # Also log row/col range so the user can compare with smooth lookup
+    logger.info(f"  row range: [{df_check['row'].min()}, {df_check['row'].max()}]")
+    logger.info(f"  col range: [{df_check['col'].min()}, {df_check['col'].max()}]")
+
+    del df_check
+    gc.collect()
+
+    # ---- Hard failure: WDPA completely NaN ----
+    if wdpa_col in report and not report[wdpa_col]["ok"]:
+        raise RuntimeError(
+            f"\n{'=' * 80}\n"
+            f"CRITICAL: '{wdpa_col}' is {report[wdpa_col]['nan_pct']:.1f}% NaN "
+            f"in the merged panel (year {sample_year}).\n"
+            f"This means the upstream merge step did NOT write valid WDPA data.\n\n"
+            f"Likely causes:\n"
+            f"  1. The WDPA rasters are not aligned with the backbone raster.\n"
+            f"     - The backbone uses FAO/GAUL boundaries but the WDPA export\n"
+            f"       may use USDOS/LSIB boundaries. For the USA (Alaska, Hawaii,\n"
+            f"       territories) this can produce very different bounding boxes\n"
+            f"       in EPSG:3857, causing zero overlap during reprojection.\n"
+            f"  2. The WDPA raster files are missing or corrupt in the data/usa/ready/WDPA/ directory.\n"
+            f"  3. The WDPA raster nodata value is set to 0, causing all 'not protected'\n"
+            f"     pixels to be treated as nodata and converted to NaN.\n\n"
+            f"Fix: Re-export WDPA using the SAME boundary dataset as the backbone\n"
+            f"     (FAO/GAUL_SIMPLIFIED_500m/2015/level0 with ADM0_NAME='United States of America'),\n"
+            f"     or re-run the merge step after ensuring raster alignment.\n"
+            f"{'=' * 80}"
+        )
+
+    # ---- Soft warning: smooth variables NaN ----
+    broken_smooth = [col for col in smooth_vars if col in report and not report[col]["ok"]]
+    if broken_smooth:
+        logger.warning(
+            f"  WARNING: Static smooth variables {broken_smooth} are ≥99% NaN.\n"
+            f"  Smooth features (elevation_smooth*, slope_smooth*) will be all NaN.\n"
+            f"  This is likely the same upstream raster-alignment issue as WDPA."
+        )
+
+    return report
+
+
+def validate_smooth_lookup(smooth_lookup: pd.DataFrame, df_ref: pd.DataFrame,
+                           input_path: Path | None = None,
+                           sample_year: int | None = None) -> None:
+    """Validate that the smooth lookup is usable: non-empty, has data, and keys match."""
+    logger.info("  Validating smooth lookup...")
+
+    smooth_cols = [c for c in smooth_lookup.columns if c not in ('row', 'col')]
+    n_lookup = len(smooth_lookup)
+
+    logger.info(f"    Lookup rows: {n_lookup:,}")
+    logger.info(f"    Lookup columns: {smooth_cols}")
+    logger.info(f"    Lookup row range: [{smooth_lookup['row'].min()}, {smooth_lookup['row'].max()}]")
+    logger.info(f"    Lookup col range: [{smooth_lookup['col'].min()}, {smooth_lookup['col'].max()}]")
+
+    if n_lookup == 0:
+        logger.error("    Smooth lookup is EMPTY — no static smooth features will be produced.")
+        return
+
+    # Check NaN rates in smooth columns
+    for col in smooth_cols:
+        n_nan = int(smooth_lookup[col].isna().sum())
+        pct = 100.0 * n_nan / n_lookup if n_lookup else 0.0
+        status = "OK" if pct < 99.0 else "ALL NaN"
+        logger.info(f"    {col}: {n_nan:,}/{n_lookup:,} NaN ({pct:.1f}%) — {status}")
+
+    # Optionally verify (row, col) overlap with a different year
+    if input_path is not None and sample_year is not None:
+        df_sample = pd.read_parquet(
+            input_path, columns=['row', 'col'],
+            filters=[('year', '==', sample_year)], engine='pyarrow',
+        )
+        n_sample = len(df_sample)
+        if n_sample > 0:
+            lookup_keys = set(zip(smooth_lookup['row'], smooth_lookup['col']))
+            sample_keys = set(zip(df_sample['row'], df_sample['col']))
+            overlap = len(lookup_keys & sample_keys)
+            overlap_pct = 100.0 * overlap / n_sample
+            logger.info(f"    (row, col) overlap with year {sample_year}: "
+                        f"{overlap:,}/{n_sample:,} ({overlap_pct:.1f}%)")
+            if overlap_pct < 1.0:
+                logger.error(
+                    f"    CRITICAL: <1% (row,col) overlap between smooth lookup "
+                    f"(from reference year) and year {sample_year} data!\n"
+                    f"    Lookup row range: [{smooth_lookup['row'].min()}, {smooth_lookup['row'].max()}]\n"
+                    f"    Year {sample_year} row range: [{df_sample['row'].min()}, {df_sample['row'].max()}]\n"
+                    f"    This means the merge by (row, col) will produce 100% NaN.\n"
+                    f"    Likely cause: the reference footprint was built on a different grid."
+                )
+        del df_sample
+        gc.collect()
+
+
 def main() -> None:
     """Main processing function."""
-    repo_root = Path(__file__).resolve().parents[3]
+    repo_root = Path(__file__).resolve().parents[4]
     scratch_root = Path(os.environ["SCRATCH"]) if "SCRATCH" in os.environ else None
 
     # Resolve input path with sensible defaults:
@@ -414,8 +558,9 @@ def main() -> None:
     # Initialize W&B
     wandb.init(
         project="ml-preprocessing-spatial",
-        name="spatial_features_preprocessing",
+        name="spatial_features_preprocessing_usa",
         config={
+            "region": "usa",
             "distance_decay_scale": DISTANCE_DECAY_SCALE,
             "smooth_variables": SMOOTH_VARIABLES,
             "smooth_sizes": SMOOTH_SIZES,
@@ -426,7 +571,7 @@ def main() -> None:
     )
     
     logger.info("="*80)
-    logger.info("SPATIAL FEATURES PREPROCESSING")
+    logger.info("SPATIAL FEATURES PREPROCESSING — USA")
     logger.info("="*80)
     logger.info(f"Input:  {input_path}")
     logger.info(f"Output: {output_path}")
@@ -461,14 +606,19 @@ def main() -> None:
     # The merge step may name the WDPA column differently depending on raster structure:
     #   - Multi-band raster  ->  'WDPA_b1'
     #   - Single-band raster ->  'WDPA'
-    if 'WDPA_b1' in available_cols:
-        wdpa_col = 'WDPA_b1'
-    elif 'WDPA' in available_cols:
-        wdpa_col = 'WDPA'
-        logger.info("  Column 'WDPA_b1' not found; using 'WDPA' instead")
-    else:
+    # Also handle case-insensitive matching (directory name may be 'wdpa' or 'WDPA')
+    wdpa_col: str | None = None
+    for candidate in ['WDPA_b1', 'WDPA', 'wdpa_b1', 'wdpa']:
+        if candidate in available_cols:
+            wdpa_col = candidate
+            if candidate not in ('WDPA_b1', 'WDPA'):
+                logger.info(f"  WDPA column found with non-standard casing: '{candidate}'")
+            elif candidate == 'WDPA':
+                logger.info("  Column 'WDPA_b1' not found; using 'WDPA' instead")
+            break
+    if wdpa_col is None:
         raise ValueError(
-            f"Input file is missing WDPA column (looked for 'WDPA_b1' and 'WDPA').\n"
+            f"Input file is missing WDPA column (looked for 'WDPA_b1', 'WDPA', 'wdpa_b1', 'wdpa').\n"
             f"Available columns: {schema.names}"
         )
     
@@ -553,6 +703,11 @@ def main() -> None:
     
     wandb.log({"total_years": len(years), "total_rows": total_rows})
     
+    # ---- Upstream data quality check (fail fast on broken data) ----
+    upstream_report = validate_upstream_data(
+        input_path, wdpa_col, resolved_smooth_vars, sample_year=years[-1]
+    )
+    
     # Precompute static distance features once on reference footprint
     logger.info("\n" + "="*80)
     logger.info("Precomputing static distance features on reference footprint...")
@@ -589,6 +744,10 @@ def main() -> None:
         df_ref = df_ref[['row', 'col'] + [c for c in static_cols if c in df_ref.columns]].drop_duplicates(subset=['row', 'col'])
         logger.info(f"Using union footprint: {len(df_ref):,} unique pixels")
     
+    logger.info(f"  Reference footprint: {len(df_ref):,} pixels")
+    logger.info(f"  Reference row range: [{df_ref['row'].min()}, {df_ref['row'].max()}]")
+    logger.info(f"  Reference col range: [{df_ref['col'].min()}, {df_ref['col'].max()}]")
+    
     # Compute static distances once (using resolved mapping)
     static_lookup = compute_static_distance_features_once(df_ref, resolved_distance_mapping)
     logger.info(f"  Computed static distances for {len(static_lookup):,} pixels")
@@ -596,6 +755,13 @@ def main() -> None:
     # Compute static smooth features once (using resolved variables)
     smooth_lookup = compute_static_smooth_features_once(df_ref, resolved_smooth_vars)
     logger.info(f"  Computed static smooth features for {len(smooth_lookup):,} pixels")
+
+    # Validate the smooth lookup before using it
+    first_non_ref_year = years[0] if years[0] != ref_year else (years[1] if len(years) > 1 else years[0])
+    validate_smooth_lookup(
+        smooth_lookup, df_ref,
+        input_path=input_path, sample_year=first_non_ref_year,
+    )
 
     del df_ref
     gc.collect()
