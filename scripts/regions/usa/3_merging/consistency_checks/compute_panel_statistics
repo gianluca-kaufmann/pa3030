@@ -15,14 +15,33 @@ from collections import Counter
 import wandb
 
 # Paths
-ROOT_DIR = Path(__file__).resolve().parents[3]
+def get_repo_root() -> Path:
+    """Get repository root directory."""
+    env_root = os.environ.get("PROJECT_ROOT") or os.environ.get("REPO_ROOT")
+    if env_root:
+        return Path(env_root).resolve()
+    script_dir = Path(__file__).resolve().parent
+    current = script_dir
+    for _ in range(10):
+        if (current / "README.md").exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    raise RuntimeError(
+        f"Repository root not found. Searched upward from {script_dir} for README.md.\n"
+        "Set PROJECT_ROOT or REPO_ROOT environment variable, or ensure README.md exists in repo root."
+    )
+
+ROOT_DIR = get_repo_root()
 SCRATCH_ROOT = Path(os.environ["SCRATCH"]) if "SCRATCH" in os.environ else None
 
 # Prefer panel file on $SCRATCH (Euler) if available, otherwise fall back to repo path
 candidate_panel_paths = []
 if SCRATCH_ROOT is not None:
-    candidate_panel_paths.append(SCRATCH_ROOT / "data" / "ml" / "merged_panel_final.parquet")
-candidate_panel_paths.append(ROOT_DIR / "data" / "ml" / "merged_panel_final.parquet")
+    candidate_panel_paths.append(SCRATCH_ROOT / "data" / "usa" / "ml" / "merged_panel_final.parquet")
+candidate_panel_paths.append(ROOT_DIR / "data" / "usa" / "ml" / "merged_panel_final.parquet")
 
 PANEL_FILE = candidate_panel_paths[-1]
 for cand in candidate_panel_paths:

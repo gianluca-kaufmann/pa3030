@@ -17,12 +17,32 @@ Output:
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 from datetime import datetime
 
 # Define paths
-ROOT_DIR = Path(__file__).resolve().parents[3]
+def get_repo_root() -> Path:
+    """Get repository root directory."""
+    env_root = os.environ.get("PROJECT_ROOT") or os.environ.get("REPO_ROOT")
+    if env_root:
+        return Path(env_root).resolve()
+    script_dir = Path(__file__).resolve().parent
+    current = script_dir
+    for _ in range(10):
+        if (current / "README.md").exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    raise RuntimeError(
+        f"Repository root not found. Searched upward from {script_dir} for README.md.\n"
+        "Set PROJECT_ROOT or REPO_ROOT environment variable, or ensure README.md exists in repo root."
+    )
+
+ROOT_DIR = get_repo_root()
 INPUT_JSON = ROOT_DIR / "outputs" / "usa" / "tables" / "merged_panel_statistics.json"
 OUTPUT_TXT = ROOT_DIR / "outputs" / "usa" / "tables" / "merged_panel_validation.txt"
 
