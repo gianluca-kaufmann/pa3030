@@ -472,30 +472,14 @@ def window_to_arrow(year: int, window: Window, band_stack: np.ndarray, band_name
     return pa.table(cols_dict)
 
 
-def build_band_names(dataset: str, arrays: List[np.ndarray], paths: List[Path] = None) -> List[str]:
-    """Build band names for a dataset given contributing arrays (all normalized to 3D)."""
-    year_re = re.compile(r'_?(19|20)\d{2}')
-    
-    # Normalize all arrays to 3D
-    arrays_3d = [normalize_to_3d(arr) for arr in arrays]
-    
-    # Count total bands
-    total_bands = sum(arr.shape[0] for arr in arrays_3d)
-    
-    # Try filename-based naming for policy datasets with multiple single-band files
-    if paths and len(arrays_3d) > 1 and all(arr.shape[0] == 1 for arr in arrays_3d):
-        candidate_names = []
-        for p in paths:
-            clean = year_re.sub('', p.stem).strip('_')
-            candidate_names.append(clean if clean else f"{dataset}_{len(candidate_names)+1}")
-        if len(set(candidate_names)) == len(candidate_names):
-            return candidate_names
-    
-    # Default: generate names based on total band count
-    if total_bands == 1:
+def get_band_names_for_array(dataset: str, num_bands: int) -> List[str]:
+    """Generate band names for a dataset given the number of bands."""
+    if num_bands == 0:
+        return []
+    elif num_bands == 1:
         return [dataset]
     else:
-        return [f"{dataset}_b{i+1}" for i in range(total_bands)]
+        return [f"{dataset}_b{i+1}" for i in range(num_bands)]
 
 
 def apply_temporal_coverage_rules(band_stack: np.ndarray, band_names: List[str], year: int, 
@@ -570,40 +554,23 @@ def normalize_to_3d(arr: np.ndarray) -> np.ndarray:
         return arr
 
 
-def count_bands(arr: np.ndarray) -> int:
-    """Count bands in an array (handles 2D and 3D)."""
-    arr_normalized = normalize_to_3d(arr)
-    return arr_normalized.shape[0]
-
-
 def load_dataset_window(
     paths: List[Path],
     ref_profile: dict,
     window: Window,
-    expected_bands: int,
     window_height: int,
     window_width: int,
     dataset: Optional[str] = None
 ) -> np.ndarray:
     """
     Load and reproject dataset files for a given window.
-    Returns a 3D array (bands, height, width) with exactly expected_bands.
+    Returns a 3D array (bands, height, width).
     
-    Args:
-        paths: List of file paths to load
-        ref_profile: Reference grid profile
-        window: Window to read
-        expected_bands: Expected number of bands
-        window_height: Window height
-        window_width: Window width
-        dataset: Dataset name (for Int16 unscaling detection)
-    
-    Returns:
-        3D array (expected_bands, window_height, window_width)
+    Simple version: just load and concatenate, no band count enforcement.
     """
     if not paths:
-        # No data available - return NaN placeholder
-        return np.full((expected_bands, window_height, window_width), np.nan, dtype=np.float32)
+        # No data - return empty 0-band array
+        return np.zeros((0, window_height, window_width), dtype=np.float32)
     
     # Load all files
     arrays = []
@@ -612,25 +579,10 @@ def load_dataset_window(
         arrays.append(normalize_to_3d(arr))
     
     if not arrays:
-        return np.full((expected_bands, window_height, window_width), np.nan, dtype=np.float32)
+        return np.zeros((0, window_height, window_width), dtype=np.float32)
     
     # Concatenate all arrays
-    combined = np.concatenate(arrays, axis=0)
-    
-    # Ensure we have exactly expected_bands
-    actual_bands = combined.shape[0]
-    if actual_bands == expected_bands:
-        return combined
-    elif actual_bands > expected_bands:
-        # Truncate extra bands
-        return combined[:expected_bands]
-    else:
-        # Pad with NaN
-        pad = np.full(
-            (expected_bands - actual_bands, window_height, window_width),
-            np.nan, dtype=np.float32
-        )
-        return np.concatenate([combined, pad], axis=0)
+    return np.concatenate(arrays, axis=0)
 
 
 # Removed pandas DataFrame conversions in favor of direct Arrow streaming per window
@@ -766,100 +718,10 @@ def main():
         "num_yearly": len(yearly_datasets)
     })
 
-    # Determine band names using a small probe window to avoid full reads
-    log_progress("\nDetermining band structure with probe window...")
-    probe_window = Window(col_off=0, row_off=0, width=min(8, ref_profile["width"]), height=min(8, ref_profile["height"]))
-    
-    # Probe static datasets first
-    static_band_names: List[str] = []
-    static_band_counts: Dict[str, int] = {}
-    
-    log_progress("  Probing static datasets...")
-    for dataset in static_datasets:
-        try:
-            entries = catalog[dataset]
-            # Prefer truly static files (no year in filename); otherwise fall back to earliest available year
-            if None in entries:
-                candidate_paths = entries[None]
-            else:
-                available_years = sorted([y for y in entries.keys() if y is not None])
-                candidate_paths = entries[available_years[0]] if available_years else []
-                if not candidate_paths:
-                    log_progress(f"    Warning: {dataset} static override but no files found")
-                    continue
-            
-            arrays = []
-            for p in candidate_paths:
-                arr = read_reproject_window(p, ref_profile, probe_window, dataset=dataset)
-                arrays.append(normalize_to_3d(arr))
-            
-            # Count total bands
-            total_bands = sum(arr.shape[0] for arr in arrays)
-            band_names = build_band_names(dataset, arrays, paths=candidate_paths)
-            
-            if band_names:
-                static_band_names.extend(band_names)
-                static_band_counts[dataset] = total_bands
-                log_progress(f"    {dataset}: {total_bands} bands (static)")
-        except Exception as e:
-            log_progress(f"    Warning: Could not probe static dataset {dataset}: {e}")
-            continue
-    
-    # Probe yearly datasets
-    yearly_band_names: List[str] = []
-    yearly_band_counts: Dict[str, int] = {}
-    
-    log_progress("  Probing yearly datasets...")
-    for dataset in yearly_datasets:
-        try:
-            entries = catalog[dataset]
-            candidate_paths: List[Path] = []
-            
-            # Find ANY available year for this dataset
-            available_years = sorted([y for y in entries.keys() if y is not None])
-            if available_years:
-                candidate_paths = entries[available_years[0]]
-            
-            if not candidate_paths:
-                log_progress(f"    Skipping {dataset}: no data files found")
-                continue
-            
-            arrays = []
-            for p in candidate_paths:
-                arr = read_reproject_window(p, ref_profile, probe_window, dataset=dataset)
-                arrays.append(normalize_to_3d(arr))
-            
-            # Count total bands
-            total_bands = sum(arr.shape[0] for arr in arrays)
-            band_names = build_band_names(dataset, arrays, paths=candidate_paths)
-            
-            if band_names:
-                yearly_band_names.extend(band_names)
-                yearly_band_counts[dataset] = total_bands
-                log_progress(f"    {dataset}: {total_bands} bands (yearly, probed from year {available_years[0]})")
-        except Exception as e:
-            log_progress(f"    Warning: Could not probe yearly dataset {dataset}: {e}")
-            continue
-    
-    # Combine band names: static first, then yearly (ensures consistent column order)
-    all_band_names = static_band_names + yearly_band_names
-    dataset_band_counts = {**static_band_counts, **yearly_band_counts}
-
-    if not all_band_names:
-        print("ERROR: Failed to determine band structure.")
-        sys.exit(1)
-    
-    log_progress(f"\nBand structure summary:")
-    log_progress(f"  Static bands: {len(static_band_names)}")
-    log_progress(f"  Yearly bands: {len(yearly_band_names)}")
-    log_progress(f"  Total bands: {len(all_band_names)}")
-    log_progress(f"  All band names: {all_band_names}")
-    
-    wandb.log({
-        "processing/total_bands": len(all_band_names),
-        "processing/static_bands": len(static_band_names),
-        "processing/yearly_bands": len(yearly_band_names)
-    })
+    # No probing - we'll determine band names dynamically on first window
+    log_progress("\nUsing dynamic band discovery (no probe phase)")
+    log_progress(f"  Static datasets: {', '.join(static_datasets)}")
+    log_progress(f"  Yearly datasets: {', '.join(yearly_datasets)}")
 
     # Setup incremental Parquet writer
     log_progress("Setting up incremental Parquet writer...")
@@ -868,14 +730,16 @@ def main():
     
     # Process window-by-window, with all years for each window
     # Key optimization: Load static datasets ONCE per window and reuse across ALL years
-    log_progress("\nProcessing windows with per-window static data caching (major speedup)...")
+    log_progress("\nProcessing windows with dynamic band discovery...")
     
     # Track progress
     total_windows = sum(1 for _ in iter_reference_windows(ref_profile, TILE_SIZE))
     window_idx = 0
     year_rows_dict = {year: 0 for year in YEARS}
     
-    current_band_names = all_band_names
+    # Band names will be determined from first non-empty window
+    all_band_names: List[str] = []
+    schema_initialized = False
     
     # Iterate windows FIRST, then years
     for w in iter_reference_windows(ref_profile, TILE_SIZE):
@@ -897,7 +761,7 @@ def main():
             continue
         
         # LOAD STATIC DATA ONCE for this window (reused across all years)
-        static_window_arrays: List[np.ndarray] = []
+        static_window_arrays: Dict[str, np.ndarray] = {}
         for dataset in static_datasets:
             entries = catalog[dataset]
             # Prefer truly static files; fallback to earliest available year
@@ -907,15 +771,15 @@ def main():
                 years_avail = sorted([y for y in entries.keys() if y is not None])
                 paths = entries[years_avail[0]] if years_avail else []
             
-            expected_bands = static_band_counts.get(dataset, 1)
-            arr = load_dataset_window(paths, ref_profile, w, expected_bands, window_height, window_width, dataset=dataset)
-            static_window_arrays.append(arr)
+            arr = load_dataset_window(paths, ref_profile, w, window_height, window_width, dataset=dataset)
+            if arr.shape[0] > 0:  # Only store if has bands
+                static_window_arrays[dataset] = arr
         
         # Now process ALL years for this window
         for year in YEARS:
             try:
                 # LOAD YEARLY DATA (varies by year, with forward-fill)
-                yearly_window_arrays: List[np.ndarray] = []
+                yearly_window_arrays: Dict[str, np.ndarray] = {}
                 for dataset in yearly_datasets:
                     entries = catalog[dataset]
                     
@@ -932,36 +796,52 @@ def main():
                             nexts = [y for y in entries.keys() if y is not None and y > year]
                             paths = entries[min(nexts)] if nexts else []
                     
-                    expected_bands = yearly_band_counts.get(dataset, 1)
-                    arr = load_dataset_window(paths, ref_profile, w, expected_bands, window_height, window_width, dataset=dataset)
-                    yearly_window_arrays.append(arr)
+                    arr = load_dataset_window(paths, ref_profile, w, window_height, window_width, dataset=dataset)
+                    if arr.shape[0] > 0:  # Only store if has bands
+                        yearly_window_arrays[dataset] = arr
                 
-                # COMBINE: Static arrays first, then yearly arrays (all are now 3D)
-                all_window_arrays = static_window_arrays + yearly_window_arrays
+                # Initialize schema from first non-empty window
+                if not schema_initialized and (static_window_arrays or yearly_window_arrays):
+                    all_band_names = []
+                    for dataset in static_datasets:
+                        if dataset in static_window_arrays:
+                            num_bands = static_window_arrays[dataset].shape[0]
+                            all_band_names.extend(get_band_names_for_array(dataset, num_bands))
+                    for dataset in yearly_datasets:
+                        if dataset in yearly_window_arrays:
+                            num_bands = yearly_window_arrays[dataset].shape[0]
+                            all_band_names.extend(get_band_names_for_array(dataset, num_bands))
+                    
+                    schema_initialized = True
+                    log_progress(f"\nSchema initialized from window {window_idx}, year {year}:")
+                    log_progress(f"  Total bands: {len(all_band_names)}")
+                    log_progress(f"  Band names: {all_band_names}")
+                    
+                    wandb.log({
+                        "processing/total_bands": len(all_band_names),
+                        "processing/band_names": all_band_names
+                    })
                 
-                if not all_window_arrays:
+                # Build band stack in dataset order
+                band_arrays = []
+                for dataset in static_datasets:
+                    if dataset in static_window_arrays:
+                        band_arrays.append(static_window_arrays[dataset])
+                for dataset in yearly_datasets:
+                    if dataset in yearly_window_arrays:
+                        band_arrays.append(yearly_window_arrays[dataset])
+                
+                if not band_arrays:
                     continue
                 
-                # Stack into single band array (all arrays are already 3D)
-                band_stack = np.concatenate(all_window_arrays, axis=0)
-
-                # Verify band count matches expected
-                if band_stack.shape[0] != len(current_band_names):
-                    log_progress(
-                        f"ERROR: Year {year}, window {window_idx}: "
-                        f"Band count mismatch: got {band_stack.shape[0]}, expected {len(current_band_names)}"
-                    )
-                    log_progress(f"  Static datasets: {static_datasets} ({len(static_window_arrays)} arrays)")
-                    log_progress(f"  Yearly datasets: {yearly_datasets} ({len(yearly_window_arrays)} arrays)")
-                    for i, arr in enumerate(static_window_arrays + yearly_window_arrays):
-                        log_progress(f"    Array {i}: shape {arr.shape}")
-                    continue
+                # Stack into single band array
+                band_stack = np.concatenate(band_arrays, axis=0)
                 
                 # Apply temporal coverage rules (in-place modification)
-                apply_temporal_coverage_rules(band_stack, current_band_names, year)
+                apply_temporal_coverage_rules(band_stack, all_band_names, year)
                 
                 # Parquet streaming with backbone mask
-                table = window_to_arrow(year, w, band_stack, current_band_names, ref_profile, backbone_window)
+                table = window_to_arrow(year, w, band_stack, all_band_names, ref_profile, backbone_window)
                 if parquet_writer is None:
                     log_progress("  Initializing Parquet writer...")
                     parquet_writer = pq.ParquetWriter(PARQUET_PATH, table.schema, compression='zstd')
@@ -970,7 +850,7 @@ def main():
                     year_rows_dict[year] += table.num_rows
                 
                 # Clean up yearly data only (keep static data for next year)
-                del band_stack, yearly_window_arrays, all_window_arrays, table
+                del band_stack, yearly_window_arrays, table
                 
             except Exception as e:
                 log_progress(f"ERROR processing year {year}, window {window_idx}: {e}")
@@ -990,7 +870,7 @@ def main():
         total_rows += year_rows
         wandb.log({
             f"year/{year}/rows": year_rows,
-            f"year/{year}/bands": len(current_band_names),
+            f"year/{year}/bands": len(all_band_names) if all_band_names else 0,
             f"year/{year}/status": "success"
         })
         log_progress(f"Year {year}: {year_rows:,} rows")
