@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""
+WorldClim bioclimatic variables visualisation for the USA.
+
+Inputs:
+    - Multi-band GeoTIFF ``data/usa/ready/WorldClim/WorldClim_BIO_USA_1km.tif``
+      containing 19 bioclimatic variables (BIO01–BIO19) at 1 km resolution.
+      These are static climatological averages (1960–1991).
+
+Process:
+    - Loads all 19 bands, produces overview maps, histograms, a summary
+      grid, and a correlation heatmap across variables.
+
+Outputs:
+    - PNG figures saved to ``outputs/usa/figures/WorldClim_vis``.
+"""
+
+import warnings
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import rasterio
+
+warnings.filterwarnings("ignore")
+
+# Paths
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DATA_DIR = PROJECT_ROOT / "data" / "usa" / "ready" / "WorldClim"
+WORLDCLIM_PATH = DATA_DIR / "WorldClim_BIO_USA_1km.tif"
+OUTPUT_DIR = PROJECT_ROOT / "outputs" / "usa" / "figures" / "WorldClim_vis"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# WorldClim bioclimatic variable descriptions
+BIO_LABELS = {
+    1: "Annual Mean Temperature (°C×10)",
+    2: "Mean Diurnal Range (°C×10)",
+    3: "Isothermality (%)",
+    4: "Temperature Seasonality (SD×100)",
+    5: "Max Temp Warmest Month (°C×10)",
+    6: "Min Temp Coldest Month (°C×10)",
+    7: "Temperature Annual Range (°C×10)",
+    8: "Mean Temp Wettest Quarter (°C×10)",
+    9: "Mean Temp Driest Quarter (°C×10)",
+    10: "Mean Temp Warmest Quarter (°C×10)",
+    11: "Mean Temp Coldest Quarter (°C×10)",
+    12: "Annual Precipitation (mm)",
+    13: "Precip Wettest Month (mm)",
+    14: "Precip Driest Month (mm)",
+    15: "Precipitation Seasonality (CV)",
+    16: "Precip Wettest Quarter (mm)",
+    17: "Precip Driest Quarter (mm)",
+    18: "Precip Warmest Quarter (mm)",
+    19: "Precip Coldest Quarter (mm)",
+}
+
+# Colormaps by variable type
+TEMP_CMAP = "RdYlBu_r"   # Temperature variables
+PRECIP_CMAP = "YlGnBu"   # Precipitation variables
+SEASON_CMAP = "viridis"   # Seasonality / range variables
+
+TEMP_BANDS = {1, 2, 5, 6, 7, 8, 9, 10, 11}
+PRECIP_BANDS = {12, 13, 14, 16, 17, 18, 19}
+SEASON_BANDS = {3, 4, 15}
+
+
+def _cmap_for_band(band_idx: int) -> str:
+    if band_idx in TEMP_BANDS:
+        return TEMP_CMAP
+    elif band_idx in PRECIP_BANDS:
+        return PRECIP_CMAP
+    return SEASON_CMAP
+
+
+def load_worldclim():
+    """Load all 19 bioclimatic bands and return as dict."""
+    if not WORLDCLIM_PATH.exists():
+        raise FileNotFoundError(
+            f"Missing WorldClim raster at {WORLDCLIM_PATH}. "
+            "Run the preprocessing script before visualising."
+        )
+
+    with rasterio.open(WORLDCLIM_PATH) as src:
+        n_bands = src.count
+        transform = src.transform
+        crs = src.crs
+        bands = {}
+        for i in range(1, n_bands + 1):
+            bands[i] = src.read(i).astype(np.float32)
+
+    print(f"Loaded WorldClim: {n_bands} bands, "
+          f"shape={bands[1].shape}, CRS={crs}")
+
+    for i, data in bands.items():
+        valid = data[~np.isnan(data)]
+        if valid.size > 0:
+            label = BIO_LABELS.get(i, f"Band {i}")
+            print(f"  BIO{i:02d} ({label}): "
+                  f"min={valid.min():.1f}, mean={valid.mean():.1f}, "
+                  f"max={valid.max():.1f}")
+
+    return bands, transform, crs
+
+
+def plot_summary_grid(bands):
+    """Plot all 19 bioclimatic variables in a 4×5 grid."""
+    print("Creating summary grid...")
+
+    n_bands = len(bands)
+    ncols = 5
+    nrows = (n_bands + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(24, nrows * 4))
+    fig.suptitle("WorldClim Bioclimatic Variables — USA (1960–1991)",
+                 fontsize=16, fontweight="bold", y=1.01)
+
+    for idx, ax in enumerate(axes.flatten()):
+        band_idx = idx + 1
+        if band_idx > n_bands:
+            ax.set_visible(False)
+            continue
+
+        data = bands[band_idx]
+        valid = data[~np.isnan(data)]
+        vmin = float(np.percentile(valid, 2)) if valid.size > 0 else 0
+        vmax = float(np.percentile(valid, 98)) if valid.size > 0 else 1
+
+        im = ax.imshow(data, cmap=_cmap_for_band(band_idx),
+                       vmin=vmin, vmax=vmax, interpolation="nearest")
+        short_label = BIO_LABELS.get(band_idx, f"Band {band_idx}")
+        ax.set_title(f"BIO{band_idx:02d}\n{short_label}",
+                     fontsize=9, fontweight="bold")
+        ax.set_axis_off()
+        plt.colorbar(im, ax=ax, shrink=0.7, pad=0.02)
+
+    plt.tight_layout()
+    out = OUTPUT_DIR / "worldclim_usa_summary_grid.png"
+    fig.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out.name}")
+
+
+def plot_individual_maps(bands):
+    """Create a high-resolution map for selected key variables."""
+    print("Creating individual variable maps...")
+    key_bands = [1, 4, 12, 15]  # temperature, seasonality, precip, precip CV
+
+    for band_idx in key_bands:
+        if band_idx not in bands:
+            continue
+
+        data = bands[band_idx]
+        valid = data[~np.isnan(data)]
+        if valid.size == 0:
+            continue
+
+        vmin = float(np.percentile(valid, 2))
+        vmax = float(np.percentile(valid, 98))
+        label = BIO_LABELS.get(band_idx, f"Band {band_idx}")
+
+        fig, ax = plt.subplots(figsize=(14, 8))
+        im = ax.imshow(data, cmap=_cmap_for_band(band_idx),
+                       vmin=vmin, vmax=vmax, interpolation="nearest")
+        ax.set_title(f"BIO{band_idx:02d}: {label} — USA",
+                     fontsize=14, fontweight="bold")
+        ax.set_axis_off()
+
+        cbar = plt.colorbar(im, ax=ax, shrink=0.7)
+        cbar.set_label(label, rotation=270, labelpad=15)
+
+        stats_text = (f"Mean: {valid.mean():.1f}  Std: {valid.std():.1f}\n"
+                      f"Min: {valid.min():.1f}  Max: {valid.max():.1f}")
+        ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
+                fontsize=10, verticalalignment="top",
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+
+        plt.tight_layout()
+        out = OUTPUT_DIR / f"worldclim_usa_BIO{band_idx:02d}.png"
+        fig.savefig(out, dpi=300, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved: {out.name}")
+
+
+def plot_histograms(bands):
+    """Plot histograms for all 19 bioclimatic variables."""
+    print("Creating histogram grid...")
+
+    n_bands = len(bands)
+    ncols = 5
+    nrows = (n_bands + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(22, nrows * 3.5))
+    fig.suptitle("WorldClim Value Distributions — USA",
+                 fontsize=15, fontweight="bold", y=1.01)
+
+    for idx, ax in enumerate(axes.flatten()):
+        band_idx = idx + 1
+        if band_idx > n_bands:
+            ax.set_visible(False)
+            continue
+
+        data = bands[band_idx]
+        valid = data[~np.isnan(data)]
+        if valid.size == 0:
+            ax.set_visible(False)
+            continue
+
+        color = ("#d62728" if band_idx in TEMP_BANDS
+                 else "#1f77b4" if band_idx in PRECIP_BANDS
+                 else "#2ca02c")
+
+        ax.hist(valid, bins=80, color=color, alpha=0.75, edgecolor="none")
+        short_label = BIO_LABELS.get(band_idx, f"Band {band_idx}")
+        ax.set_title(f"BIO{band_idx:02d}", fontsize=10, fontweight="bold")
+        ax.set_xlabel(short_label, fontsize=7)
+        ax.set_ylabel("Pixels", fontsize=8)
+        ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+
+    plt.tight_layout()
+    out = OUTPUT_DIR / "worldclim_usa_histograms.png"
+    fig.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out.name}")
+
+
+def plot_correlation_heatmap(bands):
+    """Compute and plot pairwise Pearson correlations between bands."""
+    print("Creating correlation heatmap...")
+
+    n_bands = len(bands)
+    # Flatten all bands and filter to pixels valid in ALL bands
+    flat = np.column_stack([bands[i].ravel() for i in range(1, n_bands + 1)])
+    mask = ~np.isnan(flat).any(axis=1)
+    flat = flat[mask]
+
+    if flat.shape[0] < 100:
+        print("  Not enough valid pixels for correlation; skipping.")
+        return
+
+    # Subsample for speed if very large
+    if flat.shape[0] > 500_000:
+        rng = np.random.default_rng(42)
+        idx = rng.choice(flat.shape[0], size=500_000, replace=False)
+        flat = flat[idx]
+
+    corr = np.corrcoef(flat, rowvar=False)
+
+    labels = [f"BIO{i:02d}" for i in range(1, n_bands + 1)]
+    fig, ax = plt.subplots(figsize=(12, 10))
+    im = ax.imshow(corr, cmap="RdBu_r", vmin=-1, vmax=1, interpolation="nearest")
+    ax.set_xticks(range(n_bands))
+    ax.set_yticks(range(n_bands))
+    ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=9)
+    ax.set_yticklabels(labels, fontsize=9)
+    ax.set_title("Pairwise Correlation — WorldClim Bioclimatic Variables (USA)",
+                 fontsize=13, fontweight="bold")
+
+    # Annotate cells
+    for i in range(n_bands):
+        for j in range(n_bands):
+            color = "white" if abs(corr[i, j]) > 0.6 else "black"
+            ax.text(j, i, f"{corr[i, j]:.2f}", ha="center", va="center",
+                    fontsize=6.5, color=color)
+
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8)
+    cbar.set_label("Pearson r", rotation=270, labelpad=15)
+
+    plt.tight_layout()
+    out = OUTPUT_DIR / "worldclim_usa_correlation.png"
+    fig.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out.name}")
+
+
+def main():
+    print("WorldClim Bioclimatic Variables Visualisation — USA")
+    print("=" * 60)
+    print(f"Input: {WORLDCLIM_PATH}")
+    print(f"Output: {OUTPUT_DIR}")
+    print()
+
+    bands, transform, crs = load_worldclim()
+
+    plot_summary_grid(bands)
+    plot_individual_maps(bands)
+    plot_histograms(bands)
+    plot_correlation_heatmap(bands)
+
+    print("\nWorldClim visualisation complete!")
+
+
+if __name__ == "__main__":
+    main()

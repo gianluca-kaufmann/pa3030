@@ -26,6 +26,16 @@ USA_COUNTRIES = [
     "United States of America",
 ]
 
+# Contiguous US (CONUS) bounding box in WGS84 (lon/lat)
+# Excludes Alaska, Hawaii, and US territories to match the extent of
+# data rasters (WDPA, WorldClim, etc.) that only cover the mainland.
+CONUS_BBOX = {
+    "west": -125.0,
+    "east": -66.0,
+    "south": 24.0,
+    "north": 50.0,
+}
+
 
 def initialize_earth_engine(project_id: Optional[str] = None) -> None:
     """Authenticate and initialize Earth Engine with an optional project."""
@@ -47,20 +57,38 @@ def initialize_earth_engine(project_id: Optional[str] = None) -> None:
 
 
 def get_usa_geometry() -> ee.Geometry:
-    """Return a dissolved USA geometry using GAUL level-0 boundaries."""
+    """Return a dissolved CONUS geometry using GAUL level-0 boundaries.
+    
+    The full USA geometry from GAUL includes Alaska, Hawaii, and territories,
+    which creates a very large bounding box. Most data rasters (WDPA, WorldClim,
+    etc.) only cover the contiguous US. This function clips the USA boundary to
+    the CONUS bounding box to match the data extent and avoid wasting pixels.
+    """
     countries = ee.FeatureCollection(GAUL_COLLECTION)
     region_fc = countries.filter(ee.Filter.inList("ADM0_NAME", USA_COUNTRIES))
-    region = region_fc.geometry().dissolve()
-    print("USA geometry assembled from GAUL.")
+    usa_full = region_fc.geometry().dissolve()
+    
+    # Clip to CONUS bounding box (excludes Alaska, Hawaii, territories)
+    conus_bbox = ee.Geometry.BBox(
+        CONUS_BBOX["west"], CONUS_BBOX["south"],
+        CONUS_BBOX["east"], CONUS_BBOX["north"],
+    )
+    region = usa_full.intersection(conus_bbox, ee.ErrorMargin(100, "meters"))
+    print("CONUS geometry assembled from GAUL (Alaska, Hawaii, territories excluded).")
     return region
 
 
 def build_backbone_image(region: ee.Geometry) -> ee.Image:
-    """Create a float image with USA pixels set to 1 and others to 0."""
+    """Create a float image with USA pixels set to 1 and others to 0.
+    
+    Note: No .reproject() here — the export task specifies crs and scale,
+    which is sufficient. Calling .reproject() mid-pipeline forces GEE to
+    materialize the image eagerly, breaking lazy evaluation and making
+    exports orders of magnitude slower.
+    """
     backbone = (
         ee.Image.constant(1)
         .toFloat()
-        .reproject(crs=CRS, scale=KM)
         .clip(region)
         .unmask(0)
         .rename("backbone")
@@ -100,8 +128,8 @@ def main() -> None:
         "Backbone export script completed. Monitor the Tasks tab in the EE Code Editor "
         "or ee.batch.Task.list()."
     )
-    print("\nNote: This version uses MODIS Land Cover to exclude ocean/water pixels.")
-    print("Expected result: ~9.8M land pixels (not 21.5M with ocean included)")
+    print("\nNote: This version exports CONUS only (Alaska, Hawaii, territories excluded).")
+    print("This matches the extent of data rasters (WDPA, WorldClim, etc.).")
 
 
 if __name__ == "__main__":

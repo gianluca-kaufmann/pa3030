@@ -22,46 +22,93 @@ sbatch slurm/RUN.slurm
 squeue
 ```
 
-### Sync from Euler to Mac
+---
+
+## File Transfers
+
+> **Legend**
+> - `scp` = secure copy over SSH (Desktop ↔ Euler)
+> - `gsutil cp` = single file/folder copy (any ↔ GCS)
+> - `gsutil rsync` = mirror a whole directory (any ↔ GCS)
+> - Add `-m` for parallel (multi-threaded) transfers
+> - Add `-r` for recursive (entire folder)
+
+### 1. Euler → Desktop
 
 ```bash
-# scratch outputs
-scp gikaufmann@login.euler.ethz.ch:/cluster/scratch/gikaufmann/outputs/south_america/results/merged_panel_2000_2024.parquet ~/Desktop/
+# Single file (from scratch)
+scp gikaufmann@login.euler.ethz.ch:/cluster/scratch/gikaufmann/<PATH> ~/Desktop/
 
-# txt and other outputs
-scp -r gikaufmann@euler.ethz.ch:~/master_thesis/outputs/south_america/tables/merged_panel_validation.txt ~/Desktop/
+# Single file (from home repo)
+scp gikaufmann@euler.ethz.ch:~/master_thesis/<PATH> ~/Desktop/
 
-# Download from GCS → Desktop
-gsutil -m cp gs://protected-areas/data/ml/merged_panel_final.parquet 
-
-# whole folder
-gsutil -m cp -r gs://protected-areas/outputs/south_america/results /Users/gianluca/Desktop/
+# Whole folder
+scp -r gikaufmann@login.euler.ethz.ch:/cluster/scratch/gikaufmann/outputs/<FOLDER> ~/Desktop/
 ```
-### Sync Between Euler ↔ GCS
+
+### 2. Desktop → Euler
 
 ```bash
-# GCS → Euler (pull full dataset)
-gsutil -m rsync -r gs://protected-areas/data \
-  /cluster/scratch/gikaufmann/data_v2
+# Single file (to scratch)
+scp ~/Desktop/<FILE> gikaufmann@login.euler.ethz.ch:/cluster/scratch/gikaufmann/<PATH>
 
-# Euler → GCS (push full dataset)
-gsutil -m rsync -r /cluster/scratch/gikaufmann/data_v2 \
-  gs://protected-areas/data
+# Single file (to home repo)
+scp ~/Desktop/<FILE> gikaufmann@euler.ethz.ch:~/master_thesis/<PATH>
 
-# Euler → GCS (push outputs)
-gsutil -m rsync -r /cluster/scratch/gikaufmann/outputs \
-  gs://protected-areas/data/outputs
+# Whole folder
+scp -r ~/Desktop/<FOLDER> gikaufmann@login.euler.ethz.ch:/cluster/scratch/gikaufmann/<PATH>
+```
 
-# Euler → GCS (push txt/json summaries)
+### 3. GCS → Euler
+
+```bash
+# Single file
+gsutil cp gs://protected-areas/<PATH> /cluster/scratch/gikaufmann/<PATH>
+
+# Whole folder
+gsutil -m cp -r gs://protected-areas/<FOLDER> /cluster/scratch/gikaufmann/<PATH>
+
+# Mirror a directory (skip already-synced files)
+gsutil -m rsync -r gs://protected-areas/data /cluster/scratch/gikaufmann/data_v2
+```
+
+### 4. Euler → GCS
+
+```bash
+# Single file
+gsutil cp /cluster/scratch/gikaufmann/<PATH> gs://protected-areas/<PATH>
+
+# Mirror scratch outputs
+gsutil -m rsync -r /cluster/scratch/gikaufmann/outputs gs://protected-areas/data/outputs
+
+# Mirror home-repo outputs (txt, json, figures)
 cd ~/master_thesis
-gsutil -m rsync -r outputs \
-  gs://protected-areas/outputs
-
-#For single files
-gsutil cp outputs/south_america/figures/similarity_vis_2000.png gs://protected-areas/outputs/south_america/figures/ml/
+gsutil -m rsync -r outputs gs://protected-areas/outputs
 ```
 
-### Job troubleshooting
+### 5. GCS → Desktop
+
+```bash
+# Single file
+gsutil cp gs://protected-areas/<PATH> ~/Desktop/
+
+# Whole folder
+gsutil -m cp -r gs://protected-areas/<FOLDER> ~/Desktop/
+```
+
+### 6. Desktop → GCS
+
+```bash
+# Single file
+gsutil cp ~/Desktop/<FILE> gs://protected-areas/<PATH>
+
+# Whole folder
+gsutil -m cp -r ~/Desktop/<FOLDER> gs://protected-areas/<PATH>
+```
+
+---
+
+### Job Troubleshooting
 
 ```bash
 # Find the log files for successful and failed runs
@@ -71,6 +118,7 @@ ls -lt $SCRATCH/logs | head
 less $SCRATCH/logs/<LOGFILE>.out
 # Inspect the .err file
 less $SCRATCH/logs/<LOGFILE>.err
+```
 
 ### Check Files & Folders on Euler
 

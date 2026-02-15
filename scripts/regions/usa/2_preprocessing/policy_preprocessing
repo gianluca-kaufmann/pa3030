@@ -205,8 +205,13 @@ def load_natural_earth() -> gpd.GeoDataFrame:
         gdf = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres"))
         print(f"  Loaded low-res shapefile: {len(gdf)} features")
 
+    # IMPORTANT: Use ADM0_A3 (country-level) before GU_A3 (map-unit level).
+    # In ne_10m_admin_0_map_units, GU_A3 uses sub-national codes ("US1", "USG",
+    # "HWI", etc.) while ADM0_A3 always uses the 3-letter country code ("USA").
+    # Checking GU_A3 first caused the USA filter to return empty, producing
+    # all-NaN policy rasters.
     iso3_col = None
-    for candidate in ["GU_A3", "ADM0_A3", "ISO_A3", "iso_a3"]:
+    for candidate in ["ADM0_A3", "ISO_A3", "GU_A3", "iso_a3"]:
         if candidate in gdf.columns:
             iso3_col = candidate
             break
@@ -215,6 +220,13 @@ def load_natural_earth() -> gpd.GeoDataFrame:
     print(f"  Using ISO3 column: {iso3_col}")
 
     gdf_usa = gdf[gdf[iso3_col].isin(USA_TERRITORIES)].copy()
+    if gdf_usa.empty:
+        raise ValueError(
+            f"No features found for USA_TERRITORIES={USA_TERRITORIES} "
+            f"in column '{iso3_col}'.\n"
+            f"  Unique values (sample): {sorted(gdf[iso3_col].unique())[:20]}\n"
+            f"  Try a different ISO3 column or update USA_TERRITORIES."
+        )
     gdf_usa = gdf_usa[[iso3_col, "geometry"]].rename(columns={iso3_col: "iso3"})
     print(f"  USA territories found: {sorted(gdf_usa['iso3'].unique())}")
 

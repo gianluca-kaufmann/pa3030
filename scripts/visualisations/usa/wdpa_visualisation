@@ -1,0 +1,340 @@
+#!/usr/bin/env python3
+"""
+WDPA protected-area coverage visualisation for the USA (2000-2024).
+
+Inputs:
+    - Yearly GeoTIFFs in ``data/usa/ready/WDPA``, named
+      ``WDPA_USA_1km_<year>.tif`` for years 2000-2024.
+      Binary rasters: 1 = protected, 0 = not protected.
+
+Process:
+    - Loads annual WDPA rasters, computes coverage statistics, and
+      generates overview maps, temporal trends, and change detection.
+
+Outputs:
+    - PNG figures saved to ``outputs/usa/figures/WDPA_vis``.
+"""
+
+import warnings
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import rasterio
+
+warnings.filterwarnings("ignore")
+
+# Paths
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+WDPA_DIR = PROJECT_ROOT / "data" / "usa" / "ready" / "WDPA"
+OUTPUT_DIR = PROJECT_ROOT / "outputs" / "usa" / "figures" / "WDPA_vis"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+YEARS = list(range(2000, 2025))
+PA_COLOR = "#2ca02c"
+NON_PA_COLOR = "#d9d9d9"
+
+
+def load_wdpa_data():
+    """Load all available WDPA yearly rasters."""
+    print("Loading WDPA protected-area data...")
+    all_data = {}
+
+    for year in YEARS:
+        path = WDPA_DIR / f"WDPA_USA_1km_{year}.tif"
+        if not path.exists():
+            print(f"  Warning: {path.name} not found")
+            continue
+
+        with rasterio.open(path) as src:
+            data = src.read(1)
+            transform = src.transform
+
+        pa_pixels = int((data == 1).sum())
+        total_pixels = int(data.size)
+        pct = 100 * pa_pixels / total_pixels if total_pixels > 0 else 0
+        print(f"  {year}: shape={data.shape}, "
+              f"protected={pa_pixels:,} ({pct:.2f}%)")
+        all_data[year] = data
+
+    if not all_data:
+        print("  No data loaded.")
+        return None, None
+
+    # Return transform from last loaded file for plotting
+    return all_data, transform
+
+
+def plot_overview_maps(all_data):
+    """Create overview maps for selected years."""
+    print("Creating overview maps...")
+
+    # Pick a representative subset of years
+    available = sorted(all_data.keys())
+    if len(available) <= 6:
+        selected = available
+    else:
+        # First, last, and evenly spaced years in between
+        selected = [available[0]]
+        step = max(1, (len(available) - 1) // 4)
+        for i in range(step, len(available) - 1, step):
+            selected.append(available[i])
+        selected.append(available[-1])
+        selected = sorted(set(selected))
+
+    ncols = min(3, len(selected))
+    nrows = (len(selected) + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 7, nrows * 5))
+    fig.suptitle("WDPA Protected Areas — USA",
+                 fontsize=16, fontweight="bold", y=1.01)
+
+    if nrows * ncols == 1:
+        axes = np.array([axes])
+    axes_flat = axes.flatten() if hasattr(axes, "flatten") else [axes]
+
+    from matplotlib.colors import ListedColormap
+    pa_cmap = ListedColormap([NON_PA_COLOR, PA_COLOR])
+
+    for idx, ax in enumerate(axes_flat):
+        if idx >= len(selected):
+            ax.set_visible(False)
+            continue
+
+        year = selected[idx]
+        data = all_data[year]
+        pa_count = int((data == 1).sum())
+        total = data.size
+        pct = 100 * pa_count / total
+
+        ax.imshow(data, cmap=pa_cmap, vmin=0, vmax=1,
+                  interpolation="nearest")
+        ax.set_title(f"{year}\n{pa_count:,} pixels ({pct:.2f}%)",
+                     fontsize=11, fontweight="bold")
+        ax.set_axis_off()
+
+    plt.tight_layout()
+    out = OUTPUT_DIR / "wdpa_usa_overview_grid.png"
+    fig.savefig(out, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out.name}")
+
+
+def plot_single_year_map(all_data):
+    """Plot a detailed map of the most recent year."""
+    print("Creating detailed latest-year map...")
+
+    latest_year = max(all_data.keys())
+    data = all_data[latest_year]
+
+    from matplotlib.colors import ListedColormap
+    pa_cmap = ListedColormap([NON_PA_COLOR, PA_COLOR])
+
+    pa_count = int((data == 1).sum())
+    total = data.size
+    pct = 100 * pa_count / total
+
+    fig, ax = plt.subplots(figsize=(14, 8))
+    im = ax.imshow(data, cmap=pa_cmap, vmin=0, vmax=1,
+                   interpolation="nearest")
+    ax.set_title(f"WDPA Protected Areas — USA ({latest_year})",
+                 fontsize=14, fontweight="bold")
+    ax.set_axis_off()
+
+    stats_text = (f"Protected: {pa_count:,} pixels ({pct:.2f}%)\n"
+                  f"Unprotected: {total - pa_count:,} pixels")
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
+            fontsize=11, verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+
+    # Legend
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor=PA_COLOR, label="Protected"),
+        Patch(facecolor=NON_PA_COLOR, edgecolor="grey", label="Not protected"),
+    ]
+    ax.legend(handles=legend_elements, loc="lower right", fontsize=10,
+              framealpha=0.9)
+
+    plt.tight_layout()
+    out = OUTPUT_DIR / f"wdpa_usa_{latest_year}_detail.png"
+    fig.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out.name}")
+
+
+def plot_temporal_trend(all_data):
+    """Plot the growth of protected-area coverage over time."""
+    if len(all_data) < 2:
+        return
+
+    print("Creating temporal trend plot...")
+    years = sorted(all_data.keys())
+    pa_counts = []
+    pa_pcts = []
+
+    for year in years:
+        data = all_data[year]
+        pa = int((data == 1).sum())
+        total = data.size
+        pa_counts.append(pa)
+        pa_pcts.append(100 * pa / total)
+
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+    color_count = "#2ca02c"
+    color_pct = "#1f77b4"
+
+    ax1.set_xlabel("Year", fontsize=12)
+    ax1.set_ylabel("Protected pixels", fontsize=12, color=color_count)
+    ax1.plot(years, pa_counts, color=color_count, linewidth=2.5,
+             marker="o", markersize=5, label="Protected pixels")
+    ax1.tick_params(axis="y", labelcolor=color_count)
+    ax1.yaxis.set_major_formatter(
+        plt.FuncFormatter(lambda x, _: f"{x:,.0f}"))
+
+    ax2 = ax1.twinx()
+    ax2.set_ylabel("Coverage (%)", fontsize=12, color=color_pct)
+    ax2.plot(years, pa_pcts, color=color_pct, linewidth=2.5,
+             marker="s", markersize=5, linestyle="--", label="Coverage %")
+    ax2.tick_params(axis="y", labelcolor=color_pct)
+
+    # Add 30% target line
+    ax2.axhline(y=30, color="red", linestyle=":", linewidth=1.5,
+                alpha=0.7, label="30×30 target (30%)")
+
+    # Combined legend
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left",
+               fontsize=10, framealpha=0.9)
+
+    ax1.set_title("WDPA Protected-Area Growth — USA (2000–2024)",
+                  fontsize=14, fontweight="bold")
+    ax1.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    out = OUTPUT_DIR / "wdpa_usa_temporal_trend.png"
+    fig.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out.name}")
+
+
+def plot_change_detection(all_data):
+    """Compare first and last year; highlight newly protected pixels."""
+    if len(all_data) < 2:
+        return
+
+    print("Creating change detection map...")
+    first_yr = min(all_data)
+    last_yr = max(all_data)
+    first = all_data[first_yr]
+    last = all_data[last_yr]
+
+    # 0 = never protected, 1 = already protected, 2 = newly protected
+    change = np.zeros_like(first, dtype=np.int8)
+    change[(first == 1) & (last == 1)] = 1   # persistent
+    change[(first == 0) & (last == 1)] = 2   # newly designated
+    # Note: degazettement (first==1, last==0) is rare but possible
+
+    persistent = int((change == 1).sum())
+    newly = int((change == 2).sum())
+    lost = int(((first == 1) & (last == 0)).sum())
+
+    from matplotlib.colors import ListedColormap
+    from matplotlib.patches import Patch
+    change_cmap = ListedColormap(["#f0f0f0", "#2ca02c", "#ff7f0e"])
+
+    fig, ax = plt.subplots(figsize=(14, 8))
+    ax.imshow(change, cmap=change_cmap, vmin=0, vmax=2,
+              interpolation="nearest")
+    ax.set_title(f"PA Change Detection ({first_yr} → {last_yr}) — USA",
+                 fontsize=14, fontweight="bold")
+    ax.set_axis_off()
+
+    legend_elements = [
+        Patch(facecolor="#f0f0f0", edgecolor="grey", label="Never protected"),
+        Patch(facecolor="#2ca02c", label=f"Already protected ({persistent:,})"),
+        Patch(facecolor="#ff7f0e", label=f"Newly designated ({newly:,})"),
+    ]
+    if lost > 0:
+        legend_elements.append(
+            Patch(facecolor="#d62728", label=f"Degazetted ({lost:,})")
+        )
+    ax.legend(handles=legend_elements, loc="lower right", fontsize=10,
+              framealpha=0.9)
+
+    stats_text = (f"Persistent: {persistent:,}\n"
+                  f"Newly designated: {newly:,}\n"
+                  f"Lost: {lost:,}")
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
+            fontsize=11, verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+
+    plt.tight_layout()
+    out = OUTPUT_DIR / f"wdpa_usa_change_{first_yr}_{last_yr}.png"
+    fig.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out.name}")
+
+
+def plot_annual_new_designations(all_data):
+    """Bar chart of newly designated pixels per year."""
+    if len(all_data) < 2:
+        return
+
+    print("Creating annual new-designations bar chart...")
+    years = sorted(all_data.keys())
+    new_per_year = []
+
+    for i in range(1, len(years)):
+        prev = all_data[years[i - 1]]
+        curr = all_data[years[i]]
+        newly = int(((prev == 0) & (curr == 1)).sum())
+        new_per_year.append((years[i], newly))
+
+    yr_labels = [str(y) for y, _ in new_per_year]
+    counts = [c for _, c in new_per_year]
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    bars = ax.bar(yr_labels, counts, color=PA_COLOR, edgecolor="white",
+                  linewidth=0.5)
+    ax.set_title("Annual Newly Designated PA Pixels — USA",
+                 fontsize=14, fontweight="bold")
+    ax.set_xlabel("Year", fontsize=12)
+    ax.set_ylabel("Newly protected pixels", fontsize=12)
+    ax.yaxis.set_major_formatter(
+        plt.FuncFormatter(lambda x, _: f"{x:,.0f}"))
+
+    # Rotate x-labels
+    plt.xticks(rotation=45, ha="right")
+    ax.grid(axis="y", alpha=0.3)
+
+    plt.tight_layout()
+    out = OUTPUT_DIR / "wdpa_usa_annual_new_designations.png"
+    fig.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out.name}")
+
+
+def main():
+    print("WDPA Protected Areas Visualisation — USA")
+    print("=" * 60)
+    print(f"Input directory: {WDPA_DIR}")
+    print(f"Output directory: {OUTPUT_DIR}")
+    print()
+
+    all_data, transform = load_wdpa_data()
+    if all_data is None:
+        print("No data. Exiting.")
+        return
+
+    plot_overview_maps(all_data)
+    plot_single_year_map(all_data)
+    plot_temporal_trend(all_data)
+    plot_change_detection(all_data)
+    plot_annual_new_designations(all_data)
+
+    print("\nWDPA visualisation complete!")
+
+
+if __name__ == "__main__":
+    main()
