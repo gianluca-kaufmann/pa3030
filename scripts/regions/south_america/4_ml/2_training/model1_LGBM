@@ -61,7 +61,7 @@ TARGET_COL = "transition_01_win5"  # 5-year lookahead target
 LOOKAHEAD_YEARS = 5  # Number of years ahead for prediction
 WDPA_LAST_YEAR = 2024  # Last year with WDPA data
 LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS  # Last year we can reliably label (2019)
-TRAIN_YEARS = (2000, 2016)   # Train: 2000-2016 (matches modelC main split)
+TRAIN_YEARS = (2001, 2016)   # Train: 2001-2016 (excludes 2000 — stock PAs, not true transitions)
 EARLYSTOP_YEARS = (2014, min(2016, LAST_LABEL_YEAR))     # Earlystop: 2014-2016 (matches modelC main split)
 TEST_START = 2017
 TEST_END = 2019
@@ -74,9 +74,9 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "200000"))
 # Temporal Cross-Validation Folds
 # Matches modelC CV folds exactly (scale-up only)
 CV_FOLDS = [
-    ((2000, 2008), (2009, min(2011, LAST_LABEL_YEAR))),  # Fold 1: Train 2000-2008 → Earlystop 2009-2011
-    ((2000, 2011), (2012, min(2013, LAST_LABEL_YEAR))),  # Fold 2: Train 2000-2011 → Earlystop 2012-2013
-    ((2000, 2013), (2014, min(2016, LAST_LABEL_YEAR))),  # Fold 3: Train 2000-2013 → Earlystop 2014-2016
+    ((2001, 2008), (2009, min(2011, LAST_LABEL_YEAR))),  # Fold 1: Train 2001-2008 → Earlystop 2009-2011
+    ((2001, 2011), (2012, min(2013, LAST_LABEL_YEAR))),  # Fold 2: Train 2001-2011 → Earlystop 2012-2013
+    ((2001, 2013), (2014, min(2016, LAST_LABEL_YEAR))),  # Fold 3: Train 2001-2013 → Earlystop 2014-2016
 ]
 
 # Utility Functions
@@ -479,7 +479,7 @@ def load_numpy_arrays_two_pass(
     return X, y, years_array, pos, neg, years
 
 
-def compute_year_weights(years: np.ndarray, min_year: int = 2000, max_year: int = 2014, 
+def compute_year_weights(years: np.ndarray, min_year: int = 2001, max_year: int = 2014, 
                          min_weight: float = 0.5, max_weight: float = 1.0) -> np.ndarray:
     """
     Compute sample weights based on year.
@@ -768,9 +768,9 @@ def train_single_cv_fold(
     print(f"  NOTE: Earlystop used ONLY for early stopping, NOT for metric reporting.")
     
     # Compute sample weights for training data (time-based weighting)
-    # Weight range: 2000 (weight 0.5) to train_years[1] (weight 1.0)
+    # Weight range: 2001 (weight 0.5) to train_years[1] (weight 1.0)
     if use_time_weights:
-        train_weights = compute_year_weights(train_years_array, min_year=2000, max_year=train_years[1])
+        train_weights = compute_year_weights(train_years_array, min_year=2001, max_year=train_years[1])
         print(f"  Training sample weights: min={train_weights.min():.3f}, max={train_weights.max():.3f}, mean={train_weights.mean():.3f}")
     else:
         train_weights = None
@@ -1172,9 +1172,9 @@ def phase1_training(
     print(f"Final training: no earlystop/val; num_boost_round fixed from CV to avoid leakage.")
     
     # Compute sample weights for training data (time-based weighting)
-    # Weight range: 2000 (weight 0.5) to EARLYSTOP_YEARS[1] (weight 1.0)
+    # Weight range: 2001 (weight 0.5) to EARLYSTOP_YEARS[1] (weight 1.0)
     if use_time_weights:
-        train_weights = compute_year_weights(train_years_array_full, min_year=2000, max_year=EARLYSTOP_YEARS[1])
+        train_weights = compute_year_weights(train_years_array_full, min_year=2001, max_year=EARLYSTOP_YEARS[1])
         print(f"  Training sample weights: min={train_weights.min():.3f}, max={train_weights.max():.3f}, mean={train_weights.mean():.3f}")
     else:
         train_weights = None
@@ -1299,7 +1299,7 @@ def phase2_testing(
     report_memory_usage("start of Phase 2")
     
     # Check for year overlap between training and test
-    final_train_years = (TRAIN_YEARS[0], EARLYSTOP_YEARS[1])  # Full training period: 2000-2017
+    final_train_years = (TRAIN_YEARS[0], EARLYSTOP_YEARS[1])  # Full training period: 2001-2016
     test_year_range = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))
     
     if check_year_overlap(final_train_years, test_year_range, "Test"):
