@@ -6,10 +6,51 @@ PA3030 is a large-scale, reproducible machine learning pipeline that predicts th
 
 The core question: **"Given historical patterns of protected-area establishment, which locations are most likely to be designated as protected areas in the future?"**
 
+## Policy Context: The 30x30 Target
+
+The Kunming-Montreal Global Biodiversity Framework (COP15, December 2022) commits
+nearly 200 countries to protect 30% of land and ocean by 2030. Currently ~17% of
+land is protected, meaning countries must roughly double PA coverage in under 5 years.
+
+This model directly addresses: **"Where will that doubling happen?"**
+
+Three policy-relevant angles:
+
+1. **Predicting the expansion path.** Governments face pressure to designate fast.
+   This model forecasts which land will be designated based on historical patterns —
+   useful for land-use planners, investors, and indigenous communities anticipating
+   changes.
+2. **Exposing the representation gap.** If expansion follows historical patterns
+   (cheap, remote land), 30% coverage does not mean 30% of biodiversity is covered.
+   Some biomes (tropical dry forests, grasslands, wetlands) may remain systematically
+   underprotected. The gap between predicted designations and biodiversity priority
+   maps is a finding in itself.
+3. **Transition risk.** Landowners and investors holding agricultural or mining
+   concessions can assess the probability their land gets designated. With 30x30
+   creating political urgency, designation rates may be accelerating.
+
+### Why Carbon Stocks Are Relevant
+
+Carbon stocks influence PA designation through financial incentives:
+
+- **REDD+** pays countries to keep forests standing. Designating carbon-rich forests
+  as PAs generates international payments or carbon credits, making it profitable.
+- **Voluntary carbon markets** let companies buy offsets tied to "avoided
+  deforestation" in protected areas, creating incentives to protect high-carbon forests
+  specifically.
+- **Paris Agreement NDCs** — many South American countries included forest
+  conservation in climate pledges. Protecting high-carbon-stock areas counts toward
+  both climate and biodiversity targets simultaneously.
+
+A pixel with 200 tonnes/ha of biomass is more likely to become a PA than an equally
+biodiverse grassland with 20 tonnes/ha — because the forest has carbon market value.
+The current model cannot distinguish these because it has no carbon data.
+
 ## Use Cases
 
-- Conservation planning and prioritization
+- Forecasting PA expansion under the 30x30 biodiversity target
 - Transition-risk analysis for investors and policymakers
+- Identifying the gap between where protection goes vs. where it's most needed
 - Academic research on land-use change and environmental policy
 
 ## Pipeline Architecture
@@ -102,6 +143,44 @@ performance holds across geographies or is driven by specific areas.
 - Probability maps (continuous predictions across the continent)
 - LaTeX metrics tables (paper-ready)
 - SHAP feature importance plots (optional)
+
+## Important Scope Limitation: Prediction vs. Prescription
+
+This model predicts **where governments WILL designate** protected areas based on
+historical patterns — NOT **where they SHOULD designate** them for maximum
+conservation impact. These are different questions:
+
+- **This model (descriptive):** Learns that governments protect cheap, remote,
+  biodiverse land near existing PAs — because that's what they've historically done.
+- **Conservation optimization (prescriptive):** Would maximize biodiversity
+  protected per dollar, accounting for threat, connectivity, and irreplaceability.
+
+The model implicitly learns the biases of past decisions (e.g., protecting "easy"
+land rather than the most ecologically critical land). This is a feature, not a bug —
+for transition-risk analysis (investors, policymakers) you want to know what WILL
+happen. But for conservation planning, the gap between "where protection goes" and
+"where it's most needed" is itself a finding worth discussing in the paper.
+
+## Potentially Missing Variables
+
+Features that could improve predictive power but are not currently included:
+
+- **Land tenure / ownership** — Public land is far easier to designate than private.
+  Source: national cadastral data
+- **Indigenous territories** — Many new PAs overlap indigenous lands (political path
+  of least resistance). Source: RAISG, LandMark
+- **Carbon stocks** — REDD+ and carbon markets increasingly drive designation.
+  Source: ESA CCI Biomass, GlobBiomass
+- **Species richness / endemism** — Direct conservation value, more targeted than
+  the GSN biodiversity proxy. Source: IUCN Red List, GBIF
+- **PA network connectivity** — Corridor gaps between existing PAs are high-priority
+  targets. Source: derived from WDPA network analysis
+- **Land economic value** — Agricultural rent, mining concessions; high-value land
+  resists protection. Source: FAO, national data
+- **International commitments** — 30x30 pledge creates political pressure to
+  designate. Source: CBD national pledges
+- **NGO presence / funding** — Areas with active conservation organizations get
+  designated faster. Source: IUCN, WCS, WWF activity data
 
 ## Improvement Priorities
 

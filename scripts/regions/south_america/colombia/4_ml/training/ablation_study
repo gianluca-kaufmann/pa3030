@@ -1,0 +1,584 @@
+#!/usr/bin/env python3
+"""Feature Group Ablation Study for Colombia LightGBM Model
+
+Purpose: Systematically remove feature groups one at a time and measure the impact
+         on model performance. This reveals which feature groups genuinely drive
+         predictive power vs. which are redundant.
+
+Method:  For each feature group:
+         1. Remove all features in that group from the feature set
+         2. Train LightGBM with the same hyperparameters on the reduced feature set
+         3. Evaluate on the test set (ROC-AUC, PR-AUC, Precision@1/5/10%)
+         4. Compare to the full-model baseline
+
+Output:  - ablation_results_{timestamp}.csv   (metrics per ablation)
+         - ablation_results_{timestamp}.json   (full results with metadata)
+         - ablation_summary_{timestamp}.txt    (human-readable summary)
+
+Usage:   python ablation_study --split-version main
+         python ablation_study --split-version robustness
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import os
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import lightgbm as lgb
+from sklearn.metrics import roc_auc_score, average_precision_score
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+RANDOM_STATE = 42
+TARGET_COL = "transition_01_win5"
+LOOKAHEAD_YEARS = 5
+WDPA_LAST_YEAR = 2024
+LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS  # 2019
+
+EXCLUDE_COLS = {
+    'transition_01', 'transition_01_win5', 'WDPA_b1', 'WDPA_prev',
+    'x', 'y', 'row', 'col', 'year'
+}
+
+FIXED_PARAMS = {
+    'random_state': RANDOM_STATE,
+    'boosting_type': 'gbdt',
+    'objective': 'binary',
+    'verbose': -1
+}
+
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "200000"))
+
+# Split configurations (same as modelC_LGBM)
+SPLIT_CONFIGS = {
+    'main': {
+        'train_years': (2000, 2013),
+        'earlystop_years': (2014, min(2016, LAST_LABEL_YEAR)),
+        'test_start': 2017,
+        'test_end': 2019,
+    },
+    'robustness': {
+        'train_years': (2000, 2012),
+        'earlystop_years': (2013, min(2015, LAST_LABEL_YEAR)),
+        'test_start': 2016,
+        'test_end': 2019,
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Feature groups for ablation
+# Each group maps a descriptive name to a list of column name prefixes.
+# All columns starting with any of these prefixes will be removed together.
+# ---------------------------------------------------------------------------
+
+FEATURE_GROUPS = {
+    "GSN (biodiversity)": ["GSN_"],
+    "WorldClim (climate)": ["WorldClim_"],
+    "Distance features": ["dist_wdpa", "dist_road", "dist_oil_gas", "dist_powerplant"],
+    "Spatial smoothing (all)": ["_smooth"],  # special: matched as suffix
+    "NDVI (vegetation)": ["NDVI_"],
+    "Population (GPW)": ["GPW_"],
+    "Nighttime lights (HNTL)": ["HNTL_"],
+    "Deforestation": ["deforestation_"],
+    "Elevation & slope": ["elevation_"],
+    "Land cover": ["landcover_"],
+    "Wildfire": ["wildfire_"],
+    "Oil/gas & power plants": ["dist_oil_gas", "dist_powerplant"],
+}
+
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+def get_n_jobs() -> int:
+    """Get number of CPUs."""
+    slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+    if slurm_cpus:
+        try:
+            return int(slurm_cpus)
+        except ValueError:
+            pass
+    return -1
+
+
+def get_repo_root() -> Path:
+    return Path(__file__).resolve().parents[4]
+
+
+def resolve_parquet_file(filename: str, split_version: str) -> Path:
+    """Locate parquet file (prefer $SCRATCH if present)."""
+    repo_root = get_repo_root()
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    candidates = []
+    if scratch_root is not None:
+        candidates.append(scratch_root / f"outputs/south_america/colombia/results/{split_version}/{filename}")
+        candidates.append(scratch_root / f"outputs/south_america/colombia/results/{filename}")
+        candidates.append(scratch_root / f"data/south_america/colombia/ml/{split_version}/{filename}")
+    candidates.append(repo_root / f"outputs/south_america/colombia/results/{split_version}/{filename}")
+    candidates.append(repo_root / f"outputs/south_america/colombia/results/{filename}")
+    candidates.append(repo_root / f"data/south_america/colombia/ml/{split_version}/{filename}")
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    error_msg = f"{filename} not found for split '{split_version}'.\nChecked:\n"
+    for cand in candidates:
+        error_msg += f"  - {cand}\n"
+    raise FileNotFoundError(error_msg)
+
+
+def load_best_params() -> Dict[str, Any]:
+    """Load best hyperparameters from JSON."""
+    script_dir = Path(__file__).resolve().parent
+    for name in ["lgbm_best_params_main.json", "lgbm_best_params.json"]:
+        path = script_dir / name
+        if path.exists():
+            with open(path, 'r') as f:
+                data = json.load(f)
+            if 'best_params' in data:
+                return {**FIXED_PARAMS, **data.get('fixed_params', {}), **data['best_params']}
+            return {**FIXED_PARAMS, **data}
+    # Fallback defaults
+    return {**FIXED_PARAMS, "max_depth": 8, "num_leaves": 255, "min_child_samples": 50,
+            "learning_rate": 0.03, "n_estimators": 3000}
+
+
+def compute_precision_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) -> float:
+    """Compute precision at top k% of predictions."""
+    n_top_k = max(1, int(len(y_true) * k / 100))
+    top_k_idx = np.argpartition(y_proba, -n_top_k)[-n_top_k:]
+    return float(y_true[top_k_idx].sum() / n_top_k)
+
+
+def compute_time_weights(years: np.ndarray, min_year: int, max_year: int) -> np.ndarray:
+    """Compute temporal weights: older years weighted less (0.5 → 1.0 linear)."""
+    if min_year == max_year:
+        return np.ones(len(years), dtype=np.float32)
+    weights = 0.5 + 0.5 * (years - min_year) / (max_year - min_year)
+    return weights.astype(np.float32)
+
+
+def columns_to_remove(all_feature_cols: List[str], group_name: str, prefixes: List[str]) -> List[str]:
+    """Determine which columns to remove for a given feature group."""
+    to_remove = []
+    for col in all_feature_cols:
+        for prefix in prefixes:
+            if group_name == "Spatial smoothing (all)":
+                # Special case: match suffix "_smooth" anywhere in column name
+                if "_smooth" in col:
+                    to_remove.append(col)
+                    break
+            else:
+                if col.startswith(prefix):
+                    to_remove.append(col)
+                    break
+    return list(set(to_remove))
+
+
+def convert_numpy_types(obj: Any) -> Any:
+    """Recursively convert NumPy types to native Python for JSON."""
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    elif isinstance(obj, (np.floating,)):
+        return float(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: convert_numpy_types(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_numpy_types(i) for i in obj]
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+
+def load_data(
+    df_path: Path,
+    feature_cols: List[str],
+    year_range: Optional[tuple] = None,
+    name: str = ""
+) -> tuple:
+    """Load features, target, and years from parquet file.
+
+    Returns: X (float32), y (int8), years (int32), n_pos, n_neg
+    """
+    year_str = f" (years {year_range[0]}-{year_range[1]})" if year_range else ""
+    print(f"  Loading {name}{year_str}...")
+    load_start = time.time()
+
+    essential_cols = feature_cols + [TARGET_COL, 'year', 'WDPA_prev']
+    available_cols = set(pq.read_schema(df_path).names)
+    essential_cols = [c for c in essential_cols if c in available_cols]
+
+    # Pass 1: count rows
+    parquet_file = pq.ParquetFile(df_path)
+    n_samples = 0
+    for batch in parquet_file.iter_batches(batch_size=BATCH_SIZE, columns=essential_cols):
+        table = pa.Table.from_batches([batch])
+        df_batch = table.to_pandas()
+        mask = df_batch[TARGET_COL].notna() & (df_batch['WDPA_prev'] == 0)
+        if year_range:
+            mask &= (df_batch['year'] >= year_range[0]) & (df_batch['year'] <= year_range[1])
+        n_samples += mask.sum()
+    del parquet_file
+
+    # Pass 2: fill arrays
+    X = np.empty((n_samples, len(feature_cols)), dtype=np.float32)
+    y = np.empty(n_samples, dtype=np.int8)
+    years = np.empty(n_samples, dtype=np.int32)
+    offset = 0
+
+    parquet_file = pq.ParquetFile(df_path)
+    for batch in parquet_file.iter_batches(batch_size=BATCH_SIZE, columns=essential_cols):
+        table = pa.Table.from_batches([batch])
+        df_batch = table.to_pandas()
+        mask = df_batch[TARGET_COL].notna() & (df_batch['WDPA_prev'] == 0)
+        if year_range:
+            mask &= (df_batch['year'] >= year_range[0]) & (df_batch['year'] <= year_range[1])
+        df_filtered = df_batch[mask]
+        n = len(df_filtered)
+        if n == 0:
+            continue
+        # Only use features that exist in the data
+        valid_features = [c for c in feature_cols if c in df_filtered.columns]
+        batch_X = df_filtered[valid_features].values.astype(np.float32)
+        # Pad with zeros for missing columns
+        if len(valid_features) < len(feature_cols):
+            full_batch = np.zeros((n, len(feature_cols)), dtype=np.float32)
+            col_idx = [feature_cols.index(c) for c in valid_features]
+            full_batch[:, col_idx] = batch_X
+            batch_X = full_batch
+        X[offset:offset + n] = batch_X
+        y[offset:offset + n] = df_filtered[TARGET_COL].values.astype(np.int8)
+        years[offset:offset + n] = df_filtered['year'].values.astype(np.int32)
+        offset += n
+    del parquet_file
+
+    X = X[:offset]
+    y = y[:offset]
+    years = years[:offset]
+
+    n_pos = int((y == 1).sum())
+    n_neg = int((y == 0).sum())
+    elapsed = time.time() - load_start
+    print(f"    Loaded {offset:,} rows ({n_pos:,} pos, {n_neg:,} neg) in {elapsed:.1f}s")
+    gc.collect()
+    return X, y, years, n_pos, n_neg
+
+
+# ---------------------------------------------------------------------------
+# Single ablation run
+# ---------------------------------------------------------------------------
+
+def run_single_ablation(
+    train_path: Path,
+    test_path: Path,
+    all_feature_cols: List[str],
+    removed_group: Optional[str],
+    removed_cols: List[str],
+    best_params: Dict[str, Any],
+    split_config: Dict,
+) -> Dict[str, Any]:
+    """Train and evaluate a single ablation variant.
+
+    Args:
+        removed_group: Name of removed feature group (None = full model baseline)
+        removed_cols: List of column names to exclude
+    """
+    label = removed_group or "FULL MODEL (baseline)"
+    print(f"\n{'='*70}")
+    print(f"  Ablation: {label}")
+
+    # Determine feature set for this ablation
+    feature_cols = [c for c in all_feature_cols if c not in removed_cols]
+    n_removed = len(all_feature_cols) - len(feature_cols)
+    print(f"  Features: {len(feature_cols)} ({n_removed} removed)")
+    if removed_cols:
+        print(f"  Removed: {', '.join(sorted(removed_cols)[:10])}" +
+              (f" ... (+{len(removed_cols)-10} more)" if len(removed_cols) > 10 else ""))
+
+    # Load training data
+    X_train, y_train, years_train, train_pos, train_neg = load_data(
+        train_path, feature_cols,
+        year_range=split_config['train_years'],
+        name="train"
+    )
+
+    # Load earlystop data
+    X_es, y_es, _, _, _ = load_data(
+        train_path, feature_cols,
+        year_range=split_config['earlystop_years'],
+        name="earlystop"
+    )
+
+    # Compute class weight and time weights
+    scale_pos_weight = train_neg / max(train_pos, 1)
+    train_weights = compute_time_weights(
+        years_train,
+        split_config['train_years'][0],
+        split_config['train_years'][1]
+    )
+
+    # Prepare LightGBM parameters
+    train_params = {k: v for k, v in best_params.items()
+                    if k not in ('num_boost_round', 'n_estimators', 'n_jobs',
+                                 'sampling_strategy', 'replacement', 'bootstrap',
+                                 'class_weight', 'scale_pos_weight')}
+    train_params['scale_pos_weight'] = scale_pos_weight
+    train_params['is_unbalance'] = False
+    if 'num_threads' not in train_params:
+        train_params['num_threads'] = get_n_jobs()
+
+    num_boost_round = best_params.get('n_estimators', best_params.get('num_boost_round', 3000))
+
+    # Create datasets
+    train_dataset = lgb.Dataset(X_train, label=y_train, weight=train_weights, free_raw_data=True)
+    es_dataset = lgb.Dataset(X_es, label=y_es, free_raw_data=True, reference=train_dataset)
+    del X_train, y_train, years_train, train_weights, X_es, y_es
+    gc.collect()
+
+    # Train
+    print(f"  Training (up to {num_boost_round} rounds, early stop 500)...")
+    train_start = time.time()
+    model = lgb.train(
+        train_params,
+        train_dataset,
+        num_boost_round=num_boost_round,
+        valid_sets=[es_dataset],
+        valid_names=["earlystop"],
+        callbacks=[lgb.early_stopping(500), lgb.log_evaluation(200)]
+    )
+    train_time = time.time() - train_start
+    best_iter = model.best_iteration
+    print(f"  Trained in {train_time:.1f}s (best iteration: {best_iter})")
+
+    del train_dataset, es_dataset
+    gc.collect()
+
+    # Load test data
+    test_year_range = (split_config['test_start'], min(split_config['test_end'], LAST_LABEL_YEAR))
+    X_test, y_test, _, test_pos, test_neg = load_data(
+        test_path, feature_cols,
+        year_range=test_year_range,
+        name="test"
+    )
+
+    # Predict
+    y_proba = model.predict(X_test, num_iteration=best_iter)
+    del X_test
+    gc.collect()
+
+    # Compute metrics
+    roc_auc = float(roc_auc_score(y_test, y_proba))
+    pr_auc = float(average_precision_score(y_test, y_proba))
+    p_at_1 = compute_precision_at_k(y_test, y_proba, 1)
+    p_at_5 = compute_precision_at_k(y_test, y_proba, 5)
+    p_at_10 = compute_precision_at_k(y_test, y_proba, 10)
+    baseline = float(y_test.mean())
+
+    print(f"  Results: ROC-AUC={roc_auc:.4f}  PR-AUC={pr_auc:.4f}  "
+          f"P@1%={p_at_1:.4f}  P@5%={p_at_5:.4f}  P@10%={p_at_10:.4f}")
+
+    del y_test, y_proba, model
+    gc.collect()
+
+    return {
+        "group": label,
+        "n_features": len(feature_cols),
+        "n_removed": n_removed,
+        "removed_columns": sorted(removed_cols),
+        "roc_auc": roc_auc,
+        "pr_auc": pr_auc,
+        "precision_at_1pct": p_at_1,
+        "precision_at_5pct": p_at_5,
+        "precision_at_10pct": p_at_10,
+        "baseline_rate": baseline,
+        "train_pos": train_pos,
+        "train_neg": train_neg,
+        "test_pos": test_pos,
+        "test_neg": test_neg,
+        "best_iteration": best_iter,
+        "train_time_seconds": round(train_time, 1),
+        "scale_pos_weight": round(scale_pos_weight, 4),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Feature group ablation study")
+    parser.add_argument("--split-version", default="main", choices=["main", "robustness"])
+    args = parser.parse_args()
+
+    split_version = args.split_version
+    split_config = SPLIT_CONFIGS[split_version]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    print(f"{'='*70}")
+    print(f"ABLATION STUDY: Colombia LightGBM (split: {split_version})")
+    print(f"{'='*70}")
+    print(f"Train years: {split_config['train_years']}")
+    print(f"Earlystop years: {split_config['earlystop_years']}")
+    print(f"Test years: {split_config['test_start']}-{split_config['test_end']}")
+
+    # Locate data
+    train_path = resolve_parquet_file("modelC_train.parquet", split_version)
+    test_path = resolve_parquet_file("modelC_test.parquet", split_version)
+    print(f"\nTrain file: {train_path}")
+    print(f"Test file:  {test_path}")
+
+    # Discover all feature columns from the training data
+    schema = pq.read_schema(train_path)
+    all_columns = set(schema.names)
+    all_feature_cols = sorted([c for c in all_columns if c not in EXCLUDE_COLS])
+    print(f"\nTotal features available: {len(all_feature_cols)}")
+
+    # Load hyperparameters
+    best_params = load_best_params()
+    print(f"Hyperparameters loaded: {len(best_params)} params")
+
+    # Setup output directory
+    repo_root = get_repo_root()
+    output_dir = repo_root / f"outputs/south_america/colombia/results/ablation/{split_version}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # -----------------------------------------------------------------------
+    # Run ablations
+    # -----------------------------------------------------------------------
+
+    results = []
+
+    # 1. Full model baseline (no features removed)
+    baseline_result = run_single_ablation(
+        train_path, test_path, all_feature_cols,
+        removed_group=None,
+        removed_cols=[],
+        best_params=best_params,
+        split_config=split_config,
+    )
+    results.append(baseline_result)
+
+    # 2. Ablate each feature group
+    for group_name, prefixes in FEATURE_GROUPS.items():
+        removed = columns_to_remove(all_feature_cols, group_name, prefixes)
+        if not removed:
+            print(f"\n  Skipping '{group_name}' — no matching columns found")
+            continue
+
+        result = run_single_ablation(
+            train_path, test_path, all_feature_cols,
+            removed_group=group_name,
+            removed_cols=removed,
+            best_params=best_params,
+            split_config=split_config,
+        )
+        results.append(result)
+
+    # -----------------------------------------------------------------------
+    # Save results
+    # -----------------------------------------------------------------------
+
+    # CSV table
+    df_results = pd.DataFrame(results)
+
+    # Compute deltas from baseline
+    baseline_metrics = results[0]
+    for metric in ['roc_auc', 'pr_auc', 'precision_at_1pct', 'precision_at_5pct', 'precision_at_10pct']:
+        df_results[f'{metric}_delta'] = df_results[metric] - baseline_metrics[metric]
+        df_results[f'{metric}_delta_pct'] = (
+            (df_results[metric] - baseline_metrics[metric]) / baseline_metrics[metric] * 100
+        )
+
+    csv_path = output_dir / f"ablation_results_{timestamp}.csv"
+    df_results.to_csv(csv_path, index=False, float_format='%.6f')
+    print(f"\nCSV saved: {csv_path}")
+
+    # JSON with full metadata
+    json_results = {
+        "timestamp": timestamp,
+        "split_version": split_version,
+        "split_config": split_config,
+        "n_feature_groups": len(FEATURE_GROUPS),
+        "total_features": len(all_feature_cols),
+        "hyperparameters": convert_numpy_types(best_params),
+        "results": convert_numpy_types(results),
+    }
+    json_path = output_dir / f"ablation_results_{timestamp}.json"
+    with open(json_path, 'w') as f:
+        json.dump(json_results, f, indent=2, default=str)
+    print(f"JSON saved: {json_path}")
+
+    # Human-readable summary
+    summary_path = output_dir / f"ablation_summary_{timestamp}.txt"
+    with open(summary_path, 'w') as f:
+        f.write(f"ABLATION STUDY SUMMARY — Colombia LightGBM ({split_version})\n")
+        f.write(f"{'='*70}\n\n")
+        f.write(f"Baseline (full model): {baseline_metrics['n_features']} features\n")
+        f.write(f"  ROC-AUC:  {baseline_metrics['roc_auc']:.4f}\n")
+        f.write(f"  PR-AUC:   {baseline_metrics['pr_auc']:.4f}\n")
+        f.write(f"  P@1%:     {baseline_metrics['precision_at_1pct']:.4f}\n")
+        f.write(f"  P@5%:     {baseline_metrics['precision_at_5pct']:.4f}\n\n")
+
+        f.write(f"{'Group':<30} {'#Removed':>8} {'ROC-AUC':>9} {'PR-AUC':>9} "
+                f"{'P@1%':>9} {'dROC%':>8} {'dPR%':>8} {'dP@1%':>8}\n")
+        f.write(f"{'-'*105}\n")
+
+        for r in results:
+            if r['group'] == "FULL MODEL (baseline)":
+                continue
+            d_roc = (r['roc_auc'] - baseline_metrics['roc_auc']) / baseline_metrics['roc_auc'] * 100
+            d_pr = (r['pr_auc'] - baseline_metrics['pr_auc']) / baseline_metrics['pr_auc'] * 100
+            d_p1 = (r['precision_at_1pct'] - baseline_metrics['precision_at_1pct']) / baseline_metrics['precision_at_1pct'] * 100
+            f.write(f"{r['group']:<30} {r['n_removed']:>8} {r['roc_auc']:>9.4f} {r['pr_auc']:>9.4f} "
+                    f"{r['precision_at_1pct']:>9.4f} {d_roc:>+7.2f}% {d_pr:>+7.2f}% {d_p1:>+7.2f}%\n")
+
+        # Rank by impact (most damaging removal first)
+        ablation_rows = [r for r in results if r['group'] != "FULL MODEL (baseline)"]
+        ranked = sorted(ablation_rows, key=lambda r: r['pr_auc'])
+        f.write(f"\n\nFEATURE GROUPS RANKED BY IMPORTANCE (most damaging removal first):\n")
+        f.write(f"{'-'*70}\n")
+        for i, r in enumerate(ranked, 1):
+            d_pr = (r['pr_auc'] - baseline_metrics['pr_auc']) / baseline_metrics['pr_auc'] * 100
+            f.write(f"  {i:>2}. {r['group']:<30}  PR-AUC: {r['pr_auc']:.4f} ({d_pr:+.2f}%)\n")
+
+    print(f"Summary saved: {summary_path}")
+
+    # Print final ranking to console
+    print(f"\n{'='*70}")
+    print("FEATURE GROUPS RANKED BY IMPORTANCE (most damaging removal first):")
+    print(f"{'='*70}")
+    print(f"  {'Baseline':<30}  PR-AUC: {baseline_metrics['pr_auc']:.4f}")
+    print(f"  {'-'*50}")
+    ablation_rows = [r for r in results if r['group'] != "FULL MODEL (baseline)"]
+    ranked = sorted(ablation_rows, key=lambda r: r['pr_auc'])
+    for i, r in enumerate(ranked, 1):
+        d_pr = (r['pr_auc'] - baseline_metrics['pr_auc']) / baseline_metrics['pr_auc'] * 100
+        print(f"  {i:>2}. {r['group']:<30}  PR-AUC: {r['pr_auc']:.4f} ({d_pr:+.2f}%)")
+
+    print(f"\nDone! Results in: {output_dir}")
+
+
+if __name__ == "__main__":
+    main()
