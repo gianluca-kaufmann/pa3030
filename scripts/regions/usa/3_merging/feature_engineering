@@ -253,9 +253,9 @@ def compute_all_smooth_features(df: pd.DataFrame, smooth_variables: list[str] | 
     return df
 
 
-def compute_lag_feature(input_path: Path, year: int) -> pd.DataFrame:
+def compute_lag_feature(input_path: Path, year: int, wdpa_col: str = 'WDPA_b1') -> pd.DataFrame:
     """Compute WDPA_prev (1-year lag) for a given year by joining with previous year."""
-    logger.info(f"  Computing lag feature (WDPA_prev) for year {year}...")
+    logger.info(f"  Computing lag feature (WDPA_prev) for year {year} using column '{wdpa_col}'...")
     
     # Read minimal columns for current year
     df_curr = pd.read_parquet(
@@ -267,12 +267,12 @@ def compute_lag_feature(input_path: Path, year: int) -> pd.DataFrame:
     # Read minimal columns for previous year
     df_prev = pd.read_parquet(
         input_path,
-        columns=['row', 'col', 'year', 'WDPA_b1'],
+        columns=['row', 'col', 'year', wdpa_col],
         filters=[('year', '==', year - 1)]
     )
     
     # Rename for join
-    df_prev = df_prev.rename(columns={'WDPA_b1': 'WDPA_prev'})
+    df_prev = df_prev.rename(columns={wdpa_col: 'WDPA_prev'})
     df_prev = df_prev.drop(columns=['year'])
     
     # Merge on spatial coordinates
@@ -299,6 +299,7 @@ def process_year(
     smooth_lookup: pd.DataFrame,
     distance_mapping: dict[str, str] | None = None,
     smooth_time_vars: list[str] | None = None,
+    wdpa_col: str = 'WDPA_b1',
 ) -> tuple[Path | None, dict]:
     """Process a single year and return temp file path + metrics."""
     start_time = time.time()
@@ -313,7 +314,7 @@ def process_year(
     
     # Step 1: Add WDPA_prev (1-year lag)
     if not is_first_year:
-        df_lag = compute_lag_feature(input_path, year)
+        df_lag = compute_lag_feature(input_path, year, wdpa_col=wdpa_col)
         df_year = df_year.merge(df_lag, on=['row', 'col'], how='left')
         n_nan_prev = df_year['WDPA_prev'].isna().sum()
         if n_nan_prev > 0:
@@ -341,12 +342,12 @@ def process_year(
         logger.warning(f"  No rows remaining after Risk Set filter for year {year}")
         return None, {}
     
-    # Step 4: Create transition_01 = WDPA_b1 (since WDPA_prev guaranteed to be 0)
+    # Step 4: Create transition_01 = WDPA column (since WDPA_prev guaranteed to be 0)
     # Handle NaN values: treat missing WDPA status as not protected (0)
-    wdpa_values = df_year['WDPA_b1'].fillna(0)
-    n_nan = df_year['WDPA_b1'].isna().sum()
+    wdpa_values = df_year[wdpa_col].fillna(0)
+    n_nan = df_year[wdpa_col].isna().sum()
     if n_nan > 0:
-        logger.warning(f"  Found {n_nan:,} NaN values in WDPA_b1, filling with 0")
+        logger.warning(f"  Found {n_nan:,} NaN values in {wdpa_col}, filling with 0")
     df_year['transition_01'] = wdpa_values.astype(np.uint8)
     
     temp_file = temp_dir / f"year_{year}_processed.parquet"
@@ -456,13 +457,28 @@ def main() -> None:
     available_cols = set(schema.names)
     logger.info(f"Available columns in input: {sorted(available_cols)}")
     
-    required_cols = ['year', 'row', 'col', 'WDPA_b1']
+    # --- Resolve WDPA column name against actual schema ---
+    # The merge step may name the WDPA column differently depending on raster structure:
+    #   - Multi-band raster  ->  'WDPA_b1'
+    #   - Single-band raster ->  'WDPA'
+    if 'WDPA_b1' in available_cols:
+        wdpa_col = 'WDPA_b1'
+    elif 'WDPA' in available_cols:
+        wdpa_col = 'WDPA'
+        logger.info("  Column 'WDPA_b1' not found; using 'WDPA' instead")
+    else:
+        raise ValueError(
+            f"Input file is missing WDPA column (looked for 'WDPA_b1' and 'WDPA').\n"
+            f"Available columns: {schema.names}"
+        )
+    
+    required_cols = ['year', 'row', 'col', wdpa_col]
     missing_cols = [col for col in required_cols if col not in available_cols]
     if missing_cols:
         raise ValueError(
             f"Input file is missing required columns: {missing_cols}\n"
             f"Available columns: {schema.names}\n"
-            f"Expected format: merged panel data with year, row, col, and WDPA_b1 columns."
+            f"Expected format: merged panel data with year, row, col, and WDPA column."
         )
     
     # --- Resolve STATIC_SMOOTH_VARIABLES against actual schema ---
@@ -494,6 +510,14 @@ def main() -> None:
     for input_col, output_col in STATIC_DISTANCE_MAPPING.items():
         if input_col in available_cols:
             resolved_distance_mapping[input_col] = output_col
+        elif input_col.endswith('_b1'):
+            # Try base name without _b1 suffix (single-band raster naming)
+            base_name = input_col[:-3]
+            if base_name in available_cols:
+                logger.info(f"  Column '{input_col}' not found; using '{base_name}' instead for '{output_col}'")
+                resolved_distance_mapping[base_name] = output_col
+            else:
+                logger.warning(f"  Column '{input_col}' (and '{base_name}') not found in schema — skipping distance feature '{output_col}'")
         else:
             logger.warning(f"  Column '{input_col}' not found in schema — skipping distance feature '{output_col}'")
     
@@ -505,6 +529,14 @@ def main() -> None:
     for var in SMOOTH_VARIABLES:
         if var in available_cols:
             resolved_smooth_time_vars.append(var)
+        elif var.endswith('_b1'):
+            # Try base name without _b1 suffix (single-band raster naming)
+            base_name = var[:-3]
+            if base_name in available_cols:
+                logger.info(f"  Column '{var}' not found; using '{base_name}' instead")
+                resolved_smooth_time_vars.append(base_name)
+            else:
+                logger.warning(f"  Column '{var}' (and '{base_name}') not found in schema — skipping time-varying smooth for it")
         else:
             logger.warning(f"  Column '{var}' not found in schema — skipping time-varying smooth for it")
     
@@ -581,6 +613,7 @@ def main() -> None:
                 static_lookup, smooth_lookup,
                 distance_mapping=resolved_distance_mapping,
                 smooth_time_vars=resolved_smooth_time_vars,
+                wdpa_col=wdpa_col,
             )
             if temp_file is not None:
                 temp_files.append(temp_file)
