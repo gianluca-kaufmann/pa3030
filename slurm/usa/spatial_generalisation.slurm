@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=model2_RF
-#SBATCH --partition=normal.120h
-#SBATCH --time=120:00:00
+#SBATCH --job-name=spatial_gen
+#SBATCH --partition=normal.24h
+#SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/model2_RF_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/model2_RF_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/spatial_gen_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/spatial_gen_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -33,25 +33,21 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the model2_RF script
+# Run the spatial_generalisation script
 #------------------------------------------------------------------------------
-echo "Starting model2_RF script..."
+echo "Starting spatial_generalisation script..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/regions/usa/4_ml/2_training/model2_RF" ] || {
-  echo "ERROR: model2_RF not found"
-  echo "NOTE: model2_RF script is in scripts/regions/usa/4_ml/2_training/ directory"
-  find scripts -maxdepth 6 -type f -name "model2_RF"
+[ -f "scripts/regions/usa/4_ml/3_evaluation/spatial_generalisation" ] || {
+  echo "ERROR: spatial_generalisation not found"
+  echo "NOTE: spatial_generalisation script is in scripts/regions/usa/4_ml/3_evaluation/ directory"
+  find scripts -maxdepth 6 -type f -name "spatial_generalisation"
   exit 1
 }
-
-# OOM-safe configuration for large datasets (500M rows)
-export MAX_NEG_TRAIN=50000000      # Cap negative samples at 50M for training (keeps all positives)
-
 # Run the script
-python "scripts/regions/usa/4_ml/2_training/model2_RF"
+python "scripts/regions/usa/4_ml/3_evaluation/spatial_generalisation"
 
-echo "model2_RF script finished."
+echo "spatial_generalisation script finished."
