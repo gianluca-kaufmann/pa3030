@@ -121,13 +121,24 @@ def process_year(year: int, backbone_meta: dict) -> bool:
     with rasterio.open(global_file) as src:
         src_array = src.read(1).astype(np.float32)
 
+        # Mask source NoData values (e.g., -999) BEFORE reprojection to prevent
+        # bilinear interpolation from blending sentinel values with real data.
+        src_nodata = src.nodata
+        if src_nodata is not None:
+            src_array[src_array == src_nodata] = np.nan
+        else:
+            # HNTL commonly uses -999 as NoData even if not declared in metadata
+            src_array[src_array == -999.0] = np.nan
+
         reproject(
             source=src_array,
             destination=dst_array,
             src_transform=src.transform,
             src_crs=src.crs,
+            src_nodata=np.nan,
             dst_transform=backbone_meta['transform'],
             dst_crs=backbone_meta['crs'],
+            dst_nodata=np.nan,
             resampling=Resampling.bilinear,
         )
 

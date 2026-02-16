@@ -21,7 +21,18 @@ nano scripts/regions/south_america/3_merging/merge
 sbatch slurm/RUN.slurm
 squeue
 ```
+---
+### Job Troubleshooting
 
+```bash
+# Find the log files for successful and failed runs
+ls -lt $SCRATCH/logs | head
+
+# Inspect the .out file (main stdout)
+less $SCRATCH/logs/<LOGFILE>.out
+# Inspect the .err file
+less $SCRATCH/logs/<LOGFILE>.err
+```
 ---
 
 ## File Transfers
@@ -107,18 +118,6 @@ gsutil -m cp -r ~/Desktop/<FOLDER> gs://protected-areas/<PATH>
 ```
 
 ---
-
-### Job Troubleshooting
-
-```bash
-# Find the log files for successful and failed runs
-ls -lt $SCRATCH/logs | head
-
-# Inspect the .out file (main stdout)
-less $SCRATCH/logs/<LOGFILE>.out
-# Inspect the .err file
-less $SCRATCH/logs/<LOGFILE>.err
-```
 
 ### Check Files & Folders on Euler
 

@@ -80,6 +80,52 @@ STATIC_DISTANCE_MAPPING = {
 STATIC_SMOOTH_VARIABLES = ['elevation_b1', 'elevation_b2']
 STATIC_SMOOTH_SIZES = [4, 16, 64]
 
+# Known NoData sentinel values that weren't properly masked during preprocessing or merge.
+# These must be replaced with NaN BEFORE any smoothing or distance computation, because
+# uniform_filter treats sentinels as real values and contaminates spatial neighborhoods.
+#
+# Root causes:
+#   - HNTL: preprocessing doesn't pass src_nodata to reproject(), so -999 leaks through
+#   - WorldClim/powerplants: Int16 storage optimization loses NoData metadata when the
+#     scaled sentinel overflows Int16 range; unscaling (÷100) produces -327.68
+SENTINEL_RULES: dict[str, tuple[float, float]] = {
+    # column prefix -> (lower_bound, upper_bound): values in this range are sentinels
+    'HNTL':        (-1100.0, -100.0),   # source NoData = -999; valid range is 0–63
+    'WorldClim_':  (-340.0, -320.0),    # -32768 ÷ 100 ≈ -327.68; legit temps > -300 (×10)
+    'powerplants_': (-340.0, -320.0),   # same Int16 overflow pattern
+}
+
+
+def clean_sentinel_values(df: pd.DataFrame) -> pd.DataFrame:
+    """Replace known NoData sentinel values with NaN.
+
+    Some rasters have NoData sentinel values (e.g., -999 for HNTL, -32768 for Int16
+    datasets) that weren't masked during preprocessing or merge because the raster
+    metadata was missing or corrupted during dtype conversion.
+
+    This function catches them before smoothing/distance computation to prevent
+    contamination of derived features.
+    """
+    total_cleaned = 0
+    for col in df.columns:
+        for prefix, (lo, hi) in SENTINEL_RULES.items():
+            if col.startswith(prefix):
+                mask = (df[col] >= lo) & (df[col] <= hi)
+                n_sentinel = mask.sum()
+                if n_sentinel > 0:
+                    df.loc[mask, col] = np.nan
+                    total_cleaned += n_sentinel
+                    logger.warning(
+                        f"    Sentinel cleanup: {col} — {n_sentinel:,} values "
+                        f"in [{lo}, {hi}] replaced with NaN"
+                    )
+                break
+    if total_cleaned > 0:
+        logger.info(f"  Total sentinel values cleaned: {total_cleaned:,}")
+    else:
+        logger.info(f"  Sentinel check passed — no sentinel values found")
+    return df
+
 
 def reconstruct_grid(df: pd.DataFrame, value_col: str) -> Tuple[np.ndarray, int, int, int, int]:
     """Reconstruct 2D grid from panel data."""
@@ -311,6 +357,9 @@ def process_year(
     
     if n_rows_initial == 0:
         return None, {}
+    
+    # Step 0: Clean sentinel values BEFORE any spatial computation
+    df_year = clean_sentinel_values(df_year)
     
     # Step 1: Add WDPA_prev (1-year lag)
     if not is_first_year:
@@ -588,6 +637,9 @@ def main() -> None:
         )
         df_ref = df_ref[['row', 'col'] + [c for c in static_cols if c in df_ref.columns]].drop_duplicates(subset=['row', 'col'])
         logger.info(f"Using union footprint: {len(df_ref):,} unique pixels")
+    
+    # Clean sentinel values in reference data before computing static features
+    df_ref = clean_sentinel_values(df_ref)
     
     # Compute static distances once (using resolved mapping)
     static_lookup = compute_static_distance_features_once(df_ref, resolved_distance_mapping)
