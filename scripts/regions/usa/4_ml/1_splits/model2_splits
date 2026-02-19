@@ -76,9 +76,32 @@ LOOKAHEAD_YEARS = 5          # Number of years to look ahead for target
 WANDB_PROJECT = "ml-preprocessing"
 
 
+def get_repo_root() -> Path:
+    """Get repository root directory.
+
+    Checks environment variables first, then searches upward for README.md.
+    """
+    env_root = os.environ.get("PROJECT_ROOT") or os.environ.get("REPO_ROOT")
+    if env_root:
+        return Path(env_root).resolve()
+    script_dir = Path(__file__).resolve().parent
+    current = script_dir
+    for _ in range(10):
+        if (current / "README.md").exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    raise RuntimeError(
+        f"Repository root not found. Searched upward from {script_dir} for README.md.\n"
+        "Set PROJECT_ROOT or REPO_ROOT environment variable, or ensure README.md exists in repo root."
+    )
+
+
 def resolve_input() -> Path:
     """Locate merged_panel_final.parquet (prefer $SCRATCH if present)."""
-    repo_root = Path(__file__).resolve().parents[3]
+    repo_root = get_repo_root()
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
 
     candidates = []

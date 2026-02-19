@@ -54,6 +54,30 @@ class Tee:
     def close(self) -> None:
         self.file.close()
 
+
+def get_repo_root() -> Path:
+    """Get repository root directory.
+
+    Checks environment variables first, then searches upward for README.md.
+    """
+    env_root = os.environ.get("PROJECT_ROOT") or os.environ.get("REPO_ROOT")
+    if env_root:
+        return Path(env_root).resolve()
+    script_dir = Path(__file__).resolve().parent
+    current = script_dir
+    for _ in range(10):
+        if (current / "README.md").exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    raise RuntimeError(
+        f"Repository root not found. Searched upward from {script_dir} for README.md.\n"
+        "Set PROJECT_ROOT or REPO_ROOT environment variable, or ensure README.md exists in repo root."
+    )
+
+
 # Configuration
 RANDOM_STATE = 42
 EXCLUDE_COLS = {'transition_01', 'transition_01_win5', 'WDPA_b1', 'WDPA_prev', 'x', 'y', 'row', 'col', 'year'}
@@ -178,7 +202,7 @@ def extract_features_pyarrow_to_numpy(feature_table: pa.Table, mask: np.ndarray)
 
 def resolve_parquet_file(filename: str) -> Path:
     """Locate parquet file (prefer $SCRATCH if present). Checks main/ subdirectory first."""
-    repo_root = Path(__file__).resolve().parents[3]
+    repo_root = get_repo_root()
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
 
     candidates = []
@@ -213,7 +237,7 @@ def resolve_parquet_file(filename: str) -> Path:
 
 def resolve_best_params_json() -> Optional[Path]:
     """Locate rf_best_params.json. Checks multiple locations including colombia directory and $SCRATCH."""
-    repo_root = Path(__file__).resolve().parents[3]
+    repo_root = get_repo_root()
     script_dir = Path(__file__).resolve().parent
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
 
@@ -1462,7 +1486,7 @@ def phase2_testing(
 
 def main(timestamp: str) -> None:
     start_time = time.time()
-    repo_root = Path(__file__).resolve().parents[3]
+    repo_root = get_repo_root()
     
     # Use correct filenames from preprocessing script (main split)
     train_path = resolve_parquet_file("train_win5.parquet")
@@ -1580,7 +1604,7 @@ def main(timestamp: str) -> None:
 
 if __name__ == "__main__":
     # Set up output file capture
-    repo_root = Path(__file__).resolve().parents[3]
+    repo_root = get_repo_root()
     output_dir = repo_root / "outputs/usa/results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
     

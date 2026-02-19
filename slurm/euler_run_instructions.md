@@ -35,15 +35,6 @@ less $SCRATCH/logs/<LOGFILE>.err
 ```
 ---
 
-## File Transfers
-
-> **Legend**
-> - `scp` = secure copy over SSH (Desktop ↔ Euler)
-> - `gsutil cp` = single file/folder copy (any ↔ GCS)
-> - `gsutil rsync` = mirror a whole directory (any ↔ GCS)
-> - Add `-m` for parallel (multi-threaded) transfers
-> - Add `-r` for recursive (entire folder)
-
 ### 1. Euler → Desktop
 
 ```bash
