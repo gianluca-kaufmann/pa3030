@@ -205,12 +205,21 @@ Features that could improve predictive power but are not currently included:
 8. **Explain right-censoring design** — The `LAST_LABEL_YEAR = 2019` constraint
    is methodologically rigorous. Make this prominent in the methods section.
 
+### Medium-High Priority (Paper Differentiation)
+9. **Bayesian network interpretability layer** — Train a BN on the top 10-15 features
+   (discretized) as a post-hoc explanation of LightGBM's learned relationships.
+   Produces a DAG showing dependency structure (e.g., "biodiversity → designation is
+   mediated by remoteness") and conditional probability tables readable by policymakers.
+   Addresses the "black box" critique without sacrificing predictive accuracy.
+   Use `pgmpy` library. See `docs/technical_guide.md` Section 11 for full details.
+10. **Forward prediction to 2030** — Generate "where will protection happen next?"
+    maps for a compelling paper figure with policy relevance. Use scenario-based
+    analysis (business-as-usual vs. 30x30 acceleration). See technical guide Section 11.
+
 ### Lower Priority (Polish)
-9. **Consistent logging** — Replace mixed `print()`/`logging.info()` with unified logging.
-10. **Break up monolithic files** — The 1,600-line training script should be split
+11. **Consistent logging** — Replace mixed `print()`/`logging.info()` with unified logging.
+12. **Break up monolithic files** — The 1,600-line training script should be split
     into data loading, training, and evaluation modules.
-11. **Forward prediction to 2030** — Generate "where will protection happen next?"
-    maps for a compelling paper figure with policy relevance.
 
 ## Development Commands
 

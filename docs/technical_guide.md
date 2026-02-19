@@ -18,8 +18,9 @@ understand the project without reading 1,600-line scripts.
 8. [Prediction vs. Prescription](#8-prediction-vs-prescription)
 9. [Code Quality Assessment](#9-code-quality-assessment)
 10. [Improvement Priorities](#10-improvement-priorities)
-11. [Missing Variables](#11-missing-variables)
-12. [Key File Locations](#12-key-file-locations)
+11. [The 5-Year Window and Forward Projection to 2030](#11-the-5-year-window-and-forward-projection-to-2030)
+12. [Missing Variables](#12-missing-variables)
+13. [Key File Locations](#13-key-file-locations)
 
 ---
 
@@ -679,7 +680,216 @@ to receive protection under current political dynamics."*
 
 ---
 
-## 11. Missing Variables
+## 11. The 5-Year Window and Forward Projection to 2030
+
+### Why 5 Years (and Not 6 or 10)?
+
+The 5-year lookahead window (`LOOKAHEAD_YEARS = 5`) is a modeling choice driven by
+several factors:
+
+**Policy alignment.** The 30x30 target gives countries until 2030. With data through
+2024, a 5-year lookahead answers exactly: "what gets protected by ~2029?" — directly
+policy-relevant.
+
+**Right-censoring constraint.** WDPA data ends in 2024. The model can only label
+years where the full window is observable:
+- 5-year window → labels through 2019 → Train (2000-2013), Earlystop (2014-2016), Test (2017-2019)
+- 10-year window → labels through 2014 → only 9 training years, test ends in 2014 (misses recent trends)
+- 3-year window → labels through 2021 → more data, but fewer positive examples per pixel-year
+
+**Signal-to-noise tradeoff.**
+- Too short (1-2 years): too few transitions (~0.1% positive) for the model to learn
+- Too long (10+ years): features at year t become weakly predictive of year t+10 (conditions change)
+- 5 years: enough positives (~0.5%) with features still predictive of near-future outcomes
+
+**Convention.** 5-year windows are standard in land-use change and deforestation
+prediction literature.
+
+A **sensitivity analysis** testing 3, 5, and 7-year windows would strengthen the
+paper by showing results are robust to this choice.
+
+### Can the Model Project to 2030?
+
+**Yes.** The model is trained to answer: "Given features at year t, what's the
+probability this pixel becomes protected within 5 years?" Feed it 2024 features →
+it outputs a probability of protection by ~2029.
+
+The infrastructure already exists. The embeddings pipeline
+(`modelE_splits`, lines 422-442) includes a `FUTURE_SCORING` export that extracts
+feature data for recent years with no labels, specifically for inference. The results
+script already generates probability maps and risk maps for the test period.
+
+**What's needed:**
+1. Assemble 2024 features for all currently-unprotected pixels
+2. Run `model.predict()` on those features
+3. Map the output — each pixel gets a probability of becoming protected by ~2029
+
+**Caveats for the paper:**
+- The projection shows where protection goes *if historical patterns continue*
+- It assumes **stationarity** — that the features-to-designation relationship doesn't change
+- The 30x30 push may change both *how much* gets protected (faster) and *what kind* of land (political urgency could shift patterns toward land governments wouldn't have historically protected)
+- The gap between this projection and biodiversity priority maps is itself a finding
+
+### Accounting for Acceleration Under 30x30
+
+The model was trained on historical designation rates (~17% of land protected). The
+30x30 target may accelerate designation. Several approaches can address this, from
+simple to sophisticated:
+
+**Approach 1: Threshold Adjustment (Simplest)**
+
+The model ranks pixels by probability. Acceleration doesn't change the *ranking* —
+the same types of land remain attractive. Only the *cutoff* changes. Instead of
+asking "will this pixel be protected?" you ask "what if governments protect twice as
+much land?"
+
+```
+Historical: protect top 2% of ranked pixels → matches observed ~17% coverage
+30x30 scenario: protect top 4% of ranked pixels → projects toward ~30% coverage
+```
+
+This is easy to implement and defensible: it says "if governments scale up by
+protecting the *same kinds* of land, here's what gets covered." The model already
+outputs a ranked list — you just move the threshold.
+
+**Approach 2: Rate Multiplier on Probabilities**
+
+Calculate the ratio between the required designation rate and the historical rate,
+then scale probabilities:
+
+```
+Current protected: 17%
+Target: 30%
+Remaining years: ~4
+Historical annual rate: ~0.5%/year
+Required rate: ~3.25%/year → multiplier ≈ 6.5×
+```
+
+Apply: `p_adjusted = min(1.0, p_historical × multiplier)`
+
+Simple but crude — it assumes uniform acceleration across all pixel types. In
+reality, some types may accelerate more than others.
+
+**Approach 3: Scenario-Based Analysis (Recommended for Paper)**
+
+Present multiple scenarios without claiming one is correct:
+
+| Scenario | Assumption | Method |
+|----------|-----------|--------|
+| Business-as-usual | Historical patterns continue | Raw model predictions |
+| Moderate acceleration | 2× designation rate | Threshold at top 4% |
+| 30x30 compliance | Full 30% target met | Threshold at top ~15% of unprotected land |
+
+This is the most honest approach for a paper. It acknowledges uncertainty about the
+political dynamics while still providing useful projections. The reader can see what
+changes under different assumptions.
+
+**Approach 4: Time Trend Feature (Requires Retraining)**
+
+Add a feature capturing the *political environment*:
+- A binary "post-COP15" indicator (2023+ = 1)
+- A continuous "years remaining until 2030" feature
+- The cumulative % of land already protected nationally
+
+This requires retraining the model and is speculative (you're extrapolating a trend
+that hasn't fully played out yet), but it would allow the model to learn that
+designation *accelerates* as deadlines approach.
+
+**Approach 5: Post-2019 Recalibration (Most Rigorous)**
+
+The model is trained on 2000-2019 data, but WDPA data exists through 2024. Use
+2020-2024 designation data (which the model has never seen) to:
+
+1. Run model predictions for 2020-2024 features
+2. Compare against actual 2020-2024 designations
+3. If designation rates increased post-COP15, fit a correction factor
+
+This is the most data-driven approach — it uses real post-2022 acceleration data
+rather than assumptions. The student could check: "Did designation rates actually
+increase after COP15? By how much? Does the model's ranking still hold?"
+
+**Recommendation for the paper:** Use **Approach 3** (scenario analysis) as the
+primary framing, supplemented by **Approach 5** (post-2019 recalibration) as
+empirical evidence. This gives the paper both honest uncertainty framing and
+data-driven grounding.
+
+### Bayesian Network as Interpretability Layer (Future Work)
+
+A key critique of ML models in environmental science is the "black box" problem:
+LightGBM achieves ROC-AUC 0.94, but what did it actually learn? SHAP provides
+feature importance rankings, but doesn't reveal the **dependency structure** between
+features.
+
+**The idea:** Keep LightGBM as the prediction engine. Build a Bayesian network (BN)
+as a second, post-hoc model that explains *what LightGBM learned* in a transparent,
+human-readable form.
+
+```
+Layer 1: LightGBM (prediction)
+   60 features → probability per pixel → ROC-AUC 0.94
+   Role: maximize accuracy
+
+Layer 2: Bayesian Network (interpretation)
+   Top 10-15 features (discretized) → DAG + conditional probability tables
+   Role: reveal dependency structure, address black-box critique
+```
+
+**Implementation steps:**
+
+1. **Select key features.** Take top 10-15 from SHAP: `dist_wdpa`, `dist_road`,
+   `GSN_b2`, `WorldClim_b14`, `HNTL_b1`, `NDVI`, `GPW_b1`, `deforestation`,
+   `elevation`, etc.
+
+2. **Discretize into meaningful categories:**
+   ```
+   dist_wdpa:     "adjacent" (<5km), "near" (5-50km), "far" (>50km)
+   elevation:     "lowland" (<500m), "mid" (500-2000m), "highland" (>2000m)
+   GSN_b2:        "low biodiversity", "medium", "high"
+   GPW_b1:        "uninhabited", "sparse", "populated"
+   designation:   "protected" (1) / "not protected" (0)
+   ```
+
+3. **Learn BN structure** using `pgmpy`:
+   ```python
+   from pgmpy.estimators import HillClimbSearch, BicScore
+   from pgmpy.models import BayesianNetwork
+   from pgmpy.estimators import BayesianEstimator
+
+   hc = HillClimbSearch(df_discretized)
+   best_dag = hc.estimate(scoring_method=BicScore(df_discretized))
+
+   model = BayesianNetwork(best_dag.edges())
+   model.fit(df_discretized, estimator=BayesianEstimator)
+   ```
+
+4. **Read the outputs:**
+   - A **DAG** showing which features influence designation and through what paths
+   - **Conditional probability tables** directly readable by policymakers:
+
+   | Biodiversity | Dist to PA | P(designation) |
+   |-------------|-----------|----------------|
+   | High | Adjacent (<5km) | 8.2% |
+   | High | Far (>50km) | 0.3% |
+   | Low | Adjacent (<5km) | 2.1% |
+   | Low | Far (>50km) | 0.05% |
+
+**Why this strengthens the paper:**
+- Deflects the "black box" critique with a transparent companion model
+- Shows dependency structure (e.g., "population density works *through* remoteness,
+  not directly") — richer than SHAP rankings alone
+- Produces paper-ready DAG figures readable by non-technical audiences
+- Validates LightGBM findings through convergent evidence from a different method
+
+**Important caveat:** The BN structure is correlational, not causal. The paper should
+state: *"The learned structure represents conditional dependencies consistent with the
+data, not confirmed causal relationships."*
+
+**Computational note:** Manageable because the BN uses ~15 discretized variables (not
+60 continuous). Can run on Colombia (7M rows) or a sample thereof.
+
+---
+
+## 12. Missing Variables
 
 Features that could improve predictive power:
 
@@ -699,7 +909,7 @@ and **carbon stocks**.
 
 ---
 
-## 12. Key File Locations
+## 13. Key File Locations
 
 ### Pipeline Scripts (Colombia)
 
