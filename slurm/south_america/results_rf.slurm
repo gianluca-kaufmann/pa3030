@@ -33,6 +33,15 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
+# Set threading/CPU hints for faster NumPy/PyArrow (use all allocated CPUs)
+#------------------------------------------------------------------------------
+export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
+export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
+export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
+export VECLIB_MAXIMUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
+export NUMEXPR_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
+
+#------------------------------------------------------------------------------
 # Run the model1_results script with RF model type (main split)
 #------------------------------------------------------------------------------
 echo "Starting model1_results script (RF mode, main split)..."

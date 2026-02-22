@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=modelC_results_RF_robustness
-#SBATCH --partition=normal.4h
-#SBATCH --time=04:00:00
+#SBATCH --job-name=spatial_gen_SA
+#SBATCH --partition=normal.24h
+#SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/modelC_results_RF_robustness_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/modelC_results_RF_robustness_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/spatial_gen_SA_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/spatial_gen_SA_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -14,7 +14,7 @@ mkdir -p "$SCRATCH/logs"
 mkdir -p "$SCRATCH/data"
 mkdir -p "$SCRATCH/data/ml"
 mkdir -p "$SCRATCH/outputs"
-mkdir -p "$SCRATCH/outputs/south_america/colombia/tables"
+mkdir -p "$SCRATCH/outputs/south_america/tables"
 
 #------------------------------------------------------------------------------
 # Load modules
@@ -27,27 +27,27 @@ module load cuda/12.4.1
 module load eth_proxy
 
 #------------------------------------------------------------------------------
-# Activate the Python virtual environment (uav-genAI-opti)
+# Activate the Python virtual environment
 #------------------------------------------------------------------------------
 VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Run the modelC_results script with RF model type (robustness split)
+# Run the spatial_generalisation script
 #------------------------------------------------------------------------------
-echo "Starting modelC_results script (RF mode, robustness split)..."
+echo "Starting spatial_generalisation script (South America)..."
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/regions/south_america/colombia/4_ml/results/modelC_results" ] || {
-  echo "ERROR: modelC_results not found"
-  echo "NOTE: modelC_results script is in colombia/ML/results/ directory"
-  find scripts -maxdepth 4 -type f -name "modelC_results"
+[ -f "scripts/regions/south_america/4_ml/3_evaluation/spatial_generalisation" ] || {
+  echo "ERROR: spatial_generalisation not found"
+  echo "NOTE: spatial_generalisation script is in scripts/regions/south_america/4_ml/3_evaluation/ directory"
+  find scripts -maxdepth 6 -type f -name "spatial_generalisation"
   exit 1
 }
-# Run the script with robustness split, prefers calibrated predictions
-python "scripts/regions/south_america/colombia/4_ml/results/modelC_results" --model_type rf --split-version robustness --use_calibrated auto
+# Run the script (processes both RF and LGBM internally, no arguments needed)
+python "scripts/regions/south_america/4_ml/3_evaluation/spatial_generalisation"
 
-echo "modelC_results script (RF mode, robustness split) finished."
+echo "spatial_generalisation script (South America) finished."
