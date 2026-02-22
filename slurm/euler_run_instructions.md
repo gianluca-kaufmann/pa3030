@@ -1,5 +1,30 @@
 # ETH EULER — QUICK START GUIDE (MASTER'S THESIS)
 
+## Storage Layout
+
+`data/` and `outputs/` live on `$SCRATCH` (large quota) and are symlinked into the
+repo so all scripts resolve paths transparently:
+
+```
+~/master_thesis/data    -> /cluster/scratch/gikaufmann/data
+~/master_thesis/outputs -> /cluster/scratch/gikaufmann/outputs
+```
+
+If the symlinks ever break (e.g. after scratch purge), re-run:
+
+```bash
+bash ~/master_thesis/slurm/fix_storage.sh
+```
+
+**$SCRATCH purge policy:** files not accessed for ~15 days are auto-deleted.
+Back up regularly:
+
+```bash
+gsutil -m rsync -r /cluster/scratch/gikaufmann/outputs gs://protected-areas/outputs
+```
+
+---
+
 ## Daily Workflow
 
 ### On Euler (SSH session)
@@ -21,8 +46,8 @@ nano scripts/regions/south_america/3_merging/merge
 sbatch slurm/RUN.slurm
 squeue
 ```
+
 ---
-### Job Troubleshooting
 
 ```bash
 # Find the log files for successful and failed runs
@@ -34,15 +59,13 @@ less $SCRATCH/logs/<LOGFILE>.out
 less $SCRATCH/logs/<LOGFILE>.err
 ```
 ---
+### Job Troubleshooting
 
 ### 1. Euler → Desktop
 
 ```bash
 # Single file (from scratch)
 scp gikaufmann@login.euler.ethz.ch:/cluster/scratch/gikaufmann/<PATH> ~/Desktop/
-
-# Single file (from home repo)
-scp gikaufmann@euler.ethz.ch:~/master_thesis/<PATH> ~/Desktop/
 
 # Whole folder
 scp -r gikaufmann@login.euler.ethz.ch:/cluster/scratch/gikaufmann/outputs/<FOLDER> ~/Desktop/
@@ -53,6 +76,9 @@ scp -r gikaufmann@login.euler.ethz.ch:/cluster/scratch/gikaufmann/outputs/<FOLDE
 ```bash
 # Single file (to scratch)
 scp ~/Desktop/<FILE> gikaufmann@login.euler.ethz.ch:/cluster/scratch/gikaufmann/<PATH>
+
+# Single file (from home repo)
+scp gikaufmann@euler.ethz.ch:~/master_thesis/<PATH> ~/Desktop/
 
 # Single file (to home repo)
 scp ~/Desktop/<FILE> gikaufmann@euler.ethz.ch:~/master_thesis/<PATH>
@@ -97,8 +123,7 @@ gsutil cp gs://protected-areas/<PATH> ~/Desktop/
 # Whole folder
 gsutil -m cp -r gs://protected-areas/<FOLDER> ~/Desktop/
 ```
-
-### 6. Desktop → GCS
+---
 
 ```bash
 # Single file
@@ -108,7 +133,7 @@ gsutil cp ~/Desktop/<FILE> gs://protected-areas/<PATH>
 gsutil -m cp -r ~/Desktop/<FOLDER> gs://protected-areas/<PATH>
 ```
 
----
+### 6. Desktop → GCS
 
 ### Check Files & Folders on Euler
 
