@@ -1,30 +1,3 @@
-# ETH EULER — QUICK START GUIDE (MASTER'S THESIS)
-
-## Storage Layout
-
-`data/` and `outputs/` live on `$SCRATCH` (large quota) and are symlinked into the
-repo so all scripts resolve paths transparently:
-
-```
-~/master_thesis/data    -> /cluster/scratch/gikaufmann/data
-~/master_thesis/outputs -> /cluster/scratch/gikaufmann/outputs
-```
-
-If the symlinks ever break (e.g. after scratch purge), re-run:
-
-```bash
-bash ~/master_thesis/slurm/fix_storage.sh
-```
-
-**$SCRATCH purge policy:** files not accessed for ~15 days are auto-deleted.
-Back up regularly:
-
-```bash
-gsutil -m rsync -r /cluster/scratch/gikaufmann/outputs gs://protected-areas/outputs
-```
-
----
-
 ## Daily Workflow
 
 ### On Euler (SSH session)
@@ -54,11 +27,21 @@ squeue
 ls -lt $SCRATCH/logs | head
 
 # Inspect the .out file (main stdout)
-less $SCRATCH/logs/<LOGFILE>.out
+nano $SCRATCH/logs/<LOGFILE>.out
 # Inspect the .err file
 less $SCRATCH/logs/<LOGFILE>.err
 ```
 ---
+
+### delete with time dependency
+```bash
+find /cluster/scratch/gikaufmann/logs -type f -mtime +7 -delete
+
+#find it:
+find /cluster/scratch/gikaufmann/outputs -name "*scored*.parquet" -printf "%T@ %p\n" | sort -n
+```
+
+
 ### Job Troubleshooting
 
 ### 1. Euler → Desktop
