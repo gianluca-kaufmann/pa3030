@@ -102,6 +102,7 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 
 import rasterio
+from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.warp import reproject
 from rasterio.windows import Window
@@ -148,6 +149,37 @@ def log_progress(message: str, start_time: Optional[float] = None):
         print(f"[time] {message} ({elapsed:.1f}s)")
     else:
         print(f"[info] {message}")
+
+
+def normalize_crs(crs_obj, fallback_epsg: int = 3857) -> CRS:
+    """
+    Return a canonical CRS object safe for reprojection.
+
+    Handles cases seen on HPC where a pseudo-mercator CRS is parsed as an
+    EngineeringCRS JSON blob (non-transformable). In that case we coerce to EPSG:3857.
+    """
+    fallback = CRS.from_epsg(fallback_epsg)
+    if crs_obj is None:
+        return fallback
+
+    try:
+        epsg = crs_obj.to_epsg()
+        if epsg is not None:
+            return CRS.from_epsg(epsg)
+    except Exception:
+        pass
+
+    # Robustly detect pseudo-mercator CRS strings/JSON, including EngineeringCRS variants
+    crs_text = str(crs_obj).lower()
+    try:
+        crs_text += " " + crs_obj.to_json().lower()
+    except Exception:
+        pass
+
+    if "pseudo-mercator" in crs_text or "epsg:3857" in crs_text:
+        return fallback
+
+    return CRS.from_user_input(crs_obj)
 
 
 def open_reference_backbone() -> Tuple[Path, rasterio.DatasetReader, np.ndarray]:
@@ -246,9 +278,11 @@ def check_alignment(src_path: Path, ref_profile: dict) -> bool:
     """Check if a raster is already aligned with the reference grid."""
     try:
         with rasterio.open(src_path) as src:
+            src_crs = normalize_crs(src.crs)
+            ref_crs = normalize_crs(ref_profile["crs"])
             return (
                 src.shape == (ref_profile["height"], ref_profile["width"]) and
-                src.crs == ref_profile["crs"] and
+                src_crs == ref_crs and
                 np.allclose(src.transform, ref_profile["transform"], atol=1e-6)
             )
     except Exception:
@@ -352,6 +386,7 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
     inputs without manual intervention.
     """
     with rasterio.open(src_path) as src:
+        src_crs = normalize_crs(src.crs)
         dst_height = int(window.height)
         dst_width = int(window.width)
         count = src.count
@@ -364,8 +399,9 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
         )
         
         # Fast path: if already aligned, just read the window directly (MUCH faster)
+        ref_crs = normalize_crs(ref_profile["crs"])
         if (src.shape == (ref_profile["height"], ref_profile["width"]) and
-            src.crs == ref_profile["crs"] and
+            src_crs == ref_crs and
             np.allclose(src.transform, ref_profile["transform"], atol=1e-6)):
             
             data = src.read(window=window, masked=False).astype(np.float32)
@@ -382,7 +418,7 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
         
         # Slow path: reprojection needed
         dst_transform = rasterio.windows.transform(window, ref_profile["transform"])
-        dst_crs = ref_profile["crs"]
+        dst_crs = ref_crs
         
         # Special handling for nodata=0: read full data and create temp array with different nodata
         if src.nodata in [0, 0.0]:
@@ -398,7 +434,7 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
                     source=src_array,
                     destination=dst[b - 1],
                     src_transform=src.transform,
-                    src_crs=src.crs,
+                    src_crs=src_crs,
                     src_nodata=temp_nodata,  # Use temp nodata (nothing in source has this value)
                     dst_transform=dst_transform,
                     dst_crs=dst_crs,
@@ -416,7 +452,7 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
                     source=rasterio.band(src, b),
                     destination=dst[b - 1],
                     src_transform=src.transform,
-                    src_crs=src.crs,
+                    src_crs=src_crs,
                     src_nodata=src.nodata,
                     dst_transform=dst_transform,
                     dst_crs=dst_crs,
@@ -619,12 +655,17 @@ def main():
     # Setup reference using backbone
     ref_path, ref_src, backbone_mask = open_reference_backbone()
     ref_profile = ref_src.profile.copy()
+    ref_crs_raw = ref_src.crs
+    ref_crs = normalize_crs(ref_crs_raw)
     ref_profile.update({
         "count": 1,
         "dtype": rasterio.float32,
         "nodata": np.nan,
         "compress": "lzw",
+        "crs": ref_crs,
     })
+    if str(ref_crs_raw) != str(ref_crs):
+        log_progress(f"Normalized reference CRS from {ref_crs_raw} to {ref_crs}")
     
     # Calculate land pixel statistics
     land_pixels = int((backbone_mask == 1).sum())
