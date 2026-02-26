@@ -24,8 +24,10 @@ import argparse
 import os
 from pathlib import Path
 
+import numpy as np
 import rasterio
 from rasterio.crs import CRS
+from rasterio.warp import transform as warp_transform
 
 
 def get_default_root() -> Path:
@@ -36,15 +38,33 @@ def get_default_root() -> Path:
     return project_root / "data" / "south_america" / "ready"
 
 
-def is_offending_crs(crs_obj) -> bool:
+def crs_text(crs_obj) -> str:
     if crs_obj is None:
-        return False
-    text = str(crs_obj).lower()
+        return ""
+    text = str(crs_obj)
+    try:
+        text += " " + crs_obj.to_json()
+    except Exception:
+        pass
+    return text
+
+
+def is_aligned_to_reference(src, ref_shape, ref_transform, ref_crs) -> bool:
     return (
-        "engineeringcrs" in text
-        and "pseudo-mercator" in text
-        and "unknown engineering datum" in text
+        src.shape == ref_shape
+        and src.crs == ref_crs
+        and np.allclose(tuple(src.transform), tuple(ref_transform), atol=1e-6)
     )
+
+
+def fails_transform_to_3857(src_crs, target_crs) -> tuple[bool, str]:
+    if src_crs is None:
+        return True, "source CRS is None"
+    try:
+        warp_transform(src_crs, target_crs, [0.0], [0.0])
+        return False, ""
+    except Exception as e:
+        return True, str(e)
 
 
 def main() -> None:
@@ -71,6 +91,15 @@ def main() -> None:
     print(f"[info] Found {len(tif_paths)} GeoTIFF files")
     print(f"[info] Mode: {'APPLY' if args.apply else 'DRY-RUN'}")
 
+    backbone_path = root / "backbone" / "backbone.tif"
+    if not backbone_path.exists():
+        raise FileNotFoundError(f"Reference backbone not found: {backbone_path}")
+
+    with rasterio.open(backbone_path) as ref:
+        ref_shape = ref.shape
+        ref_transform = ref.transform
+        ref_crs = ref.crs
+
     offending = []
     fixed = 0
     errors = 0
@@ -80,12 +109,19 @@ def main() -> None:
         try:
             with rasterio.open(p) as src:
                 crs = src.crs
-            if not is_offending_crs(crs):
+                if is_aligned_to_reference(src, ref_shape, ref_transform, ref_crs):
+                    # Merge won't reproject aligned rasters; skip them.
+                    continue
+                failed_transform, fail_reason = fails_transform_to_3857(crs, target_crs)
+
+            if not failed_transform:
                 continue
 
-            offending.append((p, str(crs)))
+            text = crs_text(crs)
+            offending.append((p, text, fail_reason))
             print(f"[bad] {p}")
-            print(f"      CRS: {crs}")
+            print(f"      reason: {fail_reason}")
+            print(f"      CRS: {text}")
 
             if args.apply:
                 with rasterio.open(p, "r+") as dst:
