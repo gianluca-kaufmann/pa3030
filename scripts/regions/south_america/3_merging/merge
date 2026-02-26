@@ -176,66 +176,10 @@ def normalize_crs(crs_obj, fallback_epsg: int = 3857) -> CRS:
     except Exception:
         pass
 
-    if (
-        "pseudo-mercator" in crs_text
-        or "pseudo mercator" in crs_text
-        or "web mercator" in crs_text
-        or "epsg:3857" in crs_text
-        or ("engineeringcrs" in crs_text and "3857" in crs_text)
-        or ("engineeringcrs" in crs_text and "mercator" in crs_text)
-    ):
+    if "pseudo-mercator" in crs_text or "epsg:3857" in crs_text:
         return fallback
 
     return CRS.from_user_input(crs_obj)
-
-
-def reproject_with_crs_fallback(*, source, destination, src_transform, src_crs, src_nodata,
-                                dst_transform, dst_crs, resampling, dst_nodata):
-    """
-    Reproject with a defensive CRS fallback for HPC/PROJ EngineeringCRS parsing issues.
-    """
-    try:
-        reproject(
-            source=source,
-            destination=destination,
-            src_transform=src_transform,
-            src_crs=src_crs,
-            src_nodata=src_nodata,
-            dst_transform=dst_transform,
-            dst_crs=dst_crs,
-            resampling=resampling,
-            dst_nodata=dst_nodata,
-        )
-        return
-    except Exception as e:
-        err = str(e).lower()
-        src_text = str(src_crs).lower() if src_crs is not None else ""
-        dst_text = str(dst_crs).lower() if dst_crs is not None else ""
-        if (
-            "cannot find coordinate operations" in err
-            and (
-                "engineeringcrs" in err
-                or "pseudo-mercator" in err
-                or "pseudo mercator" in err
-                or "engineeringcrs" in src_text
-                or "engineeringcrs" in dst_text
-            )
-        ):
-            fallback_crs = CRS.from_epsg(3857)
-            log_progress("CRS reprojection fallback triggered: retrying with EPSG:3857")
-            reproject(
-                source=source,
-                destination=destination,
-                src_transform=src_transform,
-                src_crs=fallback_crs if src_crs is None else normalize_crs(src_crs),
-                src_nodata=src_nodata,
-                dst_transform=dst_transform,
-                dst_crs=fallback_crs if dst_crs is None else normalize_crs(dst_crs),
-                resampling=resampling,
-                dst_nodata=dst_nodata,
-            )
-            return
-        raise
 
 
 def open_reference_backbone() -> Tuple[Path, rasterio.DatasetReader, np.ndarray]:
@@ -383,7 +327,7 @@ def read_reproject_to_ref(path: Path, ref_profile: dict) -> np.ndarray:
                 src_array = src.read(b, masked=False).astype(np.float32)
                 
                 # Reproject from numpy array
-                reproject_with_crs_fallback(
+                reproject(
                     source=src_array,
                     destination=dst[b - 1],
                     src_transform=src.transform,
@@ -402,7 +346,7 @@ def read_reproject_to_ref(path: Path, ref_profile: dict) -> np.ndarray:
             dst = np.full((count, dst_height, dst_width), np.nan, dtype=np.float32)
             
             for b in range(1, count + 1):
-                reproject_with_crs_fallback(
+                reproject(
                     source=rasterio.band(src, b),
                     destination=dst[b - 1],
                     src_transform=src.transform,
@@ -486,7 +430,7 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
                 src_array = src.read(b, masked=False).astype(np.float32)
                 
                 # Reproject from numpy array instead of rasterio band
-                reproject_with_crs_fallback(
+                reproject(
                     source=src_array,
                     destination=dst[b - 1],
                     src_transform=src.transform,
@@ -504,7 +448,7 @@ def read_reproject_window(src_path: Path, ref_profile: dict, window: Window,
             # Standard path for other nodata values
             dst = np.full((count, dst_height, dst_width), np.nan, dtype=np.float32)
             for b in range(1, count + 1):
-                reproject_with_crs_fallback(
+                reproject(
                     source=rasterio.band(src, b),
                     destination=dst[b - 1],
                     src_transform=src.transform,
