@@ -50,7 +50,7 @@ echo "Starting model2_results script (main split)..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/regions/usa/4_ml/4_results/model2_results" ] || {
+[ -f "scripts/regions/usa/4_ml/5_results/model2_results" ] || {
   echo "ERROR: model2_results not found"
   echo "NOTE: model2_results script is in ML/results/ directory"
   find scripts -maxdepth 4 -type f -name "model2_results"
@@ -59,6 +59,6 @@ echo "PWD = $(pwd)"
 # Run the script (defaults to main split, LGBM model type, prefers calibrated predictions if available)
 # Temporal validation: risk maps include future PA layer (2020-2024) when val_win5.parquet is found (auto-discovered). Use --no_future to disable.
 # --allow_test_shap: use test set for SHAP when earlystop/train unavailable
-python "scripts/regions/usa/4_ml/4_results/model2_results" --model_type lgbm --split-version main --allow_test_shap
+python "scripts/regions/usa/4_ml/5_results/model2_results" --model_type lgbm --split-version main --allow_test_shap
 
 echo "model2_results script (main split) finished."

@@ -54,30 +54,6 @@ class Tee:
     def close(self) -> None:
         self.file.close()
 
-
-def get_repo_root() -> Path:
-    """Get repository root directory.
-
-    Checks environment variables first, then searches upward for README.md.
-    """
-    env_root = os.environ.get("PROJECT_ROOT") or os.environ.get("REPO_ROOT")
-    if env_root:
-        return Path(env_root).resolve()
-    script_dir = Path(__file__).resolve().parent
-    current = script_dir
-    for _ in range(10):
-        if (current / "README.md").exists():
-            return current
-        parent = current.parent
-        if parent == current:
-            break
-        current = parent
-    raise RuntimeError(
-        f"Repository root not found. Searched upward from {script_dir} for README.md.\n"
-        "Set PROJECT_ROOT or REPO_ROOT environment variable, or ensure README.md exists in repo root."
-    )
-
-
 # Configuration
 RANDOM_STATE = 42
 EXCLUDE_COLS = {'transition_01', 'transition_01_win5', 'WDPA_b1', 'WDPA_prev', 'x', 'y', 'row', 'col', 'year'}
@@ -202,23 +178,23 @@ def extract_features_pyarrow_to_numpy(feature_table: pa.Table, mask: np.ndarray)
 
 def resolve_parquet_file(filename: str) -> Path:
     """Locate parquet file (prefer $SCRATCH if present). Checks main/ subdirectory first."""
-    repo_root = get_repo_root()
+    repo_root = Path(__file__).resolve().parents[5]
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
 
     candidates = []
     if scratch_root is not None:
         # Check main/ subdirectory first (standard location from preprocessing script with split_version='main')
-        candidates.append(scratch_root / f"outputs/usa/results/main/{filename}")
-        candidates.append(scratch_root / f"data/usa/ml/main/{filename}")
-        # Also check outputs/usa/results and data/usa/ml locations (for backward compatibility)
-        candidates.append(scratch_root / f"outputs/usa/results/{filename}")
-        candidates.append(scratch_root / f"data/usa/ml/{filename}")
+        candidates.append(scratch_root / f"outputs/south_america/results/main/{filename}")
+        candidates.append(scratch_root / f"data/south_america/ml/main/{filename}")
+        # Also check outputs/south_america/results and data/south_america/ml locations (for backward compatibility)
+        candidates.append(scratch_root / f"outputs/south_america/results/{filename}")
+        candidates.append(scratch_root / f"data/south_america/ml/{filename}")
     # Check main/ subdirectory first in repo
-    candidates.append(repo_root / f"outputs/usa/results/main/{filename}")
-    candidates.append(repo_root / f"data/usa/ml/main/{filename}")
-    # Also check outputs/usa/results and data/usa/ml locations (for backward compatibility)
-    candidates.append(repo_root / f"outputs/usa/results/{filename}")
-    candidates.append(repo_root / f"data/usa/ml/{filename}")
+    candidates.append(repo_root / f"outputs/south_america/results/main/{filename}")
+    candidates.append(repo_root / f"data/south_america/ml/main/{filename}")
+    # Also check outputs/south_america/results and data/south_america/ml locations (for backward compatibility)
+    candidates.append(repo_root / f"outputs/south_america/results/{filename}")
+    candidates.append(repo_root / f"data/south_america/ml/{filename}")
 
     for cand in candidates:
         if cand.exists():
@@ -236,25 +212,42 @@ def resolve_parquet_file(filename: str) -> Path:
 
 
 def resolve_best_params_json() -> Optional[Path]:
-    """Locate rf_best_params.json. Checks multiple locations including colombia directory and $SCRATCH."""
-    repo_root = get_repo_root()
+    """Locate rf_best_params.json from canonical and tuning locations."""
+    repo_root = Path(__file__).resolve().parents[5]
     script_dir = Path(__file__).resolve().parent
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
 
     candidates = []
-    # Check same directory as script first
+    # Canonical artifact (produced by tuning scripts)
     candidates.append(script_dir / "rf_best_params.json")
-    # Check colombia directory (where files are stored locally)
-    candidates.append(repo_root / "scripts/colombia/ML/training/rf_best_params.json")
-    # Check $SCRATCH locations if available (for Euler cluster)
+    # Backward-compatible fallback to tuning directory
+    candidates.append(script_dir / "tuning/rf_best_params.json")
+    # Optional scratch mirrors for cluster runs
     if scratch_root is not None:
-        candidates.append(scratch_root / "scripts/colombia/ML/training/rf_best_params.json")
-        candidates.append(scratch_root / "scripts/ML/training/rf_best_params.json")
-    
+        candidates.append(
+            scratch_root / "scripts/regions/south_america/4_ml/3_training/rf_best_params.json"
+        )
+        candidates.append(
+            scratch_root / "scripts/regions/south_america/4_ml/2_tuning/rf_best_params.json"
+        )
+        candidates.append(
+            scratch_root / "scripts/regions/south_america/4_ml/2_training/tuning/rf_best_params.json"
+        )
+        candidates.append(scratch_root / "rf_best_params.json")
+    candidates.append(
+        repo_root / "scripts/regions/south_america/4_ml/3_training/rf_best_params.json"
+    )
+    candidates.append(
+        repo_root / "scripts/regions/south_america/4_ml/2_tuning/rf_best_params.json"
+    )
+    candidates.append(
+        repo_root / "scripts/regions/south_america/4_ml/2_training/tuning/rf_best_params.json"
+    )
+
     for cand in candidates:
         if cand.exists():
             return cand
-    
+
     return None
 
 
@@ -282,16 +275,48 @@ def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
     with open(params_path, 'r') as f:
         params_data = json.load(f)
     
+    def sanitize_rf_param_keys(params: Dict[str, Any]) -> Dict[str, Any]:
+        cleaned: Dict[str, Any] = {}
+        for key, value in params.items():
+            if key.startswith("rf__"):
+                cleaned[key.replace("rf__", "", 1)] = value
+            else:
+                cleaned[key] = value
+        return cleaned
+
     # Support both flat and nested JSON formats
     if isinstance(params_data, dict) and ('fixed_params' in params_data or 'best_params' in params_data):
         # Nested format: {fixed_params: {...}, best_params: {...}, ...}
-        json_fixed = params_data.get('fixed_params', {})
-        json_best = params_data.get('best_params', {}).copy()
-        final_params = {**json_fixed, **json_best}
         best_score = params_data.get('best_val_score', params_data.get('best_cv_score', None))
+        if best_score is None:
+            raise ValueError(
+                f"Invalid hyperparameter artifact at {params_path}: "
+                "best_val_score (or best_cv_score) is required and cannot be null."
+            )
+
+        metadata = params_data.get("metadata")
+        required_meta = ("dataset_fingerprint", "target_col", "feature_count", "year_split", "git_commit", "timestamp")
+        if not isinstance(metadata, dict):
+            raise ValueError(
+                f"Invalid hyperparameter artifact at {params_path}: missing 'metadata' section."
+            )
+        missing_meta = [key for key in required_meta if key not in metadata]
+        if missing_meta:
+            raise ValueError(
+                f"Invalid hyperparameter artifact at {params_path}: missing metadata fields {missing_meta}."
+            )
+        if metadata.get("target_col") != TARGET_COL:
+            raise ValueError(
+                f"Invalid hyperparameter artifact at {params_path}: "
+                f"metadata.target_col='{metadata.get('target_col')}' does not match expected '{TARGET_COL}'."
+            )
+
+        json_fixed = params_data.get('fixed_params', {})
+        json_best = sanitize_rf_param_keys(params_data.get('best_params', {}).copy())
+        final_params = {**sanitize_rf_param_keys(json_fixed), **json_best}
     else:
         # Flat format: direct parameter dictionary
-        final_params = params_data.copy() if isinstance(params_data, dict) else {}
+        final_params = sanitize_rf_param_keys(params_data.copy() if isinstance(params_data, dict) else {})
         best_score = None
     
     # Guardrails: only fill missing keys, don't overwrite existing ones
@@ -1001,7 +1026,7 @@ def phase1_training(
     
     # Pass 2: Process batches and generate predictions (OOM-proof)
     print(f"  Pass 2: Generating predictions in batches...")
-    earlystop_scored_path = output_dir / f"model2_rf_win5_earlystop_scored_{timestamp}.parquet"
+    earlystop_scored_path = output_dir / f"model1_rf_win5_earlystop_scored_{timestamp}.parquet"
     parquet_file = pq.ParquetFile(earlystop_path)
     writer = None
     idx_offset = 0
@@ -1179,7 +1204,7 @@ def phase1_training(
     
     # earlystop_time already set above (intermediate training + earlystop prediction time)
     
-    model_path = model_dir / f"model2_rf_win5_{timestamp}.joblib"
+    model_path = model_dir / f"model1_rf_win5_{timestamp}.joblib"
     joblib.dump(rf_model, model_path)
     print(f"Final model saved: {model_path}")
     gc.collect()
@@ -1276,7 +1301,7 @@ def phase2_testing(
     # Pass 2: Process batches and fill pre-allocated arrays
     print(f"  Pass 2: Processing test batches (year_range={test_year_range})...")
     parquet_file = pq.ParquetFile(test_path)
-    scored_path = output_dir / f"model2_rf_win5_scored_{timestamp}.parquet"
+    scored_path = output_dir / f"model1_rf_win5_scored_{timestamp}.parquet"
     writer = None
     test_pos = test_neg = batch_num = idx_offset = 0
     pred_start = time.time()
@@ -1458,7 +1483,7 @@ def phase2_testing(
         }
     }
     metrics = convert_numpy_types(metrics)
-    metrics_path = output_dir / f"model2_rf_win5_metrics_{timestamp}.json"
+    metrics_path = output_dir / f"model1_rf_win5_metrics_{timestamp}.json"
     with open(metrics_path, 'w') as f:
         json.dump(metrics, f, indent=2)
     print(f"\nMetrics saved: {metrics_path}")
@@ -1486,7 +1511,7 @@ def phase2_testing(
 
 def main(timestamp: str) -> None:
     start_time = time.time()
-    repo_root = get_repo_root()
+    repo_root = Path(__file__).resolve().parents[5]
     
     # Use correct filenames from preprocessing script (main split)
     train_path = resolve_parquet_file("train_win5.parquet")
@@ -1504,18 +1529,18 @@ def main(timestamp: str) -> None:
         print(f"\nUsing default manual hyperparameters (rf_best_params.json not found)")
     
     # Create output directories
-    output_dir = repo_root / "outputs/usa/results/ml_models"
+    output_dir = repo_root / "outputs/south_america/results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
-    model_dir = repo_root / "data/usa/ml/models"
+    model_dir = repo_root / "data/south_america/ml/models"
     model_dir.mkdir(parents=True, exist_ok=True)
     
     use_wandb = False
     if wandb is not None:
         try:
             wandb.init(
-            project="ml-training-model2", 
+            project="ml-training-model1", 
             entity=os.environ.get("WANDB_ENTITY"), 
-            name=f"model2_rf_win5_{timestamp}",
+            name=f"model1_rf_win5_{timestamp}",
             config={
                 "model": "RandomForest", 
                 "task": "transition_01_win5_prediction", 
@@ -1604,12 +1629,12 @@ def main(timestamp: str) -> None:
 
 if __name__ == "__main__":
     # Set up output file capture
-    repo_root = get_repo_root()
-    output_dir = repo_root / "outputs/usa/results/ml_models"
+    repo_root = Path(__file__).resolve().parents[5]
+    output_dir = repo_root / "outputs/south_america/results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"model2_rf_win5_{timestamp}.txt"
+    output_file = output_dir / f"model1_rf_win5_{timestamp}.txt"
     
     tee = Tee(output_file)
     sys.stdout = tee

@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import sys
+from datetime import datetime
+from pathlib import Path
+
+from scripts.regions.shared.ml.tuning.runner import run_tuning
+
+
+class Tee:
+    def __init__(self, file_path: Path):
+        self.file = open(file_path, "w", encoding="utf-8")
+        self.stdout = sys.stdout
+
+    def write(self, text: str) -> None:
+        self.stdout.write(text)
+        self.stdout.flush()
+        self.file.write(text)
+        self.file.flush()
+
+    def flush(self) -> None:
+        self.stdout.flush()
+        self.file.flush()
+
+    def close(self) -> None:
+        self.file.close()
+
+
+if __name__ == "__main__":
+    script_dir = Path(__file__).resolve().parent
+    repo_root = Path(__file__).resolve().parents[6]
+    output_dir = repo_root / "outputs/usa/results/ml_models"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = output_dir / f"model2_tuning_lgbm_{timestamp}.txt"
+    tee = Tee(output_file)
+    sys.stdout = tee
+    try:
+        run_tuning(region="usa", model="lgbm", script_dir=script_dir, output_dir=output_dir)
+    finally:
+        tee.close()

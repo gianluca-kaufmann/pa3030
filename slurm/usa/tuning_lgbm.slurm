@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=results_model2_RF
-#SBATCH --partition=normal.4h
-#SBATCH --time=04:00:00
+#SBATCH --job-name=tuning_lgbm_usa
+#SBATCH --partition=normal.24h
+#SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem-per-cpu=16G
-#SBATCH --output=/cluster/scratch/%u/logs/results_model2_RF_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/results_model2_RF_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/model2_tuning_lgbm_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/model2_tuning_lgbm_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -27,37 +27,39 @@ module load cuda/12.4.1
 module load eth_proxy
 
 #------------------------------------------------------------------------------
-# Activate the Python virtual environment (uav-genAI-opti)
+# Activate the Python virtual environment (master-thesis)
 #------------------------------------------------------------------------------
 VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
-# Set threading/CPU hints for faster NumPy/PyArrow (use all allocated CPUs)
+# Paper-mode defaults (overridable by pre-set env vars)
 #------------------------------------------------------------------------------
-export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
-export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
-export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
-export VECLIB_MAXIMUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
-export NUMEXPR_NUM_THREADS=${SLURM_CPUS_PER_TASK:-8}
+export TUNING_MODE="${TUNING_MODE:-paper}"
+export TUNING_OPTIMIZER="${TUNING_OPTIMIZER:-optuna}"
+export CV_STRATEGY="${CV_STRATEGY:-rolling}"
+export ROLLING_FOLDS="${ROLLING_FOLDS:-5}"
+export MAX_NEG_PER_YEAR_PAPER="${MAX_NEG_PER_YEAR_PAPER:-150000}"
+export MAX_NEG_PER_YEAR_FAST="${MAX_NEG_PER_YEAR_FAST:-50000}"
+export N_ITER_LGBM_PAPER="${N_ITER_LGBM_PAPER:-140}"
+export N_ITER_LGBM_FAST="${N_ITER_LGBM_FAST:-50}"
+export TUNING_RANDOM_STATE="${TUNING_RANDOM_STATE:-42}"
 
 #------------------------------------------------------------------------------
-# Run the model2_results script with RF model type (main split)
+# Run the model2_tuning_lgbm script
 #------------------------------------------------------------------------------
-echo "Starting model2_results script (RF mode, main split)..."
+echo "Starting model2_tuning_lgbm script..."
+echo "Mode=$TUNING_MODE Optimizer=$TUNING_OPTIMIZER CV=$CV_STRATEGY Folds=$ROLLING_FOLDS"
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/regions/usa/4_ml/5_results/model2_results" ] || {
-  echo "ERROR: model2_results not found"
-  echo "NOTE: model2_results script is in ML/results/ directory"
-  find scripts -maxdepth 4 -type f -name "model2_results"
+[ -f "scripts/regions/usa/4_ml/2_tuning/model2_tuning_lgbm" ] || {
+  echo "ERROR: model2_tuning_lgbm not found"
   exit 1
 }
-# Run the script (main split, RF model type, prefers calibrated predictions if available)
-# --allow_test_shap: use test set for SHAP when earlystop/train unavailable
-python "scripts/regions/usa/4_ml/5_results/model2_results" --model_type rf --split-version main --allow_test_shap
 
-echo "model2_results script (RF mode, main split) finished."
+python "scripts/regions/usa/4_ml/2_tuning/model2_tuning_lgbm"
+
+echo "model2_tuning_lgbm script finished."

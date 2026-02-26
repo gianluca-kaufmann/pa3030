@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+from typing import Dict, List
+
+import numpy as np
+
+
+def get_lgbm_fixed_params(random_state: int, n_jobs: int) -> Dict:
+    return {
+        "random_state": random_state,
+        "n_jobs": n_jobs,
+        "boosting_type": "gbdt",
+        "objective": "binary",
+        "verbose": -1,
+    }
+
+
+def get_rf_fixed_params(random_state: int, n_jobs: int) -> Dict:
+    return {
+        "random_state": random_state,
+        "n_jobs": n_jobs,
+        "class_weight": "balanced_subsample",
+        "bootstrap": True,
+        "verbose": 0,
+    }
+
+
+def get_lgbm_randomized_space(mode: str, auto_scale_pos_weight: float) -> Dict[str, List]:
+    mode = mode.lower()
+    base = {
+        "num_leaves": [31, 63, 127],
+        "max_depth": [-1, 15, 25],
+        "learning_rate": [0.03, 0.05, 0.1],
+        "min_child_samples": [20, 50, 100],
+        "subsample": [0.7, 0.9],
+        "colsample_bytree": [0.7, 0.9],
+        "reg_alpha": [0.0, 0.1, 1.0],
+        "reg_lambda": [0.0, 0.1, 1.0, 5.0],
+        "scale_pos_weight": [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, float(auto_scale_pos_weight)],
+    }
+    if mode == "paper":
+        base.update(
+            {
+                "num_leaves": [31, 63, 127, 255],
+                "max_depth": [-1, 10, 15, 25, 35],
+                "learning_rate": [0.01, 0.03, 0.05, 0.1],
+                "min_child_samples": [10, 20, 40, 80, 120],
+                "subsample": [0.6, 0.7, 0.8, 0.9, 1.0],
+                "colsample_bytree": [0.6, 0.7, 0.8, 0.9, 1.0],
+                "reg_alpha": [0.0, 0.1, 1.0, 2.0, 5.0],
+                "reg_lambda": [0.0, 0.1, 1.0, 5.0, 10.0],
+                "scale_pos_weight": [
+                    1.0,
+                    2.0,
+                    5.0,
+                    10.0,
+                    20.0,
+                    50.0,
+                    100.0,
+                    200.0,
+                    400.0,
+                    float(auto_scale_pos_weight),
+                ],
+            }
+        )
+    # deduplicate while preserving order
+    seen = set()
+    dedup_spw = []
+    for v in base["scale_pos_weight"]:
+        if v not in seen:
+            dedup_spw.append(v)
+            seen.add(v)
+    base["scale_pos_weight"] = dedup_spw
+    return base
+
+
+def get_rf_randomized_space(mode: str) -> Dict[str, List]:
+    mode = mode.lower()
+    if mode == "paper":
+        return {
+            "n_estimators": [200, 400, 800],
+            "max_depth": [15, 20, 30, None],
+            "max_features": ["sqrt", "log2", 0.2, 0.3, 0.5],
+            "min_samples_leaf": [1, 2, 5, 10],
+            "min_samples_split": [2, 5, 10, 20],
+            "bootstrap": [True],
+        }
+    return {
+        "n_estimators": [200, 500],
+        "max_depth": [15, 20, None],
+        "max_features": ["sqrt", "log2", 0.3],
+        "min_samples_leaf": [2, 5, 10],
+    }
+
+
+def get_lgbm_optuna_bounds(mode: str, auto_scale_pos_weight: float) -> Dict:
+    if mode.lower() == "paper":
+        return {
+            "num_leaves": (31, 255),
+            "max_depth_choices": [-1, 10, 15, 20, 25, 35],
+            "learning_rate": (0.01, 0.12),
+            "min_child_samples": (10, 160),
+            "subsample": (0.6, 1.0),
+            "colsample_bytree": (0.6, 1.0),
+            "reg_alpha": (1e-6, 10.0),
+            "reg_lambda": (1e-6, 20.0),
+            "scale_pos_weight": (max(1.0, auto_scale_pos_weight / 5.0), max(20.0, auto_scale_pos_weight * 2.0)),
+            "n_estimators": (400, 3000),
+        }
+    return {
+        "num_leaves": (31, 127),
+        "max_depth_choices": [-1, 15, 25],
+        "learning_rate": (0.02, 0.12),
+        "min_child_samples": (20, 120),
+        "subsample": (0.7, 1.0),
+        "colsample_bytree": (0.7, 1.0),
+        "reg_alpha": (1e-6, 5.0),
+        "reg_lambda": (1e-6, 10.0),
+        "scale_pos_weight": (max(1.0, auto_scale_pos_weight / 8.0), max(10.0, auto_scale_pos_weight * 1.5)),
+        "n_estimators": (300, 1800),
+    }
+
+
+def get_rf_optuna_bounds(mode: str) -> Dict:
+    if mode.lower() == "paper":
+        return {
+            "n_estimators": (200, 1200),
+            "max_depth_choices": [None, 15, 20, 25, 30, 40],
+            "max_features_choices": ["sqrt", "log2", 0.2, 0.3, 0.5],
+            "min_samples_leaf": (1, 15),
+            "min_samples_split": (2, 30),
+            "bootstrap_choices": [True],
+        }
+    return {
+        "n_estimators": (150, 600),
+        "max_depth_choices": [None, 15, 20, 25],
+        "max_features_choices": ["sqrt", "log2", 0.3],
+        "min_samples_leaf": (1, 10),
+        "min_samples_split": (2, 20),
+        "bootstrap_choices": [True],
+    }
+
+
+def compute_auto_scale_pos_weight(y: np.ndarray) -> float:
+    pos = float((y > 0).sum())
+    neg = float((y == 0).sum())
+    return float(neg / max(pos, 1.0))

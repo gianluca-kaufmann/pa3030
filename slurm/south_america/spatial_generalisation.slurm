@@ -41,13 +41,13 @@ echo "Starting spatial_generalisation script (South America)..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/regions/south_america/4_ml/3_evaluation/spatial_generalisation" ] || {
+[ -f "scripts/regions/south_america/4_ml/4_evaluation/spatial_generalisation" ] || {
   echo "ERROR: spatial_generalisation not found"
-  echo "NOTE: spatial_generalisation script is in scripts/regions/south_america/4_ml/3_evaluation/ directory"
+  echo "NOTE: spatial_generalisation script is in scripts/regions/south_america/4_ml/4_evaluation/ directory"
   find scripts -maxdepth 6 -type f -name "spatial_generalisation"
   exit 1
 }
 # Run the script (processes both RF and LGBM internally, no arguments needed)
-python "scripts/regions/south_america/4_ml/3_evaluation/spatial_generalisation"
+python "scripts/regions/south_america/4_ml/4_evaluation/spatial_generalisation"
 
 echo "spatial_generalisation script (South America) finished."

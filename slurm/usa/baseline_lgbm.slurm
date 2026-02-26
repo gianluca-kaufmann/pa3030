@@ -41,13 +41,13 @@ echo "Starting baseline_LGBM script..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/regions/usa/4_ml/2_training/baseline_LGBM" ] || {
+[ -f "scripts/regions/usa/4_ml/3_training/baseline_LGBM" ] || {
   echo "ERROR: baseline_LGBM not found"
-  echo "NOTE: baseline_LGBM script is in scripts/regions/usa/4_ml/2_training/ directory"
+  echo "NOTE: baseline_LGBM script is in scripts/regions/usa/4_ml/3_training/ directory"
   find scripts -maxdepth 6 -type f -name "baseline_LGBM"
   exit 1
 }
 # Run the script
-python "scripts/regions/usa/4_ml/2_training/baseline_LGBM"
+python "scripts/regions/usa/4_ml/3_training/baseline_LGBM"
 
 echo "baseline_LGBM script finished."

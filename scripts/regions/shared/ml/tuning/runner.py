@@ -1,0 +1,399 @@
+from __future__ import annotations
+
+import os
+import time
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+import numpy as np
+from lightgbm import LGBMClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import average_precision_score, make_scorer
+from sklearn.model_selection import RandomizedSearchCV
+
+from .artifacts import build_metadata, save_tuning_artifact
+from .cv import SplitConfig, build_splits
+from .data import DataSummary, prepare_tuning_dataset, resolve_train_parquet
+from .search_spaces import (
+    compute_auto_scale_pos_weight,
+    get_lgbm_fixed_params,
+    get_lgbm_randomized_space,
+    get_rf_fixed_params,
+    get_rf_randomized_space,
+)
+
+
+TARGET_COL = "transition_01_win5"
+YEAR_COL = "year"
+PR_AUC_SCORER = make_scorer(average_precision_score, response_method="predict_proba")
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    region: str
+    model: str
+    script_dir: Path
+    output_dir: Path
+    repo_root: Path
+    random_state: int
+    tuning_mode: str
+    optimizer: str
+    cv_strategy: str
+    train_year_max: int
+    val_year_min: int
+    val_year_max: int
+    rolling_folds: int
+    min_year: int
+    max_neg_per_year_fast: int
+    max_neg_per_year_paper: int
+    adaptive_cap_enabled: bool
+    adaptive_ratio_target: float
+    adaptive_min_cap: int
+    adaptive_max_cap: int
+    n_iter_lgbm_fast: int
+    n_iter_lgbm_paper: int
+    n_iter_rf_fast: int
+    n_iter_rf_paper: int
+    n_jobs: int
+
+
+def _get_n_jobs() -> int:
+    try:
+        cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+        return int(cpus) if cpus else -1
+    except Exception:
+        return -1
+
+
+def get_repo_root() -> Path:
+    env_root = os.environ.get("PROJECT_ROOT") or os.environ.get("REPO_ROOT")
+    if env_root:
+        return Path(env_root).resolve()
+    current = Path(__file__).resolve()
+    for _ in range(12):
+        current = current.parent
+        if (current / "README.md").exists():
+            return current
+    raise RuntimeError("Repository root not found. Set PROJECT_ROOT or REPO_ROOT.")
+
+
+def load_runtime_config(region: str, model: str, script_dir: Path, output_dir: Path) -> RuntimeConfig:
+    tuning_mode = os.environ.get("TUNING_MODE", "paper").strip().lower()
+    if tuning_mode not in {"fast", "paper"}:
+        raise ValueError(f"Invalid TUNING_MODE='{tuning_mode}'. Expected fast or paper.")
+
+    optimizer_default = "randomized" if tuning_mode == "fast" else "optuna"
+    cv_default = "holdout" if tuning_mode == "fast" else "rolling"
+    optimizer = os.environ.get("TUNING_OPTIMIZER", optimizer_default).strip().lower()
+    cv_strategy = os.environ.get("CV_STRATEGY", cv_default).strip().lower()
+    if optimizer not in {"randomized", "optuna"}:
+        raise ValueError(f"Invalid TUNING_OPTIMIZER='{optimizer}'. Expected randomized or optuna.")
+    if cv_strategy not in {"holdout", "rolling"}:
+        raise ValueError(f"Invalid CV_STRATEGY='{cv_strategy}'. Expected holdout or rolling.")
+
+    repo_root = get_repo_root()
+    n_jobs = _get_n_jobs()
+
+    return RuntimeConfig(
+        region=region,
+        model=model,
+        script_dir=script_dir,
+        output_dir=output_dir,
+        repo_root=repo_root,
+        random_state=int(os.environ.get("TUNING_RANDOM_STATE", "42")),
+        tuning_mode=tuning_mode,
+        optimizer=optimizer,
+        cv_strategy=cv_strategy,
+        train_year_max=int(os.environ.get("TRAIN_YEAR_MAX", "2014")),
+        val_year_min=int(os.environ.get("VAL_YEAR_MIN", "2015")),
+        val_year_max=int(os.environ.get("VAL_YEAR_MAX", "2017")),
+        rolling_folds=int(os.environ.get("ROLLING_FOLDS", "5")),
+        min_year=int(os.environ.get("TRANSITION_MIN_YEAR", "2001")),
+        max_neg_per_year_fast=int(os.environ.get("MAX_NEG_PER_YEAR_FAST", "50000")),
+        max_neg_per_year_paper=int(os.environ.get("MAX_NEG_PER_YEAR_PAPER", "150000")),
+        adaptive_cap_enabled=os.environ.get("ADAPTIVE_NEG_CAP", "0") == "1",
+        adaptive_ratio_target=float(os.environ.get("TARGET_NEG_POS_RATIO", "50.0")),
+        adaptive_min_cap=int(os.environ.get("ADAPTIVE_NEG_CAP_MIN", "20000")),
+        adaptive_max_cap=int(os.environ.get("ADAPTIVE_NEG_CAP_MAX", "500000")),
+        n_iter_lgbm_fast=int(os.environ.get("N_ITER_LGBM_FAST", "50")),
+        n_iter_lgbm_paper=int(os.environ.get("N_ITER_LGBM_PAPER", "140")),
+        n_iter_rf_fast=int(os.environ.get("N_ITER_RF_FAST", "25")),
+        n_iter_rf_paper=int(os.environ.get("N_ITER_RF_PAPER", "120")),
+        n_jobs=n_jobs,
+    )
+
+
+def _fit_randomized_lgbm(
+    X: np.ndarray,
+    y: np.ndarray,
+    folds: List[Tuple[np.ndarray, np.ndarray]],
+    random_state: int,
+    n_jobs: int,
+    n_iter: int,
+    mode: str,
+) -> Tuple[Dict[str, Any], float]:
+    train_union_idx = np.unique(np.concatenate([tr for tr, _ in folds]))
+    auto_spw = compute_auto_scale_pos_weight(y[train_union_idx])
+    space = get_lgbm_randomized_space(mode=mode, auto_scale_pos_weight=auto_spw)
+    fixed = get_lgbm_fixed_params(random_state=random_state, n_jobs=n_jobs)
+    fixed["n_estimators"] = 1000
+    estimator = LGBMClassifier(**fixed)
+    search = RandomizedSearchCV(
+        estimator=estimator,
+        param_distributions=space,
+        n_iter=n_iter,
+        cv=folds,
+        scoring=PR_AUC_SCORER,
+        n_jobs=1,
+        random_state=random_state,
+        verbose=2,
+    )
+    search.fit(X, y)
+    return dict(search.best_params_), float(search.best_score_)
+
+
+def _fit_randomized_rf(
+    X: np.ndarray,
+    y: np.ndarray,
+    folds: List[Tuple[np.ndarray, np.ndarray]],
+    random_state: int,
+    n_jobs: int,
+    n_iter: int,
+    mode: str,
+) -> Tuple[Dict[str, Any], float]:
+    space = get_rf_randomized_space(mode=mode)
+    fixed = get_rf_fixed_params(random_state=random_state, n_jobs=n_jobs)
+    estimator = RandomForestClassifier(**fixed)
+    search = RandomizedSearchCV(
+        estimator=estimator,
+        param_distributions=space,
+        n_iter=n_iter,
+        cv=folds,
+        scoring=PR_AUC_SCORER,
+        n_jobs=1,
+        random_state=random_state,
+        verbose=2,
+    )
+    search.fit(X, y)
+    return dict(search.best_params_), float(search.best_score_)
+
+
+def _build_artifact_payload(
+    cfg: RuntimeConfig,
+    timestamp: str,
+    train_path: Path,
+    feature_count: int,
+    split_info: Dict[str, Any],
+    best_params: Dict[str, Any],
+    best_val_score: float,
+    fixed_params: Dict[str, Any],
+    search_details: Dict[str, Any],
+    data_summary: DataSummary,
+    year_sampling_stats: Dict[int, Dict[str, int]],
+) -> Dict[str, Any]:
+    metadata = build_metadata(
+        train_path=train_path,
+        target_col=TARGET_COL,
+        feature_count=feature_count,
+        year_split={
+            "train_year_max": cfg.train_year_max,
+            "val_year_min": cfg.val_year_min,
+            "val_year_max": cfg.val_year_max,
+            "min_year": cfg.min_year,
+        },
+        timestamp=timestamp,
+        mode=cfg.tuning_mode,
+        optimizer=cfg.optimizer,
+        cv_strategy=cfg.cv_strategy,
+        repo_root=cfg.repo_root,
+        seed=cfg.random_state,
+    )
+    return {
+        "best_params": best_params,
+        "best_val_score": float(best_val_score),
+        "fixed_params": fixed_params,
+        "search_details": search_details,
+        "split_info": split_info,
+        "data_summary": {
+            "n_rows_raw": data_summary.n_rows_raw,
+            "n_rows_clean": data_summary.n_rows_clean,
+            "n_rows_sampled": data_summary.n_rows_sampled,
+            "n_features": data_summary.n_features,
+            "n_pos": data_summary.n_pos,
+            "n_neg": data_summary.n_neg,
+        },
+        "year_sampling_stats": year_sampling_stats,
+        "metadata": metadata,
+    }
+
+
+def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> Dict[str, Any]:
+    if model not in {"lgbm", "rf"}:
+        raise ValueError(f"Unsupported model '{model}'")
+
+    cfg = load_runtime_config(region=region, model=model, script_dir=script_dir, output_dir=output_dir)
+    start = time.time()
+
+    max_neg_per_year = cfg.max_neg_per_year_paper if cfg.tuning_mode == "paper" else cfg.max_neg_per_year_fast
+    exclude_cols = {"transition_01", "transition_01_win5", "WDPA_b1", "WDPA_prev", "x", "y", "row", "col", YEAR_COL}
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+    train_path = resolve_train_parquet(cfg.repo_root, region=region, scratch_root=scratch_root)
+
+    df, feature_cols, data_summary, year_stats = prepare_tuning_dataset(
+        train_path=train_path,
+        target_col=TARGET_COL,
+        min_year=cfg.min_year,
+        random_state=cfg.random_state,
+        exclude_cols=exclude_cols,
+        max_neg_per_year=max_neg_per_year,
+        adaptive_cap_enabled=cfg.adaptive_cap_enabled,
+        target_neg_pos_ratio=cfg.adaptive_ratio_target,
+        adaptive_min_cap=cfg.adaptive_min_cap,
+        adaptive_max_cap=cfg.adaptive_max_cap,
+    )
+
+    split_cfg = SplitConfig(
+        train_year_max=cfg.train_year_max,
+        val_year_min=cfg.val_year_min,
+        val_year_max=cfg.val_year_max,
+        strategy=cfg.cv_strategy,
+        rolling_folds=cfg.rolling_folds,
+        year_col=YEAR_COL,
+    )
+    folds, split_info = build_splits(df=df, cfg=split_cfg)
+
+    X = df[feature_cols].to_numpy(dtype=np.float32)
+    y = (df[TARGET_COL].to_numpy() > 0).astype(np.int8)
+
+    if model == "lgbm":
+        train_union_idx = np.concatenate([tr for tr, _ in folds])
+        auto_spw = compute_auto_scale_pos_weight(y[train_union_idx])
+        fixed_params = get_lgbm_fixed_params(cfg.random_state, cfg.n_jobs)
+        fixed_params["metric"] = "average_precision"
+
+        if cfg.optimizer == "optuna":
+            from .optuna_runner import optimize_lgbm_optuna
+
+            n_trials = cfg.n_iter_lgbm_paper if cfg.tuning_mode == "paper" else cfg.n_iter_lgbm_fast
+            best_params, best_val_score, fold_records = optimize_lgbm_optuna(
+                X=X,
+                y=y,
+                folds=folds,
+                mode=cfg.tuning_mode,
+                fixed_params=fixed_params,
+                auto_scale_pos_weight=auto_spw,
+                n_trials=n_trials,
+                random_state=cfg.random_state,
+            )
+            search_details = {
+                "optimizer": "optuna",
+                "n_trials": int(n_trials),
+                "fold_records": fold_records,
+                "auto_scale_pos_weight": float(auto_spw),
+            }
+        else:
+            n_iter = cfg.n_iter_lgbm_fast if cfg.tuning_mode == "fast" else cfg.n_iter_lgbm_paper
+            best_params, best_val_score = _fit_randomized_lgbm(
+                X=X,
+                y=y,
+                folds=folds,
+                random_state=cfg.random_state,
+                n_jobs=cfg.n_jobs,
+                n_iter=n_iter,
+                mode=cfg.tuning_mode,
+            )
+            search_details = {
+                "optimizer": "randomized",
+                "n_iter": int(n_iter),
+                "auto_scale_pos_weight": float(auto_spw),
+            }
+
+        output_name = "lgbm_best_params.json"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        payload = _build_artifact_payload(
+            cfg=cfg,
+            timestamp=timestamp,
+            train_path=train_path,
+            feature_count=len(feature_cols),
+            split_info=split_info,
+            best_params=best_params,
+            best_val_score=best_val_score,
+            fixed_params=fixed_params,
+            search_details=search_details,
+            data_summary=data_summary,
+            year_sampling_stats=year_stats,
+        )
+    else:
+        fixed_params = get_rf_fixed_params(cfg.random_state, cfg.n_jobs)
+        if cfg.optimizer == "optuna":
+            from .optuna_runner import optimize_rf_optuna
+
+            n_trials = cfg.n_iter_rf_paper if cfg.tuning_mode == "paper" else cfg.n_iter_rf_fast
+            best_params, best_val_score, fold_records = optimize_rf_optuna(
+                X=X,
+                y=y,
+                folds=folds,
+                mode=cfg.tuning_mode,
+                fixed_params=fixed_params,
+                n_trials=n_trials,
+                random_state=cfg.random_state,
+            )
+            search_details = {
+                "optimizer": "optuna",
+                "n_trials": int(n_trials),
+                "fold_records": fold_records,
+            }
+        else:
+            n_iter = cfg.n_iter_rf_fast if cfg.tuning_mode == "fast" else cfg.n_iter_rf_paper
+            best_params, best_val_score = _fit_randomized_rf(
+                X=X,
+                y=y,
+                folds=folds,
+                random_state=cfg.random_state,
+                n_jobs=cfg.n_jobs,
+                n_iter=n_iter,
+                mode=cfg.tuning_mode,
+            )
+            search_details = {"optimizer": "randomized", "n_iter": int(n_iter)}
+
+        output_name = "rf_best_params.json"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        payload = _build_artifact_payload(
+            cfg=cfg,
+            timestamp=timestamp,
+            train_path=train_path,
+            feature_count=len(feature_cols),
+            split_info=split_info,
+            best_params=best_params,
+            best_val_score=best_val_score,
+            fixed_params=fixed_params,
+            search_details=search_details,
+            data_summary=data_summary,
+            year_sampling_stats=year_stats,
+        )
+
+    training_dir = script_dir.parent / "3_training"
+    if not training_dir.exists():
+        # Backward-compatible fallback if a region still uses 2_training.
+        training_dir = script_dir.parent / "2_training"
+    canonical_output_path = training_dir / output_name
+    timestamped_output_path = script_dir / f"{output_name.replace('.json', '')}_{timestamp}.json"
+    save_tuning_artifact(payload, canonical_path=canonical_output_path, timestamped_path=timestamped_output_path)
+
+    elapsed = time.time() - start
+    print("=" * 72)
+    print(f"{region.upper()} {model.upper()} tuning completed in {elapsed/60:.1f} minutes")
+    print(f"Mode: {cfg.tuning_mode} | Optimizer: {cfg.optimizer} | CV: {cfg.cv_strategy}")
+    print(f"Rows sampled: {data_summary.n_rows_sampled:,} | Features: {data_summary.n_features}")
+    print(f"Best PR-AUC: {payload['best_val_score']:.6f}")
+    print(f"Canonical artifact: {canonical_output_path}")
+    print(f"Timestamped artifact: {timestamped_output_path}")
+    print("=" * 72)
+
+    payload["paths"] = {
+        "canonical_output_path": str(canonical_output_path),
+        "timestamped_output_path": str(timestamped_output_path),
+    }
+    return payload

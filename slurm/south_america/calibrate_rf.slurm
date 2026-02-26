@@ -42,7 +42,7 @@ echo "Starting calibrate_1 script (RF mode, main split)..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/regions/south_america/4_ml/3_evaluation/calibrate_1" ] || {
+[ -f "scripts/regions/south_america/4_ml/4_evaluation/calibrate_1" ] || {
   echo "ERROR: calibrate_1 not found"
   echo "NOTE: calibrate_1 script is in ML/evaluation/ directory"
   find scripts -maxdepth 4 -type f -name "calibrate_1"
@@ -51,6 +51,6 @@ echo "PWD = $(pwd)"
 # Run the script (main split, RF model type, earlystop source for RF, platt method)
 # Note: RF doesn't have temporal CV, so we need to check if calibrate_1 supports earlystop
 # For now, using default (will need to check if RF training produces earlystop predictions)
-python "scripts/regions/south_america/4_ml/3_evaluation/calibrate_1" --model_type rf --split-version main --method platt
+python "scripts/regions/south_america/4_ml/4_evaluation/calibrate_1" --model_type rf --split-version main --method platt
 
 echo "calibrate_1 script (RF mode, main split) finished."
