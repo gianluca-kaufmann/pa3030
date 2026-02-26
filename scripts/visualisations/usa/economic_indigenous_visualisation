@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""
+USA Indigenous + Economic Value Visualisation.
+
+Creates simple map outputs for:
+  - static indigenous territories mask
+  - annual economic value (USD/ha) for selected years
+  - economic value change map (latest minus earliest selected year)
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import rasterio
+from matplotlib.colors import ListedColormap
+from scipy.ndimage import binary_dilation
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+READY_DIR = PROJECT_ROOT / "data" / "usa" / "ready"
+OUTPUT_DIR = PROJECT_ROOT / "outputs" / "usa" / "figures" / "economic_indigenous_vis"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+INDIGENOUS_PATH = READY_DIR / "indigenous_territories" / "indigenous_territories.tif"
+BACKBONE_PATH = READY_DIR / "backbone" / "backbone.tif"
+ECON_DIR = READY_DIR / "economic_value"
+YEARS = [2000, 2015, 2024]
+
+
+def read_band(path: Path) -> np.ndarray:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing raster: {path}")
+    with rasterio.open(path) as src:
+        return src.read(1)
+
+
+def plot_indigenous(mask: np.ndarray, land_mask: np.ndarray) -> None:
+    fig, ax = plt.subplots(figsize=(11, 7))
+    ax.imshow(np.where(land_mask, 1.0, np.nan), cmap="Greys", vmin=0, vmax=1, interpolation="nearest")
+    indigenous_vis = binary_dilation(mask == 1, iterations=1)
+    ax.imshow(
+        np.where(indigenous_vis, 1.0, np.nan),
+        cmap=ListedColormap(["#4E342E"]),  # dark brown
+        alpha=0.98,
+        interpolation="nearest",
+    )
+    ax.set_title("Indigenous Territories (USA)", fontsize=14, fontweight="bold")
+    ax.set_axis_off()
+    covered = int((mask == 1).sum())
+    total_land = int(land_mask.sum())
+    ax.text(
+        0.02, 0.98,
+        f"Covered land pixels: {covered:,}/{total_land:,} ({100.0 * covered / max(total_land, 1):.2f}%)",
+        transform=ax.transAxes,
+        va="top",
+        bbox={"boxstyle": "round", "facecolor": "white", "alpha": 0.85},
+    )
+    out = OUTPUT_DIR / "indigenous_mask.png"
+    fig.tight_layout()
+    fig.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_economic_years(econ_by_year: dict[int, np.ndarray]) -> None:
+    fig, axes = plt.subplots(1, len(YEARS), figsize=(6 * len(YEARS), 5.5))
+    arrays = [econ_by_year[y] for y in YEARS]
+    all_vals = np.concatenate([a[np.isfinite(a)] for a in arrays if np.isfinite(a).any()])
+    raw_low, raw_high = np.percentile(all_vals, [2, 95])
+    vmin = np.log1p(raw_low)
+    vmax = np.log1p(raw_high)
+
+    for i, year in enumerate(YEARS):
+        ax = axes[i]
+        arr = econ_by_year[year]
+        arr_clip = np.clip(arr, raw_low, raw_high)
+        arr_log = np.where(np.isfinite(arr_clip), np.log1p(arr_clip), np.nan)
+        im = ax.imshow(arr_log, cmap="viridis", vmin=vmin, vmax=vmax, interpolation="nearest")
+        ax.set_title(f"Economic Value {year}\n(log1p USD/ha, clipped 2-95 pct)", fontsize=11, fontweight="bold")
+        ax.set_axis_off()
+        plt.colorbar(im, ax=ax, shrink=0.75, label="log1p(USD/ha)")
+
+    out = OUTPUT_DIR / "economic_value_selected_years.png"
+    fig.tight_layout()
+    fig.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_change(econ_by_year: dict[int, np.ndarray]) -> None:
+    start_year = YEARS[0]
+    end_year = YEARS[-1]
+    start = econ_by_year[start_year]
+    end = econ_by_year[end_year]
+    valid = np.isfinite(start) & np.isfinite(end) & (start > 0)
+    change_pct = np.full_like(start, np.nan, dtype=np.float32)
+    change_pct[valid] = 100.0 * (end[valid] - start[valid]) / start[valid]
+
+    fig, ax = plt.subplots(figsize=(11, 7))
+    finite = change_pct[np.isfinite(change_pct)]
+    vmax = np.percentile(np.abs(finite), 95) if finite.size else 1.0
+    im = ax.imshow(change_pct, cmap="RdBu_r", vmin=-vmax, vmax=vmax, interpolation="nearest")
+    ax.set_title(
+        f"Economic Value Change ({end_year} - {start_year})",
+        fontsize=14,
+        fontweight="bold",
+    )
+    ax.set_axis_off()
+    plt.colorbar(im, ax=ax, shrink=0.75, label="% change (clipped to 95th abs pct)")
+
+    out = OUTPUT_DIR / "economic_value_change.png"
+    fig.tight_layout()
+    fig.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def main() -> None:
+    print("USA Indigenous + Economic Value Visualisation")
+    print("=" * 60)
+    print(f"Output: {OUTPUT_DIR}")
+
+    mask = read_band(INDIGENOUS_PATH)
+    backbone = read_band(BACKBONE_PATH)
+    econ_by_year = {y: read_band(ECON_DIR / f"economic_value_{y}.tif") for y in YEARS}
+    land_mask = backbone == 1
+
+    plot_indigenous(mask, land_mask)
+    plot_economic_years(econ_by_year)
+    plot_change(econ_by_year)
+
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()

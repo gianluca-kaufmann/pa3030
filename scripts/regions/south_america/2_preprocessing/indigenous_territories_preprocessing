@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""
+Indigenous Territories Preprocessing — South America
+===================================================
+
+Converts LandMark indigenous/community polygons into a static backbone-aligned
+binary raster for the South America pipeline.
+
+Input:
+  data/shared/indigenous_territories/LandMark_IPLC_poly_public_*.shp
+
+Output:
+  data/south_america/ready/indigenous_territories/indigenous_territories.tif
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import geopandas as gpd
+import numpy as np
+import rasterio
+from rasterio.features import rasterize
+from shapely.geometry import box
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
+DATA_DIR = PROJECT_ROOT / "data"
+READY_DIR = DATA_DIR / "south_america" / "ready"
+
+BACKBONE_PATH = READY_DIR / "backbone" / "backbone.tif"
+LANDMARK_DIR = DATA_DIR / "shared" / "indigenous_territories"
+OUTPUT_DIR = READY_DIR / "indigenous_territories"
+OUTPUT_PATH = OUTPUT_DIR / "indigenous_territories.tif"
+
+# South America coverage used in this project.
+# FRA is included to retain French Guiana polygons.
+SA_ISO3 = {
+    "ARG", "BOL", "BRA", "CHL", "COL", "ECU",
+    "FRA", "GUY", "PRY", "PER", "SUR", "URY", "VEN",
+}
+
+
+def find_landmark_polygon() -> Path:
+    matches = sorted(LANDMARK_DIR.glob("LandMark_IPLC_poly_public_*.shp"))
+    if not matches:
+        raise FileNotFoundError(
+            f"No LandMark polygon shapefile found in {LANDMARK_DIR} "
+            f"(expected LandMark_IPLC_poly_public_*.shp)."
+        )
+    return matches[0]
+
+
+def load_backbone():
+    if not BACKBONE_PATH.exists():
+        raise FileNotFoundError(f"Backbone raster not found: {BACKBONE_PATH}")
+
+    with rasterio.open(BACKBONE_PATH) as src:
+        profile = src.profile.copy()
+        backbone = src.read(1)
+        crs = src.crs
+        transform = src.transform
+        bounds = src.bounds
+        shape = (src.height, src.width)
+    return profile, backbone, crs, transform, bounds, shape
+
+
+def main() -> None:
+    print("Indigenous Territories Preprocessing — South America")
+    print("=" * 60)
+
+    shp_path = find_landmark_polygon()
+    profile, backbone, backbone_crs, transform, bounds, shape = load_backbone()
+    bbox_geom = box(bounds.left, bounds.bottom, bounds.right, bounds.top)
+
+    print(f"Input shapefile: {shp_path}")
+    print(f"Backbone: {BACKBONE_PATH}")
+
+    # Try bbox-filtered read first (fast path for large global file).
+    try:
+        gdf = gpd.read_file(shp_path, bbox=bbox_geom)
+    except Exception:
+        gdf = gpd.read_file(shp_path)
+
+    if gdf.empty:
+        raise RuntimeError("LandMark dataset returned no features.")
+    if "iso_code" not in gdf.columns:
+        raise ValueError("Expected 'iso_code' column in LandMark shapefile.")
+
+    gdf = gdf[gdf["iso_code"].isin(SA_ISO3)].copy()
+    if gdf.empty:
+        raise RuntimeError("No LandMark features matched South America ISO3 filter.")
+
+    if gdf.crs is None:
+        raise ValueError("LandMark shapefile has no CRS.")
+    gdf = gdf.to_crs(backbone_crs)
+    gdf = gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty].copy()
+
+    # Clip to backbone extent to remove non-SA geometry remnants.
+    gdf = gpd.clip(gdf, gpd.GeoDataFrame(geometry=[bbox_geom], crs=backbone_crs))
+    if gdf.empty:
+        raise RuntimeError("No LandMark geometries intersect the South America backbone.")
+
+    mask = rasterize(
+        ((geom, 1) for geom in gdf.geometry),
+        out_shape=shape,
+        transform=transform,
+        fill=0,
+        dtype="uint8",
+        all_touched=True,
+    ).astype(np.uint8)
+    mask[backbone == 0] = 0
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_profile = profile.copy()
+    out_profile.update(
+        dtype="uint8",
+        count=1,
+        nodata=0,
+        compress="lzw",
+        tiled=True,
+        blockxsize=512,
+        blockysize=512,
+    )
+    with rasterio.open(OUTPUT_PATH, "w", **out_profile) as dst:
+        dst.write(mask, 1)
+
+    covered = int((mask == 1).sum())
+    total_land = int((backbone == 1).sum())
+    print(f"Saved: {OUTPUT_PATH}")
+    print(f"Covered pixels: {covered:,}/{total_land:,} ({100.0 * covered / max(total_land, 1):.2f}%)")
+
+
+if __name__ == "__main__":
+    main()

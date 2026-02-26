@@ -75,7 +75,8 @@ SMOOTH_SIZES = [16, 64]
 STATIC_DISTANCE_MAPPING = {
     'road_infrastructure_b1': 'dist_road',
     'oil_gas_b1': 'dist_oil_gas',
-    'powerplants_b1': 'dist_powerplant'
+    'powerplants_b1': 'dist_powerplant',
+    'indigenous_territories_b1': 'dist_indigenous',
 }
 STATIC_SMOOTH_VARIABLES = ['elevation', 'slope']
 STATIC_SMOOTH_SIZES = [4, 16, 64]
@@ -299,9 +300,15 @@ def compute_all_smooth_features(df: pd.DataFrame, smooth_variables: list[str] | 
     return df
 
 
-def compute_lag_feature(input_path: Path, year: int, wdpa_col: str = 'WDPA_b1') -> pd.DataFrame:
-    """Compute WDPA_prev (1-year lag) for a given year by joining with previous year."""
-    logger.info(f"  Computing lag feature (WDPA_prev) for year {year} using column '{wdpa_col}'...")
+def compute_lag_feature(
+    input_path: Path,
+    year: int,
+    source_col: str,
+    output_col: str,
+    fill_value: float | int | None = None,
+) -> pd.DataFrame:
+    """Compute a generic 1-year lag feature for a given column."""
+    logger.info(f"  Computing lag feature ({output_col}) for year {year} using column '{source_col}'...")
     
     # Read minimal columns for current year
     df_curr = pd.read_parquet(
@@ -313,22 +320,23 @@ def compute_lag_feature(input_path: Path, year: int, wdpa_col: str = 'WDPA_b1') 
     # Read minimal columns for previous year
     df_prev = pd.read_parquet(
         input_path,
-        columns=['row', 'col', 'year', wdpa_col],
+        columns=['row', 'col', 'year', source_col],
         filters=[('year', '==', year - 1)]
     )
     
     # Rename for join
-    df_prev = df_prev.rename(columns={wdpa_col: 'WDPA_prev'})
+    df_prev = df_prev.rename(columns={source_col: output_col})
     df_prev = df_prev.drop(columns=['year'])
     
     # Merge on spatial coordinates
     df_merged = df_curr.merge(df_prev, on=['row', 'col'], how='left')
     
-    # Fill missing with 0 (pixels that didn't exist in previous year)
-    df_merged['WDPA_prev'] = df_merged['WDPA_prev'].fillna(0)
+    if fill_value is not None:
+        # Fill missing where requested (e.g., WDPA_prev = 0)
+        df_merged[output_col] = df_merged[output_col].fillna(fill_value)
     
     # Keep only the new column
-    result = df_merged[['row', 'col', 'WDPA_prev']].copy()
+    result = df_merged[['row', 'col', output_col]].copy()
     
     del df_curr, df_prev, df_merged
     gc.collect()
@@ -346,6 +354,7 @@ def process_year(
     distance_mapping: dict[str, str] | None = None,
     smooth_time_vars: list[str] | None = None,
     wdpa_col: str = 'WDPA_b1',
+    economic_value_col: str | None = None,
 ) -> tuple[Path | None, dict]:
     """Process a single year and return temp file path + metrics."""
     start_time = time.time()
@@ -363,7 +372,13 @@ def process_year(
     
     # Step 1: Add WDPA_prev (1-year lag)
     if not is_first_year:
-        df_lag = compute_lag_feature(input_path, year, wdpa_col=wdpa_col)
+        df_lag = compute_lag_feature(
+            input_path,
+            year,
+            source_col=wdpa_col,
+            output_col='WDPA_prev',
+            fill_value=0,
+        )
         df_year = df_year.merge(df_lag, on=['row', 'col'], how='left')
         n_nan_prev = df_year['WDPA_prev'].isna().sum()
         if n_nan_prev > 0:
@@ -374,6 +389,25 @@ def process_year(
     else:
         logger.info(f"  First year {year}: setting WDPA_prev = 0")
         df_year['WDPA_prev'] = np.uint8(0)
+
+    # Step 1b: Add lagged economic value and drop contemporaneous value to avoid simultaneity
+    if economic_value_col is not None:
+        if not is_first_year:
+            df_econ_lag = compute_lag_feature(
+                input_path,
+                year,
+                source_col=economic_value_col,
+                output_col='economic_value_lag1',
+                fill_value=None,
+            )
+            df_year = df_year.merge(df_econ_lag, on=['row', 'col'], how='left')
+            del df_econ_lag
+            gc.collect()
+        else:
+            df_year['economic_value_lag1'] = np.nan
+
+        if economic_value_col in df_year.columns:
+            df_year = df_year.drop(columns=[economic_value_col])
     
     # Step 2: Compute spatial features on FULL grid (before Risk Set filtering)
     logger.info(f"  Computing spatial features on full grid ({n_rows_initial:,} rows)...")
@@ -741,6 +775,14 @@ def main() -> None:
     
     if resolved_smooth_time_vars != list(SMOOTH_VARIABLES):
         logger.info(f"  Resolved SMOOTH_VARIABLES: {resolved_smooth_time_vars}")
+
+    # Resolve economic value column for lagged feature creation (and dropping contemporaneous value)
+    economic_value_col: str | None = None
+    for candidate in ['economic_value_b1', 'economic_value']:
+        if candidate in available_cols:
+            economic_value_col = candidate
+            logger.info(f"  Economic value column detected: {economic_value_col} (will create economic_value_lag1)")
+            break
     
     df_sample = pd.read_parquet(input_path, columns=['year'])
     years = sorted(df_sample['year'].unique())
@@ -832,6 +874,7 @@ def main() -> None:
                 distance_mapping=resolved_distance_mapping,
                 smooth_time_vars=resolved_smooth_time_vars,
                 wdpa_col=wdpa_col,
+                economic_value_col=economic_value_col,
             )
             if temp_file is not None:
                 temp_files.append(temp_file)
