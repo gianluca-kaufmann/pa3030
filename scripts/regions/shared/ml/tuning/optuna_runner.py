@@ -1,3 +1,17 @@
+"""
+Optuna-based hyperparameter optimization for LightGBM and Random Forest.
+
+- Provides a pruning-aware search backend for paper-grade tuning runs where
+  broader parameter exploration is needed than fast randomized search.
+
+Input:
+- Feature matrix, target vector, CV folds, search mode, fixed model params, and
+  Optuna trial settings.
+
+Output:
+- Best hyperparameters, best validation PR-AUC, and trial summary records.
+"""
+
 from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple

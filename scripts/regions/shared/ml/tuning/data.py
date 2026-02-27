@@ -1,11 +1,29 @@
+"""
+Data loading, filtering, and class-balanced sampling for tuning datasets.
+
+- Prepares very large train parquet files into a memory-feasible risk-set sample
+  while preserving temporal class structure for robust hyperparameter search.
+
+Input:
+- Region train parquet path plus sampling/filter configuration (target, years,
+  negative caps, exclusions, random seed).
+
+Output:
+- A sampled tuning dataframe, selected feature list, dataset summary, and
+  per-year sampling statistics.
+"""
+
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 
 @dataclass(frozen=True)
@@ -167,25 +185,162 @@ def prepare_tuning_dataset(
     adaptive_min_cap: int,
     adaptive_max_cap: int,
 ) -> Tuple[pd.DataFrame, List[str], DataSummary, Dict[int, Dict[str, int]]]:
-    raw = pd.read_parquet(train_path)
-    clean = clean_and_filter_risk_set(raw, target_col=target_col, min_year=min_year)
-    sampled, year_stats = sample_per_year(
-        clean,
-        target_col=target_col,
-        random_state=random_state,
-        base_max_neg_per_year=max_neg_per_year,
-        adaptive_enabled=adaptive_cap_enabled,
-        target_neg_pos_ratio=target_neg_pos_ratio,
-        adaptive_min_cap=adaptive_min_cap,
-        adaptive_max_cap=adaptive_max_cap,
-    )
+    parquet_file = pq.ParquetFile(train_path)
+    schema = parquet_file.schema_arrow
+
+    numeric_cols = [
+        name
+        for name, field in zip(schema.names, schema)
+        if pa.types.is_integer(field.type) or pa.types.is_floating(field.type)
+    ]
+    feature_cols = [col for col in numeric_cols if col.lower() not in {c.lower() for c in exclude_cols}]
+    keep_cols = list(dict.fromkeys(feature_cols + [target_col, "year", "WDPA_prev"]))
+
+    n_rows_raw = int(parquet_file.metadata.num_rows) if parquet_file.metadata is not None else 0
+
+    # Pass 1: gather year-level class counts after risk-set and min-year filtering.
+    year_pos_counts: Dict[int, int] = {}
+    year_neg_counts: Dict[int, int] = {}
+    n_rows_clean = 0
+    for batch in parquet_file.iter_batches(batch_size=200_000, columns=[target_col, "year", "WDPA_prev"], use_threads=True):
+        batch_table = batch
+        target_np = batch_table[target_col].to_numpy(zero_copy_only=False)
+        year_np = batch_table["year"].to_numpy(zero_copy_only=False)
+        wdpa_prev_np = batch_table["WDPA_prev"].to_numpy(zero_copy_only=False)
+
+        valid_mask = ~batch_table[target_col].is_null().to_numpy(zero_copy_only=False)
+        base_mask = valid_mask & (year_np >= min_year) & (wdpa_prev_np == 0)
+        if not base_mask.any():
+            continue
+
+        y_valid = (target_np[base_mask] > 0).astype(np.int8)
+        years_valid = year_np[base_mask].astype(np.int32)
+        n_rows_clean += int(len(y_valid))
+
+        unique_years = np.unique(years_valid)
+        for year in unique_years:
+            year = int(year)
+            year_mask = years_valid == year
+            pos_count = int(y_valid[year_mask].sum())
+            total_count = int(year_mask.sum())
+            neg_count = total_count - pos_count
+            year_pos_counts[year] = year_pos_counts.get(year, 0) + pos_count
+            year_neg_counts[year] = year_neg_counts.get(year, 0) + neg_count
+
+        del batch_table, target_np, year_np, wdpa_prev_np, valid_mask, base_mask, y_valid, years_valid
+
+    if n_rows_clean == 0:
+        raise ValueError(f"No rows remain after filtering train_path={train_path}, min_year={min_year}.")
+
+    year_neg_caps: Dict[int, int] = {}
+    year_stats: Dict[int, Dict[str, int]] = {}
+    for year in sorted(set(year_pos_counts.keys()) | set(year_neg_counts.keys())):
+        pos_count = int(year_pos_counts.get(year, 0))
+        neg_original = int(year_neg_counts.get(year, 0))
+        cap = get_negative_cap(
+            year_pos_count=pos_count,
+            base_cap=max_neg_per_year,
+            adaptive_enabled=adaptive_cap_enabled,
+            target_neg_pos_ratio=target_neg_pos_ratio,
+            min_cap=adaptive_min_cap,
+            max_cap=adaptive_max_cap,
+        )
+        year_neg_caps[year] = int(cap)
+        year_stats[year] = {
+            "pos_kept": pos_count,
+            "neg_kept": 0,
+            "neg_original": neg_original,
+            "neg_cap": int(cap),
+        }
+
+    # Pass 2: stream rows and keep all positives + bounded random negatives per year.
+    parquet_file = pq.ParquetFile(train_path)
+    rng = np.random.default_rng(random_state)
+    pos_frames: List[pd.DataFrame] = []
+    neg_frames_by_year: Dict[int, pd.DataFrame] = {}
+    neg_scores_by_year: Dict[int, np.ndarray] = {}
+
+    for batch in parquet_file.iter_batches(batch_size=200_000, columns=keep_cols, use_threads=True):
+        batch_table = batch
+        target_np = batch_table[target_col].to_numpy(zero_copy_only=False)
+        year_np = batch_table["year"].to_numpy(zero_copy_only=False)
+        wdpa_prev_np = batch_table["WDPA_prev"].to_numpy(zero_copy_only=False)
+
+        valid_mask = ~batch_table[target_col].is_null().to_numpy(zero_copy_only=False)
+        base_mask = valid_mask & (year_np >= min_year) & (wdpa_prev_np == 0)
+        if not base_mask.any():
+            continue
+
+        target_valid = target_np[base_mask]
+        years_valid = year_np[base_mask].astype(np.int32)
+        y_bin = (target_valid > 0).astype(np.int8)
+
+        filtered_table = batch_table.filter(pa.array(base_mask))
+        filtered_df = filtered_table.to_pandas()
+        filtered_df[target_col] = y_bin
+
+        pos_df = filtered_df[y_bin > 0]
+        if not pos_df.empty:
+            pos_frames.append(pos_df)
+
+        neg_df = filtered_df[y_bin == 0]
+        if not neg_df.empty:
+            for year in np.unique(neg_df["year"].to_numpy()):
+                year_int = int(year)
+                cap = int(year_neg_caps.get(year_int, max_neg_per_year))
+                if cap <= 0:
+                    continue
+                year_chunk = neg_df[neg_df["year"] == year_int]
+                if year_chunk.empty:
+                    continue
+
+                chunk_scores = rng.random(len(year_chunk))
+                existing_df = neg_frames_by_year.get(year_int)
+                existing_scores = neg_scores_by_year.get(year_int)
+
+                if existing_df is None:
+                    if len(year_chunk) <= cap:
+                        neg_frames_by_year[year_int] = year_chunk.copy()
+                        neg_scores_by_year[year_int] = chunk_scores
+                    else:
+                        keep_idx = np.argpartition(chunk_scores, cap - 1)[:cap]
+                        neg_frames_by_year[year_int] = year_chunk.iloc[keep_idx].copy()
+                        neg_scores_by_year[year_int] = chunk_scores[keep_idx]
+                    continue
+
+                combined_df = pd.concat([existing_df, year_chunk], axis=0, ignore_index=True)
+                combined_scores = np.concatenate([existing_scores, chunk_scores], axis=0)
+                keep_n = min(cap, len(combined_df))
+                keep_idx = np.argpartition(combined_scores, keep_n - 1)[:keep_n]
+                neg_frames_by_year[year_int] = combined_df.iloc[keep_idx].reset_index(drop=True)
+                neg_scores_by_year[year_int] = combined_scores[keep_idx]
+
+        del batch_table, target_np, year_np, wdpa_prev_np, valid_mask, base_mask
+        del target_valid, years_valid, y_bin, filtered_table, filtered_df, pos_df, neg_df
+
+    sampled_frames: List[pd.DataFrame] = []
+    if pos_frames:
+        sampled_frames.append(pd.concat(pos_frames, axis=0, ignore_index=True))
+    for year in sorted(neg_frames_by_year):
+        year_neg_df = neg_frames_by_year[year]
+        sampled_frames.append(year_neg_df)
+        year_stats[year]["neg_kept"] = int(len(year_neg_df))
+
+    if not sampled_frames:
+        raise ValueError("Sampling produced an empty tuning dataset.")
+
+    sampled = pd.concat(sampled_frames, axis=0, ignore_index=True)
+    sampled = sampled.sample(frac=1.0, random_state=random_state).reset_index(drop=True)
     sampled = _downcast_numeric(sampled)
-    feature_cols = get_feature_columns(sampled, exclude_cols=exclude_cols)
     pos = int((sampled[target_col] > 0).sum())
     neg = int((sampled[target_col] == 0).sum())
+
+    del pos_frames, neg_frames_by_year, neg_scores_by_year, sampled_frames
+    gc.collect()
+
     summary = DataSummary(
-        n_rows_raw=int(len(raw)),
-        n_rows_clean=int(len(clean)),
+        n_rows_raw=n_rows_raw,
+        n_rows_clean=int(n_rows_clean),
         n_rows_sampled=int(len(sampled)),
         n_features=int(len(feature_cols)),
         n_pos=pos,

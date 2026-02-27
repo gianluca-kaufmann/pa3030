@@ -1,3 +1,17 @@
+"""
+Search-space and fixed-parameter definitions for tuning classifiers.
+
+- Separates model-specific parameter ranges from execution code so tuning modes
+  (fast vs paper) are easy to compare and maintain.
+
+Input:
+- Tuning mode, random seed/CPU settings, and class-imbalance signal from labels.
+
+Output:
+- Fixed estimator parameters, randomized-search grids, Optuna bounds, and
+  auto-computed class-weight guidance.
+"""
+
 from __future__ import annotations
 
 from typing import Dict, List

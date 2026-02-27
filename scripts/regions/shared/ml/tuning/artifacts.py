@@ -1,3 +1,18 @@
+"""
+Utilities to build and save tuning artifacts with reproducibility metadata.
+
+- Ensures every tuning run stores comparable, machine-readable outputs with
+  dataset fingerprinting and git provenance.
+
+Input:
+- Best-parameter payload pieces (metrics, params, split/data metadata) and
+  target output paths.
+
+Output:
+- JSON artifact files (canonical + timestamped) ready for training scripts and
+  audit tracking.
+"""
+
 from __future__ import annotations
 
 import hashlib

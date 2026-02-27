@@ -1,5 +1,21 @@
+"""
+Main orchestration pipeline for regional hyperparameter tuning.
+
+- Coordinates dataset preparation, temporal CV, optimizer selection, and
+  artifact writing in one reproducible flow shared across regions/models.
+
+Input:
+- Region/model identifiers, script/output paths, and environment-driven tuning
+  configuration (mode, CV, sampling, optimizer, seeds).
+
+Output:
+- Best-parameter artifact payloads (canonical + timestamped JSON) and console
+  logs summarizing data size, settings, and best validation score.
+"""
+
 from __future__ import annotations
 
+import gc
 import os
 import time
 from dataclasses import dataclass
@@ -66,6 +82,16 @@ def _get_n_jobs() -> int:
         return int(cpus) if cpus else -1
     except Exception:
         return -1
+
+
+def _report_memory_usage(label: str) -> None:
+    try:
+        import psutil
+
+        rss_gb = psutil.Process().memory_info().rss / (1024**3)
+        print(f"[Memory] {label}: RSS {rss_gb:.2f} GB")
+    except Exception:
+        pass
 
 
 def get_repo_root() -> Path:
@@ -261,6 +287,7 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
         adaptive_min_cap=cfg.adaptive_min_cap,
         adaptive_max_cap=cfg.adaptive_max_cap,
     )
+    _report_memory_usage("after data sampling")
 
     split_cfg = SplitConfig(
         train_year_max=cfg.train_year_max,
@@ -271,9 +298,13 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
         year_col=YEAR_COL,
     )
     folds, split_info = build_splits(df=df, cfg=split_cfg)
+    _report_memory_usage("after split construction")
 
     X = df[feature_cols].to_numpy(dtype=np.float32)
     y = (df[TARGET_COL].to_numpy() > 0).astype(np.int8)
+    del df
+    gc.collect()
+    _report_memory_usage("after matrix materialization")
 
     if model == "lgbm":
         train_union_idx = np.concatenate([tr for tr, _ in folds])

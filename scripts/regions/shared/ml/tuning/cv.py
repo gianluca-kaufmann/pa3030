@@ -1,3 +1,16 @@
+"""
+Temporal split builders for tuning holdout and rolling cross-validation.
+
+- Keeps time-aware validation logic in one place so tuning remains consistent
+  and avoids data leakage across years.
+
+Input:
+- A dataframe with a year column and split configuration parameters.
+
+Output:
+- Index-based fold tuples and a split-info dictionary for logging/artifacts.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
