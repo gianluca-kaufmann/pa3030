@@ -58,8 +58,6 @@ def optimize_lgbm_optuna(
             "reg_lambda": trial.suggest_float("reg_lambda", bounds["reg_lambda"][0], bounds["reg_lambda"][1], log=True),
             "scale_pos_weight": trial.suggest_float("scale_pos_weight", bounds["scale_pos_weight"][0], bounds["scale_pos_weight"][1], log=True),
             "n_estimators": trial.suggest_int("n_estimators", bounds["n_estimators"][0], bounds["n_estimators"][1]),
-            "objective": "binary",
-            "metric": "average_precision",
         }
         fold_scores: List[float] = []
         for fold_idx, (train_idx, val_idx) in enumerate(folds, start=1):
@@ -122,9 +120,11 @@ def optimize_rf_optuna(
             "min_samples_split": trial.suggest_int("min_samples_split", bounds["min_samples_split"][0], bounds["min_samples_split"][1]),
             "bootstrap": trial.suggest_categorical("bootstrap", bounds["bootstrap_choices"]),
         }
+        # Exclude params already in fixed_params to avoid "multiple values" TypeError
+        params_for_clf = {k: v for k, v in params.items() if k not in fixed_params}
         fold_scores: List[float] = []
         for fold_idx, (train_idx, val_idx) in enumerate(folds, start=1):
-            clf = RandomForestClassifier(**fixed_params, **params)
+            clf = RandomForestClassifier(**fixed_params, **params_for_clf)
             X_tr, y_tr = X[train_idx], y[train_idx]
             X_va, y_va = X[val_idx], y[val_idx]
             clf.fit(X_tr, y_tr)
