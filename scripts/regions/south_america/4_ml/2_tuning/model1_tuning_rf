@@ -27,12 +27,14 @@ class Tee:
     def write(self, text: str) -> None:
         self.stdout.write(text)
         self.stdout.flush()
-        self.file.write(text)
-        self.file.flush()
+        if not self.file.closed:
+            self.file.write(text)
+            self.file.flush()
 
     def flush(self) -> None:
         self.stdout.flush()
-        self.file.flush()
+        if not self.file.closed:
+            self.file.flush()
 
     def close(self) -> None:
         self.file.close()
@@ -46,8 +48,10 @@ if __name__ == "__main__":
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = output_dir / f"model1_tuning_rf_{timestamp}.txt"
     tee = Tee(output_file)
+    original_stdout = sys.stdout
     sys.stdout = tee
     try:
         run_tuning(region="south_america", model="rf", script_dir=script_dir, output_dir=output_dir)
     finally:
+        sys.stdout = original_stdout
         tee.close()

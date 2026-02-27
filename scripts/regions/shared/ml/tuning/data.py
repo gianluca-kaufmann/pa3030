@@ -18,16 +18,53 @@ class DataSummary:
     n_neg: int
 
 
-def resolve_train_parquet(repo_root: Path, region: str, scratch_root: Path | None = None) -> Path:
-    candidates: List[Path] = []
+def resolve_train_parquet(
+    repo_root: Path,
+    region: str,
+    scratch_root: Path | None = None,
+    split_version: str = "main",
+) -> Path:
+    """
+    Locate the tuning train parquet across split-aware and legacy layouts.
+
+    Search order prioritizes SCRATCH over repo root and requested split over
+    fallback splits for robustness.
+    """
+    split = split_version.strip() or "main"
+    split_candidates: List[str] = []
+    for item in (split, "main", "robustness", ""):
+        if item not in split_candidates:
+            split_candidates.append(item)
+
+    base_dirs = [
+        f"outputs/{region}/results",
+        f"data/{region}/ml",
+    ]
+    filenames = [
+        "train_win5.parquet",
+        "train.parquet",
+    ]
+
+    roots: List[Path] = []
     if scratch_root is not None:
-        candidates.append(scratch_root / f"data/{region}/ml/train.parquet")
-    candidates.append(repo_root / f"data/{region}/ml/train.parquet")
+        roots.append(scratch_root)
+    roots.append(repo_root)
+
+    candidates: List[Path] = []
+    for root in roots:
+        for base_dir in base_dirs:
+            for split_dir in split_candidates:
+                prefix = f"{base_dir}/{split_dir}" if split_dir else base_dir
+                for filename in filenames:
+                    candidates.append(root / f"{prefix}/{filename}")
 
     for cand in candidates:
         if cand.exists():
             return cand
-    raise FileNotFoundError(f"train.parquet not found for region={region}. Checked: {candidates}")
+
+    raise FileNotFoundError(
+        f"Train parquet not found for region={region}, split={split}. Checked: {candidates}"
+    )
 
 
 def get_feature_columns(df: pd.DataFrame, exclude_cols: set[str]) -> List[str]:

@@ -29,6 +29,7 @@ source "$VENV_DIR/bin/activate"
 export TUNING_MODE="${TUNING_MODE:-paper}"
 export TUNING_OPTIMIZER="${TUNING_OPTIMIZER:-optuna}"
 export CV_STRATEGY="${CV_STRATEGY:-rolling}"
+export TUNING_SPLIT_VERSION="${TUNING_SPLIT_VERSION:-main}"
 export ROLLING_FOLDS="${ROLLING_FOLDS:-5}"
 export MAX_NEG_PER_YEAR_PAPER="${MAX_NEG_PER_YEAR_PAPER:-150000}"
 export MAX_NEG_PER_YEAR_FAST="${MAX_NEG_PER_YEAR_FAST:-50000}"
@@ -37,7 +38,7 @@ export N_ITER_RF_FAST="${N_ITER_RF_FAST:-25}"
 export TUNING_RANDOM_STATE="${TUNING_RANDOM_STATE:-42}"
 
 echo "Starting model1_tuning_rf script..."
-echo "Mode=$TUNING_MODE Optimizer=$TUNING_OPTIMIZER CV=$CV_STRATEGY Folds=$ROLLING_FOLDS"
+echo "Mode=$TUNING_MODE Optimizer=$TUNING_OPTIMIZER CV=$CV_STRATEGY Split=$TUNING_SPLIT_VERSION Folds=$ROLLING_FOLDS"
 
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"

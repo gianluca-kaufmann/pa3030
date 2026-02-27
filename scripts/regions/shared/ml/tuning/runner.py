@@ -45,6 +45,7 @@ class RuntimeConfig:
     val_year_min: int
     val_year_max: int
     rolling_folds: int
+    tuning_split_version: str
     min_year: int
     max_neg_per_year_fast: int
     max_neg_per_year_paper: int
@@ -110,6 +111,7 @@ def load_runtime_config(region: str, model: str, script_dir: Path, output_dir: P
         val_year_min=int(os.environ.get("VAL_YEAR_MIN", "2015")),
         val_year_max=int(os.environ.get("VAL_YEAR_MAX", "2017")),
         rolling_folds=int(os.environ.get("ROLLING_FOLDS", "5")),
+        tuning_split_version=os.environ.get("TUNING_SPLIT_VERSION", "main").strip() or "main",
         min_year=int(os.environ.get("TRANSITION_MIN_YEAR", "2001")),
         max_neg_per_year_fast=int(os.environ.get("MAX_NEG_PER_YEAR_FAST", "50000")),
         max_neg_per_year_paper=int(os.environ.get("MAX_NEG_PER_YEAR_PAPER", "150000")),
@@ -202,6 +204,7 @@ def _build_artifact_payload(
             "val_year_min": cfg.val_year_min,
             "val_year_max": cfg.val_year_max,
             "min_year": cfg.min_year,
+            "split_version": cfg.tuning_split_version,
         },
         timestamp=timestamp,
         mode=cfg.tuning_mode,
@@ -239,7 +242,12 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
     max_neg_per_year = cfg.max_neg_per_year_paper if cfg.tuning_mode == "paper" else cfg.max_neg_per_year_fast
     exclude_cols = {"transition_01", "transition_01_win5", "WDPA_b1", "WDPA_prev", "x", "y", "row", "col", YEAR_COL}
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
-    train_path = resolve_train_parquet(cfg.repo_root, region=region, scratch_root=scratch_root)
+    train_path = resolve_train_parquet(
+        cfg.repo_root,
+        region=region,
+        scratch_root=scratch_root,
+        split_version=cfg.tuning_split_version,
+    )
 
     df, feature_cols, data_summary, year_stats = prepare_tuning_dataset(
         train_path=train_path,
@@ -385,7 +393,10 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
     elapsed = time.time() - start
     print("=" * 72)
     print(f"{region.upper()} {model.upper()} tuning completed in {elapsed/60:.1f} minutes")
-    print(f"Mode: {cfg.tuning_mode} | Optimizer: {cfg.optimizer} | CV: {cfg.cv_strategy}")
+    print(
+        f"Mode: {cfg.tuning_mode} | Optimizer: {cfg.optimizer} | CV: {cfg.cv_strategy} | "
+        f"Split: {cfg.tuning_split_version}"
+    )
     print(f"Rows sampled: {data_summary.n_rows_sampled:,} | Features: {data_summary.n_features}")
     print(f"Best PR-AUC: {payload['best_val_score']:.6f}")
     print(f"Canonical artifact: {canonical_output_path}")
