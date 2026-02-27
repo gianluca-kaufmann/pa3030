@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import optuna
+import pandas as pd
 from lightgbm import LGBMClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import average_precision_score
@@ -38,6 +39,7 @@ def optimize_lgbm_optuna(
     auto_scale_pos_weight: float,
     n_trials: int,
     random_state: int,
+    feature_names: List[str] | None = None,
 ) -> Tuple[Dict[str, Any], float, List[Dict[str, Any]]]:
     bounds = get_lgbm_optuna_bounds(mode, auto_scale_pos_weight=auto_scale_pos_weight)
 
@@ -64,6 +66,9 @@ def optimize_lgbm_optuna(
             clf = LGBMClassifier(**fixed_params, **params)
             X_tr, y_tr = X[train_idx], y[train_idx]
             X_va, y_va = X[val_idx], y[val_idx]
+            if feature_names is not None:
+                X_tr = pd.DataFrame(X_tr, columns=feature_names)
+                X_va = pd.DataFrame(X_va, columns=feature_names)
             clf.fit(
                 X_tr,
                 y_tr,

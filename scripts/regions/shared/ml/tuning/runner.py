@@ -513,6 +513,7 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
                     auto_scale_pos_weight=auto_spw,
                     n_trials=n_trials,
                     random_state=cfg.random_state,
+                    feature_names=feature_list_used,
                 )
                 search_details = {
                     "optimizer": "optuna",
