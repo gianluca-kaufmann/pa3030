@@ -35,6 +35,11 @@ try:
 except ImportError:
     wandb = None
 
+try:
+    from optuna.integration.wandb import WeightsAndBiasesCallback
+except ImportError:
+    WeightsAndBiasesCallback = None
+
 from .artifacts import build_metadata, save_tuning_artifact
 from .cv import SplitConfig, build_splits
 from .data import DataSummary, prepare_tuning_dataset, resolve_train_parquet
@@ -165,6 +170,25 @@ def _init_wandb_tuning(cfg: RuntimeConfig, optimizer_used: str) -> Any | None:
     except Exception as err:
         print(f"W&B failed: {err}")
         return None
+
+
+def _build_optuna_wandb_callbacks(wandb_run: Any | None) -> List[Any]:
+    """
+    Build Optuna callbacks for per-trial W&B logging when a run is active.
+    Logs each trial's hyperparameters and val_pr_auc to the existing run.
+    """
+    if wandb_run is None or WeightsAndBiasesCallback is None:
+        return []
+    try:
+        wandb_kwargs = {"id": wandb.run.id, "resume": "allow"}
+        wb_callback = WeightsAndBiasesCallback(
+            metric_name="val_pr_auc",
+            wandb_kwargs=wandb_kwargs,
+        )
+        return [wb_callback]
+    except Exception as err:
+        print(f"W&B Optuna callback skipped: {err}")
+        return []
 
 
 def get_repo_root() -> Path:
@@ -504,6 +528,7 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
                 from .optuna_runner import optimize_lgbm_optuna
 
                 n_trials = cfg.n_iter_lgbm_paper if cfg.tuning_mode == "paper" else cfg.n_iter_lgbm_fast
+                optuna_callbacks = _build_optuna_wandb_callbacks(wandb_run)
                 best_params, best_val_score, fold_records = optimize_lgbm_optuna(
                     X=X,
                     y=y,
@@ -514,6 +539,7 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
                     n_trials=n_trials,
                     random_state=cfg.random_state,
                     feature_names=feature_list_used,
+                    callbacks=optuna_callbacks,
                 )
                 search_details = {
                     "optimizer": "optuna",
@@ -580,6 +606,7 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
                 from .optuna_runner import optimize_rf_optuna
 
                 n_trials = cfg.n_iter_rf_paper if cfg.tuning_mode == "paper" else cfg.n_iter_rf_fast
+                optuna_callbacks = _build_optuna_wandb_callbacks(wandb_run)
                 best_params, best_val_score, fold_records = optimize_rf_optuna(
                     X=X,
                     y=y,
@@ -588,6 +615,7 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
                     fixed_params=fixed_params,
                     n_trials=n_trials,
                     random_state=cfg.random_state,
+                    callbacks=optuna_callbacks,
                 )
                 search_details = {
                     "optimizer": "optuna",

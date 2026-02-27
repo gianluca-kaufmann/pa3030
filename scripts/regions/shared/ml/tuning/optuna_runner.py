@@ -14,7 +14,7 @@ Output:
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 import optuna
@@ -40,6 +40,7 @@ def optimize_lgbm_optuna(
     n_trials: int,
     random_state: int,
     feature_names: List[str] | None = None,
+    callbacks: Sequence[Any] | None = None,
 ) -> Tuple[Dict[str, Any], float, List[Dict[str, Any]]]:
     bounds = get_lgbm_optuna_bounds(mode, auto_scale_pos_weight=auto_scale_pos_weight)
 
@@ -84,7 +85,13 @@ def optimize_lgbm_optuna(
                 raise optuna.TrialPruned()
         return _mean(fold_scores)
 
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    study.optimize(
+        objective,
+        n_trials=n_trials,
+        n_jobs=1,
+        show_progress_bar=False,
+        callbacks=list(callbacks) if callbacks else [],
+    )
     best = study.best_trial
     best_params = dict(best.params)
     best_score = float(best.value)
@@ -109,6 +116,7 @@ def optimize_rf_optuna(
     fixed_params: Dict[str, Any],
     n_trials: int,
     random_state: int,
+    callbacks: Sequence[Any] | None = None,
 ) -> Tuple[Dict[str, Any], float, List[Dict[str, Any]]]:
     bounds = get_rf_optuna_bounds(mode)
     sampler = optuna.samplers.TPESampler(seed=random_state)
@@ -141,7 +149,13 @@ def optimize_rf_optuna(
                 raise optuna.TrialPruned()
         return _mean(fold_scores)
 
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    study.optimize(
+        objective,
+        n_trials=n_trials,
+        n_jobs=1,
+        show_progress_bar=False,
+        callbacks=list(callbacks) if callbacks else [],
+    )
     best = study.best_trial
     best_params = dict(best.params)
     best_score = float(best.value)
