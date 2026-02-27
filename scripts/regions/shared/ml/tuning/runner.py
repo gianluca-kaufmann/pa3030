@@ -16,6 +16,7 @@ Output:
 from __future__ import annotations
 
 import gc
+import importlib
 import os
 import time
 from dataclasses import dataclass
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 import numpy as np
+import pandas as pd
 from lightgbm import LGBMClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import average_precision_score, make_scorer
@@ -73,6 +75,12 @@ class RuntimeConfig:
     n_iter_lgbm_paper: int
     n_iter_rf_fast: int
     n_iter_rf_paper: int
+    total_row_budget_lgbm_fast: int
+    total_row_budget_lgbm_paper: int
+    total_row_budget_rf_fast: int
+    total_row_budget_rf_paper: int
+    min_pos_per_year_after_budget: int
+    rf_add_missing_indicators: bool
     n_jobs: int
 
 
@@ -92,6 +100,29 @@ def _report_memory_usage(label: str) -> None:
         print(f"[Memory] {label}: RSS {rss_gb:.2f} GB")
     except Exception:
         pass
+
+
+def _resolve_optimizer(requested_optimizer: str) -> tuple[str, str | None]:
+    """
+    Resolve optimizer choice with dependency-aware fallback.
+
+    If Optuna is requested but unavailable, automatically downgrade to
+    randomized search and return a warning message for logs/artifacts.
+    """
+    if requested_optimizer != "optuna":
+        return requested_optimizer, None
+    try:
+        importlib.import_module("optuna")
+        return "optuna", None
+    except ModuleNotFoundError as exc:
+        if exc.name != "optuna":
+            raise
+        warning = (
+            "Optuna requested but package 'optuna' is not installed. "
+            "Falling back to randomized search. "
+            "Install with `pip install optuna` or use TUNING_OPTIMIZER=randomized."
+        )
+        return "randomized", warning
 
 
 def get_repo_root() -> Path:
@@ -149,8 +180,94 @@ def load_runtime_config(region: str, model: str, script_dir: Path, output_dir: P
         n_iter_lgbm_paper=int(os.environ.get("N_ITER_LGBM_PAPER", "140")),
         n_iter_rf_fast=int(os.environ.get("N_ITER_RF_FAST", "25")),
         n_iter_rf_paper=int(os.environ.get("N_ITER_RF_PAPER", "120")),
+        total_row_budget_lgbm_fast=int(os.environ.get("TOTAL_ROW_BUDGET_LGBM_FAST", "1500000")),
+        total_row_budget_lgbm_paper=int(os.environ.get("TOTAL_ROW_BUDGET_LGBM_PAPER", "2500000")),
+        total_row_budget_rf_fast=int(os.environ.get("TOTAL_ROW_BUDGET_RF_FAST", "300000")),
+        total_row_budget_rf_paper=int(os.environ.get("TOTAL_ROW_BUDGET_RF_PAPER", "500000")),
+        min_pos_per_year_after_budget=int(os.environ.get("MIN_POS_PER_YEAR_AFTER_BUDGET", "25")),
+        rf_add_missing_indicators=os.environ.get("RF_ADD_MISSING_INDICATORS", "1") == "1",
         n_jobs=n_jobs,
     )
+
+
+def _get_total_row_budget(cfg: RuntimeConfig) -> int:
+    if cfg.model == "lgbm":
+        return cfg.total_row_budget_lgbm_paper if cfg.tuning_mode == "paper" else cfg.total_row_budget_lgbm_fast
+    return cfg.total_row_budget_rf_paper if cfg.tuning_mode == "paper" else cfg.total_row_budget_rf_fast
+
+
+def _prepare_rf_matrix(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    add_missing_indicators: bool,
+) -> Tuple[np.ndarray, List[str], Dict[str, Any]]:
+    X_df = df[feature_cols].copy()
+    missing_counts = X_df.isna().sum(axis=0)
+    missing_rates = (missing_counts / max(len(X_df), 1)).to_dict()
+
+    impute_values = X_df.median(axis=0, skipna=True)
+    impute_values = impute_values.fillna(0.0)
+    X_imp = X_df.fillna(impute_values)
+
+    indicator_cols: List[str] = []
+    if add_missing_indicators:
+        miss_cols = [col for col in feature_cols if int(missing_counts[col]) > 0]
+        for col in miss_cols:
+            ind_col = f"{col}__is_missing"
+            X_imp[ind_col] = X_df[col].isna().astype(np.int8)
+            indicator_cols.append(ind_col)
+    indicator_feature_bases = {c.replace("__is_missing", "") for c in indicator_cols}
+
+    used_features = feature_cols + indicator_cols
+    X = X_imp[used_features].to_numpy(dtype=np.float32)
+    stats = {
+        "add_missing_indicators": bool(add_missing_indicators),
+        "n_features_input": int(len(feature_cols)),
+        "n_missing_indicator_features": int(len(indicator_cols)),
+        "n_features_output": int(len(used_features)),
+        "features_with_missing": int(sum(1 for c in feature_cols if int(missing_counts[c]) > 0)),
+        "per_feature": {
+            col: {
+                "missing_count": int(missing_counts[col]),
+                "missing_rate": float(missing_rates[col]),
+                "impute_value": float(impute_values[col]),
+                "missing_indicator_added": bool(col in indicator_feature_bases),
+            }
+            for col in feature_cols
+        },
+    }
+    return X, used_features, stats
+
+
+def _compute_fold_base_rates(
+    folds: List[Tuple[np.ndarray, np.ndarray]], y: np.ndarray
+) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
+    fold_rates: List[Dict[str, Any]] = []
+    spw_values: List[float] = []
+    for idx, (train_idx, val_idx) in enumerate(folds, start=1):
+        y_tr = y[train_idx]
+        y_va = y[val_idx]
+        tr_pos = int((y_tr > 0).sum())
+        tr_neg = int((y_tr == 0).sum())
+        va_pos = int((y_va > 0).sum())
+        va_neg = int((y_va == 0).sum())
+        tr_pos_rate = float(tr_pos / max(len(y_tr), 1))
+        va_pos_rate = float(va_pos / max(len(y_va), 1))
+        spw = float(tr_neg / max(tr_pos, 1))
+        spw_values.append(spw)
+        fold_rates.append(
+            {
+                "fold": int(idx),
+                "train": {"n_pos": tr_pos, "n_neg": tr_neg, "pos_rate": tr_pos_rate, "scale_pos_weight_auto": spw},
+                "val": {"n_pos": va_pos, "n_neg": va_neg, "pos_rate": va_pos_rate},
+            }
+        )
+    spw_spread = {
+        "min": float(min(spw_values)) if spw_values else 0.0,
+        "max": float(max(spw_values)) if spw_values else 0.0,
+        "mean": float(np.mean(spw_values)) if spw_values else 0.0,
+    }
+    return fold_rates, spw_spread
 
 
 def _fit_randomized_lgbm(
@@ -210,6 +327,7 @@ def _fit_randomized_rf(
 
 def _build_artifact_payload(
     cfg: RuntimeConfig,
+    optimizer_used: str,
     timestamp: str,
     train_path: Path,
     feature_count: int,
@@ -220,6 +338,11 @@ def _build_artifact_payload(
     search_details: Dict[str, Any],
     data_summary: DataSummary,
     year_sampling_stats: Dict[int, Dict[str, int]],
+    feature_list_used: List[str],
+    sampling_config: Dict[str, Any],
+    wdpa_prev_diagnostics: Dict[str, Any],
+    fold_base_rates: List[Dict[str, Any]],
+    rf_preprocessing: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     metadata = build_metadata(
         train_path=train_path,
@@ -234,7 +357,7 @@ def _build_artifact_payload(
         },
         timestamp=timestamp,
         mode=cfg.tuning_mode,
-        optimizer=cfg.optimizer,
+        optimizer=optimizer_used,
         cv_strategy=cfg.cv_strategy,
         repo_root=cfg.repo_root,
         seed=cfg.random_state,
@@ -254,6 +377,11 @@ def _build_artifact_payload(
             "n_neg": data_summary.n_neg,
         },
         "year_sampling_stats": year_sampling_stats,
+        "feature_list_used": feature_list_used,
+        "sampling_config": sampling_config,
+        "wdpa_prev_diagnostics": wdpa_prev_diagnostics,
+        "fold_base_rates": fold_base_rates,
+        "rf_preprocessing": rf_preprocessing or {},
         "metadata": metadata,
     }
 
@@ -263,9 +391,13 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
         raise ValueError(f"Unsupported model '{model}'")
 
     cfg = load_runtime_config(region=region, model=model, script_dir=script_dir, output_dir=output_dir)
+    optimizer_used, optimizer_warning = _resolve_optimizer(cfg.optimizer)
+    if optimizer_warning:
+        print(f"[WARN] {optimizer_warning}")
     start = time.time()
 
     max_neg_per_year = cfg.max_neg_per_year_paper if cfg.tuning_mode == "paper" else cfg.max_neg_per_year_fast
+    total_row_budget = _get_total_row_budget(cfg)
     exclude_cols = {"transition_01", "transition_01_win5", "WDPA_b1", "WDPA_prev", "x", "y", "row", "col", YEAR_COL}
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
     train_path = resolve_train_parquet(
@@ -275,7 +407,7 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
         split_version=cfg.tuning_split_version,
     )
 
-    df, feature_cols, data_summary, year_stats = prepare_tuning_dataset(
+    df, feature_cols, data_summary, year_stats, wdpa_diag, budget_diag = prepare_tuning_dataset(
         train_path=train_path,
         target_col=TARGET_COL,
         min_year=cfg.min_year,
@@ -286,6 +418,8 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
         target_neg_pos_ratio=cfg.adaptive_ratio_target,
         adaptive_min_cap=cfg.adaptive_min_cap,
         adaptive_max_cap=cfg.adaptive_max_cap,
+        total_row_budget=total_row_budget,
+        min_pos_per_year_after_budget=cfg.min_pos_per_year_after_budget,
     )
     _report_memory_usage("after data sampling")
 
@@ -300,8 +434,18 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
     folds, split_info = build_splits(df=df, cfg=split_cfg)
     _report_memory_usage("after split construction")
 
-    X = df[feature_cols].to_numpy(dtype=np.float32)
+    feature_list_used = list(feature_cols)
+    rf_preprocessing: Dict[str, Any] | None = None
+    if model == "rf":
+        X, feature_list_used, rf_preprocessing = _prepare_rf_matrix(
+            df=df,
+            feature_cols=feature_cols,
+            add_missing_indicators=cfg.rf_add_missing_indicators,
+        )
+    else:
+        X = df[feature_cols].to_numpy(dtype=np.float32)
     y = (df[TARGET_COL].to_numpy() > 0).astype(np.int8)
+    fold_base_rates, spw_spread = _compute_fold_base_rates(folds=folds, y=y)
     del df
     gc.collect()
     _report_memory_usage("after matrix materialization")
@@ -312,7 +456,7 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
         fixed_params = get_lgbm_fixed_params(cfg.random_state, cfg.n_jobs)
         fixed_params["metric"] = "average_precision"
 
-        if cfg.optimizer == "optuna":
+        if optimizer_used == "optuna":
             from .optuna_runner import optimize_lgbm_optuna
 
             n_trials = cfg.n_iter_lgbm_paper if cfg.tuning_mode == "paper" else cfg.n_iter_lgbm_fast
@@ -328,9 +472,12 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
             )
             search_details = {
                 "optimizer": "optuna",
+                "requested_optimizer": cfg.optimizer,
+                "fallback_warning": optimizer_warning or "",
                 "n_trials": int(n_trials),
                 "fold_records": fold_records,
                 "auto_scale_pos_weight": float(auto_spw),
+                "fold_pos_rate_spw_spread": spw_spread,
             }
         else:
             n_iter = cfg.n_iter_lgbm_fast if cfg.tuning_mode == "fast" else cfg.n_iter_lgbm_paper
@@ -345,14 +492,18 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
             )
             search_details = {
                 "optimizer": "randomized",
+                "requested_optimizer": cfg.optimizer,
+                "fallback_warning": optimizer_warning or "",
                 "n_iter": int(n_iter),
                 "auto_scale_pos_weight": float(auto_spw),
+                "fold_pos_rate_spw_spread": spw_spread,
             }
 
         output_name = "lgbm_best_params.json"
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         payload = _build_artifact_payload(
             cfg=cfg,
+            optimizer_used=optimizer_used,
             timestamp=timestamp,
             train_path=train_path,
             feature_count=len(feature_cols),
@@ -363,10 +514,24 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
             search_details=search_details,
             data_summary=data_summary,
             year_sampling_stats=year_stats,
+            feature_list_used=feature_list_used,
+            sampling_config={
+                "max_neg_per_year": int(max_neg_per_year),
+                "adaptive_cap_enabled": bool(cfg.adaptive_cap_enabled),
+                "adaptive_ratio_target": float(cfg.adaptive_ratio_target),
+                "adaptive_min_cap": int(cfg.adaptive_min_cap),
+                "adaptive_max_cap": int(cfg.adaptive_max_cap),
+                "total_row_budget": int(total_row_budget),
+                "min_pos_per_year_after_budget": int(cfg.min_pos_per_year_after_budget),
+                "total_row_budget_diagnostics": budget_diag,
+            },
+            wdpa_prev_diagnostics=wdpa_diag,
+            fold_base_rates=fold_base_rates,
+            rf_preprocessing=rf_preprocessing,
         )
     else:
         fixed_params = get_rf_fixed_params(cfg.random_state, cfg.n_jobs)
-        if cfg.optimizer == "optuna":
+        if optimizer_used == "optuna":
             from .optuna_runner import optimize_rf_optuna
 
             n_trials = cfg.n_iter_rf_paper if cfg.tuning_mode == "paper" else cfg.n_iter_rf_fast
@@ -381,8 +546,11 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
             )
             search_details = {
                 "optimizer": "optuna",
+                "requested_optimizer": cfg.optimizer,
+                "fallback_warning": optimizer_warning or "",
                 "n_trials": int(n_trials),
                 "fold_records": fold_records,
+                "fold_pos_rate_spw_spread": spw_spread,
             }
         else:
             n_iter = cfg.n_iter_rf_fast if cfg.tuning_mode == "fast" else cfg.n_iter_rf_paper
@@ -395,12 +563,19 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
                 n_iter=n_iter,
                 mode=cfg.tuning_mode,
             )
-            search_details = {"optimizer": "randomized", "n_iter": int(n_iter)}
+            search_details = {
+                "optimizer": "randomized",
+                "requested_optimizer": cfg.optimizer,
+                "fallback_warning": optimizer_warning or "",
+                "n_iter": int(n_iter),
+                "fold_pos_rate_spw_spread": spw_spread,
+            }
 
         output_name = "rf_best_params.json"
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         payload = _build_artifact_payload(
             cfg=cfg,
+            optimizer_used=optimizer_used,
             timestamp=timestamp,
             train_path=train_path,
             feature_count=len(feature_cols),
@@ -411,6 +586,20 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
             search_details=search_details,
             data_summary=data_summary,
             year_sampling_stats=year_stats,
+            feature_list_used=feature_list_used,
+            sampling_config={
+                "max_neg_per_year": int(max_neg_per_year),
+                "adaptive_cap_enabled": bool(cfg.adaptive_cap_enabled),
+                "adaptive_ratio_target": float(cfg.adaptive_ratio_target),
+                "adaptive_min_cap": int(cfg.adaptive_min_cap),
+                "adaptive_max_cap": int(cfg.adaptive_max_cap),
+                "total_row_budget": int(total_row_budget),
+                "min_pos_per_year_after_budget": int(cfg.min_pos_per_year_after_budget),
+                "total_row_budget_diagnostics": budget_diag,
+            },
+            wdpa_prev_diagnostics=wdpa_diag,
+            fold_base_rates=fold_base_rates,
+            rf_preprocessing=rf_preprocessing,
         )
 
     training_dir = script_dir.parent / "3_training"
@@ -425,7 +614,7 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
     print("=" * 72)
     print(f"{region.upper()} {model.upper()} tuning completed in {elapsed/60:.1f} minutes")
     print(
-        f"Mode: {cfg.tuning_mode} | Optimizer: {cfg.optimizer} | CV: {cfg.cv_strategy} | "
+        f"Mode: {cfg.tuning_mode} | Optimizer: {optimizer_used} (requested: {cfg.optimizer}) | CV: {cfg.cv_strategy} | "
         f"Split: {cfg.tuning_split_version}"
     )
     print(f"Rows sampled: {data_summary.n_rows_sampled:,} | Features: {data_summary.n_features}")
