@@ -404,7 +404,11 @@ def process_year(
             del df_econ_lag
             gc.collect()
         else:
-            df_year['economic_value_lag1'] = np.nan
+            # Keep dtype stable across years to avoid Parquet schema mismatch.
+            df_year['economic_value_lag1'] = np.float32(np.nan)
+
+        # Enforce one dtype for all yearly temp files (year_2000 + later years).
+        df_year['economic_value_lag1'] = df_year['economic_value_lag1'].astype(np.float32)
 
         if economic_value_col in df_year.columns:
             df_year = df_year.drop(columns=[economic_value_col])
