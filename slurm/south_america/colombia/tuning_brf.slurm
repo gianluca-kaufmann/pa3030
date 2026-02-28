@@ -33,9 +33,15 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
+# Tuning iteration counts (Colombia dataset is smaller; 60 fits comfortably in 24h)
+#------------------------------------------------------------------------------
+export N_ITER_BRF="${N_ITER_BRF:-60}"
+
+#------------------------------------------------------------------------------
 # Run the modelC_tuning_brf script
 #------------------------------------------------------------------------------
 echo "Starting modelC_tuning_brf script..."
+echo "N_ITER_BRF=$N_ITER_BRF"
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }

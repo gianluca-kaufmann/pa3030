@@ -33,9 +33,15 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
+# Tuning iteration counts (Colombia dataset is smaller; 60 fits comfortably in 24h)
+#------------------------------------------------------------------------------
+export N_ITER_RF="${N_ITER_RF:-60}"
+
+#------------------------------------------------------------------------------
 # Run the modelC_tuning_rf script
 #------------------------------------------------------------------------------
 echo "Starting modelC_tuning_rf script..."
+echo "N_ITER_RF=$N_ITER_RF"
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }

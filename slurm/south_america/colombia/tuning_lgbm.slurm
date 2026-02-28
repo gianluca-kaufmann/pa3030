@@ -33,9 +33,15 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 
 #------------------------------------------------------------------------------
+# Tuning iteration counts (Colombia dataset is smaller; 70 fits comfortably in 24h)
+#------------------------------------------------------------------------------
+export N_ITER_LGBM="${N_ITER_LGBM:-70}"
+
+#------------------------------------------------------------------------------
 # Run the modelC_tuning_lgbm script with main split
 #------------------------------------------------------------------------------
 echo "Starting modelC_tuning_lgbm script (main split)..."
+echo "N_ITER_LGBM=$N_ITER_LGBM"
 
 # --- Preflight checks ---
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
