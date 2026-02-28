@@ -278,10 +278,15 @@ def _prepare_rf_matrix(
     indicator_cols: List[str] = []
     if add_missing_indicators:
         miss_cols = [col for col in feature_cols if int(missing_counts[col]) > 0]
-        for col in miss_cols:
-            ind_col = f"{col}__is_missing"
-            X_imp[ind_col] = X_df[col].isna().astype(np.int8)
-            indicator_cols.append(ind_col)
+        if miss_cols:
+            # Build all indicator columns at once to avoid DataFrame fragmentation
+            indicator_data = {
+                f"{col}__is_missing": X_df[col].isna().astype(np.int8)
+                for col in miss_cols
+            }
+            indicator_df = pd.DataFrame(indicator_data, index=X_imp.index)
+            X_imp = pd.concat([X_imp, indicator_df], axis=1)
+            indicator_cols = list(indicator_data.keys())
     indicator_feature_bases = {c.replace("__is_missing", "") for c in indicator_cols}
 
     used_features = feature_cols + indicator_cols
