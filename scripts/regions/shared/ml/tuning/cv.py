@@ -102,3 +102,4 @@ def build_splits(df: pd.DataFrame, cfg: SplitConfig) -> Tuple[List[Tuple[np.ndar
     if strategy == "rolling":
         return build_rolling_splits(df, cfg)
     raise ValueError(f"Unknown CV strategy '{cfg.strategy}'. Expected one of: holdout, rolling.")
+
