@@ -334,6 +334,7 @@ def prepare_tuning_dataset(
     adaptive_max_cap: int,
     total_row_budget: int | None = None,
     min_pos_per_year_after_budget: int = 25,
+    max_pos_per_year: int = 0,
 ) -> Tuple[pd.DataFrame, List[str], DataSummary, Dict[int, Dict[str, int]], Dict[str, Any], Dict[str, Any]]:
     parquet_file = pq.ParquetFile(train_path)
     schema = parquet_file.schema_arrow
@@ -414,18 +415,24 @@ def prepare_tuning_dataset(
             max_cap=adaptive_max_cap,
         )
         year_neg_caps[year] = int(cap)
+        pos_kept_planned = min(pos_count, int(max_pos_per_year)) if max_pos_per_year > 0 else pos_count
         year_stats[year] = {
             "pos_original": pos_count,
-            "pos_kept": pos_count,
+            "pos_kept": pos_kept_planned,
             "neg_kept": 0,
             "neg_original": neg_original,
             "neg_cap": int(cap),
+            "pos_cap": int(max_pos_per_year) if max_pos_per_year > 0 else None,
         }
 
-    # Pass 2: stream rows and keep all positives + bounded random negatives per year.
+    # Pass 2: stream rows, reservoir-sample positives (if capped) and negatives per year.
     parquet_file = pq.ParquetFile(train_path)
     rng = np.random.default_rng(random_state)
+    # pos_frames: used when max_pos_per_year == 0 (keep all positives)
     pos_frames: List[pd.DataFrame] = []
+    # pos_frames_by_year / pos_scores_by_year: reservoir when max_pos_per_year > 0
+    pos_frames_by_year: Dict[int, pd.DataFrame] = {}
+    pos_scores_by_year: Dict[int, np.ndarray] = {}
     neg_frames_by_year: Dict[int, pd.DataFrame] = {}
     neg_scores_by_year: Dict[int, np.ndarray] = {}
 
@@ -452,7 +459,35 @@ def prepare_tuning_dataset(
 
         pos_df = filtered_df[y_bin > 0]
         if not pos_df.empty:
-            pos_frames.append(pos_df)
+            if max_pos_per_year <= 0:
+                # No cap: keep every positive (original behaviour).
+                pos_frames.append(pos_df)
+            else:
+                # Reservoir-sample positives per year, identical to negative logic.
+                for year in np.unique(pos_df["year"].to_numpy()):
+                    year_int = int(year)
+                    pos_cap = int(max_pos_per_year)
+                    year_chunk = pos_df[pos_df["year"] == year_int]
+                    if year_chunk.empty:
+                        continue
+                    chunk_scores = rng.random(len(year_chunk))
+                    existing_df = pos_frames_by_year.get(year_int)
+                    existing_scores = pos_scores_by_year.get(year_int)
+                    if existing_df is None:
+                        if len(year_chunk) <= pos_cap:
+                            pos_frames_by_year[year_int] = year_chunk.copy()
+                            pos_scores_by_year[year_int] = chunk_scores
+                        else:
+                            keep_idx = np.argpartition(chunk_scores, pos_cap - 1)[:pos_cap]
+                            pos_frames_by_year[year_int] = year_chunk.iloc[keep_idx].copy()
+                            pos_scores_by_year[year_int] = chunk_scores[keep_idx]
+                        continue
+                    combined_df = pd.concat([existing_df, year_chunk], axis=0, ignore_index=True)
+                    combined_scores = np.concatenate([existing_scores, chunk_scores], axis=0)
+                    keep_n = min(pos_cap, len(combined_df))
+                    keep_idx = np.argpartition(combined_scores, keep_n - 1)[:keep_n]
+                    pos_frames_by_year[year_int] = combined_df.iloc[keep_idx].reset_index(drop=True)
+                    pos_scores_by_year[year_int] = combined_scores[keep_idx]
 
         neg_df = filtered_df[y_bin == 0]
         if not neg_df.empty:
@@ -493,7 +528,15 @@ def prepare_tuning_dataset(
 
     sampled_frames: List[pd.DataFrame] = []
     if pos_frames:
+        # max_pos_per_year == 0: collected as flat list of batch frames
         sampled_frames.append(pd.concat(pos_frames, axis=0, ignore_index=True))
+    elif pos_frames_by_year:
+        # max_pos_per_year > 0: collected per year with reservoir sampling
+        pos_all = pd.concat(list(pos_frames_by_year.values()), axis=0, ignore_index=True)
+        sampled_frames.append(pos_all)
+        for year, yr_pos_df in pos_frames_by_year.items():
+            if year in year_stats:
+                year_stats[year]["pos_kept"] = int(len(yr_pos_df))
     for year in sorted(neg_frames_by_year):
         year_neg_df = neg_frames_by_year[year]
         sampled_frames.append(year_neg_df)
@@ -525,7 +568,7 @@ def prepare_tuning_dataset(
     pos = int((sampled[target_col] > 0).sum())
     neg = int((sampled[target_col] == 0).sum())
 
-    del pos_frames, neg_frames_by_year, neg_scores_by_year, sampled_frames
+    del pos_frames, pos_frames_by_year, pos_scores_by_year, neg_frames_by_year, neg_scores_by_year, sampled_frames
     gc.collect()
 
     summary = DataSummary(
@@ -557,8 +600,15 @@ def prepare_tuning_dataset(
         )
         print("[WARN] WDPA_prev missing; assuming risk-set-only input.")
 
+    spw_actual = float(neg / max(pos, 1))
+    pos_cap_msg = f"pos_cap/yr={max_pos_per_year:,}" if max_pos_per_year > 0 else "pos_cap=none"
     print(
-        f"[Sampling] Final sampled rows={len(sampled):,} (pos={pos:,}, neg={neg:,}) "
-        f"| total_budget={budget_diag.get('total_row_budget')}"
+        f"[Sampling] Final sampled rows={len(sampled):,} (pos={pos:,}, neg={neg:,}, "
+        f"SPW={spw_actual:.1f}) | {pos_cap_msg} | total_budget={budget_diag.get('total_row_budget')}"
     )
+    if max_pos_per_year == 0 and pos > neg:
+        print(
+            f"[WARN] Majority-positive dataset: pos={pos:,} > neg={neg:,} ({100*pos/(pos+neg):.1f}% positive). "
+            "Set MAX_POS_PER_YEAR_PAPER (e.g. 5000 for SA) to restore rare-event regime."
+        )
     return sampled, feature_cols, summary, year_stats, wdpa_diag, budget_diag

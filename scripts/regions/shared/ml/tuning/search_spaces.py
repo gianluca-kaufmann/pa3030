@@ -40,6 +40,14 @@ def get_rf_fixed_params(random_state: int, n_jobs: int) -> Dict:
 
 
 def get_lgbm_randomized_space(mode: str, auto_scale_pos_weight: float) -> Dict[str, List]:
+    """
+    Return the RandomizedSearchCV distribution for LightGBM.
+
+    ``scale_pos_weight`` is intentionally absent: it is computed deterministically
+    from the training fold (neg/pos) inside the fitting code, not tuned as a
+    free hyperparameter.  Tuning it on a sampled dataset with distorted class
+    balance would optimise the wrong regime and invalidate PR-AUC comparisons.
+    """
     mode = mode.lower()
     base = {
         "num_leaves": [31, 63, 127],
@@ -47,10 +55,11 @@ def get_lgbm_randomized_space(mode: str, auto_scale_pos_weight: float) -> Dict[s
         "learning_rate": [0.03, 0.05, 0.1],
         "min_child_samples": [20, 50, 100],
         "subsample": [0.7, 0.9],
-        "colsample_bytree": [0.7, 0.9],
+        "colsample_bynode": [0.5, 0.7, 0.9],
         "reg_alpha": [0.0, 0.1, 1.0],
         "reg_lambda": [0.0, 0.1, 1.0, 5.0],
-        "scale_pos_weight": [1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, float(auto_scale_pos_weight)],
+        "min_split_gain": [0.0, 0.001, 0.01, 0.1],
+        "path_smooth": [0.0, 0.1, 1.0],
     }
     if mode == "paper":
         base.update(
@@ -60,31 +69,13 @@ def get_lgbm_randomized_space(mode: str, auto_scale_pos_weight: float) -> Dict[s
                 "learning_rate": [0.01, 0.03, 0.05, 0.1],
                 "min_child_samples": [10, 20, 40, 80, 120],
                 "subsample": [0.6, 0.7, 0.8, 0.9, 1.0],
-                "colsample_bytree": [0.6, 0.7, 0.8, 0.9, 1.0],
+                "colsample_bynode": [0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
                 "reg_alpha": [0.0, 0.1, 1.0, 2.0, 5.0],
                 "reg_lambda": [0.0, 0.1, 1.0, 5.0, 10.0],
-                "scale_pos_weight": [
-                    1.0,
-                    2.0,
-                    5.0,
-                    10.0,
-                    20.0,
-                    50.0,
-                    100.0,
-                    200.0,
-                    400.0,
-                    float(auto_scale_pos_weight),
-                ],
+                "min_split_gain": [0.0, 0.0001, 0.001, 0.01, 0.05, 0.1, 0.5],
+                "path_smooth": [0.0, 0.01, 0.1, 0.5, 1.0, 5.0, 10.0],
             }
         )
-    # deduplicate while preserving order
-    seen = set()
-    dedup_spw = []
-    for v in base["scale_pos_weight"]:
-        if v not in seen:
-            dedup_spw.append(v)
-            seen.add(v)
-    base["scale_pos_weight"] = dedup_spw
     return base
 
 
@@ -108,6 +99,14 @@ def get_rf_randomized_space(mode: str) -> Dict[str, List]:
 
 
 def get_lgbm_optuna_bounds(mode: str, auto_scale_pos_weight: float) -> Dict:
+    """
+    Return Optuna hyperparameter bounds for LightGBM.
+
+    ``scale_pos_weight`` is intentionally absent: it is computed per fold
+    inside ``optimize_lgbm_optuna`` as ``n_neg / n_pos``, matching the
+    production training convention and keeping evaluation in the correct
+    rare-event regime regardless of the sampled class balance.
+    """
     if mode.lower() == "paper":
         return {
             "num_leaves": (31, 255),
@@ -115,10 +114,11 @@ def get_lgbm_optuna_bounds(mode: str, auto_scale_pos_weight: float) -> Dict:
             "learning_rate": (0.01, 0.12),
             "min_child_samples": (10, 160),
             "subsample": (0.6, 1.0),
-            "colsample_bytree": (0.6, 1.0),
+            "colsample_bynode": (0.3, 1.0),
             "reg_alpha": (1e-6, 10.0),
             "reg_lambda": (1e-6, 20.0),
-            "scale_pos_weight": (max(1.0, auto_scale_pos_weight / 5.0), max(20.0, auto_scale_pos_weight * 2.0)),
+            "min_split_gain": (1e-6, 1.0),
+            "path_smooth": (1e-3, 20.0),
             "n_estimators": (400, 3000),
         }
     return {
@@ -127,10 +127,11 @@ def get_lgbm_optuna_bounds(mode: str, auto_scale_pos_weight: float) -> Dict:
         "learning_rate": (0.02, 0.12),
         "min_child_samples": (20, 120),
         "subsample": (0.7, 1.0),
-        "colsample_bytree": (0.7, 1.0),
+        "colsample_bynode": (0.4, 1.0),
         "reg_alpha": (1e-6, 5.0),
         "reg_lambda": (1e-6, 10.0),
-        "scale_pos_weight": (max(1.0, auto_scale_pos_weight / 8.0), max(10.0, auto_scale_pos_weight * 1.5)),
+        "min_split_gain": (1e-6, 0.5),
+        "path_smooth": (1e-3, 10.0),
         "n_estimators": (300, 1800),
     }
 

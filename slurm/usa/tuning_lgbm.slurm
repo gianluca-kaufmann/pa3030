@@ -42,6 +42,11 @@ export TUNING_SPLIT_VERSION="${TUNING_SPLIT_VERSION:-main}"
 export ROLLING_FOLDS="${ROLLING_FOLDS:-5}"
 export MAX_NEG_PER_YEAR_PAPER="${MAX_NEG_PER_YEAR_PAPER:-150000}"
 export MAX_NEG_PER_YEAR_FAST="${MAX_NEG_PER_YEAR_FAST:-50000}"
+# 0 = no cap on positives (default for USA).
+# Profile USA class balance first; if positives become majority-class in the
+# sampled dataset, set to e.g. 5000 as done for SA (see SA SLURM scripts).
+export MAX_POS_PER_YEAR_PAPER="${MAX_POS_PER_YEAR_PAPER:-0}"
+export MAX_POS_PER_YEAR_FAST="${MAX_POS_PER_YEAR_FAST:-0}"
 export N_ITER_LGBM_PAPER="${N_ITER_LGBM_PAPER:-70}"
 export N_ITER_LGBM_FAST="${N_ITER_LGBM_FAST:-50}"
 export TUNING_RANDOM_STATE="${TUNING_RANDOM_STATE:-42}"

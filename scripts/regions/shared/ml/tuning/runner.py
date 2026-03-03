@@ -76,6 +76,8 @@ class RuntimeConfig:
     min_year: int
     max_neg_per_year_fast: int
     max_neg_per_year_paper: int
+    max_pos_per_year_fast: int
+    max_pos_per_year_paper: int
     adaptive_cap_enabled: bool
     adaptive_ratio_target: float
     adaptive_min_cap: int
@@ -238,6 +240,10 @@ def load_runtime_config(region: str, model: str, script_dir: Path, output_dir: P
         min_year=int(os.environ.get("TRANSITION_MIN_YEAR", "2001")),
         max_neg_per_year_fast=int(os.environ.get("MAX_NEG_PER_YEAR_FAST", "50000")),
         max_neg_per_year_paper=int(os.environ.get("MAX_NEG_PER_YEAR_PAPER", "150000")),
+        # 0 = no cap (default for small regions like Colombia).
+        # Set to e.g. 5000 for SA where the 5-yr lookahead makes positives dominant.
+        max_pos_per_year_fast=int(os.environ.get("MAX_POS_PER_YEAR_FAST", "0")),
+        max_pos_per_year_paper=int(os.environ.get("MAX_POS_PER_YEAR_PAPER", "0")),
         adaptive_cap_enabled=os.environ.get("ADAPTIVE_NEG_CAP", "0") == "1",
         adaptive_ratio_target=float(os.environ.get("TARGET_NEG_POS_RATIO", "50.0")),
         adaptive_min_cap=int(os.environ.get("ADAPTIVE_NEG_CAP_MIN", "20000")),
@@ -355,6 +361,9 @@ def _fit_randomized_lgbm(
     space = get_lgbm_randomized_space(mode=mode, auto_scale_pos_weight=auto_spw)
     fixed = get_lgbm_fixed_params(random_state=random_state, n_jobs=n_jobs)
     fixed["n_estimators"] = 1000
+    # scale_pos_weight is not in the search grid; inject it as a fixed parameter
+    # computed from the training union so evaluation stays in the rare-event regime.
+    fixed["scale_pos_weight"] = auto_spw
     estimator = LGBMClassifier(**fixed)
     search = RandomizedSearchCV(
         estimator=estimator,
@@ -470,6 +479,7 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
 
     try:
         max_neg_per_year = cfg.max_neg_per_year_paper if cfg.tuning_mode == "paper" else cfg.max_neg_per_year_fast
+        max_pos_per_year = cfg.max_pos_per_year_paper if cfg.tuning_mode == "paper" else cfg.max_pos_per_year_fast
         total_row_budget = _get_total_row_budget(cfg)
         exclude_cols = {"transition_01", "transition_01_win5", "WDPA_b1", "WDPA_prev", "x", "y", "row", "col", YEAR_COL}
         scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
@@ -493,6 +503,7 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
             adaptive_max_cap=cfg.adaptive_max_cap,
             total_row_budget=total_row_budget,
             min_pos_per_year_after_budget=cfg.min_pos_per_year_after_budget,
+            max_pos_per_year=max_pos_per_year,
         )
         _report_memory_usage("after data sampling")
 
@@ -593,6 +604,7 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
                 feature_list_used=feature_list_used,
                 sampling_config={
                     "max_neg_per_year": int(max_neg_per_year),
+                    "max_pos_per_year": int(max_pos_per_year),
                     "adaptive_cap_enabled": bool(cfg.adaptive_cap_enabled),
                     "adaptive_ratio_target": float(cfg.adaptive_ratio_target),
                     "adaptive_min_cap": int(cfg.adaptive_min_cap),
@@ -667,6 +679,7 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
                 feature_list_used=feature_list_used,
                 sampling_config={
                     "max_neg_per_year": int(max_neg_per_year),
+                    "max_pos_per_year": int(max_pos_per_year),
                     "adaptive_cap_enabled": bool(cfg.adaptive_cap_enabled),
                     "adaptive_ratio_target": float(cfg.adaptive_ratio_target),
                     "adaptive_min_cap": int(cfg.adaptive_min_cap),

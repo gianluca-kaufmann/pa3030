@@ -33,6 +33,11 @@ export TUNING_SPLIT_VERSION="${TUNING_SPLIT_VERSION:-main}"
 export ROLLING_FOLDS="${ROLLING_FOLDS:-5}"
 export MAX_NEG_PER_YEAR_PAPER="${MAX_NEG_PER_YEAR_PAPER:-150000}"
 export MAX_NEG_PER_YEAR_FAST="${MAX_NEG_PER_YEAR_FAST:-50000}"
+# SA-specific positive cap: the 5-year lookahead makes positives majority-class
+# without a cap (~75% pos on 2.5M-row budget).  5000/year targets SPW ~30x,
+# matching the production rare-event regime and making PR-AUC meaningful.
+export MAX_POS_PER_YEAR_PAPER="${MAX_POS_PER_YEAR_PAPER:-5000}"
+export MAX_POS_PER_YEAR_FAST="${MAX_POS_PER_YEAR_FAST:-2000}"
 export N_ITER_LGBM_PAPER="${N_ITER_LGBM_PAPER:-70}"
 export N_ITER_LGBM_FAST="${N_ITER_LGBM_FAST:-50}"
 export TUNING_RANDOM_STATE="${TUNING_RANDOM_STATE:-42}"

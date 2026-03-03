@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Sequence, Tuple
 import numpy as np
 import optuna
 import pandas as pd
-from lightgbm import LGBMClassifier
+from lightgbm import LGBMClassifier, early_stopping, log_evaluation
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import average_precision_score
 
@@ -50,23 +50,31 @@ def optimize_lgbm_optuna(
     fold_records: List[Dict[str, Any]] = []
 
     def objective(trial: optuna.Trial) -> float:
+        # ``scale_pos_weight`` is intentionally excluded from the search space.
+        # It is computed per fold as n_neg/n_pos so that every trial sees the
+        # correct rare-event weighting regardless of the sampled class balance.
         params = {
             "num_leaves": trial.suggest_int("num_leaves", bounds["num_leaves"][0], bounds["num_leaves"][1]),
             "max_depth": trial.suggest_categorical("max_depth", bounds["max_depth_choices"]),
             "learning_rate": trial.suggest_float("learning_rate", bounds["learning_rate"][0], bounds["learning_rate"][1], log=True),
             "min_child_samples": trial.suggest_int("min_child_samples", bounds["min_child_samples"][0], bounds["min_child_samples"][1]),
             "subsample": trial.suggest_float("subsample", bounds["subsample"][0], bounds["subsample"][1]),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", bounds["colsample_bytree"][0], bounds["colsample_bytree"][1]),
+            "colsample_bynode": trial.suggest_float("colsample_bynode", bounds["colsample_bynode"][0], bounds["colsample_bynode"][1]),
             "reg_alpha": trial.suggest_float("reg_alpha", bounds["reg_alpha"][0], bounds["reg_alpha"][1], log=True),
             "reg_lambda": trial.suggest_float("reg_lambda", bounds["reg_lambda"][0], bounds["reg_lambda"][1], log=True),
-            "scale_pos_weight": trial.suggest_float("scale_pos_weight", bounds["scale_pos_weight"][0], bounds["scale_pos_weight"][1], log=True),
+            "min_split_gain": trial.suggest_float("min_split_gain", bounds["min_split_gain"][0], bounds["min_split_gain"][1], log=True),
+            "path_smooth": trial.suggest_float("path_smooth", bounds["path_smooth"][0], bounds["path_smooth"][1], log=True),
             "n_estimators": trial.suggest_int("n_estimators", bounds["n_estimators"][0], bounds["n_estimators"][1]),
         }
         fold_scores: List[float] = []
         for fold_idx, (train_idx, val_idx) in enumerate(folds, start=1):
-            clf = LGBMClassifier(**fixed_params, **params)
             X_tr, y_tr = X[train_idx], y[train_idx]
             X_va, y_va = X[val_idx], y[val_idx]
+            # Per-fold scale_pos_weight: n_neg/n_pos on the training portion only.
+            n_pos_fold = int((y_tr > 0).sum())
+            n_neg_fold = int((y_tr == 0).sum())
+            spw_fold = float(n_neg_fold / max(n_pos_fold, 1))
+            clf = LGBMClassifier(**fixed_params, **params, scale_pos_weight=spw_fold)
             if feature_names is not None:
                 X_tr = pd.DataFrame(X_tr, columns=feature_names)
                 X_va = pd.DataFrame(X_va, columns=feature_names)
@@ -74,8 +82,13 @@ def optimize_lgbm_optuna(
                 X_tr,
                 y_tr,
                 eval_set=[(X_va, y_va)],
+                # PR-AUC for both early stopping and the Optuna objective so the
+                # stopping signal is consistent with what we are maximising.
                 eval_metric="average_precision",
-                callbacks=[],
+                callbacks=[
+                    early_stopping(stopping_rounds=100, verbose=False),
+                    log_evaluation(period=-1),
+                ],
             )
             pred = clf.predict_proba(X_va)[:, 1]
             score = average_precision_score(y_va, pred)
