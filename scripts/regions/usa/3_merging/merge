@@ -518,6 +518,34 @@ def get_band_names_for_array(dataset: str, num_bands: int) -> List[str]:
         return [f"{dataset}_b{i+1}" for i in range(num_bands)]
 
 
+def harmonize_elevation_schema(band_names: List[str]) -> List[str]:
+    """
+    Align USA elevation naming with South America schema.
+
+    In South America, elevation is provided as a 2-band raster and becomes:
+      - elevation_b1
+      - elevation_b2
+
+    In USA inputs, elevation and slope can be separate single-band datasets:
+      - elevation
+      - slope
+
+    To keep downstream pipelines region-consistent, map:
+      elevation -> elevation_b1
+      slope     -> elevation_b2
+    """
+    if "elevation_b1" in band_names or "elevation_b2" in band_names:
+        return band_names
+    if "elevation" in band_names and "slope" in band_names:
+        return [
+            "elevation_b1" if name == "elevation"
+            else "elevation_b2" if name == "slope"
+            else name
+            for name in band_names
+        ]
+    return band_names
+
+
 def apply_temporal_coverage_rules(band_stack: np.ndarray, band_names: List[str], year: int, 
                                   log_once: Optional[dict] = None) -> None:
     """
@@ -855,6 +883,7 @@ def main():
                         if dataset in yearly_window_arrays:
                             num_bands = yearly_window_arrays[dataset].shape[0]
                             all_band_names.extend(get_band_names_for_array(dataset, num_bands))
+                    all_band_names = harmonize_elevation_schema(all_band_names)
                     
                     schema_initialized = True
                     log_progress(f"\nSchema initialized from window {window_idx}, year {year}:")
