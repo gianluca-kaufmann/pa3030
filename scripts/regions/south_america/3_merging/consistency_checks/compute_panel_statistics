@@ -55,6 +55,14 @@ OUTPUT_JSON.parent.mkdir(parents=True, exist_ok=True)
 # How many row groups to sample for statistics (None = all, but slow)
 SAMPLE_ROW_GROUPS = 20
 
+# Columns whose missing-value counts are computed exactly (not just from the sample)
+# because they have known design-driven gaps (DPI ends 2020, lag NaN in year 0)
+# that are badly estimated by a 20-row-group sample.
+EXACT_MISSING_COLS = [
+    'policy_b1', 'policy_b2', 'policy_b3', 'policy_b4',
+    'economic_value_lag1',
+]
+
 
 def analyze_panel():
     """Analyze panel dataset structure and completeness."""
@@ -118,13 +126,17 @@ def analyze_panel():
     unique_pixels = set()
     n_duplicates = 0
     duplicate_examples = []
+    # Exact NaN counts for priority columns (computed over ALL row groups, not just sample)
+    step1_extra_cols = [c for c in EXACT_MISSING_COLS if c in columns]
+    exact_missing_counts = {col: 0 for col in step1_extra_cols}
     
     for rg_idx in range(num_row_groups):
         if (rg_idx + 1) % 10 == 0 or rg_idx == 0:
             print(f"  Processed {rg_idx + 1}/{num_row_groups} row groups", flush=True)
         
-        # Read one row group at a time with only metadata columns
-        table = pf.read_row_group(rg_idx, columns=['year', 'row', 'col'])
+        # Read metadata columns + any priority columns present in this dataset
+        read_cols = ['year', 'row', 'col'] + step1_extra_cols
+        table = pf.read_row_group(rg_idx, columns=read_cols)
         df = table.to_pandas()
         
         # Update year counts
@@ -132,6 +144,10 @@ def analyze_panel():
         
         # Update unique pixels
         unique_pixels.update(zip(df['row'].tolist(), df['col'].tolist()))
+        
+        # Exact missing counts for priority columns
+        for col in step1_extra_cols:
+            exact_missing_counts[col] += int(df[col].isnull().sum())
         
         # Check for duplicates within this row group only
         dup_mask = df.duplicated(subset=['year', 'row', 'col'], keep=False)
@@ -330,10 +346,18 @@ def analyze_panel():
         "missing_values/sample_fraction": sample_rows / total_rows if total_rows > 0 else 0
     })
     
-    # Log top missing value columns
+    # Log top missing value columns (sampled estimates)
     for col, count in cols_with_missing[:20]:  # Log top 20
         pct = 100 * count / sample_rows if sample_rows > 0 else 0
         wandb.log({f"missing_values/{col}/count": count, f"missing_values/{col}/percent": pct})
+    
+    # Log exact missing counts for priority columns
+    print(f"\nExact missing counts for priority columns (all {num_row_groups} row groups):")
+    for col, count in exact_missing_counts.items():
+        pct = 100 * count / total_rows if total_rows > 0 else 0
+        print(f"  {col}: {count:,} ({pct:.2f}% of total rows)")
+        wandb.log({f"missing_values/{col}/exact_count": count,
+                   f"missing_values/{col}/exact_percent": pct})
     
     # Numeric columns summary
     print(f"\n" + "=" * 60)
@@ -396,7 +420,10 @@ def analyze_panel():
         'missing_values': {
             'sample_rows': sample_rows,
             'columns_with_missing': len(cols_with_missing),
-            'details': {col: int(count) for col, count in cols_with_missing}
+            'details': {col: int(count) for col, count in cols_with_missing},
+            # Exact NaN counts (computed over all row groups) for policy/econ columns.
+            # Use these in preference to sampled 'details' for accurate percentages.
+            'exact_details': exact_missing_counts,
         },
         'numeric_statistics': numeric_stats
     }

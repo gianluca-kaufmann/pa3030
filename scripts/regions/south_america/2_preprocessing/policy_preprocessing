@@ -55,6 +55,7 @@ import numpy as np
 import pandas as pd
 import rasterio
 from rasterio.features import rasterize
+from scipy.ndimage import distance_transform_edt
 
 warnings.filterwarnings("ignore")
 
@@ -67,9 +68,21 @@ DATA_DIR = PROJECT_ROOT / "data"
 READY_DIR = DATA_DIR / "south_america" / "ready"
 
 # Input paths (global raw data in shared/)
-WGI_PATH = DATA_DIR / "shared" / "WGI" / "wgidataset_with_sourcedata-2025 (1).xlsx"
+# WGI: accept both the original name with "(1)" and the plain download name
+_wgi_candidates = [
+    DATA_DIR / "shared" / "WGI" / "wgidataset_with_sourcedata-2025 (1).xlsx",
+    DATA_DIR / "shared" / "WGI" / "wgidataset_with_sourcedata-2025.xlsx",
+]
+WGI_PATH = next((p for p in _wgi_candidates if p.exists()), _wgi_candidates[0])
+
 VDEM_PATH = DATA_DIR / "shared" / "VDem" / "V-Dem-CY-Core-v15.csv"
-DPI_PATH = DATA_DIR / "shared" / "DPI" / "DPI2020.csv"
+
+# DPI: accept both CSV (original) and XLSX (alternative download format)
+_dpi_candidates = [
+    DATA_DIR / "shared" / "DPI" / "DPI2020.csv",
+    DATA_DIR / "shared" / "DPI" / "DPI2020.xlsx",
+]
+DPI_PATH = next((p for p in _dpi_candidates if p.exists()), _dpi_candidates[0])
 BACKBONE_PATH = READY_DIR / "backbone" / "backbone.tif"
 
 # Output directory
@@ -131,18 +144,34 @@ BACKBONE_CRS_EPSG = "EPSG:3857"
 def load_wgi() -> pd.DataFrame:
     """Read WGI Government Effectiveness (ge) and Rule of Law (rl) sheets."""
     print("Loading WGI data...")
+
+    # The WGI Excel column for the governance estimate can change name across
+    # file versions.  Try the canonical name first, then fall back to the first
+    # column whose name contains "estimate" (case-insensitive).
+    ESTIMATE_COL_CANONICAL = "Governance estimate (approx. -2.5 to +2.5)"
+
+    def _find_estimate_col(df: pd.DataFrame, sheet: str) -> str:
+        if ESTIMATE_COL_CANONICAL in df.columns:
+            return ESTIMATE_COL_CANONICAL
+        candidates = [c for c in df.columns if "estimate" in c.lower()]
+        if candidates:
+            print(f"  Warning: WGI sheet '{sheet}' — canonical column not found; "
+                  f"using '{candidates[0]}' instead.")
+            return candidates[0]
+        raise KeyError(
+            f"Cannot find governance estimate column in WGI sheet '{sheet}'. "
+            f"Available columns: {list(df.columns)}"
+        )
+
     dfs = []
     for sheet, col_name in [("ge", "wgi_ge"), ("rl", "wgi_rl")]:
-        df = pd.read_excel(
-            WGI_PATH,
-            sheet_name=sheet,
-            usecols=["Economy (code)", "Year",
-                      "Governance estimate (approx. -2.5 to +2.5)"],
-        )
+        df_raw = pd.read_excel(WGI_PATH, sheet_name=sheet)
+        estimate_col = _find_estimate_col(df_raw, sheet)
+        df = df_raw[["Economy (code)", "Year", estimate_col]].copy()
         df = df.rename(columns={
             "Economy (code)": "iso3",
             "Year": "year",
-            "Governance estimate (approx. -2.5 to +2.5)": col_name,
+            estimate_col: col_name,
         })
         df = df[df["iso3"].isin(SA_POLICY_ISO3)].copy()
         dfs.append(df)
@@ -169,10 +198,22 @@ def load_vdem() -> pd.DataFrame:
 
 
 def load_dpi() -> pd.DataFrame:
-    """Read DPI Chief Executive Party ideology (execrlc)."""
+    """Read DPI Chief Executive Party ideology (execrlc).
+
+    Accepts both CSV (original download) and XLSX (alternative download format).
+    When read from XLSX, the year column comes as datetime64 and is converted to int.
+    """
     print("Loading DPI data...")
-    df = pd.read_csv(DPI_PATH, usecols=["ifs", "year", "execrlc"], encoding="latin-1")
+    suffix = DPI_PATH.suffix.lower()
+    if suffix == ".csv":
+        df = pd.read_csv(DPI_PATH, usecols=["ifs", "year", "execrlc"], encoding="latin-1")
+    else:
+        df = pd.read_excel(DPI_PATH, usecols=["ifs", "year", "execrlc"])
+        # Excel stores the year column as datetime; extract the integer year
+        if pd.api.types.is_datetime64_any_dtype(df["year"]):
+            df["year"] = df["year"].dt.year
     df = df.rename(columns={"ifs": "iso3"})
+    df["year"] = pd.to_numeric(df["year"], errors="coerce").dropna().astype(int)
     df = df[df["iso3"].isin(SA_POLICY_ISO3)].copy()
     ideology_map = {"Left": -1.0, "Center": 0.0, "Right": 1.0}
     df["dpi_exec_ideology"] = df["execrlc"].map(ideology_map)
@@ -200,6 +241,30 @@ def build_policy_table() -> pd.DataFrame:
         if col in policy.columns:
             policy[col] = policy[col].astype("float32")
 
+    # Expand to a complete (iso3, year) grid for YEAR_MIN..YEAR_MAX so that
+    # biennial WGI gaps (e.g. 2001 is absent from WGI) are filled by carry-forward
+    # from the most recent available value.  DPI values beyond 2020 intentionally
+    # stay NaN — they are not forward-filled here.
+    all_iso3 = sorted(policy["iso3"].unique())
+    full_idx = pd.MultiIndex.from_product(
+        [all_iso3, list(range(YEAR_MIN, YEAR_MAX + 1))],
+        names=["iso3", "year"],
+    )
+    policy = (
+        policy
+        .set_index(["iso3", "year"])
+        .reindex(full_idx)
+        .reset_index()
+    )
+    # Forward-fill only WGI and V-Dem columns (continuous surveys with biennial gaps).
+    # DPI ends in 2020 by design — do not propagate those values into 2021+.
+    wgi_vdem_cols = [c for c in ["wgi_ge", "wgi_rl", "vdem_ldi"] if c in policy.columns]
+    if wgi_vdem_cols:
+        policy[wgi_vdem_cols] = (
+            policy.groupby("iso3")[wgi_vdem_cols]
+            .transform(lambda s: s.ffill().bfill())
+        )
+
     policy = policy.sort_values(["iso3", "year"]).reset_index(drop=True)
 
     print(f"\nPolicy table: {len(policy)} rows, "
@@ -208,6 +273,13 @@ def build_policy_table() -> pd.DataFrame:
     for col in POLICY_VARIABLES:
         n_miss = policy[col].isna().sum()
         print(f"  {col}: {n_miss} missing ({100 * n_miss / len(policy):.1f}%)")
+
+    # Per-year coverage diagnostic — helps pinpoint data gaps
+    print("\n  Per-year missingness (wgi_ge) — years with any NaN indicate WGI gaps:")
+    wgi_by_year = policy.groupby("year")["wgi_ge"].apply(lambda s: s.isna().mean())
+    for yr, pct in wgi_by_year.items():
+        if yr >= YEAR_MIN and pct > 0:
+            print(f"    {yr}: {pct * 100:.0f}% missing")
 
     return policy
 
@@ -309,6 +381,20 @@ def create_country_raster(gdf_sa: gpd.GeoDataFrame) -> tuple[np.ndarray, dict]:
     print(f"  Assigned to country: {assigned:,} ({100 * assigned / total_land:.1f}%)")
     if unassigned > 0:
         print(f"  Unassigned: {unassigned:,} ({100 * unassigned / total_land:.1f}%)")
+        print(f"  Applying nearest-neighbour fill to {unassigned:,} unassigned land pixels...")
+        # Land pixels with country_id=0 arise from sub-pixel polygon boundary gaps.
+        # Fill each such pixel with the country_id of its nearest assigned neighbour
+        # so that no land pixel is silently excluded from policy rasters.
+        need_fill = (backbone_data == 1) & (country_raster == 0)
+        assigned_mask = (country_raster > 0)
+        _, nearest_idx = distance_transform_edt(~assigned_mask, return_indices=True)
+        country_raster[need_fill] = country_raster[
+            nearest_idx[0][need_fill],
+            nearest_idx[1][need_fill],
+        ]
+        assigned_after = int((country_raster > 0).sum())
+        print(f"  After fill: {assigned_after:,} land pixels assigned "
+              f"({100 * assigned_after / total_land:.1f}%)")
 
     for cid, iso3 in sorted(SA_COUNTRY_ID.items()):
         n = int((country_raster == cid).sum())

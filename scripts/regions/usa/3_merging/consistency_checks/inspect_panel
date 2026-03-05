@@ -195,6 +195,11 @@ def main():
             pct = format_percentage(count, total_rows)
             f.write(f"{year:<10} {format_number(count):<20} {pct:<15}\n")
         f.write("\n")
+        f.write("Note: This is a risk-set panel — rows per year decreases as pixels become\n")
+        f.write("  protected. The large drop from year 1 to year 2 reflects pre-existing WDPA\n")
+        f.write("  pixels (year 1 sets WDPA_prev=0 for all; year 2 excludes pixels with WDPA=1\n")
+        f.write("  in year 1). Subsequent annual attrition reflects new designations each year.\n")
+        f.write("\n")
         
         # 5. Uniqueness / Balance Check
         print("5. Uniqueness / balance check...")
@@ -236,13 +241,16 @@ def main():
             f.write(f"Balanced across years: {'Yes' if is_balanced else 'No'}\n")
             
             # Check for structural issues
-            if expected_rows != actual_rows:
-                f.write(f"\n⚠ WARNING: Row count mismatch!\n")
-                diff = actual_rows - expected_rows
-                if diff > 0:
-                    f.write(f"  → {format_number(diff)} more rows than expected (possible duplicates)\n")
-                else:
-                    f.write(f"  → {format_number(-diff)} fewer rows than expected (missing data)\n")
+            if actual_rows > expected_rows:
+                f.write(f"\n⚠ WARNING: More rows than expected — possible duplicates!\n")
+                f.write(f"  → {format_number(actual_rows - expected_rows)} extra rows\n")
+            elif actual_rows < expected_rows:
+                f.write(f"\n[INFO] Risk-set panel: actual rows < first-year cohort × years.\n")
+                f.write(f"  'Unique pixels' equals the year-2000 cohort (all land pixels, since\n")
+                f.write(f"  WDPA_prev is forced to 0 for the first year). Pixels leave the panel\n")
+                f.write(f"  once designated as protected, so later years are smaller by design.\n")
+                f.write(f"  The {format_number(expected_rows - actual_rows)} 'missing' rows are\n")
+                f.write(f"  pixels that became protected in prior years — not a data error.\n")
             else:
                 f.write(f"\n✓ Row counts match expected structure perfectly\n")
         else:
@@ -266,20 +274,44 @@ def main():
             missing_counts = missing_section
             denom = total_rows
 
+        # Exact counts (all row groups) override sampled estimates for priority columns
+        exact_details = (
+            missing_section.get('exact_details', {})
+            if isinstance(missing_section, dict) else {}
+        )
+
         cols_with_missing = 0
 
         for col in col_names:
-            missing = missing_counts.get(col, 0)
-            pct = format_percentage(missing, denom)
+            if col in exact_details:
+                # Use exact count with total_rows as denominator
+                missing = exact_details[col]
+                pct = format_percentage(missing, total_rows)
+                suffix = " [exact]"
+            else:
+                missing = missing_counts.get(col, 0)
+                pct = format_percentage(missing, denom)
+                suffix = ""
 
             if missing > 0:
                 cols_with_missing += 1
 
-            f.write(f"{col:<50} {format_number(missing):<20} {pct:<15}\n")
+            f.write(f"{col:<50} {format_number(missing):<20} {pct:<15}{suffix}\n")
 
         f.write(f"\nSummary: {cols_with_missing} columns have missing values\n")
         if isinstance(missing_section, dict) and 'details' in missing_section:
-            f.write("Note: Missing value statistics are based on sampled row groups.\n")
+            f.write("Note: Missing value statistics are based on sampled row groups,\n")
+            f.write("      except columns marked [exact] which use all row groups.\n")
+        f.write("\n")
+        f.write("Known missingness patterns (by design):\n")
+        f.write("  WDPA_prev        : always 0 in the final panel — risk-set filter invariant\n")
+        f.write("                     (confirms only unprotected pixels are retained). Expected.\n")
+        f.write("  economic_value_lag1: NaN for the first panel year (no prior-year lag exists\n")
+        f.write("                     by design). ~1/n_years fraction of rows affected.\n")
+        f.write("  policy_b3, policy_b4: NaN for years 2021-2024 — DPI data ends in 2020.\n")
+        f.write("  policy_b1, policy_b2: elevated missingness may indicate a WGI data coverage\n")
+        f.write("                     gap (biennial pre-2003) or unassigned pixels in the country\n")
+        f.write("                     raster (country_id=0). Investigate if missingness > 5%%.\n")
         f.write("\n")
         
         # 7. Numeric Statistics
@@ -296,6 +328,58 @@ def main():
             if 'columns' in stats and 'numeric_columns' in stats['columns']
             else list(numeric_stats.keys())
         )
+
+        # Inline notes for columns with non-obvious ranges or units
+        COLUMN_NOTES = {
+            'WDPA_prev': (
+                "  [NOTE] Always 0 (risk-set invariant — all rows are unprotected pixels)."
+            ),
+            'dist_wdpa': (
+                "  [NOTE] min=1000 m is expected: 1 km grid + risk-set filter => nearest\n"
+                "         protected pixel is at least 1 grid cell away = 1000 m."
+            ),
+            'NDVI': (
+                "  [NOTE] Raw MODIS x10000 scale. Divide by 10000 for standard NDVI (-1 to 1).\n"
+                "         Negative values over water/snow are physically valid."
+            ),
+            'NDVI_smooth16': (
+                "  [NOTE] Spatially smoothed NDVI, still in raw MODIS x10000 scale."
+            ),
+            'NDVI_smooth64': (
+                "  [NOTE] Spatially smoothed NDVI, still in raw MODIS x10000 scale."
+            ),
+            'WorldClim_b1': (
+                "  [NOTE] WorldClim bio01 (Annual Mean Temp). Stored in x10 units after\n"
+                "         pipeline unscaling; divide by 10 for degrees Celsius."
+            ),
+            'WorldClim_b2': (
+                "  [NOTE] WorldClim bio02 (Mean Diurnal Range). x10 units; divide by 10 for C."
+            ),
+            'WorldClim_b3': (
+                "  [NOTE] WorldClim bio03 (Isothermality). x10 units."
+            ),
+            'WorldClim_b5': (
+                "  [NOTE] WorldClim bio05 (Max Temp Warmest Month). x10 units; divide by 10 for C."
+            ),
+            'WorldClim_b6': (
+                "  [NOTE] WorldClim bio06 (Min Temp Coldest Month). x10 units; divide by 10 for C."
+            ),
+            'WorldClim_b7': (
+                "  [NOTE] WorldClim bio07 (Temp Annual Range). x10 units; divide by 10 for C."
+            ),
+            'WorldClim_b8': (
+                "  [NOTE] WorldClim bio08 (Mean Temp Wettest Quarter). x10 units; /10 for C."
+            ),
+            'WorldClim_b9': (
+                "  [NOTE] WorldClim bio09 (Mean Temp Driest Quarter). x10 units; /10 for C."
+            ),
+            'WorldClim_b10': (
+                "  [NOTE] WorldClim bio10 (Mean Temp Warmest Quarter). x10 units; /10 for C."
+            ),
+            'WorldClim_b11': (
+                "  [NOTE] WorldClim bio11 (Mean Temp Coldest Quarter). x10 units; /10 for C."
+            ),
+        }
 
         for col in numeric_cols:
             if col in numeric_stats:
@@ -321,6 +405,8 @@ def main():
                     mean_str = "N/A"
 
                 f.write(f"{col:<40} {min_str:<18} {max_str:<18} {mean_str:<18}\n")
+                if col in COLUMN_NOTES:
+                    f.write(COLUMN_NOTES[col] + "\n")
 
         f.write(f"\nTotal numeric columns: {len(numeric_stats)}\n")
         f.write("\n")
