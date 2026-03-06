@@ -1,242 +1,136 @@
 #!/usr/bin/env python3
 """
 Economic Value Preprocessing — USA
-=================================
+====================================
 
-Builds yearly agricultural land economic value (constant USD/ha) for the USA
-from FAO + World Bank inputs and rasterizes it onto the USA backbone.
-
-Formula:
-  economic_value_usd_ha = (gross_production_value_1000usd * 1000) / (agri_land_sqkm * 100)
+Spatially allocates FAO national gross agricultural production value (GPV)
+across cropland and pasture pixels derived from MODIS land cover data.
 
 Inputs:
   - data/shared/FAO/value_agr.prod.csv
-  - data/shared/FAO/agr_land_area.csv
+  - data/usa/ready/landcover/  (MODIS IGBP rasters, 1 km, 2000-2024)
   - data/usa/ready/backbone/backbone.tif
-  - data/usa/ready/policy/country_iso3.tif (preferred, fallback built from Natural Earth)
-  - data/usa/ready/policy/country_iso3_mapping.json (preferred)
+  - data/usa/ready/policy/country_iso3.tif + country_iso3_mapping.json
+    (preferred; fallback: Natural Earth 10 m admin boundaries)
 
 Outputs:
-  - data/usa/ready/economic_value/economic_value_YYYY.tif
+  - data/usa/ready/economic_value/economic_value_{year}.tif
+    float32, LZW-compressed, tiled 512×512, nodata=NaN, 2000-2024
+  - data/usa/ready/economic_value/validation_totals.csv
+
+Algorithm (see scripts/utils/economic_value_utils.py for full details)
+-----------------------------------------------------------------------
+For each agricultural pixel i in country c at year y:
+
+    value_usd_ha_i = FAO_GPV(c, y) * LC_WEIGHT[lc_class_i]
+                     / Σ_j (LC_WEIGHT[lc_class_j] * 100 ha)
+
+  Cropland pixels (IGBP 12, 14) → weight 1.0
+  Pasture/rangeland pixels (IGBP 8, 9, 10) → weight 0.3
+  All other pixels within country boundary → value 0
+  Pixels outside all country boundaries → NaN
+
+National totals are preserved exactly (to float32 precision).
 """
 
 from __future__ import annotations
 
-import json
+import sys
 from pathlib import Path
 
-import geopandas as gpd
-import numpy as np
-import pandas as pd
-import rasterio
-from rasterio.features import rasterize
-
+# ── Import shared utilities ────────────────────────────────────────────────────
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
+_utils_dir = str(PROJECT_ROOT / "scripts" / "utils")
+if _utils_dir not in sys.path:
+    sys.path.insert(0, _utils_dir)
+
+from economic_value_utils import (  # noqa: E402  # pyright: ignore[reportMissingImports]
+    YEAR_MIN,
+    YEAR_MAX,
+    build_country_raster_from_natural_earth,
+    build_fao_table,
+    load_backbone,
+    load_country_raster_from_policy,
+    write_yearly_rasters,
+)
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+
 DATA_DIR = PROJECT_ROOT / "data"
 READY_DIR = DATA_DIR / "usa" / "ready"
 OUTPUT_DIR = READY_DIR / "economic_value"
-
+LANDCOVER_DIR = READY_DIR / "landcover"
 BACKBONE_PATH = READY_DIR / "backbone" / "backbone.tif"
 VALUE_PATH = DATA_DIR / "shared" / "FAO" / "value_agr.prod.csv"
-LAND_AREA_PATH = DATA_DIR / "shared" / "FAO" / "agr_land_area.csv"
-POLICY_COUNTRY_RASTER = READY_DIR / "policy" / "country_iso3.tif"
-POLICY_COUNTRY_MAP = READY_DIR / "policy" / "country_iso3_mapping.json"
+POLICY_RASTER = READY_DIR / "policy" / "country_iso3.tif"
+POLICY_MAP = READY_DIR / "policy" / "country_iso3_mapping.json"
 
-YEAR_MIN = 2000
-YEAR_MAX = 2024
+# ── Region constants ───────────────────────────────────────────────────────────
 
-USA_COUNTRY_ID = {1: "USA"}
-USA_POLICY_ISO3 = {"USA"}
-USA_TERRITORIES = ["USA"]
+USA_COUNTRY_ID: dict[int, str] = {1: "USA"}
+USA_TERRITORIES: list[str] = ["USA"]
+USA_POLICY_ISO3: set[str] = {"USA"}
 
-VALUE_NAME_OVERRIDES = {"United States of America": "United States"}
-
-NE_10M_URL = (
-    "https://naciscdn.org/naturalearth/10m/cultural/"
-    "ne_10m_admin_0_map_units.zip"
-)
+USA_NE_ISO3_COL_PREFERENCE: list[str] = ["ADM0_A3", "ISO_A3", "GU_A3", "iso_a3"]
 
 
-def load_backbone():
-    if not BACKBONE_PATH.exists():
-        raise FileNotFoundError(f"Backbone raster not found: {BACKBONE_PATH}")
-    with rasterio.open(BACKBONE_PATH) as src:
-        profile = src.profile.copy()
-        backbone = src.read(1)
-        transform = src.transform
-        shape = (src.height, src.width)
-        crs = src.crs
-    return profile, backbone, transform, shape, crs
+# ── Country raster ─────────────────────────────────────────────────────────────
 
 
-def load_country_raster_from_policy():
-    if not (POLICY_COUNTRY_RASTER.exists() and POLICY_COUNTRY_MAP.exists()):
-        return None
-    with rasterio.open(POLICY_COUNTRY_RASTER) as src:
-        country_raster = src.read(1)
-    with open(POLICY_COUNTRY_MAP, "r", encoding="utf-8") as f:
-        mapping_raw = json.load(f)
-    id_to_iso3 = {int(k): v for k, v in mapping_raw.items()}
-    return country_raster, id_to_iso3
-
-
-def build_country_raster_from_natural_earth(backbone, shape, transform, crs):
-    print("Building country raster from Natural Earth (fallback)...")
-    try:
-        gdf = gpd.read_file(NE_10M_URL)
-    except Exception:
-        gdf = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres"))
-
-    iso3_col = None
-    for candidate in ["ADM0_A3", "ISO_A3", "GU_A3", "iso_a3"]:
-        if candidate in gdf.columns:
-            iso3_col = candidate
-            break
-    if iso3_col is None:
-        raise ValueError("Could not find ISO3 column in Natural Earth data.")
-
-    gdf_usa = gdf[gdf[iso3_col].isin(USA_TERRITORIES)].copy()
-    gdf_usa = gdf_usa[[iso3_col, "geometry"]].rename(columns={iso3_col: "iso3"})
-    if gdf_usa.crs is None:
-        gdf_usa = gdf_usa.set_crs("EPSG:4326")
-    gdf_usa = gdf_usa.to_crs(crs)
-
-    territory_to_id = {v: k for k, v in USA_COUNTRY_ID.items()}
-    shapes_to_rasterize = []
-    for _, row in gdf_usa.iterrows():
-        cid = territory_to_id.get(row["iso3"])
-        if cid is not None and row.geometry is not None and not row.geometry.is_empty:
-            shapes_to_rasterize.append((row.geometry, cid))
-
-    country_raster = rasterize(
-        shapes_to_rasterize,
-        out_shape=shape,
+def get_country_raster(backbone, shape, transform, crs):
+    """Load or build the country integer raster and id→ISO3 mapping."""
+    result = load_country_raster_from_policy(POLICY_RASTER, POLICY_MAP)
+    if result is not None:
+        return result
+    return build_country_raster_from_natural_earth(
+        backbone=backbone,
+        shape=shape,
         transform=transform,
-        fill=0,
-        dtype=np.uint8,
-        all_touched=True,
-    )
-    country_raster[backbone == 0] = 0
-    return country_raster, USA_COUNTRY_ID
-
-
-def load_land_area_wb() -> pd.DataFrame:
-    df = pd.read_csv(LAND_AREA_PATH, skiprows=4)
-    year_cols = [c for c in df.columns if c.isdigit()]
-    df = df[["Country Name", "Country Code"] + year_cols].copy()
-    df_long = df.melt(
-        id_vars=["Country Name", "Country Code"],
-        value_vars=year_cols,
-        var_name="year",
-        value_name="agri_land_sqkm",
-    )
-    df_long["year"] = df_long["year"].astype(int)
-    df_long["agri_land_sqkm"] = pd.to_numeric(df_long["agri_land_sqkm"], errors="coerce")
-    df_long = df_long.rename(columns={"Country Code": "iso3"})
-    return df_long[["iso3", "year", "agri_land_sqkm"]]
-
-
-def load_fao_value() -> pd.DataFrame:
-    df = pd.read_csv(VALUE_PATH, dtype={"Area Code (M49)": str})
-    df = df[df["Element Code"] == 58].copy()
-    df["year"] = pd.to_numeric(df["Year"], errors="coerce").astype("Int64")
-    df["gross_value_1000usd"] = pd.to_numeric(df["Value"], errors="coerce")
-
-    wb_country_df = pd.read_csv(LAND_AREA_PATH, skiprows=4, usecols=["Country Name", "Country Code"])
-    wb_country_df = wb_country_df.drop_duplicates()
-    wb_map = dict(zip(wb_country_df["Country Name"], wb_country_df["Country Code"]))
-
-    df["wb_country_name"] = df["Area"].replace(VALUE_NAME_OVERRIDES)
-    df["iso3"] = df["wb_country_name"].map(wb_map)
-
-    df = df[df["iso3"].isin(USA_POLICY_ISO3)].copy()
-    df = df[["iso3", "year", "gross_value_1000usd"]].dropna(subset=["year"])
-    df["year"] = df["year"].astype(int)
-    return df
-
-
-def build_economic_table() -> pd.DataFrame:
-    land = load_land_area_wb()
-    value = load_fao_value()
-
-    merged = value.merge(land, on=["iso3", "year"], how="inner")
-    merged = merged[(merged["year"] >= YEAR_MIN) & (merged["year"] <= YEAR_MAX)].copy()
-
-    merged["agri_land_ha"] = merged["agri_land_sqkm"] * 100.0
-    merged["gross_value_usd"] = merged["gross_value_1000usd"] * 1000.0
-    merged["economic_value_usd_ha"] = merged["gross_value_usd"] / merged["agri_land_ha"]
-
-    merged.loc[~np.isfinite(merged["economic_value_usd_ha"]), "economic_value_usd_ha"] = np.nan
-    merged = merged[["iso3", "year", "economic_value_usd_ha"]]
-
-    full_idx = pd.MultiIndex.from_product(
-        [sorted(USA_POLICY_ISO3), list(range(YEAR_MIN, YEAR_MAX + 1))],
-        names=["iso3", "year"],
-    )
-    merged = merged.set_index(["iso3", "year"]).reindex(full_idx).reset_index()
-    merged["economic_value_usd_ha"] = (
-        merged.groupby("iso3")["economic_value_usd_ha"]
-        .transform(lambda s: s.interpolate(limit_direction="both").ffill().bfill())
-        .astype(np.float32)
-    )
-    return merged
-
-
-def write_yearly_rasters(economic_df: pd.DataFrame, country_raster, id_to_iso3, profile):
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_profile = profile.copy()
-    out_profile.update(
-        dtype="float32",
-        nodata=np.nan,
-        compress="lzw",
-        count=1,
-        tiled=True,
-        blockxsize=512,
-        blockysize=512,
+        crs=crs,
+        territories=USA_TERRITORIES,
+        country_id=USA_COUNTRY_ID,
+        iso3_col_preference=USA_NE_ISO3_COL_PREFERENCE,
     )
 
-    for year in range(YEAR_MIN, YEAR_MAX + 1):
-        raster = np.full(country_raster.shape, np.nan, dtype=np.float32)
-        values_year = economic_df[economic_df["year"] == year].set_index("iso3")["economic_value_usd_ha"]
-        for cid, iso3 in id_to_iso3.items():
-            if cid == 0:
-                continue
-            val = values_year.get(iso3)
-            if pd.notna(val):
-                raster[country_raster == cid] = float(val)
 
-        out_path = OUTPUT_DIR / f"economic_value_{year}.tif"
-        with rasterio.open(out_path, "w", **out_profile) as dst:
-            dst.write(raster, 1)
-
-    print(f"Wrote {YEAR_MAX - YEAR_MIN + 1} rasters to {OUTPUT_DIR}")
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 
 def main() -> None:
     print("Economic Value Preprocessing — USA")
     print("=" * 60)
 
-    for p in [VALUE_PATH, LAND_AREA_PATH]:
-        if not p.exists():
-            raise FileNotFoundError(f"Required input file missing: {p}")
-
-    profile, backbone, transform, shape, crs = load_backbone()
-    country_data = load_country_raster_from_policy()
-    if country_data is None:
-        country_raster, id_to_iso3 = build_country_raster_from_natural_earth(
-            backbone=backbone,
-            shape=shape,
-            transform=transform,
-            crs=crs,
+    if not VALUE_PATH.exists():
+        raise FileNotFoundError(f"Missing FAO production value data: {VALUE_PATH}")
+    if not LANDCOVER_DIR.exists():
+        raise FileNotFoundError(
+            f"Land-cover directory not found: {LANDCOVER_DIR}\n"
+            "Run the MODIS land-cover extraction step first."
         )
-    else:
-        country_raster, id_to_iso3 = country_data
 
-    economic_df = build_economic_table()
-    write_yearly_rasters(economic_df, country_raster, id_to_iso3, profile)
+    profile, backbone, transform, shape, crs = load_backbone(BACKBONE_PATH)
+    country_raster, id_to_iso3 = get_country_raster(backbone, shape, transform, crs)
 
-    print("Done.")
+    fao_df = build_fao_table(
+        value_path=VALUE_PATH,
+        policy_iso3=USA_POLICY_ISO3,
+        year_min=YEAR_MIN,
+        year_max=YEAR_MAX,
+    )
+
+    write_yearly_rasters(
+        fao_df=fao_df,
+        country_raster=country_raster,
+        id_to_iso3=id_to_iso3,
+        lc_dir=LANDCOVER_DIR,
+        output_dir=OUTPUT_DIR,
+        profile=profile,
+        year_min=YEAR_MIN,
+        year_max=YEAR_MAX,
+    )
+
+    print("\nDone.")
 
 
 if __name__ == "__main__":
