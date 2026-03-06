@@ -43,6 +43,7 @@ import numpy as np
 import pandas as pd
 import rasterio
 from rasterio.features import rasterize
+from rasterio.warp import reproject, Resampling
 
 # ── Temporal range ────────────────────────────────────────────────────────────
 
@@ -311,12 +312,17 @@ def get_available_lc_years(lc_dir: Path) -> dict[int, Path]:
 def load_landcover_for_year(
     year: int,
     year_to_path: dict[int, Path],
-    expected_shape: tuple[int, int] | None = None,
+    target_shape: tuple[int, int] | None = None,
+    target_transform: Any = None,
+    target_crs: Any = None,
 ) -> np.ndarray:
-    """Load the MODIS land-cover array for *year*.
+    """Load the MODIS land-cover array for *year*, reprojecting to the
+    backbone grid when necessary.
 
     Falls back to the nearest available year if *year* is not present.
-    Raises a clear error if the raster shape does not match *expected_shape*.
+    When *target_shape* / *target_transform* / *target_crs* are provided and
+    the source raster does not already match, the array is warped with
+    nearest-neighbour resampling (correct for categorical IGBP data).
     """
     if not year_to_path:
         raise FileNotFoundError("No land-cover rasters found.")
@@ -333,13 +339,31 @@ def load_landcover_for_year(
 
     with rasterio.open(path) as src:
         lc = src.read(1)
+        src_transform = src.transform
+        src_crs = src.crs
 
-    if expected_shape is not None and lc.shape != expected_shape:
-        raise ValueError(
-            f"Land-cover raster shape {lc.shape} does not match expected "
-            f"shape {expected_shape} (backbone grid). Ensure land-cover "
-            f"rasters are preprocessed to align with the backbone."
+    needs_warp = (
+        target_shape is not None
+        and target_transform is not None
+        and target_crs is not None
+        and lc.shape != target_shape
+    )
+    if needs_warp:
+        print(
+            f"  Reprojecting land-cover {year}: "
+            f"{lc.shape} → {target_shape}"
         )
+        out = np.zeros(target_shape, dtype=lc.dtype)
+        reproject(
+            source=lc,
+            destination=out,
+            src_transform=src_transform,
+            src_crs=src_crs,
+            dst_transform=target_transform,
+            dst_crs=target_crs,
+            resampling=Resampling.nearest,
+        )
+        return out
     return lc
 
 
@@ -390,11 +414,18 @@ def write_yearly_rasters(
         raise FileNotFoundError(f"No land-cover rasters found in {lc_dir}")
 
     backbone_shape = country_raster.shape
+    backbone_transform = profile["transform"]
+    backbone_crs = profile["crs"]
     valid_cids = {cid: iso3 for cid, iso3 in id_to_iso3.items() if cid != 0}
     validation_rows: list[dict] = []
 
     for year in range(year_min, year_max + 1):
-        lc = load_landcover_for_year(year, year_to_lc_path, backbone_shape)
+        lc = load_landcover_for_year(
+            year, year_to_lc_path,
+            target_shape=backbone_shape,
+            target_transform=backbone_transform,
+            target_crs=backbone_crs,
+        )
 
         # Weight array: 0 for non-agricultural classes, LC_WEIGHTS otherwise.
         weight = np.zeros(lc.shape, dtype=np.float32)
