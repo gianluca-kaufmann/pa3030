@@ -415,7 +415,11 @@ def write_yearly_rasters(
 
     backbone_shape = country_raster.shape
     backbone_transform = profile["transform"]
-    backbone_crs = profile["crs"]
+    # Always use canonical EPSG:3857 rather than profile["crs"], which may be
+    # stored as an EngineeringCRS due to a known GDAL/PROJ metadata bug
+    # (see crs_fix_engineering_mercator). Both rasters are Web Mercator, so
+    # this forces PROJ to treat the warp as a same-CRS affine resample.
+    backbone_crs = rasterio.CRS.from_epsg(3857)
     valid_cids = {cid: iso3 for cid, iso3 in id_to_iso3.items() if cid != 0}
     validation_rows: list[dict] = []
 
