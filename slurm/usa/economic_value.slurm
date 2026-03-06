@@ -18,12 +18,6 @@ mkdir -p "$SCRATCH/outputs/usa/tables"
 
 set -euo pipefail
 
-cd ~/master_thesis
-source ~/.zshrc
-conda activate pa3030
-
-ln -sfn /cluster/scratch/gikaufmann/data data
-
 #------------------------------------------------------------------------------
 # Load modules
 #------------------------------------------------------------------------------
@@ -39,6 +33,10 @@ module load eth_proxy
 #------------------------------------------------------------------------------
 VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
+
+# Ensure repo sees scratch-backed data directory
+cd ~/master_thesis
+ln -sfn /cluster/scratch/gikaufmann/data data
 
 #------------------------------------------------------------------------------
 # Run the economic_value_preprocessing script
