@@ -42,11 +42,15 @@ export TUNING_SPLIT_VERSION="${TUNING_SPLIT_VERSION:-main}"
 export ROLLING_FOLDS="${ROLLING_FOLDS:-5}"
 export MAX_NEG_PER_YEAR_PAPER="${MAX_NEG_PER_YEAR_PAPER:-150000}"
 export MAX_NEG_PER_YEAR_FAST="${MAX_NEG_PER_YEAR_FAST:-50000}"
-# 0 = no cap on positives (default for USA).
-# Profile USA class balance first; if positives become majority-class in the
-# sampled dataset, set to e.g. 5000 as done for SA (see SA SLURM scripts).
-export MAX_POS_PER_YEAR_PAPER="${MAX_POS_PER_YEAR_PAPER:-0}"
-export MAX_POS_PER_YEAR_FAST="${MAX_POS_PER_YEAR_FAST:-0}"
+# Cap positives so the tuning SPW approximates the production rare-event regime.
+# USA production SPW ≈ 673; with ~2.2M negatives in the budget, targeting
+# ~11k positives (SPW ≈ 200) requires ~500–650 positives/year depending on
+# how many years the rolling tuning folds cover.
+# 500/yr is a conservative starting point; override with
+#   MAX_POS_PER_YEAR_PAPER=X sbatch ... if you need a different target SPW.
+# Fast mode: 200/yr keeps jobs quick while staying in the rare-event regime.
+export MAX_POS_PER_YEAR_PAPER="${MAX_POS_PER_YEAR_PAPER:-500}"
+export MAX_POS_PER_YEAR_FAST="${MAX_POS_PER_YEAR_FAST:-200}"
 # 15 trials fits in 24h (~82 min/trial); override to 60 for full tuning if you have more time
 export N_ITER_RF_PAPER="${N_ITER_RF_PAPER:-15}"
 export N_ITER_RF_FAST="${N_ITER_RF_FAST:-25}"
