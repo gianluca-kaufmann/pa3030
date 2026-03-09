@@ -1,11 +1,34 @@
 #!/usr/bin/env python3
 """Random Forest Transition Model (5-Year Lookahead Prediction)
-Train RandomForestClassifier on pre-split parquet files. Final model trained on train+earlystop,
-evaluated on test.
+Train RandomForestClassifier on pre-split parquet files using two deliberate passes.
 Target: transition_01_win5 (1 if transition occurs within next 5 years, else 0)
 
 Split configuration:
 - 'main': Train 2001-2013, Earlystop 2014-2016, Test 2017-2019
+
+Two-pass design rationale:
+  Pass 1 (intermediate model, TRAIN_ONLY_YEARS = 2001-2013):
+    Trains on the pure training period only, then scores the earlystop set (2014-2016).
+    Because the model has never seen those years, the earlystop predictions are
+    genuinely out-of-sample (OOF). These OOF predictions are consumed by calibrate_1
+    to fit a Platt / isotonic calibrator.
+
+  Pass 2 (final model, TRAIN_YEARS = 2001-2016):
+    Trains on all available labelled data before the test window. Scores the test set
+    (2017-2019) for evaluation and map generation.
+
+  The calibrator fitted in Pass 1 is then applied to Pass 2's test-set probabilities.
+  This "model mismatch" (calibrator from smaller model, predictions from larger model)
+  is mild in practice and is the standard approach — LGBM uses the same pattern:
+  CV-fold models produce calibration predictions while the retrained final model
+  produces test predictions.
+
+  The alternative (single-pass, train on 2001-2013 only) would throw away three years
+  of training signal (2014-2016) from the final evaluation model — an unacceptable
+  cost for a temporal trend model where recent years carry the most signal.
+
+  NOTE: train_win5.parquet already spans 2001-2016 (per model2_splits), so the final
+  model is loaded from train_path only (no duplication from earlystop_path).
 
 Features:
 - Right-Censoring Protection: Earlystop and test data filtered to LAST_LABEL_YEAR
@@ -87,7 +110,15 @@ WDPA_LAST_YEAR = 2024  # Last year with WDPA data
 LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS  # Last year we can reliably label (2019)
 
 # Split configuration - matches modelC main split exactly (scale-up only)
-TRAIN_YEARS = (2001, 2016)   # Train: 2001-2016 (excludes 2000 — stock PAs, not true transitions)
+#
+# TRAIN_ONLY_YEARS: the pure training window used for the *intermediate* model whose
+#   predictions on the earlystop set are OOF by construction (model never saw 2014-2016).
+#   This is the calibration source consumed by calibrate_1.
+# TRAIN_YEARS: the full labelled window (train + earlystop) used for the *final* model.
+#   train_win5.parquet already spans 2001-2016, so only train_path is needed — no risk
+#   of double-counting rows from earlystop_path.
+TRAIN_ONLY_YEARS = (2001, 2013)  # Intermediate model: pure train period → OOF earlystop predictions
+TRAIN_YEARS = (2001, 2016)       # Final model: full labelled period (train + earlystop)
 EARLYSTOP_YEARS = (2014, min(2016, LAST_LABEL_YEAR))     # Earlystop: 2014-2016 (matches modelC main split)
 TEST_START = 2017
 TEST_END = 2019
@@ -945,69 +976,77 @@ def phase1_training(
     best_params: Dict[str, Any], timestamp: str, model_dir: Path, output_dir: Path, use_wandb: bool, target_col: str,
 ) -> tuple[Path, Optional[Dict[str, Any]], Dict[str, Any], float, float, int, int, int, Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
     """
-    Phase 1: Training Random Forest model.
-    
-    First train on train data only and generate earlystop predictions for calibration.
-    Then train final model on full train+earlystop data.
-    
+    Phase 1: Training Random Forest model (two deliberate passes).
+
+    Step 1 — Intermediate model (TRAIN_ONLY_YEARS = 2001-2013):
+      Trained on the pure training window. Scores the earlystop set (2014-2016) to
+      produce genuinely OOF predictions consumed by calibrate_1.
+
+    Step 2 — Final model (TRAIN_YEARS = 2001-2016):
+      Trained on all labelled data before the test window (train_win5.parquet already
+      spans 2001-2016; earlystop_path is NOT loaded here to avoid double-counting).
+      Scores the test set in phase2_testing.
+
+    The calibrator fitted in Step 1 is later applied to Step 2's test predictions.
+    This is the same "calibrate-from-smaller-model, evaluate-with-full-model" pattern
+    used by LGBM's temporal CV.
+
     Returns:
         Tuple including model path, stats, timing, and imbalance info
     """
     print("\n" + "="*70 + "\nPHASE 1: TRAINING RANDOM FOREST MODEL\n" + "="*70)
     report_memory_usage("start of Phase 1")
-    
-    # Step 1: Train on train data only and generate earlystop predictions for calibration
+
+    # ------------------------------------------------------------------
+    # Step 1: Intermediate model — OOF earlystop predictions for calibration
+    # ------------------------------------------------------------------
     print("\n" + "-"*70)
-    print("STEP 1: GENERATE EARLYSTOP PREDICTIONS FOR CALIBRATION")
+    print("STEP 1: INTERMEDIATE MODEL → OOF EARLYSTOP PREDICTIONS FOR CALIBRATION")
     print("-"*70)
-    print(f"Training intermediate model on train data only ({TRAIN_YEARS[0]}-{TRAIN_YEARS[1]})...")
-    
-    # Load train data only (with negative sampling if MAX_NEG_TRAIN > 0)
-    print(f"\nLoading train data ({TRAIN_YEARS[0]}-{TRAIN_YEARS[1]})...")
+    print(f"Training intermediate model on {TRAIN_ONLY_YEARS[0]}-{TRAIN_ONLY_YEARS[1]} only...")
+    print(f"  Earlystop years ({EARLYSTOP_YEARS[0]}-{EARLYSTOP_YEARS[1]}) are excluded so that")
+    print(f"  scoring the earlystop set produces genuinely out-of-sample predictions.")
+
+    print(f"\nLoading train data ({TRAIN_ONLY_YEARS[0]}-{TRAIN_ONLY_YEARS[1]})...")
     X_train_only, y_train_only, train_years_array_only, train_pos_only, train_neg_only, train_years_only = load_numpy_arrays_two_pass(
-        train_path, feature_cols, target_col, "train_only", 
-        year_range=TRAIN_YEARS,
+        train_path, feature_cols, target_col, "train_only",
+        year_range=TRAIN_ONLY_YEARS,
         max_neg_samples=MAX_NEG_TRAIN if MAX_NEG_TRAIN > 0 else 0
     )
     n_train_only = len(y_train_only)
-    
-    # Prepare model parameters for train-only model
+
+    # Prepare model parameters for intermediate model (same hyperparams as final)
     model_params_intermediate = best_params.copy()
     if "class_weight" not in model_params_intermediate:
         model_params_intermediate["class_weight"] = "balanced_subsample"
-    # Use random_state from best_params if overridden, otherwise use RANDOM_STATE constant
     if "random_state" not in model_params_intermediate:
         model_params_intermediate["random_state"] = RANDOM_STATE
     if "n_jobs" not in model_params_intermediate:
         model_params_intermediate["n_jobs"] = get_n_jobs()
-    # Remove any non-RF params that may have been in JSON
     for key in ["scale_pos_weight", "is_unbalance", "num_boost_round", "boosting_type", "metric"]:
         model_params_intermediate.pop(key, None)
-    
-    # Inject verbose parameter
     model_params_intermediate["verbose"] = SK_VERBOSE
-    
+
     print(f"\nTraining intermediate model on {n_train_only:,} samples...")
-    print(f"  Model parameters: n_estimators={model_params_intermediate.get('n_estimators', 'default')}, "
+    print(f"  n_estimators={model_params_intermediate.get('n_estimators', 'default')}, "
           f"max_depth={model_params_intermediate.get('max_depth', 'default')}, "
           f"class_weight={model_params_intermediate.get('class_weight', 'default')}")
     report_memory_usage("before intermediate training")
     intermediate_train_start = time.time()
-    
-    # Train intermediate model on train data only
+
     rf_model_intermediate = RandomForestClassifier(**model_params_intermediate)
     rf_model_intermediate.fit(X_train_only, y_train_only)
-    
+
     intermediate_train_time = time.time() - intermediate_train_start
     print(f"Intermediate training done in {intermediate_train_time:.1f}s")
     report_memory_usage("after intermediate training")
-    
+
     del X_train_only, y_train_only, train_years_array_only; gc.collect()
-    report_memory_usage("after freeing train data")
+    report_memory_usage("after freeing intermediate train data")
     
-    # Generate earlystop predictions in batches (OOM-proof)
-    print(f"\nGenerating earlystop predictions in batches (OOM-proof)...")
-    print(f"  Year range: {EARLYSTOP_YEARS[0]}-{EARLYSTOP_YEARS[1]} (capped at LAST_LABEL_YEAR={LAST_LABEL_YEAR})")
+    # Score earlystop set with intermediate model (OOM-proof batch processing)
+    print(f"\nScoring earlystop set ({EARLYSTOP_YEARS[0]}-{EARLYSTOP_YEARS[1]}) — OOF by construction...")
+    print(f"  Year range capped at LAST_LABEL_YEAR={LAST_LABEL_YEAR}")
     earlystop_year_range = (EARLYSTOP_YEARS[0], min(EARLYSTOP_YEARS[1], LAST_LABEL_YEAR))
     
     # Pass 1: Count earlystop rows to track progress
@@ -1144,23 +1183,25 @@ def phase1_training(
     report_memory_usage("after freeing intermediate model")
     earlystop_time = intermediate_train_time + earlystop_pred_time
     
-    # Step 2: Train final model on full train+earlystop data
+    # ------------------------------------------------------------------
+    # Step 2: Final model — trained on full labelled window 2001-2016
+    # ------------------------------------------------------------------
     print("\n" + "-"*70)
-    print("STEP 2: TRAIN FINAL MODEL ON FULL DATASET")
+    print("STEP 2: FINAL MODEL ON FULL LABELLED WINDOW (2001-2016)")
     print("-"*70)
-    print(f"Training final model on full dataset: {TRAIN_YEARS[0]}-{EARLYSTOP_YEARS[1]}")
-    report_memory_usage("before final model training")
-    
-    # Load full training data from both files (with negative sampling if MAX_NEG_TRAIN > 0)
-    # Negative sampling is applied during loading to keep memory bounded
-    print(f"\nLoading full training data ({TRAIN_YEARS[0]}-{EARLYSTOP_YEARS[1]})...")
-    X_train_full, y_train_full, train_years_array_full, train_pos_full, train_neg_full, train_years_full = load_numpy_arrays_from_multiple_files(
-        [train_path, earlystop_path], feature_cols, target_col, "full_train", 
-        year_range=(TRAIN_YEARS[0], EARLYSTOP_YEARS[1]),
+    print(f"Training final model on {TRAIN_YEARS[0]}-{TRAIN_YEARS[1]}...")
+    print(f"  Loading from train_path only: train_win5.parquet already spans 2001-2016.")
+    print(f"  earlystop_path is NOT loaded here — it is a subset of train and would duplicate rows.")
+    report_memory_usage("before final model loading")
+
+    print(f"\nLoading full training data ({TRAIN_YEARS[0]}-{TRAIN_YEARS[1]})...")
+    X_train_full, y_train_full, train_years_array_full, train_pos_full, train_neg_full, train_years_full = load_numpy_arrays_two_pass(
+        train_path, feature_cols, target_col, "full_train",
+        year_range=TRAIN_YEARS,
         max_neg_samples=MAX_NEG_TRAIN if MAX_NEG_TRAIN > 0 else 0
     )
     n_train_full = len(y_train_full)
-    
+
     train_stats = {
         "n_train": n_train_full,
         "train_positives": int(train_pos_full),
@@ -1169,27 +1210,17 @@ def phase1_training(
         "train_years": f"{train_years_full[0]}-{train_years_full[-1]}",
     }
     report_memory_usage("after loading final data")
-    
-    print(f"\nFinal model training: train ({TRAIN_YEARS[0]}-{EARLYSTOP_YEARS[1]}): {len(X_train_full):,} rows")
-    
-    # Prepare model parameters
-    # Ensure class_weight defaults to balanced_subsample if not specified
+
+    # Prepare model parameters for final model
     model_params = best_params.copy()
     if "class_weight" not in model_params:
         model_params["class_weight"] = "balanced_subsample"
-    
-    # Ensure random_state and n_jobs are set
-    # Use random_state from best_params if overridden, otherwise use RANDOM_STATE constant
     if "random_state" not in model_params:
         model_params["random_state"] = RANDOM_STATE
     if "n_jobs" not in model_params:
         model_params["n_jobs"] = get_n_jobs()
-    
-    # Remove any non-RF params that may have been in JSON (preserve class_weight which is RF-specific)
     for key in ["scale_pos_weight", "is_unbalance", "num_boost_round", "boosting_type", "metric"]:
         model_params.pop(key, None)
-    
-    # Inject verbose parameter
     model_params["verbose"] = SK_VERBOSE
     
     imbalance_info = {
@@ -1197,11 +1228,10 @@ def phase1_training(
         "pos": int(train_pos_full),
         "class_weight": model_params.get("class_weight", "balanced_subsample")
     }
-    
+
     print(f"\nImbalance: {train_neg_full:,} neg, {train_pos_full:,} pos, ratio 1:{train_neg_full/max(train_pos_full,1):.1f}")
     print(f"  Using class_weight: {model_params.get('class_weight', 'balanced_subsample')}")
-    
-    # Print final parameters before model creation
+
     print(f"\nFinal model parameters:")
     for key in sorted(model_params.keys()):
         print(f"  {key}: {model_params[key]}")
@@ -1217,21 +1247,18 @@ def phase1_training(
     report_memory_usage("before final training")
     train_start = time.time()
     
-    # Create and train Random Forest model
     rf_model = RandomForestClassifier(**model_params)
     rf_model.fit(X_train_full, y_train_full)
-    
+
     train_time = time.time() - train_start
     print(f"\nTraining done in {train_time:.1f}s")
-    
+
     del X_train_full, y_train_full, train_years_array_full; gc.collect()
-    
-    # earlystop_time already set above (intermediate training + earlystop prediction time)
-    
+
     model_path = model_dir / f"model2_rf_win5_{timestamp}.joblib"
     joblib.dump(rf_model, model_path)
     print(f"Final model saved: {model_path}")
-    gc.collect()
+    del rf_model; gc.collect()
     
     if use_wandb:
         wandb.log({
@@ -1262,7 +1289,7 @@ def phase2_testing(
     report_memory_usage("start of Phase 2")
     
     # Check for year overlap between training and test
-    final_train_years = (TRAIN_YEARS[0], EARLYSTOP_YEARS[1])  # Full training period
+    final_train_years = TRAIN_YEARS  # Full labelled training window (2001-2016)
     test_year_range = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))
     
     if check_year_overlap(final_train_years, test_year_range, "Test"):
