@@ -275,10 +275,48 @@ def main(split_version: str = 'main') -> None:
 
     try:
         print("\n" + "="*70)
-        print("STEP 1: Computing first_transition_year per (row, col)")
+        print("STEP 1: Computing year range")
         print("="*70)
-        
-        # Step 1: Compute first_transition_year per (row, col)
+
+        # Step 1: Get min_year and max_year from data.
+        # min_year is used to exclude the first data year from both first_transitions and the
+        # observation panel. In feature_engineering, WDPA_prev is forced to 0 for every pixel
+        # in the very first year of the panel (no prior-year WDPA data is available). For the
+        # USA, which has an extensive pre-existing PA network, this causes every pixel already
+        # protected at data-start to appear as transition_01=1 in year min_year — producing
+        # thousands of "phantom" first-year transitions. Because their first_transition_year
+        # equals min_year, the win5 lookback window (year < min_year) falls entirely before the
+        # data starts, so win5=0 for all of them. These phantom rows inflate transition_01 while
+        # contributing nothing to win5, which is why win5 < transition_01 in the raw panel.
+        # Excluding year min_year from first_transitions and from the observation panel removes
+        # this artifact. This is safe because all temporal splits start at min_year+1 at the
+        # earliest, so no split output is affected.
+        step1_start = time.time()
+        max_year_result = con.execute(f"SELECT MAX(year) FROM read_parquet('{escaped_in}')").fetchone()
+        max_year = max_year_result[0] if max_year_result else 2024
+        min_year_result = con.execute(f"SELECT MIN(year) FROM read_parquet('{escaped_in}')").fetchone()
+        min_year = min_year_result[0] if min_year_result else 2001
+        cutoff_year = max_year - LOOKAHEAD_YEARS
+        first_obs_year = min_year + 1
+
+        print(f"  Min year in data: {min_year}")
+        print(f"  Max year in data: {max_year}")
+        print(f"  First observation year: {first_obs_year} (year {min_year} excluded: WDPA_prev forced to 0 for first data year)")
+        print(f"  Cutoff year (max_year - {LOOKAHEAD_YEARS}): {cutoff_year}")
+        print(f"  Observation window: {first_obs_year} <= year <= {cutoff_year}")
+        print(f"  Completed in {time.time() - step1_start:.1f}s")
+
+        print("\n" + "="*70)
+        print("STEP 2: Computing first_transition_year per (row, col)")
+        print("="*70)
+
+        # Step 2: Compute first_transition_year per (row, col).
+        # Restricted to year > min_year to exclude phantom transitions that arise because
+        # WDPA_prev is forced to 0 in the first data year (see Step 1 comment above).
+        # Note: this filter does NOT change any win5 label — pixels whose only transition_01=1
+        # row is in year min_year would have first_transition_year=min_year and win5=0
+        # everywhere regardless (their lookback window falls before the data start). The filter
+        # simply removes them from the lookup table so the comparison stats are meaningful.
         first_transition_sql = f"""
         CREATE OR REPLACE TEMP TABLE first_transitions AS
         SELECT
@@ -286,36 +324,26 @@ def main(split_version: str = 'main') -> None:
             col,
             MIN(year) AS first_transition_year
         FROM read_parquet('{escaped_in}')
-        WHERE transition_01 = 1
+        WHERE transition_01 = 1 AND year > {min_year}
         GROUP BY row, col
         """
-        
-        step1_start = time.time()
+
+        step2_start = time.time()
         con.execute(first_transition_sql)
         n_transitions = con.execute("SELECT COUNT(*) FROM first_transitions").fetchone()[0]
-        print(f"  Found {n_transitions:,} (row, col) pairs with transitions")
-        print(f"  Completed in {time.time() - step1_start:.1f}s")
-        
-        print("\n" + "="*70)
-        print("STEP 2: Computing max_year and applying right-censoring")
-        print("="*70)
-        
-        # Step 2: Get max_year from data
-        max_year_result = con.execute(f"SELECT MAX(year) FROM read_parquet('{escaped_in}')").fetchone()
-        max_year = max_year_result[0] if max_year_result else 2024
-        cutoff_year = max_year - LOOKAHEAD_YEARS
-        
-        print(f"  Max year in data: {max_year}")
-        print(f"  Cutoff year (max_year - {LOOKAHEAD_YEARS}): {cutoff_year}")
-        print(f"  Filtering to year <= {cutoff_year}")
-        
+        print(f"  Found {n_transitions:,} (row, col) pairs with transitions (year > {min_year})")
+        print(f"  Completed in {time.time() - step2_start:.1f}s")
+
         print("\n" + "="*70)
         print("STEP 3: Creating merged panel with transition_01_win5")
         print("="*70)
-        
-        # Step 3: Create merged panel with transition_01_win5
-        # For each row at year t, set transition_01_win5 = 1 if first_transition_year exists 
-        # AND t < first_transition_year <= t+5, else 0
+
+        # Step 3: Create merged panel with transition_01_win5.
+        # For each row at year t, set transition_01_win5 = 1 if first_transition_year exists
+        # AND t < first_transition_year <= t+5, else 0.
+        # Panel is restricted to first_obs_year <= year <= cutoff_year: the lower bound drops
+        # the first data year (phantom transitions, see Step 1); the upper bound is the
+        # right-censoring cutoff so every included row has a full 5-year lookahead window.
         merged_win5_sql = f"""
         COPY (
             SELECT
@@ -330,7 +358,7 @@ def main(split_version: str = 'main') -> None:
             FROM read_parquet('{escaped_in}') d
             LEFT JOIN first_transitions ft
                 ON d.row = ft.row AND d.col = ft.col
-            WHERE d.year <= {cutoff_year}
+            WHERE d.year >= {first_obs_year} AND d.year <= {cutoff_year}
         )
         TO '{escaped_merged_win5}' (FORMAT PARQUET, COMPRESSION ZSTD)
         """
