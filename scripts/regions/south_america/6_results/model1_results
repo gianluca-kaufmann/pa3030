@@ -153,23 +153,20 @@ def get_repo_root() -> Path:
     
     Checks environment variables first, then searches upward for README.md.
     """
-    # Check environment variable first
     env_root = os.environ.get("PROJECT_ROOT") or os.environ.get("REPO_ROOT")
     if env_root:
         return Path(env_root).resolve()
-    
-    # Search upward from script location for README.md
+
     script_dir = Path(__file__).resolve().parent
     current = script_dir
-    for _ in range(10):  # Limit search depth
+    for _ in range(10):
         if (current / "README.md").exists():
             return current
         parent = current.parent
-        if parent == current:  # Reached filesystem root
+        if parent == current:
             break
         current = parent
-    
-    # If not found, raise an error
+
     raise RuntimeError(
         f"Repository root not found. Searched upward from {script_dir} for README.md.\n"
         "Set PROJECT_ROOT or REPO_ROOT environment variable, or ensure README.md exists in repo root."
@@ -177,48 +174,24 @@ def get_repo_root() -> Path:
 
 
 def resolve_parquet_file(filename: str, split_version: str = 'main') -> Path:
-    """Locate parquet file using $SCRATCH-first path resolution (same as training scripts).
-    
-    Checks locations in order:
-    1. $SCRATCH/data/south_america/ml/{split}/
-    2. $SCRATCH/data/south_america/ml/
-    3. $SCRATCH/outputs/south_america/results/{split}/
-    4. repo/data/south_america/ml/{split}/
-    5. repo/data/south_america/ml/
-    6. repo/outputs/south_america/results/{split}/
-    7. repo/outputs/south_america/results/
-    
-    Args:
-        filename: Name of the parquet file (e.g., 'test_win5.parquet')
-        split_version: Split version ('main' or 'robustness')
-    
-    Returns:
-        Path to the found parquet file
-    
-    Raises:
-        FileNotFoundError: If file not found in any expected location
-    """
+    """Locate parquet file using $SCRATCH-first path resolution (same as training scripts)."""
     repo_root = get_repo_root()
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
-    
+
     candidates = []
     if scratch_root is not None:
-        # Check $SCRATCH locations first (same order as training scripts)
-        # Order: $SCRATCH/data/south_america/ml/{split}/, then $SCRATCH/data/south_america/ml/, then $SCRATCH/outputs/south_america/results/{split}/
         candidates.append(scratch_root / f"data/south_america/ml/{split_version}/{filename}")
         candidates.append(scratch_root / f"data/south_america/ml/{filename}")
         candidates.append(scratch_root / f"outputs/south_america/results/{split_version}/{filename}")
-    # Check repo locations (fallback)
     candidates.append(repo_root / f"data/south_america/ml/{split_version}/{filename}")
     candidates.append(repo_root / f"data/south_america/ml/{filename}")
     candidates.append(repo_root / f"outputs/south_america/results/{split_version}/{filename}")
     candidates.append(repo_root / f"outputs/south_america/results/{filename}")
-    
+
     for cand in candidates:
         if cand.exists():
             return cand
-    
-    # Provide detailed error message with all checked paths
+
     error_msg = f"{filename} not found in expected locations.\n"
     error_msg += "\nChecked locations (in order):\n"
     for i, cand in enumerate(candidates, 1):
@@ -232,51 +205,33 @@ def resolve_parquet_file(filename: str, split_version: str = 'main') -> Path:
 
 
 def resolve_future_parquet(split_version: str = 'main') -> Path:
-    """Locate future-period parquet for temporal validation (2020-2024 PA establishments).
-
-    Tries in order:
-    1. val_win5.parquet in same locations as test data (resolve_parquet_file).
-    2. merged_panel_final.parquet in same ML locations.
-    3. merged_panel_final.parquet in $SCRATCH/data/ and repo/data/ (Euler: /cluster/scratch/.../data/).
-
-    Args:
-        split_version: Split version ('main' or 'robustness').
-
-    Returns:
-        Path to the found parquet file.
-
-    Raises:
-        FileNotFoundError: If neither file is found in any expected location.
-    """
+    """Locate future-period parquet for temporal validation (2020-2024 PA establishments)."""
     repo_root = get_repo_root()
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
     tried = []
 
-    # 1) val_win5.parquet (same locations as test_win5)
     try:
         p = resolve_parquet_file(DEFAULT_FUTURE_PARQUET_FILENAME, split_version)
         return p
     except FileNotFoundError:
         pass
     for base in ([scratch_root] if scratch_root else []):
-        for sub in [f"data/south_america/ml/{split_version}", "data/south_america/ml", f"outputs/south_america/results/{split_version}"]:
+        for sub in [f"data/south_america/ml/{split_version}", f"data/south_america/ml", f"outputs/south_america/results/{split_version}"]:
             tried.append(base / sub / DEFAULT_FUTURE_PARQUET_FILENAME)
-    for sub in [f"data/south_america/ml/{split_version}", "data/south_america/ml", f"outputs/south_america/results/{split_version}", "outputs/south_america/results"]:
+    for sub in [f"data/south_america/ml/{split_version}", f"data/south_america/ml", f"outputs/south_america/results/{split_version}", f"outputs/south_america/results"]:
         tried.append(repo_root / sub / DEFAULT_FUTURE_PARQUET_FILENAME)
 
-    # 2) merged_panel_final.parquet in ML locations
     try:
         p = resolve_parquet_file(FALLBACK_FUTURE_PARQUET_FILENAME, split_version)
         return p
     except FileNotFoundError:
         pass
     for base in ([scratch_root] if scratch_root else []):
-        for sub in [f"data/south_america/ml/{split_version}", "data/south_america/ml", f"outputs/south_america/results/{split_version}"]:
+        for sub in [f"data/south_america/ml/{split_version}", f"data/south_america/ml", f"outputs/south_america/results/{split_version}"]:
             tried.append(base / sub / FALLBACK_FUTURE_PARQUET_FILENAME)
-    for sub in [f"data/south_america/ml/{split_version}", "data/south_america/ml", f"outputs/south_america/results/{split_version}", "outputs/south_america/results"]:
+    for sub in [f"data/south_america/ml/{split_version}", f"data/south_america/ml", f"outputs/south_america/results/{split_version}", f"outputs/south_america/results"]:
         tried.append(repo_root / sub / FALLBACK_FUTURE_PARQUET_FILENAME)
 
-    # 3) merged_panel_final.parquet in $SCRATCH/data/ and repo/data/
     if scratch_root is not None:
         cand = scratch_root / "data" / FALLBACK_FUTURE_PARQUET_FILENAME
         tried.append(cand)
@@ -481,7 +436,7 @@ def detect_and_reproject_coordinates(df: pd.DataFrame) -> pd.DataFrame:
         print("  Reprojecting to EPSG:4326 (WGS84)...")
         
         # Create GeoDataFrame with Web Mercator CRS
-        geometry = [Point(xy) for xy in zip(df['x'], df['y'])]
+        geometry = gpd.points_from_xy(df['x'], df['y'])
         gdf = gpd.GeoDataFrame(df, geometry=geometry, crs='EPSG:3857')
         
         # Reproject to WGS84
@@ -551,7 +506,7 @@ def validate_coordinates(df: pd.DataFrame) -> None:
         print(f"  Coordinate validation passed ({both_valid_pct:.2f}% in expected ranges)")
 
 
-def create_metrics_table(metrics_data: Dict[str, Any], output_dir: Path, model_type: str, df: Optional[pd.DataFrame] = None) -> None:
+def create_metrics_table(metrics_data: Dict[str, Any], output_dir: Path, model_type: str, df: Optional[pd.DataFrame] = None, extra_metrics: Optional[Dict[str, float]] = None) -> None:
     """Create metrics table in CSV and LaTeX formats.
     
     Args:
@@ -559,6 +514,7 @@ def create_metrics_table(metrics_data: Dict[str, Any], output_dir: Path, model_t
         output_dir: Output directory for tables
         model_type: Model type (lgbm, rf)
         df: Optional DataFrame with y_true and y_pred_proba for computing Brier score
+        extra_metrics: Optional dict of additional metrics (e.g. future_capture_rate, combined_recall)
     """
     print("\n" + "=" * 70)
     print("CREATING METRICS TABLE")
@@ -582,7 +538,7 @@ def create_metrics_table(metrics_data: Dict[str, Any], output_dir: Path, model_t
         ("Lift @ 10%", test_perf.get("lift_at_10pct", np.nan)),
     ]
     
-    # Add Brier score if DataFrame is provided
+    # Add Brier score, ECE, MCE if DataFrame is provided
     brier_score = np.nan
     brier_score_calibrated = np.nan
     if df is not None and 'y_true' in df.columns and 'y_pred_proba' in df.columns:
@@ -590,6 +546,24 @@ def create_metrics_table(metrics_data: Dict[str, Any], output_dir: Path, model_t
             brier_score = brier_score_loss(df['y_true'], df['y_pred_proba'])
             metrics_list.append(("Brier Score", brier_score))
             print(f"  Computed Brier Score: {brier_score:.6f}")
+            
+            # ECE and MCE (uniform bins, n=10)
+            y_true_arr = df['y_true'].values
+            y_pred_arr = np.clip(df['y_pred_proba'].values.astype(np.float64), 0.0, 1.0 - 1e-9)
+            n_bins = 10
+            bin_edges = np.linspace(0, 1, n_bins + 1)
+            bin_indices = np.digitize(y_pred_arr, bin_edges[1:], right=False)
+            ece, mce = 0.0, 0.0
+            for i in range(n_bins):
+                mask = bin_indices == i
+                if mask.sum() > 0:
+                    bin_conf = y_pred_arr[mask].mean()
+                    bin_acc = y_true_arr[mask].mean()
+                    ece += (mask.sum() / len(y_true_arr)) * abs(bin_conf - bin_acc)
+                    mce = max(mce, abs(bin_conf - bin_acc))
+            metrics_list.append(("ECE (Expected Calibration Error)", ece))
+            metrics_list.append(("MCE (Maximum Calibration Error)", mce))
+            print(f"  Computed ECE: {ece:.6f}, MCE: {mce:.6f}")
             
             # If calibrated probabilities available, compute Brier score for both
             if 'y_pred_proba_calibrated' in df.columns and 'y_pred_proba_uncalibrated' in df.columns:
@@ -600,7 +574,13 @@ def create_metrics_table(metrics_data: Dict[str, Any], output_dir: Path, model_t
                 print(f"  Computed Brier Score (Uncalibrated): {brier_score_uncalibrated:.6f}")
                 print(f"  Computed Brier Score (Calibrated): {brier_score_calibrated:.6f}")
         except Exception as e:
-            print(f"  Warning: Could not compute Brier score: {e}")
+            print(f"  Warning: Could not compute Brier score / ECE / MCE: {e}")
+    
+    # Add extra metrics (e.g. Future Capture Rate, Combined Recall from temporal validation)
+    if extra_metrics:
+        display_names = {"future_capture_rate": "Future Capture Rate (%)", "combined_recall": "Combined Recall (%)"}
+        for name, val in extra_metrics.items():
+            metrics_list.append((display_names.get(name, name.replace("_", " ").title()), val))
     
     metrics_dict = {
         "Metric": [m[0] for m in metrics_list],
@@ -1401,6 +1381,7 @@ def points_to_raster(x: np.ndarray, y: np.ndarray, values: np.ndarray,
         # For 1 km resolution, ~0.009 degrees
         # Estimate from data: use median of non-zero coordinate differences
         sample_size = min(50000, len(x))
+        np.random.seed(42)  # Reproducible resolution estimate
         sample_idx = np.random.choice(len(x), sample_size, replace=False)
         x_sample = np.sort(x[sample_idx])
         y_sample = np.sort(y[sample_idx])
@@ -1491,7 +1472,7 @@ def create_risk_map(
     future_parquet_path: Optional[Path] = None,
     future_years: Optional[Sequence[int]] = None,
     sa_gdf: Optional[gpd.GeoDataFrame] = None,
-) -> None:
+) -> Optional[Dict[str, float]]:
     """Create SIMPLIFIED risk map showing model predictions vs actual PA establishments.
     
     SIMPLIFIED DESIGN (radically simplified from previous complex version):
@@ -1539,7 +1520,7 @@ def create_risk_map(
     print(f"  Projected bounds (meters): {sa_gdf_proj.total_bounds}")
     
     # Create GeoDataFrame from predictions
-    geometry = [Point(xy) for xy in zip(df['x'], df['y'])]
+    geometry = gpd.points_from_xy(df['x'], df['y'])
     gdf = gpd.GeoDataFrame(df, geometry=geometry, crs='EPSG:4326')
     
     # Reproject predictions to EPSG:3857
@@ -1564,8 +1545,8 @@ def create_risk_map(
         join_cols = ['row', 'col'] if all(col in df.columns for col in ['row', 'col']) and all(col in wdpa_test_df.columns for col in ['row', 'col']) else ['x', 'y']
         
         if join_cols == ['row', 'col']:
-            # Row/col join (preferred)
-            join_df = wdpa_test_df[['row', 'col', 'established_in_test_period']].drop_duplicates(subset=['row', 'col'])
+            # Row/col join (preferred): use max so pixel is 1 if established in ANY test year
+            join_df = wdpa_test_df[['row', 'col', 'established_in_test_period']].groupby(['row', 'col']).agg({'established_in_test_period': 'max'}).reset_index()
             df = df.merge(join_df, on=['row', 'col'], how='left')
             df['established_in_test_period'] = df['established_in_test_period'].fillna(0).astype(int)
             has_actual_establishments = True
@@ -1577,7 +1558,7 @@ def create_risk_map(
             join_df = wdpa_test_df[['x', 'y', 'established_in_test_period']].copy()
             join_df['x_rounded'] = join_df['x'].round(6)
             join_df['y_rounded'] = join_df['y'].round(6)
-            join_df = join_df[['x_rounded', 'y_rounded', 'established_in_test_period']].drop_duplicates(subset=['x_rounded', 'y_rounded'])
+            join_df = join_df[['x_rounded', 'y_rounded', 'established_in_test_period']].groupby(['x_rounded', 'y_rounded']).agg({'established_in_test_period': 'max'}).reset_index()
             df = df.merge(join_df, on=['x_rounded', 'y_rounded'], how='left')
             df = df.drop(columns=['x_rounded', 'y_rounded'])
             df['established_in_test_period'] = df['established_in_test_period'].fillna(0).astype(int)
@@ -1869,6 +1850,14 @@ def create_risk_map(
     plt.close()
     print(f"✓ Simplified risk map complete!")
 
+    # Return future capture metrics for inclusion in metrics table (when available)
+    if has_future_establishments and total_future_establishments > 0:
+        return {
+            "future_capture_rate": future_capture_rate,
+            "combined_recall": combined_recall_pct,
+        }
+    return None
+
 
 def create_p1pct_diagnostic_map(
     df: pd.DataFrame,
@@ -1908,14 +1897,14 @@ def create_p1pct_diagnostic_map(
     print(f"  Projected bounds (meters): {sa_gdf_proj.total_bounds}")
     
     # Create GeoDataFrame from predictions (keep all rows, no deduplication)
-    geometry = [Point(xy) for xy in zip(df['x'], df['y'])]
+    geometry = gpd.points_from_xy(df['x'], df['y'])
     gdf = gpd.GeoDataFrame(df, geometry=geometry, crs='EPSG:4326')
-    
+
     # Reproject predictions to EPSG:3857
     gdf = gdf.to_crs('EPSG:3857')
-    
+
     print(f"  Total rows (pixel-years): {len(gdf):,}")
-    
+
     # Compute top 1% threshold using EXACT same logic as compute_precision_at_k
     y_proba = df['y_pred_proba'].values
     n_top_k = max(1, int(len(y_proba) * 1 / 100))
@@ -2010,7 +1999,8 @@ def create_p1pct_diagnostic_map(
         gdf.geometry.x.values,
         gdf.geometry.y.values,
         gdf['category_code'].values,
-        target_resolution=1000.0  # 1000 meters resolution
+        target_resolution=1000.0,  # 1000 meters resolution
+        agg_func='max'  # Categorical: overlap (3) wins when multiple categories in same cell
     )
     print(f"  Category raster shape: {category_raster.shape}, extent: {extent}")
     print(f"  Valid (non-NaN) pixels: {np.sum(~np.isnan(category_raster)):,}")
@@ -2021,7 +2011,8 @@ def create_p1pct_diagnostic_map(
         gdf.geometry.x.values,
         gdf.geometry.y.values,
         np.ones(len(gdf), dtype=np.float32),  # All points = 1
-        target_resolution=1000.0
+        target_resolution=1000.0,
+        agg_func='max'
     )
     print(f"  Background mask created - protected areas will appear as natural holes")
 
@@ -2207,14 +2198,14 @@ def create_probability_map(
     print(f"  Projected bounds (meters): {sa_gdf_proj.total_bounds}")
     
     # Create GeoDataFrame from predictions
-    geometry = [Point(xy) for xy in zip(df['x'], df['y'])]
+    geometry = gpd.points_from_xy(df['x'], df['y'])
     gdf = gpd.GeoDataFrame(df, geometry=geometry, crs='EPSG:4326')
-    
+
     # Reproject predictions to EPSG:3857
     gdf = gdf.to_crs('EPSG:3857')
-    
+
     print(f"  Prediction points: {len(gdf):,}")
-    
+
     # Get probability values
     proba_values = df['y_pred_proba'].values
     
@@ -3149,17 +3140,13 @@ def main() -> None:
     df = detect_and_reproject_coordinates(df)
     validate_coordinates(df)
     
-    # Generate outputs
-    create_metrics_table(metrics_data, output_dir, args.model_type)
-    create_pr_curve(df, metrics_data, output_dir, args.model_type)
-    create_cumulative_gains_chart(df, output_dir, args.model_type)
     # Load South America boundary once and reuse for all map outputs (avoids 5x load/download)
     sa_gdf = get_south_america_boundary(region_boundary_path)
+    # Risk map generation (1%, 5%, 10%) - run first to get future capture metrics for table
     thresholds = [1, 5, 10]
-    # Risk map generation (1%, 5%, 10%) - run sequentially to avoid OOM on Euler
-    # (Parallel with loky duplicates df per worker; 47M+ rows causes SIGKILL -9)
+    future_metrics = None
     for threshold_pct in thresholds:
-        create_risk_map(
+        result = create_risk_map(
             df,
             region_boundary_path,
             output_dir,
@@ -3172,6 +3159,12 @@ def main() -> None:
             future_years=future_years,
             sa_gdf=sa_gdf,
         )
+        if result is not None and future_metrics is None:
+            future_metrics = result
+    # Generate outputs (metrics table includes future capture when available)
+    create_metrics_table(metrics_data, output_dir, args.model_type, df=df, extra_metrics=future_metrics)
+    create_pr_curve(df, metrics_data, output_dir, args.model_type)
+    create_cumulative_gains_chart(df, output_dir, args.model_type)
     # Pass explicit test years to the row-level P@1% diagnostic map
     create_p1pct_diagnostic_map(
         df,
