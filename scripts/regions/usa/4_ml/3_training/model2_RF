@@ -61,45 +61,22 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 import joblib
 
 
-class Tee:
-    """Write to both stdout and a file."""
-    def __init__(self, file_path: Path):
-        self.file = open(file_path, 'w', encoding='utf-8')
-        self.stdout = sys.stdout
-    def write(self, text: str) -> None:
-        self.stdout.write(text)
-        self.file.write(text)
-        self.stdout.flush()
-        self.file.flush()
-    def flush(self) -> None:
-        self.stdout.flush()
-        self.file.flush()
-    def close(self) -> None:
-        self.file.close()
-
-
-def get_repo_root() -> Path:
-    """Get repository root directory.
-
-    Checks environment variables first, then searches upward for README.md.
-    """
-    env_root = os.environ.get("PROJECT_ROOT") or os.environ.get("REPO_ROOT")
-    if env_root:
-        return Path(env_root).resolve()
-    script_dir = Path(__file__).resolve().parent
-    current = script_dir
-    for _ in range(10):
-        if (current / "README.md").exists():
-            return current
-        parent = current.parent
-        if parent == current:
-            break
-        current = parent
-    raise RuntimeError(
-        f"Repository root not found. Searched upward from {script_dir} for README.md.\n"
-        "Set PROJECT_ROOT or REPO_ROOT environment variable, or ensure README.md exists in repo root."
-    )
-
+# ── Shared utility imports ────────────────────────────────────────────────────
+_shared = Path(__file__).resolve().parents[3] / "shared"
+if str(_shared) not in sys.path:
+    sys.path.insert(0, str(_shared))
+del _shared
+from ml.training.utils import (  # noqa: E402
+    Tee,
+    get_repo_root,
+    report_memory_usage,
+    convert_numpy_types,
+    compute_precision_at_k,
+    extract_features_pyarrow_to_numpy,
+    compute_metrics,
+    check_year_overlap,
+)
+# ─────────────────────────────────────────────────────────────────────────────
 
 # Configuration
 RANDOM_STATE = 42
@@ -158,77 +135,6 @@ def get_n_jobs() -> int:
             n_jobs = 4
     
     return n_jobs
-
-
-def report_memory_usage(label: str = "") -> None:
-    """Report current memory usage."""
-    try:
-        import psutil
-        process = psutil.Process()
-        mem_info = process.memory_info()
-        mem_gb = mem_info.rss / 1024**3
-        print(f"  [Memory {label}] RSS: {mem_gb:.2f} GB")
-    except ImportError:
-        pass  # psutil not available
-
-
-def convert_numpy_types(obj: Any) -> Any:
-    """Recursively convert NumPy types to native Python types for JSON serialization."""
-    if isinstance(obj, (np.integer, np.intc, np.intp, np.int8, np.int16, np.int32, 
-                        np.int64, np.uint8, np.uint16, np.uint32, np.uint64)):
-        return int(obj)
-    elif isinstance(obj, (np.floating, np.float16, np.float32, np.float64)):
-        return float(obj)
-    elif isinstance(obj, np.bool_):
-        return bool(obj)
-    elif isinstance(obj, np.ndarray):
-        return obj.tolist()
-    elif isinstance(obj, dict):
-        return {key: convert_numpy_types(value) for key, value in obj.items()}
-    elif isinstance(obj, (list, tuple)):
-        return [convert_numpy_types(item) for item in obj]
-    elif obj is None or isinstance(obj, (str, int, float, bool)):
-        return obj
-    else:
-        try:
-            return obj.item() if hasattr(obj, 'item') else obj
-        except (ValueError, TypeError, AttributeError):
-            return str(obj)
-
-
-def compute_precision_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) -> float:
-    """Compute precision at top k% of predictions."""
-    n_top_k = max(1, int(len(y_true) * k / 100))
-    # Use argpartition for efficiency: only need to separate top K from the rest
-    # argpartition puts the n_top_k largest elements at the end
-    top_k_idx = np.argpartition(y_proba, -n_top_k)[-n_top_k:]
-    return y_true[top_k_idx].sum() / n_top_k
-
-
-def extract_features_pyarrow_to_numpy(feature_table: pa.Table, mask: np.ndarray) -> np.ndarray:
-    """
-    Extract feature columns from PyArrow table and convert to NumPy float32 array.
-    Pure PyArrow→NumPy path (no pandas) for speed.
-    
-    Args:
-        feature_table: PyArrow table containing feature columns
-        mask: Boolean mask to filter rows (applied after conversion)
-    
-    Returns:
-        Feature matrix (n_filtered, n_features) as float32
-    """
-    # Preallocate output array to avoid column_stack overhead
-    n_rows = int(mask.sum())
-    n_features = len(feature_table.column_names)
-    X = np.empty((n_rows, n_features), dtype=np.float32)
-    
-    # Fill each column directly into preallocated array
-    for col_idx, col_name in enumerate(feature_table.column_names):
-        col_array = feature_table[col_name].to_numpy(zero_copy_only=False)
-        # Apply mask and convert to float32, write directly to preallocated column
-        X[:, col_idx] = col_array[mask].astype(np.float32)
-    
-    return X
 
 
 def resolve_parquet_file(filename: str) -> Path:
@@ -935,40 +841,9 @@ def load_numpy_arrays_from_multiple_files(
     return X, y, years_array, pos, neg, years
 
 
-def compute_metrics(y_true: np.ndarray, y_proba: np.ndarray) -> Dict[str, float]:
-    """Compute all metrics (used for earlystop/test sets)."""
-    roc_auc = roc_auc_score(y_true, y_proba)
-    pr_auc = average_precision_score(y_true, y_proba)
-    baseline_rate = y_true.mean()
-    prec_at_k = {k: compute_precision_at_k(y_true, y_proba, k) for k in [1, 5, 10]}
-    return {"roc_auc": float(roc_auc), "pr_auc": float(pr_auc), "precision_at_1pct": float(prec_at_k[1]),
-            "precision_at_5pct": float(prec_at_k[5]), "precision_at_10pct": float(prec_at_k[10]),
-            "baseline_rate": float(baseline_rate),
-            "lift_at_1pct": float(prec_at_k[1] / baseline_rate) if baseline_rate > 0 else 0,
-            "lift_at_5pct": float(prec_at_k[5] / baseline_rate) if baseline_rate > 0 else 0,
-            "lift_at_10pct": float(prec_at_k[10] / baseline_rate) if baseline_rate > 0 else 0}
-
-
 # =============================================================================
 # Main Pipeline
 # =============================================================================
-
-def check_year_overlap(train_years: tuple[int, int], eval_years: tuple[int, int], eval_name: str) -> bool:
-    """
-    Check if evaluation years overlap with training years.
-    Returns True if there's overlap, False otherwise.
-    """
-    train_start, train_end = train_years
-    eval_start, eval_end = eval_years
-    
-    # Check for overlap: eval years should be strictly after training years
-    if eval_start <= train_end:
-        print(f"\n{'!'*70}")
-        print(f"WARNING: {eval_name} years ({eval_start}-{eval_end}) OVERLAP with training years ({train_start}-{train_end})!")
-        print(f"  Evaluation years must be strictly after training years to avoid data leakage.")
-        print(f"{'!'*70}\n")
-        return True
-    return False
 
 
 def phase1_training(
