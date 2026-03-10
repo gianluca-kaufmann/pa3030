@@ -56,21 +56,25 @@ The current model cannot distinguish these because it has no carbon data.
 ## Pipeline Architecture
 
 ```
-1. Data Extraction (1_extraction/)
-   -> Export from Google Earth Engine + external APIs to GeoTIFF rasters
+Continental regions (South America, USA):
+  1_extraction/    -> Export from Google Earth Engine + external APIs to GeoTIFF rasters
+  2_preprocessing/ -> Format harmonization, reprojection, storage optimization
+  3_merging/       -> Build modeling panels (Parquet) + feature engineering
+  4_tuning/        -> Hyperparameter search (Optuna / randomized, 3-fold temporal CV)
+  5_training/      -> Train/test splits + final model training (LightGBM, RF, BRF)
+  6_evaluation/    -> Temporal CV, spatial CV, benchmarking, calibration
+  7_results/       -> Metrics, visualizations, risk maps
 
-2. Preprocessing (2_preprocessing/)
-   -> Format harmonization, reprojection, storage optimization
+Sub-region Colombia (south_america/colombia/):
+  3_merging/  -> Colombia-specific merge + feature engineering
+  4_ml/
+    splits/   -> Train/validation/test data splits
+    training/ -> Model training + hyperparameter tuning (LightGBM, RF, BRF)
+    evaluation/ -> Calibration, benchmarking, spatial CV
+    results/  -> Figures, metrics tables, probability maps
 
-3. Merging (3_merging/)
-   -> Build modeling panels: pixel-year observations in Parquet format
-   -> Feature engineering: spatial features, distance metrics, smoothed neighbors
-
-4. ML Pipeline (4_ml/)
-   -> 4_tuning/   : Hyperparameter tuning | 5_training/ : Splits + model training
-   -> 2_training/ : Model training with hyperparameter tuning
-   -> 3_evaluation/: Temporal CV, spatial CV, benchmarking, calibration
-   -> 4_results/  : Generate metrics, visualizations, risk maps
+Shared utilities (scripts/regions/shared/):
+  1_preprocessing/ -> 2_tuning/ -> 3_training/ -> 4_evaluation/ -> 5_results/
 ```
 
 ## Tech Stack
@@ -228,11 +232,23 @@ Features that could improve predictive power but are not currently included:
 conda env create -f environment.yml
 conda activate pa3030
 
-# Run pipeline stages (example for Colombia)
-python scripts/regions/south_america/colombia/3_merging/merge_all.py
-python scripts/regions/south_america/colombia/4_ml/1_splits/create_splits.py
-python scripts/regions/south_america/colombia/4_ml/2_training/train_lgbm.py
-python scripts/regions/south_america/colombia/4_ml/3_evaluation/evaluate.py
+# Run pipeline stages (Colombia example)
+python scripts/regions/south_america/colombia/3_merging/colombia_merge
+python scripts/regions/south_america/colombia/4_ml/splits/modelC_splits
+python scripts/regions/south_america/colombia/4_ml/training/modelC_LGBM
+python scripts/regions/south_america/colombia/4_ml/evaluation/calibrate_C
+python scripts/regions/south_america/colombia/4_ml/evaluation/benchmark_C
+python scripts/regions/south_america/colombia/4_ml/results/modelC_results
+
+# Run pipeline stages (South America continental example)
+python scripts/regions/south_america/4_tuning/model1_tuning_lgbm
+python scripts/regions/south_america/5_training/model1_splits
+python scripts/regions/south_america/5_training/model1_LGBM
+python scripts/regions/south_america/6_evaluation/calibrate_1
+python scripts/regions/south_america/7_results/model1_results
+
+# Run tests
+pytest tests/test_pipeline.py -v
 ```
 
 ## Project Structure
@@ -240,18 +256,29 @@ python scripts/regions/south_america/colombia/4_ml/3_evaluation/evaluate.py
 ```
 /
 ├── scripts/regions/
-│   ├── south_america/        # Primary region
+│   ├── south_america/            # Primary region
 │   │   ├── 1_extraction/
 │   │   ├── 2_preprocessing/
 │   │   ├── 3_merging/
-│   │   ├── 4_ml/
-│   │   ├── colombia/         # Sub-region pipeline
-│   │   └── embeddings/       # Satellite embedding features
-│   ├── usa/                  # Template for expansion
-│   ├── se_asia/              # Planned
-│   └── tropical_africa/      # Planned
-├── outputs/                  # Figures, tables, metrics, predictions
-├── slurm/                    # SLURM job scripts for Euler cluster
+│   │   ├── 4_tuning/
+│   │   ├── 5_training/           # Includes splits scripts + best_params JSONs
+│   │   ├── 6_evaluation/
+│   │   ├── 7_results/
+│   │   ├── colombia/             # Sub-region pipeline
+│   │   │   ├── 3_merging/
+│   │   │   └── 4_ml/
+│   │   │       ├── splits/
+│   │   │       ├── training/
+│   │   │       ├── evaluation/
+│   │   │       └── results/
+│   │   └── embeddings/           # Satellite embedding pipeline
+│   ├── shared/                   # Shared utilities (1_preprocessing/ … 5_results/)
+│   ├── usa/                      # Mirrors SA continental structure
+│   ├── se_asia/                  # Planned
+│   └── tropical_africa/          # Planned
+├── tests/                        # pytest suite (test_pipeline.py)
+├── outputs/                      # Figures, tables, metrics, predictions
+├── slurm/                        # SLURM job scripts for Euler cluster
 ├── environment.yml
 └── README.md
 ```

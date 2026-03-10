@@ -618,7 +618,7 @@ to receive protection under current political dynamics."*
 
 ### Concerns
 
-1. **No software tests** — Zero test files. The single biggest gap.
+1. **Software tests exist** — `tests/test_pipeline.py` covers distance transforms, WDPA lag, risk-set filtering, right-censoring, temporal splits, calibration, and grid reconstruction (34 tests, all passing).
 
 2. **Monolithic files** — The RF training script is 1,600 lines in one file.
 
@@ -958,7 +958,7 @@ and **carbon stocks**.
 | Unit tests | `tests/test_pipeline.py` (34 tests) |
 | Environment | `environment.yml` |
 | SLURM jobs | `slurm/` |
-| Project docs | `CLAUDE.md`, `README.md`, `context.md` |
+| Project docs | `CLAUDE.md`, `README.md`, `docs/technical_guide.md` |
 
 ### Running the Pipeline
 
@@ -968,10 +968,11 @@ conda env create -f environment.yml
 conda activate pa3030
 
 # Run pipeline (Colombia example)
-python scripts/regions/south_america/colombia/3_merging/merge_all.py
-python scripts/regions/south_america/colombia/4_ml/1_splits/create_splits.py
-python scripts/regions/south_america/colombia/4_ml/2_training/train_lgbm.py
-python scripts/regions/south_america/colombia/4_ml/3_evaluation/evaluate.py
+python scripts/regions/south_america/colombia/3_merging/colombia_merge
+python scripts/regions/south_america/colombia/4_ml/splits/modelC_splits
+python scripts/regions/south_america/colombia/4_ml/training/modelC_LGBM
+python scripts/regions/south_america/colombia/4_ml/evaluation/calibrate_C
+python scripts/regions/south_america/colombia/4_ml/results/modelC_results
 
 # Run tests
 pytest tests/test_pipeline.py -v
