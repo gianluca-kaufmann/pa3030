@@ -1,0 +1,1401 @@
+#!/usr/bin/env python3
+
+"""Baseline Suitability Model for Protected Area Prediction
+
+Purpose: Estimate how "protection-like" each pixel looked in year 2000.
+         A model trained only on 2000 (protected vs unprotected) learns the
+         spatial signature of protected areas. Its predicted probability for
+         each unprotected pixel becomes a suitability score. We then check
+         whether high-suitability pixels actually became protected by 2024.
+
+Features:
+- Leakage prevention: case-insensitive regex denylist for features; hard-fail
+  if any forbidden column remains; leakage audit (top correlations with target).
+- Splits: random split + spatial (blocked) train/val/test; metrics reported for both.
+- Future status: DuckDB parquet aggregation (row,col -> MAX(WDPA_b1) 2001-2024).
+- Tie handling: deterministic precision@k under ties; tie diagnostics for suitability.
+- Thesis artifacts: metrics JSON, LaTeX table, PR/ROC plots, suitability map;
+  dataset/schema hashes and config snapshot in metrics.
+
+Input:   `merged_panel_final.parquet` (same locations as model1_preprocessing)
+Output:  - Trained LightGBM model (baseline_lgbm_2000.txt)
+         - Suitability scores (baseline_scores_2000.parquet)
+         - Evaluation metrics (baseline_lgbm_metrics.json)
+         - LaTeX table, PR/ROC plots, suitability map (outputs/south_america/results/ml_baselines)
+         - Scored outcome table (baseline_scored_outcomes.parquet)
+"""
+
+from __future__ import annotations
+
+import gc
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+import wandb
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    roc_auc_score,
+    average_precision_score,
+    precision_recall_curve,
+    roc_curve,
+)
+from sklearn.model_selection import train_test_split
+
+try:
+    import duckdb
+except ImportError:
+    duckdb = None
+
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import ListedColormap, BoundaryNorm
+    from matplotlib.lines import Line2D
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+    plt = None
+    ListedColormap = BoundaryNorm = Line2D = None
+
+try:
+    import geopandas as gpd
+    from shapely.geometry import Point
+    GEOPANDAS_AVAILABLE = True
+except ImportError:
+    GEOPANDAS_AVAILABLE = False
+    gpd = None
+    Point = None
+
+
+class Tee:
+    """Write to both stdout and a file."""
+    def __init__(self, file_path: Path):
+        self.file = open(file_path, 'w', encoding='utf-8')
+        self.stdout = sys.stdout
+    
+    def write(self, text: str) -> None:
+        self.stdout.write(text)
+        self.file.write(text)
+        self.file.flush()
+    
+    def flush(self) -> None:
+        self.stdout.flush()
+        self.file.flush()
+    
+    def close(self) -> None:
+        self.file.close()
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+RANDOM_STATE = 42
+TEST_SIZE = 0.2
+VAL_SIZE = 0.1  # Fraction of train used for early-stopping validation
+
+# Case-insensitive regex denylist: exclude any column whose name matches (prevents leakage)
+FEATURE_DENYLIST_REGEX = re.compile(
+    r'(wdpa|transition|protected|label|target|dist_wdpa|row|col|\bx\b|\by\b|year)',
+    re.IGNORECASE
+)
+
+# LightGBM parameters (increased flexibility for complex patterns)
+LGBM_PARAMS = {
+    'objective': 'binary',
+    'metric': 'auc',
+    'boosting_type': 'gbdt',
+    'num_leaves': 511,          # Increased from 255 for more flexibility
+    'learning_rate': 0.05,
+    'feature_fraction': 0.8,
+    'bagging_fraction': 0.8,
+    'bagging_freq': 5,
+    'max_depth': -1,            # Unlimited depth (num_leaves controls complexity)
+    'min_child_samples': 20,    # Reduced from 100 for more granular splits
+    'min_data_in_leaf': 20,     # Additional constraint for leaf size
+    'random_state': RANDOM_STATE,
+    'n_jobs': -1,
+    'verbose': -1,
+}
+
+
+# =============================================================================
+# Utility Functions
+# =============================================================================
+
+def convert_numpy_types(obj):
+    """Recursively convert NumPy types to native Python types for JSON serialization.
+    
+    Handles:
+    - NumPy scalars (int64, float64, etc.) -> int, float
+    - NumPy arrays -> lists
+    - Dicts and lists (recursively)
+    - None, bool, str pass through unchanged
+    
+    Args:
+        obj: Object that may contain NumPy types
+        
+    Returns:
+        Object with all NumPy types converted to native Python types
+    """
+    if isinstance(obj, (np.integer, np.intc, np.intp, np.int8,
+                        np.int16, np.int32, np.int64, np.uint8, np.uint16,
+                        np.uint32, np.uint64)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float16, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_numpy_types(value) for key, value in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [convert_numpy_types(item) for item in obj]
+    elif obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    else:
+        # Fallback: try to convert to native type
+        try:
+            if hasattr(obj, 'item'):  # NumPy scalar
+                return obj.item()
+            else:
+                return obj
+        except (ValueError, TypeError, AttributeError):
+            return str(obj)  # Last resort: convert to string
+
+
+def compute_precision_at_k(
+    y_true: np.ndarray,
+    y_proba: np.ndarray,
+    k: float,
+    tie_break_order: Optional[np.ndarray] = None,
+) -> float:
+    """Compute precision at top k% of predictions (deterministic under ties).
+
+    Tie-breaking: when scores are tied, order by tie_break_order (ascending)
+    so that the same subset is chosen every run. If tie_break_order is None,
+    uses np.arange(len(y_true)) so that earlier indices win.
+
+    Args:
+        y_true: True labels (0 or 1)
+        y_proba: Predicted probabilities for positive class
+        k: Percentage (e.g., 1 for top 1%, 5 for top 5%)
+        tie_break_order: Optional secondary sort key (same length as y_true).
+            Lower values are preferred when y_proba is tied.
+
+    Returns:
+        Precision among top k% predictions
+    """
+    n_samples = len(y_true)
+    n_top_k = max(1, int(n_samples * k / 100))
+    if tie_break_order is None:
+        tie_break_order = np.arange(n_samples, dtype=np.int64)
+    # Lexicographic sort: descending score, then ascending tie_break_order (deterministic)
+    lex_order = np.lexsort((tie_break_order, -y_proba))
+    top_k_idx = lex_order[:n_top_k]
+    return float(y_true[top_k_idx].sum() / n_top_k)
+
+
+def tie_diagnostics(y_proba: np.ndarray, name: str = "score") -> dict:
+    """Compute tie diagnostics for suitability/probability scores.
+
+    Returns dict with: n_unique, n_tied_groups, max_tie_size, pct_in_largest_tie.
+    """
+    uniq, counts = np.unique(y_proba, return_counts=True)
+    n_unique = len(uniq)
+    tied = counts > 1
+    n_tied_groups = int(tied.sum())
+    max_tie_size = int(counts.max()) if len(counts) else 0
+    n_in_largest = int(counts.max()) if len(counts) else 0
+    pct_largest = (n_in_largest / len(y_proba) * 100) if len(y_proba) else 0.0
+    return {
+        f"{name}_n_unique": n_unique,
+        f"{name}_n_tied_groups": n_tied_groups,
+        f"{name}_max_tie_size": max_tie_size,
+        f"{name}_pct_in_largest_tie": round(pct_largest, 4),
+    }
+
+
+def load_year_data(parquet_path: Path, year: int, columns: Optional[list] = None) -> pd.DataFrame:
+    """Load data for a specific year from parquet file efficiently.
+    
+    Uses row group filtering to minimize memory usage.
+    """
+    print(f"Loading data for year {year} from {parquet_path} ...")
+    
+    # Read parquet file with filter
+    filters = [('year', '==', year)]
+    load_start = time.time()
+    df = pd.read_parquet(parquet_path, filters=filters, columns=columns)
+    load_time = time.time() - load_start
+    
+    print(f"  Loaded {len(df):,} rows in {load_time:.1f}s")
+    return df
+
+
+def load_future_protection_status_duckdb(parquet_path: Path, year_min: int, year_max: int) -> pd.DataFrame:
+    """Compute ever_protected_after_2000 via DuckDB parquet aggregation (no full load).
+
+    Aggregation: (row, col) -> MAX(WDPA_b1) over years [year_min, year_max], then
+    ever_protected = (max > 0). Avoids loading hundreds of millions of rows into pandas.
+
+    Returns DataFrame with columns: row, col, ever_protected_after_2000 (int8).
+    """
+    if duckdb is None:
+        raise RuntimeError("duckdb is required for load_future_protection_status_duckdb; install duckdb")
+    print(f"\nComputing future protection status (years {year_min}-{year_max}) via DuckDB ...")
+    escaped = str(parquet_path).replace("'", "''")
+    load_start = time.time()
+    con = duckdb.connect()
+    try:
+        con.execute("SET threads TO 4")
+        q = f"""
+        SELECT row, col, MAX(WDPA_b1) AS max_wdpa
+        FROM read_parquet('{escaped}')
+        WHERE year >= {year_min} AND year <= {year_max}
+        GROUP BY row, col
+        """
+        protection_max = con.execute(q).fetchdf()
+    finally:
+        con.close()
+    protection_max = protection_max.rename(columns={"max_wdpa": "ever_protected_after_2000"})
+    protection_max["ever_protected_after_2000"] = (
+        (protection_max["ever_protected_after_2000"] > 0).astype(np.int8)
+    )
+    load_time = time.time() - load_start
+    print(f"  Computed for {len(protection_max):,} unique pixels in {load_time:.1f}s")
+    return protection_max
+
+
+def get_feature_columns(df: pd.DataFrame, denylist_regex: re.Pattern = FEATURE_DENYLIST_REGEX) -> list:
+    """Get feature columns: numeric only, excluding any matching case-insensitive denylist regex.
+
+    Hard-fails if any column name matches the denylist (leakage prevention).
+    """
+    numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+    feature_cols = []
+    forbidden = []
+    for col in numeric_cols:
+        if denylist_regex.search(col):
+            forbidden.append(col)
+        else:
+            feature_cols.append(col)
+    if forbidden:
+        raise ValueError(
+            f"Leakage prevention: the following columns match the feature denylist and must not be used: {forbidden}. "
+            "Remove them from the dataset or adjust FEATURE_DENYLIST_REGEX."
+        )
+    return feature_cols
+
+
+def leakage_audit(df: pd.DataFrame, feature_cols: list, target_series: pd.Series, top_n: int = 20) -> dict:
+    """Compute top absolute correlations of each feature with target (leakage audit).
+
+    Returns dict with feature names and correlations, and a short summary for logging.
+    """
+    X = df[feature_cols]
+    corrs = X.corrwith(target_series).abs().sort_values(ascending=False)
+    top = corrs.head(top_n)
+    return {
+        "top_correlations": {str(k): float(v) for k, v in top.items()},
+        "max_correlation": float(corrs.max()) if len(corrs) else 0.0,
+    }
+
+
+def spatial_blocked_split(
+    row: np.ndarray,
+    col: np.ndarray,
+    n_tiles_per_axis: int = 8,
+    train_frac: float = 0.7,
+    val_frac: float = 0.15,
+    test_frac: float = 0.15,
+    random_state: int = 42,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Assign each sample to train/val/test by spatial blocks (tile grid on row,col).
+
+    Tiles are (row_bin, col_bin) with row_bin = row // step, col_bin = col // step.
+    Tiles are then randomly assigned to train/val/test so that no spatial block is split.
+    Returns boolean masks: is_train, is_val, is_test (each shape (n_samples,)).
+    """
+    r_min, r_max = row.min(), row.max()
+    c_min, c_max = col.min(), col.max()
+    r_span = max(1, r_max - r_min + 1)
+    c_span = max(1, c_max - c_min + 1)
+    r_step = max(1, r_span // n_tiles_per_axis)
+    c_step = max(1, c_span // n_tiles_per_axis)
+    row_bin = (row - r_min) // r_step
+    col_bin = (col - c_min) // c_step
+    row_bin = np.clip(row_bin, 0, n_tiles_per_axis - 1)
+    col_bin = np.clip(col_bin, 0, n_tiles_per_axis - 1)
+    tile_id = row_bin * n_tiles_per_axis + col_bin
+    unique_tiles = np.unique(tile_id)
+    rng = np.random.RandomState(random_state)
+    rng.shuffle(unique_tiles)
+    n_tiles = len(unique_tiles)
+    n_train = max(1, int(n_tiles * train_frac))
+    n_val = max(0, int(n_tiles * val_frac))
+    n_test = max(0, n_tiles - n_train - n_val)
+    train_tiles = set(unique_tiles[:n_train])
+    val_tiles = set(unique_tiles[n_train : n_train + n_val])
+    test_tiles = set(unique_tiles[n_train + n_val :])
+    is_train = np.array([t in train_tiles for t in tile_id], dtype=bool)
+    is_val = np.array([t in val_tiles for t in tile_id], dtype=bool)
+    is_test = np.array([t in test_tiles for t in tile_id], dtype=bool)
+    return is_train, is_val, is_test
+
+
+def compute_dataset_schema_hash(parquet_path: Path, num_sample_row_groups: int = 3) -> str:
+    """Content-stable hash from parquet schema + row count + sampled row-group metadata."""
+    try:
+        import pyarrow.parquet as pq
+        pf = pq.ParquetFile(parquet_path)
+        meta = pf.metadata
+        schema = pf.schema_arrow
+        parts = [
+            "columns=" + ",".join(sorted(f.name for f in schema)),
+            f"total_rows={meta.num_rows}",
+            f"num_row_groups={meta.num_row_groups}",
+        ]
+        for i in range(min(num_sample_row_groups, meta.num_row_groups)):
+            rg = meta.row_group(i)
+            parts.append(f"rg{i}:rows={rg.num_rows}:cols={rg.num_columns}")
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+    except Exception as e:
+        return f"hash_error:{type(e).__name__}"
+
+
+def write_metrics_latex_table(metrics: dict, output_dir: Path, prefix: str = "baseline_lgbm") -> None:
+    """Write LaTeX table of key metrics (thesis artifact)."""
+    def fmt(v):
+        if isinstance(v, (int, float)):
+            return f"{v:.4f}" if isinstance(v, float) and abs(v) < 100 else f"{v:.2f}"
+        return str(v) if v is not None else ""
+    m2000 = metrics.get("model_performance_2000", {})
+    m_future = metrics.get("future_prediction_2001_2024", {})
+    m_spatial = metrics.get("model_performance_2000_spatial", {})
+    rows = [
+        ("ROC-AUC (2000, random)", fmt(m2000.get("roc_auc"))),
+        ("PR-AUC (2000, random)", fmt(m2000.get("pr_auc"))),
+        ("ROC-AUC (2000, spatial)", fmt(m_spatial.get("roc_auc"))),
+        ("PR-AUC (2000, spatial)", fmt(m_spatial.get("pr_auc"))),
+        ("ROC-AUC (future 2001-2024)", fmt(m_future.get("roc_auc"))),
+        ("PR-AUC (future 2001-2024)", fmt(m_future.get("pr_auc"))),
+        ("Precision @ 1\\% (future)", fmt(m_future.get("precision_at_1pct"))),
+        ("Precision @ 5\\% (future)", fmt(m_future.get("precision_at_5pct"))),
+        ("Precision @ 10\\% (future)", fmt(m_future.get("precision_at_10pct"))),
+    ]
+    latex_lines = [
+        "\\begin{table}[h]",
+        "\\centering",
+        "\\begin{tabular}{lr}",
+        "\\toprule",
+        "Metric & Value \\\\",
+        "\\midrule",
+    ]
+    for label, val in rows:
+        label_tex = label.replace("_", "\\_")
+        latex_lines.append(f"{label_tex} & {val} \\\\")
+    latex_lines.extend(["\\bottomrule", "\\end{tabular}", "\\caption{Baseline LGBM Suitability Metrics}", "\\label{tab:baseline_lgbm_metrics}", "\\end{table}"])
+    path = output_dir / f"{prefix}_metrics_table.tex"
+    path.write_text("\n".join(latex_lines) + "\n", encoding="utf-8")
+    print(f"LaTeX table saved: {path}")
+
+
+def create_pr_roc_plots(
+    y_true: np.ndarray,
+    y_proba: np.ndarray,
+    output_dir: Path,
+    prefix: str = "baseline_lgbm",
+) -> None:
+    """Create PR and ROC curves (thesis artifacts)."""
+    if not MATPLOTLIB_AVAILABLE:
+        print("Skipping PR/ROC plots (matplotlib not available)")
+        return
+    figsize = (8, 6)
+    # PR curve
+    precision, recall, _ = precision_recall_curve(y_true, y_proba)
+    pr_auc = average_precision_score(y_true, y_proba)
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.plot(recall, precision, lw=2, label=f"AP = {pr_auc:.4f}")
+    ax.axhline(y=y_true.mean(), color="r", linestyle="--", lw=2, label=f"Baseline = {y_true.mean():.4f}")
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.set_title(f"{prefix} Precision-Recall Curve")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    plt.tight_layout()
+    for ext in ("png", "pdf"):
+        p = output_dir / f"{prefix}_pr_curve.{ext}"
+        plt.savefig(p, dpi=300 if ext == "png" else 150, bbox_inches="tight")
+        print(f"Saved {p}")
+    plt.close()
+    # ROC curve
+    fpr, tpr, _ = roc_curve(y_true, y_proba)
+    roc_auc = roc_auc_score(y_true, y_proba)
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.plot(fpr, tpr, lw=2, label=f"AUC = {roc_auc:.4f}")
+    ax.plot([0, 1], [0, 1], "k--", lw=1, label="Random")
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.set_title(f"{prefix} ROC Curve")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    plt.tight_layout()
+    for ext in ("png", "pdf"):
+        p = output_dir / f"{prefix}_roc_curve.{ext}"
+        plt.savefig(p, dpi=300 if ext == "png" else 150, bbox_inches="tight")
+        print(f"Saved {p}")
+    plt.close()
+
+
+# Map constants (high-res suitability and risk maps)
+_MAP_DPI = 600
+_TARGET_RESOLUTION_M = 1000.0
+_SUITABILITY_COLORMAP = 'plasma'
+_SUITABILITY_PERCENTILE_MIN = 25
+_SUITABILITY_PERCENTILE_MAX = 98
+_COLOR_PROTECTED = '#2E8B57'
+_SUITABILITY_RISK_THRESHOLD_PCT = 10.0  # Top 10% suitability for risk map
+
+
+def _get_south_america_boundary(repo_root: Path) -> Optional[object]:
+    """Get South America boundary. Returns None if geopandas unavailable or boundary not found."""
+    if not GEOPANDAS_AVAILABLE:
+        return None
+    south_america_iso_codes = ['ARG', 'BOL', 'BRA', 'CHL', 'COL', 'ECU', 'GUF', 'GUY', 'PRY', 'PER', 'SUR', 'URY', 'VEN']
+    for cand in [repo_root / "data" / "boundaries" / "south_america.geojson", repo_root / "data" / "boundaries" / "south_america.gpkg"]:
+        if cand.exists():
+            try:
+                gdf = gpd.read_file(cand)
+                if gdf.crs is None:
+                    gdf.set_crs('EPSG:4326', inplace=True)
+                if 'iso_a3' in gdf.columns:
+                    return gdf[gdf['iso_a3'].isin(south_america_iso_codes)].dissolve().explode(index_parts=False)
+                elif 'ISO_A3' in gdf.columns:
+                    return gdf[gdf['ISO_A3'].isin(south_america_iso_codes)].dissolve().explode(index_parts=False)
+                return gdf
+            except Exception:
+                continue
+    return None
+
+
+def _points_to_raster(x: np.ndarray, y: np.ndarray, values: np.ndarray, target_resolution: float = 1000.0,
+                      agg_func: str = 'mean', extent_hint: Optional[Tuple[float, float, float, float]] = None
+                      ) -> Tuple[np.ndarray, Tuple[float, float, float, float]]:
+    """Convert point data to raster grid. Coordinates in meters (EPSG:3857)."""
+    if extent_hint is not None:
+        x_min, x_max, y_min, y_max = extent_hint
+    else:
+        x_min, x_max = float(x.min()), float(x.max())
+        y_min, y_max = float(y.min()), float(y.max())
+    x_res = y_res = target_resolution
+    padding = max(x_res, y_res) * 0.1
+    x_edges = np.arange(x_min - padding, x_max + padding + x_res, x_res)
+    y_edges = np.arange(y_min - padding, y_max + padding + y_res, y_res)
+    ncols, nrows = len(x_edges) - 1, len(y_edges) - 1
+    x_idx = np.clip(np.digitize(x, x_edges) - 1, 0, ncols - 1).astype(np.intp)
+    y_idx = np.clip(np.digitize(y, y_edges) - 1, 0, nrows - 1).astype(np.intp)
+    flat_idx = y_idx * ncols + x_idx
+    values = np.asarray(values, dtype=np.float64)
+    if agg_func == 'mean':
+        sum_arr = np.zeros(nrows * ncols, dtype=np.float64)
+        count_arr = np.zeros(nrows * ncols, dtype=np.float64)
+        np.add.at(sum_arr, flat_idx, values)
+        np.add.at(count_arr, flat_idx, 1.0)
+        raster_flat = np.where(count_arr > 0, sum_arr / count_arr, np.nan)
+    else:
+        raster_flat = np.full(nrows * ncols, -np.inf, dtype=np.float64)
+        np.maximum.at(raster_flat, flat_idx, values)
+        raster_flat = np.where(np.isfinite(raster_flat), raster_flat, np.nan)
+    raster = np.flipud(raster_flat.reshape(nrows, ncols).astype(np.float32))
+    return raster, (float(x_edges[0]), float(x_edges[-1]), float(y_edges[0]), float(y_edges[-1]))
+
+
+def _load_protected_areas_until_2024(parquet_path: Path, year_max: int = 2024) -> Optional[pd.DataFrame]:
+    """Load all pixels protected in any year through year_max from merged panel."""
+    if duckdb is None:
+        return None
+    escaped = str(parquet_path).replace("'", "''")
+    con = duckdb.connect()
+    try:
+        con.execute("SET threads TO 4")
+        return con.execute(f"""
+            SELECT row, col, MAX(x) AS x, MAX(y) AS y
+            FROM read_parquet('{escaped}')
+            WHERE year <= {year_max} AND WDPA_b1 = 1
+            GROUP BY row, col
+        """).fetchdf()
+    finally:
+        con.close()
+
+
+def _create_high_res_suitability_map(outcome_df: pd.DataFrame, output_dir: Path, input_path: Path,
+                                     prefix: str, repo_root: Path) -> None:
+    """Create high-resolution suitability map (raster)."""
+    if not MATPLOTLIB_AVAILABLE or not GEOPANDAS_AVAILABLE or "x" not in outcome_df.columns or "score" not in outcome_df.columns:
+        print("Skipping suitability map (matplotlib/geopandas not available or missing columns)")
+        return
+    sa_gdf = _get_south_america_boundary(repo_root)
+    proj_bounds = sa_gdf.to_crs('EPSG:3857').total_bounds if sa_gdf is not None else None
+    if proj_bounds is None:
+        print("Skipping suitability map (South America boundary not found)")
+        return
+    geometry = [Point(xy) for xy in zip(outcome_df['x'], outcome_df['y'])]
+    gdf = gpd.GeoDataFrame(outcome_df, geometry=geometry, crs='EPSG:3857')
+    if proj_bounds is not None:
+        gdf = gdf[(gdf.geometry.x >= proj_bounds[0]) & (gdf.geometry.x <= proj_bounds[2]) &
+                  (gdf.geometry.y >= proj_bounds[1]) & (gdf.geometry.y <= proj_bounds[3])].copy()
+    outcome_filtered = outcome_df.loc[gdf.index].copy()
+    score_values = outcome_filtered['score'].values
+    score_pmin, score_pmax = np.percentile(score_values, _SUITABILITY_PERCENTILE_MIN), np.percentile(score_values, _SUITABILITY_PERCENTILE_MAX)
+    score_span = score_pmax - score_pmin
+    score_norm = np.sqrt(np.clip(score_values, score_pmin, score_pmax) - score_pmin) / score_span if score_span > 0 else np.zeros_like(score_values)
+    raster, extent = _points_to_raster(gdf.geometry.x.values, gdf.geometry.y.values, score_norm, _TARGET_RESOLUTION_M, agg_func='mean')
+    fig_width = 14
+    fig_height = fig_width * (proj_bounds[3] - proj_bounds[1]) / (proj_bounds[2] - proj_bounds[0]) if proj_bounds is not None else 11
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    if sa_gdf is not None:
+        sa_gdf.to_crs('EPSG:3857').plot(ax=ax, color='white', edgecolor='none', linewidth=1.5, zorder=1)
+    im = ax.imshow(raster, extent=extent, cmap=_SUITABILITY_COLORMAP, vmin=0, vmax=1, origin='upper', interpolation='nearest', aspect='equal', zorder=2)
+    if proj_bounds is not None:
+        ax.set_xlim(proj_bounds[0], proj_bounds[2])
+        ax.set_ylim(proj_bounds[1], proj_bounds[3])
+    ax.set_aspect('equal', adjustable='box')
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label('Suitability score', fontsize=12, rotation=270, labelpad=20)
+    cbar.set_ticks([0.0, 1.0])
+    cbar.set_ticklabels(['Low', 'High'])
+    ax.set_xlabel('Easting (m, EPSG:3857)', fontsize=12)
+    ax.set_ylabel('Northing (m, EPSG:3857)', fontsize=12)
+    ax.set_title(f'{prefix} Suitability Map', fontsize=15, fontweight='bold', pad=15)
+    ax.text(0.02, 0.98, f"Min: {score_values.min():.4f} | Max: {score_values.max():.4f}\nMean: {score_values.mean():.4f} | Pixels: {len(outcome_filtered):,}",
+            transform=ax.transAxes, fontsize=9, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor='black', linewidth=1), zorder=10)
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5, zorder=3)
+    plt.tight_layout(pad=0.5)
+    for ext in ("png", "pdf"):
+        try:
+            plt.savefig(output_dir / f"{prefix}_suitability_map.{ext}", dpi=_MAP_DPI if ext == "png" else 150, bbox_inches='tight')
+            print(f"Saved {output_dir / f'{prefix}_suitability_map.{ext}'}")
+        except Exception as e:
+            print(f"Warning: Could not save {ext}: {e}")
+    plt.close()
+
+
+def _create_suitability_map_with_pa(outcome_df: pd.DataFrame, output_dir: Path, input_path: Path,
+                                    prefix: str, repo_root: Path) -> None:
+    """Create suitability map with protected areas (through 2024) overlay."""
+    if not MATPLOTLIB_AVAILABLE or not GEOPANDAS_AVAILABLE or "x" not in outcome_df.columns or "score" not in outcome_df.columns:
+        return
+    sa_gdf = _get_south_america_boundary(repo_root)
+    proj_bounds = sa_gdf.to_crs('EPSG:3857').total_bounds if sa_gdf is not None else None
+    if proj_bounds is None:
+        return
+    geometry = [Point(xy) for xy in zip(outcome_df['x'], outcome_df['y'])]
+    gdf = gpd.GeoDataFrame(outcome_df, geometry=geometry, crs='EPSG:3857')
+    if proj_bounds is not None:
+        gdf = gdf[(gdf.geometry.x >= proj_bounds[0]) & (gdf.geometry.x <= proj_bounds[2]) &
+                  (gdf.geometry.y >= proj_bounds[1]) & (gdf.geometry.y <= proj_bounds[3])].copy()
+    outcome_filtered = outcome_df.loc[gdf.index].copy()
+    score_values = outcome_filtered['score'].values
+    score_pmin, score_pmax = np.percentile(score_values, _SUITABILITY_PERCENTILE_MIN), np.percentile(score_values, _SUITABILITY_PERCENTILE_MAX)
+    score_span = score_pmax - score_pmin
+    score_norm = np.sqrt(np.clip(score_values, score_pmin, score_pmax) - score_pmin) / score_span if score_span > 0 else np.zeros_like(score_values)
+    raster, extent = _points_to_raster(gdf.geometry.x.values, gdf.geometry.y.values, score_norm, _TARGET_RESOLUTION_M, agg_func='mean')
+    pa_raster, n_pa_pixels = None, 0
+    if input_path.exists() and duckdb is not None:
+        pa_df = _load_protected_areas_until_2024(input_path, 2024)
+        if pa_df is not None and len(pa_df) > 0:
+            pa_geom = [Point(xy) for xy in zip(pa_df['x'], pa_df['y'])]
+            pa_gdf = gpd.GeoDataFrame(pa_df, geometry=pa_geom, crs='EPSG:3857')
+            if proj_bounds is not None:
+                pa_gdf = pa_gdf[(pa_gdf.geometry.x >= proj_bounds[0]) & (pa_gdf.geometry.x <= proj_bounds[2]) &
+                                (pa_gdf.geometry.y >= proj_bounds[1]) & (pa_gdf.geometry.y <= proj_bounds[3])]
+            if len(pa_gdf) > 0:
+                n_pa_pixels = len(pa_gdf)
+                pa_raster, _ = _points_to_raster(pa_gdf.geometry.x.values, pa_gdf.geometry.y.values,
+                                                 np.ones(len(pa_gdf), dtype=np.float32), _TARGET_RESOLUTION_M, agg_func='max', extent_hint=(extent[0], extent[1], extent[2], extent[3]))
+    fig_width = 14
+    fig_height = fig_width * (proj_bounds[3] - proj_bounds[1]) / (proj_bounds[2] - proj_bounds[0]) if proj_bounds is not None else 11
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    if sa_gdf is not None:
+        sa_gdf.to_crs('EPSG:3857').plot(ax=ax, color='white', edgecolor='none', zorder=1)
+    im = ax.imshow(raster, extent=extent, cmap=_SUITABILITY_COLORMAP, vmin=0, vmax=1, origin='upper', interpolation='nearest', aspect='equal', zorder=2)
+    if pa_raster is not None:
+        pa_masked = np.ma.masked_where(np.isnan(pa_raster) | (pa_raster < 0.5), pa_raster)
+        ax.imshow(pa_masked, extent=extent, cmap=ListedColormap([_COLOR_PROTECTED]), vmin=0, vmax=1, origin='upper', interpolation='nearest', aspect='equal', alpha=0.6, zorder=3)
+    if proj_bounds is not None:
+        ax.set_xlim(proj_bounds[0], proj_bounds[2])
+        ax.set_ylim(proj_bounds[1], proj_bounds[3])
+    ax.set_aspect('equal', adjustable='box')
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label('Suitability score', fontsize=12, rotation=270, labelpad=20)
+    ax.set_xlabel('Easting (m, EPSG:3857)', fontsize=12)
+    ax.set_ylabel('Northing (m, EPSG:3857)', fontsize=12)
+    ax.set_title(f'{prefix} Suitability Map + Protected Areas (through 2024)', fontsize=15, fontweight='bold', pad=15)
+    if n_pa_pixels > 0:
+        ax.legend(handles=[Line2D([0], [0], marker='s', color='w', markerfacecolor=_COLOR_PROTECTED, markersize=10, alpha=0.9, label=f'Protected areas until 2024 (n={n_pa_pixels:,})')], loc='upper left', fontsize=10, framealpha=0.95)
+    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5, zorder=4)
+    plt.tight_layout(pad=0.5)
+    for ext in ("png", "pdf"):
+        try:
+            plt.savefig(output_dir / f"{prefix}_suitability_map_with_pa.{ext}", dpi=_MAP_DPI if ext == "png" else 150, bbox_inches='tight')
+            print(f"Saved {output_dir / f'{prefix}_suitability_map_with_pa.{ext}'}")
+        except Exception as e:
+            print(f"Warning: Could not save {ext}: {e}")
+    plt.close()
+
+
+def _create_suitability_risk_map(outcome_df: pd.DataFrame, output_dir: Path, input_path: Path,
+                                 prefix: str, repo_root: Path) -> None:
+    """Create risk map: top 10% suitability + protected areas until 2024 overlay."""
+    if not MATPLOTLIB_AVAILABLE or not GEOPANDAS_AVAILABLE or "x" not in outcome_df.columns or "score" not in outcome_df.columns:
+        print("Skipping risk map (matplotlib/geopandas not available or missing columns)")
+        return
+    sa_gdf = _get_south_america_boundary(repo_root)
+    proj_bounds = sa_gdf.to_crs('EPSG:3857').total_bounds if sa_gdf is not None else None
+    if proj_bounds is None:
+        print("Skipping risk map (South America boundary not found)")
+        return
+    geometry = [Point(xy) for xy in zip(outcome_df['x'], outcome_df['y'])]
+    gdf = gpd.GeoDataFrame(outcome_df.copy(), geometry=geometry, crs='EPSG:3857')
+    if proj_bounds is not None:
+        gdf = gdf[(gdf.geometry.x >= proj_bounds[0]) & (gdf.geometry.x <= proj_bounds[2]) &
+                  (gdf.geometry.y >= proj_bounds[1]) & (gdf.geometry.y <= proj_bounds[3])].copy()
+    top_threshold = np.percentile(gdf['score'].values, 100 - _SUITABILITY_RISK_THRESHOLD_PCT)
+    gdf['is_predicted'] = (gdf['score'] >= top_threshold).astype(int)
+    predicted_count = int(gdf['is_predicted'].sum())
+    category_raster, extent = _points_to_raster(gdf.geometry.x.values, gdf.geometry.y.values, gdf['is_predicted'].values.astype(np.float32), _TARGET_RESOLUTION_M, agg_func='max')
+    background_mask, _ = _points_to_raster(gdf.geometry.x.values, gdf.geometry.y.values, np.ones(len(gdf), dtype=np.float32), _TARGET_RESOLUTION_M, agg_func='max')
+    pa_raster, pa_extent, n_pa_pixels = None, None, 0
+    if input_path.exists() and duckdb is not None:
+        pa_df = _load_protected_areas_until_2024(input_path, 2024)
+        if pa_df is not None and len(pa_df) > 0 and 'x' in pa_df.columns and 'y' in pa_df.columns:
+            pa_geom = [Point(xy) for xy in zip(pa_df['x'], pa_df['y'])]
+            pa_gdf = gpd.GeoDataFrame(pa_df, geometry=pa_geom, crs='EPSG:3857')
+            if proj_bounds is not None:
+                pa_gdf = pa_gdf[(pa_gdf.geometry.x >= proj_bounds[0]) & (pa_gdf.geometry.x <= proj_bounds[2]) &
+                                (pa_gdf.geometry.y >= proj_bounds[1]) & (pa_gdf.geometry.y <= proj_bounds[3])]
+            if len(pa_gdf) > 0:
+                n_pa_pixels = len(pa_gdf)
+                pa_raster, pa_extent = _points_to_raster(pa_gdf.geometry.x.values, pa_gdf.geometry.y.values,
+                                                         np.ones(len(pa_gdf), dtype=np.float32), _TARGET_RESOLUTION_M,
+                                                         agg_func='max', extent_hint=(extent[0], extent[1], extent[2], extent[3]))
+    fig_width = 14
+    fig_height = fig_width * (proj_bounds[3] - proj_bounds[1]) / (proj_bounds[2] - proj_bounds[0]) if proj_bounds is not None else 11
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    background_masked = np.ma.masked_where(np.isnan(background_mask), background_mask)
+    ax.imshow(background_masked, extent=extent, cmap=ListedColormap(['#F5F5F5']), vmin=0, vmax=1, origin='upper', interpolation='nearest', aspect='equal', zorder=1)
+    COLOR_PREDICTED = '#5B9BD5'
+    cat_no_bg = np.where((category_raster >= 1) & (category_raster <= 1), category_raster, np.nan)
+    ax.imshow(np.ma.masked_where(np.isnan(cat_no_bg), cat_no_bg), extent=extent, cmap=ListedColormap([COLOR_PREDICTED]), vmin=0.5, vmax=1.5, origin='upper', interpolation='nearest', aspect='equal', zorder=2)
+    if pa_raster is not None and pa_extent is not None:
+        pa_masked = np.ma.masked_where(np.isnan(pa_raster) | (pa_raster < 0.5), pa_raster)
+        ax.imshow(pa_masked, extent=pa_extent, cmap=ListedColormap([_COLOR_PROTECTED]), vmin=0, vmax=1, origin='upper', interpolation='nearest', aspect='equal', alpha=0.6, zorder=3)
+    if proj_bounds is not None:
+        ax.set_xlim(proj_bounds[0], proj_bounds[2])
+        ax.set_ylim(proj_bounds[1], proj_bounds[3])
+    ax.set_aspect('equal', adjustable='box')
+    ax.set_xlabel('Easting (m, EPSG:3857)', fontsize=12)
+    ax.set_ylabel('Northing (m, EPSG:3857)', fontsize=12)
+    ax.set_title(f'{prefix} Suitability Risk Map: Top {int(_SUITABILITY_RISK_THRESHOLD_PCT)}% + Protected Areas (through 2024)', fontsize=15, fontweight='bold', pad=15)
+    legend_elements = [Line2D([0], [0], marker='s', color='w', markerfacecolor=COLOR_PREDICTED, markersize=10, alpha=0.9, label=f'Top {int(_SUITABILITY_RISK_THRESHOLD_PCT)}% suitability (n={predicted_count:,})')]
+    if n_pa_pixels > 0:
+        legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=_COLOR_PROTECTED, markersize=10, alpha=0.9, label=f'Protected areas until 2024 (n={n_pa_pixels:,})'))
+    ax.legend(handles=legend_elements, loc='upper left', fontsize=10, framealpha=0.95)
+    ax.text(0.02, 0.02, f"Pixels: {len(gdf):,}\nTop {int(_SUITABILITY_RISK_THRESHOLD_PCT)}% threshold: {top_threshold:.4f}", transform=ax.transAxes, fontsize=9, verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.9, edgecolor='black', linewidth=1), zorder=10)
+    ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5, zorder=4)
+    plt.tight_layout(pad=0.5)
+    for ext in ("png", "pdf"):
+        try:
+            plt.savefig(output_dir / f"{prefix}_risk_map_top{int(_SUITABILITY_RISK_THRESHOLD_PCT)}pct.{ext}", dpi=_MAP_DPI if ext == "png" else 150, bbox_inches='tight')
+            print(f"Saved {output_dir / f'{prefix}_risk_map_top{int(_SUITABILITY_RISK_THRESHOLD_PCT)}pct.{ext}'}")
+        except Exception as e:
+            print(f"Warning: Could not save {ext}: {e}")
+    plt.close()
+
+
+# =============================================================================
+# Main Pipeline
+# =============================================================================
+
+def main() -> None:
+    start_time = time.time()
+    
+    # -------------------------------------------------------------------------
+    # Setup paths
+    # -------------------------------------------------------------------------
+    repo_root = Path(__file__).resolve().parents[4]
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+    
+    # Input path: merged_panel_final.parquet (same locations as model1_preprocessing)
+    candidate_inputs = []
+    if scratch_root is not None:
+        candidate_inputs.append(scratch_root / "outputs/south_america/results/merged_panel_final.parquet")
+        candidate_inputs.append(scratch_root / "data/south_america/ml/merged_panel_final.parquet")
+    candidate_inputs.append(repo_root / "outputs/south_america/results/merged_panel_final.parquet")
+    candidate_inputs.append(repo_root / "data/south_america/ml/merged_panel_final.parquet")
+    
+    input_path = candidate_inputs[-1]  # Default to last (local repo path)
+    for cand in candidate_inputs:
+        if cand.exists():
+            input_path = cand
+            break
+    
+    if input_path is None or not input_path.exists():
+        error_msg = (
+            "Could not find merged_panel_final.parquet in any expected location.\n"
+            f"Checked:\n"
+        )
+        for cand in candidate_inputs:
+            error_msg += f"  - {cand}\n"
+        raise FileNotFoundError(error_msg)
+    
+    # Output directories
+    output_dir = repo_root / "outputs/south_america/results/ml_baselines"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    data_output_dir = repo_root / "data/south_america/ml"
+    data_output_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Initialize W&B
+    wandb_api_key = os.environ.get("WANDB_API_KEY")
+    wandb_entity = os.environ.get("WANDB_ENTITY")
+    
+    if not wandb_api_key:
+        print("Warning: WANDB_API_KEY not found in environment")
+    if not wandb_entity:
+        print("Warning: WANDB_ENTITY not found in environment")
+    
+    print("Initializing Weights & Biases...")
+    wandb.init(
+        project="ml-training-baselines",
+        entity=wandb_entity,
+        name=f"baseline_lgbm_suitability_{timestamp}",
+        config={
+            "model": "LightGBM",
+            "task": "baseline_suitability_2000",
+            "random_state": RANDOM_STATE,
+            "test_size": TEST_SIZE,
+            "target": "is_protected_2000",
+            "future_prediction": "ever_protected_after_2000",
+        },
+    )
+    print("W&B connected\n")
+    
+    print("=" * 70)
+    print("BASELINE SUITABILITY MODEL FOR PROTECTED AREA PREDICTION")
+    print("=" * 70)
+    print(f"\nInput:  {input_path}")
+    print(f"Output: {output_dir}")
+    
+    # -------------------------------------------------------------------------
+    # Step 1: Load 2000 snapshot
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 1: LOAD YEAR 2000 SNAPSHOT")
+    print("=" * 70)
+    
+    df_2000 = load_year_data(input_path, year=2000)
+    
+    # Target: is_protected_2000 = WDPA_b1
+    target_col = "is_protected_2000"
+    df_2000[target_col] = df_2000['WDPA_b1']
+    
+    # Drop rows with missing target
+    df_2000_clean = df_2000.dropna(subset=[target_col])
+    dropped = len(df_2000) - len(df_2000_clean)
+    if dropped > 0:
+        print(f"Dropped {dropped:,} rows with missing target")
+    
+    print(f"Total pixels in 2000: {len(df_2000_clean):,}")
+    
+    # Feature selection via case-insensitive regex denylist (hard-fail if any forbidden remains).
+    # Pass a view without denylist columns so get_feature_columns does not raise; keep df_2000_clean for target and pixel_ids.
+    cols_to_drop_for_features = [c for c in df_2000_clean.columns if FEATURE_DENYLIST_REGEX.search(c)]
+    df_for_feature_selection = df_2000_clean.drop(columns=cols_to_drop_for_features)
+    feature_cols = get_feature_columns(df_for_feature_selection)
+    print(f"\nUsing {len(feature_cols)} features (denylist: any col matching {FEATURE_DENYLIST_REGEX.pattern!r})")
+    print("Final feature list:")
+    for i, feat in enumerate(sorted(feature_cols), 1):
+        print(f"  {i:3d}. {feat}")
+    
+    # Leakage audit: top correlations with target
+    target_series = df_2000_clean[target_col]
+    audit = leakage_audit(df_2000_clean, feature_cols, target_series, top_n=20)
+    print("\nLeakage audit (top absolute correlations with target):")
+    print(f"  Max correlation: {audit['max_correlation']:.4f}")
+    for fname, corr in list(audit["top_correlations"].items())[:10]:
+        print(f"  {fname}: {corr:.4f}")
+    
+    # Target distribution
+    n_protected = (df_2000_clean[target_col] > 0).sum()
+    n_unprotected = (df_2000_clean[target_col] == 0).sum()
+    pct_protected = n_protected / len(df_2000_clean) * 100
+    
+    print(f"\n" + "-" * 40)
+    print("Protection status in 2000:")
+    print(f"  Protected:   {n_protected:>12,}  ({pct_protected:.2f}%)")
+    print(f"  Unprotected: {n_unprotected:>12,}  ({100 - pct_protected:.2f}%)")
+    print("-" * 40)
+    
+    # Log data statistics and leakage audit to wandb
+    wandb.log({
+        "data/n_features": len(feature_cols),
+        "data/n_total_pixels_2000": int(len(df_2000_clean)),
+        "data/n_protected_2000": int(n_protected),
+        "data/n_unprotected_2000": int(n_unprotected),
+        "data/pct_protected_2000": float(pct_protected),
+        "data/class_ratio_2000": float(n_unprotected / max(n_protected, 1)),
+        "data/features": feature_cols,
+        "data/leakage_audit_max_correlation": float(audit["max_correlation"]),
+    })
+    
+    # -------------------------------------------------------------------------
+    # Step 2: Prepare features and target
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 2: PREPARE FEATURES AND TARGET")
+    print("=" * 70)
+    
+    # Binary target
+    y = (df_2000_clean[target_col] > 0).astype(np.int8)
+    X = df_2000_clean[feature_cols]
+    
+    # Store pixel identifiers for scoring later
+    pixel_ids = df_2000_clean[['row', 'col', 'x', 'y']].copy()
+    
+    print(f"Feature matrix shape: {X.shape}")
+    print(f"Target shape: {y.shape}")
+    
+    # Check for missing values
+    missing_counts = X.isnull().sum()
+    cols_with_missing = missing_counts[missing_counts > 0]
+    if len(cols_with_missing) > 0:
+        print(f"\nColumns with missing values: {len(cols_with_missing)}")
+        print("  Top 5:")
+        for col, count in cols_with_missing.head().items():
+            print(f"    {col}: {count:,} ({count/len(X)*100:.2f}%)")
+    
+    # -------------------------------------------------------------------------
+    # Step 3: Train/test split and model training
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 3: TRAIN LIGHTGBM MODEL")
+    print("=" * 70)
+    
+    # Split data
+    print(f"\nSplitting data (80/20) with stratification ...")
+    X_train, X_test, y_train, y_test, idx_train, idx_test = train_test_split(
+        X, y, pixel_ids.index,
+        test_size=TEST_SIZE,
+        stratify=y,
+        random_state=RANDOM_STATE
+    )
+    
+    print(f"Training set: {len(X_train):,} samples")
+    print(f"  Protected:   {y_train.sum():,}")
+    print(f"  Unprotected: {(y_train == 0).sum():,}")
+    print(f"\nTest set: {len(X_test):,} samples")
+    print(f"  Protected:   {y_test.sum():,}")
+    print(f"  Unprotected: {(y_test == 0).sum():,}")
+    
+    # Calculate scale_pos_weight for imbalanced classification
+    n_train_pos = y_train.sum()
+    n_train_neg = (y_train == 0).sum()
+    scale_pos_weight = n_train_neg / max(n_train_pos, 1)
+    
+    print(f"\nClass imbalance handling:")
+    print(f"  Positive (protected): {n_train_pos:,}")
+    print(f"  Negative (unprotected): {n_train_neg:,}")
+    print(f"  Imbalance ratio: 1:{n_train_neg / max(n_train_pos, 1):.2f}")
+    print(f"  Scale pos weight (auto): {scale_pos_weight:.2f}")
+    
+    # Log split information
+    wandb.log({
+        "data/train_size": len(X_train),
+        "data/test_size": len(X_test),
+        "data/train_protected": int(n_train_pos),
+        "data/train_unprotected": int(n_train_neg),
+        "data/test_protected": int(y_test.sum()),
+        "data/test_unprotected": int((y_test == 0).sum()),
+        "data/train_imbalance_ratio": float(n_train_neg / max(n_train_pos, 1)),
+        "model/scale_pos_weight": float(scale_pos_weight),
+    })
+    
+    # Update params with scale_pos_weight for balanced learning
+    lgbm_params = LGBM_PARAMS.copy()
+    lgbm_params['scale_pos_weight'] = scale_pos_weight
+    
+    print("\nLightGBM parameters:")
+    for param, value in lgbm_params.items():
+        if param != 'verbose':
+            print(f"  {param}: {value}")
+    
+    # Create and train model
+    print("\nTraining LightGBM ...")
+    model = lgb.LGBMClassifier(n_estimators=500, **lgbm_params)
+    
+    # Use part of training set for early stopping
+    X_train_fit, X_val, y_train_fit, y_val = train_test_split(
+        X_train, y_train,
+        test_size=0.1,
+        stratify=y_train,
+        random_state=RANDOM_STATE
+    )
+    
+    print(f"  Training on {len(X_train_fit):,} samples")
+    print(f"  Validating on {len(X_val):,} samples")
+    print(f"  Using early stopping (patience=50, period=100) ...\n")
+    
+    train_start = time.time()
+    model.fit(
+        X_train_fit, y_train_fit,
+        eval_set=[(X_val, y_val)],
+        eval_metric='auc',
+        callbacks=[
+            lgb.early_stopping(stopping_rounds=50, verbose=False),
+            lgb.log_evaluation(period=100)
+        ]
+    )
+    train_time = time.time() - train_start
+    print(f"\nTraining completed in {train_time:.1f}s")
+    
+    print(f"\nTraining complete!")
+    print(f"Best iteration: {model.best_iteration_}")
+    print(f"Best validation AUC: {model.best_score_['valid_0']['auc']:.4f}")
+    
+    # Log training progress
+    wandb.log({
+        "training/best_iteration": model.best_iteration_,
+        "training/best_val_auc": float(model.best_score_['valid_0']['auc']),
+    })
+    
+    # Save model
+    model_path = data_output_dir / "baseline_lgbm_2000.txt"
+    model.booster_.save_model(str(model_path))
+    print(f"\nModel saved to: {model_path}")
+    
+    # -------------------------------------------------------------------------
+    # Step 4: Evaluate on test set
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 4: EVALUATE ON TEST SET (YEAR 2000)")
+    print("=" * 70)
+    
+    y_pred = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)[:, 1]
+    
+    # Classification report
+    print("\nClassification Report:")
+    print(classification_report(y_test, y_pred, digits=4))
+    
+    # Confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    tn, fp, fn, tp = cm.ravel()
+    
+    print("\nConfusion Matrix:")
+    print(f"                 Predicted 0    Predicted 1")
+    print(f"Actual 0  {tn:>15,}  {fp:>14,}")
+    print(f"Actual 1  {fn:>15,}  {tp:>14,}")
+    
+    # AUC metrics
+    roc_auc = roc_auc_score(y_test, y_proba)
+    pr_auc = average_precision_score(y_test, y_proba)
+    
+    print(f"\nROC-AUC: {roc_auc:.4f}")
+    print(f"PR-AUC:  {pr_auc:.4f}")
+    
+    # Log 2000 classification metrics
+    wandb.log({
+        "metrics_2000/roc_auc": float(roc_auc),
+        "metrics_2000/pr_auc": float(pr_auc),
+        "metrics_2000/true_negatives": int(tn),
+        "metrics_2000/false_positives": int(fp),
+        "metrics_2000/false_negatives": int(fn),
+        "metrics_2000/true_positives": int(tp),
+        "metrics_2000/accuracy": float((tp + tn) / (tp + tn + fp + fn)),
+        "metrics_2000/precision": float(tp / (tp + fp)) if (tp + fp) > 0 else 0,
+        "metrics_2000/recall": float(tp / (tp + fn)) if (tp + fn) > 0 else 0,
+        "metrics_2000/f1": float(2 * tp / (2 * tp + fp + fn)) if (2 * tp + fp + fn) > 0 else 0,
+    })
+    
+    # Feature importance
+    print("\n" + "-" * 40)
+    print("Top 20 Most Important Features:")
+    print("-" * 40)
+    feature_importance = pd.DataFrame({
+        'feature': feature_cols,
+        'importance': model.feature_importances_
+    }).sort_values('importance', ascending=False)
+    print(feature_importance.head(20).to_string(index=False))
+    
+    # -------------------------------------------------------------------------
+    # Step 4b: Spatial (blocked) split — train and evaluate
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 4b: SPATIAL BLOCKED SPLIT (TRAIN / VAL / TEST)")
+    print("=" * 70)
+    row_arr = pixel_ids['row'].values
+    col_arr = pixel_ids['col'].values
+    is_train_sp, is_val_sp, is_test_sp = spatial_blocked_split(
+        row_arr, col_arr,
+        n_tiles_per_axis=8,
+        train_frac=0.7, val_frac=0.15, test_frac=0.15,
+        random_state=RANDOM_STATE,
+    )
+    X_train_sp = X.iloc[is_train_sp][feature_cols]
+    y_train_sp = y[is_train_sp]
+    X_val_sp = X.iloc[is_val_sp][feature_cols]
+    y_val_sp = y[is_val_sp]
+    X_test_sp = X.iloc[is_test_sp][feature_cols]
+    y_test_sp = y[is_test_sp]
+    print(f"Spatial train: {len(X_train_sp):,}  val: {len(X_val_sp):,}  test: {len(X_test_sp):,}")
+    scale_pos_weight_sp = (y_train_sp == 0).sum() / max(y_train_sp.sum(), 1)
+    lgbm_params_sp = {**lgbm_params, 'scale_pos_weight': scale_pos_weight_sp}
+    model_spatial = lgb.LGBMClassifier(n_estimators=500, **lgbm_params_sp)
+    model_spatial.fit(
+        X_train_sp, y_train_sp,
+        eval_set=[(X_val_sp, y_val_sp)],
+        eval_metric='auc',
+        callbacks=[
+            lgb.early_stopping(stopping_rounds=50, verbose=False),
+            lgb.log_evaluation(period=100),
+        ],
+    )
+    y_proba_sp = model_spatial.predict_proba(X_test_sp)[:, 1]
+    roc_auc_spatial = float(roc_auc_score(y_test_sp, y_proba_sp))
+    pr_auc_spatial = float(average_precision_score(y_test_sp, y_proba_sp))
+    cm_sp = confusion_matrix(y_test_sp, model_spatial.predict(X_test_sp))
+    tn_sp, fp_sp, fn_sp, tp_sp = cm_sp.ravel()
+    print(f"\nSpatial test — ROC-AUC: {roc_auc_spatial:.4f}  PR-AUC: {pr_auc_spatial:.4f}")
+    wandb.log({
+        "metrics_2000_spatial/roc_auc": roc_auc_spatial,
+        "metrics_2000_spatial/pr_auc": pr_auc_spatial,
+        "metrics_2000_spatial/true_negatives": int(tn_sp),
+        "metrics_2000_spatial/false_positives": int(fp_sp),
+        "metrics_2000_spatial/false_negatives": int(fn_sp),
+        "metrics_2000_spatial/true_positives": int(tp_sp),
+    })
+    
+    # -------------------------------------------------------------------------
+    # Step 5: Score all unprotected 2000 pixels
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 5: SCORE UNPROTECTED 2000 PIXELS")
+    print("=" * 70)
+    
+    # Get unprotected pixels in 2000
+    unprotected_mask = y == 0
+    X_unprotected = X[unprotected_mask]
+    pixel_ids_unprotected = pixel_ids[unprotected_mask].copy()
+    
+    print(f"\nUnprotected pixels in 2000: {len(X_unprotected):,}")
+    
+    # Compute suitability scores
+    print("Computing suitability scores ...")
+    score_start = time.time()
+    suitability_scores = model.predict_proba(X_unprotected)[:, 1]
+    score_time = time.time() - score_start
+    print(f"  Scored {len(X_unprotected):,} pixels in {score_time:.1f}s")
+    
+    # Create scores dataframe
+    scores_df = pixel_ids_unprotected.copy()
+    scores_df['score'] = suitability_scores
+    
+    # Save scores
+    scores_path = data_output_dir / "baseline_scores_2000.parquet"
+    scores_df.to_parquet(scores_path, index=False)
+    print(f"\nScores saved to: {scores_path}")
+    print(f"Score statistics:")
+    print(f"  Min:    {suitability_scores.min():.4f}")
+    print(f"  Max:    {suitability_scores.max():.4f}")
+    print(f"  Mean:   {suitability_scores.mean():.4f}")
+    print(f"  Median: {np.median(suitability_scores):.4f}")
+    
+    # Log score statistics
+    wandb.log({
+        "scores/n_unprotected_scored": len(X_unprotected),
+        "scores/min": float(suitability_scores.min()),
+        "scores/max": float(suitability_scores.max()),
+        "scores/mean": float(suitability_scores.mean()),
+        "scores/median": float(np.median(suitability_scores)),
+        "scores/std": float(suitability_scores.std()),
+    })
+    
+    # Free memory
+    del df_2000, df_2000_clean, X, y, pixel_ids
+    del X_train, X_test, y_train, y_test
+    del X_train_fit, X_val, y_train_fit, y_val
+    gc.collect()
+    
+    # -------------------------------------------------------------------------
+    # Step 6: Build 2000→2024 outcome
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 6: BUILD 2000→2024 OUTCOME")
+    print("=" * 70)
+    
+    # Future protection via DuckDB parquet aggregation (no full 393M-row load)
+    future_protection = load_future_protection_status_duckdb(input_path, 2001, 2024)
+    
+    # Join with suitability scores
+    print("\nJoining scores with future protection status ...")
+    outcome_df = scores_df.merge(
+        future_protection,
+        on=['row', 'col'],
+        how='left'
+    )
+    
+    # Fill NaN (pixels that might not exist in future years) with 0
+    outcome_df['ever_protected_after_2000'] = (
+        outcome_df['ever_protected_after_2000'].fillna(0).astype(np.int8)
+    )
+    
+    n_became_protected = outcome_df['ever_protected_after_2000'].sum()
+    n_remained_unprotected = len(outcome_df) - n_became_protected
+    pct_became_protected = n_became_protected / len(outcome_df) * 100
+    
+    print(f"\nOutcome for unprotected 2000 pixels:")
+    print(f"  Became protected (2001-2024): {n_became_protected:>12,}  ({pct_became_protected:.2f}%)")
+    print(f"  Remained unprotected:         {n_remained_unprotected:>12,}  ({100 - pct_became_protected:.2f}%)")
+    
+    # Log future protection outcome
+    wandb.log({
+        "future/n_unprotected_2000": int(len(outcome_df)),
+        "future/n_became_protected": int(n_became_protected),
+        "future/n_remained_unprotected": int(n_remained_unprotected),
+        "future/pct_became_protected": float(pct_became_protected),
+    })
+    
+    # -------------------------------------------------------------------------
+    # Step 7: Evaluate suitability scores as predictor of future protection
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 7: EVALUATE SUITABILITY AS PREDICTOR OF FUTURE PROTECTION")
+    print("=" * 70)
+    
+    y_future = outcome_df['ever_protected_after_2000'].values
+    y_score = outcome_df['score'].values
+    
+    # Tie diagnostics for suitability scores (deterministic precision@k)
+    tie_diag = tie_diagnostics(y_score, name="suitability")
+    print("\nTie diagnostics (suitability scores):")
+    for k, v in tie_diag.items():
+        print(f"  {k}: {v}")
+    
+    # Deterministic tie-breaking for precision@k: secondary sort by (row, col)
+    r = outcome_df['row'].values.astype(np.int64)
+    c = outcome_df['col'].values.astype(np.int64)
+    col_max = c.max()
+    tie_break_order = r * (col_max + 1) + c
+    
+    # ROC-AUC and PR-AUC
+    future_roc_auc = roc_auc_score(y_future, y_score)
+    future_pr_auc = average_precision_score(y_future, y_score)
+    
+    print(f"\nPredicting future protection (2001-2024) from 2000 suitability:")
+    print(f"  ROC-AUC: {future_roc_auc:.4f}")
+    print(f"  PR-AUC:  {future_pr_auc:.4f}")
+    
+    # Precision at top k% (deterministic under ties)
+    print("\nPrecision @ Top-K (tie-breaking: row, col):")
+    print("(Among top k% highest suitability scores, what fraction became protected?)")
+    print()
+    
+    prec_at_k = {}
+    for k in [1, 5, 10]:
+        prec = compute_precision_at_k(y_future, y_score, k, tie_break_order=tie_break_order)
+        prec_at_k[k] = prec
+        n_top_k = max(1, int(len(y_future) * k / 100))
+        n_protected_in_top_k = int(n_top_k * prec)
+        print(f"  Precision @ top {k:>2}%:  {prec:.4f}  "
+              f"({n_protected_in_top_k:>7,} protected in top {n_top_k:>9,})")
+    
+    # Baseline (random)
+    baseline_rate = y_future.mean()
+    print(f"\n  Baseline (random):    {baseline_rate:.4f}  "
+          f"(overall protection rate among unprotected 2000 pixels)")
+    
+    # Lift over baseline
+    print("\nLift over baseline (precision / baseline):")
+    for k, prec in prec_at_k.items():
+        lift = prec / baseline_rate if baseline_rate > 0 else 0
+        print(f"  Top {k:>2}%: {lift:.2f}x")
+    
+    # Log future prediction metrics and tie diagnostics
+    wandb.log({
+        "metrics_future/roc_auc": float(future_roc_auc),
+        "metrics_future/pr_auc": float(future_pr_auc),
+        "metrics_future/precision_at_1pct": float(prec_at_k[1]),
+        "metrics_future/precision_at_5pct": float(prec_at_k[5]),
+        "metrics_future/precision_at_10pct": float(prec_at_k[10]),
+        "metrics_future/baseline_rate": float(baseline_rate),
+        "metrics_future/lift_at_1pct": float(prec_at_k[1] / baseline_rate) if baseline_rate > 0 else 0,
+        "metrics_future/lift_at_5pct": float(prec_at_k[5] / baseline_rate) if baseline_rate > 0 else 0,
+        "metrics_future/lift_at_10pct": float(prec_at_k[10] / baseline_rate) if baseline_rate > 0 else 0,
+        **tie_diag,
+    })
+    
+    # -------------------------------------------------------------------------
+    # Step 8: Save results
+    # -------------------------------------------------------------------------
+    print("\n" + "=" * 70)
+    print("STEP 8: SAVE RESULTS")
+    print("=" * 70)
+    
+    # Save scored outcomes
+    outcomes_path = data_output_dir / "baseline_scored_outcomes.parquet"
+    outcome_df.to_parquet(outcomes_path, index=False)
+    print(f"\nScored outcomes saved to: {outcomes_path}")
+    
+    # Dataset/schema hashes and config snapshot (thesis artifacts)
+    dataset_hash = compute_dataset_schema_hash(input_path)
+    config_snapshot = {
+        "random_state": RANDOM_STATE,
+        "test_size": TEST_SIZE,
+        "val_size": VAL_SIZE,
+        "feature_denylist_regex": FEATURE_DENYLIST_REGEX.pattern,
+        "lgbm_params": {k: (int(v) if isinstance(v, (np.integer, np.int64)) else float(v) if isinstance(v, (np.floating, np.float64)) else v) for k, v in LGBM_PARAMS.items()},
+    }
+    
+    # Compile metrics (random + spatial + future + tie diagnostics + hashes)
+    metrics = {
+        "metadata": {
+            "timestamp": timestamp,
+            "model": "LightGBM",
+            "random_state": RANDOM_STATE,
+            "test_size": TEST_SIZE,
+            "n_features": len(feature_cols),
+            "best_iteration": model.best_iteration_,
+        },
+        "dataset": {
+            "schema_hash": dataset_hash,
+            "input_path": str(input_path),
+        },
+        "config_snapshot": config_snapshot,
+        "year_2000_data": {
+            "n_total_pixels": n_protected + n_unprotected,
+            "n_protected": int(n_protected),
+            "n_unprotected": int(n_unprotected),
+            "pct_protected": float(pct_protected),
+        },
+        "leakage_audit": audit,
+        "model_performance_2000": {
+            "roc_auc": float(roc_auc),
+            "pr_auc": float(pr_auc),
+            "confusion_matrix": {
+                "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)
+            },
+        },
+        "model_performance_2000_spatial": {
+            "roc_auc": roc_auc_spatial,
+            "pr_auc": pr_auc_spatial,
+            "confusion_matrix": {
+                "tn": int(tn_sp), "fp": int(fp_sp), "fn": int(fn_sp), "tp": int(tp_sp)
+            },
+        },
+        "future_prediction_2001_2024": {
+            "n_unprotected_2000": int(len(outcome_df)),
+            "n_became_protected": int(n_became_protected),
+            "pct_became_protected": float(pct_became_protected),
+            "roc_auc": float(future_roc_auc),
+            "pr_auc": float(future_pr_auc),
+            "precision_at_1pct": float(prec_at_k[1]),
+            "precision_at_5pct": float(prec_at_k[5]),
+            "precision_at_10pct": float(prec_at_k[10]),
+            "baseline_rate": float(baseline_rate),
+            "lift_at_1pct": float(prec_at_k[1] / baseline_rate) if baseline_rate > 0 else 0,
+            "lift_at_5pct": float(prec_at_k[5] / baseline_rate) if baseline_rate > 0 else 0,
+            "lift_at_10pct": float(prec_at_k[10] / baseline_rate) if baseline_rate > 0 else 0,
+        },
+        "tie_diagnostics": tie_diag,
+        "top_features": feature_importance.head(20).to_dict('records'),
+    }
+    
+    # Save metrics
+    metrics_path = output_dir / "baseline_lgbm_metrics.json"
+    with open(metrics_path, 'w') as f:
+        # Convert NumPy types to native Python types for JSON serialization
+        metrics_serializable = convert_numpy_types(metrics)
+        json.dump(metrics_serializable, f, indent=2)
+    print(f"Metrics saved to: {metrics_path}")
+    
+    # Thesis artifacts: LaTeX table, PR/ROC plots, high-res suitability + risk maps
+    write_metrics_latex_table(metrics_serializable, output_dir, prefix="baseline_lgbm")
+    create_pr_roc_plots(y_future, y_score, output_dir, prefix="baseline_lgbm")
+    _create_high_res_suitability_map(outcome_df, output_dir, input_path, "baseline_lgbm", repo_root)
+    _create_suitability_map_with_pa(outcome_df, output_dir, input_path, "baseline_lgbm", repo_root)
+    _create_suitability_risk_map(outcome_df, output_dir, input_path, "baseline_lgbm", repo_root)
+    
+    # -------------------------------------------------------------------------
+    # Summary
+    # -------------------------------------------------------------------------
+    total_time = time.time() - start_time
+    
+    print("\n" + "=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+    print(f"Model:                       LightGBM ({model.best_iteration_} iterations)")
+    print(f"Features used:               {len(feature_cols)}")
+    print(f"\n2000 Classification — random split:")
+    print(f"  ROC-AUC:                   {roc_auc:.4f}")
+    print(f"  PR-AUC:                    {pr_auc:.4f}")
+    print(f"\n2000 Classification — spatial split:")
+    print(f"  ROC-AUC:                   {roc_auc_spatial:.4f}")
+    print(f"  PR-AUC:                    {pr_auc_spatial:.4f}")
+    print(f"\nFuture Protection Prediction (unprotected 2000 → protected by 2024):")
+    print(f"  ROC-AUC:                   {future_roc_auc:.4f}")
+    print(f"  PR-AUC:                    {future_pr_auc:.4f}")
+    print(f"  Precision @ top 1%:        {prec_at_k[1]:.4f} ({prec_at_k[1]/baseline_rate:.1f}x lift)" if baseline_rate > 0 else "  Precision @ top 1%:        N/A")
+    print(f"  Precision @ top 5%:        {prec_at_k[5]:.4f} ({prec_at_k[5]/baseline_rate:.1f}x lift)" if baseline_rate > 0 else "  Precision @ top 5%:        N/A")
+    print(f"  Precision @ top 10%:       {prec_at_k[10]:.4f} ({prec_at_k[10]/baseline_rate:.1f}x lift)" if baseline_rate > 0 else "  Precision @ top 10%:       N/A")
+    print(f"\nTotal time: {total_time:.1f}s ({total_time/60:.1f} min)")
+    print("=" * 70)
+    print("Done.")
+    
+    # Log final timing
+    wandb.log({
+        "timing/total_seconds": total_time,
+        "timing/total_minutes": total_time / 60,
+        "status": "success"
+    })
+    
+    wandb.finish()
+
+
+if __name__ == "__main__":
+    # Set up output file capture
+    repo_root = Path(__file__).resolve().parents[4]
+    output_dir = repo_root / "outputs/south_america/results/ml_baselines"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = output_dir / f"baseline_lgbm_{timestamp}.txt"
+    
+    tee = Tee(output_file)
+    sys.stdout = tee
+    
+    try:
+        main()
+    finally:
+        sys.stdout = tee.stdout
+        tee.close()
+        print(f"\nOutput saved to: {output_file}")

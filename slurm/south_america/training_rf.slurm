@@ -41,9 +41,9 @@ echo "Starting model1_RF script..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/regions/south_america/4_ml/3_training/model1_RF" ] || {
+[ -f "scripts/regions/south_america/5_training/model1_RF" ] || {
   echo "ERROR: model1_RF not found"
-  echo "NOTE: model1_RF script is in scripts/regions/south_america/4_ml/3_training/ directory"
+  echo "NOTE: model1_RF script is in scripts/regions/south_america/5_training/ directory"
   find scripts -maxdepth 6 -type f -name "model1_RF"
   exit 1
 }
@@ -52,6 +52,6 @@ echo "PWD = $(pwd)"
 export MAX_NEG_TRAIN=50000000      # Cap negative samples at 50M for training (keeps all positives)
 
 # Run the script
-python "scripts/regions/south_america/4_ml/3_training/model1_RF"
+python "scripts/regions/south_america/5_training/model1_RF"
 
 echo "model1_RF script finished."

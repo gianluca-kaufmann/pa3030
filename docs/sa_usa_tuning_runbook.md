@@ -16,15 +16,15 @@ This runbook describes the new SA/USA tuning system with paper mode as default.
 ### South America
 
 ```bash
-python scripts/regions/south_america/4_ml/2_tuning/model1_tuning_lgbm
-python scripts/regions/south_america/4_ml/2_tuning/model1_tuning_rf
+python scripts/regions/south_america/4_tuning/model1_tuning_lgbm
+python scripts/regions/south_america/4_tuning/model1_tuning_rf
 ```
 
 ### USA
 
 ```bash
-python scripts/regions/usa/4_ml/2_tuning/model2_tuning_lgbm
-python scripts/regions/usa/4_ml/2_tuning/model2_tuning_rf
+python scripts/regions/usa/4_tuning/model2_tuning_lgbm
+python scripts/regions/usa/4_tuning/model2_tuning_rf
 ```
 
 ## Fast debug mode (optional)
@@ -33,7 +33,7 @@ Use fast mode only for debugging and rapid iteration:
 
 ```bash
 TUNING_MODE=fast TUNING_OPTIMIZER=randomized CV_STRATEGY=holdout \
-python scripts/regions/usa/4_ml/2_tuning/model2_tuning_lgbm
+python scripts/regions/usa/4_tuning/model2_tuning_lgbm
 ```
 
 ## Euler SLURM
@@ -52,8 +52,8 @@ All scripts default to paper mode and expose environment-variable overrides.
 Each tuning run writes:
 
 - Canonical artifact:
-  - `scripts/regions/<region>/4_ml/3_training/lgbm_best_params.json`
-  - `scripts/regions/<region>/4_ml/3_training/rf_best_params.json`
+  - `scripts/regions/<region>/5_training/lgbm_best_params.json`
+  - `scripts/regions/<region>/5_training/rf_best_params.json`
 - Timestamped archive in corresponding `tuning/` directory.
 
 Artifacts include metadata fields required by training loaders:

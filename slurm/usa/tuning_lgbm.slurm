@@ -65,11 +65,11 @@ echo "Mode=$TUNING_MODE Optimizer=$TUNING_OPTIMIZER CV=$CV_STRATEGY Split=$TUNIN
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/regions/usa/4_ml/2_tuning/model2_tuning_lgbm" ] || {
+[ -f "scripts/regions/usa/4_tuning/model2_tuning_lgbm" ] || {
   echo "ERROR: model2_tuning_lgbm not found"
   exit 1
 }
 
-python "scripts/regions/usa/4_ml/2_tuning/model2_tuning_lgbm"
+python "scripts/regions/usa/4_tuning/model2_tuning_lgbm"
 
 echo "model2_tuning_lgbm script finished."

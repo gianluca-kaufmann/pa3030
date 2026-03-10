@@ -41,13 +41,13 @@ echo "Starting spatial_generalisation script..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/regions/usa/4_ml/4_evaluation/spatial_generalisation" ] || {
+[ -f "scripts/regions/usa/6_evaluation/spatial_generalisation" ] || {
   echo "ERROR: spatial_generalisation not found"
-  echo "NOTE: spatial_generalisation script is in scripts/regions/usa/4_ml/4_evaluation/ directory"
+  echo "NOTE: spatial_generalisation script is in scripts/regions/usa/6_evaluation/ directory"
   find scripts -maxdepth 6 -type f -name "spatial_generalisation"
   exit 1
 }
 # Run the script
-python "scripts/regions/usa/4_ml/4_evaluation/spatial_generalisation"
+python "scripts/regions/usa/6_evaluation/spatial_generalisation"
 
 echo "spatial_generalisation script finished."

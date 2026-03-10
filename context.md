@@ -238,7 +238,7 @@ The repository is organized geography-first: each region contains a self-contain
 │   │   │   ├── 1_extraction/        # GEE exports
 │   │   │   ├── 2_preprocessing/     # Format harmonization
 │   │   │   ├── 3_merging/           # Panel construction
-│   │   │   ├── 4_ml/               # Continental ML (splits, training, evaluation, results)
+│   │   │   ├── 4_tuning/ 5_training/ 6_evaluation/ 7_results/  # Continental ML pipeline
 │   │   │   ├── colombia/            # Country sub-pipeline (own merging + ML)
 │   │   │   └── embeddings/          # Satellite embedding pipeline (own extraction through ML)
 │   │   ├── usa/                     # New regions replicate SA top-level structure

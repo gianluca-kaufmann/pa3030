@@ -42,13 +42,13 @@ echo "Starting calibrate_2 script (main split)..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/regions/usa/4_ml/4_evaluation/calibrate_2" ] || {
+[ -f "scripts/regions/usa/6_evaluation/calibrate_2" ] || {
   echo "ERROR: calibrate_2 not found"
   echo "NOTE: calibrate_2 script is in ML/evaluation/ directory"
   find scripts -maxdepth 4 -type f -name "calibrate_2"
   exit 1
 }
 # Run the script (defaults to main split, LGBM model type, temporal_cv source, platt method)
-python "scripts/regions/usa/4_ml/4_evaluation/calibrate_2" --model_type lgbm --split-version main --method platt
+python "scripts/regions/usa/6_evaluation/calibrate_2" --model_type lgbm --split-version main --method platt
 
 echo "calibrate_2 script (main split) finished."

@@ -41,13 +41,13 @@ echo "Starting benchmark_2 script (RF mode, main split)..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/regions/usa/4_ml/4_evaluation/benchmark_2" ] || {
+[ -f "scripts/regions/usa/6_evaluation/benchmark_2" ] || {
   echo "ERROR: benchmark_2 not found"
   echo "NOTE: benchmark_2 script is in ML/evaluation/ directory"
   find scripts -maxdepth 4 -type f -name "benchmark_2"
   exit 1
 }
 # Run the script (main split, RF model type)
-python "scripts/regions/usa/4_ml/4_evaluation/benchmark_2" --model_type rf --split-version main
+python "scripts/regions/usa/6_evaluation/benchmark_2" --model_type rf --split-version main
 
 echo "benchmark_2 script (RF mode, main split) finished."

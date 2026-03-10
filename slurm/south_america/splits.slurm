@@ -41,13 +41,13 @@ echo "Starting model1_splits script..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/regions/south_america/4_ml/1_splits/model1_splits" ] || {
+[ -f "scripts/regions/south_america/5_training/model1_splits" ] || {
   echo "ERROR: model1_splits not found"
-  echo "NOTE: model1_splits script is in scripts/regions/south_america/4_ml/1_splits/ directory"
+  echo "NOTE: model1_splits script is in scripts/regions/south_america/5_training/ directory"
   find scripts -maxdepth 6 -type f -name "model1_splits"
   exit 1
 }
 # Run the script
-python "scripts/regions/south_america/4_ml/1_splits/model1_splits"
+python "scripts/regions/south_america/5_training/model1_splits"
 
 echo "model1_splits script finished."

@@ -41,13 +41,13 @@ echo "Starting baseline_RF script..."
 ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Path missing"; exit 1; }
 echo "PWD = $(pwd)"
 
-[ -f "scripts/regions/usa/4_ml/3_training/baseline_RF" ] || {
+[ -f "scripts/regions/usa/5_training/baseline_RF" ] || {
   echo "ERROR: baseline_RF not found"
-  echo "NOTE: baseline_RF script is in scripts/regions/usa/4_ml/3_training/ directory"
+  echo "NOTE: baseline_RF script is in scripts/regions/usa/5_training/ directory"
   find scripts -maxdepth 6 -type f -name "baseline_RF"
   exit 1
 }
 # Run the script
-python "scripts/regions/usa/4_ml/3_training/baseline_RF"
+python "scripts/regions/usa/5_training/baseline_RF"
 
 echo "baseline_RF script finished."

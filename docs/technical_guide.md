@@ -934,11 +934,11 @@ and **carbon stocks**.
 |-------|------|
 | Merge | `scripts/regions/south_america/3_merging/merge` |
 | Feature engineering | `scripts/regions/south_america/3_merging/feature_engineering` |
-| LightGBM training | `scripts/regions/south_america/4_ml/3_training/model1_LGBM` |
-| RF training | `scripts/regions/south_america/4_ml/3_training/model1_RF` |
-| Calibration | `scripts/regions/south_america/4_ml/4_evaluation/calibrate_1` |
-| Spatial generalization | `scripts/regions/south_america/4_ml/4_evaluation/spatial_generalisation` |
-| Results/figures | `scripts/regions/south_america/4_ml/5_results/model1_results` |
+| LightGBM training | `scripts/regions/south_america/5_training/model1_LGBM` |
+| RF training | `scripts/regions/south_america/5_training/model1_RF` |
+| Calibration | `scripts/regions/south_america/6_evaluation/calibrate_1` |
+| Spatial generalization | `scripts/regions/south_america/6_evaluation/spatial_generalisation` |
+| Results/figures | `scripts/regions/south_america/7_results/model1_results` |
 
 ### Outputs
 

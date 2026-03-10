@@ -67,7 +67,7 @@ The current model cannot distinguish these because it has no carbon data.
    -> Feature engineering: spatial features, distance metrics, smoothed neighbors
 
 4. ML Pipeline (4_ml/)
-   -> 1_splits/   : Train/validation/test data splits
+   -> 4_tuning/   : Hyperparameter tuning | 5_training/ : Splits + model training
    -> 2_training/ : Model training with hyperparameter tuning
    -> 3_evaluation/: Temporal CV, spatial CV, benchmarking, calibration
    -> 4_results/  : Generate metrics, visualizations, risk maps
@@ -238,7 +238,7 @@ python scripts/regions/south_america/colombia/4_ml/3_evaluation/evaluate.py
 ## Project Structure
 
 ```
-pa3030/
+/
 ├── scripts/regions/
 │   ├── south_america/        # Primary region
 │   │   ├── 1_extraction/
