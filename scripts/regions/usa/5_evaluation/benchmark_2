@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Benchmark Evaluation Script for model1_LGBM
+"""Benchmark Evaluation Script for model2_LGBM
 
-Purpose: Extract final CV + test metrics from model1_LGBM training results,
+Purpose: Extract final CV + test metrics from model2_LGBM training results,
          create a benchmark JSON file with metrics, features, params, seed, and dataset hash.
          Marks in-sample earlystop as NON-EVALUATIVE.
 
-Input:   - model1_lgbm_metrics_*.json (for LGBM) or model1_rf_win5_metrics_*.json (for RF)
-           (most recent file from outputs/south_america/results/ml_models)
+Input:   - model2_lgbm_metrics_*.json (for LGBM) or model2_rf_win5_metrics_*.json (for RF)
+           (most recent file from outputs/usa/results/ml_models)
          - train_win5.parquet, test_win5.parquet
            (for dataset hash computation; earlystop/val excluded)
 
@@ -61,7 +61,7 @@ def _print_summary(
     print(f"\nSource metrics: {metrics_path.name}")
     print(f"Benchmark file: {benchmark_path.name}")
     print(f"\nDataset hash: {dataset_hash[:16]}...")
-
+    
     # Handle CV metrics (may not be available for RF/BRF)
     if "aggregated" in cv_section and cv_section["aggregated"]:
         cv_agg = cv_section["aggregated"]
@@ -136,7 +136,7 @@ def _print_summary(
 
 def main(model_type: str, split_version: str = 'main') -> None:
     """
-    South America model1 benchmark entrypoint.
+    USA model2 benchmark entrypoint.
 
     Delegates core logic to the shared evaluation module while preserving the
     original console output structure.
@@ -145,8 +145,8 @@ def main(model_type: str, split_version: str = 'main') -> None:
     from scripts.regions.shared.evaluation.benchmark_core import run_benchmark
 
     config = ModelEvalConfig.for_region_model(
-        region="south_america",
-        model_id="model1",
+        region="usa",
+        model_id="model2",
         algorithm=model_type,  # "lgbm" or "rf"
     )
 
@@ -155,7 +155,7 @@ def main(model_type: str, split_version: str = 'main') -> None:
     benchmark_output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
-    print(f"BENCHMARK EVALUATION: model1_{model_type.upper()} (Split: {split_version})")
+    print(f"BENCHMARK EVALUATION: model2_{model_type.upper()} (Split: {split_version})")
     print("=" * 70)
     print(f"\nOutput directory: {benchmark_output_dir}")
     print(f"Model type: {model_type}")
@@ -171,7 +171,7 @@ def main(model_type: str, split_version: str = 'main') -> None:
 
     try:
         result = run_benchmark(config=config, model_type=model_type, split_version=split_version)
-        print(f"\nBenchmark JSON structure created")
+        print("\nBenchmark JSON structure created")
         cv_note = result.benchmark["evaluative_metrics"]["cross_validation"].get("note", "")
         if "Not available" in cv_note:
             print(f"  Evaluative metrics: Test performance (CV: {cv_note})")
@@ -205,7 +205,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(
-        description="Benchmark evaluation script for model1 (LGBM, RF)"
+        description="Benchmark evaluation script for model2 (LGBM, RF)"
     )
     parser.add_argument(
         "--model_type",
@@ -229,14 +229,14 @@ if __name__ == "__main__":
         print(f"ERROR: Invalid model_type '{model_type}'. Must be one of: lgbm, rf")
         sys.exit(1)
     
-    repo_root = Path(__file__).resolve().parents[5]
-    output_dir = repo_root / "outputs/south_america/results/ml_models"
+    repo_root = get_repo_root()
+    output_dir = repo_root / "outputs/usa/results/ml_models"
     # Create split-specific output directory
     split_output_dir = output_dir / args.split_version
     split_output_dir.mkdir(parents=True, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = split_output_dir / f"benchmark_model1_{model_type}_{timestamp}.txt"
+    output_file = split_output_dir / f"benchmark_model2_{model_type}_{timestamp}.txt"
     
     tee = Tee(output_file)
     sys.stdout = tee
