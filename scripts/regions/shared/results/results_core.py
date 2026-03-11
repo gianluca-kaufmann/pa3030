@@ -118,6 +118,10 @@ RISK_MAP_COLORS = {
 RISK_MAP_ALPHA_BACKGROUND = 0.15  # Background category transparency
 RISK_MAP_ALPHA_PROTECTED = 0.6  # Protected areas overlay transparency
 
+# Existing PA holes color (pixels absent from scored parquet = already protected before test period)
+# Must contrast clearly with both the unprotected background (#F5F5F5) and the white ocean.
+PA_HOLE_COLOR = '#BEBEBE'  # Light gray — distinguishable from #F5F5F5 (unprotected) and white (ocean)
+
 # Probability map color scheme
 PROBABILITY_MAP_COLORMAP = 'plasma'  # Colormap: dark purple -> yellow
 
@@ -129,6 +133,7 @@ PROBABILITY_MAP_TRANSFORMATION = 'sqrt'  # Transformation: 'sqrt' (square root) 
 # PR curve figure dimensions
 PR_CURVE_FIGSIZE = (8, 6)
 PR_CURVE_DPI = 300
+CUMULATIVE_GAINS_MAX_PLOT_POINTS = 20000
 
 
 
@@ -370,9 +375,21 @@ def create_cumulative_gains_chart(df: pd.DataFrame, output_dir: Path, model_type
     # x: % of area searched (0 to 100); y: % of PAs captured (recall)
     pct_area_searched = (np.arange(1, n + 1, dtype=float) / n) * 100
     pct_pas_captured = (cumulative_captured / total_positives) * 100
+
+    # Plotting tens of millions of points to vector PDF can cause compression
+    # timeouts/zlib failures on some filesystems; downsample uniformly for display.
+    n_points = len(pct_area_searched)
+    if n_points > CUMULATIVE_GAINS_MAX_PLOT_POINTS:
+        idx = np.linspace(0, n_points - 1, CUMULATIVE_GAINS_MAX_PLOT_POINTS, dtype=int)
+        pct_area_plot = pct_area_searched[idx]
+        pct_pas_plot = pct_pas_captured[idx]
+        print(f"  Downsampled cumulative gains curve: {n_points:,} -> {len(idx):,} points")
+    else:
+        pct_area_plot = pct_area_searched
+        pct_pas_plot = pct_pas_captured
     
     fig, ax = plt.subplots(figsize=PR_CURVE_FIGSIZE)
-    ax.plot(pct_area_searched, pct_pas_captured, linewidth=2, label='Model')
+    ax.plot(pct_area_plot, pct_pas_plot, linewidth=2, label='Model')
     ax.plot([0, 100], [0, 100], 'k--', linewidth=1.5, label='Random guess')
     ax.set_xlabel('% of Area Searched', fontsize=FONTSIZE_LABEL)
     ax.set_ylabel('% of PAs Captured', fontsize=FONTSIZE_LABEL)
@@ -862,10 +879,16 @@ def create_risk_map(
 
     from matplotlib.colors import ListedColormap, BoundaryNorm
 
+    # Base layer: SA polygon in PA_HOLE_COLOR so existing PA holes (pixels absent from
+    # scored parquet = already protected before the test period) show as gray rather than
+    # blending with the white ocean background. The background_mask overwrites this for
+    # all unprotected pixels; areas outside SA remain white (figure background).
+    sa_gdf_proj.plot(ax=ax, color=PA_HOLE_COLOR, edgecolor='#808080', linewidth=0.4, zorder=0)
+
     # Plot background mask from actual data (shows data coverage; protected areas = natural holes)
     background_masked = np.ma.masked_where(np.isnan(background_mask), background_mask)
     ax.imshow(background_masked, extent=extent, cmap=ListedColormap(['#F5F5F5']),
-              vmin=0, vmax=1, origin='upper', interpolation='nearest', 
+              vmin=0, vmax=1, origin='upper', interpolation='nearest',
               aspect='equal', zorder=1)
 
     # ListedColormap for 3-4 categories (Predicted, Observed, Overlap, Future)
@@ -906,7 +929,7 @@ def create_risk_map(
     legend_elements = []
     if predicted_only_count > 0:
         legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=COLOR_PREDICTED_ONLY,
-                                      markersize=10, alpha=0.9, label=f'Predicted future PA candidates (n={predicted_only_count:,})'))
+                                      markersize=10, alpha=0.9, label=f'Predicted but not established (n={predicted_only_count:,})'))
     if observed_only_count > 0:
         legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=COLOR_OBSERVED_ONLY,
                                       markersize=10, alpha=0.9, label=f'Established (not predicted) (n={observed_only_count:,})'))
@@ -917,6 +940,9 @@ def create_risk_map(
         future_year_str = f"{min(future_years)}-{max(future_years)}"
         legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=COLOR_FUTURE,
                                       markersize=10, alpha=0.9, label=f'Future PAs {future_year_str} (n={future_count:,})'))
+    # Always add existing PAs entry so readers know what the gray means
+    legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=PA_HOLE_COLOR,
+                                  markersize=10, alpha=0.9, label=f'Existing protected areas (pre-{min(test_years)})'))
     if legend_elements:
         ax.legend(handles=legend_elements, loc='upper left', fontsize=FONTSIZE_LEGEND, framealpha=0.95)
 
@@ -1141,10 +1167,13 @@ def create_p1pct_diagnostic_map(
 
     from matplotlib.colors import ListedColormap, BoundaryNorm
 
+    # Base layer: SA polygon in PA_HOLE_COLOR so existing PA holes show as gray.
+    sa_gdf_proj.plot(ax=ax, color=PA_HOLE_COLOR, edgecolor='#808080', linewidth=0.4, zorder=0)
+
     # Plot background mask from actual data (shows data coverage; protected areas = natural holes)
     background_masked = np.ma.masked_where(np.isnan(background_mask), background_mask)
     ax.imshow(background_masked, extent=extent, cmap=ListedColormap(['#F5F5F5']),
-              vmin=0, vmax=1, origin='upper', interpolation='nearest', 
+              vmin=0, vmax=1, origin='upper', interpolation='nearest',
               aspect='equal', zorder=1)
     
     # Define colors for each category
@@ -1429,8 +1458,10 @@ def create_probability_map(
     fig_height = fig_width * proj_aspect
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
 
-    # Clean white background: plot South America boundary as solid base
-    sa_gdf_proj.plot(ax=ax, color='white', edgecolor='none', linewidth=1.5, zorder=1)
+    # Base layer: SA polygon in PA_HOLE_COLOR so existing PAs (absent from scored parquet)
+    # appear as gray rather than blending with the white ocean background.
+    # Pixels with predictions overwrite this layer; pixels outside SA stay white (figure bg).
+    sa_gdf_proj.plot(ax=ax, color=PA_HOLE_COLOR, edgecolor='#808080', linewidth=0.4, zorder=1)
     
     # Plot probability raster with pixel-perfect rendering
     # Use standardized colormap for consistent visualization across all models
@@ -1479,11 +1510,12 @@ def create_probability_map(
     ax.set_title(f'{MODEL_LABEL} ({model_type.upper()}) Probability Map{calibration_note}',
                  fontsize=FONTSIZE_TITLE, fontweight='bold', pad=15)
     
-    # Add simple description (removed verbose text)
-    # Colorbar already shows "Low probability" to "High probability"
-    # Title already shows what the map represents
-    # No need for additional text boxes
-    
+    # Gray patch legend: explain what the PA holes mean
+    from matplotlib.patches import Patch
+    ax.legend(handles=[Patch(facecolor=PA_HOLE_COLOR, edgecolor='none',
+                             label=f'Existing protected areas (pre-{min(test_years_list)})')],
+              loc='lower left', fontsize=FONTSIZE_LEGEND, framealpha=0.95)
+
     # Add statistics text box
     stats_text = (f"Min: {proba_min:.6f} | Max: {proba_max:.6f}\n"
                   f"Mean: {proba_mean:.6f} | Median: {proba_median:.6f}")

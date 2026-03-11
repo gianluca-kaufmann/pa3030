@@ -289,20 +289,29 @@ def derive_test_years(metrics_data: Optional[Dict[str, Any]] = None,
         parquet_unusable = True
     
     # ------------------------------------------------------------------
-    # 2) Fall back to metrics metadata
+    # 2) Fall back to metrics metadata / temporal_split
     # ------------------------------------------------------------------
     if metrics_data:
+        # Check metadata section first
         metadata = metrics_data.get("metadata", {})
         test_year_range = metadata.get("test_year_range")
         if test_year_range and isinstance(test_year_range, list) and len(test_year_range) == 2:
             test_years = list(range(int(test_year_range[0]), int(test_year_range[1]) + 1))
             print(f"  Derived test years from metadata.test_year_range: {test_years}")
             return test_years
-        
+
         test_years_meta = metadata.get("test_years")
         if test_years_meta and isinstance(test_years_meta, (list, tuple)):
             test_years = [int(y) for y in test_years_meta]
             print(f"  Derived test years from metadata.test_years: {test_years}")
+            return test_years
+
+        # Check temporal_split section (training scripts store years here as [min, max])
+        temporal_split = metrics_data.get("temporal_split", {})
+        ts_test_years = temporal_split.get("test_years")
+        if ts_test_years and isinstance(ts_test_years, (list, tuple)) and len(ts_test_years) == 2:
+            test_years = list(range(int(ts_test_years[0]), int(ts_test_years[1]) + 1))
+            print(f"  Derived test years from temporal_split.test_years: {test_years}")
             return test_years
     
     # ------------------------------------------------------------------

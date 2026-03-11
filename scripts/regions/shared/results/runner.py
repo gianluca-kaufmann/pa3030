@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import importlib
 import os
-import runpy
 from pathlib import Path
 
 
@@ -21,7 +21,12 @@ def run_region_results(region: str) -> None:
     previous = os.environ.get("PA3030_RESULTS_REGION")
     os.environ["PA3030_RESULTS_REGION"] = normalized
     try:
-        runpy.run_path(str(core_script), run_name="__main__")
+        # Import as a package module so relative imports in results_core work.
+        # Reload after setting PA3030_RESULTS_REGION to refresh region-specific config.
+        importlib.invalidate_caches()
+        importlib.reload(importlib.import_module("scripts.regions.shared.results.config"))
+        core_module = importlib.reload(importlib.import_module("scripts.regions.shared.results.results_core"))
+        core_module.main()
     finally:
         if previous is None:
             os.environ.pop("PA3030_RESULTS_REGION", None)
