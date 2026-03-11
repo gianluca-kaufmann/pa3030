@@ -328,12 +328,7 @@ def create_pr_curve(df: pd.DataFrame, metrics_data: Dict[str, Any], output_dir: 
     ax.set_ylim([0, 1])
     
     plt.tight_layout()
-    
-    # Save PNG
-    png_path = output_dir / f"pr_curve.png"
-    plt.savefig(png_path, dpi=PR_CURVE_DPI, bbox_inches='tight')
-    print(f"\nSaved PNG: {png_path}")
-    
+
     # Save PDF
     pdf_path = output_dir / f"pr_curve.pdf"
     plt.savefig(pdf_path, dpi=PR_CURVE_DPI, bbox_inches='tight')
@@ -388,10 +383,7 @@ def create_cumulative_gains_chart(df: pd.DataFrame, output_dir: Path, model_type
     ax.set_ylim([0, 100])
     ax.set_aspect('equal', adjustable='box')
     plt.tight_layout()
-    
-    png_path = output_dir / f"cumulative_gains.png"
-    plt.savefig(png_path, dpi=PR_CURVE_DPI, bbox_inches='tight')
-    print(f"\nSaved PNG: {png_path}")
+
     pdf_path = output_dir / f"cumulative_gains.pdf"
     plt.savefig(pdf_path, dpi=PR_CURVE_DPI, bbox_inches='tight')
     print(f"Saved PDF: {pdf_path}")
@@ -399,8 +391,12 @@ def create_cumulative_gains_chart(df: pd.DataFrame, output_dir: Path, model_type
 
 
 def create_calibration_curve(df: pd.DataFrame, output_dir: Path, model_type: str) -> None:
-    """Create reliability/calibration curve (uniform + quantile bins) for test predictions.
-    
+    """Create reliability/calibration curve (uniform bins) for test predictions.
+
+    Plots uncalibrated curve (dashed) if y_pred_proba_uncalibrated column is present,
+    and the main calibrated curve from y_pred_proba_calibrated (or y_pred_proba).
+    Saves as calibration_reliability.pdf only.
+
     Args:
         df: DataFrame with y_true and y_pred_proba columns
         output_dir: Output directory for plots
@@ -409,110 +405,58 @@ def create_calibration_curve(df: pd.DataFrame, output_dir: Path, model_type: str
     print("\n" + "=" * 70)
     print("CREATING CALIBRATION/RELIABILITY CURVE")
     print("=" * 70)
-    
+
     y_true = df['y_true'].values
-    y_pred_proba = df['y_pred_proba'].values
-    
-    # Check if calibrated probabilities are available
-    has_calibrated = 'y_pred_proba_calibrated' in df.columns
+
     has_uncalibrated = 'y_pred_proba_uncalibrated' in df.columns
-    
-    # Create figure with subplots
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-    
-    # Method 1: Uniform bins
-    ax1 = axes[0]
-    n_bins_uniform = 10
-    fraction_of_positives_uniform, mean_predicted_value_uniform = calibration_curve(
-        y_true, y_pred_proba, n_bins=n_bins_uniform, strategy='uniform'
+    has_calibrated = 'y_pred_proba_calibrated' in df.columns
+
+    # Main curve: prefer calibrated column, fall back to y_pred_proba
+    if has_calibrated:
+        y_main = df['y_pred_proba_calibrated'].values
+        main_label = 'Calibrated'
+    else:
+        y_main = df['y_pred_proba'].values
+        main_label = 'Model predictions'
+
+    n_bins = 10
+
+    fig, ax = plt.subplots(figsize=PR_CURVE_FIGSIZE)
+
+    # Uncalibrated curve (dashed), if available
+    if has_uncalibrated:
+        frac_pos_uncal, mean_pred_uncal = calibration_curve(
+            y_true, df['y_pred_proba_uncalibrated'].values, n_bins=n_bins, strategy='uniform'
+        )
+        ax.plot(mean_pred_uncal, frac_pos_uncal, 's--',
+                label='Uncalibrated', linewidth=2, markersize=8, alpha=0.7)
+
+    # Main (calibrated) curve
+    frac_pos_main, mean_pred_main = calibration_curve(
+        y_true, y_main, n_bins=n_bins, strategy='uniform'
     )
-    
-    ax1.plot(mean_predicted_value_uniform, fraction_of_positives_uniform, 
-             's-', label='Model predictions', linewidth=2, markersize=8)
-    ax1.plot([0, 1], [0, 1], 'k--', label='Perfectly calibrated', linewidth=2)
-    ax1.set_xlabel('Mean Predicted Probability', fontsize=FONTSIZE_LABEL)
-    ax1.set_ylabel('Fraction of Positives', fontsize=FONTSIZE_LABEL)
-    ax1.set_title(f'Calibration Curve (Uniform Bins, n={n_bins_uniform})', 
-                  fontsize=FONTSIZE_TITLE, fontweight='bold')
-    ax1.legend(loc='best', fontsize=FONTSIZE_LEGEND)
-    ax1.grid(True, alpha=0.3)
-    ax1.set_xlim([0, 1])
-    ax1.set_ylim([0, 1])
-    
-    # Method 2: Quantile bins
-    ax2 = axes[1]
-    n_bins_quantile = 10
-    fraction_of_positives_quantile, mean_predicted_value_quantile = calibration_curve(
-        y_true, y_pred_proba, n_bins=n_bins_quantile, strategy='quantile'
-    )
-    
-    ax2.plot(mean_predicted_value_quantile, fraction_of_positives_quantile, 
-             's-', label='Model predictions', linewidth=2, markersize=8)
-    ax2.plot([0, 1], [0, 1], 'k--', label='Perfectly calibrated', linewidth=2)
-    ax2.set_xlabel('Mean Predicted Probability', fontsize=FONTSIZE_LABEL)
-    ax2.set_ylabel('Fraction of Positives', fontsize=FONTSIZE_LABEL)
-    ax2.set_title(f'Calibration Curve (Quantile Bins, n={n_bins_quantile})', 
-                  fontsize=FONTSIZE_TITLE, fontweight='bold')
-    ax2.legend(loc='best', fontsize=FONTSIZE_LEGEND)
-    ax2.grid(True, alpha=0.3)
-    ax2.set_xlim([0, 1])
-    ax2.set_ylim([0, 1])
-    
+    ax.plot(mean_pred_main, frac_pos_main, 'o-',
+            label=main_label, linewidth=2, markersize=8)
+
+    # Perfect calibration diagonal
+    ax.plot([0, 1], [0, 1], 'k--', label='Perfectly calibrated', linewidth=2)
+
+    ax.set_xlabel('Mean Predicted Probability', fontsize=FONTSIZE_LABEL)
+    ax.set_ylabel('Fraction of Positives', fontsize=FONTSIZE_LABEL)
+    ax.set_title(f'{MODEL_LABEL} ({model_type.upper()}) Calibration Reliability Diagram '
+                 f'(Uniform Bins, n={n_bins})',
+                 fontsize=FONTSIZE_TITLE, fontweight='bold')
+    ax.legend(loc='best', fontsize=FONTSIZE_LEGEND)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim([0, 1])
+    ax.set_ylim([0, 1])
+
     plt.tight_layout()
-    
-    # Save PNG
-    png_path = output_dir / f"calibration_curve.png"
-    plt.savefig(png_path, dpi=PR_CURVE_DPI, bbox_inches='tight')
-    print(f"\nSaved PNG: {png_path}")
-    
-    # Save PDF
-    pdf_path = output_dir / f"calibration_curve.pdf"
+
+    pdf_path = output_dir / 'calibration_reliability.pdf'
     plt.savefig(pdf_path, dpi=PR_CURVE_DPI, bbox_inches='tight')
     print(f"Saved PDF: {pdf_path}")
-    
-    # If calibrated probabilities available, create comparison plot
-    if has_calibrated and has_uncalibrated:
-        print("\nCreating calibrated vs uncalibrated comparison...")
-        fig2, ax = plt.subplots(figsize=PR_CURVE_FIGSIZE)
-        
-        # Uncalibrated
-        frac_pos_uncal, mean_pred_uncal = calibration_curve(
-            y_true, df['y_pred_proba_uncalibrated'].values, n_bins=10, strategy='uniform'
-        )
-        ax.plot(mean_pred_uncal, frac_pos_uncal, 's-', 
-                label='Uncalibrated', linewidth=2, markersize=8, alpha=0.7)
-        
-        # Calibrated
-        frac_pos_cal, mean_pred_cal = calibration_curve(
-            y_true, df['y_pred_proba_calibrated'].values, n_bins=10, strategy='uniform'
-        )
-        ax.plot(mean_pred_cal, frac_pos_cal, 'o-', 
-                label='Calibrated', linewidth=2, markersize=8, alpha=0.7)
-        
-        # Perfect calibration line
-        ax.plot([0, 1], [0, 1], 'k--', label='Perfectly calibrated', linewidth=2)
-        
-        ax.set_xlabel('Mean Predicted Probability', fontsize=FONTSIZE_LABEL)
-        ax.set_ylabel('Fraction of Positives', fontsize=FONTSIZE_LABEL)
-        ax.set_title(f'{MODEL_LABEL} ({model_type.upper()}) Calibration: Uncalibrated vs Calibrated',
-                     fontsize=FONTSIZE_TITLE, fontweight='bold')
-        ax.legend(loc='best', fontsize=FONTSIZE_LEGEND)
-        ax.grid(True, alpha=0.3)
-        ax.set_xlim([0, 1])
-        ax.set_ylim([0, 1])
-        
-        plt.tight_layout()
-        
-        png_path2 = output_dir / f"calibration_comparison.png"
-        plt.savefig(png_path2, dpi=PR_CURVE_DPI, bbox_inches='tight')
-        print(f"Saved PNG: {png_path2}")
-        
-        pdf_path2 = output_dir / f"calibration_comparison.pdf"
-        plt.savefig(pdf_path2, dpi=PR_CURVE_DPI, bbox_inches='tight')
-        print(f"Saved PDF: {pdf_path2}")
-        
-        plt.close(fig2)
-    
+
     plt.close(fig)
     print(f"\nCalibration analysis complete")
 
@@ -962,7 +906,7 @@ def create_risk_map(
     legend_elements = []
     if predicted_only_count > 0:
         legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=COLOR_PREDICTED_ONLY,
-                                      markersize=10, alpha=0.9, label=f'Predicted risk only (n={predicted_only_count:,})'))
+                                      markersize=10, alpha=0.9, label=f'Predicted future PA candidates (n={predicted_only_count:,})'))
     if observed_only_count > 0:
         legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=COLOR_OBSERVED_ONLY,
                                       markersize=10, alpha=0.9, label=f'Established (not predicted) (n={observed_only_count:,})'))
@@ -997,11 +941,6 @@ def create_risk_map(
     ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5, zorder=3)
 
     plt.tight_layout(pad=0.5)
-
-    # Save PNG with high DPI for maximum resolution
-    png_path = output_dir / f"risk_map_top{int(threshold_pct)}pct.png"
-    plt.savefig(png_path, dpi=600, bbox_inches='tight')
-    print(f"\n✓ Saved simplified risk map (PNG): {png_path}")
 
     # Save PDF with low DPI to avoid timeout/zlib/backend errors on large rasters
     pdf_path = output_dir / f"risk_map_top{int(threshold_pct)}pct.pdf"
@@ -1259,12 +1198,16 @@ def create_p1pct_diagnostic_map(
                  fontsize=FONTSIZE_TITLE, fontweight='bold', pad=15)
     
     # Add description text box
-    description_text = (f"Row-level P@1% diagnostic.\n"
-                       f"Top 1% rows by probability (blue-green),\n"
-                       f"observed positives (cyan), overlap (red).\n"
-                       f"Overlap = same row has both.\n"
-                       f"No pixel deduplication.\n"
-                       f"P@1% = {actual_p1pct:.4f} ({overlap_count:,}/{n_top_k:,})")
+    description_text = (f"Why P@1% differs from the risk map:\n"
+                       f"Training metric uses row-level logic —\n"
+                       f"each pixel-year is a separate row.\n"
+                       f"A pixel protected in 2019 appears in\n"
+                       f"test years 2017 & 2018 as y_true=1.\n"
+                       f"Many 'misses' are temporal leads:\n"
+                       f"the model correctly scores the pixel\n"
+                       f"high, but the match falls in a\n"
+                       f"different test year's row.\n"
+                       f"P@1% (row) = {actual_p1pct:.4f} ({overlap_count:,}/{n_top_k:,})")
     ax.text(0.98, 0.98, description_text, transform=ax.transAxes, fontsize=FONTSIZE_DESCRIPTION,
            verticalalignment='top', horizontalalignment='right',
            bbox=dict(boxstyle='round', facecolor='lightgreen', 
@@ -1297,11 +1240,6 @@ def create_p1pct_diagnostic_map(
     ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5, zorder=3)
 
     plt.tight_layout(pad=0.5)
-
-    # Save PNG
-    png_path = output_dir / f"p1pct_diagnostic.png"
-    plt.savefig(png_path, dpi=MAP_DPI, bbox_inches='tight')
-    print(f"\nSaved PNG: {png_path}")
 
     # Save PDF (use low DPI first - diagnostic map has very large raster, avoids timeout/backend errors)
     pdf_path = output_dir / f"p1pct_diagnostic.pdf"
@@ -1557,11 +1495,6 @@ def create_probability_map(
 
     plt.tight_layout(pad=0.5)
 
-    # Save PNG with standardized DPI
-    png_path = output_dir / f"probability_map.png"
-    plt.savefig(png_path, dpi=MAP_DPI, bbox_inches='tight')
-    print(f"\nSaved PNG: {png_path}")
-
     # Save PDF (lower DPI + retry to avoid timeout/zlib errors on large raster)
     pdf_path = output_dir / f"probability_map.pdf"
     for pdf_dpi in (300, 150):
@@ -1739,8 +1672,8 @@ def compute_shap_analysis(
     plt.figure(figsize=(10, 8))
     shap.summary_plot(shap_values_pos, X_shap, feature_names=feature_cols, show=False, plot_type="dot")
     plt.tight_layout()
-    
-    summary_plot_path = output_dir / f"shap_summary.png"
+
+    summary_plot_path = output_dir / f"shap_summary.pdf"
     plt.savefig(summary_plot_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"  Saved SHAP summary plot: {summary_plot_path.name}")
@@ -1778,7 +1711,7 @@ def compute_shap_analysis(
         plt.figure(figsize=(8, 6))
         shap.dependence_plot(feat_idx, shap_values_pos, X_shap, feature_names=feature_cols, show=False)
         plt.tight_layout()
-        dep_path = output_dir / f"shap_dep_{safe_name}.png"
+        dep_path = output_dir / f"shap_dep_{safe_name}.pdf"
         plt.savefig(dep_path, dpi=300, bbox_inches='tight')
         plt.close()
         print(f"  Saved SHAP dependence: {dep_path.name}")
@@ -1806,7 +1739,7 @@ def compute_shap_analysis(
     ax.set_title(f'{MODEL_LABEL} ({model_type.upper()}) SHAP importance by theme', fontsize=FONTSIZE_TITLE, fontweight='bold')
     ax.invert_yaxis()
     plt.tight_layout()
-    thematic_path = output_dir / f"shap_thematic.png"
+    thematic_path = output_dir / f"shap_thematic.pdf"
     plt.savefig(thematic_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"  Saved thematic SHAP: {thematic_path.name}")
@@ -1818,6 +1751,482 @@ def compute_shap_analysis(
     print("  SHAP analysis completed.")
 
 
+def create_calibration_improvement_figure(
+    df: pd.DataFrame,
+    output_dir: Path,
+    model_type: str,
+) -> None:
+    """Bar chart comparing ECE and Brier Score before vs after calibration.
+
+    Requires y_pred_proba_uncalibrated and y_pred_proba_calibrated columns in df.
+    """
+    print("\n" + "=" * 70)
+    print("CREATING CALIBRATION IMPROVEMENT FIGURE")
+    print("=" * 70)
+
+    has_uncal = 'y_pred_proba_uncalibrated' in df.columns
+    has_cal = 'y_pred_proba_calibrated' in df.columns
+
+    if not (has_uncal and has_cal):
+        print("  Skipping: need both y_pred_proba_uncalibrated and y_pred_proba_calibrated columns.")
+        return
+
+    y_true = df['y_true'].values
+    y_uncal = df['y_pred_proba_uncalibrated'].values
+    y_cal = df['y_pred_proba_calibrated'].values
+
+    def compute_ece(y_true, y_prob, n_bins=10):
+        """Expected Calibration Error with uniform bins."""
+        bins = np.linspace(0, 1, n_bins + 1)
+        ece = 0.0
+        n = len(y_true)
+        for i in range(n_bins):
+            mask = (y_prob >= bins[i]) & (y_prob < bins[i + 1])
+            if mask.sum() == 0:
+                continue
+            acc = y_true[mask].mean()
+            conf = y_prob[mask].mean()
+            ece += mask.sum() / n * abs(acc - conf)
+        return ece
+
+    ece_before = compute_ece(y_true, y_uncal)
+    ece_after = compute_ece(y_true, y_cal)
+    brier_before = brier_score_loss(y_true, y_uncal)
+    brier_after = brier_score_loss(y_true, y_cal)
+
+    print(f"  ECE:   before={ece_before:.4f}  after={ece_after:.4f}  improvement={ece_before - ece_after:.4f}")
+    print(f"  Brier: before={brier_before:.4f}  after={brier_after:.4f}  improvement={brier_before - brier_after:.4f}")
+
+    metrics = ['ECE', 'Brier Score']
+    before_vals = [ece_before, brier_before]
+    after_vals = [ece_after, brier_after]
+
+    x = np.arange(len(metrics))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    bars1 = ax.bar(x - width / 2, before_vals, width, label='Uncalibrated', color='#E07B54', alpha=0.9)
+    bars2 = ax.bar(x + width / 2, after_vals, width, label='Calibrated', color='#4A90D9', alpha=0.9)
+
+    # Value labels on bars
+    for bar in bars1:
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.0001,
+                f'{bar.get_height():.4f}', ha='center', va='bottom', fontsize=FONTSIZE_STATS)
+    for bar in bars2:
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.0001,
+                f'{bar.get_height():.4f}', ha='center', va='bottom', fontsize=FONTSIZE_STATS)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(metrics, fontsize=FONTSIZE_LABEL)
+    ax.set_ylabel('Error (lower is better)', fontsize=FONTSIZE_LABEL)
+    ax.set_title(f'{MODEL_LABEL} ({model_type.upper()}) Calibration Improvement', fontsize=FONTSIZE_TITLE, fontweight='bold')
+    ax.legend(fontsize=FONTSIZE_LEGEND)
+    ax.grid(True, axis='y', alpha=0.3)
+    ax.set_ylim(bottom=0)
+
+    plt.tight_layout()
+
+    pdf_path = output_dir / 'calibration_improvement.pdf'
+    plt.savefig(pdf_path, dpi=PR_CURVE_DPI, bbox_inches='tight')
+    print(f"  Saved: {pdf_path}")
+    plt.close()
+
+
+def create_country_breakdown(
+    df: pd.DataFrame,
+    output_dir: Path,
+    model_type: str,
+) -> None:
+    """Per-country ROC-AUC, Precision@1%, observed PAs → CSV + LaTeX table.
+
+    Uses spatial join with Natural Earth country boundaries.
+    Aggregates to pixel level first (unique row/col) for efficiency, then computes
+    row-level metrics using country assignments.
+    """
+    from sklearn.metrics import roc_auc_score
+
+    print("\n" + "=" * 70)
+    print("CREATING COUNTRY-LEVEL BREAKDOWN")
+    print("=" * 70)
+
+    required_cols = ['y_true', 'y_pred_proba', 'x', 'y']
+    if not all(c in df.columns for c in required_cols):
+        print(f"  Skipping: missing required columns {required_cols}")
+        return
+
+    # Build pixel-level lookup for country assignment (unique row/col or x/y)
+    use_rowcol = 'row' in df.columns and 'col' in df.columns
+    if use_rowcol:
+        pixel_coords = df[['row', 'col', 'x', 'y']].drop_duplicates(subset=['row', 'col'])
+    else:
+        df['_x_r'] = df['x'].round(4)
+        df['_y_r'] = df['y'].round(4)
+        pixel_coords = df[['_x_r', '_y_r', 'x', 'y']].drop_duplicates(subset=['_x_r', '_y_r'])
+
+    print(f"  Unique pixels: {len(pixel_coords):,} from {len(df):,} rows")
+
+    # Spatial join with Natural Earth country boundaries
+    try:
+        import geopandas as gpd
+        world = gpd.read_file(gpd.datasets.get_path('naturalearth_lowres'))
+        world = world[world.geometry.notnull()].copy()
+        print(f"  Loaded {len(world)} country geometries from Natural Earth")
+    except Exception as e:
+        print(f"  Could not load country boundaries: {e}. Skipping country breakdown.")
+        return
+
+    # Create pixel GeoDataFrame (assume EPSG:4326 after coordinate detection)
+    try:
+        pixel_gdf = gpd.GeoDataFrame(
+            pixel_coords.copy(),
+            geometry=gpd.points_from_xy(pixel_coords['x'], pixel_coords['y']),
+            crs='EPSG:4326'
+        )
+        world_4326 = world.to_crs('EPSG:4326')
+        joined = gpd.sjoin(pixel_gdf, world_4326[['name', 'continent', 'geometry']],
+                          how='left', predicate='within')
+        joined['country'] = joined['name'].fillna('Unknown')
+        print(f"  Spatial join complete. Countries assigned: {joined['country'].nunique()}")
+    except Exception as e:
+        print(f"  Spatial join failed: {e}. Skipping country breakdown.")
+        return
+
+    # Build country lookup
+    if use_rowcol:
+        country_lookup = joined.set_index(['row', 'col'])['country'].to_dict()
+        df = df.copy()
+        df['country'] = df.apply(lambda r: country_lookup.get((r['row'], r['col']), 'Unknown'), axis=1)
+    else:
+        country_lookup = joined.set_index(['_x_r', '_y_r'])['country'].to_dict()
+        df = df.copy()
+        df['country'] = df.apply(lambda r: country_lookup.get((round(r['x'], 4), round(r['y'], 4)), 'Unknown'), axis=1)
+        df = df.drop(columns=['_x_r', '_y_r'], errors='ignore')
+
+    # Compute per-country metrics
+    records = []
+    for country, grp in df.groupby('country'):
+        n_rows = len(grp)
+        n_pos = int(grp['y_true'].sum())
+        n_neg = n_rows - n_pos
+
+        if n_pos < 10 or n_neg < 10:
+            continue  # Skip countries with too few samples
+
+        # ROC-AUC
+        try:
+            roc_auc = roc_auc_score(grp['y_true'], grp['y_pred_proba'])
+        except Exception:
+            roc_auc = float('nan')
+
+        # Precision@1%
+        y_proba = grp['y_pred_proba'].values
+        y_true_arr = grp['y_true'].values
+        n_top = max(1, int(len(y_proba) * 0.01))
+        top_idx = np.argpartition(y_proba, -n_top)[-n_top:]
+        p_at_1pct = float(y_true_arr[top_idx].mean())
+
+        records.append({
+            'Country': country,
+            'n_pixels': n_rows,
+            'n_observed_PAs': n_pos,
+            'ROC_AUC': round(roc_auc, 4),
+            'Precision_at_1pct': round(p_at_1pct, 4),
+        })
+
+    if not records:
+        print("  No countries with sufficient data. Skipping.")
+        return
+
+    result_df = pd.DataFrame(records).sort_values('n_observed_PAs', ascending=False)
+
+    # Save CSV
+    csv_path = output_dir / 'country_breakdown.csv'
+    result_df.to_csv(csv_path, index=False)
+    print(f"  Saved CSV: {csv_path}")
+
+    # Save LaTeX table (top 15 countries by n_observed_PAs)
+    top_df = result_df.head(15).copy()
+    top_df.columns = ['Country', 'N Pixels', 'N Observed PAs', 'ROC-AUC', 'P@1\\%']
+    latex_str = top_df.to_latex(index=False, float_format='%.4f',
+                                 caption=f'Per-country model performance ({MODEL_LABEL}, {model_type.upper()})',
+                                 label=f'tab:country_breakdown_{model_type}',
+                                 escape=False)
+    latex_path = output_dir / 'country_breakdown.tex'
+    latex_path.write_text(latex_str)
+    print(f"  Saved LaTeX: {latex_path}")
+    print(f"  Countries included: {len(result_df)} (min 10 positive samples)")
+
+
+def create_biome_breakdown(
+    df: pd.DataFrame,
+    output_dir: Path,
+    model_type: str,
+    gsn_tif_path: Optional[Path] = None,
+    gsn_shp_path: Optional[Path] = None,
+) -> None:
+    """Per-biome and per-ecoregion metrics using GSN terrestrial ecoregions data.
+
+    The raster (gsn_terrestrial_ecoregions_mask_1km.tif) is a single-band int16
+    categorical raster in EPSG:3857 at 1 km resolution aligned to the backbone
+    grid. Pixel values = ecoregion_id × 4 (63 ecoregions; 0 = nodata/ocean).
+    Pixel assignment via direct row/col indexing — no reprojection needed.
+
+    If the shapefile (Terrestrial_ecoregions.shp) is also provided, a spatial
+    sample is used to build a raster_value → ECO_NAME → BIOME_NAME lookup,
+    enabling named ecoregion labels and biome-level aggregation.
+
+    Outputs:
+        ecoregion_breakdown.csv  — per-ecoregion metrics (ECO_NAME, BIOME_NAME, ROC-AUC, P@1%)
+        biome_breakdown.pdf      — biome-level bar chart (grouped by BIOME_NAME)
+        ecoregion_breakdown.pdf  — top-20 ecoregions bar chart (only if shapefile available)
+
+    Args:
+        df: Scored predictions DataFrame (must have row, col, y_true, y_pred_proba).
+        output_dir: Directory for output files.
+        model_type: Model identifier string.
+        gsn_tif_path: Path to gsn_terrestrial_ecoregions_mask_1km.tif.
+        gsn_shp_path: Path to Terrestrial_ecoregions.shp (optional but recommended).
+    """
+    import rasterio
+    import rasterio.transform
+    from sklearn.metrics import roc_auc_score
+    from shapely.geometry import Point
+
+    print("\n" + "=" * 70)
+    print("CREATING BIOME / ECOREGION BREAKDOWN")
+    print("=" * 70)
+
+    if gsn_tif_path is None or not Path(gsn_tif_path).exists():
+        print(f"  Skipping: GSN raster not found.")
+        if gsn_tif_path is not None:
+            print(f"  Expected: {gsn_tif_path}")
+        return
+
+    if 'row' not in df.columns or 'col' not in df.columns:
+        print("  Skipping: scored parquet missing row/col columns.")
+        return
+
+    print(f"  TIF:      {gsn_tif_path}")
+    print(f"  Shapefile: {gsn_shp_path if gsn_shp_path and gsn_shp_path.exists() else 'not provided — numeric IDs only'}")
+
+    # ── 1. Read raster ────────────────────────────────────────────────────────
+    with rasterio.open(gsn_tif_path) as src:
+        raster_height, raster_width = src.height, src.width
+        raster_transform = src.transform
+        raster_crs = src.crs
+        eco_raster = src.read(1)  # int16; raw_value = eco_id × 4; 0 = nodata
+
+    unique_raw = sorted(set(eco_raster.flatten()) - {0})
+    print(f"  Ecoregions in raster: {len(unique_raw)}")
+
+    # ── 2. Build raster_value → (ECO_NAME, BIOME_NAME) lookup via spatial join ─
+    val_to_meta: dict[int, dict] = {}
+    has_names = False
+
+    if gsn_shp_path is not None and Path(gsn_shp_path).exists():
+        try:
+            eco_gdf = gpd.read_file(gsn_shp_path).to_crs(raster_crs)
+            # Sample one representative pixel center per raster value
+            sample_rows, sample_cols, sample_vals = [], [], []
+            for val in unique_raw:
+                r_idx, c_idx = np.where(eco_raster == val)
+                mid = len(r_idx) // 2
+                sample_rows.append(r_idx[mid])
+                sample_cols.append(c_idx[mid])
+                sample_vals.append(int(val))
+
+            xs, ys = rasterio.transform.xy(raster_transform, sample_rows, sample_cols)
+            pts_gdf = gpd.GeoDataFrame(
+                {'raster_val': sample_vals},
+                geometry=[Point(x, y) for x, y in zip(xs, ys)],
+                crs=raster_crs,
+            )
+            joined = gpd.sjoin(
+                pts_gdf,
+                eco_gdf[['ECO_NAME', 'BIOME_NAME', 'REALM', 'geometry']],
+                how='left', predicate='within',
+            )
+            for _, row in joined.iterrows():
+                val_to_meta[int(row['raster_val'])] = {
+                    'ECO_NAME':  str(row.get('ECO_NAME',  f'Ecoregion {int(row["raster_val"])//4}')),
+                    'BIOME_NAME': str(row.get('BIOME_NAME', 'Unknown')),
+                    'REALM':     str(row.get('REALM',     'Unknown')),
+                }
+            has_names = True
+            print(f"  Name lookup built: {len(val_to_meta)} ecoregions matched")
+        except Exception as e:
+            print(f"  Warning: shapefile join failed ({e}). Using numeric IDs.")
+
+    # Fallback: numeric labels
+    for val in unique_raw:
+        if val not in val_to_meta:
+            val_to_meta[int(val)] = {
+                'ECO_NAME':   f'Ecoregion {int(val)//4}',
+                'BIOME_NAME': 'Unknown',
+                'REALM':      'Unknown',
+            }
+
+    # ── 3. Assign ecoregion to each row via row/col lookup ───────────────────
+    rows_arr = df['row'].values.astype(int)
+    cols_arr = df['col'].values.astype(int)
+    valid = (rows_arr >= 0) & (rows_arr < raster_height) & (cols_arr >= 0) & (cols_arr < raster_width)
+    if (~valid).sum() > 0:
+        print(f"  Warning: {(~valid).sum():,} rows out of raster bounds (treated as nodata)")
+
+    raw_vals = np.zeros(len(df), dtype=np.int32)
+    raw_vals[valid] = eco_raster[rows_arr[valid], cols_arr[valid]]
+
+    n_covered = (raw_vals > 0).sum()
+    print(f"  Rows with ecoregion: {n_covered:,} / {len(df):,} ({n_covered/len(df)*100:.1f}%)")
+
+    # ── 4. Per-ecoregion metrics ──────────────────────────────────────────────
+    y_true_all  = df['y_true'].values
+    y_proba_all = df['y_pred_proba'].values
+
+    eco_records = []
+    for val in unique_raw:
+        mask = (raw_vals == val)
+        grp_true  = y_true_all[mask]
+        grp_proba = y_proba_all[mask]
+        n_rows = int(mask.sum())
+        n_pos  = int(grp_true.sum())
+        if n_pos < 5 or (n_rows - n_pos) < 100:
+            continue
+
+        try:
+            roc_auc = roc_auc_score(grp_true, grp_proba)
+        except Exception:
+            roc_auc = float('nan')
+
+        n_top   = max(1, int(n_rows * 0.01))
+        top_idx = np.argpartition(grp_proba, -n_top)[-n_top:]
+        p_at_1pct = float(grp_true[top_idx].mean())
+
+        meta = val_to_meta[val]
+        eco_records.append({
+            'ecoregion_id':   int(val) // 4,
+            'ECO_NAME':       meta['ECO_NAME'],
+            'BIOME_NAME':     meta['BIOME_NAME'],
+            'REALM':          meta['REALM'],
+            'n_pixel_years':  n_rows,
+            'n_observed_PAs': n_pos,
+            'prevalence_pct': round(n_pos / n_rows * 100, 4),
+            'ROC_AUC':        round(roc_auc, 4),
+            'Precision_at_1pct': round(p_at_1pct, 4),
+        })
+
+    if not eco_records:
+        print("  No ecoregions with sufficient data. Skipping.")
+        return
+
+    eco_df = pd.DataFrame(eco_records).sort_values('n_observed_PAs', ascending=False)
+    csv_path = output_dir / 'ecoregion_breakdown.csv'
+    eco_df.to_csv(csv_path, index=False)
+    print(f"  Saved: {csv_path}  ({len(eco_df)} ecoregions)")
+
+    # ── 5. Per-biome aggregation ──────────────────────────────────────────────
+    biome_records = []
+    for biome_name, grp_df in eco_df.groupby('BIOME_NAME'):
+        # Re-aggregate metrics over raw pixel rows (not average of ecoregion metrics)
+        biome_mask = np.isin(raw_vals, [v for v in unique_raw if val_to_meta[v]['BIOME_NAME'] == biome_name])
+        grp_true  = y_true_all[biome_mask]
+        grp_proba = y_proba_all[biome_mask]
+        n_rows = int(biome_mask.sum())
+        n_pos  = int(grp_true.sum())
+        if n_pos < 5 or (n_rows - n_pos) < 100:
+            continue
+        try:
+            roc_auc = roc_auc_score(grp_true, grp_proba)
+        except Exception:
+            roc_auc = float('nan')
+        n_top   = max(1, int(n_rows * 0.01))
+        top_idx = np.argpartition(grp_proba, -n_top)[-n_top:]
+        p_at_1pct = float(grp_true[top_idx].mean())
+        biome_records.append({
+            'BIOME_NAME':     biome_name,
+            'n_ecoregions':   len(grp_df),
+            'n_pixel_years':  n_rows,
+            'n_observed_PAs': n_pos,
+            'prevalence_pct': round(n_pos / n_rows * 100, 4),
+            'ROC_AUC':        round(roc_auc, 4),
+            'Precision_at_1pct': round(p_at_1pct, 4),
+        })
+
+    biome_df = pd.DataFrame(biome_records).sort_values('ROC_AUC', ascending=True)
+    biome_csv = output_dir / 'biome_breakdown.csv'
+    biome_df.to_csv(biome_csv, index=False)
+    print(f"  Saved: {biome_csv}  ({len(biome_df)} biomes)")
+
+    result_df = biome_df  # used for plotting below
+    print(f"  Ecoregions with sufficient data: {len(eco_df)}")
+
+    # Save CSV
+    csv_path = output_dir / 'biome_breakdown.csv'
+    result_df.to_csv(csv_path, index=False)
+    print(f"  Saved CSV: {csv_path}")
+
+    # Bar chart: ROC-AUC per band (horizontal, sorted by ROC-AUC)
+    # ── 6. Biome-level bar chart (paper figure) ───────────────────────────────
+    # Short biome labels for clean axis display
+    SHORT_BIOME = {
+        'Tropical & Subtropical Moist Broadleaf Forests':         'Trop. Moist Broadleaf',
+        'Tropical & Subtropical Dry Broadleaf Forests':           'Trop. Dry Broadleaf',
+        'Tropical & Subtropical Grasslands, Savannas & Shrublands': 'Trop. Grasslands/Savannas',
+        'Tropical & Subtropical Coniferous Forests':               'Trop. Coniferous',
+        'Temperate Broadleaf & Mixed Forests':                     'Temp. Broadleaf',
+        'Temperate Grasslands, Savannas & Shrublands':             'Temp. Grasslands/Savannas',
+        'Flooded Grasslands & Savannas':                           'Flooded Grasslands',
+        'Montane Grasslands & Shrublands':                         'Montane Grasslands',
+        'Mediterranean Forests, Woodlands & Scrub':                'Mediterranean',
+        'Deserts & Xeric Shrublands':                              'Deserts & Xeric',
+        'Mangroves':                                               'Mangroves',
+        'Tundra':                                                  'Tundra',
+    }
+
+    labels = [SHORT_BIOME.get(b, b[:30]) for b in biome_df['BIOME_NAME']]
+    roc_vals = biome_df['ROC_AUC'].tolist()
+    p1_vals  = biome_df['Precision_at_1pct'].tolist()
+    y_pos = np.arange(len(labels))
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, max(4, len(biome_df) * 0.55)))
+
+    # ROC-AUC panel
+    ax1 = axes[0]
+    bars1 = ax1.barh(y_pos, roc_vals, color='#4A90D9', alpha=0.85)
+    ax1.set_yticks(y_pos)
+    ax1.set_yticklabels(labels, fontsize=FONTSIZE_STATS)
+    ax1.set_xlabel('ROC-AUC', fontsize=FONTSIZE_LABEL)
+    ax1.set_title('ROC-AUC by Biome', fontsize=FONTSIZE_TITLE, fontweight='bold')
+    ax1.axvline(x=0.5, color='red', linestyle='--', linewidth=1, alpha=0.7, label='Random (0.5)')
+    ax1.set_xlim(0, 1)
+    ax1.legend(fontsize=FONTSIZE_LEGEND)
+    ax1.grid(True, axis='x', alpha=0.3)
+    for bar, val in zip(bars1, roc_vals):
+        ax1.text(min(val + 0.01, 0.97), bar.get_y() + bar.get_height() / 2,
+                f'{val:.3f}', va='center', ha='left', fontsize=FONTSIZE_STATS)
+
+    # P@1% panel
+    ax2 = axes[1]
+    bars2 = ax2.barh(y_pos, p1_vals, color='#E07B54', alpha=0.85)
+    ax2.set_yticks(y_pos)
+    ax2.set_yticklabels(labels, fontsize=FONTSIZE_STATS)
+    ax2.set_xlabel('Precision@1%', fontsize=FONTSIZE_LABEL)
+    ax2.set_title('Precision@1% by Biome', fontsize=FONTSIZE_TITLE, fontweight='bold')
+    p1_max = max(p1_vals) if p1_vals else 1
+    ax2.set_xlim(0, p1_max * 1.3)
+    ax2.grid(True, axis='x', alpha=0.3)
+    for bar, val in zip(bars2, p1_vals):
+        ax2.text(val + p1_max * 0.01, bar.get_y() + bar.get_height() / 2,
+                f'{val:.4f}', va='center', ha='left', fontsize=FONTSIZE_STATS)
+
+    plt.suptitle(f'{MODEL_LABEL} ({model_type.upper()}) Performance by Biome (GSN Terrestrial Ecoregions)',
+                fontsize=FONTSIZE_TITLE, fontweight='bold', y=1.01)
+    plt.tight_layout()
+
+    pdf_path = output_dir / 'biome_breakdown.pdf'
+    plt.savefig(pdf_path, dpi=PR_CURVE_DPI, bbox_inches='tight')
+    print(f"  Saved PDF: {pdf_path}")
+    plt.close()
 
 
 
@@ -1850,7 +2259,7 @@ def main() -> None:
         '--out_dir',
         type=str,
         default=None,
-        help=f'Output directory (default: outputs/{REGION_SLUG}/results/{MODEL_ID}_{{model_type}}/{{split_version}}/)'
+        help=f'Output directory (default: outputs/{REGION_SLUG}/results/{MODEL_ID}_{{model_type}}/)'
     )
     parser.add_argument(
         '--region_boundary',
@@ -1914,6 +2323,23 @@ def main() -> None:
         type=str,
         default=None,
         help=f'Path to the exact .pkl/.joblib that produced the scored parquet. If provided, SHAP uses this model (ensures explanations match results). If not set, auto-discovers {MODEL_ID}_* only (never Model C).'
+    )
+    parser.add_argument(
+        '--gsn_tif',
+        type=str,
+        default=None,
+        help='Path to gsn_terrestrial_ecoregions_mask_1km.tif. If not provided, auto-discovers from data/{region}/ready/GSN/ under $SCRATCH or repo root. Pass --skip_gsn to disable.'
+    )
+    parser.add_argument(
+        '--gsn_shp',
+        type=str,
+        default=None,
+        help='Path to Terrestrial_ecoregions.shp. If not provided, auto-discovers from data/shared/GlobalSafetyNet/terrestrial_ecoregions/ under repo root. Adds ECO_NAME and BIOME_NAME labels to biome breakdown.'
+    )
+    parser.add_argument(
+        '--skip_gsn',
+        action='store_true',
+        help='Skip biome/GSN breakdown (default: False)'
     )
     args = parser.parse_args()
     
@@ -2143,11 +2569,10 @@ def main() -> None:
         output_dir = Path(args.out_dir).resolve()
     else:
         # Prefer $SCRATCH for outputs on cluster, otherwise use repo root
-        # Use split-specific subdirectory
         if scratch_root is not None:
-            output_dir = scratch_root / f"outputs/{REGION_SLUG}/results/{MODEL_ID}_{args.model_type}" / args.split_version
+            output_dir = scratch_root / f"outputs/{REGION_SLUG}/results/{MODEL_ID}_{args.model_type}"
         else:
-            output_dir = repo_root / f"outputs/{REGION_SLUG}/results/{MODEL_ID}_{args.model_type}" / args.split_version
+            output_dir = repo_root / f"outputs/{REGION_SLUG}/results/{MODEL_ID}_{args.model_type}"
     
     region_boundary_path = None
     if args.region_boundary:
@@ -2274,7 +2699,45 @@ def main() -> None:
         test_parquet_path=test_parquet_path,
         sa_gdf=sa_gdf,
     )
-    
+
+    # New outputs: calibration improvement, country breakdown, biome breakdown
+    create_calibration_improvement_figure(df, output_dir, args.model_type)
+    create_country_breakdown(df, output_dir, args.model_type)
+
+    # GSN biome breakdown: resolve raster path
+    gsn_tif_path = None
+    if not args.skip_gsn:
+        if args.gsn_tif:
+            gsn_tif_path = Path(args.gsn_tif).resolve()
+        else:
+            # Auto-discover: $SCRATCH first, then repo root
+            gsn_candidates = []
+            if scratch_root is not None:
+                gsn_candidates.append(scratch_root / f"data/{REGION_SLUG}/ready/GSN/gsn_terrestrial_ecoregions_mask_1km.tif")
+            gsn_candidates.append(repo_root / f"data/{REGION_SLUG}/ready/GSN/gsn_terrestrial_ecoregions_mask_1km.tif")
+            for cand in gsn_candidates:
+                if cand.exists():
+                    gsn_tif_path = cand
+                    print(f"  Auto-discovered GSN raster: {gsn_tif_path}")
+                    break
+            if gsn_tif_path is None:
+                print("  GSN raster not found in standard locations. Pass --gsn_tif to enable biome breakdown.")
+    # Resolve GSN shapefile path
+    gsn_shp_path = None
+    if not args.skip_gsn:
+        if args.gsn_shp:
+            gsn_shp_path = Path(args.gsn_shp).resolve()
+        else:
+            # Auto-discover from repo root (shared across all regions)
+            shp_candidate = repo_root / "data/shared/GlobalSafetyNet/terrestrial_ecoregions/Terrestrial_ecoregions.shp"
+            if shp_candidate.exists():
+                gsn_shp_path = shp_candidate
+                print(f"  Auto-discovered GSN shapefile: {gsn_shp_path}")
+            else:
+                print("  GSN shapefile not found. Pass --gsn_shp to enable biome names.")
+
+    create_biome_breakdown(df, output_dir, args.model_type, gsn_tif_path=gsn_tif_path, gsn_shp_path=gsn_shp_path)
+
     # Resolve model file for SHAP: explicit --model_pkl, or auto-discover configured model only.
     model_path = None
     if not args.skip_shap:
