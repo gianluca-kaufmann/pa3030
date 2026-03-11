@@ -24,6 +24,7 @@ module load eth_proxy
 
 VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
+export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
 # Paper-mode defaults (overridable by pre-set env vars)
 export TUNING_MODE="${TUNING_MODE:-paper}"

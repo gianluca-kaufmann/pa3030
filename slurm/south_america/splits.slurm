@@ -31,6 +31,7 @@ module load eth_proxy
 #------------------------------------------------------------------------------
 VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
+export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
 #------------------------------------------------------------------------------
 # Run the model1_splits script

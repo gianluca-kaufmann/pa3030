@@ -32,6 +32,7 @@ module load eth_proxy
 #------------------------------------------------------------------------------
 VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
+export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
 #------------------------------------------------------------------------------
 # Run the calibrate_2 script with RF model type (main split)
