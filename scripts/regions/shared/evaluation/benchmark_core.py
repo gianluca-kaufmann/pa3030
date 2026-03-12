@@ -22,16 +22,13 @@ class BenchmarkResult:
 def _find_latest_metrics_file(
     config: ModelEvalConfig,
     model_type: Literal["lgbm", "rf"],
+    split_version: str = "main",
 ) -> Path:
     """
     Find the most recent metrics JSON file for a given region/model/algorithm.
 
     This unifies the SA `benchmark_1` and USA `benchmark_2` behaviours.
     """
-    output_dir = config.metrics_root
-    if not output_dir.exists():
-        raise FileNotFoundError(f"Output directory does not exist: {output_dir}")
-
     if model_type == "lgbm":
         pattern = f"{config.model_id}_lgbm_metrics_*.json"
         ts_re = re.compile(rf"{re.escape(config.model_id)}_lgbm_metrics_(\d{{8}}_\d{{6}})\.json")
@@ -41,11 +38,28 @@ def _find_latest_metrics_file(
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
-    files = list(output_dir.glob(pattern))
-    if not files:
-        raise FileNotFoundError(
-            f"No metrics files found in {output_dir} matching pattern {pattern}"
-        )
+    # Search order:
+    # 1) split-specific subdir under primary metrics_root
+    # 2) primary metrics_root
+    # 3) split-specific subdir under repo outputs root
+    # 4) repo outputs root
+    # This makes the benchmark robust on clusters where some stages write to
+    # $SCRATCH while others still live under repo outputs.
+    repo_metrics_root = config.repo_root / f"outputs/{config.region}/results/ml_models"
+    candidates = [
+        config.metrics_root / split_version,
+        config.metrics_root,
+        repo_metrics_root / split_version,
+        repo_metrics_root,
+    ]
+    search_dirs: list[Path] = []
+    seen: set[Path] = set()
+    for cand in candidates:
+        resolved = cand.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        search_dirs.append(cand)
 
     def key(path: Path):
         m = ts_re.match(path.name)
@@ -57,7 +71,17 @@ def _find_latest_metrics_file(
                 pass
         return (datetime.fromtimestamp(0), path.stat().st_mtime)
 
-    return max(files, key=key)
+    for output_dir in search_dirs:
+        if not output_dir.exists():
+            continue
+        files = list(output_dir.glob(pattern))
+        if files:
+            return max(files, key=key)
+
+    searched = ", ".join(str(p) for p in search_dirs)
+    raise FileNotFoundError(
+        f"No metrics files found matching pattern {pattern}. Searched: {searched}"
+    )
 
 
 def _load_metrics_file(path: Path) -> Dict[str, Any]:
@@ -162,7 +186,7 @@ def run_benchmark(
     """
     Core benchmark routine used by all regions/models.
     """
-    metrics_path = _find_latest_metrics_file(config, model_type)
+    metrics_path = _find_latest_metrics_file(config, model_type, split_version=split_version)
     metrics_data = _load_metrics_file(metrics_path)
 
     dataset_hash = compute_dataset_hash(config, split_version=split_version)
@@ -173,9 +197,14 @@ def run_benchmark(
         source_metrics_filename=metrics_path.name,
     )
 
-    # Benchmarks are stored under results/ml_models/<split_version> to mirror
-    # existing scripts.
-    benchmark_output_dir = config.metrics_root / split_version
+    # Save benchmark under the same ml_models root where metrics were found.
+    # If metrics are in .../ml_models/<split>, step back one level first.
+    metrics_parent = metrics_path.parent
+    if metrics_parent.name == split_version:
+        metrics_root_used = metrics_parent.parent
+    else:
+        metrics_root_used = metrics_parent
+    benchmark_output_dir = metrics_root_used / split_version
     benchmark_output_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
