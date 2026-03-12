@@ -6,6 +6,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Literal, Optional
 
+import pandas as pd
+
 from .calibration_core import (
     apply_isotonic_calibration,
     apply_platt_calibration,
@@ -40,6 +42,26 @@ class CalibrationRunResult:
     test_calibrated_metrics: Dict[str, float]
 
 
+def _candidate_metrics_roots(config: ModelEvalConfig) -> list[Path]:
+    """
+    Return candidate ml_models roots to search.
+
+    When running on Euler, evaluation config prefers $SCRATCH paths. However,
+    some training scripts still write to repo-local outputs. To be robust during
+    transition, search both roots (deduplicated) in priority order.
+    """
+    roots = [config.metrics_root, config.ml_models_root]
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        resolved = root.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        deduped.append(root)
+    return deduped
+
+
 def _find_latest_scored_file(
     config: ModelEvalConfig,
     split_version: str,
@@ -53,10 +75,14 @@ def _find_latest_scored_file(
     LGBM: <model_id>_lgbm_scored_*.parquet
     RF:   <model_id>_rf_win5_scored_*.parquet
     """
-    output_dir = config.metrics_root
-
-    if not output_dir.exists():
-        raise FileNotFoundError(f"Output directory does not exist: {output_dir}")
+    candidate_roots = _candidate_metrics_roots(config)
+    existing_roots = [d for d in candidate_roots if d.exists()]
+    if not existing_roots:
+        searched = "\n".join(str(d) for d in candidate_roots)
+        raise FileNotFoundError(
+            "Output directory does not exist.\n"
+            f"Searched in:\n{searched}"
+        )
 
     if pattern_override is not None:
         pattern = pattern_override
@@ -68,12 +94,16 @@ def _find_latest_scored_file(
         else:
             raise ValueError(f"Unknown algorithm: {config.algorithm}")
 
-    files = list(output_dir.glob(pattern))
+    files: list[Path] = []
+    for output_dir in existing_roots:
+        files.extend(output_dir.glob(pattern))
     files = [f for f in files if "calibrated" not in f.name]
 
     if not files:
+        searched = "\n".join(str(d) for d in existing_roots)
         raise FileNotFoundError(
-            f"No scored files found matching pattern {pattern} in {output_dir}\n"
+            f"No scored files found matching pattern {pattern}.\n"
+            f"Searched in:\n{searched}\n"
             f"Expected pattern: {pattern}"
         )
 
@@ -91,13 +121,16 @@ def _search_cv_files(
     Behaviour mirrors the original region-specific scripts but is parameterised
     by ModelEvalConfig.
     """
-    ml_root = config.metrics_root
-    split_dir = ml_root / split_version
+    search_dirs: list[Path] = []
+    for root in _candidate_metrics_roots(config):
+        split_dir = root / split_version
+        if split_dir.exists():
+            search_dirs.append(split_dir)
+        if root.exists():
+            search_dirs.append(root)
 
-    search_dirs = []
-    if split_dir.exists():
-        search_dirs.append(split_dir)
-    search_dirs.append(ml_root)
+    # Deduplicate while preserving order
+    search_dirs = list(dict.fromkeys(search_dirs))
 
     temporal_cv_files: list[Path] = []
     other_cv_files: list[Path] = []
