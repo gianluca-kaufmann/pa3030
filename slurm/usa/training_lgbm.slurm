@@ -3,8 +3,8 @@
 #SBATCH --partition=normal.120h
 #SBATCH --time=120:00:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem-per-cpu=16G
+#SBATCH --cpus-per-task=32
+#SBATCH --mem-per-cpu=4G
 #SBATCH --output=/cluster/scratch/%u/logs/model2_LGBM_%j.out
 #SBATCH --error=/cluster/scratch/%u/logs/model2_LGBM_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis

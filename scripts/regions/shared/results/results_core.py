@@ -28,6 +28,7 @@ from scipy.interpolate import interp1d, griddata
 from .boundaries import (
     detect_and_reproject_coordinates,
     get_region_boundary,
+    get_world_countries,
     validate_coordinates,
 )
 from .config import (
@@ -1399,7 +1400,12 @@ def create_probability_map(
     # Apply transformation to stretch the distribution
     proba_shifted = proba_clipped - proba_pmin  # Shift to start at 0
     proba_span = proba_pmax - proba_pmin
-    proba_normalized_linear = proba_shifted / proba_span  # Linear normalization to [0, 1]
+    if proba_span > 1e-12:
+        proba_normalized_linear = proba_shifted / proba_span  # Linear normalization to [0, 1]
+    else:
+        # All probabilities are identical — fill with 0.5 to avoid division by zero
+        print("  Warning: probability range is effectively zero; using flat 0.5 normalization.")
+        proba_normalized_linear = np.full_like(proba_shifted, 0.5)
     
     # Apply transformation based on constant setting
     if PROBABILITY_MAP_TRANSFORMATION == 'sqrt':
@@ -1430,7 +1436,10 @@ def create_probability_map(
     proba_values_filtered = df['y_pred_proba'].values
     proba_clipped_filtered = np.clip(proba_values_filtered, proba_pmin, proba_pmax)
     proba_shifted_filtered = proba_clipped_filtered - proba_pmin
-    proba_normalized_linear = proba_shifted_filtered / proba_span
+    if proba_span > 1e-12:
+        proba_normalized_linear = proba_shifted_filtered / proba_span
+    else:
+        proba_normalized_linear = np.full_like(proba_shifted_filtered, 0.5)
     
     if PROBABILITY_MAP_TRANSFORMATION == 'sqrt':
         proba_normalized = np.sqrt(proba_normalized_linear)
@@ -1899,8 +1908,7 @@ def create_country_breakdown(
 
     # Spatial join with Natural Earth country boundaries
     try:
-        import geopandas as gpd
-        world = gpd.read_file(gpd.datasets.get_path('naturalearth_lowres'))
+        world = get_world_countries()
         world = world[world.geometry.notnull()].copy()
         print(f"  Loaded {len(world)} country geometries from Natural Earth")
     except Exception as e:
@@ -1915,9 +1923,20 @@ def create_country_breakdown(
             crs='EPSG:4326'
         )
         world_4326 = world.to_crs('EPSG:4326')
-        joined = gpd.sjoin(pixel_gdf, world_4326[['name', 'continent', 'geometry']],
-                          how='left', predicate='within')
-        joined['country'] = joined['name'].fillna('Unknown')
+        # Detect country name column (varies by Natural Earth version/source)
+        name_col = next(
+            (c for c in world_4326.columns if c.lower() == 'name'),
+            None,
+        )
+        if name_col is None:
+            # Fallback: ADMIN is present in 110m files
+            name_col = next(
+                (c for c in world_4326.columns if c.lower() in ('admin', 'sovereignt', 'country')),
+                world_4326.columns[0],
+            )
+        join_cols = [name_col, 'geometry']
+        joined = gpd.sjoin(pixel_gdf, world_4326[join_cols], how='left', predicate='within')
+        joined['country'] = joined[name_col].fillna('Unknown')
         print(f"  Spatial join complete. Countries assigned: {joined['country'].nunique()}")
     except Exception as e:
         print(f"  Spatial join failed: {e}. Skipping country breakdown.")
@@ -2157,6 +2176,14 @@ def create_biome_breakdown(
     print(f"  Saved: {csv_path}  ({len(eco_df)} ecoregions)")
 
     # ── 5. Per-biome aggregation ──────────────────────────────────────────────
+    # Skip biome aggregation when no shapefile was available: every ecoregion
+    # would have BIOME_NAME = 'Unknown', collapsing the entire region into a
+    # single uninformative 'Unknown' biome row.
+    if not has_names:
+        print("  Biome aggregation skipped: no GSN shapefile provided (all ecoregions "
+              "labelled 'Unknown'). Supply --gsn_shp for named biome outputs.")
+        return
+
     biome_records = []
     for biome_name, grp_df in eco_df.groupby('BIOME_NAME'):
         # Re-aggregate metrics over raw pixel rows (not average of ecoregion metrics)
@@ -2184,18 +2211,18 @@ def create_biome_breakdown(
             'Precision_at_1pct': round(p_at_1pct, 4),
         })
 
+    if not biome_records:
+        print("  No biomes with sufficient data for aggregation. Skipping biome chart.")
+        return
+
     biome_df = pd.DataFrame(biome_records).sort_values('ROC_AUC', ascending=True)
+
     biome_csv = output_dir / 'biome_breakdown.csv'
     biome_df.to_csv(biome_csv, index=False)
     print(f"  Saved: {biome_csv}  ({len(biome_df)} biomes)")
 
     result_df = biome_df  # used for plotting below
     print(f"  Ecoregions with sufficient data: {len(eco_df)}")
-
-    # Save CSV
-    csv_path = output_dir / 'biome_breakdown.csv'
-    result_df.to_csv(csv_path, index=False)
-    print(f"  Saved CSV: {csv_path}")
 
     # Bar chart: ROC-AUC per band (horizontal, sorted by ROC-AUC)
     # ── 6. Biome-level bar chart (paper figure) ───────────────────────────────

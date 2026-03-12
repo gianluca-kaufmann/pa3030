@@ -109,6 +109,85 @@ def validate_coordinates(df: pd.DataFrame) -> None:
     else:
         print(f"  Coordinate validation passed ({both_valid_pct:.2f}% in expected ranges)")
 
+def get_world_countries() -> gpd.GeoDataFrame:
+    """Return a world-countries GeoDataFrame (EPSG:4326) for spatial joins.
+
+    Strategy (in order):
+    1. Cached local file: ``data/shared/admin/ne_110m_admin_0_countries.gpkg``
+       (written on first successful download so Euler runs work offline after
+       the file has been transferred once).
+    2. Download from Natural Earth and cache to the above path.
+
+    Note: ``gpd.datasets.get_path('naturalearth_lowres')`` was removed in
+    geopandas 1.0 so we no longer rely on it.
+    """
+    repo_root = get_repo_root()
+    cache_path = repo_root / "data" / "shared" / "admin" / "ne_110m_admin_0_countries.gpkg"
+
+    if cache_path.exists():
+        print(f"  Loading world countries from cache: {cache_path}")
+        return gpd.read_file(cache_path)
+
+    # Download from Natural Earth
+    import shutil
+    import tempfile
+    import urllib.request
+    import zipfile
+
+    print("  Downloading Natural Earth 110m countries shapefile…")
+    url = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip"
+    fallback_url = (
+        "https://github.com/nvkelso/natural-earth-vector/raw/master/110m_cultural/"
+        "ne_110m_admin_0_countries.zip"
+    )
+
+    gdf = None
+    for attempt_url in (url, fallback_url):
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
+                urllib.request.urlretrieve(attempt_url, tmp.name)
+                extract_dir = tempfile.mkdtemp()
+                try:
+                    with zipfile.ZipFile(tmp.name, "r") as zf:
+                        zf.extractall(extract_dir)
+                    shp_files = list(Path(extract_dir).glob("*.shp"))
+                    if not shp_files:
+                        raise ValueError("No .shp file found in downloaded zip")
+                    gdf = gpd.read_file(shp_files[0])
+                finally:
+                    import os as _os
+                    _os.unlink(tmp.name)
+                    shutil.rmtree(extract_dir)
+            if gdf is not None and not gdf.empty:
+                print(f"  Downloaded from {attempt_url}")
+                break
+        except Exception as exc:
+            print(f"  Download failed ({attempt_url}): {exc}")
+
+    if gdf is None or gdf.empty:
+        raise RuntimeError(
+            "Could not load world country boundaries. "
+            "Download ne_110m_admin_0_countries.gpkg from Natural Earth and place it at "
+            f"{cache_path}"
+        )
+
+    # Ensure EPSG:4326
+    if gdf.crs is None:
+        gdf = gdf.set_crs("EPSG:4326")
+    elif gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs("EPSG:4326")
+
+    # Cache locally for subsequent runs (including Euler after scp)
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        gdf.to_file(cache_path, driver="GPKG")
+        print(f"  Cached to: {cache_path}")
+    except Exception as exc:
+        print(f"  Warning: could not cache world countries file ({exc})")
+
+    return gdf
+
+
 def get_region_boundary(region_boundary_path: Optional[Path] = None) -> gpd.GeoDataFrame:
     """Get region boundary from file or download from URL.
     

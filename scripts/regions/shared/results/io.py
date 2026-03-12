@@ -187,9 +187,11 @@ def load_scored_parquet(parquet_path: Path, test_years: Optional[Sequence[int]] 
             print(f"  Found protected area column: '{wdpa_col}'")
             break
     
-    # Optional metadata columns for joining with original test data
+    # Optional metadata columns for joining with original test data;
+    # also load raw calibration columns when present so downstream
+    # analyses (calibration improvement figure, Brier comparison) can use them.
     optional_metadata_cols = []
-    for col in ['year', 'row', 'col']:
+    for col in ['year', 'row', 'col', 'y_pred_proba_uncalibrated', 'y_pred_proba_calibrated']:
         if col in available_columns:
             optional_metadata_cols.append(col)
             print(f"  Found metadata column: '{col}'")
