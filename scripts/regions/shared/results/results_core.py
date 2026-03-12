@@ -576,7 +576,11 @@ def points_to_raster(x: np.ndarray, y: np.ndarray, values: np.ndarray,
         count_arr = np.zeros(n_cells, dtype=np.float64)
         np.add.at(sum_arr, flat_idx, values)
         np.add.at(count_arr, flat_idx, 1.0)
-        raster_flat = np.where(count_arr > 0, sum_arr / count_arr, np.nan)
+        # Avoid RuntimeWarning: np.where evaluates both branches before selecting,
+        # so divide only where count > 0 and fill the rest with nan.
+        with np.errstate(invalid='ignore', divide='ignore'):
+            mean_arr = np.where(count_arr > 0, sum_arr / count_arr, np.nan)
+        raster_flat = mean_arr
     else:  # 'max'
         raster_flat = np.full(n_cells, -np.inf, dtype=np.float64)
         np.maximum.at(raster_flat, flat_idx, values)
@@ -1995,15 +1999,37 @@ def create_country_breakdown(
     result_df.to_csv(csv_path, index=False)
     print(f"  Saved CSV: {csv_path}")
 
-    # Save LaTeX table (top 15 countries by n_observed_PAs)
+    # Save LaTeX table (top 15 countries by n_observed_PAs).
+    # Written manually to avoid pandas Styler / jinja2 dependency
+    # (to_latex() routes through Styler in pandas >= 1.3 and requires jinja2).
     top_df = result_df.head(15).copy()
-    top_df.columns = ['Country', 'N Pixels', 'N Observed PAs', 'ROC-AUC', 'P@1\\%']
-    latex_str = top_df.to_latex(index=False, float_format='%.4f',
-                                 caption=f'Per-country model performance ({MODEL_LABEL}, {model_type.upper()})',
-                                 label=f'tab:country_breakdown_{model_type}',
-                                 escape=False)
+    col_headers = ['Country', 'N Pixels', 'N Observed PAs', 'ROC-AUC', r'P@1\%']
+
+    def _fmt(val):
+        if isinstance(val, float):
+            return f'{val:.4f}'
+        return str(val).replace('_', r'\_').replace('%', r'\%').replace('&', r'\&')
+
+    latex_lines = [
+        r'\begin{table}[h]',
+        r'\centering',
+        r'\begin{tabular}{lrrrrr}',
+        r'\toprule',
+        ' & '.join(col_headers) + r' \\',
+        r'\midrule',
+    ]
+    for _, row in top_df.iterrows():
+        cells = [_fmt(v) for v in row]
+        latex_lines.append(' & '.join(cells) + r' \\')
+    latex_lines += [
+        r'\bottomrule',
+        r'\end{tabular}',
+        rf'\caption{{Per-country model performance ({MODEL_LABEL}, {model_type.upper()})}}',
+        rf'\label{{tab:country_breakdown_{model_type}}}',
+        r'\end{table}',
+    ]
     latex_path = output_dir / 'country_breakdown.tex'
-    latex_path.write_text(latex_str)
+    latex_path.write_text('\n'.join(latex_lines) + '\n')
     print(f"  Saved LaTeX: {latex_path}")
     print(f"  Countries included: {len(result_df)} (min 10 positive samples)")
 
