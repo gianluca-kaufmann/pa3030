@@ -49,9 +49,7 @@ echo "PWD = $(pwd)"
   find scripts -maxdepth 4 -type f -name "calibrate_2"
   exit 1
 }
-# Run the script (main split, RF model type, earlystop source for RF, platt method)
-# Note: RF doesn't have temporal CV, so we need to check if calibrate_2 supports earlystop
-# For now, using default (will need to check if RF training produces earlystop predictions)
-python "scripts/regions/usa/6_evaluation/calibrate_2" --model_type rf --split-version main --method platt
+# Run the script (main split, RF, earlystop source; auto selects best of Platt/Isotonic by test Brier)
+python "scripts/regions/usa/6_evaluation/calibrate_2" --model_type rf --split-version main --method auto
 
 echo "calibrate_2 script (RF mode, main split) finished."

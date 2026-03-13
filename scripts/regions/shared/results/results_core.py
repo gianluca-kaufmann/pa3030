@@ -2581,27 +2581,29 @@ def main() -> None:
                 print("Please provide --scored_parquet path explicitly.")
                 sys.exit(1)
         else:
-            # RF currently has only uncalibrated scored files; keep existing behaviour.
-            # Search in all candidate directories (training scripts may save to repo root)
-            parquet_path = None
-            for search_dir in ml_models_candidates:
-                if not search_dir.exists():
-                    continue
-                found = find_latest_file(
-                    f"{MODEL_ID}_{args.model_type}_win5_scored*.parquet",
-                    search_dir,
-                    args.split_version,
-                    args.model_type,
-                )
-                if found is not None:
-                    parquet_path = found
-                    print(f"  Found: {parquet_path}")
-                    break
-            
-            if parquet_path is None:
-                expected_pattern = f"{MODEL_ID}_rf_win5_scored_*.parquet"
-                print(f"ERROR: Could not find {expected_pattern} in any of the following directories:")
-                for cand in ml_models_candidates:
+            # RF: prefer calibrated scored files (written by calibrate script into the
+            # split-specific subdir); fall back to uncalibrated raw scores.
+            search_dirs_scored_rf: list[Path] = []
+            for base in ml_models_candidates:
+                search_dirs_scored_rf.append(base / args.split_version)
+                search_dirs_scored_rf.append(base)
+
+            calibrated_pattern_rf = f"{MODEL_ID}_rf_win5_scored_calibrated_*.parquet"
+            raw_pattern_rf = f"{MODEL_ID}_rf_win5_scored_*.parquet"
+
+            calibrated_path_rf = find_latest_file_in_dirs(calibrated_pattern_rf, search_dirs_scored_rf)
+            raw_path_rf = find_latest_file_in_dirs(raw_pattern_rf, search_dirs_scored_rf, exclude_substr="calibrated")
+
+            if calibrated_path_rf is not None:
+                parquet_path = calibrated_path_rf
+                print(f"  Found calibrated scored file (preferred): {parquet_path}")
+            elif raw_path_rf is not None:
+                parquet_path = raw_path_rf
+                print("  No calibrated RF scored file found; using uncalibrated scores:")
+                print(f"    {parquet_path}")
+            else:
+                print(f"ERROR: Could not find {raw_pattern_rf} in any of the following directories:")
+                for cand in search_dirs_scored_rf:
                     print(f"  - {cand}")
                 print("Please provide --scored_parquet path explicitly.")
                 sys.exit(1)

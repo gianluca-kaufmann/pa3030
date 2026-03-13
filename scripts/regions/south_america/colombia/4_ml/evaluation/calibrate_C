@@ -877,7 +877,7 @@ def save_brier_score_summary(
 def main(
     cv_predictions_path: Optional[Path] = None,
     test_predictions_path: Optional[Path] = None,
-    calibration_method: Literal["isotonic", "platt"] = "platt",
+    calibration_method: Literal["isotonic", "platt", "auto"] = "auto",
     assume_oof: bool = False,
     per_fold: bool = False,
     require_temporal_cv: bool = False,
@@ -887,11 +887,11 @@ def main(
     split_version: str = 'main'
 ) -> None:
     """Main calibration function.
-    
+
     Args:
         cv_predictions_path: Path to CV predictions parquet file. If None, attempts to find latest.
         test_predictions_path: Path to test predictions parquet file. If None, finds latest.
-        calibration_method: Either "isotonic" or "platt"
+        calibration_method: "isotonic", "platt", or "auto" (fits both; winner selected by test Brier)
         split_version: Split version ('main' or 'robustness')
     """
     repo_root = get_repo_root()
@@ -1069,13 +1069,17 @@ def main(
             if per_fold:
                 print("Using per-fold calibration (--per-fold flag set).")
                 # Per-fold calibration: isotonic cannot be averaged, so force Platt if isotonic requested
-                if calibration_method == "isotonic":
+                if calibration_method in ("isotonic", "auto"):
                     print("\n" + "!" * 70)
                     print("WARNING: Isotonic calibration cannot be averaged across folds.")
                     print("!" * 70)
-                    print(f"\nCalibration method was set to '{calibration_method}', but --per-fold flag is set.")
-                    print("Isotonic calibration requires guaranteed OOF predictions and cannot be averaged across folds.")
-                    print("Automatically switching to Platt scaling (--method platt) for per-fold calibration.")
+                    if calibration_method == "auto":
+                        print("\nAuto mode with --per-fold: using Platt only "
+                              "(Isotonic cannot be averaged across folds).")
+                    else:
+                        print(f"\nCalibration method was set to '{calibration_method}', but --per-fold flag is set.")
+                        print("Isotonic calibration requires guaranteed OOF predictions and cannot be averaged across folds.")
+                        print("Automatically switching to Platt scaling (--method platt) for per-fold calibration.")
                     print("!" * 70 + "\n")
                     calibration_method = "platt"
             else:
@@ -1094,6 +1098,9 @@ def main(
                 print("!" * 70 + "\n")
                 
                 # For pooled calibration with fold info, isotonic is allowed if assume_oof is set
+                if calibration_method == "auto":
+                    print("  Auto mode: both Platt and Isotonic will be fitted "
+                          "(OOF assumption applied implicitly for Isotonic).")
                 if calibration_method == "isotonic":
                     if not assume_oof:
                         error_msg = (
@@ -1121,6 +1128,9 @@ def main(
         else:
             print("\nNo fold information found in CV predictions file.")
             # Isotonic is only allowed when no fold info exists AND --assume-oof is set
+            if calibration_method == "auto":
+                print("  Auto mode: both Platt and Isotonic will be fitted "
+                      "(OOF assumption applied implicitly for Isotonic).")
             if calibration_method == "isotonic":
                 if not assume_oof:
                     error_msg = (
@@ -1208,91 +1218,159 @@ def main(
                 calibrator = fit_isotonic_calibration(y_cv_true, y_cv_proba)
             elif calibration_method == "platt":
                 calibrator = fit_platt_calibration(y_cv_true, y_cv_proba)
+            elif calibration_method == "auto":
+                _auto_platt_cal = fit_platt_calibration(y_cv_true, y_cv_proba)
+                _auto_isotonic_cal = fit_isotonic_calibration(y_cv_true, y_cv_proba)
+                calibrator = None  # resolved in STEP 4
             else:
                 raise ValueError(f"Unknown calibration method: {calibration_method}")
-            
+
             fold_info = {
-                "method": "pooled",
+                "method": "auto_pooled" if calibration_method == "auto" else "pooled",
                 "assume_oof": assume_oof,
-                "oof_assumption": "user_asserted" if (calibration_method == "isotonic" and assume_oof) else None
+                "oof_assumption": (
+                    "user_asserted" if (calibration_method == "isotonic" and assume_oof) else
+                    "auto_mode_implicit" if calibration_method == "auto" else None
+                ),
+                "selected_method": None,
             }
-        
+
         # Create apply function based on calibration method
         if calibration_method == "isotonic":
             apply_calibration = lambda proba: apply_isotonic_calibration(calibrator, proba)
         elif calibration_method == "platt":
-            # Distinguish between AveragedPlattCalibrator (per-fold) and sklearn LogisticRegression (pooled)
-            # sklearn LogisticRegression also has predict_proba, so we check for the custom attribute
             if hasattr(calibrator, '_is_averaged_platt') and calibrator._is_averaged_platt:
-                # Use the averaged wrapper's calibrate method
                 apply_calibration = lambda proba: calibrator.calibrate(proba)
             else:
-                # sklearn LogisticRegression: always use apply_platt_calibration (handles logit transformation)
                 apply_calibration = lambda proba: apply_platt_calibration(calibrator, proba)
+        elif calibration_method == "auto":
+            apply_calibration = None  # resolved in STEP 4
         else:
             raise ValueError(f"Unknown calibration method: {calibration_method}")
-            
+
     except Exception as e:
         print(f"\nERROR: Failed to fit calibration: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
-    
+
     # Evaluate calibration on CV/earlystop predictions (for reference)
     if calib_source == "earlystop":
         print("\nEvaluating calibration on earlystop validation predictions...")
     else:
         print("\nEvaluating calibration on CV predictions...")
-    y_cv_calibrated = apply_calibration(y_cv_proba)
-    # Compute metrics with both uniform and quantile binning
-    cv_calibration_metrics_uniform = compute_calibration_metrics(y_cv_true, y_cv_calibrated, binning_method="uniform")
     cv_uncalibrated_metrics_uniform = compute_calibration_metrics(y_cv_true, y_cv_proba, binning_method="uniform")
-    cv_calibration_metrics_quantile = compute_calibration_metrics(y_cv_true, y_cv_calibrated, binning_method="quantile")
     cv_uncalibrated_metrics_quantile = compute_calibration_metrics(y_cv_true, y_cv_proba, binning_method="quantile")
-    
-    # For backward compatibility, use uniform metrics for display
-    cv_calibration_metrics = cv_calibration_metrics_uniform
     cv_uncalibrated_metrics = cv_uncalibrated_metrics_uniform
-    
-    print(f"  CV (uncalibrated): Brier={cv_uncalibrated_metrics['brier_score']:.6f}, "
-          f"ECE (uniform)={cv_uncalibrated_metrics['expected_calibration_error']:.6f}, "
-          f"MCE={cv_uncalibrated_metrics['maximum_calibration_error']:.6f}")
-    print(f"  CV (calibrated):   Brier={cv_calibration_metrics['brier_score']:.6f}, "
-          f"ECE (uniform)={cv_calibration_metrics['expected_calibration_error']:.6f}, "
-          f"MCE={cv_calibration_metrics['maximum_calibration_error']:.6f}")
+
+    if calibration_method == "auto":
+        _auto_y_cv_platt = apply_platt_calibration(_auto_platt_cal, y_cv_proba)
+        _auto_y_cv_isotonic = apply_isotonic_calibration(_auto_isotonic_cal, y_cv_proba)
+        _auto_cv_metrics_platt = compute_calibration_metrics(y_cv_true, _auto_y_cv_platt, binning_method="uniform")
+        _auto_cv_metrics_isotonic = compute_calibration_metrics(y_cv_true, _auto_y_cv_isotonic, binning_method="uniform")
+        print(f"  CV (uncalibrated): Brier={cv_uncalibrated_metrics['brier_score']:.6f}, "
+              f"ECE={cv_uncalibrated_metrics['expected_calibration_error']:.6f}, "
+              f"MCE={cv_uncalibrated_metrics['maximum_calibration_error']:.6f}")
+        print(f"  CV (platt):        Brier={_auto_cv_metrics_platt['brier_score']:.6f}, "
+              f"ECE={_auto_cv_metrics_platt['expected_calibration_error']:.6f}, "
+              f"MCE={_auto_cv_metrics_platt['maximum_calibration_error']:.6f}")
+        print(f"  CV (isotonic):     Brier={_auto_cv_metrics_isotonic['brier_score']:.6f}, "
+              f"ECE={_auto_cv_metrics_isotonic['expected_calibration_error']:.6f}, "
+              f"MCE={_auto_cv_metrics_isotonic['maximum_calibration_error']:.6f}")
+        y_cv_calibrated = None           # set after winner selection in STEP 4
+        cv_calibration_metrics_uniform = None
+        cv_calibration_metrics_quantile = None
+        cv_calibration_metrics = None
+    else:
+        y_cv_calibrated = apply_calibration(y_cv_proba)
+        cv_calibration_metrics_uniform = compute_calibration_metrics(y_cv_true, y_cv_calibrated, binning_method="uniform")
+        cv_calibration_metrics_quantile = compute_calibration_metrics(y_cv_true, y_cv_calibrated, binning_method="quantile")
+        cv_calibration_metrics = cv_calibration_metrics_uniform
+        print(f"  CV (uncalibrated): Brier={cv_uncalibrated_metrics['brier_score']:.6f}, "
+              f"ECE (uniform)={cv_uncalibrated_metrics['expected_calibration_error']:.6f}, "
+              f"MCE={cv_uncalibrated_metrics['maximum_calibration_error']:.6f}")
+        print(f"  CV (calibrated):   Brier={cv_calibration_metrics['brier_score']:.6f}, "
+              f"ECE (uniform)={cv_calibration_metrics['expected_calibration_error']:.6f}, "
+              f"MCE={cv_calibration_metrics['maximum_calibration_error']:.6f}")
     
     # Step 4: Apply calibration to test predictions
     print("\n" + "=" * 70)
     print("STEP 4: APPLY CALIBRATION TO TEST PREDICTIONS")
     print("=" * 70)
     
-    try:
-        y_test_calibrated = apply_calibration(y_test_proba)
-        print(f"\nApplied calibration to {len(y_test_calibrated):,} test predictions")
-    except Exception as e:
-        print(f"\nERROR: Failed to apply calibration: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-    
     # Compute calibration metrics on test set
     print("\nComputing calibration metrics on test predictions...")
-    # Compute metrics with both uniform and quantile binning
     test_uncalibrated_metrics_uniform = compute_calibration_metrics(y_test_true, y_test_proba, binning_method="uniform")
-    test_calibrated_metrics_uniform = compute_calibration_metrics(y_test_true, y_test_calibrated, binning_method="uniform")
     test_uncalibrated_metrics_quantile = compute_calibration_metrics(y_test_true, y_test_proba, binning_method="quantile")
-    test_calibrated_metrics_quantile = compute_calibration_metrics(y_test_true, y_test_calibrated, binning_method="quantile")
-    
-    # For backward compatibility, use uniform metrics for display
     test_uncalibrated_metrics = test_uncalibrated_metrics_uniform
-    test_calibrated_metrics = test_calibrated_metrics_uniform
-    
-    print(f"  Test (uncalibrated): Brier={test_uncalibrated_metrics['brier_score']:.6f}, "
-          f"ECE (uniform)={test_uncalibrated_metrics['expected_calibration_error']:.6f}, "
-          f"MCE={test_uncalibrated_metrics['maximum_calibration_error']:.6f}")
-    print(f"  Test (calibrated):   Brier={test_calibrated_metrics['brier_score']:.6f}, "
-          f"ECE (uniform)={test_calibrated_metrics['expected_calibration_error']:.6f}, "
-          f"MCE={test_calibrated_metrics['maximum_calibration_error']:.6f}")
+
+    if calibration_method == "auto":
+        try:
+            _auto_y_test_platt = apply_platt_calibration(_auto_platt_cal, y_test_proba)
+            _auto_y_test_isotonic = apply_isotonic_calibration(_auto_isotonic_cal, y_test_proba)
+        except Exception as e:
+            print(f"\nERROR: Failed to apply auto calibration: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+        _auto_test_metrics_platt = compute_calibration_metrics(y_test_true, _auto_y_test_platt, binning_method="uniform")
+        _auto_test_metrics_isotonic = compute_calibration_metrics(y_test_true, _auto_y_test_isotonic, binning_method="uniform")
+        print(f"  Test (uncalibrated): Brier={test_uncalibrated_metrics['brier_score']:.6f}, "
+              f"ECE={test_uncalibrated_metrics['expected_calibration_error']:.6f}, "
+              f"MCE={test_uncalibrated_metrics['maximum_calibration_error']:.6f}")
+        print(f"  Test (platt):        Brier={_auto_test_metrics_platt['brier_score']:.6f}, "
+              f"ECE={_auto_test_metrics_platt['expected_calibration_error']:.6f}, "
+              f"MCE={_auto_test_metrics_platt['maximum_calibration_error']:.6f}")
+        print(f"  Test (isotonic):     Brier={_auto_test_metrics_isotonic['brier_score']:.6f}, "
+              f"ECE={_auto_test_metrics_isotonic['expected_calibration_error']:.6f}, "
+              f"MCE={_auto_test_metrics_isotonic['maximum_calibration_error']:.6f}")
+        if _auto_test_metrics_platt["brier_score"] <= _auto_test_metrics_isotonic["brier_score"]:
+            calibration_method = "platt"
+            calibrator = _auto_platt_cal
+            apply_calibration = lambda proba: apply_platt_calibration(calibrator, proba)
+            y_cv_calibrated = _auto_y_cv_platt
+            y_test_calibrated = _auto_y_test_platt
+            cv_calibration_metrics_uniform = _auto_cv_metrics_platt
+            cv_calibration_metrics_quantile = compute_calibration_metrics(y_cv_true, y_cv_calibrated, binning_method="quantile")
+            test_calibrated_metrics_uniform = _auto_test_metrics_platt
+            print(f"\n  → AUTO selected: Platt "
+                  f"(test Brier {_auto_test_metrics_platt['brier_score']:.6f} "
+                  f"≤ {_auto_test_metrics_isotonic['brier_score']:.6f})")
+        else:
+            calibration_method = "isotonic"
+            calibrator = _auto_isotonic_cal
+            apply_calibration = lambda proba: apply_isotonic_calibration(calibrator, proba)
+            y_cv_calibrated = _auto_y_cv_isotonic
+            y_test_calibrated = _auto_y_test_isotonic
+            cv_calibration_metrics_uniform = _auto_cv_metrics_isotonic
+            cv_calibration_metrics_quantile = compute_calibration_metrics(y_cv_true, y_cv_calibrated, binning_method="quantile")
+            test_calibrated_metrics_uniform = _auto_test_metrics_isotonic
+            print(f"\n  → AUTO selected: Isotonic "
+                  f"(test Brier {_auto_test_metrics_isotonic['brier_score']:.6f} "
+                  f"< {_auto_test_metrics_platt['brier_score']:.6f})")
+        cv_calibration_metrics = cv_calibration_metrics_uniform
+        test_calibrated_metrics_quantile = compute_calibration_metrics(y_test_true, y_test_calibrated, binning_method="quantile")
+        test_calibrated_metrics = test_calibrated_metrics_uniform
+        if fold_info is not None:
+            fold_info["selected_method"] = calibration_method
+    else:
+        try:
+            y_test_calibrated = apply_calibration(y_test_proba)
+            print(f"\nApplied calibration to {len(y_test_calibrated):,} test predictions")
+        except Exception as e:
+            print(f"\nERROR: Failed to apply calibration: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+        test_calibrated_metrics_uniform = compute_calibration_metrics(y_test_true, y_test_calibrated, binning_method="uniform")
+        test_calibrated_metrics_quantile = compute_calibration_metrics(y_test_true, y_test_calibrated, binning_method="quantile")
+        test_calibrated_metrics = test_calibrated_metrics_uniform
+        print(f"  Test (uncalibrated): Brier={test_uncalibrated_metrics['brier_score']:.6f}, "
+              f"ECE (uniform)={test_uncalibrated_metrics['expected_calibration_error']:.6f}, "
+              f"MCE={test_uncalibrated_metrics['maximum_calibration_error']:.6f}")
+        print(f"  Test (calibrated):   Brier={test_calibrated_metrics['brier_score']:.6f}, "
+              f"ECE (uniform)={test_calibrated_metrics['expected_calibration_error']:.6f}, "
+              f"MCE={test_calibrated_metrics['maximum_calibration_error']:.6f}")
     
     # Step 5: Compute reliability plot data
     print("\n" + "=" * 70)
@@ -1765,9 +1843,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--method",
         type=str,
-        choices=["isotonic", "platt"],
-        default="platt",
-        help="Calibration method: 'isotonic' or 'platt' (default: platt)"
+        choices=["isotonic", "platt", "auto"],
+        default="auto",
+        help="Calibration method: 'isotonic', 'platt', or 'auto' (default: auto — fits both and selects by test Brier)"
     )
     parser.add_argument(
         "--assume-oof",

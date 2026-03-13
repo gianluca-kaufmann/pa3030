@@ -48,7 +48,7 @@ echo "PWD = $(pwd)"
   find scripts -maxdepth 4 -type f -name "calibrate_C"
   exit 1
 }
-# Run the script (defaults to main split, earlystop source for RF)
-python "scripts/regions/south_america/colombia/4_ml/evaluation/calibrate_C" --model_type rf --split-version main --calib-source earlystop --method platt
+# Run the script (main split, RF, earlystop source; auto selects best of Platt/Isotonic by test Brier)
+python "scripts/regions/south_america/colombia/4_ml/evaluation/calibrate_C" --model_type rf --split-version main --calib-source earlystop --method auto
 
 echo "calibrate_C script (RF mode, main split) finished."

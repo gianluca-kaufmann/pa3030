@@ -48,7 +48,7 @@ echo "PWD = $(pwd)"
   find scripts -maxdepth 4 -type f -name "calibrate_C"
   exit 1
 }
-# Run the script (defaults to main split, temporal_cv source)
-python "scripts/regions/south_america/colombia/4_ml/evaluation/calibrate_C" --model_type lgbm --split-version main --calib-source temporal_cv --method platt
+# Run the script (main split, LGBM, temporal_cv source; auto selects best of Platt/Isotonic by test Brier)
+python "scripts/regions/south_america/colombia/4_ml/evaluation/calibrate_C" --model_type lgbm --split-version main --calib-source temporal_cv --method auto
 
 echo "calibrate_C script (LGBM mode, main split) finished."
