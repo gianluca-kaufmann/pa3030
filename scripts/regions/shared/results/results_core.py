@@ -651,21 +651,21 @@ def create_risk_map(
     if sa_gdf.crs is None:
         sa_gdf.set_crs('EPSG:4326', inplace=True)
     
-    print(f"  South America boundary CRS: {sa_gdf.crs}")
-    print(f"  South America boundary bounds: {sa_gdf.total_bounds}")
-    
+    print(f"  {REGION_LABEL} boundary CRS: {sa_gdf.crs}")
+    print(f"  {REGION_LABEL} boundary bounds: {sa_gdf.total_bounds}")
+
     # Reproject to EPSG:3857 (Web Mercator) for accurate visualization
     sa_gdf_proj = sa_gdf.to_crs('EPSG:3857')
     print(f"  Reprojected to EPSG:3857 (Web Mercator)")
     print(f"  Projected bounds (meters): {sa_gdf_proj.total_bounds}")
-    
+
     # Create GeoDataFrame from predictions
     geometry = gpd.points_from_xy(df['x'], df['y'])
     gdf = gpd.GeoDataFrame(df, geometry=geometry, crs='EPSG:4326')
-    
+
     # Reproject predictions to EPSG:3857
     gdf = gdf.to_crs('EPSG:3857')
-    
+
     print(f"  Total rows (pixel-years): {len(gdf):,}")
     
     # Extract time period for labels
@@ -790,11 +790,20 @@ def create_risk_map(
     total_actual_establishments = int(pixel_agg['is_observed'].sum())
     total_future_establishments = int(pixel_agg['is_future'].sum())
     
-    # Step 4: Calculate top-X% threshold at PIXEL level
-    top_pct_threshold = np.percentile(pixel_agg['y_pred_proba'], 100 - threshold_pct)
-    pixel_agg['is_predicted'] = (pixel_agg['y_pred_proba'] >= top_pct_threshold).astype(int)
-    
-    print(f"  ✓ Top-{threshold_pct}% threshold (pixel-level): {top_pct_threshold:.6f}")
+    # Step 4: Select exactly top-threshold_pct% pixels using argpartition.
+    # Using np.percentile + >= would include all ties at the boundary and over-select
+    # (e.g. many RF probability ties could push predicted_count well above threshold_pct%).
+    # argpartition gives exactly n_top_pixels, with ties broken arbitrarily but consistently.
+    n_top_pixels = max(1, int(len(pixel_agg) * threshold_pct / 100))
+    proba_vals = pixel_agg['y_pred_proba'].values
+    top_pixel_idx = np.argpartition(proba_vals, -n_top_pixels)[-n_top_pixels:]
+    is_predicted_arr = np.zeros(len(pixel_agg), dtype=np.int8)
+    is_predicted_arr[top_pixel_idx] = 1
+    pixel_agg = pixel_agg.copy()
+    pixel_agg['is_predicted'] = is_predicted_arr
+    top_pct_threshold = float(proba_vals[top_pixel_idx].min())
+
+    print(f"  ✓ Top-{threshold_pct}% = {n_top_pixels:,} pixels (pixel-level min score: {top_pct_threshold:.6f})")
     
     # Step 5: Compute statistics from pixel_agg (unique physical pixels by row,col)
     predicted_count = int(pixel_agg['is_predicted'].sum())
@@ -817,9 +826,16 @@ def create_risk_map(
 
     print(f"\n  FINAL STATISTICS (pixel-level, after filtering):")
     print(f"    Total pixels: {len(pixel_agg):,}")
-    print(f"    Predicted high-risk (top {threshold_pct}%): {predicted_count:,}")
-    print(f"    Actual PA establishments (test period): {observed_count:,}")
+    print(f"    Predicted high-risk (top {threshold_pct}%): {predicted_count:,} "
+          f"({predicted_count / len(pixel_agg) * 100:.2f}% of pixels)")
+    print(f"    Actual PA establishments (test period): {observed_count:,} "
+          f"({observed_count / len(pixel_agg) * 100:.3f}% of pixels)")
     print(f"    Overlap (correct predictions): {overlap_count:,}")
+    if observed_count > 0:
+        print(f"    NOTE: With only {observed_count:,} actual establishments out of "
+              f"{len(pixel_agg):,} pixels, top-{threshold_pct}% selects "
+              f"{predicted_count:,} pixels — high recall can be legitimate if "
+              f"designations are geographically concentrated.")
     if predicted_count > 0:
         hit_rate = overlap_count / predicted_count * 100
         print(f"    Hit rate: {overlap_count:,}/{predicted_count:,} = {hit_rate:.1f}%")
@@ -1025,21 +1041,21 @@ def create_p1pct_diagnostic_map(
     print("CREATING ROW-LEVEL P@1% DIAGNOSTIC MAP")
     print("=" * 70)
     
-    # Get South America boundary (use cached if provided)
+    # Get region boundary (use cached if provided)
     if sa_gdf is None:
         sa_gdf = get_region_boundary(region_boundary_path)
-    
+
     # Ensure CRS is set (assume EPSG:4326 if not set)
     if sa_gdf.crs is None:
         sa_gdf.set_crs('EPSG:4326', inplace=True)
-    
-    print(f"  South America boundary CRS: {sa_gdf.crs}")
-    
+
+    print(f"  {REGION_LABEL} boundary CRS: {sa_gdf.crs}")
+
     # Reproject to EPSG:3857 (Web Mercator) for accurate visualization
     sa_gdf_proj = sa_gdf.to_crs('EPSG:3857')
     print(f"  Reprojected to EPSG:3857 (Web Mercator)")
     print(f"  Projected bounds (meters): {sa_gdf_proj.total_bounds}")
-    
+
     # Create GeoDataFrame from predictions (keep all rows, no deduplication)
     geometry = gpd.points_from_xy(df['x'], df['y'])
     gdf = gpd.GeoDataFrame(df, geometry=geometry, crs='EPSG:4326')
@@ -1054,13 +1070,18 @@ def create_p1pct_diagnostic_map(
     n_top_k = max(1, int(len(y_proba) * 1 / 100))
     print(f"  Top 1% count: {n_top_k:,} rows")
     
-    # Use argpartition to get top 1% indices (same as training script)
+    # Use argpartition to select exactly n_top_k rows.
+    # Do NOT back-convert to a threshold and re-apply >=: ties at the boundary
+    # would expand the selection beyond n_top_k and make overlap_count inconsistent
+    # with the actual P@1% metric value printed in the same block.
     top_k_idx = np.argpartition(y_proba, -n_top_k)[-n_top_k:]
-    top_k_threshold = np.min(y_proba[top_k_idx])
-    print(f"  Top 1% threshold: {top_k_threshold:.6f}")
-    
-    # Mark rows as top-1% (row-level, no aggregation)
-    gdf['is_top1pct'] = df['y_pred_proba'] >= top_k_threshold
+    top_k_threshold = float(np.min(y_proba[top_k_idx]))
+    print(f"  Top 1% min score: {top_k_threshold:.6f}")
+    top_k_mask = np.zeros(len(y_proba), dtype=bool)
+    top_k_mask[top_k_idx] = True
+
+    # Mark rows as top-1% (row-level, no aggregation, exactly n_top_k rows)
+    gdf['is_top1pct'] = top_k_mask
     
     # Mark rows as positive using ONLY y_true (no WDPA OR-logic, no cross-year)
     gdf['is_positive'] = (df['y_true'] == 1)
@@ -1079,10 +1100,12 @@ def create_p1pct_diagnostic_map(
     # Compute actual P@1% metric for verification
     y_true = df['y_true'].values
     actual_p1pct = y_true[top_k_idx].sum() / n_top_k
+    total_pos = overlap_count + observed_only_count
     print(f"  Row-level P@1% metric: {actual_p1pct:.4f} ({overlap_count:,}/{n_top_k:,})")
-    print(f"  Predicted high-risk only: {predicted_only_count:,}")
-    print(f"  Observed positives only: {observed_only_count:,}")
-    print(f"  Overlap (same row): {overlap_count:,}")
+    print(f"  Total positive rows (y_true=1): {total_pos:,}")
+    print(f"    Captured by top 1% (overlap): {overlap_count:,}")
+    print(f"    Missed by top 1% (y_true=1, outside top 1%): {observed_only_count:,}")
+    print(f"  Predicted high-risk only (y_true=0, in top 1%): {predicted_only_count:,}")
     
     # Create categorical raster
     category_codes = {
@@ -1258,9 +1281,9 @@ def create_p1pct_diagnostic_map(
                                     markerfacecolor=category_colors_hex[1], markersize=10, 
                                     alpha=1.0, label=f'Predicted high-risk only (n={predicted_only_count:,} rows)'))
     if observed_only_count > 0:
-        legend_elements.append(Line2D([0], [0], marker='s', color='w', 
-                                    markerfacecolor=category_colors_hex[2], markersize=10, 
-                                    alpha=1.0, label=f'Observed positives only (n={observed_only_count:,} rows)'))
+        legend_elements.append(Line2D([0], [0], marker='s', color='w',
+                                    markerfacecolor=category_colors_hex[2], markersize=10,
+                                    alpha=1.0, label=f'Missed: y_true=1, outside top 1% (n={observed_only_count:,} rows)'))
     
     ax.legend(handles=legend_elements, loc='upper left', fontsize=FONTSIZE_LEGEND, 
               framealpha=0.95, fancybox=True, shadow=True)
@@ -1328,21 +1351,21 @@ def create_probability_map(
     print("CREATING PROBABILITY MAP")
     print("=" * 70)
     
-    # Get South America boundary (use cached if provided)
+    # Get region boundary (use cached if provided)
     if sa_gdf is None:
         sa_gdf = get_region_boundary(region_boundary_path)
-    
+
     # Ensure CRS is set (assume EPSG:4326 if not set)
     if sa_gdf.crs is None:
         sa_gdf.set_crs('EPSG:4326', inplace=True)
-    
-    print(f"  South America boundary CRS: {sa_gdf.crs}")
-    
+
+    print(f"  {REGION_LABEL} boundary CRS: {sa_gdf.crs}")
+
     # Reproject to EPSG:3857 (Web Mercator) for accurate visualization
     sa_gdf_proj = sa_gdf.to_crs('EPSG:3857')
     print(f"  Reprojected to EPSG:3857 (Web Mercator)")
     print(f"  Projected bounds (meters): {sa_gdf_proj.total_bounds}")
-    
+
     # Create GeoDataFrame from predictions
     geometry = gpd.points_from_xy(df['x'], df['y'])
     gdf = gpd.GeoDataFrame(df, geometry=geometry, crs='EPSG:4326')
@@ -2737,7 +2760,7 @@ def main() -> None:
     df = detect_and_reproject_coordinates(df)
     validate_coordinates(df)
     
-    # Load South America boundary once and reuse for all map outputs (avoids 5x load/download)
+    # Load region boundary once and reuse for all map outputs (avoids 5x load/download)
     sa_gdf = get_region_boundary(region_boundary_path)
     # Risk map generation (1%, 5%, 10%) - run first to get future capture metrics for table
     thresholds = [1, 5, 10]
