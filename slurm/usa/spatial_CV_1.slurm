@@ -1,0 +1,96 @@
+#!/bin/bash
+#SBATCH --job-name=lobo_USA
+#SBATCH --partition=normal.120h
+#SBATCH --time=120:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem-per-cpu=4G
+#SBATCH --output=/cluster/scratch/%u/logs/lobo_USA_%A_%a.out
+#SBATCH --error=/cluster/scratch/%u/logs/lobo_USA_%A_%a.err
+#SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
+#SBATCH --array=0-9
+
+# ------------------------------------------------------------------------------
+# Leave-One-Biome-Out (LOBO) spatial CV — USA
+#
+# Submits one SLURM array job per biome fold.  Each task trains a LightGBM
+# model on all biomes except one and evaluates on the held-out biome.
+#
+# Usage (submit all folds at once via array):
+#   sbatch slurm/usa/spatial_cv_lobo.slurm
+#
+# Usage (single fold, e.g. biome index 3):
+#   BIOME_IDX=3 sbatch --array=3 slurm/usa/spatial_cv_lobo.slurm
+#   or equivalently:
+#   sbatch --export=BIOME_IDX=3 --array=3 slurm/usa/spatial_cv_lobo.slurm
+#
+# The SLURM array index (SLURM_ARRAY_TASK_ID) is used as the biome index
+# unless the BIOME_IDX environment variable is set explicitly.
+#
+# To find valid biome indices run:
+#   python scripts/regions/usa/6_evaluation/spatial_cv_lobo --list-biomes
+#
+# Prerequisites:
+#   The USA GSN raster must exist at:
+#   data/usa/ready/GSN/gsn_terrestrial_ecoregions_mask_1km.tif
+#   Generate it by adapting scripts/regions/south_america/2_preprocessing/gsn_preprocessing
+#   for the USA backbone extent.
+# ------------------------------------------------------------------------------
+
+# Create necessary folders on $SCRATCH if they don't exist
+mkdir -p "$SCRATCH/logs"
+mkdir -p "$SCRATCH/outputs/usa/results/spatial_cv"
+
+#------------------------------------------------------------------------------
+# Load modules
+#------------------------------------------------------------------------------
+module purge
+module load stack/2024-06
+module load gcc/12.2.0
+module load python_cuda/3.11.6
+module load cuda/12.4.1
+module load eth_proxy
+
+#------------------------------------------------------------------------------
+# Activate the Python virtual environment
+#------------------------------------------------------------------------------
+VENV_DIR="$HOME/venvs/master_thesis"
+source "$VENV_DIR/bin/activate"
+export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
+
+#------------------------------------------------------------------------------
+# Determine biome index
+#   - If BIOME_IDX is set externally, use it.
+#   - Otherwise fall back to the SLURM array task ID.
+#------------------------------------------------------------------------------
+FOLD_IDX="${BIOME_IDX:-${SLURM_ARRAY_TASK_ID}}"
+echo "LOBO fold index: ${FOLD_IDX}"
+
+#------------------------------------------------------------------------------
+# Preflight checks
+#------------------------------------------------------------------------------
+ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Repo path missing"; exit 1; }
+echo "PWD = $(pwd)"
+
+SCRIPT="scripts/regions/usa/6_evaluation/spatial_CV_1"
+[ -f "$SCRIPT" ] || {
+  echo "ERROR: $SCRIPT not found"
+  find scripts -maxdepth 6 -type f -name "spatial_CV_1" 2>/dev/null
+  exit 1
+}
+
+GSN_RASTER="data/usa/ready/GSN/gsn_terrestrial_ecoregions_mask_1km.tif"
+[ -f "$GSN_RASTER" ] || {
+  echo "ERROR: USA GSN raster not found at $GSN_RASTER"
+  echo "Generate it by adapting scripts/regions/south_america/2_preprocessing/gsn_preprocessing for USA."
+  exit 1
+}
+
+#------------------------------------------------------------------------------
+# Run the LOBO fold
+#------------------------------------------------------------------------------
+echo "Starting LOBO fold ${FOLD_IDX} (USA)..."
+srun --cpu-bind=cores --distribution=block:block \
+  python -u "$SCRIPT" --biome-idx "${FOLD_IDX}"
+
+echo "spatial_CV_1 fold ${FOLD_IDX} (USA) finished."

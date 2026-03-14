@@ -92,6 +92,7 @@ Shared utilities (scripts/regions/shared/):
 | Model | Region | Scale | Description |
 |-------|--------|-------|-------------|
 | Model 1 | South America (continental) | ~350M pixel-years | Full-scale production model |
+| Model 2 | USA (continental) | TBD | Mirrors Model 1 structure for cross-continental validation |
 | Model C | Colombia (sub-region) | ~7M pixel-years | Rapid validation & development |
 | Model E | South America | ~20M pixel-years | Satellite embedding experiments |
 
@@ -137,8 +138,21 @@ Raw LightGBM probabilities are post-hoc calibrated using:
 Per-fold calibrators are fitted during temporal CV, then averaged.
 
 ### Spatial Generalization
-Region-wise (country/biome) breakdown of metrics to check whether
-performance holds across geographies or is driven by specific areas.
+Three-layer framework using WWF biomes from the GSN terrestrial ecoregions dataset:
+
+- **Layer 1 — Leave-One-Biome-Out (LOBO)** (`spatial_CV_1`): For each biome fold,
+  train on all other biomes, evaluate on the held-out biome's test pixels.
+  Run as a SLURM array job (one task per biome). Aggregate results with
+  `spatial_CV_1_aggregate`. Tests whether the model generalizes to unseen geographies.
+- **Layer 2 — Biome-stratified metrics** (`spatial_CV_2`): Loads existing scored
+  parquets from the full trained model, assigns WWF biome labels via GSN raster
+  row/col lookup, computes per-biome metrics. Fast diagnostic; run after step 5.
+- **Layer 3 — Cross-continental transfer** (`spatial_CV_3`): Trains on SA, evaluates
+  on USA; then USA → SA. Uses features common to both regions. Strongest
+  generalization claim — success means patterns are continent-independent.
+
+All logic lives in `scripts/regions/shared/evaluation/spatial_cv_core.py`.
+Region-specific scripts are thin wrappers (2–3 lines each).
 
 ### Outputs
 - Benchmark JSON (structured metrics for comparison)
@@ -195,15 +209,16 @@ Features that could improve predictive power but are not currently included:
    - Regression test: same seed produces same metrics
 2. **Ablation study** — Remove feature groups one at a time and measure impact.
    Shows what actually drives protection decisions (not just that the model works).
-3. **Second continent** — Run the pipeline on USA or another region.
-   Transforms a regional result into a generalizable finding.
+3. ~~**Second continent**~~ — **DONE.** USA pipeline mirrors SA structure (Model 2).
+   Spatial CV Layer 3 provides cross-continental transfer evaluation (SA ↔ USA).
 4. **Literature comparison** — Benchmark against published PA prediction methods.
 
 ### Medium Priority (Quality & Credibility)
 5. **Pin all package versions** — `environment.yml` uses `python=3.12` not `3.12.1`.
    LightGBM version unspecified. Risk of irreproducible results over time.
-6. **Extract shared utilities** — USA and South America preprocessing are copy-pasted.
-   Refactor into a shared `utils/` module to reduce duplication and bug risk.
+6. **Extract shared utilities** — Spatial CV is now fully shared (`spatial_cv_core.py`).
+   Preprocessing scripts for USA and SA are still copy-pasted — refactor into
+   `shared/` to reduce duplication and bug risk.
 7. **Highlight calibration in paper** — Many ML papers skip calibration.
    The reliability diagrams and Platt/isotonic correction are a strength.
 8. **Explain right-censoring design** — The `LAST_LABEL_YEAR = 2019` constraint
@@ -246,6 +261,19 @@ python scripts/regions/south_america/5_training/model1_splits
 python scripts/regions/south_america/5_training/model1_LGBM
 python scripts/regions/south_america/6_evaluation/calibrate_1
 python scripts/regions/south_america/7_results/model1_results
+
+# Spatial CV — Layer 2 (after step 5 training)
+python scripts/regions/south_america/6_evaluation/spatial_CV_2
+python scripts/regions/usa/6_evaluation/spatial_CV_2
+
+# Spatial CV — Layer 1 LOBO (can run in parallel with step 5, on Euler)
+python scripts/regions/south_america/6_evaluation/spatial_CV_1 --list-biomes
+sbatch slurm/south_america/spatial_CV_1.slurm          # array: all folds
+sbatch --export=BIOME_IDX=3 --array=3 slurm/south_america/spatial_CV_1.slurm  # single fold
+sbatch slurm/south_america/spatial_CV_1_aggregate.slurm  # after all folds finish
+
+# Spatial CV — Layer 3 cross-continental transfer (can run in parallel with step 5)
+sbatch slurm/south_america/spatial_CV_3.slurm
 
 # Run tests
 pytest tests/test_pipeline.py -v
