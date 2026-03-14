@@ -406,7 +406,8 @@ def load_numpy_arrays_two_pass(
     idx_pos = 0  # Index for positive samples
     idx_neg = 0  # Index for negative samples (starts after positives)
     batch_num = 0
-    
+    _load_milestone = -1
+
     # Reservoir sampling state for negatives (if max_neg_samples > 0)
     neg_reservoir = None
     neg_reservoir_years = None
@@ -527,18 +528,22 @@ def load_numpy_arrays_two_pass(
             
             del batch_table, target_array, year_array, wdpa_prev_array, target_valid, year_valid
             del feature_table, X_batch, y_batch, batch
-            
+
             # More aggressive garbage collection for large datasets
             if batch_num % 10 == 0:
                 gc.collect()
                 loaded_so_far = idx_pos + (len(neg_reservoir) if neg_reservoir is not None else idx_neg)
-                print(f"  {batch_num} batches, {loaded_so_far:,}/{n_samples:,} samples loaded")
-                report_memory_usage(f"load batch {batch_num}")
-    
+                _pct = loaded_so_far * 100 // n_samples if n_samples > 0 else 0
+                _ms  = _pct // 25
+                if _ms > _load_milestone:
+                    _load_milestone = _ms
+                    print(f"  {_pct}% — {loaded_so_far:,}/{n_samples:,} rows")
+                    report_memory_usage(f"  {_pct}%")
+
     finally:
         del parquet_file
         gc.collect()
-    
+
     # If we used reservoir sampling, copy reservoir to final arrays
     if max_neg_samples > 0 and neg_reservoir is not None:
         n_neg_final = min(neg_seen, max_neg_samples)
@@ -673,7 +678,8 @@ def load_numpy_arrays_from_multiple_files(
     idx_pos = 0  # Index for positive samples
     idx_neg = 0  # Index for negative samples (starts after positives)
     batch_num = 0
-    
+    _load_milestone = -1
+
     # Reservoir sampling state for negatives (if max_neg_samples > 0)
     neg_reservoir = None
     neg_reservoir_years = None
@@ -793,17 +799,21 @@ def load_numpy_arrays_from_multiple_files(
                 
                 del batch_table, target_array, year_array, wdpa_prev_array, target_valid, year_valid
                 del feature_table, X_batch, y_batch, batch
-                
+
                 # More aggressive garbage collection for large datasets
                 if batch_num % 10 == 0:
                     gc.collect()
                     loaded_so_far = idx_pos + (len(neg_reservoir) if neg_reservoir is not None else idx_neg)
-                    print(f"  {batch_num} batches, {loaded_so_far:,}/{n_samples:,} samples loaded")
-                    report_memory_usage(f"load batch {batch_num}")
+                    _pct = loaded_so_far * 100 // n_samples if n_samples > 0 else 0
+                    _ms  = _pct // 25
+                    if _ms > _load_milestone:
+                        _load_milestone = _ms
+                        print(f"  {_pct}% — {loaded_so_far:,}/{n_samples:,} rows")
+                        report_memory_usage(f"  {_pct}%")
         finally:
             del parquet_file
             gc.collect()
-    
+
     # If we used reservoir sampling, copy reservoir to final arrays
     if max_neg_samples > 0 and neg_reservoir is not None:
         n_neg_final = min(neg_seen, max_neg_samples)
@@ -964,6 +974,7 @@ def phase1_training(
     writer = None
     idx_offset = 0
     batch_num = 0
+    _score_milestone = -1
     earlystop_pred_start = time.time()
 
     keep_cols_with_wdpa = keep_cols_train + ['WDPA_prev'] if 'WDPA_prev' not in keep_cols_train else keep_cols_train
@@ -1027,8 +1038,12 @@ def phase1_training(
 
             if batch_num % 10 == 0:
                 gc.collect()
-                print(f"  {batch_num} batches, {idx_offset:,}/{n_earlystop:,} predictions generated")
-                report_memory_usage(f"earlystop batch {batch_num}")
+                _pct = idx_offset * 100 // n_earlystop if n_earlystop > 0 else 0
+                _ms  = _pct // 25
+                if _ms > _score_milestone:
+                    _score_milestone = _ms
+                    print(f"  {_pct}% — {idx_offset:,}/{n_earlystop:,} rows")
+                    report_memory_usage(f"  {_pct}%")
     finally:
         if writer is not None:
             writer.close()
@@ -1218,6 +1233,7 @@ def phase2_testing(
     scored_path = output_dir / f"model1_rf_win5_scored_{timestamp}.parquet"
     writer = None
     test_pos = test_neg = batch_num = idx_offset = 0
+    _score_milestone = -1
     pred_start = time.time()
     
     # Add WDPA_prev to columns we need to read for filtering
@@ -1298,17 +1314,21 @@ def phase2_testing(
             
             del batch_table, target_array, wdpa_prev_array, target_valid, feature_table, X_batch, y_batch, y_proba_batch
             del row_array, col_array, year_array, year_array_valid, result_arrays, result_table, batch
-            
+
             # More aggressive garbage collection for large datasets
             if batch_num % 10 == 0:
                 gc.collect()
-                print(f"  {batch_num} batches, {idx_offset:,}/{n_test_total:,} rows")
-                report_memory_usage(f"batch {batch_num}")
+                _pct = idx_offset * 100 // n_test_total if n_test_total > 0 else 0
+                _ms  = _pct // 25
+                if _ms > _score_milestone:
+                    _score_milestone = _ms
+                    print(f"  {_pct}% — {idx_offset:,}/{n_test_total:,} rows")
+                    report_memory_usage(f"  {_pct}%")
     finally:
         if writer is not None:
             writer.close()
         del parquet_file; gc.collect()
-    
+
     if idx_offset != n_test_total:
         raise ValueError(f"Mismatch: expected {n_test_total:,} samples but processed {idx_offset:,}")
     

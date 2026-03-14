@@ -356,7 +356,8 @@ def load_numpy_arrays_two_pass(
     parquet_file = pq.ParquetFile(df_path)
     idx_offset = 0
     batch_num = 0
-    
+    _load_milestone = -1
+
     try:
         for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols, use_threads=True):
             batch_num += 1
@@ -416,17 +417,19 @@ def load_numpy_arrays_two_pass(
             
             del batch_table, target_array, year_array, wdpa_prev_array, target_valid, year_valid
             del feature_table, X_batch, y_batch, batch
-            
+
             if batch_num % 25 == 0:
                 gc.collect()
-            
-            if batch_num % 10 == 0:
-                print(f"  {batch_num} batches, {idx_offset:,}/{n_samples:,} samples loaded")
-                report_memory_usage(f"load batch {batch_num}")
+            _pct = idx_offset * 100 // n_samples if n_samples > 0 else 0
+            _ms  = _pct // 25
+            if _ms > _load_milestone:
+                _load_milestone = _ms
+                print(f"  {_pct}% — {idx_offset:,}/{n_samples:,} rows")
+                report_memory_usage(f"  {_pct}%")
     finally:
         del parquet_file
         gc.collect()
-    
+
     if idx_offset != n_samples:
         raise ValueError(f"Mismatch: expected {n_samples:,} samples but loaded {idx_offset:,}")
     
@@ -531,7 +534,8 @@ def load_numpy_arrays_from_multiple_files(
     years_array = np.empty(n_samples, dtype=np.int32)
     idx_offset = 0
     batch_num = 0
-    
+    _load_milestone = -1
+
     for file_idx, df_path in enumerate(df_paths):
         parquet_file = pq.ParquetFile(df_path)
         try:
@@ -589,20 +593,22 @@ def load_numpy_arrays_from_multiple_files(
                 
                 del batch_table, target_array, year_array, wdpa_prev_array, target_valid, year_valid
                 del feature_table, X_batch, y_batch, batch
-                
+
                 if batch_num % 25 == 0:
                     gc.collect()
-                
-                if batch_num % 10 == 0:
-                    print(f"  {batch_num} batches, {idx_offset:,}/{n_samples:,} samples loaded")
-                    report_memory_usage(f"load batch {batch_num}")
+                _pct = idx_offset * 100 // n_samples if n_samples > 0 else 0
+                _ms  = _pct // 25
+                if _ms > _load_milestone:
+                    _load_milestone = _ms
+                    print(f"  {_pct}% — {idx_offset:,}/{n_samples:,} rows")
+                    report_memory_usage(f"  {_pct}%")
         finally:
             del parquet_file
             gc.collect()
-    
+
     if idx_offset != n_samples:
         raise ValueError(f"Mismatch: expected {n_samples:,} samples but loaded {idx_offset:,}")
-    
+
     pos = int(y.sum())
     neg = int((y == 0).sum())
     years = sorted(years_set)
@@ -1278,6 +1284,7 @@ def phase2_testing(
     scored_path = output_dir / f"model1_lgbm_scored_{timestamp}.parquet"
     writer = None
     test_pos = test_neg = batch_num = idx_offset = 0
+    _score_milestone = -1
     pred_start = time.time()
     
     # Ensure WDPA_prev is included in columns to read
@@ -1358,21 +1365,23 @@ def phase2_testing(
             
             del batch_table, target_array, wdpa_prev_array, target_valid, feature_table, X_batch, y_batch, y_proba_batch
             del row_array, col_array, year_array, year_array_valid, result_arrays, result_table, batch
-            
+
             if batch_num % 25 == 0:
                 gc.collect()
-            
-            if batch_num % 10 == 0:
-                print(f"  {batch_num} batches, {idx_offset:,}/{n_test_total:,} rows")
-                report_memory_usage(f"batch {batch_num}")
+            _pct = idx_offset * 100 // n_test_total if n_test_total > 0 else 0
+            _ms  = _pct // 25
+            if _ms > _score_milestone:
+                _score_milestone = _ms
+                print(f"  {_pct}% — {idx_offset:,}/{n_test_total:,} rows")
+                report_memory_usage(f"  {_pct}%")
     finally:
         if writer is not None:
             writer.close()
         del parquet_file; gc.collect()
-    
+
     if idx_offset != n_test_total:
         raise ValueError(f"Mismatch: expected {n_test_total:,} samples but processed {idx_offset:,}")
-    
+
     pred_time = time.time() - pred_start
     print(f"Completed {batch_num} batches in {pred_time:.1f}s, {n_test_total:,} rows")
     report_memory_usage("after all predictions")

@@ -51,6 +51,11 @@ try:
 except ImportError:
     gpd = None
 
+try:
+    import wandb
+except ImportError:
+    wandb = None
+
 from scripts.regions.shared.training.utils import (
     Tee,
     get_repo_root,
@@ -332,6 +337,7 @@ def load_data_spatial(
     years_arr = np.empty(n_total, dtype=np.int32)
     offset    = 0
     batch_num = 0
+    _load_milestone = -1
 
     for path in parquet_paths:
         pf = pq.ParquetFile(path)
@@ -370,9 +376,12 @@ def load_data_spatial(
                 offset += bs
                 if batch_num % 25 == 0:
                     gc.collect()
-                if batch_num % 10 == 0:
-                    print(f"  batch {batch_num}, {offset:,}/{n_total:,}")
-                    report_memory_usage(f"batch {batch_num}")
+                _pct = offset * 100 // n_total if n_total > 0 else 0
+                _ms  = _pct // 25
+                if _ms > _load_milestone:
+                    _load_milestone = _ms
+                    print(f"  {_pct}% — {offset:,}/{n_total:,} rows")
+                    report_memory_usage(f"  {_pct}%")
         finally:
             del pf; gc.collect()
 
@@ -431,7 +440,7 @@ def load_region_train(
     X         = np.empty((n_total, len(feature_cols)), dtype=np.float32)
     y         = np.empty(n_total, dtype=np.int8)
     years_arr = np.empty(n_total, dtype=np.int32)
-    offset = 0; batch_n = 0
+    offset = 0; batch_n = 0; _load_milestone = -1
 
     for path in paths:
         pf = pq.ParquetFile(path)
@@ -459,9 +468,12 @@ def load_region_train(
                 offset += bs
                 if batch_n % 25 == 0:
                     gc.collect()
-                if batch_n % 10 == 0:
-                    print(f"  batch {batch_n}, {offset:,}/{n_total:,}")
-                    report_memory_usage(f"batch {batch_n}")
+                _pct = offset * 100 // n_total if n_total > 0 else 0
+                _ms  = _pct // 25
+                if _ms > _load_milestone:
+                    _load_milestone = _ms
+                    print(f"  {_pct}% — {offset:,}/{n_total:,} rows")
+                    report_memory_usage(f"  {_pct}%")
         finally:
             del pf; gc.collect()
 
@@ -1022,8 +1034,9 @@ def run_lobo_main(region: str, model_id: str) -> None:
                               .replace("&", "and")[:40]
         if c.isalnum() or c == "_"
     )
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path  = output_dir / f"fold_{args.biome_idx:02d}_{biome_slug}_{timestamp}.txt"
+    timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path   = output_dir / f"fold_{args.biome_idx:02d}_{biome_slug}_{timestamp}.txt"
+    use_wandb  = False
 
     tee = Tee(log_path)
     sys.stdout = tee
@@ -1066,6 +1079,29 @@ def run_lobo_main(region: str, model_id: str) -> None:
         ]
         print(f"\nFeatures: {len(feature_cols)}")
         report_memory_usage("startup")
+
+        if wandb is not None:
+            try:
+                wandb.init(
+                    project="spatial-cv",
+                    entity=os.environ.get("WANDB_ENTITY"),
+                    name=f"lobo_{region}_{args.biome_idx:02d}_{biome_slug[:20]}",
+                    config={
+                        "region":          region,
+                        "model_id":        model_id,
+                        "biome_idx":       args.biome_idx,
+                        "biome_name":      biome_name,
+                        "n_biomes":        len(biome_groups),
+                        "train_years":     list(TRAIN_YEARS),
+                        "test_years":      [TEST_START, TEST_END],
+                        "num_boost_round": num_boost_round,
+                        "n_features":      len(feature_cols),
+                    },
+                )
+                use_wandb = True
+                print("W&B connected")
+            except Exception as _err:
+                print(f"W&B failed: {_err}")
 
         print("\n" + "=" * 70)
         print("STEP 1: LOAD TRAINING DATA (held-out biome excluded)")
@@ -1153,9 +1189,28 @@ def run_lobo_main(region: str, model_id: str) -> None:
         print(f"Time:      {elapsed:.1f}s ({elapsed/60:.1f} min)")
         print("=" * 70)
         print(f"\nFold results saved: {json_path}")
+
+        if use_wandb:
+            wandb.log({
+                "test/roc_auc":            m.get("roc_auc",            float("nan")),
+                "test/pr_auc":             m.get("pr_auc",             float("nan")),
+                "test/precision_at_1pct":  m.get("precision_at_1pct",  float("nan")),
+                "test/lift_at_1pct":       m.get("lift_at_1pct",       float("nan")),
+                "test/precision_at_5pct":  m.get("precision_at_5pct",  float("nan")),
+                "test/brier_score":        m.get("brier_score",        float("nan")),
+                "test/n_samples":          test_results["n_test"],
+                "test/n_positive":         n_pos_test,
+                "train/n_samples":         n_train,
+                "train/n_positive":        n_pos_tr,
+                "timing/total_seconds":    elapsed,
+            })
+            wandb.finish()
+
         print("Done.")
 
     finally:
+        if use_wandb and wandb is not None and wandb.run is not None:
+            wandb.finish()
         sys.stdout = tee.stdout
         tee.close()
         print(f"\nLog saved to: {log_path}")
@@ -1292,6 +1347,7 @@ def run_spatial_gen_main(region: str, model_id: str) -> None:
     timestamp    = datetime.now().strftime("%Y%m%d_%H%M%S")
     region_label = region.replace("_", " ").upper()
     log_path     = eval_dir / f"spatial_generalisation_{timestamp}.txt"
+    use_wandb    = False
 
     tee = Tee(log_path)
     sys.stdout = tee
@@ -1316,6 +1372,24 @@ def run_spatial_gen_main(region: str, model_id: str) -> None:
             raise FileNotFoundError(f"Shapefile not found: {shp_path}")
 
         biome_raster, _, int_to_biome = load_biome_raster_and_mapping(raster_path, shp_path)
+
+        if wandb is not None:
+            try:
+                wandb.init(
+                    project="spatial-cv",
+                    entity=os.environ.get("WANDB_ENTITY"),
+                    name=f"cv2_{region}_{model_id}_{timestamp}",
+                    config={
+                        "region":     region,
+                        "model_id":   model_id,
+                        "test_years": [TEST_START, TEST_END],
+                        "layer":      2,
+                    },
+                )
+                use_wandb = True
+                print("W&B connected")
+            except Exception as _err:
+                print(f"W&B failed: {_err}")
 
         print("\n" + "=" * 70)
         print("STEP 2: FIND SCORED FILES")
@@ -1387,9 +1461,28 @@ def run_spatial_gen_main(region: str, model_id: str) -> None:
         elapsed = time.time() - t_start
         print(f"\nTotal time: {elapsed:.1f}s ({elapsed/60:.1f} min)")
         print("=" * 70)
+
+        if use_wandb:
+            for _, row in results.iterrows():
+                prefix = f"{row['model']}/{row['biome'].replace(' ', '_')}"
+                log_dict: dict[str, Any] = {
+                    f"{prefix}/n_samples":   row.get("n_samples"),
+                    f"{prefix}/n_positives": row.get("n_positives"),
+                }
+                for metric in ("roc_auc", "pr_auc", "precision_at_1pct",
+                               "precision_at_5pct", "precision_at_10pct"):
+                    v = row.get(metric)
+                    if v is not None and not (isinstance(v, float) and np.isnan(v)):
+                        log_dict[f"{prefix}/{metric}"] = v
+                wandb.log(log_dict)
+            wandb.log({"timing/total_seconds": elapsed})
+            wandb.finish()
+
         print("Done.")
 
     finally:
+        if use_wandb and wandb is not None and wandb.run is not None:
+            wandb.finish()
         sys.stdout = tee.stdout
         tee.close()
         print(f"\nLog saved to: {log_path}")
@@ -1404,6 +1497,7 @@ def run_transfer_main() -> None:
     output_dir = resolve_cv_output_dir("south_america")
     timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path   = output_dir / f"transfer_results_{timestamp}.txt"
+    use_wandb  = False
 
     tee = Tee(log_path)
     sys.stdout = tee
@@ -1439,6 +1533,24 @@ def run_transfer_main() -> None:
 
         if len(common) == 0:
             raise ValueError("No common features found between SA and USA.")
+
+        if wandb is not None:
+            try:
+                wandb.init(
+                    project="spatial-cv",
+                    entity=os.environ.get("WANDB_ENTITY"),
+                    name=f"transfer_sa_usa_{timestamp}",
+                    config={
+                        "n_common_features": len(common),
+                        "train_years":       list(TRAIN_YEARS),
+                        "test_years":        [TEST_START, TEST_END],
+                        "layer":             3,
+                    },
+                )
+                use_wandb = True
+                print("W&B connected")
+            except Exception as _err:
+                print(f"W&B failed: {_err}")
 
         result_sa_to_usa = _run_transfer_direction(
             "south_america", "usa", common, output_dir, timestamp
@@ -1497,9 +1609,32 @@ def run_transfer_main() -> None:
 
         print(f"\nResults saved: {json_path}")
         print(f"Total time: {elapsed:.1f}s ({elapsed/60:.1f} min)")
+
+        if use_wandb:
+            for result in [result_sa_to_usa, result_usa_to_sa]:
+                src  = result["source_region"]
+                tgt  = result["target_region"]
+                m    = result["test_metrics"]
+                pref = f"{src}_to_{tgt}"
+                wandb.log({
+                    f"{pref}/roc_auc":           m.get("roc_auc",           float("nan")),
+                    f"{pref}/pr_auc":            m.get("pr_auc",            float("nan")),
+                    f"{pref}/precision_at_1pct": m.get("precision_at_1pct", float("nan")),
+                    f"{pref}/lift_at_1pct":      m.get("lift_at_1pct",      float("nan")),
+                    f"{pref}/precision_at_5pct": m.get("precision_at_5pct", float("nan")),
+                    f"{pref}/brier_score":       m.get("brier_score",       float("nan")),
+                    f"{pref}/n_test":            result["test_data"]["n_samples"],
+                    f"{pref}/n_test_positive":   result["test_data"]["n_positive"],
+                    f"{pref}/n_train":           result["train_data"]["n_samples"],
+                })
+            wandb.log({"timing/total_seconds": elapsed})
+            wandb.finish()
+
         print("Done.")
 
     finally:
+        if use_wandb and wandb is not None and wandb.run is not None:
+            wandb.finish()
         sys.stdout = tee.stdout
         tee.close()
         print(f"\nLog saved to: {log_path}")
