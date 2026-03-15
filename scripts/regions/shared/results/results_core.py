@@ -19,7 +19,7 @@ from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
-from sklearn.metrics import precision_recall_curve, average_precision_score, brier_score_loss
+from sklearn.metrics import precision_recall_curve, average_precision_score, brier_score_loss, roc_curve, roc_auc_score
 from sklearn.calibration import calibration_curve
 import geopandas as gpd
 from shapely.geometry import Point
@@ -298,6 +298,146 @@ def create_metrics_table(metrics_data: Dict[str, Any], output_dir: Path, model_t
     print(f"Saved LaTeX: {latex_path}")
 
 
+def create_comparison_table(
+    output_dir: Path,
+    model_type: str,
+    repo_root: Path,
+    scratch_root: Optional[Path],
+) -> None:
+    """Side-by-side performance comparison table for South America and USA.
+
+    Reads the already-written metrics_table.csv for each region and produces
+    a two-column PDF table + LaTeX file.  Gracefully skips if neither or only
+    one region's CSV is found (but still writes whatever is available).
+    """
+    print("\n" + "=" * 70)
+    print("CREATING CROSS-REGION COMPARISON TABLE")
+    print("=" * 70)
+
+    # Canonical metrics rows and display order
+    ROWS = [
+        ("ROC AUC",              "ROC AUC"),
+        ("PR AUC",               "PR AUC"),
+        ("Precision @ 1%",       "Precision @ 1\\%"),
+        ("Precision @ 5%",       "Precision @ 5\\%"),
+        ("Lift @ 1%",            "Lift @ 1\\%"),
+        ("Lift @ 5%",            "Lift @ 5\\%"),
+        ("Baseline Rate",        "Baseline Rate"),
+        ("Brier Score",          "Brier Score"),
+        ("ECE (Expected Calibration Error)", "ECE"),
+    ]
+
+    # Region configs: (slug, model_id, display_label)
+    REGIONS = [
+        ("south_america", "model1", "Model 1 (SA)"),
+        ("usa",           "model2", "Model 2 (USA)"),
+    ]
+
+    def find_metrics_csv(region_slug: str, model_id: str) -> Optional[Path]:
+        candidates = []
+        if scratch_root:
+            candidates.append(
+                scratch_root / f"outputs/{region_slug}/results/{model_id}_{model_type}/metrics_table.csv"
+            )
+        candidates.append(
+            repo_root / f"outputs/{region_slug}/results/{model_id}_{model_type}/metrics_table.csv"
+        )
+        for c in candidates:
+            if c.exists():
+                return c
+        return None
+
+    # Load each region's CSV into a dict {metric_name: value_str}
+    region_data = {}
+    for slug, mid, label in REGIONS:
+        csv_path = find_metrics_csv(slug, mid)
+        if csv_path:
+            df_m = pd.read_csv(csv_path)
+            region_data[label] = dict(zip(df_m['Metric'], df_m['Value'].astype(str)))
+            print(f"  Loaded metrics for {label}: {csv_path}")
+        else:
+            print(f"  Metrics CSV not found for {label} — column will show N/A")
+            region_data[label] = {}
+
+    found_labels = [label for _, _, label in REGIONS if region_data[label]]
+    if not found_labels:
+        print("  No metrics CSVs found for either region; skipping comparison table.")
+        return
+
+    # Build table data
+    col_labels = [label for _, _, label in REGIONS]
+    table_rows = []
+    for csv_key, _ in ROWS:
+        row = [csv_key]
+        for label in col_labels:
+            row.append(region_data[label].get(csv_key, "N/A"))
+        table_rows.append(row)
+
+    # ── PDF table ─────────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(9, len(table_rows) * 0.55 + 1.5))
+    ax.axis('off')
+
+    display_row_labels = [display for _, display in ROWS]
+    cell_text = [[r[1], r[2]] for r in table_rows]
+    tbl = ax.table(
+        cellText=cell_text,
+        rowLabels=display_row_labels,
+        colLabels=col_labels,
+        loc='center',
+        cellLoc='center',
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(10)
+    tbl.scale(1.2, 1.6)
+
+    # Style header row
+    for j in range(len(col_labels)):
+        tbl[(0, j)].set_facecolor('#4A90D9')
+        tbl[(0, j)].set_text_props(color='white', fontweight='bold')
+    # Style row label column (alternating shading)
+    for i in range(1, len(table_rows) + 1):
+        tbl[(i, -1)].set_facecolor('#F5F5F5' if i % 2 == 0 else 'white')
+        for j in range(len(col_labels)):
+            tbl[(i, j)].set_facecolor('#F5F5F5' if i % 2 == 0 else 'white')
+
+    ax.set_title('Cross-Region Model Performance Comparison',
+                 fontsize=FONTSIZE_TITLE, fontweight='bold', pad=12)
+    plt.tight_layout()
+
+    pdf_path = output_dir / 'comparison_table.pdf'
+    plt.savefig(pdf_path, dpi=PR_CURVE_DPI, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved PDF: {pdf_path}")
+
+    # ── LaTeX table ───────────────────────────────────────────────────────────
+    def esc(s: str) -> str:
+        return s.replace('_', '\\_').replace('%', '\\%').replace('&', '\\&')
+
+    header = " & ".join(["Metric"] + col_labels) + " \\\\"
+    latex_lines = [
+        "\\begin{table}[h]",
+        "\\centering",
+        f"\\begin{{tabular}}{{l{'r' * len(col_labels)}}}",
+        "\\toprule",
+        header,
+        "\\midrule",
+    ]
+    for csv_key, display in ROWS:
+        vals = " & ".join(region_data[label].get(csv_key, "N/A") for _, _, label in REGIONS)
+        latex_lines.append(f"{esc(display)} & {vals} \\\\")
+    latex_lines += [
+        "\\bottomrule",
+        "\\end{tabular}",
+        "\\caption{Cross-region performance comparison (Model 1: South America, Model 2: USA).}",
+        "\\label{tab:comparison}",
+        "\\end{table}",
+    ]
+    latex_path = output_dir / 'comparison_table.tex'
+    with open(latex_path, 'w') as f:
+        f.write('\n'.join(latex_lines) + '\n')
+    print(f"  Saved LaTeX: {latex_path}")
+
+
 def create_pr_curve(df: pd.DataFrame, metrics_data: Dict[str, Any], output_dir: Path, model_type: str) -> None:
     """Create Precision-Recall curve with baseline prevalence."""
     print("\n" + "=" * 70)
@@ -345,6 +485,45 @@ def create_pr_curve(df: pd.DataFrame, metrics_data: Dict[str, Any], output_dir: 
     plt.savefig(pdf_path, dpi=PR_CURVE_DPI, bbox_inches='tight')
     print(f"Saved PDF: {pdf_path}")
     
+    plt.close()
+
+
+def create_roc_curve(df: pd.DataFrame, output_dir: Path, model_type: str) -> None:
+    """Create ROC curve with random-guess diagonal and AUC annotation."""
+    print("\n" + "=" * 70)
+    print("CREATING ROC CURVE")
+    print("=" * 70)
+
+    y_true = df['y_true'].values
+    y_pred_proba = df['y_pred_proba'].values
+
+    fpr, tpr, _ = roc_curve(y_true, y_pred_proba)
+    auc = roc_auc_score(y_true, y_pred_proba)
+    print(f"  ROC AUC: {auc:.4f}")
+
+    # Downsample if very large (purely cosmetic)
+    n_pts = len(fpr)
+    if n_pts > CUMULATIVE_GAINS_MAX_PLOT_POINTS:
+        idx = np.linspace(0, n_pts - 1, CUMULATIVE_GAINS_MAX_PLOT_POINTS, dtype=int)
+        fpr, tpr = fpr[idx], tpr[idx]
+
+    fig, ax = plt.subplots(figsize=PR_CURVE_FIGSIZE)
+    ax.plot(fpr, tpr, linewidth=2, label=f'Model (AUC = {auc:.4f})')
+    ax.plot([0, 1], [0, 1], 'r--', linewidth=2, label='Random guess (AUC = 0.5)')
+    ax.set_xlabel('False Positive Rate', fontsize=FONTSIZE_LABEL)
+    ax.set_ylabel('True Positive Rate', fontsize=FONTSIZE_LABEL)
+    ax.set_title(f'{MODEL_LABEL} ({model_type.upper()}) ROC Curve',
+                 fontsize=FONTSIZE_TITLE, fontweight='bold')
+    ax.legend(loc='lower right', fontsize=FONTSIZE_LEGEND)
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim([0, 1])
+    ax.set_ylim([0, 1])
+    ax.set_aspect('equal', adjustable='box')
+    plt.tight_layout()
+
+    pdf_path = output_dir / 'roc_curve.pdf'
+    plt.savefig(pdf_path, dpi=PR_CURVE_DPI, bbox_inches='tight')
+    print(f"  Saved PDF: {pdf_path}")
     plt.close()
 
 
@@ -1910,10 +2089,10 @@ def compute_shap_analysis(
     shap_importance_df.to_csv(shap_csv_path, index=False)
     print(f"  Saved top 20 features: {shap_csv_path.name}")
     
-    # SHAP dependence plots for top 5 features (feature value vs SHAP value)
+    # SHAP dependence plots for top 2 features by mean |SHAP| (most impactful features).
     # Distance features (dist_*) are stored in metres; rescale x-axis to km for readability.
     METER_FEATURES = {'dist_wdpa', 'dist_road', 'dist_indigenous', 'dist_water', 'dist_coast'}
-    top5_indices = np.argsort(mean_abs_shap)[-5:][::-1]
+    top5_indices = np.argsort(mean_abs_shap)[-2:][::-1]
     for feat_idx in top5_indices:
         feat_name = feature_cols[feat_idx]
         safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in str(feat_name))
@@ -2984,6 +3163,7 @@ def main() -> None:
     # Generate outputs (metrics table includes future capture when available)
     create_metrics_table(metrics_data, output_dir, args.model_type, df=df, extra_metrics=future_metrics)
     create_pr_curve(df, metrics_data, output_dir, args.model_type)
+    create_roc_curve(df, output_dir, args.model_type)
     create_cumulative_gains_chart(df, output_dir, args.model_type)
     # Pass explicit test years to the row-level P@1% diagnostic map
     create_p1pct_diagnostic_map(
@@ -3010,8 +3190,9 @@ def main() -> None:
         backbone_path=backbone_path,
     )
 
-    # New outputs: calibration improvement, country breakdown, biome breakdown
+    # New outputs: calibration improvement, reliability diagram, country breakdown, biome breakdown
     create_calibration_improvement_figure(df, output_dir, args.model_type)
+    create_calibration_curve(df, output_dir, args.model_type)
     create_country_breakdown(df, output_dir, args.model_type)
 
     # GSN biome breakdown: resolve raster path
@@ -3047,6 +3228,9 @@ def main() -> None:
                 print("  GSN shapefile not found. Pass --gsn_shp to enable biome names.")
 
     create_biome_breakdown(df, output_dir, args.model_type, gsn_tif_path=gsn_tif_path, gsn_shp_path=gsn_shp_path)
+
+    # Cross-region comparison table (reads the other region's metrics_table.csv if available)
+    create_comparison_table(output_dir, args.model_type, repo_root, scratch_root)
 
     # Resolve model file for SHAP: explicit --model_pkl, or auto-discover configured model only.
     model_path = None
