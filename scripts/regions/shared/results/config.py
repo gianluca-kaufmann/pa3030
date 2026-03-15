@@ -17,6 +17,10 @@ PROFILE = {
         "y_limits": (-56, 13),
         "iso_codes": ['ARG', 'BOL', 'BRA', 'CHL', 'COL', 'ECU', 'GUF', 'GUY', 'PRY', 'PER', 'SUR', 'URY', 'VEN'],
         "country_names": ['Argentina', 'Bolivia', 'Brazil', 'Chile', 'Colombia', 'Ecuador', 'French Guiana', 'Guyana', 'Paraguay', 'Peru', 'Suriname', 'Uruguay', 'Venezuela'],
+        # Probability map: percentile-clipped sqrt stretch works well for SA's skewed distribution
+        "probability_map_percentile_min": 25,
+        "probability_map_percentile_max": 98,
+        "probability_map_transformation": "sqrt",
     },
     "usa": {
         "region_slug": "usa",
@@ -27,6 +31,11 @@ PROFILE = {
         "y_limits": (24, 50),
         "iso_codes": ['USA'],
         "country_names": ['United States of America', 'United States'],
+        # Probability map: log transform needed because calibration collapses >98% of values
+        # to the same floor probability, making percentile-based linear/sqrt normalization fail.
+        "probability_map_percentile_min": 0,
+        "probability_map_percentile_max": 99.9,
+        "probability_map_transformation": "log",
     },
 }[RUN_REGION]
 
@@ -36,6 +45,9 @@ MODEL_ID = PROFILE["model_id"]
 MODEL_LABEL = PROFILE["model_label"]
 X_LIMITS = PROFILE["x_limits"]
 Y_LIMITS = PROFILE["y_limits"]
+PROBABILITY_MAP_PERCENTILE_MIN = PROFILE["probability_map_percentile_min"]
+PROBABILITY_MAP_PERCENTILE_MAX = PROFILE["probability_map_percentile_max"]
+PROBABILITY_MAP_TRANSFORMATION = PROFILE["probability_map_transformation"]
 CALIBRATE_SCRIPT = "calibrate_1" if MODEL_ID == "model1" else "calibrate_2"
 DEFAULT_FUTURE_PARQUET_FILENAME = "val_win5.parquet"
 FALLBACK_FUTURE_PARQUET_FILENAME = "merged_panel_final.parquet"

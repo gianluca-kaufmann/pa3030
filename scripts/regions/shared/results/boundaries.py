@@ -7,6 +7,8 @@ from typing import Optional
 import geopandas as gpd
 import pandas as pd
 
+from shapely.geometry import box as shapely_box
+
 from .config import (
     PROFILE,
     REGION_LABEL,
@@ -296,6 +298,16 @@ def get_region_boundary(region_boundary_path: Optional[Path] = None) -> gpd.GeoD
     elif south_america.crs.to_string() != 'EPSG:4326':
         print(f"  Reprojecting from {south_america.crs} to EPSG:4326...")
         south_america = south_america.to_crs('EPSG:4326')
-    
+
+    # For USA: clip to continental US (CONUS) bounding box to exclude Alaska,
+    # Hawaii, and other territories that are not in the prediction dataset.
+    # This also removes the large whitespace gap these territories create on maps.
+    if REGION_SLUG == 'usa':
+        conus_box = shapely_box(X_LIMITS[0], Y_LIMITS[0], X_LIMITS[1], Y_LIMITS[1])
+        south_america = south_america.copy()
+        south_america['geometry'] = south_america['geometry'].intersection(conus_box)
+        south_america = south_america[~south_america['geometry'].is_empty].reset_index(drop=True)
+        print(f"  Clipped USA boundary to CONUS extent {X_LIMITS}/{Y_LIMITS}")
+
     print(f"  Found {REGION_LABEL} boundary with {len(south_america)} feature(s) in EPSG:4326")
     return south_america

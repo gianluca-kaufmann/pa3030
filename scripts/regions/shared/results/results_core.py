@@ -36,6 +36,9 @@ from .config import (
     DEFAULT_FUTURE_YEARS_STR,
     MODEL_ID,
     MODEL_LABEL,
+    PROBABILITY_MAP_PERCENTILE_MIN,
+    PROBABILITY_MAP_PERCENTILE_MAX,
+    PROBABILITY_MAP_TRANSFORMATION,
     REGION_LABEL,
     REGION_SLUG,
     X_LIMITS,
@@ -44,6 +47,7 @@ from .config import (
 )
 from .io import (
     derive_test_years,
+    find_backbone_path,
     find_latest_file,
     find_latest_file_in_dirs,
     load_future_pa_establishments,
@@ -126,10 +130,11 @@ PA_HOLE_COLOR = '#BEBEBE'  # Light gray — distinguishable from #F5F5F5 (unprot
 # Probability map color scheme
 PROBABILITY_MAP_COLORMAP = 'plasma'  # Colormap: dark purple -> yellow
 
-# Probability map color scaling (percentile-based)
-PROBABILITY_MAP_PERCENTILE_MIN = 25  # Lower percentile for colorbar range
-PROBABILITY_MAP_PERCENTILE_MAX = 98  # Upper percentile for colorbar range
-PROBABILITY_MAP_TRANSFORMATION = 'sqrt'  # Transformation: 'sqrt' (square root) or 'linear'
+# Probability map color scaling — imported from config (region-specific).
+# SA: percentile_min=25, percentile_max=98, transformation='sqrt'
+# USA: percentile_min=0, percentile_max=99.9, transformation='log'
+# (log is needed for USA because isotonic calibration collapses >98% of
+#  probabilities to the same floor value, making linear/sqrt normalization fail)
 
 # PR curve figure dimensions
 PR_CURVE_FIGSIZE = (8, 6)
@@ -487,6 +492,116 @@ def create_calibration_curve(df: pd.DataFrame, output_dir: Path, model_type: str
 
 
 
+def _add_latlon_ticks(ax, xlim_m: tuple, ylim_m: tuple) -> None:
+    """Replace raw EPSG:3857 metre tick labels with readable lat/lon degree labels.
+
+    Uses the standard Web Mercator forward/inverse formulae (no external dependency).
+    Safe to call for any region — tick spacing is chosen automatically from the extent.
+    """
+    import math
+
+    R = 6378137.0  # WGS-84 semi-major axis (metres)
+
+    def m_to_lon(x_m):
+        return x_m * 180.0 / (math.pi * R)
+
+    def m_to_lat(y_m):
+        return math.degrees(2.0 * math.atan(math.exp(y_m / R)) - math.pi / 2.0)
+
+    def lon_to_m(lon):
+        return lon * math.pi * R / 180.0
+
+    def lat_to_m(lat):
+        return R * math.log(math.tan(math.pi / 4.0 + math.radians(lat) / 2.0))
+
+    lon_min = m_to_lon(xlim_m[0])
+    lon_max = m_to_lon(xlim_m[1])
+    lat_min = m_to_lat(ylim_m[0])
+    lat_max = m_to_lat(ylim_m[1])
+
+    # Choose nice tick intervals based on the extent of the map
+    lon_range = abs(lon_max - lon_min)
+    lat_range = abs(lat_max - lat_min)
+    lon_step = 20 if lon_range > 60 else 10 if lon_range > 30 else 5 if lon_range > 10 else 2
+    lat_step = 10 if lat_range > 40 else 5 if lat_range > 15 else 2 if lat_range > 5 else 1
+
+    lon_ticks = np.arange(
+        math.ceil(lon_min / lon_step) * lon_step,
+        math.floor(lon_max / lon_step) * lon_step + 0.01,
+        lon_step,
+    )
+    lat_ticks = np.arange(
+        math.ceil(lat_min / lat_step) * lat_step,
+        math.floor(lat_max / lat_step) * lat_step + 0.01,
+        lat_step,
+    )
+
+    ax.set_xticks([lon_to_m(lon) for lon in lon_ticks])
+    ax.set_xticklabels(
+        [f'{abs(lon):.0f}°W' if lon < -0.05 else f'{lon:.0f}°E' if lon > 0.05 else '0°'
+         for lon in lon_ticks]
+    )
+    ax.set_yticks([lat_to_m(lat) for lat in lat_ticks])
+    ax.set_yticklabels(
+        [f'{abs(lat):.0f}°N' if lat > 0.05 else f'{abs(lat):.0f}°S' if lat < -0.05 else '0°'
+         for lat in lat_ticks]
+    )
+    ax.set_xlabel('Longitude', fontsize=FONTSIZE_LABEL)
+    ax.set_ylabel('Latitude', fontsize=FONTSIZE_LABEL)
+
+
+def _plot_backbone_background(
+    ax,
+    backbone_path: Optional[Path],
+    zorder: int = 0,
+) -> bool:
+    """Plot the backbone raster as the gray background layer for PA holes.
+
+    The backbone (uint8, 1=inside region, 0=outside) is already in EPSG:3857
+    so it can be passed directly to imshow without reprojection.  Pixels with
+    value 0 are masked transparent so the white figure background (ocean) shows
+    through.  Pixels with value 1 are drawn in PA_HOLE_COLOR; the prediction
+    layers drawn on top will overwrite all non-PA pixels, leaving only the
+    genuine PA holes visible in gray.
+
+    Returns True if the backbone was plotted successfully, False if the caller
+    should fall back to the Natural Earth polygon.
+    """
+    if backbone_path is None:
+        return False
+    try:
+        import rasterio
+        with rasterio.open(backbone_path) as src:
+            data = src.read(1)          # uint8 array: 1=region, 0=outside
+            t = src.transform
+            left   = t.c
+            top    = t.f
+            right  = left + src.width  * t.a   # t.a > 0 (pixel width)
+            bottom = top  + src.height * t.e   # t.e < 0 (pixel height, negative)
+            extent = (left, right, bottom, top)
+
+        backbone_float = data.astype(np.float32)
+        backbone_float[data == 0] = np.nan
+        backbone_masked = np.ma.masked_invalid(backbone_float)
+
+        from matplotlib.colors import ListedColormap
+        ax.imshow(
+            backbone_masked,
+            extent=extent,
+            cmap=ListedColormap([PA_HOLE_COLOR]),
+            vmin=0.5, vmax=1.5,
+            origin='upper',
+            interpolation='nearest',
+            aspect='equal',
+            zorder=zorder,
+        )
+        print(f"  Backbone background plotted from: {backbone_path}")
+        return True
+    except Exception as exc:
+        print(f"  Warning: could not plot backbone raster ({exc}); falling back to Natural Earth polygon.")
+        return False
+
+
 def points_to_raster(x: np.ndarray, y: np.ndarray, values: np.ndarray,
                      target_resolution: Optional[float] = None,
                      agg_func: str = 'mean') -> tuple[np.ndarray, tuple]:
@@ -612,6 +727,7 @@ def create_risk_map(
     future_parquet_path: Optional[Path] = None,
     future_years: Optional[Sequence[int]] = None,
     sa_gdf: Optional[gpd.GeoDataFrame] = None,
+    backbone_path: Optional[Path] = None,
 ) -> Optional[Dict[str, float]]:
     """Create SIMPLIFIED risk map showing model predictions vs actual PA establishments.
     
@@ -793,10 +909,15 @@ def create_risk_map(
     # Step 4: Select exactly top-threshold_pct% pixels using argpartition.
     # Using np.percentile + >= would include all ties at the boundary and over-select
     # (e.g. many RF probability ties could push predicted_count well above threshold_pct%).
-    # argpartition gives exactly n_top_pixels, with ties broken arbitrarily but consistently.
+    # argpartition gives exactly n_top_pixels; we add tiny random noise to break ties
+    # in a spatially uniform way — without noise, argpartition resolves ties in memory
+    # order (row/col order), which produces structured horizontal-band artefacts when
+    # many pixels share the same floor probability (e.g. after isotonic calibration).
     n_top_pixels = max(1, int(len(pixel_agg) * threshold_pct / 100))
     proba_vals = pixel_agg['y_pred_proba'].values
-    top_pixel_idx = np.argpartition(proba_vals, -n_top_pixels)[-n_top_pixels:]
+    rng = np.random.default_rng(42)
+    proba_for_selection = proba_vals + rng.uniform(0, 1e-12, len(proba_vals))
+    top_pixel_idx = np.argpartition(proba_for_selection, -n_top_pixels)[-n_top_pixels:]
     is_predicted_arr = np.zeros(len(pixel_agg), dtype=np.int8)
     is_predicted_arr[top_pixel_idx] = 1
     pixel_agg = pixel_agg.copy()
@@ -900,11 +1021,13 @@ def create_risk_map(
 
     from matplotlib.colors import ListedColormap, BoundaryNorm
 
-    # Base layer: SA polygon in PA_HOLE_COLOR so existing PA holes (pixels absent from
-    # scored parquet = already protected before the test period) show as gray rather than
-    # blending with the white ocean background. The background_mask overwrites this for
-    # all unprotected pixels; areas outside SA remain white (figure background).
-    sa_gdf_proj.plot(ax=ax, color=PA_HOLE_COLOR, edgecolor='#808080', linewidth=0.4, zorder=0)
+    # Base layer: gray fill so existing PA holes (pixels absent from the scored parquet
+    # = already protected before the test period) appear gray instead of white ocean.
+    # Prefer the backbone raster (pixel-perfect coastal alignment); fall back to the
+    # Natural Earth polygon if backbone is unavailable.
+    used_backbone = _plot_backbone_background(ax, backbone_path, zorder=0)
+    if not used_backbone:
+        sa_gdf_proj.plot(ax=ax, color=PA_HOLE_COLOR, edgecolor='#808080', linewidth=0.4, zorder=0)
 
     # Plot background mask from actual data (shows data coverage; protected areas = natural holes)
     background_masked = np.ma.masked_where(np.isnan(background_mask), background_mask)
@@ -939,9 +1062,8 @@ def create_risk_map(
     ax.set_ylim(proj_bounds[1], proj_bounds[3])
     ax.set_aspect('equal', adjustable='box')
 
-    # Styling
-    ax.set_xlabel('Easting (m, EPSG:3857)', fontsize=FONTSIZE_LABEL)
-    ax.set_ylabel('Northing (m, EPSG:3857)', fontsize=FONTSIZE_LABEL)
+    # Styling — replace raw EPSG:3857 metre labels with lat/lon degree labels
+    _add_latlon_ticks(ax, (proj_bounds[0], proj_bounds[2]), (proj_bounds[1], proj_bounds[3]))
     establishment_source = "Actual Establishments" if has_actual_establishments else "5-yr Lookahead Targets"
     ax.set_title(f'{MODEL_LABEL} ({model_type.upper()}): Predicted Risk vs {establishment_source} ({time_period})',
                  fontsize=FONTSIZE_TITLE, fontweight='bold', pad=15)
@@ -970,7 +1092,7 @@ def create_risk_map(
     # Stats box with key metrics
     stats_lines = [
         f"Pixels: {len(pixel_agg):,}",
-        f"Top {int(threshold_pct)}% threshold: {top_pct_threshold:.4f}",
+        f"Top {int(threshold_pct)}% threshold: {top_pct_threshold:.6f}",
         f"Hit rate: {overlap_count:,}/{predicted_count:,} = {hit_rate:.1f}%",
         f"Recall (test): {overlap_count:,}/{total_actual_establishments:,} = {recall_pct:.1f}%"
     ]
@@ -1027,6 +1149,7 @@ def create_p1pct_diagnostic_map(
     metrics_data: Optional[Dict[str, Any]] = None,
     test_years: Optional[list] = None,
     sa_gdf: Optional[gpd.GeoDataFrame] = None,
+    backbone_path: Optional[Path] = None,
 ) -> None:
     """Create diagnostic map showing row-level P@1% metric visualization.
     
@@ -1195,8 +1318,10 @@ def create_p1pct_diagnostic_map(
 
     from matplotlib.colors import ListedColormap, BoundaryNorm
 
-    # Base layer: SA polygon in PA_HOLE_COLOR so existing PA holes show as gray.
-    sa_gdf_proj.plot(ax=ax, color=PA_HOLE_COLOR, edgecolor='#808080', linewidth=0.4, zorder=0)
+    # Base layer: gray fill for PA holes — prefer backbone raster, fall back to polygon.
+    used_backbone = _plot_backbone_background(ax, backbone_path, zorder=0)
+    if not used_backbone:
+        sa_gdf_proj.plot(ax=ax, color=PA_HOLE_COLOR, edgecolor='#808080', linewidth=0.4, zorder=0)
 
     # Plot background mask from actual data (shows data coverage; protected areas = natural holes)
     background_masked = np.ma.masked_where(np.isnan(background_mask), background_mask)
@@ -1248,9 +1373,8 @@ def create_p1pct_diagnostic_map(
     ax.set_ylim(proj_bounds[1], proj_bounds[3])
     ax.set_aspect('equal', adjustable='box')
 
-    # Styling
-    ax.set_xlabel('Easting (m, EPSG:3857)', fontsize=FONTSIZE_LABEL)
-    ax.set_ylabel('Northing (m, EPSG:3857)', fontsize=FONTSIZE_LABEL)
+    # Styling — replace raw EPSG:3857 metre labels with lat/lon degree labels
+    _add_latlon_ticks(ax, (proj_bounds[0], proj_bounds[2]), (proj_bounds[1], proj_bounds[3]))
     ax.set_title(f'{MODEL_LABEL} ({model_type.upper()}) Row-Level P@1% Diagnostic Map',
                  fontsize=FONTSIZE_TITLE, fontweight='bold', pad=15)
     
@@ -1329,6 +1453,7 @@ def create_probability_map(
     test_years: Optional[Sequence[int]] = None,
     test_parquet_path: Optional[Path] = None,
     sa_gdf: Optional[gpd.GeoDataFrame] = None,
+    backbone_path: Optional[Path] = None,
 ) -> None:
     """Create continuous probability map showing predicted probabilities across South America.
     
@@ -1411,67 +1536,82 @@ def create_probability_map(
             pred_end = max(test_years_list) + lookahead
             prediction_horizon = f"{lookahead}-year lookahead ({min(test_years_list)}-{pred_end})"
     
-    # Use percentile-based range to balance color distribution
-    # This clips extreme outliers and better utilizes the full colormap
-    proba_pmin = np.percentile(proba_values, PROBABILITY_MAP_PERCENTILE_MIN)
-    proba_pmax = np.percentile(proba_values, PROBABILITY_MAP_PERCENTILE_MAX)
-    
-    print(f"  Using percentile-based color range ({PROBABILITY_MAP_PERCENTILE_MIN}th-{PROBABILITY_MAP_PERCENTILE_MAX}th percentile)")
-    print(f"  Probability range: [{proba_min:.6f}, {proba_max:.6f}]")
-    print(f"  Colorbar range: [{proba_pmin:.6f}, {proba_pmax:.6f}]")
-    print(f"  Range span: {proba_pmax - proba_pmin:.6f}")
-    
-    # Clip values to percentile range
-    proba_clipped = np.clip(proba_values, proba_pmin, proba_pmax)
-    
-    # Apply transformation to stretch the distribution
-    proba_shifted = proba_clipped - proba_pmin  # Shift to start at 0
-    proba_span = proba_pmax - proba_pmin
-    if proba_span > 1e-12:
-        proba_normalized_linear = proba_shifted / proba_span  # Linear normalization to [0, 1]
+    # ---------------------------------------------------------------------------
+    # Normalise probabilities to [0, 1] for the colourmap.
+    # The method is region-specific (set in config.py via PROBABILITY_MAP_TRANSFORMATION):
+    #   'sqrt'  (SA)  — percentile clip + square-root stretch; works well when the
+    #                    distribution is moderately skewed.
+    #   'log'   (USA) — log10 transform applied before percentile clipping; needed
+    #                    when isotonic calibration collapses >98 % of values to the
+    #                    same floor, making any linear/sqrt approach produce a flat map.
+    # ---------------------------------------------------------------------------
+    def _normalise(vals: np.ndarray, log_pmin: float = 0.0, log_pmax: float = 1.0,
+                   proba_pmin: float = 0.0, proba_span: float = 1.0) -> np.ndarray:
+        """Apply the region-appropriate normalisation to a probability array."""
+        if PROBABILITY_MAP_TRANSFORMATION == 'log':
+            log_v = np.log10(np.maximum(vals, 1e-10))
+            span = log_pmax - log_pmin
+            if span > 1e-6:
+                return np.clip((log_v - log_pmin) / span, 0.0, 1.0)
+            else:
+                return np.full_like(log_v, 0.5)
+        else:
+            clipped = np.clip(vals, proba_pmin, proba_pmin + proba_span)
+            shifted = clipped - proba_pmin
+            if proba_span > 1e-12:
+                linear = shifted / proba_span
+            else:
+                return np.full_like(shifted, 0.5)
+            if PROBABILITY_MAP_TRANSFORMATION == 'sqrt':
+                return np.sqrt(linear)
+            return linear  # linear fallback
+
+    # Compute normalisation parameters from the FULL dataset (before coordinate filtering)
+    if PROBABILITY_MAP_TRANSFORMATION == 'log':
+        log_proba_full = np.log10(np.maximum(proba_values, 1e-10))
+        log_pmin = float(np.percentile(log_proba_full, PROBABILITY_MAP_PERCENTILE_MIN))
+        log_pmax = float(np.percentile(log_proba_full, PROBABILITY_MAP_PERCENTILE_MAX))
+        proba_pmin_param = 0.0
+        proba_span_param = 1.0
+        transform_name = 'log10'
+        print(f"  Using log10 colour range ({PROBABILITY_MAP_PERCENTILE_MIN}th–{PROBABILITY_MAP_PERCENTILE_MAX}th percentile of log values)")
+        print(f"  log10 range: [{log_pmin:.4f}, {log_pmax:.4f}]  "
+              f"(raw prob: [{10**log_pmin:.6f}, {10**log_pmax:.6f}])")
     else:
-        # All probabilities are identical — fill with 0.5 to avoid division by zero
-        print("  Warning: probability range is effectively zero; using flat 0.5 normalization.")
-        proba_normalized_linear = np.full_like(proba_shifted, 0.5)
-    
-    # Apply transformation based on constant setting
-    if PROBABILITY_MAP_TRANSFORMATION == 'sqrt':
-        proba_normalized = np.sqrt(proba_normalized_linear)  # Square root stretches lower values
-        transform_name = 'square root'
-    else:  # linear
-        proba_normalized = proba_normalized_linear
-        transform_name = 'linear'
-    
+        log_pmin = 0.0
+        log_pmax = 1.0
+        proba_pmin_param = float(np.percentile(proba_values, PROBABILITY_MAP_PERCENTILE_MIN))
+        proba_pmax_param = float(np.percentile(proba_values, PROBABILITY_MAP_PERCENTILE_MAX))
+        proba_span_param = proba_pmax_param - proba_pmin_param
+        transform_name = 'square root' if PROBABILITY_MAP_TRANSFORMATION == 'sqrt' else 'linear'
+        print(f"  Using percentile-based colour range ({PROBABILITY_MAP_PERCENTILE_MIN}th–{PROBABILITY_MAP_PERCENTILE_MAX}th percentile)")
+        print(f"  Colour range: [{proba_pmin_param:.6f}, {proba_pmax_param:.6f}]  span: {proba_span_param:.6f}")
+        if proba_span_param <= 1e-12:
+            print("  Warning: probability range is effectively zero; colour map will be flat.")
+
+    proba_normalized = _normalise(proba_values, log_pmin, log_pmax,
+                                   proba_pmin_param, proba_span_param)
     print(f"  Applied {transform_name} transformation to stretch distribution")
-    print(f"  Normalized value range: [{proba_normalized.min():.4f}, {proba_normalized.max():.4f}]")
-    print(f"  Normalized value mean: {proba_normalized.mean():.4f}, median: {np.median(proba_normalized):.4f}")
-    
+    print(f"  Normalised value range: [{proba_normalized.min():.4f}, {proba_normalized.max():.4f}]")
+    print(f"  Normalised value mean: {proba_normalized.mean():.4f}, median: {np.median(proba_normalized):.4f}")
+
     # Filter coordinate outliers before rasterization (using projected bounds)
     print(f"  Filtering coordinate outliers...")
     initial_count = len(gdf)
     proj_bounds = sa_gdf_proj.total_bounds  # (minx, miny, maxx, maxy) in meters
-    gdf = gdf[(gdf.geometry.x >= proj_bounds[0]) & (gdf.geometry.x <= proj_bounds[2]) & 
+    gdf = gdf[(gdf.geometry.x >= proj_bounds[0]) & (gdf.geometry.x <= proj_bounds[2]) &
               (gdf.geometry.y >= proj_bounds[1]) & (gdf.geometry.y <= proj_bounds[3])].copy()
     filtered_count = len(gdf)
     if initial_count != filtered_count:
         print(f"  Filtered out {initial_count - filtered_count:,} coordinate outliers ({initial_count:,} -> {filtered_count:,})")
-    
+
     # Update df to match filtered gdf (keep in sync)
     df = df[df.index.isin(gdf.index)].copy()
-    
-    # Recompute proba_normalized from filtered data (using same percentile thresholds from original data)
+
+    # Recompute proba_normalized from filtered data using the SAME parameters derived above
     proba_values_filtered = df['y_pred_proba'].values
-    proba_clipped_filtered = np.clip(proba_values_filtered, proba_pmin, proba_pmax)
-    proba_shifted_filtered = proba_clipped_filtered - proba_pmin
-    if proba_span > 1e-12:
-        proba_normalized_linear = proba_shifted_filtered / proba_span
-    else:
-        proba_normalized_linear = np.full_like(proba_shifted_filtered, 0.5)
-    
-    if PROBABILITY_MAP_TRANSFORMATION == 'sqrt':
-        proba_normalized = np.sqrt(proba_normalized_linear)
-    else:
-        proba_normalized = proba_normalized_linear
+    proba_normalized = _normalise(proba_values_filtered, log_pmin, log_pmax,
+                                   proba_pmin_param, proba_span_param)
     
     # Convert points to raster for pixel-perfect visualization (using projected coordinates)
     print(f"  Converting {len(gdf):,} points to raster grid...")
@@ -1494,10 +1634,10 @@ def create_probability_map(
     fig_height = fig_width * proj_aspect
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
 
-    # Base layer: SA polygon in PA_HOLE_COLOR so existing PAs (absent from scored parquet)
-    # appear as gray rather than blending with the white ocean background.
-    # Pixels with predictions overwrite this layer; pixels outside SA stay white (figure bg).
-    sa_gdf_proj.plot(ax=ax, color=PA_HOLE_COLOR, edgecolor='#808080', linewidth=0.4, zorder=1)
+    # Base layer: gray fill for PA holes — prefer backbone raster, fall back to polygon.
+    used_backbone = _plot_backbone_background(ax, backbone_path, zorder=1)
+    if not used_backbone:
+        sa_gdf_proj.plot(ax=ax, color=PA_HOLE_COLOR, edgecolor='#808080', linewidth=0.4, zorder=1)
     
     # Plot probability raster with pixel-perfect rendering
     # Use standardized colormap for consistent visualization across all models
@@ -1530,10 +1670,9 @@ def create_probability_map(
     cbar.set_ticklabels(tick_labels)
     cbar.ax.tick_params(labelsize=FONTSIZE_LEGEND)
     
-    # Styling
-    ax.set_xlabel('Easting (m, EPSG:3857)', fontsize=FONTSIZE_LABEL)
-    ax.set_ylabel('Northing (m, EPSG:3857)', fontsize=FONTSIZE_LABEL)
-    
+    # Styling — replace raw EPSG:3857 metre labels with lat/lon degree labels
+    _add_latlon_ticks(ax, (proj_bounds[0], proj_bounds[2]), (proj_bounds[1], proj_bounds[3]))
+
     # Check if calibrated probabilities were used
     calibration_note = ""
     has_uncalibrated_col = 'y_pred_proba_uncalibrated' in df.columns
@@ -2764,6 +2903,13 @@ def main() -> None:
     
     # Load region boundary once and reuse for all map outputs (avoids 5x load/download)
     sa_gdf = get_region_boundary(region_boundary_path)
+
+    # Resolve backbone raster once — used as pixel-perfect gray background in all maps.
+    # Returns None gracefully if not available; each map then falls back to the Natural
+    # Earth polygon so the script runs correctly on any machine.
+    print("\nResolving backbone raster for map backgrounds...")
+    backbone_path = find_backbone_path()
+
     # Risk map generation (1%, 5%, 10%) - run first to get future capture metrics for table
     thresholds = [1, 5, 10]
     future_metrics = None
@@ -2780,6 +2926,7 @@ def main() -> None:
             future_parquet_path=future_parquet_path,
             future_years=future_years,
             sa_gdf=sa_gdf,
+            backbone_path=backbone_path,
         )
         if result is not None and future_metrics is None:
             future_metrics = result
@@ -2796,6 +2943,7 @@ def main() -> None:
         metrics_data,
         test_years=test_years,
         sa_gdf=sa_gdf,
+        backbone_path=backbone_path,
     )
     # Also pass explicit test years to the probability map
     create_probability_map(
@@ -2808,6 +2956,7 @@ def main() -> None:
         test_years=test_years,
         test_parquet_path=test_parquet_path,
         sa_gdf=sa_gdf,
+        backbone_path=backbone_path,
     )
 
     # New outputs: calibration improvement, country breakdown, biome breakdown

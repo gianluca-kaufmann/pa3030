@@ -697,10 +697,39 @@ def find_latest_file_in_dirs(
         
         if not matches:
             continue
-        
+
         # Within this directory, pick the most recent file, but never fall back
         # to later directories if we already have at least one match here.
         matches.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         return matches[0]
-    
+
+    return None
+
+
+def find_backbone_path() -> Optional[Path]:
+    """Locate the preprocessed backbone mask raster (backbone.tif) for the current region.
+
+    Uses the same $SCRATCH-first resolution as other data files so the results
+    script works identically on Euler and locally (after downloading from Euler).
+
+    Returns the path if found, or None if the file is absent — callers must
+    handle None gracefully by falling back to the Natural Earth polygon.
+    """
+    repo_root = get_repo_root()
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    candidates: list[Path] = []
+    if scratch_root is not None:
+        candidates.append(scratch_root / "data" / REGION_SLUG / "ready" / "backbone" / "backbone.tif")
+    candidates.append(repo_root / "data" / REGION_SLUG / "ready" / "backbone" / "backbone.tif")
+
+    for cand in candidates:
+        if cand.exists():
+            print(f"  Found backbone raster: {cand}")
+            return cand
+
+    print(
+        f"  Backbone raster not found (checked {len(candidates)} location(s)); "
+        "will use Natural Earth polygon as fallback background layer."
+    )
     return None
