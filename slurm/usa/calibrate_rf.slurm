@@ -49,7 +49,10 @@ echo "PWD = $(pwd)"
   find scripts -maxdepth 4 -type f -name "calibrate_2"
   exit 1
 }
-# Run the script (main split, RF, earlystop source; auto selects best of Platt/Isotonic by test Brier)
-python "scripts/regions/usa/6_evaluation/calibrate_2" --model_type rf --split-version main --method auto
+# Run the script (main split, RF, earlystop source; force Platt to preserve ranking metrics)
+# NOTE: auto-selection chose isotonic, which collapsed most probabilities to floor value 0.000729
+# (median == min), dropping ROC-AUC from 0.9989 → 0.9316 and PR-AUC from 0.5586 → 0.4931.
+# Isotonic is unsuitable here due to extreme class imbalance (1:2485) in the test set.
+python "scripts/regions/usa/6_evaluation/calibrate_2" --model_type rf --split-version main --method platt
 
 echo "calibrate_2 script (RF mode, main split) finished."

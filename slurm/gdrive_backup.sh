@@ -3,8 +3,8 @@
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem-per-cpu=1G
+#SBATCH --cpus-per-task=16
+#SBATCH --mem-per-cpu=8G
 #SBATCH --output=/cluster/scratch/%u/logs/gdrive_backup_%j.out
 #SBATCH --error=/cluster/scratch/%u/logs/gdrive_backup_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
@@ -26,9 +26,10 @@ echo "Starting rclone backup to Google Drive..."
 rclone copy \
   /cluster/scratch/gikaufmann/data/ \
   gdrive:"Meine Ablage/data/" \
-  --transfers=16 \
+  --transfers=8 \
   --checkers=8 \
-  --drive-chunk-size=128M \
+  --drive-chunk-size=512M \
+  --buffer-size=512M \
   --log-file="$SCRATCH/logs/rclone_backup_${SLURM_JOB_ID}.log" \
   --log-level=INFO
 
