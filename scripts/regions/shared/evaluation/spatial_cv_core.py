@@ -32,7 +32,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -121,6 +121,15 @@ _configure_threading_env(NUM_THREADS)
 
 import lightgbm as lgb  # noqa: E402 — must be after thread env vars
 
+try:
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.impute import SimpleImputer
+    from sklearn.pipeline import Pipeline as SklearnPipeline
+except ImportError:
+    RandomForestClassifier = None  # type: ignore[assignment,misc]
+    SimpleImputer = None           # type: ignore[assignment,misc]
+    SklearnPipeline = None         # type: ignore[assignment,misc]
+
 
 # =============================================================================
 # Path resolution
@@ -171,15 +180,40 @@ def resolve_best_params(region: str) -> Optional[Path]:
     return None
 
 
-def resolve_cv_output_dir(region: str) -> Path:
-    """Resolve spatial_cv output directory, preferring $SCRATCH."""
+def resolve_rf_best_params(region: str) -> Optional[Path]:
+    """Find rf_best_params.json for a region, checking $SCRATCH first."""
+    repo_root = get_repo_root()
+    scratch   = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+    candidates: list[Path] = []
+    if scratch:
+        candidates += [
+            Path(scratch) / f"scripts/regions/{region}/5_training/rf_best_params.json",
+            Path(scratch) / f"scripts/regions/{region}/4_tuning/rf_best_params.json",
+        ]
+    candidates += [
+        repo_root / f"scripts/regions/{region}/5_training/rf_best_params.json",
+        repo_root / f"scripts/regions/{region}/4_tuning/rf_best_params.json",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+def resolve_cv_output_dir(region: str, model_type: str = "lgbm") -> Path:
+    """Resolve spatial_cv output directory, preferring $SCRATCH.
+
+    Outputs are namespaced by model type (lgbm / rf) so that LOBO fold files
+    for different algorithms never mix in the same directory.
+    """
     repo_root = get_repo_root()
     scratch   = os.environ.get("SCRATCH")
+    subdir    = f"spatial_cv/{model_type}"
     if scratch:
-        d = Path(scratch) / f"outputs/{region}/results/spatial_cv"
+        d = Path(scratch) / f"outputs/{region}/results/{subdir}"
         d.mkdir(parents=True, exist_ok=True)
         return d
-    d = repo_root / f"outputs/{region}/results/spatial_cv"
+    d = repo_root / f"outputs/{region}/results/{subdir}"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -561,21 +595,119 @@ def train_lgbm(
 
 
 # =============================================================================
+# RF parameter loading and training — Layer 1
+# =============================================================================
+
+_RF_DEFAULTS: dict[str, Any] = {
+    "n_estimators":      300,
+    "max_depth":         None,
+    "max_features":      "sqrt",
+    "min_samples_leaf":  1,
+    "min_samples_split": 2,
+    "bootstrap":         True,
+    "class_weight":      "balanced_subsample",
+    "random_state":      RANDOM_STATE,
+    "verbose":           0,
+}
+
+_RF_ALLOWED_KEYS = {
+    "n_estimators", "max_depth", "max_features", "min_samples_leaf",
+    "min_samples_split", "bootstrap", "class_weight", "random_state",
+    "min_weight_fraction_leaf", "max_leaf_nodes", "min_impurity_decrease",
+    "oob_score", "warm_start", "ccp_alpha", "max_samples",
+}
+
+
+def load_rf_params(path: Optional[Path]) -> tuple[dict[str, Any], int]:
+    """Load RandomForest hyperparameters; return (params_dict, n_estimators).
+
+    Expected JSON structure (produced by tuning scripts):
+        {"best_params": {...}, "fixed_params": {...}}
+    or a flat dict.  Falls back to _RF_DEFAULTS if path is None.
+    """
+    if path is None:
+        print("  rf_best_params.json not found — using defaults")
+        params = dict(_RF_DEFAULTS)
+        return params, int(params["n_estimators"])
+
+    with open(path) as f:
+        data = json.load(f)
+
+    if isinstance(data, dict) and ("fixed_params" in data or "best_params" in data):
+        params = {**data.get("fixed_params", {}), **data.get("best_params", {}).copy()}
+    else:
+        params = dict(data) if isinstance(data, dict) else {}
+
+    for k, v in _RF_DEFAULTS.items():
+        params.setdefault(k, v)
+
+    n_estimators = int(params.get("n_estimators", _RF_DEFAULTS["n_estimators"]))
+    return params, n_estimators
+
+
+def train_rf(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    params: dict[str, Any],
+    n_jobs: int,
+) -> Any:
+    """Train RandomForestClassifier with median imputation.
+
+    Returns a fitted sklearn Pipeline (SimpleImputer → RandomForestClassifier)
+    so NaN handling is bundled with the model.  Prediction is then simply
+    ``pipeline.predict_proba(X)[:, 1]``.
+    """
+    if RandomForestClassifier is None:
+        raise ImportError("scikit-learn is required for RF training: pip install scikit-learn")
+
+    rf_params = {k: v for k, v in params.items() if k in _RF_ALLOWED_KEYS}
+    rf_params["n_jobs"] = n_jobs
+    rf_params["verbose"] = 0
+    n_estimators = int(rf_params.pop("n_estimators", _RF_DEFAULTS["n_estimators"]))
+
+    n_pos = int(y_train.sum())
+    n_neg = int((y_train == 0).sum())
+    print(f"\n  Training RandomForestClassifier: {n_estimators} trees, n_jobs={n_jobs}")
+    print(f"  class_weight={rf_params.get('class_weight', 'balanced_subsample')}, "
+          f"max_depth={rf_params.get('max_depth', 'None')}, "
+          f"max_features={rf_params.get('max_features', 'sqrt')}")
+    print(f"  Training set: {len(y_train):,} samples ({n_pos:,} pos, {n_neg:,} neg)")
+
+    pipeline = SklearnPipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("rf",      RandomForestClassifier(n_estimators=n_estimators, **rf_params)),
+    ])
+
+    t0 = time.time()
+    report_memory_usage("before RF fit")
+    pipeline.fit(X_train, y_train)
+    print(f"  RF training done in {time.time()-t0:.1f}s")
+    report_memory_usage("after RF fit")
+    return pipeline
+
+
+# =============================================================================
 # Evaluation on held-out biome — Layer 1
 # =============================================================================
 
 def evaluate_on_biome(
     test_path: Path,
-    model: lgb.Booster,
+    predict_fn: Callable[[np.ndarray], np.ndarray],
     feature_cols: list[str],
     biome_raster: np.ndarray,
     biome_ints: set[int],
-    num_boost_round: int,
     output_dir: Path,
     timestamp: str,
     biome_slug: str,
 ) -> dict[str, Any]:
-    """Score test parquet filtered to held-out biome; compute metrics."""
+    """Score test parquet filtered to held-out biome; compute metrics.
+
+    Args:
+        predict_fn: Callable that takes a float32 feature matrix and returns
+                    a float32 probability array.  Build it at the call site:
+                    LGBM: ``lambda X: model.predict(X, num_iteration=n).astype(np.float32)``
+                    RF:   ``lambda X: model.predict_proba(X)[:, 1].astype(np.float32)``
+    """
     print(f"\nEvaluating on held-out biome (test years {TEST_START}-{TEST_END})...")
     H, W = biome_raster.shape
     biome_arr_set = np.array(sorted(biome_ints), dtype=np.int32)
@@ -639,7 +771,7 @@ def evaluate_on_biome(
                 continue
             Xb  = extract_features_pyarrow_to_numpy(batch.select(feature_cols), final)
             yb  = (ta[final] > 0).astype(np.int8)
-            pb  = model.predict(Xb, num_iteration=num_boost_round).astype(np.float32)
+            pb  = predict_fn(Xb)
             bs  = len(yb)
             y_test[offset:offset + bs]  = yb
             y_proba[offset:offset + bs] = pb
@@ -999,10 +1131,13 @@ def run_lobo_main(region: str, model_id: str) -> None:
                         help="0-based biome index to hold out (see --list-biomes)")
     parser.add_argument("--list-biomes", action="store_true",
                         help="Print available biomes and exit")
+    parser.add_argument("--model-type", choices=["lgbm", "rf"], default="lgbm",
+                        help="Model type to train in each fold (default: lgbm)")
     args = parser.parse_args()
 
+    model_type  = args.model_type
     repo_root   = get_repo_root()
-    output_dir  = resolve_cv_output_dir(region)
+    output_dir  = resolve_cv_output_dir(region, model_type)
     raster_path, shp_path = _biome_raster_paths(region)
 
     if not raster_path.exists():
@@ -1048,6 +1183,7 @@ def run_lobo_main(region: str, model_id: str) -> None:
         print(f"LOBO SPATIAL CV — {region_label}  "
               f"Fold {args.biome_idx}/{len(biome_groups)-1}")
         print("=" * 70)
+        print(f"Model type:       {model_type.upper()}")
         print(f"Held-out biome:   {biome_name}")
         print(f"Biome int codes:  {sorted(biome_ints)}")
         print(f"N biomes total:   {len(biome_groups)}")
@@ -1062,14 +1198,23 @@ def run_lobo_main(region: str, model_id: str) -> None:
         print(f"Earlystop: {earlystop_path}")
         print(f"Test:      {test_path}")
 
-        params_path = resolve_best_params(region)
-        if params_path:
-            print(f"\nLoaded params: {params_path}")
-        else:
-            print("\nWARNING: lgbm_best_params.json not found — using guardrail defaults")
-        params, num_boost_round = load_best_params(params_path)
-        params["num_threads"] = NUM_THREADS
-        print(f"num_boost_round: {num_boost_round}")
+        if model_type == "lgbm":
+            params_path = resolve_best_params(region)
+            if params_path:
+                print(f"\nLoaded LGBM params: {params_path}")
+            else:
+                print("\nWARNING: lgbm_best_params.json not found — using guardrail defaults")
+            params, num_boost_round = load_best_params(params_path)
+            params["num_threads"] = NUM_THREADS
+            print(f"num_boost_round: {num_boost_round}")
+        else:  # rf
+            params_path = resolve_rf_best_params(region)
+            if params_path:
+                print(f"\nLoaded RF params: {params_path}")
+            else:
+                print("\nWARNING: rf_best_params.json not found — using defaults")
+            params, num_boost_round = load_rf_params(params_path)
+            print(f"n_estimators: {num_boost_round}")
 
         schema       = pq.ParquetFile(train_path).schema_arrow
         feature_cols = [
@@ -1089,6 +1234,7 @@ def run_lobo_main(region: str, model_id: str) -> None:
                     config={
                         "region":          region,
                         "model_id":        model_id,
+                        "model_type":      model_type,
                         "biome_idx":       args.biome_idx,
                         "biome_name":      biome_name,
                         "n_biomes":        len(biome_groups),
@@ -1118,15 +1264,23 @@ def run_lobo_main(region: str, model_id: str) -> None:
         report_memory_usage("after loading training data")
 
         print("\n" + "=" * 70)
-        print("STEP 2: TRAIN LIGHTGBM (cv_mode=none, fixed num_boost_round)")
+        print(f"STEP 2: TRAIN {model_type.upper()} (fixed rounds/trees)")
         print("=" * 70)
-        model = train_lgbm(X_train, y_train, years_train, params, num_boost_round)
+        if model_type == "lgbm":
+            model = train_lgbm(X_train, y_train, years_train, params, num_boost_round)
+            predict_fn: Callable[[np.ndarray], np.ndarray] = (
+                lambda X, _m=model, _n=num_boost_round:
+                    _m.predict(X, num_iteration=_n).astype(np.float32)
+            )
+        else:  # rf
+            model = train_rf(X_train, y_train, params, n_jobs=NUM_THREADS)
+            predict_fn = lambda X, _m=model: _m.predict_proba(X)[:, 1].astype(np.float32)
         del X_train, y_train, years_train; gc.collect()
         report_memory_usage("after training")
 
         model_dir  = repo_root / f"data/{region}/ml/models"
         model_dir.mkdir(parents=True, exist_ok=True)
-        model_path = model_dir / f"lobo_{args.biome_idx:02d}_{biome_slug}_{timestamp}.pkl"
+        model_path = model_dir / f"lobo_{model_type}_{args.biome_idx:02d}_{biome_slug}_{timestamp}.pkl"
         with open(model_path, "wb") as f:
             pickle.dump(model, f)
         print(f"  Model saved: {model_path}")
@@ -1135,8 +1289,8 @@ def run_lobo_main(region: str, model_id: str) -> None:
         print("STEP 3: EVALUATE ON HELD-OUT BIOME")
         print("=" * 70)
         test_results = evaluate_on_biome(
-            test_path, model, feature_cols, biome_raster, biome_ints,
-            num_boost_round, output_dir, timestamp, biome_slug,
+            test_path, predict_fn, feature_cols, biome_raster, biome_ints,
+            output_dir, timestamp, biome_slug,
         )
         del model; gc.collect()
 
@@ -1151,7 +1305,8 @@ def run_lobo_main(region: str, model_id: str) -> None:
             "biome_name":      biome_name,
             "biome_ints":      sorted(biome_ints),
             "region":          region,
-            "model":           f"{model_id}_lgbm",
+            "model":           f"{model_id}_{model_type}",
+            "model_type":      model_type,
             "timestamp":       timestamp,
             "num_boost_round": num_boost_round,
             "train_years":     list(TRAIN_YEARS),
@@ -1230,7 +1385,14 @@ METRIC_COLS = [
 
 def run_lobo_aggregate_main(region: str) -> None:
     """Aggregate all fold_*.json files for a region into a summary CSV."""
-    cv_dir    = resolve_cv_output_dir(region)
+    parser = argparse.ArgumentParser(
+        description=f"LOBO aggregate — {region.replace('_', ' ').title()}"
+    )
+    parser.add_argument("--model-type", choices=["lgbm", "rf"], default="lgbm",
+                        help="Model type whose fold JSONs to aggregate (default: lgbm)")
+    args      = parser.parse_args()
+    model_type = args.model_type
+    cv_dir    = resolve_cv_output_dir(region, model_type)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path  = cv_dir / f"lobo_aggregate_{timestamp}.txt"
 
@@ -1241,7 +1403,7 @@ def run_lobo_aggregate_main(region: str) -> None:
         region_label = region.replace("_", " ").upper()
 
         print("=" * 70)
-        print(f"LOBO AGGREGATE — {region_label}")
+        print(f"LOBO AGGREGATE — {region_label} ({model_type.upper()})")
         print("=" * 70)
         print(f"Looking for fold JSONs in: {cv_dir}")
 
@@ -1645,4 +1807,12 @@ __all__ = [
     "run_lobo_aggregate_main",
     "run_spatial_gen_main",
     "run_transfer_main",
+    # helpers exposed for testing / external use
+    "train_lgbm",
+    "train_rf",
+    "load_best_params",
+    "load_rf_params",
+    "resolve_best_params",
+    "resolve_rf_best_params",
+    "resolve_cv_output_dir",
 ]

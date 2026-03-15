@@ -267,10 +267,15 @@ python scripts/regions/south_america/6_evaluation/spatial_CV_2
 python scripts/regions/usa/6_evaluation/spatial_CV_2
 
 # Spatial CV — Layer 1 LOBO (can run in parallel with step 5, on Euler)
+# Both LGBM and RF run the same wrapper but pass --model-type; outputs go to
+# separate subdirs: outputs/{region}/results/spatial_cv/{lgbm,rf}/
 python scripts/regions/south_america/6_evaluation/spatial_CV_1 --list-biomes
-sbatch slurm/south_america/spatial_CV_1.slurm          # array: all folds
-sbatch --export=BIOME_IDX=3 --array=3 slurm/south_america/spatial_CV_1.slurm  # single fold
-sbatch slurm/south_america/spatial_CV_1_aggregate.slurm  # after all folds finish
+sbatch slurm/south_america/spatial_CV_1.slurm              # LGBM, all folds
+sbatch slurm/south_america/spatial_CV_1_rf.slurm           # RF, all folds
+sbatch --export=BIOME_IDX=3 --array=3 slurm/south_america/spatial_CV_1.slurm     # LGBM, single fold
+sbatch --export=BIOME_IDX=3 --array=3 slurm/south_america/spatial_CV_1_rf.slurm  # RF, single fold
+sbatch slurm/south_america/spatial_CV_1_aggregate.slurm    # aggregate LGBM folds
+sbatch slurm/south_america/spatial_CV_1_aggregate_rf.slurm # aggregate RF folds
 
 # Spatial CV — Layer 3 cross-continental transfer (can run in parallel with step 5)
 sbatch slurm/south_america/spatial_CV_3.slurm

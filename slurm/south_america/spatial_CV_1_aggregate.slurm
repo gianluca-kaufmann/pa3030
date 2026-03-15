@@ -56,7 +56,7 @@ SCRIPT="scripts/regions/south_america/6_evaluation/spatial_CV_1_aggregate"
 #------------------------------------------------------------------------------
 # Run
 #------------------------------------------------------------------------------
-echo "Starting spatial_CV_1_aggregate (South America)..."
-python -u "$SCRIPT"
+echo "Starting spatial_CV_1_aggregate (South America, lgbm)..."
+python -u "$SCRIPT" --model-type lgbm
 
-echo "spatial_CV_1_aggregate (South America) finished."
+echo "spatial_CV_1_aggregate (South America, lgbm) finished."

@@ -78,6 +78,6 @@ SCRIPT="scripts/regions/south_america/6_evaluation/spatial_CV_1"
 #------------------------------------------------------------------------------
 echo "Starting LOBO fold ${FOLD_IDX} (South America)..."
 srun --cpu-bind=cores --distribution=block:block \
-  python -u "$SCRIPT" --biome-idx "${FOLD_IDX}"
+  python -u "$SCRIPT" --biome-idx "${FOLD_IDX}" --model-type lgbm
 
-echo "spatial_CV_1 fold ${FOLD_IDX} (South America) finished."
+echo "spatial_CV_1 (lgbm) fold ${FOLD_IDX} (South America) finished."

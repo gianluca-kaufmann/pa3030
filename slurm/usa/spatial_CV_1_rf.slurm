@@ -1,45 +1,30 @@
 #!/bin/bash
-#SBATCH --job-name=lobo_USA
+#SBATCH --job-name=lobo_USA_rf
 #SBATCH --partition=normal.120h
 #SBATCH --time=120:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem-per-cpu=4G
-#SBATCH --output=/cluster/scratch/%u/logs/lobo_USA_%A_%a.out
-#SBATCH --error=/cluster/scratch/%u/logs/lobo_USA_%A_%a.err
+#SBATCH --output=/cluster/scratch/%u/logs/lobo_USA_rf_%A_%a.out
+#SBATCH --error=/cluster/scratch/%u/logs/lobo_USA_rf_%A_%a.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 #SBATCH --array=0-9
 
 # ------------------------------------------------------------------------------
-# Leave-One-Biome-Out (LOBO) spatial CV — USA
+# Leave-One-Biome-Out (LOBO) spatial CV — USA — Random Forest
 #
-# Submits one SLURM array job per biome fold.  Each task trains a LightGBM
-# model on all biomes except one and evaluates on the held-out biome.
+# Mirrors spatial_CV_1.slurm but trains a Random Forest in each fold.
+# Outputs go to outputs/usa/results/spatial_cv/rf/
 #
 # Usage (submit all folds at once via array):
-#   sbatch slurm/usa/spatial_cv_lobo.slurm
+#   sbatch slurm/usa/spatial_CV_1_rf.slurm
 #
 # Usage (single fold, e.g. biome index 3):
-#   BIOME_IDX=3 sbatch --array=3 slurm/usa/spatial_cv_lobo.slurm
-#   or equivalently:
-#   sbatch --export=BIOME_IDX=3 --array=3 slurm/usa/spatial_cv_lobo.slurm
-#
-# The SLURM array index (SLURM_ARRAY_TASK_ID) is used as the biome index
-# unless the BIOME_IDX environment variable is set explicitly.
-#
-# To find valid biome indices run:
-#   python scripts/regions/usa/6_evaluation/spatial_cv_lobo --list-biomes
-#
-# Prerequisites:
-#   The USA GSN raster must exist at:
-#   data/usa/ready/GSN/gsn_terrestrial_ecoregions_mask_1km.tif
-#   Generate it by adapting scripts/regions/south_america/2_preprocessing/gsn_preprocessing
-#   for the USA backbone extent.
+#   sbatch --export=BIOME_IDX=3 --array=3 slurm/usa/spatial_CV_1_rf.slurm
 # ------------------------------------------------------------------------------
 
-# Create necessary folders on $SCRATCH if they don't exist
 mkdir -p "$SCRATCH/logs"
-mkdir -p "$SCRATCH/outputs/usa/results/spatial_cv"
+mkdir -p "$SCRATCH/outputs/usa/results/spatial_cv/rf"
 
 #------------------------------------------------------------------------------
 # Load modules
@@ -60,11 +45,9 @@ export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
 #------------------------------------------------------------------------------
 # Determine biome index
-#   - If BIOME_IDX is set externally, use it.
-#   - Otherwise fall back to the SLURM array task ID.
 #------------------------------------------------------------------------------
 FOLD_IDX="${BIOME_IDX:-${SLURM_ARRAY_TASK_ID}}"
-echo "LOBO fold index: ${FOLD_IDX}"
+echo "LOBO RF fold index: ${FOLD_IDX}"
 
 #------------------------------------------------------------------------------
 # Preflight checks
@@ -82,15 +65,14 @@ SCRIPT="scripts/regions/usa/6_evaluation/spatial_CV_1"
 GSN_RASTER="data/usa/ready/GSN/gsn_terrestrial_ecoregions_mask_1km.tif"
 [ -f "$GSN_RASTER" ] || {
   echo "ERROR: USA GSN raster not found at $GSN_RASTER"
-  echo "Generate it by adapting scripts/regions/south_america/2_preprocessing/gsn_preprocessing for USA."
   exit 1
 }
 
 #------------------------------------------------------------------------------
-# Run the LOBO fold
+# Run the RF LOBO fold
 #------------------------------------------------------------------------------
-echo "Starting LOBO fold ${FOLD_IDX} (USA)..."
+echo "Starting LOBO RF fold ${FOLD_IDX} (USA)..."
 srun --cpu-bind=cores --distribution=block:block \
-  python -u "$SCRIPT" --biome-idx "${FOLD_IDX}" --model-type lgbm
+  python -u "$SCRIPT" --biome-idx "${FOLD_IDX}" --model-type rf
 
-echo "spatial_CV_1 (lgbm) fold ${FOLD_IDX} (USA) finished."
+echo "spatial_CV_1 (rf) fold ${FOLD_IDX} (USA) finished."
