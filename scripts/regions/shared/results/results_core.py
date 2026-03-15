@@ -1911,12 +1911,21 @@ def compute_shap_analysis(
     print(f"  Saved top 20 features: {shap_csv_path.name}")
     
     # SHAP dependence plots for top 5 features (feature value vs SHAP value)
+    # Distance features (dist_*) are stored in metres; rescale x-axis to km for readability.
+    METER_FEATURES = {'dist_wdpa', 'dist_road', 'dist_indigenous', 'dist_water', 'dist_coast'}
     top5_indices = np.argsort(mean_abs_shap)[-5:][::-1]
     for feat_idx in top5_indices:
         feat_name = feature_cols[feat_idx]
         safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in str(feat_name))
         plt.figure(figsize=(8, 6))
         shap.dependence_plot(feat_idx, shap_values_pos, X_shap, feature_names=feature_cols, show=False)
+        # Convert x-axis from metres to km for distance features
+        if feat_name in METER_FEATURES:
+            cur_ax = plt.gca()
+            xticks_m = cur_ax.get_xticks()
+            cur_ax.set_xticks(xticks_m)
+            cur_ax.set_xticklabels([f'{v/1000:.0f}' for v in xticks_m])
+            cur_ax.set_xlabel(f'{feat_name} (km)', fontsize=FONTSIZE_LABEL)
         plt.tight_layout()
         dep_path = output_dir / f"shap_dep_{safe_name}.pdf"
         plt.savefig(dep_path, dpi=300, bbox_inches='tight')
@@ -1924,11 +1933,38 @@ def compute_shap_analysis(
         print(f"  Saved SHAP dependence: {dep_path.name}")
     
     # Thematic feature importance: group features by prefix and aggregate mean_abs_shap
+    # Ordered so that the first matching prefix wins.
     FEATURE_THEME_PREFIXES = (
-        ('dist_', 'Proximity'),
-        ('topo_', 'Terrain'),
-        ('socio_', 'Socio-economic'),
+        ('dist_',            'Proximity'),
+        ('WorldClim_',       'Climate'),
+        ('GSN_',             'Biodiversity'),
+        ('GPW',              'Population'),        # matches GPW and GPW_smooth*
+        ('elevation_',       'Terrain'),
+        ('topo_',            'Terrain'),
+        ('HNTL',             'Nighttime Lights'),  # matches HNTL and HNTL_smooth*
+        ('landcover',        'Land Cover'),
+        ('deforestation_',   'Deforestation'),
+        ('wildfire_',        'Fire'),
+        ('policy_',          'Policy'),
+        ('economic_value',   'Economic Value'),
+        ('socio_',           'Socio-economic'),
     )
+    # Fixed color palette for consistent theme coloring across regions
+    THEME_COLORS = {
+        'Proximity':       '#E07B54',
+        'Climate':         '#4A90D9',
+        'Biodiversity':    '#27AE60',
+        'Population':      '#9B59B6',
+        'Terrain':         '#795548',
+        'Nighttime Lights':'#F39C12',
+        'Land Cover':      '#16A085',
+        'Deforestation':   '#C0392B',
+        'Fire':            '#E74C3C',
+        'Policy':          '#2980B9',
+        'Economic Value':  '#8E44AD',
+        'Socio-economic':  '#7F8C8D',
+        'Other':           '#BDC3C7',
+    }
     theme_sums = {}
     for i, fname in enumerate(feature_cols):
         theme = "Other"
@@ -1940,8 +1976,9 @@ def compute_shap_analysis(
     theme_order = sorted(theme_sums.keys(), key=lambda k: theme_sums[k], reverse=True)
     themes = [theme_order[i] for i in range(len(theme_order))]
     sums = [theme_sums[t] for t in themes]
-    fig, ax = plt.subplots(figsize=(8, max(4, len(themes) * 0.4)))
-    ax.barh(themes, sums, color=plt.cm.viridis(np.linspace(0.2, 0.8, len(themes))))
+    bar_colors = [THEME_COLORS.get(t, '#BDC3C7') for t in themes]
+    fig, ax = plt.subplots(figsize=(8, max(4, len(themes) * 0.5)))
+    ax.barh(themes, sums, color=bar_colors)
     ax.set_xlabel('Sum of mean |SHAP|', fontsize=FONTSIZE_LABEL)
     ax.set_title(f'{MODEL_LABEL} ({model_type.upper()}) SHAP importance by theme', fontsize=FONTSIZE_TITLE, fontweight='bold')
     ax.invert_yaxis()
@@ -2022,6 +2059,17 @@ def create_calibration_improvement_figure(
     for bar in bars2:
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.0001,
                 f'{bar.get_height():.4f}', ha='center', va='bottom', fontsize=FONTSIZE_STATS)
+
+    # Delta annotations: show improvement (↓ good) or degradation (↑ bad) between pairs
+    overall_max = max(before_vals + after_vals)
+    for i, (before, after) in enumerate(zip(before_vals, after_vals)):
+        delta = after - before  # negative = improved
+        if abs(delta) > 1e-8:
+            arrow = '↓' if delta < 0 else '↑'
+            color = '#27AE60' if delta < 0 else '#C0392B'
+            label = f'{arrow} {abs(delta):.4f}'
+            ax.text(i, max(before, after) + overall_max * 0.05, label,
+                    ha='center', va='bottom', fontsize=FONTSIZE_STATS, color=color, fontweight='bold')
 
     ax.set_xticks(x)
     ax.set_xticklabels(metrics, fontsize=FONTSIZE_LABEL)
@@ -2430,9 +2478,10 @@ def create_biome_breakdown(
         'Tundra':                                                  'Tundra',
     }
 
-    labels = [SHORT_BIOME.get(b, b[:30]) for b in biome_df['BIOME_NAME']]
+    labels   = [SHORT_BIOME.get(b, b[:30]) for b in biome_df['BIOME_NAME']]
     roc_vals = biome_df['ROC_AUC'].tolist()
     p1_vals  = biome_df['Precision_at_1pct'].tolist()
+    n_vals   = biome_df['n_pixel_years'].tolist()
     y_pos = np.arange(len(labels))
 
     fig, axes = plt.subplots(1, 2, figsize=(14, max(4, len(biome_df) * 0.55)))
@@ -2448,9 +2497,9 @@ def create_biome_breakdown(
     ax1.set_xlim(0, 1)
     ax1.legend(fontsize=FONTSIZE_LEGEND)
     ax1.grid(True, axis='x', alpha=0.3)
-    for bar, val in zip(bars1, roc_vals):
+    for bar, val, n in zip(bars1, roc_vals, n_vals):
         ax1.text(min(val + 0.01, 0.97), bar.get_y() + bar.get_height() / 2,
-                f'{val:.3f}', va='center', ha='left', fontsize=FONTSIZE_STATS)
+                f'{val:.3f}  (n={n:,})', va='center', ha='left', fontsize=FONTSIZE_STATS)
 
     # P@1% panel
     ax2 = axes[1]
@@ -2460,11 +2509,13 @@ def create_biome_breakdown(
     ax2.set_xlabel('Precision@1%', fontsize=FONTSIZE_LABEL)
     ax2.set_title('Precision@1% by Biome', fontsize=FONTSIZE_TITLE, fontweight='bold')
     p1_max = max(p1_vals) if p1_vals else 1
-    ax2.set_xlim(0, p1_max * 1.3)
+    # Cap axis at 1.0 (precision is bounded) with a small right margin
+    ax2.set_xlim(0, min(p1_max * 1.3, 1.05))
     ax2.grid(True, axis='x', alpha=0.3)
-    for bar, val in zip(bars2, p1_vals):
-        ax2.text(val + p1_max * 0.01, bar.get_y() + bar.get_height() / 2,
-                f'{val:.4f}', va='center', ha='left', fontsize=FONTSIZE_STATS)
+    for bar, val, n in zip(bars2, p1_vals, n_vals):
+        n_str = f'n={n:,}'
+        ax2.text(min(val + p1_max * 0.01, p1_max * 1.25), bar.get_y() + bar.get_height() / 2,
+                f'{val:.4f}  ({n_str})', va='center', ha='left', fontsize=FONTSIZE_STATS)
 
     plt.suptitle(f'{MODEL_LABEL} ({model_type.upper()}) Performance by Biome (GSN Terrestrial Ecoregions)',
                 fontsize=FONTSIZE_TITLE, fontweight='bold', y=1.01)
