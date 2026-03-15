@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 """Cross-Continental Transfer — SA ↔ USA (Layer 3)
 
-Trains on South America, evaluates on USA (SA→USA); then trains on USA and
-evaluates on South America (USA→SA).  Only features common to both regions
-are used.  Both directions run sequentially in a single job.
+Loads the production models from step-5 training (no retraining) and evaluates
+them on the other continent's test set.  Runs 4 combinations sequentially:
+    SA-LGBM → USA,  USA-LGBM → SA,  SA-RF → USA,  USA-RF → SA
+
+SA and USA share identical 73-feature sets, so feature columns are read directly
+from the loaded model (LGBM: model.feature_name(), RF: model.feature_names_in_).
 
 Usage:
     python scripts/regions/south_america/6_evaluation/spatial_CV_3
 
 SLURM:
-    sbatch slurm/south_america/spatial_cv_transfer.slurm
+    sbatch slurm/south_america/spatial_CV_3.slurm
+
+Prerequisites:
+    data/{region}/ml/models/model{1,2}_lgbm_*.pkl
+    data/{region}/ml/models/model{1,2}_rf_win5_*.joblib
+    (missing model files are skipped gracefully)
 
 Output:
-    outputs/south_america/results/spatial_cv/
+    outputs/south_america/results/spatial_cv/transfer/
         transfer_results_<timestamp>.json
         transfer_results_<timestamp>.txt
-        transfer_south_america_to_usa_<timestamp>.parquet
-        transfer_usa_to_south_america_<timestamp>.parquet
 
 See scripts/regions/shared/evaluation/spatial_cv_core.py for full implementation.
 """

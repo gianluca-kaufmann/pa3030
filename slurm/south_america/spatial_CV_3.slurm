@@ -12,27 +12,31 @@
 # ------------------------------------------------------------------------------
 # Cross-continental transfer evaluation (SA <-> USA) — Layer 3 spatial CV
 #
-# Trains on South America, evaluates on USA (SA→USA), then trains on USA and
-# evaluates on South America (USA→SA).  Both directions run sequentially in a
-# single job.  No biome index is needed — the script handles everything internally.
+# Loads the production models trained in step 5 (no retraining) and scores them
+# on the other continent's test set.  Runs 4 combinations sequentially:
+#   SA-LGBM → USA,  USA-LGBM → SA,  SA-RF → USA,  USA-RF → SA
+#
+# Missing model files (e.g. RF not yet trained) are skipped gracefully.
 #
 # Usage:
-#   sbatch slurm/south_america/spatial_cv_transfer.slurm
+#   sbatch slurm/south_america/spatial_CV_3.slurm
 #
 # Prerequisites:
-#   1. South America model trained: outputs/south_america/results/ populated
-#   2. USA model trained:           outputs/usa/results/ populated
-#   3. Both regions' parquet data accessible under data/south_america/ and data/usa/
+#   1. SA step-5 training done:  data/south_america/ml/models/model1_lgbm_*.pkl
+#                                data/south_america/ml/models/model1_rf_win5_*.joblib
+#   2. USA step-5 training done: data/usa/ml/models/model2_lgbm_*.pkl
+#                                data/usa/ml/models/model2_rf_win5_*.joblib
+#   3. Test parquets:            data/{region}/ml/main/test_win5.parquet
 #
 # Output:
-#   outputs/south_america/results/spatial_cv/transfer_results_<timestamp>.json
-#   outputs/south_america/results/spatial_cv/transfer_<timestamp>.txt  (log)
+#   outputs/south_america/results/spatial_cv/transfer/
+#       transfer_results_<timestamp>.json
+#       transfer_results_<timestamp>.txt  (log)
 # ------------------------------------------------------------------------------
 
 # Create necessary folders on $SCRATCH if they don't exist
 mkdir -p "$SCRATCH/logs"
-mkdir -p "$SCRATCH/outputs/south_america/results/spatial_cv"
-mkdir -p "$SCRATCH/outputs/usa/results/spatial_cv"
+mkdir -p "$SCRATCH/outputs/south_america/results/spatial_cv/transfer"
 
 #------------------------------------------------------------------------------
 # Load modules

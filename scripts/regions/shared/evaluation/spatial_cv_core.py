@@ -180,6 +180,41 @@ def resolve_best_params(region: str) -> Optional[Path]:
     return None
 
 
+def resolve_trained_model(region: str, model_id: str, model_type: str) -> Path:
+    """Find the most-recently-saved production model file for a region.
+
+    File naming conventions (from the training scripts):
+        LGBM: data/{region}/ml/models/{model_id}_lgbm_{timestamp}.pkl
+        RF:   data/{region}/ml/models/{model_id}_rf_win5_{timestamp}.joblib
+
+    Checks $SCRATCH first, then repo_root.  Raises FileNotFoundError if none found.
+    """
+    repo_root = get_repo_root()
+    scratch   = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    if model_type == "lgbm":
+        pattern = f"{model_id}_lgbm_*.pkl"
+    else:
+        pattern = f"{model_id}_rf_win5_*.joblib"
+
+    search_dirs: list[Path] = []
+    if scratch:
+        search_dirs.append(scratch / f"data/{region}/ml/models")
+    search_dirs.append(repo_root / f"data/{region}/ml/models")
+
+    for d in search_dirs:
+        candidates = sorted(d.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+        if candidates:
+            return candidates[0]
+
+    checked = "\n".join(f"  {d / pattern}" for d in search_dirs)
+    raise FileNotFoundError(
+        f"No trained {model_type.upper()} model found for {region}/{model_id}.\n"
+        f"Checked:\n{checked}\n"
+        f"Run the step-5 training script first."
+    )
+
+
 def resolve_rf_best_params(region: str) -> Optional[Path]:
     """Find rf_best_params.json for a region, checking $SCRATCH first."""
     repo_root = get_repo_root()
@@ -832,14 +867,20 @@ def common_feature_cols(cols_a: list[str], cols_b: list[str]) -> list[str]:
 
 def score_region_test(
     test_path: Path,
-    model: lgb.Booster,
+    predict_fn: Callable[[np.ndarray], np.ndarray],
     feature_cols: list[str],
-    num_boost_round: int,
     output_dir: Path,
     timestamp: str,
     label: str,
 ) -> dict[str, Any]:
-    """Score a full region's test set with a transfer model."""
+    """Score a full region's test set with a transfer model.
+
+    Args:
+        predict_fn: Callable that takes float32 feature matrix and returns
+                    float32 probabilities.  Build at call site:
+                    LGBM: ``lambda X: model.predict(X, num_iteration=n).astype(np.float32)``
+                    RF:   ``lambda X: model.predict_proba(X)[:, 1].astype(np.float32)``
+    """
     print(f"\nScoring {label} test set (years {TEST_START}-{TEST_END})...")
     ess = feature_cols + [TARGET_COL, 'year', 'WDPA_prev', 'row', 'col']
 
@@ -890,7 +931,7 @@ def score_region_test(
                 continue
             Xb   = extract_features_pyarrow_to_numpy(batch.select(feature_cols), final)
             yb   = (ta[final] > 0).astype(np.int8)
-            pb   = model.predict(Xb, num_iteration=num_boost_round).astype(np.float32)
+            pb   = predict_fn(Xb)
             bs   = len(yb)
             y_test[offset:offset + bs]  = yb
             y_proba[offset:offset + bs] = pb
@@ -1049,71 +1090,89 @@ def _evaluate_model_layer2(
 
 
 # =============================================================================
-# Layer 3 transfer run helper
+# Layer 3 transfer helper — uses production models, no retraining
 # =============================================================================
 
 def _run_transfer_direction(
     source_region: str,
+    source_model_id: str,
     target_region: str,
-    feature_cols: list[str],
+    model_type: str,
     output_dir: Path,
     timestamp: str,
 ) -> dict[str, Any]:
-    """Train on source_region, evaluate on target_region."""
-    label = f"{source_region}_to_{target_region}"
+    """Load the production model for source_region and evaluate on target_region.
+
+    No retraining: the production model (trained in step 5) is loaded directly.
+    Feature columns are read from the model itself, guaranteeing that the target
+    region's data is extracted in exactly the order the model expects.
+
+    SA and USA share identical 73-feature sets, so cross-scoring is exact.
+    """
+    label = f"{source_region}_to_{target_region}_{model_type}"
     print("\n" + "=" * 70)
-    print(f"TRANSFER: {source_region.upper()} → {target_region.upper()}")
+    print(f"TRANSFER ({model_type.upper()}): "
+          f"{source_region.upper()} → {target_region.upper()}")
     print("=" * 70)
-    print(f"Features: {len(feature_cols)}")
 
-    src_train     = resolve_parquet(source_region, "train_win5.parquet")
-    src_earlystop = resolve_parquet(source_region, "earlystop_win5.parquet")
-    tgt_test      = resolve_parquet(target_region,  "test_win5.parquet")
-    src_params    = resolve_best_params(source_region)
-    params, num_boost_round = load_best_params(src_params)
-    params["num_threads"] = NUM_THREADS
-    print(f"Source params: {src_params or 'guardrails'}")
-    print(f"num_boost_round: {num_boost_round}")
+    # ── Load production model ────────────────────────────────────────────────
+    model_path = resolve_trained_model(source_region, source_model_id, model_type)
+    print(f"  Loading model: {model_path.name}")
 
-    X_train, y_train, years_train, n_pos_tr, n_neg_tr = load_region_train(
-        src_train, src_earlystop, feature_cols,
-        year_range=(TRAIN_YEARS[0], EARLYSTOP_YEARS[1]),
-        name=source_region,
-    )
-    n_train = len(y_train)
-    report_memory_usage("after loading source training data")
+    if model_type == "lgbm":
+        with open(model_path, "rb") as fh:
+            model = pickle.load(fh)
+        # LightGBM stores exact training column order
+        feature_cols = list(model.feature_name())
+        num_boost_round = model.num_trees()
+        predict_fn: Callable[[np.ndarray], np.ndarray] = (
+            lambda X, _m=model, _n=num_boost_round:
+                _m.predict(X, num_iteration=_n).astype(np.float32)
+        )
+        model_details = {"num_boost_round": num_boost_round}
+    else:  # rf
+        try:
+            import joblib as _joblib
+        except ImportError:
+            raise ImportError("joblib is required to load RF models: pip install joblib")
+        model = _joblib.load(model_path)
+        # sklearn RF stores training feature order in feature_names_in_
+        if hasattr(model, "feature_names_in_"):
+            feature_cols = list(model.feature_names_in_)
+        else:
+            # Fallback: read from source region's parquet schema
+            src_train = resolve_parquet(source_region, "train_win5.parquet")
+            feature_cols = get_feature_cols(src_train)
+            print("  WARNING: feature_names_in_ not available — using parquet schema order")
+        n_estimators = model.n_estimators if hasattr(model, "n_estimators") else "?"
+        predict_fn = lambda X, _m=model: _m.predict_proba(X)[:, 1].astype(np.float32)
+        model_details = {"n_estimators": n_estimators}
 
-    model = train_lgbm(X_train, y_train, years_train, params, num_boost_round)
-    del X_train, y_train, years_train; gc.collect()
+    print(f"  Features: {len(feature_cols)}")
+    for k, v in model_details.items():
+        print(f"  {k}: {v}")
 
-    repo_root = get_repo_root()
-    model_dir = repo_root / f"data/{source_region}/ml/models"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    model_path = model_dir / f"transfer_{label}_{timestamp}.pkl"
-    with open(model_path, "wb") as f:
-        pickle.dump(model, f)
-    print(f"  Model saved: {model_path}")
-
+    # ── Score target region ──────────────────────────────────────────────────
+    tgt_test = resolve_parquet(target_region, "test_win5.parquet")
     test_result = score_region_test(
-        tgt_test, model, feature_cols, num_boost_round, output_dir, timestamp, label,
+        tgt_test, predict_fn, feature_cols, output_dir, timestamp, label,
     )
     del model; gc.collect()
 
     return {
-        "direction":       f"{source_region} → {target_region}",
-        "source_region":   source_region,
-        "target_region":   target_region,
-        "n_features":      len(feature_cols),
-        "num_boost_round": num_boost_round,
-        "source_params":   str(src_params) if src_params else "guardrails",
-        "train_data": {"n_samples": n_train, "n_positive": n_pos_tr, "n_negative": n_neg_tr},
+        "direction":     f"{source_region} → {target_region}",
+        "model_type":    model_type,
+        "source_region": source_region,
+        "target_region": target_region,
+        "n_features":    len(feature_cols),
+        "model_path":    str(model_path),
+        **model_details,
         "test_data": {
             "n_samples":  test_result["n_test"],
             "n_positive": test_result["n_test_pos"],
             "n_negative": test_result["n_test_neg"],
         },
         "test_metrics": test_result["metrics"],
-        "model_path":   str(model_path),
         "scored_path":  test_result["scored_path"],
     }
 
@@ -1655,8 +1714,17 @@ def run_spatial_gen_main(region: str, model_id: str) -> None:
 # =============================================================================
 
 def run_transfer_main() -> None:
-    """Train on SA, evaluate on USA; train on USA, evaluate on SA."""
-    output_dir = resolve_cv_output_dir("south_america")
+    """Cross-continental transfer evaluation: SA ↔ USA, for both LGBM and RF.
+
+    Loads the production models trained in step 5 (no retraining) and scores
+    them on the other continent's test set.  SA and USA share identical 73-feature
+    sets, so feature columns are taken directly from the loaded model.
+
+    Runs 4 combinations:
+        SA-LGBM → USA,  USA-LGBM → SA
+        SA-RF   → USA,  USA-RF   → SA
+    """
+    output_dir = resolve_cv_output_dir("south_america", "transfer")
     timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path   = output_dir / f"transfer_results_{timestamp}.txt"
     use_wandb  = False
@@ -1667,34 +1735,29 @@ def run_transfer_main() -> None:
         t_global = time.time()
         print("=" * 70)
         print("CROSS-CONTINENTAL TRANSFER EVALUATION — SA ↔ USA (Layer 3)")
+        print("Uses production models from step-5 training — no retraining.")
         print("=" * 70)
-        print(f"Train years:  {TRAIN_YEARS[0]}-{EARLYSTOP_YEARS[1]}")
         print(f"Test years:   {TEST_START}-{TEST_END}")
         print(f"Output dir:   {output_dir}")
 
+        # ── Sanity check: confirm feature sets are identical ─────────────────
         print("\n" + "=" * 70)
-        print("STEP 0: DETECT COMMON FEATURE COLUMNS")
+        print("STEP 0: VERIFY FEATURE SETS")
         print("=" * 70)
         sa_train_path  = resolve_parquet("south_america", "train_win5.parquet")
         usa_train_path = resolve_parquet("usa",           "train_win5.parquet")
-        sa_cols        = get_feature_cols(sa_train_path)
-        usa_cols       = get_feature_cols(usa_train_path)
-        common         = common_feature_cols(sa_cols, usa_cols)
-        print(f"SA features:     {len(sa_cols)}")
-        print(f"USA features:    {len(usa_cols)}")
-        print(f"Common features: {len(common)}")
-
+        sa_cols  = get_feature_cols(sa_train_path)
+        usa_cols = get_feature_cols(usa_train_path)
         sa_only  = set(sa_cols)  - set(usa_cols)
         usa_only = set(usa_cols) - set(sa_cols)
+        print(f"SA features:  {len(sa_cols)}")
+        print(f"USA features: {len(usa_cols)}")
         if sa_only:
-            print(f"SA-only  ({len(sa_only)}): "
-                  f"{sorted(sa_only)[:10]}{'...' if len(sa_only) > 10 else ''}")
+            print(f"WARNING — SA-only features ({len(sa_only)}): {sorted(sa_only)}")
         if usa_only:
-            print(f"USA-only ({len(usa_only)}): "
-                  f"{sorted(usa_only)[:10]}{'...' if len(usa_only) > 10 else ''}")
-
-        if len(common) == 0:
-            raise ValueError("No common features found between SA and USA.")
+            print(f"WARNING — USA-only features ({len(usa_only)}): {sorted(usa_only)}")
+        if not sa_only and not usa_only:
+            print("Feature sets are identical — cross-scoring is exact.")
 
         if wandb is not None:
             try:
@@ -1703,10 +1766,10 @@ def run_transfer_main() -> None:
                     entity=os.environ.get("WANDB_ENTITY"),
                     name=f"transfer_sa_usa_{timestamp}",
                     config={
-                        "n_common_features": len(common),
-                        "train_years":       list(TRAIN_YEARS),
-                        "test_years":        [TEST_START, TEST_END],
-                        "layer":             3,
+                        "n_sa_features":  len(sa_cols),
+                        "n_usa_features": len(usa_cols),
+                        "test_years":     [TEST_START, TEST_END],
+                        "layer":          3,
                     },
                 )
                 use_wandb = True
@@ -1714,70 +1777,67 @@ def run_transfer_main() -> None:
             except Exception as _err:
                 print(f"W&B failed: {_err}")
 
-        result_sa_to_usa = _run_transfer_direction(
-            "south_america", "usa", common, output_dir, timestamp
-        )
-        gc.collect()
-        report_memory_usage("after SA→USA")
+        # ── Run all 4 combinations ───────────────────────────────────────────
+        directions = [
+            ("south_america", "model1", "usa"),
+            ("usa",           "model2", "south_america"),
+        ]
+        model_types_to_run = ["lgbm", "rf"]
 
-        result_usa_to_sa = _run_transfer_direction(
-            "usa", "south_america", common, output_dir, timestamp
-        )
-        gc.collect()
-        report_memory_usage("after USA→SA")
+        all_results: list[dict[str, Any]] = []
+        for model_type in model_types_to_run:
+            for src, src_model_id, tgt in directions:
+                try:
+                    result = _run_transfer_direction(
+                        src, src_model_id, tgt, model_type, output_dir, timestamp
+                    )
+                    all_results.append(result)
+                except FileNotFoundError as e:
+                    print(f"\nSKIPPED {src}→{tgt} ({model_type.upper()}): {e}")
+                gc.collect()
+                report_memory_usage(f"after {src}→{tgt} ({model_type})")
 
+        # ── Print results table ──────────────────────────────────────────────
         print("\n" + "=" * 70)
-        print("RESULTS COMPARISON")
+        print("RESULTS SUMMARY")
         print("=" * 70)
 
         def _fmt(m: dict, key: str) -> str:
             v = m.get(key)
-            return f"{v:.4f}" if v is not None else "N/A"
+            return f"{v:.4f}" if v is not None else "  N/A"
 
-        for result in [result_sa_to_usa, result_usa_to_sa]:
-            m = result["test_metrics"]
-            print(f"\n{result['direction']}:")
-            print(f"  Test region:  {result['target_region']}")
-            print(f"  Train rows:   {result['train_data']['n_samples']:,}  "
-                  f"({result['train_data']['n_positive']:,} pos)")
-            print(f"  Test rows:    {result['test_data']['n_samples']:,}  "
-                  f"({result['test_data']['n_positive']:,} pos)")
-            print(f"  ROC-AUC:      {_fmt(m, 'roc_auc')}")
-            print(f"  PR-AUC:       {_fmt(m, 'pr_auc')}")
-            print(f"  P@1%:         {_fmt(m, 'precision_at_1pct')}  "
-                  f"(Lift {m.get('lift_at_1pct', 0.0):.1f}x)"
-                  if m.get("lift_at_1pct") else
-                  f"  P@1%:         {_fmt(m, 'precision_at_1pct')}")
-            print(f"  P@5%:         {_fmt(m, 'precision_at_5pct')}")
-            print(f"  Brier:        {_fmt(m, 'brier_score')}")
+        print(f"\n{'Direction':<32} {'Model':>5}  "
+              f"{'ROC-AUC':>8} {'PR-AUC':>8} {'P@1%':>7} {'Lift@1%':>8}")
+        print("-" * 75)
+        for result in all_results:
+            m   = result["test_metrics"]
+            dir_str = f"{result['source_region']} → {result['target_region']}"
+            print(f"{dir_str:<32} {result['model_type'].upper():>5}  "
+                  f"{_fmt(m, 'roc_auc'):>8} {_fmt(m, 'pr_auc'):>8} "
+                  f"{_fmt(m, 'precision_at_1pct'):>7} "
+                  f"{m.get('lift_at_1pct', float('nan')):.1f}x")
 
         elapsed = time.time() - t_global
-        output  = {
-            "experiment":        "cross_continental_transfer",
-            "timestamp":         timestamp,
-            "common_features":   common,
-            "n_common_features": len(common),
-            "train_years":       list(TRAIN_YEARS),
-            "test_years":        [TEST_START, TEST_END],
-            "sa_to_usa":         result_sa_to_usa,
-            "usa_to_sa":         result_usa_to_sa,
-            "timing":            {"total_seconds": elapsed, "total_minutes": elapsed / 60},
+        output_json = {
+            "experiment":  "cross_continental_transfer",
+            "timestamp":   timestamp,
+            "test_years":  [TEST_START, TEST_END],
+            "results":     all_results,
+            "timing":      {"total_seconds": elapsed, "total_minutes": elapsed / 60},
         }
-        output = convert_numpy_types(output)
+        output_json = convert_numpy_types(output_json)
 
         json_path = output_dir / f"transfer_results_{timestamp}.json"
         with open(json_path, "w") as f:
-            json.dump(output, f, indent=2)
+            json.dump(output_json, f, indent=2)
 
         print(f"\nResults saved: {json_path}")
         print(f"Total time: {elapsed:.1f}s ({elapsed/60:.1f} min)")
 
         if use_wandb:
-            for result in [result_sa_to_usa, result_usa_to_sa]:
-                src  = result["source_region"]
-                tgt  = result["target_region"]
+            for result in all_results:
                 m    = result["test_metrics"]
-                pref = f"{src}_to_{tgt}"
+                pref = f"{result['source_region']}_to_{result['target_region']}_{result['model_type']}"
                 wandb.log({
                     f"{pref}/roc_auc":           m.get("roc_auc",           float("nan")),
                     f"{pref}/pr_auc":            m.get("pr_auc",            float("nan")),
@@ -1787,7 +1847,6 @@ def run_transfer_main() -> None:
                     f"{pref}/brier_score":       m.get("brier_score",       float("nan")),
                     f"{pref}/n_test":            result["test_data"]["n_samples"],
                     f"{pref}/n_test_positive":   result["test_data"]["n_positive"],
-                    f"{pref}/n_train":           result["train_data"]["n_samples"],
                 })
             wandb.log({"timing/total_seconds": elapsed})
             wandb.finish()
@@ -1814,5 +1873,6 @@ __all__ = [
     "load_rf_params",
     "resolve_best_params",
     "resolve_rf_best_params",
+    "resolve_trained_model",
     "resolve_cv_output_dir",
 ]
