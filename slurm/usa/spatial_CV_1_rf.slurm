@@ -74,6 +74,7 @@ GSN_RASTER="data/usa/ready/GSN/gsn_terrestrial_ecoregions_mask_1km.tif"
 echo "Starting LOBO RF fold ${FOLD_IDX} (USA)..."
 export MAX_NEG_TRAIN=50000000      # Cap negative samples at 50M — matches production training_rf.slurm
 export BATCH_SIZE=100000           # Reduced batch size for OOM safety — matches production training_rf.slurm
+export LOBO_N_ESTIMATORS=100       # Reduced trees for LOBO tractability — production uses 300
 srun --cpu-bind=cores --distribution=block:block \
   python -u "$SCRIPT" --biome-idx "${FOLD_IDX}" --model-type rf
 

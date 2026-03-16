@@ -17,18 +17,20 @@
 # model on all biomes except one and evaluates on the held-out biome.
 #
 # Usage (submit all folds at once via array):
-#   sbatch slurm/south_america/spatial_cv_lobo.slurm
+#   sbatch slurm/south_america/spatial_CV_1.slurm
 #
 # Usage (single fold, e.g. biome index 3):
-#   BIOME_IDX=3 sbatch --array=3 slurm/south_america/spatial_cv_lobo.slurm
-#   or equivalently:
-#   sbatch --export=BIOME_IDX=3 --array=3 slurm/south_america/spatial_cv_lobo.slurm
+#   sbatch --export=BIOME_IDX=3 --array=3 slurm/south_america/spatial_CV_1.slurm
 #
 # The SLURM array index (SLURM_ARRAY_TASK_ID) is used as the biome index
-# unless the BIOME_IDX environment variable is set explicitly.
+# unless BIOME_IDX is set explicitly.
 #
-# To find valid biome indices run:
-#   python scripts/regions/south_america/6_evaluation/spatial_cv_lobo --list-biomes
+# To find valid biome indices:
+#   python scripts/regions/south_america/6_evaluation/spatial_CV_1 --list-biomes
+#
+# To select a representative biome subset (update --array after running):
+#   python scripts/regions/shared/evaluation/select_lobo_biomes.py \
+#       --region south_america --n-biomes 5
 # ------------------------------------------------------------------------------
 
 # Create necessary folders on $SCRATCH if they don't exist
@@ -77,6 +79,7 @@ SCRIPT="scripts/regions/south_america/6_evaluation/spatial_CV_1"
 # Run the LOBO fold
 #------------------------------------------------------------------------------
 echo "Starting LOBO fold ${FOLD_IDX} (South America)..."
+export LOBO_NUM_BOOST_ROUND=1000   # Reduced rounds for LOBO tractability — production uses ~2555
 srun --cpu-bind=cores --distribution=block:block \
   python -u "$SCRIPT" --biome-idx "${FOLD_IDX}" --model-type lgbm
 

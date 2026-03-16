@@ -1379,6 +1379,11 @@ def run_lobo_main(region: str, model_id: str) -> None:
             params, num_boost_round = load_best_params(params_path)
             params["num_threads"] = NUM_THREADS
             print(f"num_boost_round: {num_boost_round}")
+            _lobo_rounds = int(os.environ.get("LOBO_NUM_BOOST_ROUND", "0"))
+            if _lobo_rounds > 0 and _lobo_rounds != num_boost_round:
+                print(f"  LOBO override: num_boost_round {num_boost_round} → {_lobo_rounds} "
+                      f"(LOBO_NUM_BOOST_ROUND env var; production value preserved elsewhere)")
+                num_boost_round = _lobo_rounds
         else:  # rf
             params_path = resolve_rf_best_params(region)
             if params_path:
@@ -1387,6 +1392,12 @@ def run_lobo_main(region: str, model_id: str) -> None:
                 print("\nWARNING: rf_best_params.json not found — using defaults")
             params, num_boost_round = load_rf_params(params_path)
             print(f"n_estimators: {num_boost_round}")
+            _lobo_trees = int(os.environ.get("LOBO_N_ESTIMATORS", "0"))
+            if _lobo_trees > 0 and _lobo_trees != num_boost_round:
+                print(f"  LOBO override: n_estimators {num_boost_round} → {_lobo_trees} "
+                      f"(LOBO_N_ESTIMATORS env var; production value preserved elsewhere)")
+                num_boost_round = _lobo_trees
+                params["n_estimators"] = _lobo_trees  # train_rf reads from params dict
 
         schema       = pq.ParquetFile(train_path).schema_arrow
         feature_cols = [
