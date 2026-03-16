@@ -7,7 +7,7 @@ The selection is data-driven and objective: per-biome mean feature vectors are
 computed from a sample of the training parquet, z-score normalised, and then
 the N biomes that are farthest apart in that space are selected greedily.
 
-Run on Euler (where the parquet data lives), from the repo root:
+Run interactively on the Euler login node (fast, ~1-2 min), from the repo root:
 
     python scripts/regions/shared/evaluation/select_lobo_biomes.py \\
         --region south_america --n-biomes 5
@@ -15,8 +15,11 @@ Run on Euler (where the parquet data lives), from the repo root:
     python scripts/regions/shared/evaluation/select_lobo_biomes.py \\
         --region usa --n-biomes 6
 
-Output: prints the selected biome names and the --array string to paste
-directly into the SLURM files.
+The script writes the selected indices to slurm/{region}/lobo_biome_array.txt
+so SLURM files do not need to be edited manually.  Submit directly with:
+
+    sbatch --array=$(cat slurm/south_america/lobo_biome_array.txt) \\
+        slurm/south_america/spatial_CV_1.slurm
 """
 
 import argparse
@@ -216,10 +219,18 @@ def main() -> None:
         print(f"  [{idx:2d}] {name}")
 
     array_str = ",".join(str(i) for i in indices)
-    print(f"\nSLURM --array flag:  --array={array_str}")
-    print(f"\nUpdate #SBATCH --array in:")
-    print(f"  slurm/{args.region}/spatial_CV_1.slurm")
-    print(f"  slurm/{args.region}/spatial_CV_1_rf.slurm")
+
+    # Write array string to file so sbatch can consume it without editing SLURM files
+    array_file = _REPO / f"slurm/{args.region}/lobo_biome_array.txt"
+    array_file.parent.mkdir(parents=True, exist_ok=True)
+    array_file.write_text(array_str + "\n")
+    print(f"\nArray indices written to: {array_file}")
+
+    print(f"\nSubmit with:")
+    print(f"  sbatch --array=$(cat slurm/{args.region}/lobo_biome_array.txt) "
+          f"slurm/{args.region}/spatial_CV_1.slurm")
+    print(f"  sbatch --array=$(cat slurm/{args.region}/lobo_biome_array.txt) "
+          f"slurm/{args.region}/spatial_CV_1_rf.slurm")
 
 
 if __name__ == "__main__":

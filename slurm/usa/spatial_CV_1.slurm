@@ -28,9 +28,11 @@
 # To find valid biome indices:
 #   python scripts/regions/usa/6_evaluation/spatial_CV_1 --list-biomes
 #
-# To select a representative biome subset (update --array after running):
+# To run a representative biome subset (no manual edits needed):
 #   python scripts/regions/shared/evaluation/select_lobo_biomes.py \
 #       --region usa --n-biomes 6
+#   sbatch --array=$(cat slurm/usa/lobo_biome_array.txt) \
+#       slurm/usa/spatial_CV_1.slurm
 #
 # Prerequisites:
 #   The USA GSN raster must exist at:
