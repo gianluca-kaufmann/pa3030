@@ -655,13 +655,25 @@ def load_best_params(path: Optional[Path]) -> tuple[dict[str, Any], int]:
 # =============================================================================
 
 def train_lgbm(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    years_train: np.ndarray,
+    arrays_holder: list,
     params: dict[str, Any],
     num_boost_round: int,
 ) -> lgb.Booster:
-    """Train LightGBM with fixed num_boost_round (no temporal CV, no early stopping)."""
+    """Train LightGBM with fixed num_boost_round (no temporal CV, no early stopping).
+
+    ``arrays_holder`` must be a list ``[X_train, y_train, years_train]``.  The
+    function clears the list immediately after extracting the arrays so that the
+    caller's references are dropped before ``lgb.Dataset.construct()`` runs.
+    This mirrors the pattern used in model1_LGBM: ``del X_train`` in the same
+    scope as ``lgb.Dataset(X_train, ..., free_raw_data=True)`` ensures the raw
+    89 GB array is freed during Dataset construction rather than held through all
+    training rounds, cutting peak RSS by ~90 GB on the SA LOBO folds.
+    """
+    X_train, y_train, years_train = arrays_holder
+    arrays_holder.clear()   # release caller's last references
+    del arrays_holder
+    gc.collect()
+
     scale_pos_weight = int((y_train == 0).sum()) / max(int(y_train.sum()), 1)
     print(f"\n  scale_pos_weight = {scale_pos_weight:.4f}")
 
@@ -747,11 +759,19 @@ def train_rf(
     params: dict[str, Any],
     n_jobs: int,
 ) -> Any:
-    """Train RandomForestClassifier with median imputation.
+    """Train RandomForestClassifier, with NaN handling only when needed.
 
-    Returns a fitted sklearn Pipeline (SimpleImputer → RandomForestClassifier)
-    so NaN handling is bundled with the model.  Prediction is then simply
-    ``pipeline.predict_proba(X)[:, 1]``.
+    When the training matrix contains no NaN values (the normal case for the
+    preprocessed LOBO parquets), the RF is fitted directly — matching the
+    pattern used in model1_RF / model2_RF.  This avoids the full-copy that
+    SimpleImputer.fit_transform() allocates inside a Pipeline, which would
+    temporarily double peak RSS (e.g. 2 × 17 GB with a 50M neg cap, or
+    2 × 88 GB without one).
+
+    When NaNs are present a sklearn Pipeline(SimpleImputer → RF) is returned
+    instead so that inference-time imputation is still bundled with the model.
+
+    The returned object always supports ``.predict_proba(X)[:, 1]``.
     """
     if RandomForestClassifier is None:
         raise ImportError("scikit-learn is required for RF training: pip install scikit-learn")
@@ -769,17 +789,27 @@ def train_rf(
           f"max_features={rf_params.get('max_features', 'sqrt')}")
     print(f"  Training set: {len(y_train):,} samples ({n_pos:,} pos, {n_neg:,} neg)")
 
-    pipeline = SklearnPipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("rf",      RandomForestClassifier(n_estimators=n_estimators, **rf_params)),
-    ])
+    has_nan = bool(np.isnan(X_train).any())
+    print(f"  NaNs in training data: {has_nan}")
 
     t0 = time.time()
     report_memory_usage("before RF fit")
-    pipeline.fit(X_train, y_train)
+    if has_nan:
+        # Pipeline bundles imputation with the model so predict_proba works on
+        # data that may also contain NaNs.
+        model_obj = SklearnPipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("rf",      RandomForestClassifier(n_estimators=n_estimators, **rf_params)),
+        ])
+        model_obj.fit(X_train, y_train)
+    else:
+        # No NaNs: fit RF directly, same as model1_RF / model2_RF.
+        # Avoids the full-matrix copy that SimpleImputer.fit_transform allocates.
+        model_obj = RandomForestClassifier(n_estimators=n_estimators, **rf_params)
+        model_obj.fit(X_train, y_train)
     print(f"  RF training done in {time.time()-t0:.1f}s")
     report_memory_usage("after RF fit")
-    return pipeline
+    return model_obj
 
 
 # =============================================================================
@@ -1451,7 +1481,16 @@ def run_lobo_main(region: str, model_id: str) -> None:
         print(f"STEP 2: TRAIN {model_type.upper()} (fixed rounds/trees)")
         print("=" * 70)
         if model_type == "lgbm":
-            model = train_lgbm(X_train, y_train, years_train, params, num_boost_round)
+            # Transfer ownership via a holder list so the caller's X_train reference
+            # is dropped before lgb.Dataset.construct() runs.  After arrays_holder.clear()
+            # inside train_lgbm, ds.data is the only live reference; free_raw_data=True
+            # then frees the 89 GB array after binning, cutting ~90 GB from peak RSS
+            # during training rounds.  RF keeps the full array through fit() so its
+            # memory is managed via MAX_NEG_TRAIN in the SLURM scripts.
+            _holder = [X_train, y_train, years_train]
+            del X_train, y_train, years_train
+            gc.collect()
+            model = train_lgbm(_holder, params, num_boost_round)
             predict_fn: Callable[[np.ndarray], np.ndarray] = (
                 lambda X, _m=model, _n=num_boost_round:
                     _m.predict(X, num_iteration=_n).astype(np.float32)
@@ -1459,7 +1498,7 @@ def run_lobo_main(region: str, model_id: str) -> None:
         else:  # rf
             model = train_rf(X_train, y_train, params, n_jobs=NUM_THREADS)
             predict_fn = lambda X, _m=model: _m.predict_proba(X)[:, 1].astype(np.float32)
-        del X_train, y_train, years_train; gc.collect()
+            del X_train, y_train, years_train; gc.collect()
         report_memory_usage("after training")
 
         model_dir  = repo_root / f"data/{region}/ml/models"
