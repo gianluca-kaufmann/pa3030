@@ -90,6 +90,7 @@ FIXED_PARAMS     = {
     'verbose': -1,
 }
 BATCH_SIZE       = int(os.environ.get("BATCH_SIZE", "200000"))
+MAX_NEG_SPATIAL  = int(os.environ.get("MAX_NEG_TRAIN", "0"))  # 0 = no cap; set in RF SLURM scripts
 MIN_POSITIVES    = 10    # minimum positives in a test biome to consider fold valid
 MIN_SAMPLES      = 100   # minimum samples in a biome to compute Layer 2 metrics
 
@@ -349,11 +350,16 @@ def load_data_spatial(
     include: bool,
     year_range: tuple[int, int],
     name: str = "",
+    max_neg_samples: int = 0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
     """Two-pass PyArrow loader with spatial biome mask + year + risk-set filters.
 
     Args:
         include: True = keep only pixels in biome_ints; False = exclude them.
+        max_neg_samples: If > 0, cap negatives at this count via uniform random
+            sampling without replacement (all positives are always kept).
+            Mirrors the MAX_NEG_TRAIN env-var approach used in production RF
+            training scripts; set via MAX_NEG_SPATIAL at module level.
 
     Returns:
         X (float32), y (int8), years_arr (int32), n_pos, n_neg
@@ -362,14 +368,16 @@ def load_data_spatial(
     biome_arr_set = np.array(sorted(biome_ints), dtype=np.int32)
     year_lo, year_hi = year_range
     op = "INCLUDE" if include else "EXCLUDE"
-    print(f"\nLoading {name} [{op} biome, years {year_lo}-{year_hi}]...")
+    neg_cap_str = f", max_neg={max_neg_samples:,}" if max_neg_samples > 0 else ""
+    print(f"\nLoading {name} [{op} biome, years {year_lo}-{year_hi}{neg_cap_str}]...")
     t0 = time.time()
 
     essential_cols = feature_cols + [TARGET_COL, 'year', 'WDPA_prev', 'row', 'col']
 
-    # ── Pass 1: count rows ───────────────────────────────────────────────────
+    # ── Pass 1: count positives and negatives separately ────────────────────
     print("  Pass 1: counting rows...")
-    n_total = 0
+    n_pos_total = 0
+    n_neg_total = 0
     for path in parquet_paths:
         pf = pq.ParquetFile(path)
         try:
@@ -379,6 +387,7 @@ def load_data_spatial(
                 valid_mask   = ~null_mask
                 if not valid_mask.any():
                     continue
+                target_arr = batch[TARGET_COL].to_numpy(zero_copy_only=False)
                 year_arr  = batch['year'].to_numpy(zero_copy_only=False)
                 wdpa_arr  = batch['WDPA_prev'].to_numpy(zero_copy_only=False)
                 row_arr   = batch['row'].to_numpy(zero_copy_only=False)
@@ -391,21 +400,37 @@ def load_data_spatial(
                                                       col_arr[in_bounds]].astype(np.int32)
                 spatial_mask = np.isin(biome_vals, biome_arr_set) if include \
                                else ~np.isin(biome_vals, biome_arr_set)
-                n_total += int((valid_mask & risk_mask & year_mask & spatial_mask).sum())
+                final = valid_mask & risk_mask & year_mask & spatial_mask
+                n_pos_total += int((final & (target_arr > 0)).sum())
+                n_neg_total += int((final & (target_arr == 0)).sum())
         finally:
             del pf; gc.collect()
 
+    do_neg_sample = max_neg_samples > 0 and n_neg_total > max_neg_samples
+    n_neg_final   = max_neg_samples if do_neg_sample else n_neg_total
+    n_total       = n_pos_total + n_neg_final
     print(f"  Found {n_total:,} samples")
+    if do_neg_sample:
+        print(f"  ({n_pos_total:,} pos, {n_neg_total:,} neg → capping neg at {n_neg_final:,})")
     if n_total == 0:
         raise ValueError(f"No samples found for '{name}'. Check biome index and year range.")
 
-    # ── Pass 2: fill pre-allocated arrays ────────────────────────────────────
+    # ── Pre-generate negative keep indices (exact uniform sample) ───────────
+    if do_neg_sample:
+        rng      = np.random.default_rng(RANDOM_STATE)
+        neg_keep = np.sort(rng.choice(n_neg_total, size=n_neg_final, replace=False))
+    else:
+        neg_keep = None
+
+    # ── Pass 2: fill pre-allocated arrays ───────────────────────────────────
     print(f"  Pass 2: pre-allocating {n_total:,} × {len(feature_cols)} float32...")
-    X         = np.empty((n_total, len(feature_cols)), dtype=np.float32)
-    y         = np.empty(n_total, dtype=np.int8)
-    years_arr = np.empty(n_total, dtype=np.int32)
-    offset    = 0
-    batch_num = 0
+    X          = np.empty((n_total, len(feature_cols)), dtype=np.float32)
+    y          = np.empty(n_total, dtype=np.int8)
+    years_arr  = np.empty(n_total, dtype=np.int32)
+    pos_offset = 0
+    neg_offset = n_pos_total   # negatives placed after all positives
+    neg_seen   = 0             # global counter across batches (for subsampling)
+    batch_num  = 0
     _load_milestone = -1
 
     for path in parquet_paths:
@@ -434,31 +459,67 @@ def load_data_spatial(
                 final = valid_mask & risk_mask & year_mask & spatial_mask
                 if not final.any():
                     continue
-                feat_tbl = batch.select(feature_cols)
-                X_b  = extract_features_pyarrow_to_numpy(feat_tbl, final)
-                y_b  = (target_arr[final] > 0).astype(np.int8)
-                yr_b = year_arr[final].astype(np.int32)
-                bs   = len(y_b)
-                X[offset:offset + bs]         = X_b
-                y[offset:offset + bs]         = y_b
-                years_arr[offset:offset + bs] = yr_b
-                offset += bs
+
+                pos_final     = final & (target_arr > 0)
+                neg_final_all = final & (target_arr == 0)
+
+                # --- Positives: always keep all ---
+                if pos_final.any():
+                    Xb_pos = extract_features_pyarrow_to_numpy(
+                        batch.select(feature_cols), pos_final)
+                    yr_pos = year_arr[pos_final].astype(np.int32)
+                    bs_pos = len(yr_pos)
+                    X[pos_offset:pos_offset + bs_pos]         = Xb_pos
+                    y[pos_offset:pos_offset + bs_pos]         = 1
+                    years_arr[pos_offset:pos_offset + bs_pos] = yr_pos
+                    pos_offset += bs_pos
+
+                # --- Negatives: optional subsampling ---
+                if neg_final_all.any():
+                    n_neg_b = int(neg_final_all.sum())
+                    if neg_keep is not None:
+                        # Vectorised membership test: which global neg indices land in neg_keep
+                        batch_idx = np.arange(neg_seen, neg_seen + n_neg_b, dtype=np.int64)
+                        lo        = np.searchsorted(neg_keep, batch_idx)
+                        lo_c      = np.minimum(lo, len(neg_keep) - 1)
+                        keep_local = neg_keep[lo_c] == batch_idx   # bool mask, len = n_neg_b
+                        neg_seen  += n_neg_b
+
+                        if keep_local.any():
+                            neg_where    = np.where(neg_final_all)[0]
+                            kept_global  = neg_where[keep_local]
+                            neg_filtered = np.zeros(len(target_arr), dtype=bool)
+                            neg_filtered[kept_global] = True
+                            Xb_neg = extract_features_pyarrow_to_numpy(
+                                batch.select(feature_cols), neg_filtered)
+                            n_kept = int(keep_local.sum())
+                            X[neg_offset:neg_offset + n_kept]         = Xb_neg
+                            y[neg_offset:neg_offset + n_kept]         = 0
+                            years_arr[neg_offset:neg_offset + n_kept] = year_arr[neg_filtered].astype(np.int32)
+                            neg_offset += n_kept
+                    else:
+                        # No subsampling — combined extraction path
+                        Xb_neg = extract_features_pyarrow_to_numpy(
+                            batch.select(feature_cols), neg_final_all)
+                        X[neg_offset:neg_offset + n_neg_b]         = Xb_neg
+                        y[neg_offset:neg_offset + n_neg_b]         = 0
+                        years_arr[neg_offset:neg_offset + n_neg_b] = year_arr[neg_final_all].astype(np.int32)
+                        neg_offset += n_neg_b
+
                 if batch_num % 25 == 0:
                     gc.collect()
-                _pct = offset * 100 // n_total if n_total > 0 else 0
+                total_filled = pos_offset + (neg_offset - n_pos_total)
+                _pct = total_filled * 100 // n_total if n_total > 0 else 0
                 _ms  = _pct // 25
                 if _ms > _load_milestone:
                     _load_milestone = _ms
-                    print(f"  {_pct}% — {offset:,}/{n_total:,} rows")
+                    print(f"  {_pct}% — {total_filled:,}/{n_total:,} rows")
                     report_memory_usage(f"  {_pct}%")
         finally:
             del pf; gc.collect()
 
-    if offset != n_total:
-        raise ValueError(f"Row count mismatch: expected {n_total}, got {offset}")
-
-    n_pos = int(y.sum())
-    n_neg = int((y == 0).sum())
+    n_pos = int(y[:n_total].sum())
+    n_neg = int((y[:n_total] == 0).sum())
     print(f"  Loaded in {time.time()-t0:.1f}s — {n_neg:,} neg, {n_pos:,} pos "
           f"(ratio 1:{n_neg/max(n_pos,1):.1f})")
     return X, y, years_arr, n_pos, n_neg
@@ -772,8 +833,41 @@ def evaluate_on_biome(
 
     print(f"  Found {n_test:,} test samples")
     if n_test == 0:
-        raise ValueError("No test samples for held-out biome. "
-                         "Check year range and biome index.")
+        # Diagnostic: count biome rows in test years ignoring WDPA_prev filter
+        # to distinguish "all already protected" from "raster coordinate mismatch"
+        n_biome_unfiltered = 0
+        n_biome_protected  = 0
+        pf_diag = pq.ParquetFile(test_path)
+        try:
+            for batch in pf_diag.iter_batches(
+                    batch_size=BATCH_SIZE,
+                    columns=['year', 'WDPA_prev', 'row', 'col'],
+                    use_threads=True):
+                ya = batch['year'].to_numpy(zero_copy_only=False)
+                wa = batch['WDPA_prev'].to_numpy(zero_copy_only=False)
+                ra = batch['row'].to_numpy(zero_copy_only=False)
+                ca = batch['col'].to_numpy(zero_copy_only=False)
+                ib = (ra >= 0) & (ra < H) & (ca >= 0) & (ca < W)
+                bv = np.zeros(len(ra), dtype=np.int32)
+                bv[ib] = biome_raster[ra[ib], ca[ib]].astype(np.int32)
+                in_biome = np.isin(bv, biome_arr_set)
+                in_years = (ya >= TEST_START) & (ya <= TEST_END)
+                mask_raw  = in_biome & in_years
+                n_biome_unfiltered += int(mask_raw.sum())
+                n_biome_protected  += int((mask_raw & (wa == 1)).sum())
+        finally:
+            del pf_diag; gc.collect()
+        if n_biome_unfiltered == 0:
+            print("  DIAGNOSTIC: 0 rows found for this biome in test years even before "
+                  "WDPA_prev filter — possible biome raster coordinate mismatch or "
+                  "biome truly absent from test parquet.")
+        else:
+            print(f"  DIAGNOSTIC: {n_biome_unfiltered:,} rows in test years for this biome "
+                  f"({n_biome_protected:,} already protected, WDPA_prev=1). "
+                  "All eligible pixels are already protected — fold correctly skipped.")
+        print(f"  WARNING: No unprotected test samples for held-out biome in test years "
+              f"({TEST_START}-{TEST_END}). Fold will be skipped.")
+        return None
 
     # Pass 2: predict and stream scored output
     print("  Pass 2: predicting and writing scored output...")
@@ -1024,12 +1118,17 @@ def find_scored_file(
     algorithm: str,
     model_id: str,
 ) -> Optional[Path]:
-    """Find the most recent scored parquet for a given algorithm."""
+    """Find the most recent scored parquet for a given algorithm.
+
+    Searches both ``output_dir/`` and ``output_dir/main/`` because calibrated
+    outputs from the calibration step land in the ``main/`` subdirectory.
+    """
     if algorithm == "lgbm":
         pattern = f"{model_id}_lgbm_scored_*.parquet"
     else:
         pattern = f"{model_id}_rf_win5_scored_*.parquet"
     files = list(output_dir.glob(pattern))
+    files.extend(output_dir.glob(f"main/{pattern}"))
     return max(files, key=lambda p: p.stat().st_mtime) if files else None
 
 
@@ -1124,6 +1223,20 @@ def _run_transfer_direction(
             model = pickle.load(fh)
         # LightGBM stores exact training column order
         feature_cols = list(model.feature_name())
+        # Production models trained on numpy arrays store generic names ("Column_0", ...).
+        # Replace with parquet-derived names from the target region (same feature set,
+        # same positional order) so that batch.select(feature_cols) works correctly.
+        if feature_cols and feature_cols[0].startswith("Column_") and feature_cols[0][7:].isdigit():
+            tgt_parquet_cols = get_feature_cols(resolve_parquet(target_region, "train_win5.parquet"))
+            if len(tgt_parquet_cols) == len(feature_cols):
+                feature_cols = tgt_parquet_cols
+                print(f"  NOTE: Replaced generic Column_N names with "
+                      f"{len(feature_cols)} parquet-derived feature names")
+            else:
+                raise ValueError(
+                    f"Feature count mismatch: model has {len(feature_cols)} features "
+                    f"(generic names), target parquet has {len(tgt_parquet_cols)}. "
+                    f"Cannot infer correct column mapping.")
         num_boost_round = model.num_trees()
         predict_fn: Callable[[np.ndarray], np.ndarray] = (
             lambda X, _m=model, _n=num_boost_round:
@@ -1317,6 +1430,7 @@ def run_lobo_main(region: str, model_id: str) -> None:
             include=False,
             year_range=(TRAIN_YEARS[0], EARLYSTOP_YEARS[1]),
             name="train+earlystop",
+            max_neg_samples=MAX_NEG_SPATIAL,
         )
         n_train = len(y_train)
         print(f"  Training set: {n_train:,} rows")
@@ -1353,36 +1467,63 @@ def run_lobo_main(region: str, model_id: str) -> None:
         )
         del model; gc.collect()
 
-        n_pos_test = test_results["n_test_pos"]
-        if n_pos_test < MIN_POSITIVES:
-            print(f"\nWARNING: Only {n_pos_test} positives in held-out biome "
-                  f"(minimum recommended: {MIN_POSITIVES}). Metrics may be unreliable.")
-
         elapsed = time.time() - t_global
-        fold_result = {
-            "fold_idx":        args.biome_idx,
-            "biome_name":      biome_name,
-            "biome_ints":      sorted(biome_ints),
-            "region":          region,
-            "model":           f"{model_id}_{model_type}",
-            "model_type":      model_type,
-            "timestamp":       timestamp,
-            "num_boost_round": num_boost_round,
-            "train_years":     list(TRAIN_YEARS),
-            "test_years":      [TEST_START, TEST_END],
-            "n_biome_folds":   len(biome_groups),
-            "train_data": {"n_samples": n_train,
-                           "n_positive": n_pos_tr,
-                           "n_negative": n_neg_tr},
-            "test_data": test_results["test_metrics"] | {
-                "n_samples":  test_results["n_test"],
-                "n_positive": test_results["n_test_pos"],
-                "n_negative": test_results["n_test_neg"],
-            },
-            "timing":       {"total_seconds": elapsed, "total_minutes": elapsed / 60},
-            "model_path":   str(model_path),
-            "scored_path":  test_results["scored_path"],
-        }
+
+        if test_results is None:
+            # Biome has no unprotected test pixels in test years — skip evaluation
+            fold_result = {
+                "fold_idx":      args.biome_idx,
+                "biome_name":    biome_name,
+                "biome_ints":    sorted(biome_ints),
+                "region":        region,
+                "model":         f"{model_id}_{model_type}",
+                "model_type":    model_type,
+                "timestamp":     timestamp,
+                "num_boost_round": num_boost_round,
+                "train_years":   list(TRAIN_YEARS),
+                "test_years":    [TEST_START, TEST_END],
+                "n_biome_folds": len(biome_groups),
+                "skipped":       True,
+                "skip_reason":   "No unprotected test pixels in test years",
+                "train_data": {"n_samples": n_train,
+                               "n_positive": n_pos_tr,
+                               "n_negative": n_neg_tr},
+                "test_data":     {"n_samples": 0, "n_positive": 0, "n_negative": 0},
+                "timing":        {"total_seconds": elapsed, "total_minutes": elapsed / 60},
+                "model_path":    str(model_path),
+                "scored_path":   None,
+            }
+            print(f"\nFold {args.biome_idx} ({biome_name}) SKIPPED — no test samples.")
+        else:
+            n_pos_test = test_results["n_test_pos"]
+            if n_pos_test < MIN_POSITIVES:
+                print(f"\nWARNING: Only {n_pos_test} positives in held-out biome "
+                      f"(minimum recommended: {MIN_POSITIVES}). Metrics may be unreliable.")
+
+            fold_result = {
+                "fold_idx":        args.biome_idx,
+                "biome_name":      biome_name,
+                "biome_ints":      sorted(biome_ints),
+                "region":          region,
+                "model":           f"{model_id}_{model_type}",
+                "model_type":      model_type,
+                "timestamp":       timestamp,
+                "num_boost_round": num_boost_round,
+                "train_years":     list(TRAIN_YEARS),
+                "test_years":      [TEST_START, TEST_END],
+                "n_biome_folds":   len(biome_groups),
+                "train_data": {"n_samples": n_train,
+                               "n_positive": n_pos_tr,
+                               "n_negative": n_neg_tr},
+                "test_data": test_results["test_metrics"] | {
+                    "n_samples":  test_results["n_test"],
+                    "n_positive": test_results["n_test_pos"],
+                    "n_negative": test_results["n_test_neg"],
+                },
+                "timing":       {"total_seconds": elapsed, "total_minutes": elapsed / 60},
+                "model_path":   str(model_path),
+                "scored_path":  test_results["scored_path"],
+            }
         fold_result = convert_numpy_types(fold_result)
 
         json_path = output_dir / f"fold_{args.biome_idx:02d}_{biome_slug}_{timestamp}.json"
@@ -1394,12 +1535,15 @@ def run_lobo_main(region: str, model_id: str) -> None:
         print("=" * 70)
         m = fold_result["test_data"]
         print(f"Biome:     {biome_name}")
-        print(f"Test rows: {test_results['n_test']:,}  ({n_pos_test:,} pos)")
-        print(f"ROC-AUC:   {m.get('roc_auc', float('nan')):.4f}")
-        print(f"PR-AUC:    {m.get('pr_auc', float('nan')):.4f}")
-        print(f"P@1%:      {m.get('precision_at_1pct', float('nan')):.4f}  "
-              f"(Lift {m.get('lift_at_1pct', float('nan')):.1f}x)")
-        print(f"P@5%:      {m.get('precision_at_5pct', float('nan')):.4f}")
+        if test_results is not None:
+            print(f"Test rows: {test_results['n_test']:,}  ({n_pos_test:,} pos)")
+            print(f"ROC-AUC:   {m.get('roc_auc', float('nan')):.4f}")
+            print(f"PR-AUC:    {m.get('pr_auc', float('nan')):.4f}")
+            print(f"P@1%:      {m.get('precision_at_1pct', float('nan')):.4f}  "
+                  f"(Lift {m.get('lift_at_1pct', float('nan')):.1f}x)")
+            print(f"P@5%:      {m.get('precision_at_5pct', float('nan')):.4f}")
+        else:
+            print("Test rows: 0 (fold skipped — no test samples)")
         print(f"Time:      {elapsed:.1f}s ({elapsed/60:.1f} min)")
         print("=" * 70)
         print(f"\nFold results saved: {json_path}")
@@ -1412,8 +1556,8 @@ def run_lobo_main(region: str, model_id: str) -> None:
                 "test/lift_at_1pct":       m.get("lift_at_1pct",       float("nan")),
                 "test/precision_at_5pct":  m.get("precision_at_5pct",  float("nan")),
                 "test/brier_score":        m.get("brier_score",        float("nan")),
-                "test/n_samples":          test_results["n_test"],
-                "test/n_positive":         n_pos_test,
+                "test/n_samples":          fold_result["test_data"].get("n_samples", 0),
+                "test/n_positive":         fold_result["test_data"].get("n_positive", 0),
                 "train/n_samples":         n_train,
                 "train/n_positive":        n_pos_tr,
                 "timing/total_seconds":    elapsed,

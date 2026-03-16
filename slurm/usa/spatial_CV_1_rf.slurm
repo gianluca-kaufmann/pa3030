@@ -8,7 +8,7 @@
 #SBATCH --output=/cluster/scratch/%u/logs/lobo_USA_rf_%A_%a.out
 #SBATCH --error=/cluster/scratch/%u/logs/lobo_USA_rf_%A_%a.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
-#SBATCH --array=0-9
+#SBATCH --array=0-11
 
 # ------------------------------------------------------------------------------
 # Leave-One-Biome-Out (LOBO) spatial CV — USA — Random Forest
@@ -72,6 +72,8 @@ GSN_RASTER="data/usa/ready/GSN/gsn_terrestrial_ecoregions_mask_1km.tif"
 # Run the RF LOBO fold
 #------------------------------------------------------------------------------
 echo "Starting LOBO RF fold ${FOLD_IDX} (USA)..."
+export MAX_NEG_TRAIN=50000000      # Cap negative samples at 50M — matches production training_rf.slurm
+export BATCH_SIZE=100000           # Reduced batch size for OOM safety — matches production training_rf.slurm
 srun --cpu-bind=cores --distribution=block:block \
   python -u "$SCRIPT" --biome-idx "${FOLD_IDX}" --model-type rf
 
