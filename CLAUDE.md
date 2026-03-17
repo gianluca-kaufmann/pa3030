@@ -64,6 +64,7 @@ Continental regions (South America, USA):
   5_training/      -> Train/test splits + final model training (LightGBM, RF, BRF)
   6_evaluation/    -> Temporal CV, spatial CV, benchmarking, calibration
   7_results/       -> Metrics, visualizations, risk maps
+  8_forward/       -> Forward predictions to 2030 (deployment model + calibrated inference + scenario analysis)
 
 Sub-region Colombia (south_america/colombia/):
   3_merging/  -> Colombia-specific merge + feature engineering
@@ -75,6 +76,8 @@ Sub-region Colombia (south_america/colombia/):
 
 Shared utilities (scripts/regions/shared/):
   1_preprocessing/ -> 2_tuning/ -> 3_training/ -> 4_evaluation/ -> 5_results/
+  forward/         -> Shared forward-prediction core (coverage_core, features_core,
+                      predict_core, results_core, backtest_core, config, runner)
 ```
 
 ## Tech Stack
@@ -92,7 +95,7 @@ Shared utilities (scripts/regions/shared/):
 | Model | Region | Scale | Description |
 |-------|--------|-------|-------------|
 | Model 1 | South America (continental) | ~350M pixel-years | Full-scale production model |
-| Model 2 | USA (continental) | TBD | Mirrors Model 1 structure for cross-continental validation |
+| Model 2 | USA (continental) | ~200M pixel-years | Mirrors Model 1 structure for cross-continental validation |
 | Model C | Colombia (sub-region) | ~7M pixel-years | Rapid validation & development |
 | Model E | South America | ~20M pixel-years | Satellite embedding experiments |
 
@@ -231,9 +234,14 @@ Features that could improve predictive power but are not currently included:
    mediated by remoteness") and conditional probability tables readable by policymakers.
    Addresses the "black box" critique without sacrificing predictive accuracy.
    Use `pgmpy` library. See `docs/technical_guide.md` Section 11 for full details.
-10. **Forward prediction to 2030** — Generate "where will protection happen next?"
-    maps for a compelling paper figure with policy relevance. Use scenario-based
-    analysis (business-as-usual vs. 30x30 acceleration). See technical guide Section 11.
+10. ~~**Forward prediction to 2030**~~ — **DONE.** Full `8_forward/` pipeline built:
+    deployment model trained on 2001–2019, calibrated batch inference producing
+    `forward_scored_2024.parquet`, BAU / moderate / 30×30 scenario maps, per-country
+    coverage table, economic exposure in top risk zones, false-positive spatial analysis,
+    hotspot zoom-in figures, and backtesting validation (2009→2014, 2011→2016 windows).
+    Temporal framing: 2024 data = start of 2025; 5-year lookahead ends 2030, consistent
+    with 30×30 policy target. Moderate scenario is region-adaptive (midpoint between
+    current coverage and 30%). All logic shared via `scripts/regions/shared/forward/`.
 
 ### Lower Priority (Polish)
 11. **Consistent logging** — Replace mixed `print()`/`logging.info()` with unified logging.
@@ -280,6 +288,21 @@ sbatch slurm/south_america/spatial_CV_1_aggregate_rf.slurm # aggregate RF folds
 # Spatial CV — Layer 3 cross-continental transfer (can run in parallel with step 5)
 sbatch slurm/south_america/spatial_CV_3.slurm
 
+# Forward prediction pipeline (8_forward/)
+# Stage 0a: Coverage baseline (run locally or on cluster)
+python scripts/regions/south_america/8_forward/1_forward_coverage_baseline.py
+
+# Stages 0b + 1 + 2: Deployment model training + feature extraction + inference (Euler)
+sbatch slurm/south_america/forward_deployment.slurm
+
+# Stage 0c: Backtesting validation (Euler)
+sbatch slurm/south_america/forward_backtest.slurm
+
+# Stage 3: Results — scenario maps, country breakdown, exposure analysis, hotspots
+python scripts/regions/south_america/8_forward/4_forward_results.py
+
+# Same commands work for USA (replace south_america with usa)
+
 # Run tests
 pytest tests/test_pipeline.py -v
 ```
@@ -297,6 +320,12 @@ pytest tests/test_pipeline.py -v
 │   │   ├── 5_training/           # Includes splits scripts + best_params JSONs
 │   │   ├── 6_evaluation/
 │   │   ├── 7_results/
+│   │   ├── 8_forward/            # Forward predictions to 2030
+│   │   │   ├── 1_forward_coverage_baseline.py
+│   │   │   ├── 2_forward_features.py
+│   │   │   ├── 3_forward_predict.py
+│   │   │   ├── 4_forward_results.py
+│   │   │   └── 5_forward_backtest.py
 │   │   ├── colombia/             # Sub-region pipeline
 │   │   │   ├── 3_merging/
 │   │   │   └── 4_ml/
@@ -306,7 +335,16 @@ pytest tests/test_pipeline.py -v
 │   │   │       └── results/
 │   │   └── embeddings/           # Satellite embedding pipeline
 │   ├── shared/                   # Shared utilities (1_preprocessing/ … 5_results/)
-│   ├── usa/                      # Mirrors SA continental structure
+│   │   ├── forward/              # Shared forward-prediction pipeline core
+│   │   │   ├── config.py         # Region profiles + env-var dispatch
+│   │   │   ├── runner.py         # Orchestrates stages 0a–3 via subprocess reload
+│   │   │   ├── coverage_core.py  # Stage 0a: coverage baseline + per-country stats
+│   │   │   ├── features_core.py  # Stage 1: extract 2024 inference features
+│   │   │   ├── predict_core.py   # Stage 2: calibrated batch inference
+│   │   │   ├── results_core.py   # Stage 3: scenario maps, tables, exposure, hotspots
+│   │   │   └── backtest_core.py  # Stage 0c: temporal backtesting validation
+│   │   └── results/              # Shared training-results core (results_core.py)
+│   ├── usa/                      # Mirrors SA continental structure (incl. 8_forward/)
 │   ├── se_asia/                  # Planned
 │   └── tropical_africa/          # Planned
 ├── tests/                        # pytest suite (test_pipeline.py)

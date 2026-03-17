@@ -864,7 +864,8 @@ def create_economic_exposure(
     # ── Load and join features ────────────────────────────────────────────────
     print(f"  Loading features: {proxy_cols} …")
     feat_df = pq.read_table(feat_path, columns=["row", "col"] + proxy_cols).to_pandas()
-    merged  = df[["row", "col", PROBA_COL, "area_km2"]].merge(
+    coord_cols = [c for c in ["x", "y"] if c in df.columns]
+    merged  = df[["row", "col", PROBA_COL, "area_km2"] + coord_cols].merge(
         feat_df, on=["row", "col"], how="left"
     )
     del feat_df
@@ -906,10 +907,9 @@ def create_economic_exposure(
     if ntl_col is not None:
         bau_sub = merged[bau_mask].dropna(subset=[ntl_col])
         if len(bau_sub) > 0:
-            lon_b, lat_b = epsg3857_to_lonlat(bau_sub["x"].values if "x" in bau_sub.columns
-                                               else df.loc[bau_mask, "x"].values,
-                                               bau_sub["y"].values if "y" in bau_sub.columns
-                                               else df.loc[bau_mask, "y"].values)
+            lon_b, lat_b = epsg3857_to_lonlat(
+                bau_sub["x"].values, bau_sub["y"].values,
+            )
             ntl_vals = bau_sub[ntl_col].values
 
             # Rasterize mean NTL per grid cell

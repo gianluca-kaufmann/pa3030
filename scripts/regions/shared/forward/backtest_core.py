@@ -158,7 +158,7 @@ def create_false_positive_map(
             ax.imshow(
                 np.flipud(grid), origin="lower",
                 extent=[X_LIMITS[0], X_LIMITS[1], Y_LIMITS[0], Y_LIMITS[1]],
-                cmap=plt.cm.colors.LinearSegmentedColormap.from_list("c", ["white", color]),
+                cmap=matplotlib.colors.LinearSegmentedColormap.from_list("c", ["white", color]),
                 aspect="auto", interpolation="nearest",
             )
         ax.set_xlim(X_LIMITS)
