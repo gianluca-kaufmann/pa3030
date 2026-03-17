@@ -5,7 +5,7 @@ Reads forward_scored_2024.parquet from forward/{model_type}/ and
 forward_coverage_baseline.json, and produces all paper-ready outputs.
 
 BAU Forecast
-  - forward_probability_map.pdf/.png   — continuous P(protection by ~2029)
+  - forward_probability_map.pdf/.png   — continuous P(protection by 2030)
   - forward_risk_map_bau.pdf           — binary map, top X% by BAU designation volume
 
 30x30 Scenario Analysis
@@ -202,7 +202,8 @@ def epsg3857_to_lonlat(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.nda
 
 def compute_scenario_cutoffs(
     df: pd.DataFrame,
-    km2_needed_25: float,
+    km2_needed_moderate: float,
+    moderate_target_pct: float,
     km2_needed_30: float,
     bau_km2: Optional[float] = None,
 ) -> Tuple[float, float, float]:
@@ -213,6 +214,7 @@ def compute_scenario_cutoffs(
 
     BAU target: historical 5-year designation volume (bau_km2 from coverage baseline,
       i.e. new km² protected 2019→2024). Falls back to top-0.5% proxy if not available.
+    Moderate target: midpoint between current coverage and 30% (region-adaptive).
     """
     print("\nComputing scenario cutoffs…")
     df_sorted = df.sort_values(PROBA_COL, ascending=False).reset_index(drop=True)
@@ -242,8 +244,8 @@ def compute_scenario_cutoffs(
         print(f"  BAU (top 0.5% proxy — WDPA_2019 not available): "
               f"{n_bau:,} pixels ({bau_km2_actual:,.0f} km²), cutoff p={bau_cutoff:.6f}")
 
-    moderate_cutoff = _cutoff(km2_needed_25, "30x30 Moderate (→25%)")
-    full_cutoff     = _cutoff(km2_needed_30, "30x30 Full    (→30%)")
+    moderate_cutoff = _cutoff(km2_needed_moderate, f"Moderate (→{moderate_target_pct:.1%})")
+    full_cutoff     = _cutoff(km2_needed_30,       "30x30 Full    (→30%)")
 
     return bau_cutoff, moderate_cutoff, full_cutoff
 
@@ -347,7 +349,7 @@ def create_probability_map(
     _draw_boundary(ax, region_boundary)
 
     cbar = plt.colorbar(im, ax=ax, fraction=0.03, pad=0.04)
-    cbar.set_label("P(protection by ~2029) [sqrt-stretched]", fontsize=10)
+    cbar.set_label("P(protection by 2030) [sqrt-stretched]", fontsize=10)
     cbar.set_ticks([0, 0.5, 1.0])
     cbar.set_ticklabels(["low", "medium", "high"])
 
@@ -356,7 +358,7 @@ def create_probability_map(
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
     ax.set_title(
-        f"BAU Forecast: P(Protected-Area Designation by ~2029) — {region_label}\n"
+        f"BAU Forecast: P(Protected-Area Designation by 2030) — {region_label}\n"
         "Deployment model (2001–2019), unprotected pixels as of 2024",
         fontsize=12,
     )
@@ -463,15 +465,17 @@ def create_scenario_maps(
     protected_2024_km2 = baseline["protected_2024_km2"]
 
     scenario_info: Dict[str, Any] = {}
+    moderate_pct = baseline.get("moderate_target_pct", 0.25)
+    moderate_pct_str = f"{moderate_pct:.0%}"
 
     scenarios = [
         (proba >= bau_cutoff, "bau",
-         f"BAU Forecast — Projected Designations (~2025–2029) — {region_label}",
+         f"BAU Forecast — Projected Designations (2025–2030) — {region_label}",
          "Top 0.5% unprotected pixels by predicted probability",
          SCENARIO_COLORS["bau"], "forward_risk_map_bau"),
         (proba >= moderate_cutoff, "moderate",
-         f"30x30 Moderate Scenario (→25% {region_label} coverage)",
-         "Spatial projection if historical designation preferences continue to 25% coverage",
+         f"Moderate Scenario (→{moderate_pct_str} {region_label} coverage)",
+         f"Spatial projection if historical designation preferences continue to {moderate_pct_str} coverage",
          SCENARIO_COLORS["moderate"], "forward_scenario_moderate"),
         (proba >= full_cutoff, "30x30",
          f"30x30 Full Scenario (→30% {region_label} coverage)",
@@ -525,6 +529,15 @@ def create_country_breakdown(
 
         region_world = world_gdf[world_gdf["iso_a3"].isin(iso_codes)].copy()
 
+        # Build per-country area lookup from coverage baseline (raster-based, accurate)
+        country_stats_lookup: dict = {
+            cs["iso_a3"]: cs
+            for cs in baseline.get("country_stats", [])
+        }
+        if not country_stats_lookup:
+            print("  NOTE: country_stats not found in baseline — run 1_forward_coverage_baseline.py "
+                  "to populate per-country area stats. Current/projected % will be 0.")
+
         lon, lat = epsg3857_to_lonlat(df["x"].values, df["y"].values)
         area  = df["area_km2"].values
         proba = df[PROBA_COL].values
@@ -548,15 +561,30 @@ def create_country_breakdown(
         rows = []
         for iso, grp in joined.groupby("iso_a3"):
             country_name = grp["name"].iloc[0] if len(grp) > 0 else iso
-            current_unprotected_km2 = float(grp["area_km2"].sum())
-            bau_new_km2  = float(grp.loc[grp["bau_sel"] == 1, "area_km2"].sum())
-            full_new_km2 = float(grp.loc[grp["full_sel"] == 1, "area_km2"].sum())
+            unprotected_km2 = float(grp["area_km2"].sum())
+            bau_new_km2     = float(grp.loc[grp["bau_sel"] == 1, "area_km2"].sum())
+            full_new_km2    = float(grp.loc[grp["full_sel"] == 1, "area_km2"].sum())
+
+            cs = country_stats_lookup.get(iso, {})
+            total_km2      = cs.get("total_km2", 0.0)
+            prot_km2       = cs.get("protected_2024_km2", 0.0)
+            current_pct    = cs.get("current_pct_protected", 0.0)
+            proj_pct_bau   = (prot_km2 + bau_new_km2)  / max(total_km2, 1.0)
+            proj_pct_30x30 = (prot_km2 + full_new_km2) / max(total_km2, 1.0)
+            gap_km2        = max(0.0, 0.30 * total_km2 - (prot_km2 + full_new_km2))
+
             rows.append({
                 "iso_a3": iso,
                 "country": country_name,
-                "unprotected_2024_km2": round(current_unprotected_km2, 0),
+                "total_km2": round(total_km2, 0),
+                "protected_2024_km2": round(prot_km2, 0),
+                "current_pct_protected": round(current_pct, 4),
+                "unprotected_2024_km2": round(unprotected_km2, 0),
                 "bau_new_km2": round(bau_new_km2, 0),
                 "30x30_new_km2": round(full_new_km2, 0),
+                "projected_pct_2030_bau": round(proj_pct_bau, 4),
+                "projected_pct_2030_30x30": round(proj_pct_30x30, 4),
+                "gap_to_30pct_km2": round(gap_km2, 0),
             })
 
         country_df = pd.DataFrame(rows).sort_values("30x30_new_km2", ascending=False)
@@ -566,10 +594,17 @@ def create_country_breakdown(
 
         # LaTeX table (top 13 countries)
         tex_path = output_dir / "forward_country_breakdown.tex"
-        tex_cols = ["country", "unprotected_2024_km2", "bau_new_km2", "30x30_new_km2"]
+        tex_cols = [
+            "country", "total_km2", "current_pct_protected",
+            "30x30_new_km2", "projected_pct_2030_30x30", "gap_to_30pct_km2",
+        ]
         country_df[tex_cols].head(13).to_latex(
-            tex_path, index=False, float_format="%.0f",
-            caption="Country-level breakdown: unprotected 2024 area and projected designations.",
+            tex_path, index=False, float_format="%.4g",
+            caption=(
+                "Country-level breakdown: total land area, current protection (end-2024), "
+                "projected new designations under the 30×30 scenario, "
+                "projected coverage by 2030, and remaining gap to the 30\\% target."
+            ),
             label="tab:forward_country",
         )
         print(f"  Saved: {tex_path}")
@@ -698,7 +733,7 @@ def create_gap_analysis(
     gsn_mask_for_fig = df["GSN_b1"].values.astype(bool) if has_gsn else np.zeros(len(df), dtype=bool)
 
     panel_defs = [
-        (bau_mask, "BAU Projected Designations\n(top 0.5% unprotected, ~2025–2029)",
+        (bau_mask, "BAU Projected Designations\n(top 0.5% unprotected, 2025–2030)",
          SCENARIO_COLORS["bau"]),
         (gsn_mask_for_fig,
          "Biodiversity Priority (GSN_b1==1)\nHigh-priority unprotected pixels",
@@ -826,9 +861,14 @@ def main() -> None:
     print(f"  Baseline coverage 2024:        {baseline['coverage_pct_2024']:.2%}")
 
     # ── Scenario cutoffs ──────────────────────────────────────────────────────
+    # Use adaptive moderate target (midpoint current→30%) from baseline.
+    # Fall back to the legacy 25% key if re-running against an old baseline JSON.
+    km2_moderate = baseline.get("km2_needed_for_moderate") or baseline.get("km2_needed_for_25pct", 0.0)
+    moderate_pct = baseline.get("moderate_target_pct", 0.25)
     bau_cutoff, moderate_cutoff, full_cutoff = compute_scenario_cutoffs(
         df,
-        baseline["km2_needed_for_25pct"],
+        km2_moderate,
+        moderate_pct,
         baseline["km2_needed_for_30pct"],
         bau_km2=baseline.get("bau_km2"),
     )

@@ -65,6 +65,7 @@ def compute_coverage_baseline(
     output_dir: Path,
     data_subdir: str,
     region_label: str,
+    iso_codes: list[str] | None = None,
 ) -> dict:
     """Compute total area, 2024 coverage, and scenario thresholds."""
     print("\n" + "=" * 70)
@@ -161,25 +162,81 @@ def compute_coverage_baseline(
         print("  forward_results will fall back to top-0.5% proxy for BAU cutoff.")
 
     # ── 4. Scenario thresholds ────────────────────────────────────────────────
-    km2_needed_25 = max(0.0, 0.25 * total_km2 - protected_2024_km2)
+    # Moderate target: midpoint between current coverage and 30x30 goal.
+    # This adapts per region (e.g. SA ~20% → moderate=25%; USA ~12% → moderate~21%).
+    moderate_target_pct = (coverage_pct_2024 + 0.30) / 2
+    km2_needed_moderate = max(0.0, moderate_target_pct * total_km2 - protected_2024_km2)
     km2_needed_30 = max(0.0, 0.30 * total_km2 - protected_2024_km2)
     print(f"\n  Scenario thresholds:")
-    print(f"    25% target: {km2_needed_25:,.0f} km² additional protection needed")
+    print(f"    Moderate target ({moderate_target_pct:.1%}, midpoint current→30%): "
+          f"{km2_needed_moderate:,.0f} km² additional protection needed")
     print(f"    30% target: {km2_needed_30:,.0f} km² additional protection needed")
 
-    # ── 5. Save JSON ──────────────────────────────────────────────────────────
+    # ── 5. Per-country area stats ─────────────────────────────────────────────
+    country_stats: list[dict] = []
+    if iso_codes:
+        try:
+            import geopandas as gpd
+            import warnings as _warnings
+            from rasterio.features import rasterize as rio_rasterize
+
+            print("\n  Computing per-country area stats (raster-based)...")
+            with _warnings.catch_warnings():
+                _warnings.simplefilter("ignore")
+                world_gdf = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres"))
+            region_world = world_gdf[world_gdf["iso_a3"].isin(iso_codes)].copy()
+            region_world = region_world.to_crs("EPSG:3857")
+
+            H, W = valid_mask.shape
+            for _, row in region_world.iterrows():
+                iso = row["iso_a3"]
+                country_name = row["name"]
+                c_mask = rio_rasterize(
+                    [(row.geometry, 1)],
+                    out_shape=(H, W),
+                    transform=transform,
+                    fill=0,
+                    dtype=np.uint8,
+                ).astype(bool)
+
+                land_rows, _ = np.where(valid_mask & c_mask)
+                y_land = transform.f + (land_rows + 0.5) * transform.e
+                total_c_km2 = float(pixel_area_km2(y_land, pixel_size_m=PIXEL_SIZE_M).sum()) if len(land_rows) else 0.0
+
+                prot_rows_c, _ = np.where(protected_mask & c_mask)
+                y_prot_c = transform.f + (prot_rows_c + 0.5) * transform.e
+                prot_c_km2 = float(pixel_area_km2(y_prot_c, pixel_size_m=PIXEL_SIZE_M).sum()) if len(prot_rows_c) else 0.0
+
+                current_pct = prot_c_km2 / max(total_c_km2, 1.0)
+                print(f"    {iso} ({country_name}): total={total_c_km2:,.0f} km², "
+                      f"protected={prot_c_km2:,.0f} km² ({current_pct:.1%})")
+                country_stats.append({
+                    "iso_a3": iso,
+                    "country": country_name,
+                    "total_km2": round(total_c_km2, 2),
+                    "protected_2024_km2": round(prot_c_km2, 2),
+                    "current_pct_protected": round(current_pct, 6),
+                })
+        except Exception as e:
+            print(f"  WARNING: Per-country stats failed: {e}")
+            import traceback; traceback.print_exc()
+            country_stats = []
+
+    # ── 6. Save JSON ──────────────────────────────────────────────────────────
     baseline = {
         "total_land_pixels": total_pixels,
         "total_land_km2": round(total_km2, 2),
         "protected_2024_pixels": protected_pixels,
         "protected_2024_km2": round(protected_2024_km2, 2),
         "coverage_pct_2024": round(coverage_pct_2024, 6),
-        "km2_needed_for_25pct": round(km2_needed_25, 2),
+        "moderate_target_pct": round(moderate_target_pct, 6),
+        "km2_needed_for_moderate": round(km2_needed_moderate, 2),
         "km2_needed_for_30pct": round(km2_needed_30, 2),
         "bau_km2": round(bau_km2, 2) if bau_km2 is not None else None,
         "pixel_size_m": float(PIXEL_SIZE_M),
         "backbone_path": str(backbone_path),
         "wdpa_2024_path": str(wdpa_2024_path),
+        "country_stats": country_stats,
         # Legacy keys (backward-compat with 4_forward_results.py references)
         "total_sa_pixels": total_pixels,
         "total_sa_km2": round(total_km2, 2),
@@ -194,7 +251,7 @@ def compute_coverage_baseline(
 
 def main() -> None:
     # Re-import config here so the module-level reload in runner.py takes effect
-    from scripts.regions.shared.forward.config import DATA_SUBDIR, OUTPUTS_SUBDIR, REGION_LABEL  # noqa: F401
+    from scripts.regions.shared.forward.config import DATA_SUBDIR, ISO_CODES, OUTPUTS_SUBDIR, REGION_LABEL  # noqa: F401
 
     repo_root = get_repo_root()
     backbone_path = resolve_raster("backbone.tif", DATA_SUBDIR, subdirs=["backbone"])
@@ -204,6 +261,7 @@ def main() -> None:
         backbone_path, wdpa_2024_path, output_dir,
         data_subdir=DATA_SUBDIR,
         region_label=REGION_LABEL,
+        iso_codes=ISO_CODES,
     )
 
 
