@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Stage 0a: South America 2024 coverage baseline.
+
+Computes total SA land area and 2024 protection coverage from the backbone
+raster and WDPA 2024 raster using latitude-corrected km² calculations.
+
+Background: merged_panel_final.parquet contains only unprotected pixels
+(risk-set filter WDPA_prev==0 applied during feature engineering), so it
+cannot be used alone for coverage calculations. The backbone + WDPA rasters
+are the correct source for total land area and current protection coverage.
+
+Output:
+    outputs/south_america/results/forward/forward_coverage_baseline.json
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+import rasterio
+
+# ── sys.path bootstrap ────────────────────────────────────────────────────────
+_repo_root = Path(__file__).resolve().parents[4]
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+del _repo_root
+# ─────────────────────────────────────────────────────────────────────────────
+
+from scripts.regions.shared.geo_utils import pixel_area_km2  # noqa: E402
+from scripts.regions.shared.training.utils import get_repo_root  # noqa: E402
+
+
+def resolve_raster(filename: str, subdirs: list[str] | None = None) -> Path:
+    """Locate a raster: check $SCRATCH then repo, optionally inside subdirs."""
+    repo_root = get_repo_root()
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    bases = []
+    if scratch_root is not None:
+        bases.append(scratch_root / "data/south_america/ready")
+    bases.append(repo_root / "data/south_america/ready")
+
+    search_subdirs = [""] + (subdirs or [])
+    candidates: list[Path] = []
+    for base in bases:
+        for sd in search_subdirs:
+            candidates.append(base / sd / filename if sd else base / filename)
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    raise FileNotFoundError(
+        f"'{filename}' not found. Checked:\n" + "\n".join(f"  {c}" for c in candidates)
+    )
+
+
+def compute_coverage_baseline(
+    backbone_path: Path,
+    wdpa_2024_path: Path,
+    output_dir: Path,
+) -> dict:
+    """Compute SA total area, 2024 coverage, and scenario thresholds."""
+    print("\n" + "=" * 70)
+    print("COMPUTING SA COVERAGE BASELINE")
+    print("=" * 70)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── 1. Read backbone raster ───────────────────────────────────────────────
+    print(f"\nReading backbone raster: {backbone_path}")
+    with rasterio.open(backbone_path) as src:
+        PIXEL_SIZE_M = abs(src.transform.a)
+        transform = src.transform
+        print(f"  Pixel size:  {PIXEL_SIZE_M:.2f} m")
+        print(f"  CRS:         {src.crs}")
+        print(f"  Shape:       {src.height} × {src.width}")
+        print(f"  Transform:   {transform}")
+
+        backbone_data = src.read(1)
+        nodata = src.nodata
+
+    # Valid SA land pixels (backbone == 1, excluding nodata)
+    if nodata is not None:
+        valid_mask = (backbone_data == 1)
+    else:
+        valid_mask = (backbone_data > 0)
+
+    rows_all, cols_all = np.where(valid_mask)
+    total_pixels = int(len(rows_all))
+    print(f"  Total SA land pixels: {total_pixels:,}")
+
+    # EPSG:3857 y-centre for each backbone pixel: y = f + (row + 0.5) * e
+    # transform.e < 0  (northing decreases as row increases)
+    y_all = transform.f + (rows_all + 0.5) * transform.e
+    print(f"  y range: [{y_all.min():.0f}, {y_all.max():.0f}] m (EPSG:3857)")
+
+    areas_all = pixel_area_km2(y_all, pixel_size_m=PIXEL_SIZE_M)
+    total_sa_km2 = float(areas_all.sum())
+    print(f"\n  Total SA area (latitude-corrected): {total_sa_km2:,.0f} km²")
+
+    # ── 2. Read WDPA 2024 raster ──────────────────────────────────────────────
+    print(f"\nReading WDPA 2024 raster: {wdpa_2024_path}")
+    with rasterio.open(wdpa_2024_path) as src_wdpa:
+        print(f"  CRS:   {src_wdpa.crs}")
+        print(f"  Shape: {src_wdpa.height} × {src_wdpa.width}")
+        wdpa_data = src_wdpa.read(1)
+
+    # Protected = WDPA 2024 == 1 AND backbone == 1 (land pixels only)
+    if wdpa_data.shape == valid_mask.shape:
+        protected_mask = valid_mask & (wdpa_data == 1)
+    else:
+        print(
+            f"  WARNING: WDPA shape {wdpa_data.shape} != backbone shape {valid_mask.shape}. "
+            "Clipping to minimum common shape."
+        )
+        h = min(valid_mask.shape[0], wdpa_data.shape[0])
+        w = min(valid_mask.shape[1], wdpa_data.shape[1])
+        protected_mask = valid_mask[:h, :w] & (wdpa_data[:h, :w] == 1)
+
+    prot_rows, prot_cols = np.where(protected_mask)
+    protected_pixels = int(len(prot_rows))
+    print(f"  Protected 2024 pixels: {protected_pixels:,}")
+
+    y_prot = transform.f + (prot_rows + 0.5) * transform.e
+    areas_prot = pixel_area_km2(y_prot, pixel_size_m=PIXEL_SIZE_M)
+    protected_2024_km2 = float(areas_prot.sum())
+    coverage_pct_2024 = protected_2024_km2 / total_sa_km2
+
+    print(f"  Protected area 2024: {protected_2024_km2:,.0f} km² ({coverage_pct_2024:.1%})")
+
+    # ── 3. BAU target: historical 5-year designation volume (2019→2024) ───────
+    # Try to read WDPA_2019 raster to compute new km² protected over 2019→2024.
+    # This gives the BAU designation volume for the forward prediction scenario.
+    bau_km2 = None  # float or None
+    try:
+        wdpa_2019_path = resolve_raster("WDPA_2019.tif", subdirs=["WDPA", "wdpa"])
+        print(f"\nReading WDPA 2019 raster for BAU baseline: {wdpa_2019_path}")
+        with rasterio.open(wdpa_2019_path) as src_2019:
+            wdpa_2019_data = src_2019.read(1)
+
+        if wdpa_2019_data.shape == valid_mask.shape:
+            protected_2019_mask = valid_mask & (wdpa_2019_data == 1)
+        else:
+            h = min(valid_mask.shape[0], wdpa_2019_data.shape[0])
+            w = min(valid_mask.shape[1], wdpa_2019_data.shape[1])
+            protected_2019_mask = valid_mask[:h, :w] & (wdpa_2019_data[:h, :w] == 1)
+
+        prot_2019_rows, prot_2019_cols = np.where(protected_2019_mask)
+        y_2019 = transform.f + (prot_2019_rows + 0.5) * transform.e
+        areas_2019 = pixel_area_km2(y_2019, pixel_size_m=PIXEL_SIZE_M)
+        protected_2019_km2 = float(areas_2019.sum())
+        bau_km2 = max(0.0, protected_2024_km2 - protected_2019_km2)
+        print(f"  Protected 2019: {protected_2019_km2:,.0f} km²")
+        print(f"  BAU volume (2019→2024): {bau_km2:,.0f} km² over 5 years")
+    except FileNotFoundError:
+        print("\n  WDPA_2019.tif not found — BAU km² will not be computed.")
+        print("  forward_results.py will fall back to top-0.5% proxy for BAU cutoff.")
+
+    # ── 4. Scenario thresholds ────────────────────────────────────────────────
+    km2_needed_25 = max(0.0, 0.25 * total_sa_km2 - protected_2024_km2)
+    km2_needed_30 = max(0.0, 0.30 * total_sa_km2 - protected_2024_km2)
+    print(f"\n  Scenario thresholds:")
+    print(f"    25% target: {km2_needed_25:,.0f} km² additional protection needed")
+    print(f"    30% target: {km2_needed_30:,.0f} km² additional protection needed")
+
+    # ── 5. Save JSON ──────────────────────────────────────────────────────────
+    baseline = {
+        "total_sa_pixels": total_pixels,
+        "total_sa_km2": round(total_sa_km2, 2),
+        "protected_2024_pixels": protected_pixels,
+        "protected_2024_km2": round(protected_2024_km2, 2),
+        "coverage_pct_2024": round(coverage_pct_2024, 6),
+        "km2_needed_for_25pct": round(km2_needed_25, 2),
+        "km2_needed_for_30pct": round(km2_needed_30, 2),
+        "bau_km2": round(bau_km2, 2) if bau_km2 is not None else None,
+        "pixel_size_m": float(PIXEL_SIZE_M),
+        "backbone_path": str(backbone_path),
+        "wdpa_2024_path": str(wdpa_2024_path),
+    }
+
+    out_path = output_dir / "forward_coverage_baseline.json"
+    with open(out_path, "w") as f:
+        json.dump(baseline, f, indent=2)
+    print(f"\nSaved: {out_path}")
+    return baseline
+
+
+def main() -> None:
+    repo_root = get_repo_root()
+    backbone_path = resolve_raster("backbone.tif", subdirs=["backbone"])
+    wdpa_2024_path = resolve_raster("WDPA_2024.tif", subdirs=["WDPA", "wdpa"])
+    output_dir = repo_root / "outputs/south_america/results/forward"
+    compute_coverage_baseline(backbone_path, wdpa_2024_path, output_dir)
+
+
+if __name__ == "__main__":
+    main()
