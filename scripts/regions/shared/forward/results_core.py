@@ -57,6 +57,7 @@ del _repo_root
 from scripts.regions.shared.geo_utils import pixel_area_km2  # noqa: E402
 from scripts.regions.shared.forward.config import (  # noqa: E402
     DATA_SUBDIR,
+    HOTSPOT_REGIONS,
     ISO_CODES,
     MODEL_PREFIX,
     OUTPUTS_SUBDIR,
@@ -792,6 +793,274 @@ def create_gap_analysis(
     return gap_metrics
 
 
+# ── Economic exposure ──────────────────────────────────────────────────────────
+
+_NTL_CANDIDATES = [
+    "ntl", "NTL", "ntl_mean", "VIIRS_ntl", "nighttime_lights", "lights_mean",
+    "BU_ntl", "viirs_ntl",
+]
+_POP_CANDIDATES = [
+    "pop_density", "population_density", "pop", "GPW_pop", "population",
+    "pop_dens", "GPW",
+]
+
+
+def _detect_col(candidates: List[str], available: set) -> Optional[str]:
+    for c in candidates:
+        if c in available:
+            return c
+    avail_lower = {a.lower(): a for a in available}
+    for c in candidates:
+        if c.lower() in avail_lower:
+            return avail_lower[c.lower()]
+    return None
+
+
+def create_economic_exposure(
+    df: pd.DataFrame,
+    forward_dir: Path,
+    bau_cutoff: float,
+    full_cutoff: float,
+    output_dir: Path,
+    x_limits: Tuple[float, float],
+    y_limits: Tuple[float, float],
+    world_gdf: Optional[Any],
+    iso_codes: List[str],
+) -> pd.DataFrame:
+    """Quantify economic proxy values in top-1% / top-5% / BAU risk zones.
+
+    Joins forward_features_2024.parquet (model-agnostic) to the scored
+    parquet on (row, col) to retrieve NTL and population density columns,
+    then computes summary statistics across three zones:
+      - All unprotected 2024 pixels (baseline)
+      - Top 5% by predicted probability
+      - Top 1% by predicted probability
+
+    Outputs:
+      forward_economic_exposure.csv
+      forward_economic_exposure_map.pdf/.png  (if NTL column found)
+    """
+    print("\n" + "=" * 70)
+    print("ECONOMIC EXPOSURE ANALYSIS")
+    print("=" * 70)
+
+    feat_path = forward_dir / "forward_features_2024.parquet"
+    if not feat_path.exists():
+        print(f"  Skipping — features parquet not found: {feat_path}")
+        return pd.DataFrame()
+
+    # ── Detect economic proxy columns ────────────────────────────────────────
+    schema_names = set(pq.ParquetFile(feat_path).schema_arrow.names)
+    ntl_col = _detect_col(_NTL_CANDIDATES, schema_names)
+    pop_col = _detect_col(_POP_CANDIDATES, schema_names)
+    print(f"  NTL column detected:        {ntl_col or 'none'}")
+    print(f"  Population column detected: {pop_col or 'none'}")
+
+    proxy_cols = [c for c in [ntl_col, pop_col] if c is not None]
+    if not proxy_cols:
+        print("  No economic proxy columns found — skipping.")
+        return pd.DataFrame()
+
+    # ── Load and join features ────────────────────────────────────────────────
+    print(f"  Loading features: {proxy_cols} …")
+    feat_df = pq.read_table(feat_path, columns=["row", "col"] + proxy_cols).to_pandas()
+    merged  = df[["row", "col", PROBA_COL, "area_km2"]].merge(
+        feat_df, on=["row", "col"], how="left"
+    )
+    del feat_df
+
+    # ── Define zones ─────────────────────────────────────────────────────────
+    top5_mask = merged[PROBA_COL] >= float(np.percentile(merged[PROBA_COL], 95))
+    top1_mask = merged[PROBA_COL] >= float(np.percentile(merged[PROBA_COL], 99))
+    bau_mask  = merged[PROBA_COL] >= bau_cutoff
+
+    zones = [
+        ("All unprotected (baseline)", np.ones(len(merged), dtype=bool)),
+        ("BAU risk zone",              bau_mask),
+        ("Top 5% risk",               top5_mask),
+        ("Top 1% risk",               top1_mask),
+    ]
+
+    rows = []
+    for zone_name, mask in zones:
+        sub = merged[mask]
+        row: Dict[str, Any] = {
+            "zone": zone_name,
+            "n_pixels": int(mask.sum()),
+            "area_km2": round(float(sub["area_km2"].sum()), 0),
+        }
+        for col in proxy_cols:
+            vals = sub[col].dropna()
+            row[f"{col}_mean"]   = round(float(vals.mean()), 3)   if len(vals) else None
+            row[f"{col}_median"] = round(float(vals.median()), 3) if len(vals) else None
+            row[f"{col}_p75"]    = round(float(np.percentile(vals, 75)), 3) if len(vals) else None
+        rows.append(row)
+
+    exposure_df = pd.DataFrame(rows)
+    csv_path = output_dir / "forward_economic_exposure.csv"
+    exposure_df.to_csv(csv_path, index=False)
+    print(f"  Saved: {csv_path}")
+    print(exposure_df.to_string(index=False))
+
+    # ── Map: BAU risk zone coloured by NTL ───────────────────────────────────
+    if ntl_col is not None:
+        bau_sub = merged[bau_mask].dropna(subset=[ntl_col])
+        if len(bau_sub) > 0:
+            lon_b, lat_b = epsg3857_to_lonlat(bau_sub["x"].values if "x" in bau_sub.columns
+                                               else df.loc[bau_mask, "x"].values,
+                                               bau_sub["y"].values if "y" in bau_sub.columns
+                                               else df.loc[bau_mask, "y"].values)
+            ntl_vals = bau_sub[ntl_col].values
+
+            # Rasterize mean NTL per grid cell
+            res = 0.1
+            x_bins = np.arange(x_limits[0], x_limits[1] + res, res)
+            y_bins = np.arange(y_limits[0], y_limits[1] + res, res)
+            nx, ny = len(x_bins) - 1, len(y_bins) - 1
+            xi = np.clip(np.searchsorted(x_bins, lon_b, side="right") - 1, 0, nx - 1)
+            yi = np.clip(np.searchsorted(y_bins, lat_b, side="right") - 1, 0, ny - 1)
+            grid_sum = np.zeros(ny * nx)
+            grid_cnt = np.zeros(ny * nx, dtype=np.int32)
+            lin = yi * nx + xi
+            np.add.at(grid_sum, lin, ntl_vals)
+            np.add.at(grid_cnt, lin, 1)
+            grid = np.where(grid_cnt > 0, grid_sum / np.maximum(grid_cnt, 1), np.nan).reshape(ny, nx)
+
+            fig, ax = plt.subplots(figsize=(12, 9))
+            im = ax.imshow(
+                np.flipud(grid),
+                extent=[x_limits[0], x_limits[1], y_limits[0], y_limits[1]],
+                cmap="plasma", aspect="auto", interpolation="nearest",
+            )
+            region_boundary = _get_boundary(world_gdf, iso_codes)
+            _draw_boundary(ax, region_boundary)
+            ax.set_xlim(x_limits)
+            ax.set_ylim(y_limits)
+            ax.set_title(
+                "Economic Exposure in BAU Risk Zone\n"
+                f"BAU-designated pixels coloured by nighttime light intensity ({ntl_col})",
+                fontsize=11,
+            )
+            ax.set_xlabel("Longitude")
+            ax.set_ylabel("Latitude")
+            cbar = plt.colorbar(im, ax=ax, fraction=0.03, pad=0.04)
+            cbar.set_label(f"{ntl_col} (mean per 0.1° cell)", fontsize=9)
+            plt.tight_layout()
+            for ext in ["pdf", "png"]:
+                p = output_dir / f"forward_economic_exposure_map.{ext}"
+                plt.savefig(p, dpi=MAP_DPI, bbox_inches="tight")
+                print(f"  Saved: {p}")
+            plt.close(fig)
+
+    return exposure_df
+
+
+# ── Hotspot zoom-in maps ───────────────────────────────────────────────────────
+
+def create_hotspot_maps(
+    df: pd.DataFrame,
+    hotspot_regions: List[Tuple],
+    bau_cutoff: float,
+    output_dir: Path,
+    world_gdf: Optional[Any],
+    iso_codes: List[str],
+    region_label: str,
+) -> None:
+    """Produce a figure with one panel per hotspot region showing zoomed
+    probability maps with BAU designation pixels highlighted.
+
+    hotspot_regions: list of (label, lon_min, lon_max, lat_min, lat_max)
+    Output: forward_hotspot_maps.pdf/.png
+    """
+    print("\n" + "=" * 70)
+    print("HOTSPOT ZOOM-IN MAPS")
+    print("=" * 70)
+
+    if not hotspot_regions:
+        print("  No hotspot regions defined — skipping.")
+        return
+
+    lon_all, lat_all = epsg3857_to_lonlat(df["x"].values, df["y"].values)
+    proba = df[PROBA_COL].values
+    bau_mask = proba >= bau_cutoff
+
+    n = len(hotspot_regions)
+    fig, axes = plt.subplots(2, n, figsize=(6 * n, 12))
+    if n == 1:
+        axes = axes.reshape(2, 1)
+
+    fig.suptitle(
+        f"Hotspot Zoom-ins — {region_label}\n"
+        "Top row: P(protection by 2030) | Bottom row: BAU designation zone",
+        fontsize=12,
+    )
+
+    for col_idx, (label, x0, x1, y0, y1) in enumerate(hotspot_regions):
+        # Spatial filter
+        in_box = (lon_all >= x0) & (lon_all <= x1) & (lat_all >= y0) & (lat_all <= y1)
+        if not in_box.any():
+            print(f"  WARNING: no pixels in hotspot '{label}' — check coordinates")
+            for row_idx in range(2):
+                axes[row_idx, col_idx].set_visible(False)
+            continue
+
+        print(f"  {label}: {in_box.sum():,} pixels")
+        lon_h = lon_all[in_box]
+        lat_h = lat_all[in_box]
+        res   = 0.02  # higher resolution for zoomed maps
+
+        # Row 0: continuous probability
+        ax0 = axes[0, col_idx]
+        grid_p, _, _ = _rasterize(
+            lon_h, lat_h, proba[in_box], resolution=res,
+            agg="max", x_lim=(x0, x1), y_lim=(y0, y1),
+        )
+        im = ax0.imshow(
+            np.flipud(np.sqrt(np.clip(grid_p, 0, 1))),
+            extent=[x0, x1, y0, y1], cmap="plasma",
+            vmin=0, vmax=1, aspect="auto", interpolation="nearest",
+        )
+        _draw_boundary(ax0, _get_boundary(world_gdf, iso_codes))
+        ax0.set_xlim(x0, x1)
+        ax0.set_ylim(y0, y1)
+        ax0.set_title(label, fontsize=10)
+        if col_idx == 0:
+            ax0.set_ylabel("P(protection by 2030) [√-stretch]", fontsize=8)
+        plt.colorbar(im, ax=ax0, fraction=0.04, pad=0.03)
+
+        # Row 1: BAU designation zone
+        ax1 = axes[1, col_idx]
+        bau_in = bau_mask & in_box
+        if bau_in.any():
+            grid_b, _, _ = _rasterize(
+                lon_all[bau_in], lat_all[bau_in],
+                np.ones(bau_in.sum()), resolution=res,
+                agg="max", x_lim=(x0, x1), y_lim=(y0, y1),
+            )
+            ax1.imshow(
+                np.flipud(np.where(np.isnan(grid_b), np.nan, 1.0)),
+                extent=[x0, x1, y0, y1],
+                cmap=mcolors.ListedColormap([SCENARIO_COLORS["bau"]]),
+                vmin=0, vmax=1, aspect="auto", interpolation="nearest", alpha=0.85,
+            )
+        _draw_boundary(ax1, _get_boundary(world_gdf, iso_codes))
+        ax1.set_xlim(x0, x1)
+        ax1.set_ylim(y0, y1)
+        n_bau = int(bau_in.sum())
+        ax1.text(0.02, 0.02, f"{n_bau:,} BAU pixels",
+                 transform=ax1.transAxes, fontsize=8,
+                 bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7))
+        if col_idx == 0:
+            ax1.set_ylabel("BAU designation zone", fontsize=8)
+
+    plt.tight_layout()
+    for ext in ["pdf", "png"]:
+        p = output_dir / f"forward_hotspot_maps.{ext}"
+        plt.savefig(p, dpi=MAP_DPI, bbox_inches="tight")
+        print(f"  Saved: {p}")
+    plt.close(fig)
+
+
 # ── Summary JSON ──────────────────────────────────────────────────────────────
 
 def save_scenario_summary(
@@ -824,7 +1093,8 @@ def save_scenario_summary(
 def main() -> None:
     # Re-import config after runner.py reload
     from scripts.regions.shared.forward.config import (  # noqa: F401
-        DATA_SUBDIR, ISO_CODES, MODEL_PREFIX, OUTPUTS_SUBDIR, REGION_LABEL, X_LIMITS, Y_LIMITS,
+        DATA_SUBDIR, HOTSPOT_REGIONS, ISO_CODES, MODEL_PREFIX, OUTPUTS_SUBDIR,
+        REGION_LABEL, X_LIMITS, Y_LIMITS,
     )
 
     model_type = os.environ.get("PA3030_FORWARD_MODEL_TYPE", "lgbm").strip().lower()
@@ -899,6 +1169,18 @@ def main() -> None:
         model_output_dir, world_gdf, X_LIMITS, Y_LIMITS, ISO_CODES,
     )
 
+    # ── Economic exposure ─────────────────────────────────────────────────────
+    create_economic_exposure(
+        df, forward_dir, bau_cutoff, full_cutoff,
+        model_output_dir, X_LIMITS, Y_LIMITS, world_gdf, ISO_CODES,
+    )
+
+    # ── Hotspot zoom-ins ──────────────────────────────────────────────────────
+    create_hotspot_maps(
+        df, HOTSPOT_REGIONS, bau_cutoff,
+        model_output_dir, world_gdf, ISO_CODES, REGION_LABEL,
+    )
+
     # ── Summary JSON ──────────────────────────────────────────────────────────
     save_scenario_summary(
         baseline, scenario_info, gap_metrics, country_df, biome_df, model_output_dir
@@ -915,6 +1197,8 @@ def main() -> None:
         "forward_gap_analysis.pdf",
         "forward_country_breakdown.csv",
         "forward_biome_breakdown.csv",
+        "forward_economic_exposure.csv",
+        "forward_hotspot_maps.pdf",
         "forward_scenario_summary.json",
     ]
     for fn in outputs:

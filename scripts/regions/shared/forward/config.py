@@ -20,6 +20,12 @@ PROFILE = {
         ],
         "data_subdir": "south_america",
         "outputs_subdir": "south_america",
+        # (label, lon_min, lon_max, lat_min, lat_max)
+        "hotspot_regions": [
+            ("Amazon Basin",              -72, -48, -12,  4),
+            ("Cerrado / Atlantic Forest", -55, -36, -28, -8),
+            ("Andes Foothills",           -81, -64, -22,  3),
+        ],
     },
     "usa": {
         "region_slug": "usa",
@@ -30,17 +36,24 @@ PROFILE = {
         "iso_codes": ['USA'],
         "data_subdir": "usa",
         "outputs_subdir": "usa",
+        # (label, lon_min, lon_max, lat_min, lat_max)
+        "hotspot_regions": [
+            ("Pacific Northwest", -125, -110, 43, 50),
+            ("Rocky Mountains",   -115, -100, 36, 48),
+            ("Southeast",          -92,  -78, 25, 35),
+        ],
     },
 }[RUN_REGION]
 
-REGION_SLUG    = PROFILE["region_slug"]
-REGION_LABEL   = PROFILE["region_label"]
-MODEL_PREFIX   = PROFILE["model_prefix"]
-X_LIMITS       = PROFILE["x_limits"]
-Y_LIMITS       = PROFILE["y_limits"]
-ISO_CODES      = PROFILE["iso_codes"]
-DATA_SUBDIR    = PROFILE["data_subdir"]
-OUTPUTS_SUBDIR = PROFILE["outputs_subdir"]
+REGION_SLUG     = PROFILE["region_slug"]
+REGION_LABEL    = PROFILE["region_label"]
+MODEL_PREFIX    = PROFILE["model_prefix"]
+X_LIMITS        = PROFILE["x_limits"]
+Y_LIMITS        = PROFILE["y_limits"]
+ISO_CODES       = PROFILE["iso_codes"]
+DATA_SUBDIR     = PROFILE["data_subdir"]
+OUTPUTS_SUBDIR  = PROFILE["outputs_subdir"]
+HOTSPOT_REGIONS = PROFILE["hotspot_regions"]
 
 
 def get_repo_root() -> Path:

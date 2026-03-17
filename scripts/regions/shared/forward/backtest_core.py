@@ -80,6 +80,104 @@ WDPA_LAST_YEAR = 2024
 LOOKAHEAD_YEARS = 5
 LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS  # 2019
 
+
+# ── Coordinate + rasterization helpers (for false-positive map) ───────────────
+
+def _bt_lonlat(x: np.ndarray, y: np.ndarray):
+    """EPSG:3857 → WGS84 lon/lat (degrees)."""
+    R = 6378137.0
+    return np.degrees(x / R), np.degrees(2.0 * np.arctan(np.exp(y / R)) - np.pi / 2.0)
+
+
+def _bt_rasterize(lon, lat, resolution, x_lim, y_lim):
+    """Count pixels per cell; returns (H, W) float array with NaN for empty."""
+    x_bins = np.arange(x_lim[0], x_lim[1] + resolution, resolution)
+    y_bins = np.arange(y_lim[0], y_lim[1] + resolution, resolution)
+    H, _, _ = np.histogram2d(lat, lon, bins=[y_bins, x_bins])
+    H[H == 0] = np.nan
+    return H
+
+
+def create_false_positive_map(
+    y_proba: np.ndarray,
+    label_5yr: np.ndarray,
+    evaluable: np.ndarray,
+    xy: dict,
+    origin_year: int,
+    output_dir: Path,
+) -> None:
+    """Map true vs false positives in the top-5% risk zone at origin year T.
+
+    Only runs when x/y coordinates are available (requires panel to include
+    x, y columns) and when the origin year has a clean 5-year window.
+    Outputs: forward_backtest_T{T}_false_positives.pdf/.png
+    """
+    if not (xy.get("x") is not None and xy.get("y") is not None):
+        print(f"  T={origin_year}: skipping FP map — no x/y coords in panel.")
+        return
+
+    # Local config import (values correct after runner.py reload)
+    from scripts.regions.shared.forward.config import REGION_LABEL, X_LIMITS, Y_LIMITS
+
+    x_arr = xy["x"]
+    y_arr = xy["y"]
+    lon, lat = _bt_lonlat(x_arr.astype(np.float64), y_arr.astype(np.float64))
+
+    # Top-5% probability threshold
+    threshold = float(np.percentile(y_proba, 95))
+    top_mask  = y_proba >= threshold
+
+    ev_top  = top_mask & evaluable
+    tp_mask = ev_top & (label_5yr == 1)
+    fp_mask = ev_top & (label_5yr == 0)
+    n_tp, n_fp = int(tp_mask.sum()), int(fp_mask.sum())
+    precision = n_tp / max(n_tp + n_fp, 1)
+    print(f"\n  T={origin_year} FP map: top-5% → {n_tp:,} TP, {n_fp:,} FP "
+          f"(precision={precision:.3f})")
+
+    if n_tp + n_fp == 0:
+        print("  Nothing to plot — skipping FP map.")
+        return
+
+    res = 0.15
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    fig.suptitle(
+        f"False Positive Analysis — T={origin_year} Backtest ({REGION_LABEL})\n"
+        f"Top-5% risk zone: {n_tp:,} true positives (green) / {n_fp:,} false positives (red)  "
+        f"precision={precision:.3f}",
+        fontsize=11,
+    )
+
+    panel_defs = [
+        (tp_mask, "True Positives\n(high-risk → actually protected)", "#2ca02c"),
+        (fp_mask, "False Positives\n(high-risk → NOT protected in window)", "#d62728"),
+    ]
+    for ax, (mask, title, color) in zip(axes, panel_defs):
+        if mask.any():
+            grid = _bt_rasterize(lon[mask], lat[mask], res, X_LIMITS, Y_LIMITS)
+            ax.imshow(
+                np.flipud(grid), origin="lower",
+                extent=[X_LIMITS[0], X_LIMITS[1], Y_LIMITS[0], Y_LIMITS[1]],
+                cmap=plt.cm.colors.LinearSegmentedColormap.from_list("c", ["white", color]),
+                aspect="auto", interpolation="nearest",
+            )
+        ax.set_xlim(X_LIMITS)
+        ax.set_ylim(Y_LIMITS)
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        n_px = int(mask.sum())
+        ax.text(0.02, 0.02, f"{n_px:,} pixels", transform=ax.transAxes,
+                fontsize=8, bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7))
+
+    plt.tight_layout()
+    stem = output_dir / f"forward_backtest_T{origin_year}_false_positives"
+    for ext in ["pdf", "png"]:
+        plt.savefig(f"{stem}.{ext}", dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {stem}.pdf")
+
+
 ORIGIN_YEARS = [2013, 2015, 2017, 2019]
 N_ESTIMATORS_LOCKED_LGBM = 2555   # LGBM backtest locked round count
 N_ESTIMATORS_LOCKED_RF   = 500    # RF uses fewer trees for speed
@@ -621,6 +719,10 @@ def run_single_origin(
         result["metrics"] = metrics
     else:
         print(f"  T={T}: no evaluable positive labels — skipping metrics")
+
+    # False-positive spatial analysis (only for clean 5-year windows)
+    if clean_window:
+        create_false_positive_map(y_proba, label_5yr, evaluable, xy, T, output_dir)
 
     del y_proba, label_5yr, evaluable, row_col
     gc.collect()
