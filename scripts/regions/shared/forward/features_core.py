@@ -10,12 +10,12 @@ Both filters are required.  Without the WDPA==0 filter, pixels newly protected
 in 2024 would have dist_wdpa≈0 in their feature row and receive inflated model
 scores, despite already being protected.
 
-Selects the same 73 training features (numeric columns minus EXCLUDE_COLS)
-plus the y (EPSG:3857 northing) coordinate for downstream area correction.
+Selects the same numeric training features (minus EXCLUDE_COLS) plus the y
+(EPSG:3857 northing) coordinate for downstream area correction.
 
 Output:
-    outputs/south_america/results/forward/forward_features_2024.parquet
-    (columns: row, col, x, y, <73 feature cols>)
+    outputs/{region}/results/forward/forward_features_2024.parquet
+    (columns: row, col, x, y, <feature cols>)
 """
 
 from __future__ import annotations
@@ -25,10 +25,6 @@ import os
 import sys
 from pathlib import Path
 
-import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
-
 # ── sys.path bootstrap ────────────────────────────────────────────────────────
 _repo_root = Path(__file__).resolve().parents[4]
 if str(_repo_root) not in sys.path:
@@ -36,7 +32,11 @@ if str(_repo_root) not in sys.path:
 del _repo_root
 # ─────────────────────────────────────────────────────────────────────────────
 
-from scripts.regions.shared.training.utils import get_repo_root  # noqa: E402
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from scripts.regions.shared.forward.config import DATA_SUBDIR, OUTPUTS_SUBDIR, get_repo_root  # noqa: E402
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 INFERENCE_YEAR = 2024
@@ -48,7 +48,7 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "200_000"))
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def resolve_panel() -> Path:
+def resolve_panel(data_subdir: str) -> Path:
     repo_root = get_repo_root()
     scratch = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
 
@@ -56,14 +56,14 @@ def resolve_panel() -> Path:
     candidates: list[Path] = []
     if scratch is not None:
         candidates += [
-            scratch / f"data/south_america/ml/{fn}",
-            scratch / f"outputs/south_america/results/{fn}",
-            scratch / f"outputs/south_america/results/main/{fn}",
+            scratch / f"data/{data_subdir}/ml/{fn}",
+            scratch / f"outputs/{data_subdir}/results/{fn}",
+            scratch / f"outputs/{data_subdir}/results/main/{fn}",
         ]
     candidates += [
-        repo_root / f"data/south_america/ml/{fn}",
-        repo_root / f"outputs/south_america/results/{fn}",
-        repo_root / f"outputs/south_america/results/main/{fn}",
+        repo_root / f"data/{data_subdir}/ml/{fn}",
+        repo_root / f"outputs/{data_subdir}/results/{fn}",
+        repo_root / f"outputs/{data_subdir}/results/main/{fn}",
     ]
     for c in candidates:
         if c.exists():
@@ -134,6 +134,7 @@ def extract_2024_features(panel_path: Path, output_dir: Path) -> Path:
     writer = None
     n_written = 0
     _mile = -1
+    out_col_names = None
 
     pf = pq.ParquetFile(panel_path)
     try:
@@ -148,8 +149,11 @@ def extract_2024_features(panel_path: Path, output_dir: Path) -> Path:
                 continue
 
             # Build output table (meta + coords + features), drop filter cols
-            out_col_names = meta_cols + coord_cols + feature_cols
-            out_col_names = [c for c in out_col_names if c in batch.schema.names]
+            if out_col_names is None:
+                out_col_names = [
+                    c for c in (meta_cols + coord_cols + feature_cols)
+                    if c in batch.schema.names
+                ]
             pa_mask = pa.array(mask)
             out_arrays = {c: batch.column(c).filter(pa_mask) for c in out_col_names}
             out_table = pa.table(out_arrays)
@@ -176,14 +180,18 @@ def extract_2024_features(panel_path: Path, output_dir: Path) -> Path:
         print(f"  WARNING: wrote {n_written:,} rows but counted {n_total:,}")
 
     print(f"\n  Written: {n_written:,} rows → {out_path}")
-    print(f"  Columns: {meta_cols + coord_cols + feature_cols[:5]} … ({len(out_col_names)} total)")
+    if out_col_names is not None:
+        print(f"  Columns: {out_col_names[:5]} … ({len(out_col_names)} total)")
     return out_path
 
 
 def main() -> None:
+    # Re-import config after runner.py reload
+    from scripts.regions.shared.forward.config import DATA_SUBDIR, OUTPUTS_SUBDIR  # noqa: F401
+
     repo_root = get_repo_root()
-    panel_path = resolve_panel()
-    output_dir = repo_root / "outputs/south_america/results/forward"
+    panel_path = resolve_panel(DATA_SUBDIR)
+    output_dir = repo_root / f"outputs/{OUTPUTS_SUBDIR}/results/forward"
     out = extract_2024_features(panel_path, output_dir)
     print(f"\nDone. Output: {out}")
 

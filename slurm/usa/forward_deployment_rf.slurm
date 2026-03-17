@@ -1,35 +1,35 @@
 #!/bin/bash
-#SBATCH --job-name=forward_deploy
+#SBATCH --job-name=forward_deploy_usa_rf
 #SBATCH --partition=normal.120h
 #SBATCH --time=120:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
-#SBATCH --mem-per-cpu=2G
-#SBATCH --output=/cluster/scratch/%u/logs/forward_deploy_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/forward_deploy_%j.err
+#SBATCH --mem-per-cpu=4G
+#SBATCH --output=/cluster/scratch/%u/logs/forward_deploy_usa_rf_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/forward_deploy_usa_rf_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # ------------------------------------------------------------------------------
-# Forward Prediction Pipeline — Stages 0b + 1 + 2
+# Forward Prediction Pipeline (USA RF) — Stages 0b + 1 + 2
 #
-# Stage 0b: Train deployment model on 2001-2019 (+ fit calibrators)
-# Stage 1:  Extract 2024 inference features from merged_panel_final.parquet
-# Stage 2:  Run calibrated batch inference → forward_scored_2024.parquet
+# Stage 0b: Train RF deployment model on 2001-2019 (+ fit calibrators)
+# Stage 1:  Extract 2024 inference features (model-agnostic)
+# Stage 2:  Run calibrated RF inference → forward/rf/forward_scored_2024.parquet
 #
-# Memory budget: ~64 GB  (32 CPUs × 2 GB each)
+# Memory budget: ~128 GB  (32 CPUs × 4 GB each; RF is memory-intensive)
 #
 # Run AFTER:
-#   - model1_LGBM (evaluation model) has completed and produced split parquets
+#   - model2_RF (evaluation model) has completed and produced split parquets
 #   - merged_panel_final.parquet contains year=2024 rows
 #
-# Stage 0c (backtesting) runs separately — see forward_backtest.slurm
-# Stage 0a (coverage baseline) runs on its own: forward_coverage_baseline.py
-# Stage 3  (results) runs after this job — see results_lgbm.slurm or run locally
+# Stage 0c (RF backtesting) runs separately — see forward_backtest_rf.slurm (usa)
+# Stage 0a (coverage baseline) runs on its own: 1_forward_coverage_baseline.py
+# Stage 3  (RF results) runs after: 4_forward_results.py --model-type rf
 # ------------------------------------------------------------------------------
 
 mkdir -p "$SCRATCH/logs"
-mkdir -p "$SCRATCH/outputs/south_america/results/forward/lgbm"
-mkdir -p "$SCRATCH/data/south_america/ml/models"
+mkdir -p "$SCRATCH/outputs/usa/results/forward/rf"
+mkdir -p "$SCRATCH/data/usa/ml/models"
 
 #------------------------------------------------------------------------------
 # Load modules
@@ -55,47 +55,47 @@ ls -ld /cluster/home/gikaufmann/master_thesis || { echo "Repo path missing"; exi
 echo "PWD = $(pwd)"
 
 for SCRIPT in \
-    "scripts/regions/south_america/5_training/model1_LGBM_deployment.py" \
-    "scripts/regions/south_america/8_forward/2_forward_features.py" \
-    "scripts/regions/south_america/8_forward/3_forward_predict.py"; do
+    "scripts/regions/usa/5_training/model2_rf_deployment.py" \
+    "scripts/regions/usa/8_forward/2_forward_features.py" \
+    "scripts/regions/usa/8_forward/3_forward_predict.py"; do
   [ -f "$SCRIPT" ] || { echo "ERROR: $SCRIPT not found"; exit 1; }
 done
 
 #------------------------------------------------------------------------------
-# Stage 0b: Train deployment model (2001-2019) + fit calibrators
+# Stage 0b: Train RF deployment model (2001-2019) + fit calibrators
 #------------------------------------------------------------------------------
 echo ""
 echo "========================================================================="
-echo "Stage 0b: Training deployment model (2001-2019)..."
+echo "Stage 0b: Training USA RF deployment model (2001-2019)..."
 echo "========================================================================="
 srun --cpu-bind=cores --distribution=block:block \
-  python -u scripts/regions/south_america/5_training/model1_LGBM_deployment.py
+  python -u scripts/regions/usa/5_training/model2_rf_deployment.py
 echo "Stage 0b complete."
 
 #------------------------------------------------------------------------------
-# Stage 1: Extract 2024 inference features
+# Stage 1: Extract 2024 inference features (model-agnostic)
 #------------------------------------------------------------------------------
 echo ""
 echo "========================================================================="
 echo "Stage 1: Extracting 2024 inference features..."
 echo "========================================================================="
 srun --cpu-bind=cores --distribution=block:block \
-  python -u scripts/regions/south_america/8_forward/2_forward_features.py
+  python -u scripts/regions/usa/8_forward/2_forward_features.py
 echo "Stage 1 complete."
 
 #------------------------------------------------------------------------------
-# Stage 2: Calibrated forward inference → forward_scored_2024.parquet
+# Stage 2: Calibrated RF forward inference → forward/rf/forward_scored_2024.parquet
 #------------------------------------------------------------------------------
 echo ""
 echo "========================================================================="
-echo "Stage 2: Running calibrated forward inference..."
+echo "Stage 2: Running calibrated RF forward inference..."
 echo "========================================================================="
 srun --cpu-bind=cores --distribution=block:block \
-  python -u scripts/regions/south_america/8_forward/3_forward_predict.py
+  python -u scripts/regions/usa/8_forward/3_forward_predict.py --model-type rf
 echo "Stage 2 complete."
 
 echo ""
-echo "forward_deployment job finished. Next steps:"
+echo "forward_deployment_rf (USA RF) job finished. Next steps:"
 echo "  1. Run 1_forward_coverage_baseline.py (if not already done)"
-echo "  2. Run 4_forward_results.py for maps and scenario analysis"
-echo "  3. Run forward_backtest.slurm for backtesting validation"
+echo "  2. Run 4_forward_results.py --model-type rf for maps and scenario analysis"
+echo "  3. Run forward_backtest_rf.slurm (usa) for RF backtesting validation"

@@ -5,28 +5,28 @@ Validates the forward prediction methodology by simulating the analysis at
 four historical time points: T ∈ {2013, 2015, 2017, 2019}.
 
 For each origin year T:
-  1. Train a historical deployment model on 2001–(T-1) with locked hyperparams
-     + n_estimators=2555 (scale_pos_weight recomputed from data).
+  1. Train a historical deployment model on 2001–(T-1) with locked hyperparams.
   2. Score year-T feature rows for WDPA_prev==0 AND WDPA==0 pixels from
      merged_panel_final.parquet.
   3. Reconstruct 5-year window actuals from the WDPA column (years T+1…T+5)
      — NOT from transition_01_win5 (which may be absent or unreliable).
   4. Evaluate: Precision@1/5/10%, Lift@1/5/10%, Forecast Capture Rate.
 
+Model-type support:
+  lgbm  — trains lgb.Booster with locked hyperparams; temporal weighting applied.
+  rf    — trains RandomForestClassifier with class_weight="balanced_subsample";
+          NO temporal weighting (consistent with existing RF training scripts).
+
 Right-censoring:
   Pixels where T+5 > LAST_LABEL_YEAR (2019) are excluded from quantitative
   evaluation.  T=2013 and T=2015 have clean 5-year windows.  T=2017 is
   partial (only 2 years observable).  T=2019 is a consistency check only.
 
-SLURM usage:
-  sbatch slurm/south_america/forward_backtest.slurm     # all 4 origins
-  # or single origin: SLURM_ARRAY_TASK_ID=0..3 → T=2013,2015,2017,2019
-
 Outputs (per origin T):
-  outputs/south_america/results/forward/forward_backtest_T{T}.json
+  outputs/{region}/results/forward/{model_type}/forward_backtest_T{T}.json
 Aggregated (after all origins complete):
-  outputs/south_america/results/forward/forward_backtest_results.json
-  outputs/south_america/results/forward/forward_backtest_precision_over_time.pdf
+  outputs/{region}/results/forward/{model_type}/forward_backtest_results.json
+  outputs/{region}/results/forward/{model_type}/forward_backtest_precision_over_time.pdf
 """
 
 from __future__ import annotations
@@ -35,7 +35,6 @@ import argparse
 import gc
 import json
 import os
-import pickle
 import sys
 import time
 from datetime import datetime
@@ -56,11 +55,17 @@ if str(_repo_root) not in sys.path:
 del _repo_root
 # ─────────────────────────────────────────────────────────────────────────────
 
+from scripts.regions.shared.forward.config import (  # noqa: E402
+    DATA_SUBDIR,
+    MODEL_PREFIX,
+    OUTPUTS_SUBDIR,
+    get_repo_root,
+)
 from scripts.regions.shared.training.utils import (  # noqa: E402
     compute_precision_at_k,
     compute_year_weights,
     extract_features_pyarrow_to_numpy,
-    get_repo_root,
+    get_repo_root as _get_repo_root,
     report_memory_usage,
 )
 
@@ -76,9 +81,10 @@ LOOKAHEAD_YEARS = 5
 LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS  # 2019
 
 ORIGIN_YEARS = [2013, 2015, 2017, 2019]
-N_ESTIMATORS_LOCKED = 2555
+N_ESTIMATORS_LOCKED_LGBM = 2555   # LGBM backtest locked round count
+N_ESTIMATORS_LOCKED_RF   = 500    # RF uses fewer trees for speed
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "200_000"))
-FIXED_PARAMS = {
+FIXED_PARAMS_LGBM = {
     "random_state": RANDOM_STATE, "boosting_type": "gbdt",
     "objective": "binary", "verbose": -1,
 }
@@ -101,26 +107,24 @@ NUM_THREADS = get_num_threads()
 for _k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ[_k] = str(NUM_THREADS)
 
-import lightgbm as lgb  # noqa: E402
-
 
 # ── Path helpers ──────────────────────────────────────────────────────────────
 
-def resolve_panel(filename: str = "merged_panel_final.parquet") -> Path:
+def resolve_panel(data_subdir: str, filename: str = "merged_panel_final.parquet") -> Path:
     repo_root = get_repo_root()
     scratch = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
 
     candidates: list[Path] = []
     if scratch is not None:
         candidates += [
-            scratch / f"data/south_america/ml/{filename}",
-            scratch / f"outputs/south_america/results/{filename}",
-            scratch / f"outputs/south_america/results/main/{filename}",
+            scratch / f"data/{data_subdir}/ml/{filename}",
+            scratch / f"outputs/{data_subdir}/results/{filename}",
+            scratch / f"outputs/{data_subdir}/results/main/{filename}",
         ]
     candidates += [
-        repo_root / f"data/south_america/ml/{filename}",
-        repo_root / f"outputs/south_america/results/{filename}",
-        repo_root / f"outputs/south_america/results/main/{filename}",
+        repo_root / f"data/{data_subdir}/ml/{filename}",
+        repo_root / f"outputs/{data_subdir}/results/{filename}",
+        repo_root / f"outputs/{data_subdir}/results/main/{filename}",
     ]
     for c in candidates:
         if c.exists():
@@ -130,7 +134,7 @@ def resolve_panel(filename: str = "merged_panel_final.parquet") -> Path:
     )
 
 
-def resolve_split_parquets() -> List[Path]:
+def resolve_split_parquets(data_subdir: str) -> List[Path]:
     """Resolve split parquet files (train + earlystop + test) for training."""
     filenames = ["train_win5.parquet", "earlystop_win5.parquet", "test_win5.parquet"]
     repo_root = get_repo_root()
@@ -139,8 +143,12 @@ def resolve_split_parquets() -> List[Path]:
     for fn in filenames:
         found = None
         for base in ([scratch] if scratch else []) + [repo_root]:
-            for sub in ["data/south_america/ml/main", "outputs/south_america/results/main",
-                        "data/south_america/ml", "outputs/south_america/results"]:
+            for sub in [
+                f"data/{data_subdir}/ml/main",
+                f"outputs/{data_subdir}/results/main",
+                f"data/{data_subdir}/ml",
+                f"outputs/{data_subdir}/results",
+            ]:
                 cand = base / sub / fn
                 if cand.exists():
                     found = cand
@@ -152,14 +160,20 @@ def resolve_split_parquets() -> List[Path]:
     return paths
 
 
-def resolve_best_params_json() -> Optional[Path]:
+def resolve_best_params_json(model_prefix: str, data_subdir: str, model_type: str) -> Optional[Path]:
+    """Find {model_type}_best_params.json for the given region."""
     repo_root = get_repo_root()
-    script_dir = Path(__file__).resolve().parents[1] / "5_training"
+    # The training script lives at scripts/regions/{data_subdir}/5_training/
+    training_dir = repo_root / f"scripts/regions/{data_subdir}/5_training"
     scratch = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
-    candidates = [script_dir / "lgbm_best_params.json"]
+
+    json_name = f"{model_type}_best_params.json"
+    candidates = [training_dir / json_name]
     if scratch is not None:
-        candidates.append(scratch / "scripts/regions/south_america/5_training/lgbm_best_params.json")
-    candidates.append(repo_root / "scripts/regions/south_america/5_training/lgbm_best_params.json")
+        candidates.append(
+            scratch / f"scripts/regions/{data_subdir}/5_training/{json_name}"
+        )
+    candidates.append(repo_root / f"scripts/regions/{data_subdir}/5_training/{json_name}")
     for c in candidates:
         if c.exists():
             return c
@@ -168,20 +182,48 @@ def resolve_best_params_json() -> Optional[Path]:
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 
-def load_best_params(params_path: Optional[Path]) -> Dict[str, Any]:
+def load_best_params_lgbm(params_path: Optional[Path], num_threads: int) -> Dict[str, Any]:
     if params_path is None:
-        return {**FIXED_PARAMS, "max_depth": 8, "num_leaves": 255,
-                "min_child_samples": 50, "subsample": 0.7, "subsample_freq": 1,
-                "colsample_bytree": 0.7, "learning_rate": 0.03,
-                "reg_alpha": 1.0, "reg_lambda": 1.0,
-                "metric": "average_precision", "num_threads": NUM_THREADS}
+        return {
+            **FIXED_PARAMS_LGBM,
+            "max_depth": 8, "num_leaves": 255,
+            "min_child_samples": 50, "subsample": 0.7, "subsample_freq": 1,
+            "colsample_bytree": 0.7, "learning_rate": 0.03,
+            "reg_alpha": 1.0, "reg_lambda": 1.0,
+            "metric": "average_precision", "num_threads": num_threads,
+        }
     with open(params_path) as f:
         data = json.load(f)
     if isinstance(data, dict) and "best_params" in data:
-        params = {**FIXED_PARAMS, **data.get("fixed_params", {}), **data["best_params"]}
+        params = {**FIXED_PARAMS_LGBM, **data.get("fixed_params", {}), **data["best_params"]}
     else:
-        params = {**FIXED_PARAMS, **(data if isinstance(data, dict) else {})}
-    params["num_threads"] = NUM_THREADS
+        params = {**FIXED_PARAMS_LGBM, **(data if isinstance(data, dict) else {})}
+    params["num_threads"] = num_threads
+    return params
+
+
+def load_best_params_rf(params_path: Optional[Path], n_jobs: int) -> Dict[str, Any]:
+    defaults = {
+        "n_estimators": N_ESTIMATORS_LOCKED_RF,
+        "max_depth": None,
+        "min_samples_leaf": 1,
+        "max_features": "sqrt",
+        "random_state": RANDOM_STATE,
+    }
+    if params_path is None:
+        params = defaults.copy()
+    else:
+        with open(params_path) as f:
+            data = json.load(f)
+        if isinstance(data, dict) and "best_params" in data:
+            loaded = {**data.get("fixed_params", {}), **data["best_params"]}
+        else:
+            loaded = data if isinstance(data, dict) else {}
+        params = {**defaults, **loaded}
+    # For backtest, use the locked RF estimator count (faster)
+    params["n_estimators"] = N_ESTIMATORS_LOCKED_RF
+    params["random_state"] = RANDOM_STATE
+    params["n_jobs"] = n_jobs
     return params
 
 
@@ -199,7 +241,7 @@ def load_training_data(
         pf = pq.ParquetFile(path)
         try:
             for batch in pf.iter_batches(batch_size=BATCH_SIZE, columns=essential, use_threads=True):
-                tgt_arr = batch[TARGET_COL]
+                tgt_arr  = batch[TARGET_COL]
                 null_mask = tgt_arr.is_null().to_numpy(zero_copy_only=False)
                 tgt = tgt_arr.to_numpy(zero_copy_only=False)
                 yr  = batch["year"].to_numpy(zero_copy_only=False)
@@ -224,7 +266,7 @@ def load_training_data(
         pf = pq.ParquetFile(path)
         try:
             for batch in pf.iter_batches(batch_size=BATCH_SIZE, columns=essential, use_threads=True):
-                tgt_arr = batch[TARGET_COL]
+                tgt_arr  = batch[TARGET_COL]
                 null_mask = tgt_arr.is_null().to_numpy(zero_copy_only=False)
                 tgt = tgt_arr.to_numpy(zero_copy_only=False)
                 yr  = batch["year"].to_numpy(zero_copy_only=False)
@@ -256,29 +298,13 @@ def load_inference_rows_and_wdpa(
     panel_path: Path,
     feature_cols: List[str],
     origin_year: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Load year-T pixels (WDPA_prev==0, WDPA==0) + WDPA values for T+1…T+5.
-
-    For each qualifying pixel we need to know whether it transitioned in
-    (origin_year, origin_year+5].  We fetch the WDPA column for all years
-    T through T+5 and build the 5-year window label on the fly.
-
-    Returns:
-        X_inf:       float32 (n_inf, n_features)  — year-T features
-        row_col:     int32   (n_inf, 2)            — (row, col)
-        label_5yr:   int8    (n_inf,)              — 1 if WDPA==1 in (T, T+5]
-        is_evaluable: bool array — True if T+5 <= LAST_LABEL_YEAR
-    """
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
+    """Load year-T pixels (WDPA_prev==0, WDPA==0) + WDPA values for T+1…T+5."""
     T = origin_year
     window_years = list(range(T + 1, T + LOOKAHEAD_YEARS + 1))
     is_evaluable_flag = (T + LOOKAHEAD_YEARS) <= LAST_LABEL_YEAR
 
-    # merged_panel_final has one WDPA column per row (year-level panel)
-    # We must load all rows for years T..T+5, pivot by (row, col)
-
-    # Step 1: load year-T rows to get inference features + identify pixel ids
     cols_inf = feature_cols + ["year", "WDPA_prev", "WDPA", "row", "col"]
-    # Filter to available columns
     schema_cols = set(pq.ParquetFile(panel_path).schema_arrow.names)
     cols_inf = [c for c in cols_inf if c in schema_cols]
     optional_xy = [c for c in ["x", "y"] if c in schema_cols]
@@ -291,8 +317,8 @@ def load_inference_rows_and_wdpa(
     try:
         read_cols = list(set(cols_inf + optional_xy + feature_cols))
         for batch in pf.iter_batches(batch_size=BATCH_SIZE, columns=read_cols, use_threads=True):
-            yr  = batch["year"].to_numpy(zero_copy_only=False)
-            wp  = batch["WDPA_prev"].to_numpy(zero_copy_only=False)
+            yr   = batch["year"].to_numpy(zero_copy_only=False)
+            wp   = batch["WDPA_prev"].to_numpy(zero_copy_only=False)
             wdpa = batch["WDPA"].to_numpy(zero_copy_only=False)
             mask = (yr == T) & (wp == 0) & (wdpa == 0)
             if not mask.any():
@@ -313,17 +339,16 @@ def load_inference_rows_and_wdpa(
     if not X_list:
         raise ValueError(f"No inference rows found for origin year T={T}")
 
-    X_inf = np.concatenate(X_list, axis=0)
+    X_inf   = np.concatenate(X_list, axis=0)
     rows_arr = np.concatenate(rows_list, axis=0)
     cols_arr = np.concatenate(cols_list, axis=0)
     n_inf = len(rows_arr)
     print(f"  {n_inf:,} inference pixels at T={T}")
 
-    # Step 2: build pixel-id → index mapping for fast lookup
+    # Build pixel-id → index mapping
     pixel_idx = {(int(r), int(c)): i for i, (r, c) in enumerate(zip(rows_arr, cols_arr))}
     label_5yr = np.zeros(n_inf, dtype=np.int8)
 
-    # Step 3: stream years T+1 … T+5 (capped at LAST_LABEL_YEAR)
     years_to_check = [yr for yr in window_years if yr <= LAST_LABEL_YEAR]
     if years_to_check:
         print(f"  Reconstructing 5-year labels from years {years_to_check[0]}–{years_to_check[-1]}…")
@@ -332,7 +357,7 @@ def load_inference_rows_and_wdpa(
             for batch in pf2.iter_batches(
                 batch_size=BATCH_SIZE, columns=["year", "row", "col", "WDPA"], use_threads=True
             ):
-                yr  = batch["year"].to_numpy(zero_copy_only=False)
+                yr   = batch["year"].to_numpy(zero_copy_only=False)
                 wdpa = batch["WDPA"].to_numpy(zero_copy_only=False)
                 r_arr = batch["row"].to_numpy(zero_copy_only=False)
                 c_arr = batch["col"].to_numpy(zero_copy_only=False)
@@ -350,14 +375,13 @@ def load_inference_rows_and_wdpa(
 
     evaluable = np.ones(n_inf, dtype=bool) if is_evaluable_flag else np.zeros(n_inf, dtype=bool)
     if not is_evaluable_flag:
-        # Partial window: mark as evaluable but flag in results
         evaluable_years = len(years_to_check)
         print(f"  NOTE: T={T} has only {evaluable_years}/{LOOKAHEAD_YEARS} years observable "
               f"(T+5={T+LOOKAHEAD_YEARS} > LAST_LABEL_YEAR={LAST_LABEL_YEAR})")
         evaluable[:] = (evaluable_years > 0)
 
     row_col = np.stack([rows_arr, cols_arr], axis=1)
-    xy = {}
+    xy: dict = {}
     if x_list:
         xy["x"] = np.concatenate(x_list)
     if y_list:
@@ -366,10 +390,83 @@ def load_inference_rows_and_wdpa(
     return X_inf, row_col, label_5yr, evaluable, xy
 
 
+# ── Training helpers ──────────────────────────────────────────────────────────
+
+def _train_lgbm(
+    X: np.ndarray,
+    y: np.ndarray,
+    years_arr: np.ndarray,
+    best_params: Dict[str, Any],
+    n_est: int,
+    year_range: Tuple[int, int],
+):
+    import lightgbm as lgb
+
+    n_pos = int(y.sum())
+    n_neg = len(y) - n_pos
+    spw = n_neg / max(n_pos, 1)
+    weights = compute_year_weights(years_arr, min_year=year_range[0], max_year=year_range[1])
+
+    p = {**best_params, "is_unbalance": False}
+    for k in ("num_boost_round", "n_estimators", "n_jobs", "scale_pos_weight",
+              "early_stopping_rounds", "early_stopping",
+              "sampling_strategy", "replacement", "bootstrap", "class_weight"):
+        p.pop(k, None)
+    p["scale_pos_weight"] = spw
+    p.setdefault("num_threads", NUM_THREADS)
+
+    ds = lgb.Dataset(X, label=y, weight=weights, free_raw_data=True)
+    del X, y, years_arr, weights
+    gc.collect()
+
+    t0 = time.time()
+    model = lgb.train(p, ds, num_boost_round=n_est, callbacks=[lgb.log_evaluation(500)])
+    print(f"  Training done in {time.time() - t0:.1f}s")
+    del ds
+    gc.collect()
+    return model
+
+
+def _train_rf(
+    X: np.ndarray,
+    y: np.ndarray,
+    rf_params: Dict[str, Any],
+):
+    from sklearn.ensemble import RandomForestClassifier
+
+    # Build final RF params — strip keys not accepted by sklearn
+    params = {k: v for k, v in rf_params.items()
+              if k not in ("scale_pos_weight", "num_threads", "metric",
+                           "boosting_type", "objective", "verbose",
+                           "num_boost_round", "learning_rate",
+                           "reg_alpha", "reg_lambda",
+                           "subsample", "subsample_freq", "colsample_bytree",
+                           "num_leaves", "min_child_samples")}
+    params["class_weight"] = "balanced_subsample"
+    params.setdefault("random_state", RANDOM_STATE)
+    params.setdefault("n_jobs", NUM_THREADS)
+
+    n_pos = int(y.sum())
+    n_neg = len(y) - n_pos
+    print(f"  RF training: {len(y):,} samples ({n_pos:,} pos / {n_neg:,} neg), "
+          f"n_estimators={params.get('n_estimators')}")
+    for k in sorted(params):
+        print(f"    {k}: {params[k]}")
+
+    rf = RandomForestClassifier(**params)
+    t0 = time.time()
+    rf.fit(X, y)
+    print(f"  Training done in {time.time() - t0:.1f}s")
+    del X, y
+    gc.collect()
+    return rf
+
+
 # ── Metrics ───────────────────────────────────────────────────────────────────
 
 def compute_backtest_metrics(y_true: np.ndarray, y_proba: np.ndarray, label: str) -> Dict[str, Any]:
     from sklearn.metrics import roc_auc_score, average_precision_score
+
     n = len(y_true)
     n_pos = int(y_true.sum())
     base_rate = n_pos / max(n, 1)
@@ -406,16 +503,17 @@ def compute_backtest_metrics(y_true: np.ndarray, y_proba: np.ndarray, label: str
 
 # ── Plotting ──────────────────────────────────────────────────────────────────
 
-def plot_backtest_precision(all_results: List[Dict], output_dir: Path) -> None:
-    clean = [r for r in all_results if r.get("clean_5yr_window")]
+def plot_backtest_precision(all_results: List[Dict], output_dir: Path, model_type: str) -> None:
+    clean   = [r for r in all_results if r.get("clean_5yr_window")]
     partial = [r for r in all_results if not r.get("clean_5yr_window") and r.get("metrics")]
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    fig.suptitle("Pseudo-forecast Backtesting: Precision@K% and Lift@K%", fontsize=13)
+    fig.suptitle(
+        f"Pseudo-forecast Backtesting ({model_type.upper()}): Precision@K% and Lift@K%",
+        fontsize=13,
+    )
 
     colors = {"1": "#1f77b4", "5": "#ff7f0e", "10": "#2ca02c"}
-    markers_clean = "o"
-    markers_partial = "s"
 
     for ax, metric_prefix, ylabel in [
         (axes[0], "precision_at", "Precision@K%"),
@@ -426,12 +524,12 @@ def plot_backtest_precision(all_results: List[Dict], output_dir: Path) -> None:
             if clean:
                 xs = [r["origin_year"] for r in clean if r.get("metrics") and key in r["metrics"]]
                 ys = [r["metrics"][key] for r in clean if r.get("metrics") and key in r["metrics"]]
-                ax.plot(xs, ys, marker=markers_clean, color=color, label=f"K={k}% (clean)")
+                ax.plot(xs, ys, marker="o", color=color, label=f"K={k}% (clean)")
             if partial:
                 xs_p = [r["origin_year"] for r in partial if r.get("metrics") and key in r["metrics"]]
                 ys_p = [r["metrics"][key] for r in partial if r.get("metrics") and key in r["metrics"]]
-                ax.plot(xs_p, ys_p, marker=markers_partial, color=color,
-                        linestyle="--", alpha=0.6, label=f"K={k}% (partial)")
+                ax.plot(xs_p, ys_p, marker="s", color=color, linestyle="--", alpha=0.6,
+                        label=f"K={k}% (partial)")
 
         ax.set_xlabel("Forecast Origin Year (T)")
         ax.set_ylabel(ylabel)
@@ -451,7 +549,9 @@ def plot_backtest_precision(all_results: List[Dict], output_dir: Path) -> None:
 
 def run_single_origin(
     origin_year: int,
-    best_params: Dict[str, Any],
+    model_type: str,
+    lgbm_params: Optional[Dict[str, Any]],
+    rf_params: Optional[Dict[str, Any]],
     feature_cols: List[str],
     split_paths: List[Path],
     panel_path: Path,
@@ -459,11 +559,11 @@ def run_single_origin(
 ) -> Dict[str, Any]:
     T = origin_year
     train_range = (2001, T - 1)
-    n_est = int(best_params.get("n_estimators", N_ESTIMATORS_LOCKED))
     clean_window = (T + LOOKAHEAD_YEARS) <= LAST_LABEL_YEAR
 
     print("\n" + "=" * 70)
-    print(f"BACKTEST: origin year T={T}  (train 2001–{T-1}, eval {T+1}–{min(T+5, LAST_LABEL_YEAR)})")
+    print(f"BACKTEST [{model_type.upper()}]: origin year T={T}  "
+          f"(train 2001–{T-1}, eval {T+1}–{min(T+5, LAST_LABEL_YEAR)})")
     print(f"  Clean 5-year window: {clean_window}")
     print("=" * 70)
     report_memory_usage(f"start T={T}")
@@ -474,25 +574,13 @@ def run_single_origin(
     )
     print(f"  Training data: {len(y_tr):,} rows ({n_pos_tr:,} pos / {n_neg_tr:,} neg)")
 
-    spw = n_neg_tr / max(n_pos_tr, 1)
-    weights = compute_year_weights(yr_tr, min_year=2001, max_year=T - 1)
+    if model_type == "lgbm":
+        n_est = int(lgbm_params.get("n_estimators", N_ESTIMATORS_LOCKED_LGBM))
+        model = _train_lgbm(X_tr, y_tr, yr_tr, lgbm_params, n_est, train_range)
+    else:  # rf
+        model = _train_rf(X_tr, y_tr, rf_params)
 
-    p = {**best_params, "is_unbalance": False}
-    for k in ("num_boost_round", "n_estimators", "n_jobs", "scale_pos_weight",
-              "early_stopping_rounds", "early_stopping",
-              "sampling_strategy", "replacement", "bootstrap", "class_weight"):
-        p.pop(k, None)
-    p["scale_pos_weight"] = spw
-    p.setdefault("num_threads", NUM_THREADS)
-
-    ds = lgb.Dataset(X_tr, label=y_tr, weight=weights, free_raw_data=True)
-    del X_tr, y_tr, yr_tr, weights
-    gc.collect()
-
-    t0 = time.time()
-    model = lgb.train(p, ds, num_boost_round=n_est, callbacks=[lgb.log_evaluation(500)])
-    print(f"  Training done in {time.time() - t0:.1f}s")
-    del ds
+    del X_tr, y_tr, yr_tr
     gc.collect()
     report_memory_usage(f"after training T={T}")
 
@@ -503,7 +591,12 @@ def run_single_origin(
 
     # ── Predict ───────────────────────────────────────────────────────────────
     print(f"\nScoring {len(X_inf):,} pixels…")
-    y_proba = model.predict(X_inf, num_iteration=n_est).astype(np.float32)
+    if model_type == "lgbm":
+        n_est_inf = int(lgbm_params.get("n_estimators", N_ESTIMATORS_LOCKED_LGBM))
+        y_proba = model.predict(X_inf, num_iteration=n_est_inf).astype(np.float32)
+    else:  # rf
+        y_proba = model.predict_proba(X_inf)[:, 1].astype(np.float32)
+
     del model, X_inf
     gc.collect()
 
@@ -511,6 +604,7 @@ def run_single_origin(
     result: Dict[str, Any] = {
         "origin_year": T,
         "train_years": list(train_range),
+        "model_type": model_type,
         "clean_5yr_window": bool(clean_window),
         "n_pixels_scored": int(len(y_proba)),
         "n_evaluable": int(evaluable.sum()),
@@ -555,20 +649,32 @@ def aggregate_backtest_results(output_dir: Path) -> List[Dict]:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
+    # Re-import config after runner.py reload
+    from scripts.regions.shared.forward.config import DATA_SUBDIR, MODEL_PREFIX, OUTPUTS_SUBDIR  # noqa: F401
+
+    model_type = os.environ.get("PA3030_FORWARD_MODEL_TYPE", "lgbm").strip().lower()
+
     parser = argparse.ArgumentParser(description="Forward prediction backtesting")
     parser.add_argument("--origin-year", type=int, choices=ORIGIN_YEARS, default=None,
                         help="Origin year T to process. Defaults to SLURM_ARRAY_TASK_ID index.")
     parser.add_argument("--aggregate", action="store_true",
                         help="Aggregate individual backtest JSONs into summary + plot.")
+    # model-type can also be passed via env (preferred when called from runner.py)
+    parser.add_argument("--model-type", type=str, choices=["lgbm", "rf"], default=None,
+                        help="Model type (overrides PA3030_FORWARD_MODEL_TYPE env var).")
     args = parser.parse_args()
 
-    repo_root = get_repo_root()
-    output_dir = repo_root / "outputs/south_america/results/forward"
+    if args.model_type is not None:
+        model_type = args.model_type.strip().lower()
+
+    repo_root   = get_repo_root()
+    forward_dir = repo_root / f"outputs/{OUTPUTS_SUBDIR}/results/forward"
+    output_dir  = forward_dir / model_type
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Aggregate mode ────────────────────────────────────────────────────────
     if args.aggregate:
-        print("Aggregating backtest results…")
+        print(f"Aggregating backtest results ({model_type.upper()})…")
         all_results = aggregate_backtest_results(output_dir)
         if not all_results:
             print("No backtest JSONs found — run individual origins first.")
@@ -577,7 +683,7 @@ def main() -> None:
         with open(out_json, "w") as f:
             json.dump(all_results, f, indent=2)
         print(f"Saved: {out_json}")
-        plot_backtest_precision(all_results, output_dir)
+        plot_backtest_precision(all_results, output_dir, model_type)
         return
 
     # ── Single origin ─────────────────────────────────────────────────────────
@@ -587,39 +693,37 @@ def main() -> None:
         task_id = int(os.environ.get("SLURM_ARRAY_TASK_ID", "0"))
         origin_year = ORIGIN_YEARS[task_id % len(ORIGIN_YEARS)]
 
-    print(f"Processing origin year T={origin_year}")
+    print(f"Processing origin year T={origin_year} [{model_type.upper()}]")
 
-    params_path = resolve_best_params_json()
-    best_params = load_best_params(params_path)
+    params_path = resolve_best_params_json(MODEL_PREFIX, DATA_SUBDIR, model_type)
+    if model_type == "lgbm":
+        import lightgbm  # noqa: F401 — ensure available
+        best_params_lgbm = load_best_params_lgbm(params_path, NUM_THREADS)
+        best_params_rf   = None
+    else:
+        best_params_lgbm = None
+        best_params_rf   = load_best_params_rf(params_path, NUM_THREADS)
 
     # Resolve data sources
-    split_paths = resolve_split_parquets()
-    panel_path  = resolve_panel()
+    split_paths = resolve_split_parquets(DATA_SUBDIR)
+    panel_path  = resolve_panel(DATA_SUBDIR)
     print(f"  panel:        {panel_path}")
     print(f"  split_paths:  {[str(p) for p in split_paths]}")
 
-    # Feature columns from train parquet schema
-    if split_paths:
-        schema = pq.ParquetFile(split_paths[0]).schema_arrow
-        feature_cols = [
-            name for name, fld in zip(schema.names, schema)
-            if (pa.types.is_integer(fld.type) or pa.types.is_floating(fld.type))
-            and name not in EXCLUDE_COLS
-        ]
-    else:
-        # Fallback: derive from panel
-        schema = pq.ParquetFile(panel_path).schema_arrow
-        feature_cols = [
-            name for name, fld in zip(schema.names, schema)
-            if (pa.types.is_integer(fld.type) or pa.types.is_floating(fld.type))
-            and name not in EXCLUDE_COLS
-        ]
+    # Feature columns from train parquet schema (or panel fallback)
+    source = split_paths[0] if split_paths else panel_path
+    schema = pq.ParquetFile(source).schema_arrow
+    feature_cols = [
+        name for name, fld in zip(schema.names, schema)
+        if (pa.types.is_integer(fld.type) or pa.types.is_floating(fld.type))
+        and name not in EXCLUDE_COLS
+    ]
     print(f"  feature_cols: {len(feature_cols)}")
 
-    result = run_single_origin(
-        origin_year, best_params, feature_cols, split_paths, panel_path, output_dir
+    run_single_origin(
+        origin_year, model_type, best_params_lgbm, best_params_rf,
+        feature_cols, split_paths, panel_path, output_dir,
     )
-    print(f"\nDone. Result: {result}")
 
 
 if __name__ == "__main__":

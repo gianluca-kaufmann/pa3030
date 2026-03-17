@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Stage 2: Calibrated forward inference on 2024 features.
 
-Loads the deployment model artifact (model1_lgbm_deployment_*.pkl) plus its
-Platt / isotonic calibrators and runs batched inference on the 2024 feature
-set produced by forward_features.py.
+Loads the deployment model artifact ({model_prefix}_{model_type}_deployment_*.pkl)
+plus its Platt / isotonic calibrators and runs batched inference on the 2024
+feature set produced by features_core.py.
 
 Output:
-    outputs/south_america/results/forward/forward_scored_2024.parquet
+    outputs/{region}/results/forward/{model_type}/forward_scored_2024.parquet
     Columns: row, col, x, y, y_pred_proba_raw, y_pred_proba_calibrated
+
+Model-type support:
+  lgbm  — finds {model_prefix}_lgbm_deployment_*.pkl,
+           calls model.predict(X, num_iteration=num_boost_round)
+  rf    — finds {model_prefix}_rf_deployment_*.pkl,
+           calls model.predict_proba(X)[:, 1]  (no num_boost_round)
 """
 
 from __future__ import annotations
@@ -18,10 +24,6 @@ import pickle
 import sys
 from pathlib import Path
 
-import numpy as np
-import pyarrow as pa
-import pyarrow.parquet as pq
-
 # ── sys.path bootstrap ────────────────────────────────────────────────────────
 _repo_root = Path(__file__).resolve().parents[4]
 if str(_repo_root) not in sys.path:
@@ -29,20 +31,31 @@ if str(_repo_root) not in sys.path:
 del _repo_root
 # ─────────────────────────────────────────────────────────────────────────────
 
-from scripts.regions.shared.training.utils import get_repo_root, report_memory_usage  # noqa: E402
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from scripts.regions.shared.forward.config import (  # noqa: E402
+    DATA_SUBDIR,
+    MODEL_PREFIX,
+    OUTPUTS_SUBDIR,
+    get_repo_root,
+)
+from scripts.regions.shared.training.utils import get_repo_root as _get_repo_root, report_memory_usage  # noqa: E402
 
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "500_000"))
 
 
 # ── Path helpers ──────────────────────────────────────────────────────────────
 
-def resolve_deployment_artifact(model_dir: Path) -> Path:
-    """Find the most-recent model1_lgbm_deployment_*.pkl in model_dir."""
-    candidates = sorted(model_dir.glob("model1_lgbm_deployment_*.pkl"), reverse=True)
+def resolve_deployment_artifact(model_dir: Path, model_prefix: str, model_type: str) -> Path:
+    """Find the most-recent {model_prefix}_{model_type}_deployment_*.pkl in model_dir."""
+    pattern = f"{model_prefix}_{model_type}_deployment_*.pkl"
+    candidates = sorted(model_dir.glob(pattern), reverse=True)
     if not candidates:
         raise FileNotFoundError(
-            f"No model1_lgbm_deployment_*.pkl found in {model_dir}.\n"
-            "Run scripts/regions/south_america/5_training/model1_LGBM_deployment.py first."
+            f"No {pattern} found in {model_dir}.\n"
+            f"Run the {model_prefix}_{model_type}_deployment.py training script first."
         )
     chosen = candidates[0]
     if len(candidates) > 1:
@@ -56,7 +69,7 @@ def resolve_features_parquet(forward_dir: Path) -> Path:
         return cand
     raise FileNotFoundError(
         f"forward_features_2024.parquet not found in {forward_dir}.\n"
-        "Run scripts/regions/south_america/8_forward/forward_features.py first."
+        "Run features_core (2_forward_features.py) first."
     )
 
 
@@ -92,18 +105,30 @@ def calibrate(artifact: dict, raw_proba: np.ndarray) -> np.ndarray:
         return raw_proba.copy()
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Prediction helpers ────────────────────────────────────────────────────────
+
+def _predict_batch(model, model_type: str, X_batch: np.ndarray, num_boost_round: int) -> np.ndarray:
+    """Run model inference for one batch; handles LGBM vs RF differences."""
+    if model_type == "lgbm":
+        return model.predict(X_batch, num_iteration=num_boost_round).astype(np.float32)
+    else:  # rf
+        return model.predict_proba(X_batch)[:, 1].astype(np.float32)
+
+
+# ── Main inference ────────────────────────────────────────────────────────────
 
 def run_inference(
     features_path: Path,
     artifact_path: Path,
     output_dir: Path,
+    model_type: str,
 ) -> Path:
     print("\n" + "=" * 70)
-    print("FORWARD INFERENCE — 2024")
+    print(f"FORWARD INFERENCE — 2024 ({model_type.upper()})")
     print("=" * 70)
-    print(f"  Features:  {features_path}")
-    print(f"  Artifact:  {artifact_path}")
+    print(f"  Features:   {features_path}")
+    print(f"  Artifact:   {artifact_path}")
+    print(f"  Model type: {model_type}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Load deployment artifact ───────────────────────────────────────────────
@@ -114,9 +139,10 @@ def run_inference(
     model         = artifact["model"]
     feature_cols  = artifact["feature_cols"]
     meta          = artifact.get("metadata", {})
-    num_boost_round = int(meta.get("num_boost_round", 2555))
+    num_boost_round = int(meta.get("num_boost_round", 2555)) if model_type == "lgbm" else 0
     print(f"  Model trained on years: {meta.get('train_years')}")
-    print(f"  num_boost_round:        {num_boost_round}")
+    if model_type == "lgbm":
+        print(f"  num_boost_round:        {num_boost_round}")
     print(f"  feature_cols:           {len(feature_cols)}")
     print(f"  calibrators:            platt={artifact.get('platt') is not None}, "
           f"isotonic={artifact.get('isotonic') is not None}")
@@ -163,9 +189,7 @@ def run_inference(
                 for c in feature_cols
             ])
 
-            raw_proba = model.predict(
-                X_batch, num_iteration=num_boost_round
-            ).astype(np.float32)
+            raw_proba = _predict_batch(model, model_type, X_batch, num_boost_round)
             cal_proba = calibrate(artifact, raw_proba)
 
             # Build output table
@@ -214,13 +238,19 @@ def run_inference(
 
 
 def main() -> None:
-    repo_root  = get_repo_root()
-    model_dir  = repo_root / "data/south_america/ml/models"
-    forward_dir = repo_root / "outputs/south_america/results/forward"
+    # Re-import config after runner.py reload
+    from scripts.regions.shared.forward.config import DATA_SUBDIR, MODEL_PREFIX, OUTPUTS_SUBDIR  # noqa: F401
 
-    artifact_path  = resolve_deployment_artifact(model_dir)
+    model_type = os.environ.get("PA3030_FORWARD_MODEL_TYPE", "lgbm").strip().lower()
+
+    repo_root   = get_repo_root()
+    model_dir   = repo_root / f"data/{DATA_SUBDIR}/ml/models"
+    forward_dir = repo_root / f"outputs/{OUTPUTS_SUBDIR}/results/forward"
+    output_dir  = forward_dir / model_type
+
+    artifact_path  = resolve_deployment_artifact(model_dir, MODEL_PREFIX, model_type)
     features_path  = resolve_features_parquet(forward_dir)
-    out = run_inference(features_path, artifact_path, forward_dir)
+    out = run_inference(features_path, artifact_path, output_dir, model_type)
     print(f"\nDone. Output: {out}")
 
 

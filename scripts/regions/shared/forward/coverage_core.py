@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Stage 0a: South America 2024 coverage baseline.
+"""Stage 0a: Region coverage baseline.
 
-Computes total SA land area and 2024 protection coverage from the backbone
+Computes total land area and current protection coverage from the backbone
 raster and WDPA 2024 raster using latitude-corrected km² calculations.
 
 Background: merged_panel_final.parquet contains only unprotected pixels
 (risk-set filter WDPA_prev==0 applied during feature engineering), so it
-cannot be used alone for coverage calculations. The backbone + WDPA rasters
+cannot be used alone for coverage calculations.  The backbone + WDPA rasters
 are the correct source for total land area and current protection coverage.
 
 Output:
-    outputs/south_america/results/forward/forward_coverage_baseline.json
+    outputs/{region}/results/forward/forward_coverage_baseline.json
 """
 
 from __future__ import annotations
@@ -20,9 +20,6 @@ import os
 import sys
 from pathlib import Path
 
-import numpy as np
-import rasterio
-
 # ── sys.path bootstrap ────────────────────────────────────────────────────────
 _repo_root = Path(__file__).resolve().parents[4]
 if str(_repo_root) not in sys.path:
@@ -30,19 +27,22 @@ if str(_repo_root) not in sys.path:
 del _repo_root
 # ─────────────────────────────────────────────────────────────────────────────
 
+import numpy as np
+import rasterio
+
+from scripts.regions.shared.forward.config import DATA_SUBDIR, OUTPUTS_SUBDIR, REGION_LABEL, get_repo_root  # noqa: E402
 from scripts.regions.shared.geo_utils import pixel_area_km2  # noqa: E402
-from scripts.regions.shared.training.utils import get_repo_root  # noqa: E402
 
 
-def resolve_raster(filename: str, subdirs: list[str] | None = None) -> Path:
+def resolve_raster(filename: str, data_subdir: str, subdirs: list[str] | None = None) -> Path:
     """Locate a raster: check $SCRATCH then repo, optionally inside subdirs."""
     repo_root = get_repo_root()
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
 
     bases = []
     if scratch_root is not None:
-        bases.append(scratch_root / "data/south_america/ready")
-    bases.append(repo_root / "data/south_america/ready")
+        bases.append(scratch_root / f"data/{data_subdir}/ready")
+    bases.append(repo_root / f"data/{data_subdir}/ready")
 
     search_subdirs = [""] + (subdirs or [])
     candidates: list[Path] = []
@@ -63,10 +63,12 @@ def compute_coverage_baseline(
     backbone_path: Path,
     wdpa_2024_path: Path,
     output_dir: Path,
+    data_subdir: str,
+    region_label: str,
 ) -> dict:
-    """Compute SA total area, 2024 coverage, and scenario thresholds."""
+    """Compute total area, 2024 coverage, and scenario thresholds."""
     print("\n" + "=" * 70)
-    print("COMPUTING SA COVERAGE BASELINE")
+    print(f"COMPUTING {region_label.upper()} COVERAGE BASELINE")
     print("=" * 70)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -83,7 +85,7 @@ def compute_coverage_baseline(
         backbone_data = src.read(1)
         nodata = src.nodata
 
-    # Valid SA land pixels (backbone == 1, excluding nodata)
+    # Valid land pixels (backbone == 1, excluding nodata)
     if nodata is not None:
         valid_mask = (backbone_data == 1)
     else:
@@ -91,7 +93,7 @@ def compute_coverage_baseline(
 
     rows_all, cols_all = np.where(valid_mask)
     total_pixels = int(len(rows_all))
-    print(f"  Total SA land pixels: {total_pixels:,}")
+    print(f"  Total {region_label} land pixels: {total_pixels:,}")
 
     # EPSG:3857 y-centre for each backbone pixel: y = f + (row + 0.5) * e
     # transform.e < 0  (northing decreases as row increases)
@@ -99,8 +101,8 @@ def compute_coverage_baseline(
     print(f"  y range: [{y_all.min():.0f}, {y_all.max():.0f}] m (EPSG:3857)")
 
     areas_all = pixel_area_km2(y_all, pixel_size_m=PIXEL_SIZE_M)
-    total_sa_km2 = float(areas_all.sum())
-    print(f"\n  Total SA area (latitude-corrected): {total_sa_km2:,.0f} km²")
+    total_km2 = float(areas_all.sum())
+    print(f"\n  Total {region_label} area (latitude-corrected): {total_km2:,.0f} km²")
 
     # ── 2. Read WDPA 2024 raster ──────────────────────────────────────────────
     print(f"\nReading WDPA 2024 raster: {wdpa_2024_path}")
@@ -128,16 +130,14 @@ def compute_coverage_baseline(
     y_prot = transform.f + (prot_rows + 0.5) * transform.e
     areas_prot = pixel_area_km2(y_prot, pixel_size_m=PIXEL_SIZE_M)
     protected_2024_km2 = float(areas_prot.sum())
-    coverage_pct_2024 = protected_2024_km2 / total_sa_km2
+    coverage_pct_2024 = protected_2024_km2 / total_km2
 
     print(f"  Protected area 2024: {protected_2024_km2:,.0f} km² ({coverage_pct_2024:.1%})")
 
     # ── 3. BAU target: historical 5-year designation volume (2019→2024) ───────
-    # Try to read WDPA_2019 raster to compute new km² protected over 2019→2024.
-    # This gives the BAU designation volume for the forward prediction scenario.
     bau_km2 = None  # float or None
     try:
-        wdpa_2019_path = resolve_raster("WDPA_2019.tif", subdirs=["WDPA", "wdpa"])
+        wdpa_2019_path = resolve_raster("WDPA_2019.tif", data_subdir, subdirs=["WDPA", "wdpa"])
         print(f"\nReading WDPA 2019 raster for BAU baseline: {wdpa_2019_path}")
         with rasterio.open(wdpa_2019_path) as src_2019:
             wdpa_2019_data = src_2019.read(1)
@@ -158,19 +158,19 @@ def compute_coverage_baseline(
         print(f"  BAU volume (2019→2024): {bau_km2:,.0f} km² over 5 years")
     except FileNotFoundError:
         print("\n  WDPA_2019.tif not found — BAU km² will not be computed.")
-        print("  forward_results.py will fall back to top-0.5% proxy for BAU cutoff.")
+        print("  forward_results will fall back to top-0.5% proxy for BAU cutoff.")
 
     # ── 4. Scenario thresholds ────────────────────────────────────────────────
-    km2_needed_25 = max(0.0, 0.25 * total_sa_km2 - protected_2024_km2)
-    km2_needed_30 = max(0.0, 0.30 * total_sa_km2 - protected_2024_km2)
+    km2_needed_25 = max(0.0, 0.25 * total_km2 - protected_2024_km2)
+    km2_needed_30 = max(0.0, 0.30 * total_km2 - protected_2024_km2)
     print(f"\n  Scenario thresholds:")
     print(f"    25% target: {km2_needed_25:,.0f} km² additional protection needed")
     print(f"    30% target: {km2_needed_30:,.0f} km² additional protection needed")
 
     # ── 5. Save JSON ──────────────────────────────────────────────────────────
     baseline = {
-        "total_sa_pixels": total_pixels,
-        "total_sa_km2": round(total_sa_km2, 2),
+        "total_land_pixels": total_pixels,
+        "total_land_km2": round(total_km2, 2),
         "protected_2024_pixels": protected_pixels,
         "protected_2024_km2": round(protected_2024_km2, 2),
         "coverage_pct_2024": round(coverage_pct_2024, 6),
@@ -180,6 +180,9 @@ def compute_coverage_baseline(
         "pixel_size_m": float(PIXEL_SIZE_M),
         "backbone_path": str(backbone_path),
         "wdpa_2024_path": str(wdpa_2024_path),
+        # Legacy keys (backward-compat with 4_forward_results.py references)
+        "total_sa_pixels": total_pixels,
+        "total_sa_km2": round(total_km2, 2),
     }
 
     out_path = output_dir / "forward_coverage_baseline.json"
@@ -190,11 +193,18 @@ def compute_coverage_baseline(
 
 
 def main() -> None:
+    # Re-import config here so the module-level reload in runner.py takes effect
+    from scripts.regions.shared.forward.config import DATA_SUBDIR, OUTPUTS_SUBDIR, REGION_LABEL  # noqa: F401
+
     repo_root = get_repo_root()
-    backbone_path = resolve_raster("backbone.tif", subdirs=["backbone"])
-    wdpa_2024_path = resolve_raster("WDPA_2024.tif", subdirs=["WDPA", "wdpa"])
-    output_dir = repo_root / "outputs/south_america/results/forward"
-    compute_coverage_baseline(backbone_path, wdpa_2024_path, output_dir)
+    backbone_path = resolve_raster("backbone.tif", DATA_SUBDIR, subdirs=["backbone"])
+    wdpa_2024_path = resolve_raster("WDPA_2024.tif", DATA_SUBDIR, subdirs=["WDPA", "wdpa"])
+    output_dir = repo_root / f"outputs/{OUTPUTS_SUBDIR}/results/forward"
+    compute_coverage_baseline(
+        backbone_path, wdpa_2024_path, output_dir,
+        data_subdir=DATA_SUBDIR,
+        region_label=REGION_LABEL,
+    )
 
 
 if __name__ == "__main__":

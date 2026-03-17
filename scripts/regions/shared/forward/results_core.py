@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Stage 3: Forward results — maps, scenario analysis, breakdowns, gap analysis.
 
-Reads forward_scored_2024.parquet and forward_coverage_baseline.json and
-produces all paper-ready outputs.
+Reads forward_scored_2024.parquet from forward/{model_type}/ and
+forward_coverage_baseline.json, and produces all paper-ready outputs.
 
 BAU Forecast
   - forward_probability_map.pdf/.png   — continuous P(protection by ~2029)
@@ -24,6 +24,8 @@ Summary JSON
 
 All km² figures use pixel_area_km2() with pixel_size_m extracted from the
 backbone raster transform.
+
+Outputs are written to outputs/{region}/results/forward/{model_type}/.
 """
 
 from __future__ import annotations
@@ -53,15 +55,21 @@ del _repo_root
 # ─────────────────────────────────────────────────────────────────────────────
 
 from scripts.regions.shared.geo_utils import pixel_area_km2  # noqa: E402
-from scripts.regions.shared.training.utils import get_repo_root  # noqa: E402
-
+from scripts.regions.shared.forward.config import (  # noqa: E402
+    DATA_SUBDIR,
+    ISO_CODES,
+    MODEL_PREFIX,
+    OUTPUTS_SUBDIR,
+    REGION_LABEL,
+    X_LIMITS,
+    Y_LIMITS,
+    get_repo_root,
+)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # ── Map style constants ───────────────────────────────────────────────────────
 MAP_FIGSIZE  = (14, 11)
 MAP_DPI      = 300
-SA_X_LIMITS  = (-85, -32)    # lon degrees
-SA_Y_LIMITS  = (-56, 13)     # lat degrees
 WDPA_COLOR   = "#555555"     # existing PA overlay
 SCENARIO_COLORS = {
     "bau":      "#1a78c2",
@@ -76,13 +84,13 @@ RAW_COL   = "y_pred_proba_raw"
 
 # ── Path helpers ──────────────────────────────────────────────────────────────
 
-def resolve_scored_parquet(forward_dir: Path) -> Path:
-    cand = forward_dir / "forward_scored_2024.parquet"
+def resolve_scored_parquet(model_output_dir: Path) -> Path:
+    cand = model_output_dir / "forward_scored_2024.parquet"
     if cand.exists():
         return cand
     raise FileNotFoundError(
-        f"forward_scored_2024.parquet not found in {forward_dir}.\n"
-        "Run forward_predict.py first."
+        f"forward_scored_2024.parquet not found in {model_output_dir}.\n"
+        "Run predict_core (3_forward_predict.py) first."
     )
 
 
@@ -91,13 +99,13 @@ def resolve_coverage_baseline(forward_dir: Path) -> Dict:
     if not cand.exists():
         raise FileNotFoundError(
             f"forward_coverage_baseline.json not found in {forward_dir}.\n"
-            "Run forward_coverage_baseline.py first."
+            "Run coverage_core (1_forward_coverage_baseline.py) first."
         )
     with open(cand) as f:
         return json.load(f)
 
 
-def resolve_backbone_pixel_size(repo_root: Path) -> float:
+def resolve_backbone_pixel_size(repo_root: Path, data_subdir: str) -> float:
     """Extract pixel size from backbone raster; fall back to 1000.0 m."""
     try:
         import rasterio
@@ -105,12 +113,12 @@ def resolve_backbone_pixel_size(repo_root: Path) -> float:
         candidates: list[Path] = []
         if scratch is not None:
             candidates += [
-                scratch / "data/south_america/ready/backbone.tif",
-                scratch / "data/south_america/ready/backbone/backbone.tif",
+                scratch / f"data/{data_subdir}/ready/backbone.tif",
+                scratch / f"data/{data_subdir}/ready/backbone/backbone.tif",
             ]
         candidates += [
-            repo_root / "data/south_america/ready/backbone.tif",
-            repo_root / "data/south_america/ready/backbone/backbone.tif",
+            repo_root / f"data/{data_subdir}/ready/backbone.tif",
+            repo_root / f"data/{data_subdir}/ready/backbone/backbone.tif",
         ]
         for cand in candidates:
             if cand.exists():
@@ -124,12 +132,16 @@ def resolve_backbone_pixel_size(repo_root: Path) -> float:
     return 1000.0
 
 
-def resolve_gsn_raster(repo_root: Path) -> Optional[Path]:
+def resolve_gsn_raster(repo_root: Path, data_subdir: str) -> Optional[Path]:
     scratch = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
     candidates: list[Path] = []
     if scratch is not None:
-        candidates.append(scratch / "data/south_america/ready/GSN/gsn_terrestrial_ecoregions_mask_1km.tif")
-    candidates.append(repo_root / "data/south_america/ready/GSN/gsn_terrestrial_ecoregions_mask_1km.tif")
+        candidates.append(
+            scratch / f"data/{data_subdir}/ready/GSN/gsn_terrestrial_ecoregions_mask_1km.tif"
+        )
+    candidates.append(
+        repo_root / f"data/{data_subdir}/ready/GSN/gsn_terrestrial_ecoregions_mask_1km.tif"
+    )
     for c in candidates:
         if c.exists():
             return c
@@ -243,8 +255,8 @@ def _rasterize(
     lat: np.ndarray,
     values: np.ndarray,
     resolution: float = 0.05,
-    x_lim: Tuple[float, float] = SA_X_LIMITS,
-    y_lim: Tuple[float, float] = SA_Y_LIMITS,
+    x_lim: Tuple[float, float] = (-85, -32),
+    y_lim: Tuple[float, float] = (-56, 13),
     agg: str = "max",
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Bin point data onto a regular grid.
@@ -278,23 +290,20 @@ def _rasterize(
     return grid, x_centres, y_centres
 
 
-def _get_boundary(world_gdf: Optional[Any]) -> Optional[Any]:
+def _get_boundary(world_gdf: Optional[Any], iso_codes: List[str]) -> Optional[Any]:
     if world_gdf is None:
         return None
     try:
-        import geopandas as gpd
-        sa_iso = ["ARG", "BOL", "BRA", "CHL", "COL", "ECU", "GUF", "GUY",
-                  "PRY", "PER", "SUR", "URY", "VEN"]
-        sa = world_gdf[world_gdf["iso_a3"].isin(sa_iso)]
-        return sa
+        region_gdf = world_gdf[world_gdf["iso_a3"].isin(iso_codes)]
+        return region_gdf
     except Exception:
         return None
 
 
-def _draw_boundary(ax: plt.Axes, sa_gdf: Optional[Any]) -> None:
-    if sa_gdf is not None:
+def _draw_boundary(ax: plt.Axes, region_gdf: Optional[Any]) -> None:
+    if region_gdf is not None:
         try:
-            sa_gdf.boundary.plot(ax=ax, color="black", linewidth=0.5, zorder=5)
+            region_gdf.boundary.plot(ax=ax, color="black", linewidth=0.5, zorder=5)
         except Exception:
             pass
 
@@ -306,6 +315,10 @@ def create_probability_map(
     pixel_size_m: float,
     output_dir: Path,
     world_gdf: Optional[Any],
+    x_limits: Tuple[float, float],
+    y_limits: Tuple[float, float],
+    iso_codes: List[str],
+    region_label: str,
 ) -> None:
     print("\n" + "=" * 70)
     print("CREATING PROBABILITY MAP (BAU forecast)")
@@ -314,33 +327,36 @@ def create_probability_map(
     lon, lat = epsg3857_to_lonlat(df["x"].values, df["y"].values)
     proba = df[PROBA_COL].values.astype(np.float32)
 
-    # sqrt transform for perceptual uniformity (same as results_core.py for SA)
+    # sqrt transform for perceptual uniformity
     p_min = np.percentile(proba, 25)
     p_max = np.percentile(proba, 98)
     proba_clip = np.clip(proba, p_min, p_max)
     proba_stretch = np.sqrt((proba_clip - p_min) / max(p_max - p_min, 1e-9))
 
-    grid, xc, yc = _rasterize(lon, lat, proba_stretch, resolution=0.05)
+    grid, xc, yc = _rasterize(
+        lon, lat, proba_stretch, resolution=0.05, x_lim=x_limits, y_lim=y_limits
+    )
 
     fig, ax = plt.subplots(figsize=MAP_FIGSIZE)
     im = ax.imshow(
-        np.flipud(grid), extent=[SA_X_LIMITS[0], SA_X_LIMITS[1], SA_Y_LIMITS[0], SA_Y_LIMITS[1]],
+        np.flipud(grid),
+        extent=[x_limits[0], x_limits[1], y_limits[0], y_limits[1]],
         cmap="plasma", vmin=0.0, vmax=1.0, aspect="auto", interpolation="nearest",
     )
-    sa_boundary = _get_boundary(world_gdf)
-    _draw_boundary(ax, sa_boundary)
+    region_boundary = _get_boundary(world_gdf, iso_codes)
+    _draw_boundary(ax, region_boundary)
 
     cbar = plt.colorbar(im, ax=ax, fraction=0.03, pad=0.04)
     cbar.set_label("P(protection by ~2029) [sqrt-stretched]", fontsize=10)
     cbar.set_ticks([0, 0.5, 1.0])
     cbar.set_ticklabels(["low", "medium", "high"])
 
-    ax.set_xlim(SA_X_LIMITS)
-    ax.set_ylim(SA_Y_LIMITS)
+    ax.set_xlim(x_limits)
+    ax.set_ylim(y_limits)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
     ax.set_title(
-        "BAU Forecast: P(Protected-Area Designation by ~2029)\n"
+        f"BAU Forecast: P(Protected-Area Designation by ~2029) — {region_label}\n"
         "Deployment model (2001–2019), unprotected pixels as of 2024",
         fontsize=12,
     )
@@ -368,34 +384,49 @@ def _create_scenario_map(
     n_pixels: int,
     area_km2: float,
     coverage_pct: float,
+    x_limits: Tuple[float, float],
+    y_limits: Tuple[float, float],
+    iso_codes: List[str],
 ) -> None:
-    grid, xc, yc = _rasterize(lon[selected], lat[selected],
-                               np.ones(selected.sum()), resolution=0.05, agg="max")
+    grid, xc, yc = _rasterize(
+        lon[selected], lat[selected],
+        np.ones(selected.sum()), resolution=0.05, agg="max",
+        x_lim=x_limits, y_lim=y_limits,
+    )
 
     fig, ax = plt.subplots(figsize=MAP_FIGSIZE)
 
     # Background: grey for all unprotected pixels
-    bg_grid, _, _ = _rasterize(lon, lat, np.ones(len(lon)), resolution=0.05, agg="max")
+    bg_grid, _, _ = _rasterize(
+        lon, lat, np.ones(len(lon)), resolution=0.05, agg="max",
+        x_lim=x_limits, y_lim=y_limits,
+    )
     bg_masked = np.where(np.isnan(bg_grid), np.nan, 0.1)
-    ax.imshow(np.flipud(bg_masked),
-              extent=[SA_X_LIMITS[0], SA_X_LIMITS[1], SA_Y_LIMITS[0], SA_Y_LIMITS[1]],
-              cmap="Greys", vmin=0, vmax=1, aspect="auto", interpolation="nearest", alpha=0.3)
+    ax.imshow(
+        np.flipud(bg_masked),
+        extent=[x_limits[0], x_limits[1], y_limits[0], y_limits[1]],
+        cmap="Greys", vmin=0, vmax=1, aspect="auto", interpolation="nearest", alpha=0.3,
+    )
 
     # Selected pixels
     sel_masked = np.where(np.isnan(grid), np.nan, 1.0)
     cmap_sel = mcolors.ListedColormap([color])
-    ax.imshow(np.flipud(sel_masked),
-              extent=[SA_X_LIMITS[0], SA_X_LIMITS[1], SA_Y_LIMITS[0], SA_Y_LIMITS[1]],
-              cmap=cmap_sel, vmin=0, vmax=1, aspect="auto", interpolation="nearest",
-              alpha=0.85)
+    ax.imshow(
+        np.flipud(sel_masked),
+        extent=[x_limits[0], x_limits[1], y_limits[0], y_limits[1]],
+        cmap=cmap_sel, vmin=0, vmax=1, aspect="auto", interpolation="nearest", alpha=0.85,
+    )
 
-    sa_boundary = _get_boundary(world_gdf)
-    _draw_boundary(ax, sa_boundary)
+    region_boundary = _get_boundary(world_gdf, iso_codes)
+    _draw_boundary(ax, region_boundary)
 
-    patch = mpatches.Patch(color=color, label=f"Projected designations ({n_pixels:,} pixels, {area_km2:,.0f} km²)")
+    patch = mpatches.Patch(
+        color=color,
+        label=f"Projected designations ({n_pixels:,} pixels, {area_km2:,.0f} km²)",
+    )
     ax.legend(handles=[patch], loc="lower left", fontsize=9)
-    ax.set_xlim(SA_X_LIMITS)
-    ax.set_ylim(SA_Y_LIMITS)
+    ax.set_xlim(x_limits)
+    ax.set_ylim(y_limits)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
     ax.set_title(f"{title}\n{subtitle}", fontsize=12)
@@ -416,6 +447,10 @@ def create_scenario_maps(
     full_cutoff: float,
     output_dir: Path,
     world_gdf: Optional[Any],
+    x_limits: Tuple[float, float],
+    y_limits: Tuple[float, float],
+    iso_codes: List[str],
+    region_label: str,
 ) -> Dict[str, Any]:
     print("\n" + "=" * 70)
     print("CREATING SCENARIO MAPS")
@@ -424,19 +459,22 @@ def create_scenario_maps(
     lon, lat = epsg3857_to_lonlat(df["x"].values, df["y"].values)
     proba = df[PROBA_COL].values
     area  = df["area_km2"].values
-    total_sa_km2 = baseline["total_sa_km2"]
+    total_km2 = baseline.get("total_land_km2") or baseline.get("total_sa_km2", 1.0)
     protected_2024_km2 = baseline["protected_2024_km2"]
 
     scenario_info: Dict[str, Any] = {}
 
     scenarios = [
-        (proba >= bau_cutoff, "bau", "BAU Forecast — Projected Designations (~2025–2029)",
+        (proba >= bau_cutoff, "bau",
+         f"BAU Forecast — Projected Designations (~2025–2029) — {region_label}",
          "Top 0.5% unprotected pixels by predicted probability",
          SCENARIO_COLORS["bau"], "forward_risk_map_bau"),
-        (proba >= moderate_cutoff, "moderate", "30x30 Moderate Scenario (→25% SA coverage)",
+        (proba >= moderate_cutoff, "moderate",
+         f"30x30 Moderate Scenario (→25% {region_label} coverage)",
          "Spatial projection if historical designation preferences continue to 25% coverage",
          SCENARIO_COLORS["moderate"], "forward_scenario_moderate"),
-        (proba >= full_cutoff, "30x30", "30x30 Full Scenario (→30% SA coverage)",
+        (proba >= full_cutoff, "30x30",
+         f"30x30 Full Scenario (→30% {region_label} coverage)",
          "Spatial projection if historical designation preferences continue to 30% coverage",
          SCENARIO_COLORS["30x30"], "forward_scenario_30x30"),
     ]
@@ -444,7 +482,7 @@ def create_scenario_maps(
     for mask, key, title, subtitle, color, stem in scenarios:
         n = int(mask.sum())
         km2 = float(area[mask].sum())
-        coverage_new = (protected_2024_km2 + km2) / total_sa_km2
+        coverage_new = (protected_2024_km2 + km2) / max(total_km2, 1.0)
         print(f"\n  {key}: {n:,} pixels, {km2:,.0f} km², → coverage {coverage_new:.2%}")
         scenario_info[key] = {
             "n_pixels": n,
@@ -454,7 +492,7 @@ def create_scenario_maps(
         if n > 0:
             _create_scenario_map(
                 lon, lat, mask, title, subtitle, color, stem, output_dir, world_gdf,
-                n, km2, coverage_new,
+                n, km2, coverage_new, x_limits, y_limits, iso_codes,
             )
         else:
             print(f"  WARNING: no pixels selected for {key} scenario — target already met?")
@@ -471,6 +509,7 @@ def create_country_breakdown(
     full_cutoff: float,
     output_dir: Path,
     world_gdf: Optional[Any],
+    iso_codes: List[str],
 ) -> pd.DataFrame:
     print("\n" + "=" * 70)
     print("CREATING COUNTRY BREAKDOWN")
@@ -484,31 +523,33 @@ def create_country_breakdown(
         import geopandas as gpd
         from shapely.geometry import Point
 
-        sa_iso = ["ARG", "BOL", "BRA", "CHL", "COL", "ECU", "GUF", "GUY",
-                  "PRY", "PER", "SUR", "URY", "VEN"]
-        sa_world = world_gdf[world_gdf["iso_a3"].isin(sa_iso)].copy()
+        region_world = world_gdf[world_gdf["iso_a3"].isin(iso_codes)].copy()
 
         lon, lat = epsg3857_to_lonlat(df["x"].values, df["y"].values)
-        area     = df["area_km2"].values
-        proba    = df[PROBA_COL].values
+        area  = df["area_km2"].values
+        proba = df[PROBA_COL].values
 
-        # Spatial join — sample to manage memory
         print(f"  Joining {len(df):,} pixels to country boundaries…")
         pts_gdf = gpd.GeoDataFrame(
-            {"area_km2": area, "proba": proba,
-             "bau_sel": (proba >= bau_cutoff).astype(np.int8),
-             "full_sel": (proba >= full_cutoff).astype(np.int8)},
+            {
+                "area_km2": area,
+                "proba": proba,
+                "bau_sel":  (proba >= bau_cutoff).astype(np.int8),
+                "full_sel": (proba >= full_cutoff).astype(np.int8),
+            },
             geometry=gpd.points_from_xy(lon, lat),
             crs="EPSG:4326",
         )
-        joined = gpd.sjoin(pts_gdf, sa_world[["iso_a3", "name", "geometry"]], how="left",
-                           predicate="within")
+        joined = gpd.sjoin(
+            pts_gdf, region_world[["iso_a3", "name", "geometry"]],
+            how="left", predicate="within",
+        )
 
         rows = []
         for iso, grp in joined.groupby("iso_a3"):
             country_name = grp["name"].iloc[0] if len(grp) > 0 else iso
             current_unprotected_km2 = float(grp["area_km2"].sum())
-            bau_new_km2 = float(grp.loc[grp["bau_sel"] == 1, "area_km2"].sum())
+            bau_new_km2  = float(grp.loc[grp["bau_sel"] == 1, "area_km2"].sum())
             full_new_km2 = float(grp.loc[grp["full_sel"] == 1, "area_km2"].sum())
             rows.append({
                 "iso_a3": iso,
@@ -523,7 +564,7 @@ def create_country_breakdown(
         country_df.to_csv(csv_path, index=False)
         print(f"  Saved: {csv_path}")
 
-        # LaTeX table (top 10 countries)
+        # LaTeX table (top 13 countries)
         tex_path = output_dir / "forward_country_breakdown.tex"
         tex_cols = ["country", "unprotected_2024_km2", "bau_new_km2", "30x30_new_km2"]
         country_df[tex_cols].head(13).to_latex(
@@ -559,25 +600,21 @@ def create_biome_breakdown(
 
     try:
         import rasterio
-        from rasterio.transform import rowcol as rio_rowcol
 
         print(f"  GSN raster: {gsn_path}")
         with rasterio.open(gsn_path) as src:
             gsn_data = src.read(1)
-            transform = src.transform
 
-        # Map pixel (row, col) → biome label from GSN raster
         row_arr = df["row"].values.astype(int)
         col_arr = df["col"].values.astype(int)
 
-        # Clip to raster bounds
         max_row, max_col = gsn_data.shape
         valid = (row_arr >= 0) & (row_arr < max_row) & (col_arr >= 0) & (col_arr < max_col)
         biome_arr = np.full(len(df), -1, dtype=np.int32)
         biome_arr[valid] = gsn_data[row_arr[valid], col_arr[valid]]
 
         df2 = df.copy()
-        df2["biome"] = biome_arr
+        df2["biome"]    = biome_arr
         df2["bau_sel"]  = (df2[PROBA_COL] >= bau_cutoff).astype(int)
         df2["full_sel"] = (df2[PROBA_COL] >= full_cutoff).astype(int)
 
@@ -613,13 +650,13 @@ def create_gap_analysis(
     full_cutoff: float,
     output_dir: Path,
     world_gdf: Optional[Any],
+    x_limits: Tuple[float, float],
+    y_limits: Tuple[float, float],
+    iso_codes: List[str],
 ) -> Dict[str, Any]:
     """Compute and visualise Biodiversity Capture Rate (BCR).
 
     BCR = area(top-K ∩ GSN_b1==1) / area(all unprotected GSN_b1==1)
-
-    Requires 'GSN_b1' column in df (GlobalSafetyNet high-priority flag).
-    If not present, produces a placeholder figure with a note.
     """
     print("\n" + "=" * 70)
     print("GAP ANALYSIS (Biodiversity Capture Rate)")
@@ -639,15 +676,12 @@ def create_gap_analysis(
     full_mask = proba >= full_cutoff
 
     if has_gsn:
-        gsn_mask  = df["GSN_b1"].values.astype(bool)
+        gsn_mask         = df["GSN_b1"].values.astype(bool)
         total_biodiv_km2 = float(area[gsn_mask].sum())
 
         for key, sel_mask in [("bau", bau_mask), ("30x30_full", full_mask)]:
             overlap_km2 = float(area[sel_mask & gsn_mask].sum())
             bcr = overlap_km2 / max(total_biodiv_km2, 1.0)
-            random_km2 = area[sel_mask].sum()
-            # Expected overlap under random designation
-            random_bcr = (random_km2 / max(area.sum(), 1.0)) * (total_biodiv_km2 / max(total_biodiv_km2, 1.0))
             gap_metrics[key] = {
                 "overlap_km2": round(overlap_km2, 0),
                 "total_biodiv_km2": round(total_biodiv_km2, 0),
@@ -659,49 +693,59 @@ def create_gap_analysis(
     # ── 4-panel figure ────────────────────────────────────────────────────────
     fig, axes = plt.subplots(2, 2, figsize=(18, 14))
     fig.suptitle("Gap Analysis: BAU Forecast vs. Biodiversity Priority Areas", fontsize=14)
-    sa_boundary = _get_boundary(world_gdf)
+    region_boundary = _get_boundary(world_gdf, iso_codes)
+
+    gsn_mask_for_fig = df["GSN_b1"].values.astype(bool) if has_gsn else np.zeros(len(df), dtype=bool)
 
     panel_defs = [
         (bau_mask, "BAU Projected Designations\n(top 0.5% unprotected, ~2025–2029)",
          SCENARIO_COLORS["bau"]),
-        (gsn_mask if has_gsn else np.zeros(len(df), dtype=bool),
+        (gsn_mask_for_fig,
          "Biodiversity Priority (GSN_b1==1)\nHigh-priority unprotected pixels",
          "#2ca02c"),
-        (bau_mask & (gsn_mask if has_gsn else np.zeros(len(df), dtype=bool)),
+        (bau_mask & gsn_mask_for_fig,
          "Overlap: BAU ∩ Biodiversity Priority\n(correctly-targeted designations)",
          "#d62728"),
-        (~bau_mask & (gsn_mask if has_gsn else np.zeros(len(df), dtype=bool)),
+        (~bau_mask & gsn_mask_for_fig,
          "Gap: Biodiversity Priority not in BAU\n(high-value land left unprotected)",
          "#ff7f0e"),
     ]
 
     for ax, (mask, panel_title, color) in zip(axes.flat, panel_defs):
         if mask.any():
-            grid, _, _ = _rasterize(lon[mask], lat[mask], np.ones(mask.sum()),
-                                     resolution=0.05, agg="max")
-            ax.imshow(np.flipud(np.where(np.isnan(grid), np.nan, 1.0)),
-                      extent=[SA_X_LIMITS[0], SA_X_LIMITS[1], SA_Y_LIMITS[0], SA_Y_LIMITS[1]],
-                      cmap=mcolors.ListedColormap([color]), vmin=0, vmax=1,
-                      aspect="auto", interpolation="nearest", alpha=0.85)
-        _draw_boundary(ax, sa_boundary)
-        ax.set_xlim(SA_X_LIMITS)
-        ax.set_ylim(SA_Y_LIMITS)
+            grid, _, _ = _rasterize(
+                lon[mask], lat[mask], np.ones(mask.sum()),
+                resolution=0.05, agg="max", x_lim=x_limits, y_lim=y_limits,
+            )
+            ax.imshow(
+                np.flipud(np.where(np.isnan(grid), np.nan, 1.0)),
+                extent=[x_limits[0], x_limits[1], y_limits[0], y_limits[1]],
+                cmap=mcolors.ListedColormap([color]), vmin=0, vmax=1,
+                aspect="auto", interpolation="nearest", alpha=0.85,
+            )
+        _draw_boundary(ax, region_boundary)
+        ax.set_xlim(x_limits)
+        ax.set_ylim(y_limits)
         ax.set_title(panel_title, fontsize=10)
         n_px = int(mask.sum())
         km2 = float(area[mask].sum()) if mask.any() else 0.0
-        ax.text(0.02, 0.02, f"{n_px:,} px / {km2:,.0f} km²",
-                transform=ax.transAxes, fontsize=8, color="black",
-                bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7))
+        ax.text(
+            0.02, 0.02, f"{n_px:,} px / {km2:,.0f} km²",
+            transform=ax.transAxes, fontsize=8, color="black",
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7),
+        )
 
     if has_gsn and gap_metrics:
         bcr_bau  = gap_metrics.get("bau", {}).get("bcr", "N/A")
         bcr_full = gap_metrics.get("30x30_full", {}).get("bcr", "N/A")
         rand_bcr = gap_metrics.get("bau", {}).get("random_bcr", "N/A")
-        fig.text(0.5, 0.01,
-                 f"Biodiversity Capture Rate — BAU: {bcr_bau:.3f}  |  "
-                 f"30x30 Full: {bcr_full:.3f}  |  Random baseline: {rand_bcr:.3f}",
-                 ha="center", fontsize=10,
-                 bbox=dict(boxstyle="round", fc="lightyellow", alpha=0.8))
+        fig.text(
+            0.5, 0.01,
+            f"Biodiversity Capture Rate — BAU: {bcr_bau:.3f}  |  "
+            f"30x30 Full: {bcr_full:.3f}  |  Random baseline: {rand_bcr:.3f}",
+            ha="center", fontsize=10,
+            bbox=dict(boxstyle="round", fc="lightyellow", alpha=0.8),
+        )
 
     plt.tight_layout(rect=[0, 0.03, 1, 1])
     for ext in ["pdf", "png"]:
@@ -743,32 +787,41 @@ def save_scenario_summary(
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    repo_root  = get_repo_root()
-    forward_dir = repo_root / "outputs/south_america/results/forward"
-    forward_dir.mkdir(parents=True, exist_ok=True)
+    # Re-import config after runner.py reload
+    from scripts.regions.shared.forward.config import (  # noqa: F401
+        DATA_SUBDIR, ISO_CODES, MODEL_PREFIX, OUTPUTS_SUBDIR, REGION_LABEL, X_LIMITS, Y_LIMITS,
+    )
+
+    model_type = os.environ.get("PA3030_FORWARD_MODEL_TYPE", "lgbm").strip().lower()
+
+    repo_root   = get_repo_root()
+    forward_dir = repo_root / f"outputs/{OUTPUTS_SUBDIR}/results/forward"
+    model_output_dir = forward_dir / model_type
+    model_output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
-    print("FORWARD RESULTS — MAPS, SCENARIOS, BREAKDOWNS, GAP ANALYSIS")
+    print(f"FORWARD RESULTS — MAPS, SCENARIOS, BREAKDOWNS, GAP ANALYSIS ({model_type.upper()})")
     print("=" * 70)
 
     # ── Load inputs ───────────────────────────────────────────────────────────
-    scored_path = resolve_scored_parquet(forward_dir)
-    baseline    = resolve_coverage_baseline(forward_dir)
-    pixel_size_m = resolve_backbone_pixel_size(repo_root)
+    scored_path  = resolve_scored_parquet(model_output_dir)
+    baseline     = resolve_coverage_baseline(forward_dir)
+    pixel_size_m = resolve_backbone_pixel_size(repo_root, DATA_SUBDIR)
     # Fall back to value stored in baseline (from coverage_baseline run)
     if pixel_size_m == 1000.0 and "pixel_size_m" in baseline:
         pixel_size_m = float(baseline["pixel_size_m"])
         print(f"  Using pixel_size_m from coverage baseline: {pixel_size_m:.2f} m")
 
-    gsn_path   = resolve_gsn_raster(repo_root)
-    world_gdf  = resolve_country_shapefile()
+    gsn_path  = resolve_gsn_raster(repo_root, DATA_SUBDIR)
+    world_gdf = resolve_country_shapefile()
 
     df = load_scored(scored_path)
     df = add_area_col(df, pixel_size_m)
 
+    total_km2 = baseline.get("total_land_km2") or baseline.get("total_sa_km2", 1.0)
     print(f"\n  Total unprotected 2024 pixels: {len(df):,}")
     print(f"  Total unprotected 2024 area:   {df['area_km2'].sum():,.0f} km²")
-    print(f"  Baseline total SA km²:         {baseline['total_sa_km2']:,.0f}")
+    print(f"  Baseline total land km²:        {total_km2:,.0f}")
     print(f"  Baseline protected 2024 km²:   {baseline['protected_2024_km2']:,.0f}")
     print(f"  Baseline coverage 2024:        {baseline['coverage_pct_2024']:.2%}")
 
@@ -781,27 +834,35 @@ def main() -> None:
     )
 
     # ── Maps ──────────────────────────────────────────────────────────────────
-    create_probability_map(df, pixel_size_m, forward_dir, world_gdf)
+    create_probability_map(
+        df, pixel_size_m, model_output_dir, world_gdf,
+        X_LIMITS, Y_LIMITS, ISO_CODES, REGION_LABEL,
+    )
 
     scenario_info = create_scenario_maps(
-        df, baseline, bau_cutoff, moderate_cutoff, full_cutoff, forward_dir, world_gdf
+        df, baseline, bau_cutoff, moderate_cutoff, full_cutoff,
+        model_output_dir, world_gdf, X_LIMITS, Y_LIMITS, ISO_CODES, REGION_LABEL,
     )
 
     # ── Breakdowns ────────────────────────────────────────────────────────────
     country_df = create_country_breakdown(
-        df, baseline, bau_cutoff, full_cutoff, forward_dir, world_gdf
+        df, baseline, bau_cutoff, full_cutoff,
+        model_output_dir, world_gdf, ISO_CODES,
     )
     biome_df = create_biome_breakdown(
-        df, bau_cutoff, full_cutoff, gsn_path, forward_dir
+        df, bau_cutoff, full_cutoff, gsn_path, model_output_dir
     )
 
     # ── Gap analysis ──────────────────────────────────────────────────────────
     gap_metrics = create_gap_analysis(
-        df, bau_cutoff, full_cutoff, forward_dir, world_gdf
+        df, bau_cutoff, full_cutoff,
+        model_output_dir, world_gdf, X_LIMITS, Y_LIMITS, ISO_CODES,
     )
 
     # ── Summary JSON ──────────────────────────────────────────────────────────
-    save_scenario_summary(baseline, scenario_info, gap_metrics, country_df, biome_df, forward_dir)
+    save_scenario_summary(
+        baseline, scenario_info, gap_metrics, country_df, biome_df, model_output_dir
+    )
 
     print("\n" + "=" * 70)
     print("FORWARD RESULTS COMPLETE")
@@ -817,9 +878,9 @@ def main() -> None:
         "forward_scenario_summary.json",
     ]
     for fn in outputs:
-        p = forward_dir / fn
-        status = "✓" if p.exists() else "✗ (not produced)"
-        print(f"  {status}  {fn}")
+        p = model_output_dir / fn
+        status = "OK" if p.exists() else "MISSING"
+        print(f"  [{status}]  {fn}")
 
 
 if __name__ == "__main__":
