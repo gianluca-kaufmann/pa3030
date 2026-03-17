@@ -34,6 +34,7 @@ from .boundaries import (
 from .config import (
     CALIBRATE_SCRIPT,
     DEFAULT_FUTURE_YEARS_STR,
+    HOTSPOT_REGIONS,
     MODEL_ID,
     MODEL_LABEL,
     PROBABILITY_MAP_PERCENTILE_MIN,
@@ -296,6 +297,354 @@ def create_metrics_table(metrics_data: Dict[str, Any], output_dir: Path, model_t
         f.write('\n'.join(latex_lines) + '\n')
     
     print(f"Saved LaTeX: {latex_path}")
+
+
+# ── False positive spatial map ────────────────────────────────────────────────
+
+_NTL_CANDIDATES_R = [
+    "ntl", "NTL", "ntl_mean", "VIIRS_ntl", "nighttime_lights",
+    "lights_mean", "BU_ntl", "viirs_ntl",
+]
+_POP_CANDIDATES_R = [
+    "pop_density", "population_density", "pop", "GPW_pop", "population",
+    "pop_dens", "GPW",
+]
+
+
+def _detect_col_r(candidates: list, available: set) -> Optional[str]:
+    for c in candidates:
+        if c in available:
+            return c
+    avail_lower = {a.lower(): a for a in available}
+    for c in candidates:
+        if c.lower() in avail_lower:
+            return avail_lower[c.lower()]
+    return None
+
+
+def create_false_positive_map(
+    df: pd.DataFrame,
+    output_dir: Path,
+    model_type: str,
+    region_gdf=None,
+) -> None:
+    """2-panel map: true positives (green) vs false positives (red) in top-5% risk zone.
+
+    Uses the test-set ground truth labels directly — no backtesting required.
+    Outputs: false_positive_map.pdf/.png
+    """
+    print("\n" + "=" * 70)
+    print("FALSE POSITIVE SPATIAL MAP")
+    print("=" * 70)
+
+    if "y_true" not in df.columns or "y_pred_proba" not in df.columns:
+        print("  Skipping — y_true or y_pred_proba not in scored parquet.")
+        return
+    if "x" not in df.columns or "y" not in df.columns:
+        print("  Skipping — x/y coordinates not available.")
+        return
+
+    from scripts.regions.shared.results.config import REGION_LABEL, X_LIMITS, Y_LIMITS
+
+    y_proba = df["y_pred_proba"].values
+    y_true  = df["y_true"].values
+    threshold = float(np.percentile(y_proba, 95))
+    top_mask  = y_proba >= threshold
+    tp_mask   = top_mask & (y_true == 1)
+    fp_mask   = top_mask & (y_true == 0)
+
+    n_tp      = int(tp_mask.sum())
+    n_fp      = int(fp_mask.sum())
+    precision = n_tp / max(n_tp + n_fp, 1)
+    print(f"  Top-5% zone: {n_tp:,} TP (green), {n_fp:,} FP (red)  precision={precision:.3f}")
+
+    if n_tp + n_fp == 0:
+        print("  Nothing to plot — skipping.")
+        return
+
+    x_all = df["x"].values
+    y_all = df["y"].values
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    fig.suptitle(
+        f"False Positive Analysis — Test Set ({REGION_LABEL}, {model_type.upper()})\n"
+        f"Top-5% risk zone: {n_tp:,} true positives / {n_fp:,} false positives  "
+        f"precision={precision:.3f}",
+        fontsize=11,
+    )
+
+    for ax, mask, title, color in [
+        (axes[0], tp_mask,
+         "True Positives\n(high-risk → actually became protected)", "#2ca02c"),
+        (axes[1], fp_mask,
+         "False Positives\n(high-risk → NOT protected in test window)", "#d62728"),
+    ]:
+        if mask.any():
+            grid, extent = points_to_raster(
+                x_all[mask], y_all[mask], np.ones(mask.sum()),
+                target_resolution=0.1, agg_func="max",
+            )
+            ax.imshow(
+                np.flipud(grid), origin="upper", extent=extent,
+                cmap=matplotlib.colors.LinearSegmentedColormap.from_list("c", ["white", color]),
+                aspect="auto", interpolation="nearest",
+            )
+        if region_gdf is not None:
+            try:
+                region_gdf.boundary.plot(ax=ax, color="black", linewidth=0.4, zorder=5)
+            except Exception:
+                pass
+        ax.set_xlim(X_LIMITS)
+        ax.set_ylim(Y_LIMITS)
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("Longitude")
+        ax.set_ylabel("Latitude")
+        ax.text(0.02, 0.02, f"{int(mask.sum()):,} pixels",
+                transform=ax.transAxes, fontsize=8,
+                bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7))
+
+    plt.tight_layout()
+    for ext in ["pdf", "png"]:
+        p = output_dir / f"false_positive_map.{ext}"
+        plt.savefig(p, dpi=150, bbox_inches="tight")
+        print(f"  Saved: {p}")
+    plt.close(fig)
+
+
+# ── Economic exposure ──────────────────────────────────────────────────────────
+
+def create_economic_exposure(
+    df: pd.DataFrame,
+    test_parquet_path: Optional[Path],
+    output_dir: Path,
+    model_type: str,
+) -> pd.DataFrame:
+    """Quantify economic proxy values (NTL, population) across risk zones.
+
+    Joins the test split parquet (which has all feature columns) to the scored
+    parquet on (row, col) to retrieve nighttime lights and population density.
+    Computes summary statistics for four zones:
+      - All test pixels (baseline)
+      - Top 10% by predicted probability  (matches existing risk_map_10)
+      - Top 5%  by predicted probability  (matches existing risk_map_5)
+      - Top 1%  by predicted probability  (matches existing risk_map_1)
+
+    Outputs:
+      economic_exposure.csv
+      economic_exposure_map.pdf/.png  (if NTL column found)
+    """
+    print("\n" + "=" * 70)
+    print("ECONOMIC EXPOSURE ANALYSIS")
+    print("=" * 70)
+
+    if test_parquet_path is None or not test_parquet_path.exists():
+        print(f"  Skipping — test parquet not found: {test_parquet_path}")
+        return pd.DataFrame()
+    if "row" not in df.columns or "col" not in df.columns:
+        print("  Skipping — row/col not in scored parquet (needed for join).")
+        return pd.DataFrame()
+
+    import pyarrow.parquet as _pq
+
+    schema_names = set(_pq.ParquetFile(test_parquet_path).schema_arrow.names)
+    ntl_col = _detect_col_r(_NTL_CANDIDATES_R, schema_names)
+    pop_col = _detect_col_r(_POP_CANDIDATES_R, schema_names)
+    print(f"  NTL column:        {ntl_col or 'not found'}")
+    print(f"  Population column: {pop_col or 'not found'}")
+
+    proxy_cols = [c for c in [ntl_col, pop_col] if c is not None]
+    if not proxy_cols:
+        print("  No economic proxy columns found — skipping.")
+        return pd.DataFrame()
+
+    feat_df = _pq.read_table(
+        test_parquet_path, columns=["row", "col"] + proxy_cols
+    ).to_pandas()
+
+    merged = df[["row", "col", "y_pred_proba", "x", "y"]].merge(
+        feat_df, on=["row", "col"], how="left"
+    )
+    del feat_df
+
+    top10_mask = merged["y_pred_proba"] >= float(np.percentile(merged["y_pred_proba"], 90))
+    top5_mask  = merged["y_pred_proba"] >= float(np.percentile(merged["y_pred_proba"], 95))
+    top1_mask  = merged["y_pred_proba"] >= float(np.percentile(merged["y_pred_proba"], 99))
+
+    zones = [
+        ("All test pixels (baseline)", np.ones(len(merged), dtype=bool)),
+        ("Top 10% risk",               top10_mask),
+        ("Top 5% risk",                top5_mask),
+        ("Top 1% risk",                top1_mask),
+    ]
+
+    rows = []
+    for zone_name, mask in zones:
+        sub = merged[mask]
+        row: Dict = {
+            "zone":     zone_name,
+            "n_pixels": int(mask.sum()),
+        }
+        for col in proxy_cols:
+            vals = sub[col].dropna()
+            row[f"{col}_mean"]   = round(float(vals.mean()),   3) if len(vals) else None
+            row[f"{col}_median"] = round(float(vals.median()), 3) if len(vals) else None
+            row[f"{col}_p75"]    = round(float(np.percentile(vals, 75)), 3) if len(vals) else None
+        rows.append(row)
+
+    exposure_df = pd.DataFrame(rows)
+    csv_path = output_dir / f"economic_exposure_{model_type}.csv"
+    exposure_df.to_csv(csv_path, index=False)
+    print(f"  Saved: {csv_path}")
+    print(exposure_df.to_string(index=False))
+
+    # Map: top-1% risk zone coloured by NTL intensity
+    if ntl_col is not None and "x" in merged.columns:
+        from scripts.regions.shared.results.config import X_LIMITS, Y_LIMITS, REGION_LABEL
+        sub1 = merged[top1_mask].dropna(subset=[ntl_col])
+        if len(sub1) > 0:
+            grid, extent = points_to_raster(
+                sub1["x"].values, sub1["y"].values, sub1[ntl_col].values,
+                target_resolution=0.1, agg_func="mean",
+            )
+            fig, ax = plt.subplots(figsize=(12, 9))
+            im = ax.imshow(
+                np.flipud(grid), origin="upper", extent=extent,
+                cmap="plasma", aspect="auto", interpolation="nearest",
+            )
+            ax.set_xlim(X_LIMITS)
+            ax.set_ylim(Y_LIMITS)
+            ax.set_title(
+                f"Economic Exposure in Top-1% Risk Zone\n"
+                f"Top-1% predicted pixels coloured by {ntl_col} ({REGION_LABEL}, {model_type.upper()})",
+                fontsize=11,
+            )
+            ax.set_xlabel("Longitude")
+            ax.set_ylabel("Latitude")
+            cbar = plt.colorbar(im, ax=ax, fraction=0.03, pad=0.04)
+            cbar.set_label(f"{ntl_col} (mean per 0.1° cell)", fontsize=9)
+            plt.tight_layout()
+            for ext in ["pdf", "png"]:
+                p = output_dir / f"economic_exposure_map_{model_type}.{ext}"
+                plt.savefig(p, dpi=300, bbox_inches="tight")
+                print(f"  Saved: {p}")
+            plt.close(fig)
+
+    return exposure_df
+
+
+# ── Hotspot zoom-in maps ───────────────────────────────────────────────────────
+
+def create_hotspot_maps(
+    df: pd.DataFrame,
+    output_dir: Path,
+    model_type: str,
+    region_gdf=None,
+) -> None:
+    """2-row × N-column figure with zoomed probability and risk maps per hotspot.
+
+    Uses HOTSPOT_REGIONS from config (list of (label, lon_min, lon_max, lat_min, lat_max)).
+    Top row: continuous P(protection) probability map at 0.02° resolution.
+    Bottom row: top-1% risk zone (binary) in the same hotspot box.
+
+    Output: hotspot_maps_{model_type}.pdf/.png
+    """
+    print("\n" + "=" * 70)
+    print("HOTSPOT ZOOM-IN MAPS")
+    print("=" * 70)
+
+    from scripts.regions.shared.results.config import HOTSPOT_REGIONS, REGION_LABEL
+
+    if not HOTSPOT_REGIONS:
+        print("  No hotspot regions defined in config — skipping.")
+        return
+    if "x" not in df.columns or "y" not in df.columns:
+        print("  Skipping — x/y not available.")
+        return
+
+    x_all   = df["x"].values
+    y_all   = df["y"].values
+    p_all   = df["y_pred_proba"].values
+    top1_thr = float(np.percentile(p_all, 99))
+    top1_mask = p_all >= top1_thr
+
+    n = len(HOTSPOT_REGIONS)
+    fig, axes = plt.subplots(2, n, figsize=(6 * n, 12))
+    if n == 1:
+        axes = axes.reshape(2, 1)
+
+    fig.suptitle(
+        f"Hotspot Zoom-ins — {REGION_LABEL} ({model_type.upper()})\n"
+        "Top row: P(protection) probability | Bottom row: top-1% risk zone",
+        fontsize=12,
+    )
+
+    for col_idx, (label, x0, x1, y0, y1) in enumerate(HOTSPOT_REGIONS):
+        in_box = (x_all >= x0) & (x_all <= x1) & (y_all >= y0) & (y_all <= y1)
+        if not in_box.any():
+            print(f"  WARNING: no pixels in hotspot '{label}' — check coordinates.")
+            for ri in range(2):
+                axes[ri, col_idx].set_visible(False)
+            continue
+
+        print(f"  {label}: {in_box.sum():,} pixels")
+        x_h  = x_all[in_box]
+        y_h  = y_all[in_box]
+        p_h  = p_all[in_box]
+
+        # Row 0: continuous probability (sqrt-stretched)
+        ax0 = axes[0, col_idx]
+        grid_p, extent_p = points_to_raster(
+            x_h, y_h, np.sqrt(np.clip(p_h, 0, 1)),
+            target_resolution=0.02, agg_func="max",
+        )
+        im = ax0.imshow(
+            np.flipud(grid_p), origin="upper", extent=extent_p,
+            cmap="plasma", vmin=0, vmax=1, aspect="auto", interpolation="nearest",
+        )
+        if region_gdf is not None:
+            try:
+                region_gdf.boundary.plot(ax=ax0, color="black", linewidth=0.4, zorder=5)
+            except Exception:
+                pass
+        ax0.set_xlim(x0, x1)
+        ax0.set_ylim(y0, y1)
+        ax0.set_title(label, fontsize=10)
+        if col_idx == 0:
+            ax0.set_ylabel("P(protection) [√-stretch]", fontsize=8)
+        plt.colorbar(im, ax=ax0, fraction=0.04, pad=0.03)
+
+        # Row 1: top-1% risk zone (binary)
+        ax1 = axes[1, col_idx]
+        top1_in = top1_mask & in_box
+        if top1_in.any():
+            grid_b, extent_b = points_to_raster(
+                x_all[top1_in], y_all[top1_in], np.ones(top1_in.sum()),
+                target_resolution=0.02, agg_func="max",
+            )
+            ax1.imshow(
+                np.flipud(grid_b), origin="upper", extent=extent_b,
+                cmap=matplotlib.colors.ListedColormap(["#1a78c2"]),
+                vmin=0, vmax=1, aspect="auto", interpolation="nearest", alpha=0.85,
+            )
+        if region_gdf is not None:
+            try:
+                region_gdf.boundary.plot(ax=ax1, color="black", linewidth=0.4, zorder=5)
+            except Exception:
+                pass
+        ax1.set_xlim(x0, x1)
+        ax1.set_ylim(y0, y1)
+        ax1.text(0.02, 0.02, f"{int(top1_in.sum()):,} top-1% pixels",
+                 transform=ax1.transAxes, fontsize=8,
+                 bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7))
+        if col_idx == 0:
+            ax1.set_ylabel("Top-1% risk zone", fontsize=8)
+
+    plt.tight_layout()
+    for ext in ["pdf", "png"]:
+        p = output_dir / f"hotspot_maps_{model_type}.{ext}"
+        plt.savefig(p, dpi=300, bbox_inches="tight")
+        print(f"  Saved: {p}")
+    plt.close(fig)
 
 
 def create_comparison_table(
@@ -3228,6 +3577,11 @@ def main() -> None:
                 print("  GSN shapefile not found. Pass --gsn_shp to enable biome names.")
 
     create_biome_breakdown(df, output_dir, args.model_type, gsn_tif_path=gsn_tif_path, gsn_shp_path=gsn_shp_path)
+
+    # ── New spatial analyses ───────────────────────────────────────────────────
+    create_false_positive_map(df, output_dir, args.model_type, region_gdf=sa_gdf)
+    create_economic_exposure(df, test_parquet_path, output_dir, args.model_type)
+    create_hotspot_maps(df, output_dir, args.model_type, region_gdf=sa_gdf)
 
     # Cross-region comparison table (reads the other region's metrics_table.csv if available)
     create_comparison_table(output_dir, args.model_type, repo_root, scratch_root)

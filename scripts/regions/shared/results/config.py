@@ -21,6 +21,12 @@ PROFILE = {
         "probability_map_percentile_min": 25,
         "probability_map_percentile_max": 98,
         "probability_map_transformation": "sqrt",
+        # (label, lon_min, lon_max, lat_min, lat_max)
+        "hotspot_regions": [
+            ("Amazon Basin",              -72, -48, -12,  4),
+            ("Cerrado / Atlantic Forest", -55, -36, -28, -8),
+            ("Andes Foothills",           -81, -64, -22,  3),
+        ],
     },
     "usa": {
         "region_slug": "usa",
@@ -36,15 +42,23 @@ PROFILE = {
         "probability_map_percentile_min": 0,
         "probability_map_percentile_max": 99.9,
         "probability_map_transformation": "log",
+        # (label, lon_min, lon_max, lat_min, lat_max)
+        "hotspot_regions": [
+            ("Pacific Northwest", -125, -110, 43, 50),
+            ("Rocky Mountains",   -115, -100, 36, 48),
+            ("Southeast",          -92,  -78, 25, 35),
+        ],
     },
 }[RUN_REGION]
 
-REGION_SLUG = PROFILE["region_slug"]
-REGION_LABEL = PROFILE["region_label"]
-MODEL_ID = PROFILE["model_id"]
-MODEL_LABEL = PROFILE["model_label"]
-X_LIMITS = PROFILE["x_limits"]
-Y_LIMITS = PROFILE["y_limits"]
+REGION_SLUG     = PROFILE["region_slug"]
+REGION_LABEL    = PROFILE["region_label"]
+MODEL_ID        = PROFILE["model_id"]
+MODEL_LABEL     = PROFILE["model_label"]
+X_LIMITS        = PROFILE["x_limits"]
+Y_LIMITS        = PROFILE["y_limits"]
+ISO_CODES       = PROFILE.get("iso_codes", [])
+HOTSPOT_REGIONS = PROFILE["hotspot_regions"]
 PROBABILITY_MAP_PERCENTILE_MIN = PROFILE["probability_map_percentile_min"]
 PROBABILITY_MAP_PERCENTILE_MAX = PROFILE["probability_map_percentile_max"]
 PROBABILITY_MAP_TRANSFORMATION = PROFILE["probability_map_transformation"]
