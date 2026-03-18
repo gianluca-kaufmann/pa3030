@@ -20,7 +20,7 @@ from typing import Any, Dict
 
 import numpy as np
 import pyarrow as pa
-from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
 
 
 class Tee:
@@ -127,6 +127,38 @@ def compute_precision_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) ->
     return y_true[top_k_idx].sum() / n_top_k
 
 
+def compute_recall_at_k(y_true: np.ndarray, y_proba: np.ndarray, k: float) -> float:
+    """Compute recall at top k% of predictions.
+
+    "Of all actual PA designation events in the test set, what fraction fall
+    within the top k% of model-predicted risk pixels?"
+
+    This metric operates over the full test period (all years pooled), so the
+    denominator is every PA transition event across the entire test window.
+    It is policy-relevant: k% defines the share of pixels a planner would
+    need to screen to capture this fraction of real future designations.
+
+    A random model achieves recall_at_k ≈ k/100 (e.g. 0.05 at k=5).
+    Values substantially above k/100 indicate that the model prioritises
+    genuine future PA sites over unprotected background pixels.
+
+    Args:
+        y_true:  Binary ground-truth labels (0/1).
+        y_proba: Predicted probabilities (higher = more likely to transition).
+        k:       Percentage of top predictions to consider (e.g. k=5 → top 5%).
+
+    Returns:
+        Fraction of positives captured in top k% predictions.
+        Returns 0.0 if no positive labels exist.
+    """
+    n_pos_total = int(y_true.sum())
+    if n_pos_total == 0:
+        return 0.0
+    n_top_k = max(1, int(len(y_true) * k / 100))
+    top_k_idx = np.argpartition(y_proba, -n_top_k)[-n_top_k:]
+    return float(y_true[top_k_idx].sum() / n_pos_total)
+
+
 def extract_features_pyarrow_to_numpy(feature_table: pa.Table, mask: np.ndarray) -> np.ndarray:
     """Extract feature columns from PyArrow table and convert to NumPy float32 array.
 
@@ -192,17 +224,34 @@ def compute_metrics(y_true: np.ndarray, y_proba: np.ndarray) -> Dict[str, float]
     roc_auc = roc_auc_score(y_true, y_proba)
     pr_auc = average_precision_score(y_true, y_proba)
     baseline_rate = y_true.mean()
-    prec_at_k = {k: compute_precision_at_k(y_true, y_proba, k) for k in [1, 5, 10]}
+    prec_at_k   = {k: compute_precision_at_k(y_true, y_proba, k) for k in [1, 5, 10]}
+    recall_at_k = {k: compute_recall_at_k(y_true, y_proba, k)    for k in [1, 5, 10]}
+    # Brier score: clip predictions to [0, 1] first so out-of-distribution transfer
+    # scores (e.g. cross-continental) don't produce NaN or values > 1.
+    y_proba_clipped = np.clip(y_proba, 0.0, 1.0)
+    try:
+        brier = float(brier_score_loss(y_true, y_proba_clipped))
+    except Exception:
+        brier = float("nan")
     return {
         "roc_auc": float(roc_auc),
         "pr_auc": float(pr_auc),
-        "precision_at_1pct": float(prec_at_k[1]),
-        "precision_at_5pct": float(prec_at_k[5]),
+        "precision_at_1pct":  float(prec_at_k[1]),
+        "precision_at_5pct":  float(prec_at_k[5]),
         "precision_at_10pct": float(prec_at_k[10]),
+        # Recall at top-k%: fraction of all actual PA events captured when
+        # screening the top k% of predictions.  Complementary to precision:
+        # precision measures purity of the shortlist, recall measures coverage
+        # of real events.  Both are needed to characterise the precision-recall
+        # tradeoff at a policy-actionable operating point.
+        "recall_at_1pct":  float(recall_at_k[1]),
+        "recall_at_5pct":  float(recall_at_k[5]),
+        "recall_at_10pct": float(recall_at_k[10]),
         "baseline_rate": float(baseline_rate),
-        "lift_at_1pct": float(prec_at_k[1] / baseline_rate) if baseline_rate > 0 else 0,
-        "lift_at_5pct": float(prec_at_k[5] / baseline_rate) if baseline_rate > 0 else 0,
+        "lift_at_1pct":  float(prec_at_k[1]  / baseline_rate) if baseline_rate > 0 else 0,
+        "lift_at_5pct":  float(prec_at_k[5]  / baseline_rate) if baseline_rate > 0 else 0,
         "lift_at_10pct": float(prec_at_k[10] / baseline_rate) if baseline_rate > 0 else 0,
+        "brier_score": brier,
     }
 
 

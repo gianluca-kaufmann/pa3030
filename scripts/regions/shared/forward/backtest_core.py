@@ -63,6 +63,7 @@ from scripts.regions.shared.forward.config import (  # noqa: E402
 )
 from scripts.regions.shared.training.utils import (  # noqa: E402
     compute_precision_at_k,
+    compute_recall_at_k,
     compute_year_weights,
     extract_features_pyarrow_to_numpy,
     get_repo_root as _get_repo_root,
@@ -577,12 +578,15 @@ def compute_backtest_metrics(y_true: np.ndarray, y_proba: np.ndarray, label: str
         "pr_auc":  float(average_precision_score(y_true, y_proba)) if n_pos > 0 else None,
     }
     for k in [1, 5, 10]:
-        prec = compute_precision_at_k(y_true, y_proba, k)
-        lift = prec / max(base_rate, 1e-9)
+        prec   = compute_precision_at_k(y_true, y_proba, k)
+        recall = compute_recall_at_k(y_true, y_proba, k)
+        lift   = prec / max(base_rate, 1e-9)
         metrics[f"precision_at_{k}pct"] = float(prec)
-        metrics[f"lift_at_{k}pct"] = float(lift)
+        metrics[f"recall_at_{k}pct"]    = float(recall)
+        metrics[f"lift_at_{k}pct"]      = float(lift)
 
     # Forecast Capture Rate: fraction of all positives in top 5% predicted
+    # (kept for backward compatibility — identical to recall_at_5pct)
     n_top5 = max(1, int(n * 0.05))
     top5_idx = np.argsort(y_proba)[-n_top5:]
     fcr = float(y_true[top5_idx].sum()) / max(n_pos, 1)
@@ -593,7 +597,9 @@ def compute_backtest_metrics(y_true: np.ndarray, y_proba: np.ndarray, label: str
     if metrics["roc_auc"] is not None:
         print(f"    ROC-AUC: {metrics['roc_auc']:.4f}  PR-AUC: {metrics['pr_auc']:.4f}")
     for k in [1, 5, 10]:
-        print(f"    P@{k}%: {metrics[f'precision_at_{k}pct']:.4f}  Lift: {metrics[f'lift_at_{k}pct']:.2f}x")
+        print(f"    P@{k}%: {metrics[f'precision_at_{k}pct']:.4f}  "
+              f"R@{k}%: {metrics[f'recall_at_{k}pct']:.4f}  "
+              f"Lift: {metrics[f'lift_at_{k}pct']:.2f}x")
     print(f"    Forecast Capture Rate (top 5%): {fcr:.4f}")
 
     return metrics

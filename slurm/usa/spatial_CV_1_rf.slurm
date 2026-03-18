@@ -72,10 +72,10 @@ GSN_RASTER="data/usa/ready/GSN/gsn_terrestrial_ecoregions_mask_1km.tif"
 # Run the RF LOBO fold
 #------------------------------------------------------------------------------
 echo "Starting LOBO RF fold ${FOLD_IDX} (USA)..."
-export MAX_NEG_TRAIN=50000000      # Cap negative samples at 50M — matches production training_rf.slurm
-export BATCH_SIZE=100000           # Reduced batch size for OOM safety — matches production training_rf.slurm
-export LOBO_N_ESTIMATORS=100       # Reduced trees for LOBO tractability — production uses 300
-srun --cpu-bind=cores --distribution=block:block \
-  python -u "$SCRIPT" --biome-idx "${FOLD_IDX}" --model-type rf
+export MAX_NEG_TRAIN=30000000      # Cap negatives at 30M (below production 50M) — LOBO holds a biome
+                                   # raster + loads train+earlystop combined, so needs extra headroom
+                                   # within the 32×4G=128GB hard cluster limit
+export BATCH_SIZE=100000           # Matches production training_rf.slurm default
+python -u "$SCRIPT" --biome-idx "${FOLD_IDX}" --model-type rf
 
 echo "spatial_CV_1 (rf) fold ${FOLD_IDX} (USA) finished."

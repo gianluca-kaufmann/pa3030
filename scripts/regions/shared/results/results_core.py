@@ -182,12 +182,18 @@ def create_metrics_table(metrics_data: Dict[str, Any], output_dir: Path, model_t
     metrics_list = [
         ("ROC AUC", test_perf.get("roc_auc", np.nan)),
         ("PR AUC", test_perf.get("pr_auc", np.nan)),
-        ("Precision @ 1%", test_perf.get("precision_at_1pct", np.nan)),
-        ("Precision @ 5%", test_perf.get("precision_at_5pct", np.nan)),
+        ("Precision @ 1%",  test_perf.get("precision_at_1pct",  np.nan)),
+        ("Precision @ 5%",  test_perf.get("precision_at_5pct",  np.nan)),
         ("Precision @ 10%", test_perf.get("precision_at_10pct", np.nan)),
+        # Recall at top-k%: fraction of all PA designation events in the test
+        # set captured when screening the top k% of predicted-risk pixels.
+        # A random model achieves recall ≈ k/100 (e.g. 0.05 at k=5).
+        ("Recall @ 1%",  test_perf.get("recall_at_1pct",  np.nan)),
+        ("Recall @ 5%",  test_perf.get("recall_at_5pct",  np.nan)),
+        ("Recall @ 10%", test_perf.get("recall_at_10pct", np.nan)),
         ("Baseline Rate", test_perf.get("baseline_rate", np.nan)),
-        ("Lift @ 1%", test_perf.get("lift_at_1pct", np.nan)),
-        ("Lift @ 5%", test_perf.get("lift_at_5pct", np.nan)),
+        ("Lift @ 1%",  test_perf.get("lift_at_1pct",  np.nan)),
+        ("Lift @ 5%",  test_perf.get("lift_at_5pct",  np.nan)),
         ("Lift @ 10%", test_perf.get("lift_at_10pct", np.nan)),
     ]
     

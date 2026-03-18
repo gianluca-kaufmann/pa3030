@@ -1,0 +1,99 @@
+LOBO RF fold index: 7
+drwxr-xr-x 10 gikaufmann gikaufmann-group 4096 Mar 17 11:17 /cluster/home/gikaufmann/master_thesis
+PWD = /cluster/home/gikaufmann/master_thesis
+Starting LOBO RF fold 7 (USA)...
+Loading biome raster and mapping...
+  Loading biome raster: /cluster/home/gikaufmann/master_thesis/data/usa/ready/GSN/gsn_terrestrial_ecoregions_mask_1km.tif
+  Raster shape: (3536, 6437), dtype: uint8
+  85 ecoregions → 12 biomes
+======================================================================
+LOBO SPATIAL CV — USA  Fold 7/11
+======================================================================
+Model type:       RF
+Held-out biome:   Temperate Grasslands, Savannas & Shrublands
+Biome int codes:  [12, 16, 19, 20, 22, 26, 32, 34, 42, 46, 47, 54, 55, 59, 72, 73, 77, 83, 84]
+N biomes total:   12
+Train years:      2001-2016
+Test years:       2017-2019
+Output dir:       /cluster/scratch/gikaufmann/outputs/usa/results/spatial_cv/rf
+
+Train:     /cluster/scratch/gikaufmann/data/usa/ml/main/train_win5.parquet
+Earlystop: /cluster/scratch/gikaufmann/data/usa/ml/main/earlystop_win5.parquet
+Test:      /cluster/scratch/gikaufmann/data/usa/ml/main/test_win5.parquet
+
+Loaded RF params: /cluster/home/gikaufmann/master_thesis/scripts/regions/usa/5_training/rf_best_params.json
+n_estimators: 300
+  LOBO override: n_estimators 300 → 100 (LOBO_N_ESTIMATORS env var; production value preserved elsewhere)
+
+Features: 73
+  [Memory startup] RSS: 2.50 GB
+W&B connected
+
+======================================================================
+STEP 1: LOAD TRAINING DATA (held-out biome excluded)
+======================================================================
+
+Loading train+earlystop [EXCLUDE biome, years 2001-2016, max_neg=50,000,000]...
+  Pass 1: counting rows...
+  Found 50,284,254 samples
+  (284,254 pos, 133,920,906 neg → capping neg at 50,000,000)
+  Pass 2: pre-allocating 50,284,254 × 73 float32...
+  0% — 26,218/50,284,254 rows
+  [Memory   0%] RSS: 2.97 GB
+  25% — 12,599,295/50,284,254 rows
+  [Memory   25%] RSS: 6.39 GB
+  50% — 25,169,480/50,284,254 rows
+  [Memory   50%] RSS: 9.81 GB
+  75% — 37,718,203/50,284,254 rows
+  [Memory   75%] RSS: 13.22 GB
+  100% — 50,284,254/50,284,254 rows
+  [Memory   100%] RSS: 16.62 GB
+  Loaded in 268.6s — 50,000,000 neg, 284,254 pos (ratio 1:175.9)
+  Training set: 50,284,254 rows
+  [Memory after loading training data] RSS: 16.62 GB
+
+======================================================================
+STEP 2: TRAIN RF (fixed rounds/trees)
+======================================================================
+
+  Training RandomForestClassifier: 100 trees, n_jobs=32
+  class_weight=balanced_subsample, max_depth=None, max_features=sqrt
+  Training set: 50,284,254 samples (284,254 pos, 50,000,000 neg)
+  NaNs in training data: True
+  [Memory before RF fit] RSS: 16.62 GB
+  RF training done in 3970.2s
+  [Memory after RF fit] RSS: 17.35 GB
+  [Memory after training] RSS: 3.68 GB
+  Model saved: /cluster/home/gikaufmann/master_thesis/data/usa/ml/models/lobo_rf_07_Temperate_Grasslands_Savannas_and_Shrub_20260317_183957.pkl
+
+======================================================================
+STEP 3: EVALUATE ON HELD-OUT BIOME
+======================================================================
+
+Evaluating on held-out biome (test years 2017-2019)...
+  Pass 1: counting test rows...
+  Found 15,657,831 test samples
+  Pass 2: predicting and writing scored output...
+
+  Test held-out biome: 15,657,468 neg, 363 pos
+  ROC-AUC: 0.5960  PR-AUC: 0.0141
+  P@1%: 0.0003  Lift@1%: 11.8x
+  Scored output: spatial_cv1_scored_Temperate_Grasslands_Savannas_and_Shrub_20260317_183957.parquet
+
+======================================================================
+SUMMARY
+======================================================================
+Biome:     Temperate Grasslands, Savannas & Shrublands
+Test rows: 15,657,831  (363 pos)
+ROC-AUC:   0.5960
+PR-AUC:    0.0141
+P@1%:      0.0003  (Lift 11.8x)
+P@5%:      0.0001
+Time:      4318.0s (72.0 min)
+======================================================================
+
+Fold results saved: /cluster/scratch/gikaufmann/outputs/usa/results/spatial_cv/rf/fold_07_Temperate_Grasslands_Savannas_and_Shrub_20260317_183957.json
+Done.
+
+Log saved to: /cluster/scratch/gikaufmann/outputs/usa/results/spatial_cv/rf/fold_07_Temperate_Grasslands_Savannas_and_Shrub_20260317_183957.txt
+spatial_CV_1 (rf) fold 7 (USA) finished.

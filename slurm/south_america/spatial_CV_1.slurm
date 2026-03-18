@@ -81,8 +81,6 @@ SCRIPT="scripts/regions/south_america/6_evaluation/spatial_CV_1"
 # Run the LOBO fold
 #------------------------------------------------------------------------------
 echo "Starting LOBO fold ${FOLD_IDX} (South America)..."
-export LOBO_NUM_BOOST_ROUND=1000   # Reduced rounds for LOBO tractability — production uses ~2555
-srun --cpu-bind=cores --distribution=block:block \
-  python -u "$SCRIPT" --biome-idx "${FOLD_IDX}" --model-type lgbm
+python -u "$SCRIPT" --biome-idx "${FOLD_IDX}" --model-type lgbm
 
 echo "spatial_CV_1 (lgbm) fold ${FOLD_IDX} (South America) finished."

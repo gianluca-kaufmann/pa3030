@@ -94,8 +94,6 @@ GSN_RASTER="data/usa/ready/GSN/gsn_terrestrial_ecoregions_mask_1km.tif"
 # Run the LOBO fold
 #------------------------------------------------------------------------------
 echo "Starting LOBO fold ${FOLD_IDX} (USA)..."
-export LOBO_NUM_BOOST_ROUND=1000   # Reduced rounds for LOBO tractability — production uses ~2985
-srun --cpu-bind=cores --distribution=block:block \
-  python -u "$SCRIPT" --biome-idx "${FOLD_IDX}" --model-type lgbm
+python -u "$SCRIPT" --biome-idx "${FOLD_IDX}" --model-type lgbm
 
 echo "spatial_CV_1 (lgbm) fold ${FOLD_IDX} (USA) finished."

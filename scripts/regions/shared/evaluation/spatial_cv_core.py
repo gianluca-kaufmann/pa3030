@@ -1118,14 +1118,24 @@ def _compute_region_metrics_layer2(
     }
     if n < MIN_SAMPLES or n_pos < MIN_POSITIVES or len(np.unique(y_true)) < 2:
         out.update(roc_auc=np.nan, pr_auc=np.nan,
-                   precision_at_1pct=np.nan,
-                   precision_at_5pct=np.nan,
-                   precision_at_10pct=np.nan)
+                   precision_at_1pct=np.nan,  precision_at_5pct=np.nan,
+                   precision_at_10pct=np.nan,
+                   recall_at_1pct=np.nan,     recall_at_5pct=np.nan,
+                   recall_at_10pct=np.nan)
         return out
 
     def _p_at_k(k: float) -> float:
         n_top = max(1, int(n * k / 100))
-        return float(y_true[np.argsort(y_proba)[-n_top:]].sum() / n_top)
+        top_idx = np.argpartition(y_proba, -n_top)[-n_top:]
+        return float(y_true[top_idx].sum() / n_top)
+
+    def _r_at_k(k: float) -> float:
+        """Recall at top-k%: fraction of all positives captured in top-k% predictions."""
+        if n_pos == 0:
+            return 0.0
+        n_top = max(1, int(n * k / 100))
+        top_idx = np.argpartition(y_proba, -n_top)[-n_top:]
+        return float(y_true[top_idx].sum() / n_pos)
 
     try:
         roc = float(roc_auc_score(y_true, y_proba))
@@ -1139,7 +1149,10 @@ def _compute_region_metrics_layer2(
     out.update(roc_auc=roc, pr_auc=pr,
                precision_at_1pct=_p_at_k(1.0),
                precision_at_5pct=_p_at_k(5.0),
-               precision_at_10pct=_p_at_k(10.0))
+               precision_at_10pct=_p_at_k(10.0),
+               recall_at_1pct=_r_at_k(1.0),
+               recall_at_5pct=_r_at_k(5.0),
+               recall_at_10pct=_r_at_k(10.0))
     return out
 
 
@@ -1213,8 +1226,9 @@ def _evaluate_model_layer2(
     del df; gc.collect()
     result = pd.DataFrame(rows)
     cols = ["model", "biome", "n_samples", "n_positives", "positive_rate",
-            "roc_auc", "pr_auc", "precision_at_1pct",
-            "precision_at_5pct", "precision_at_10pct"]
+            "roc_auc", "pr_auc",
+            "precision_at_1pct",  "precision_at_5pct",  "precision_at_10pct",
+            "recall_at_1pct",     "recall_at_5pct",     "recall_at_10pct"]
     return result[[c for c in cols if c in result.columns]]
 
 
@@ -1283,10 +1297,22 @@ def _run_transfer_direction(
         if hasattr(model, "feature_names_in_"):
             feature_cols = list(model.feature_names_in_)
         else:
-            # Fallback: read from source region's parquet schema
+            # Fallback: infer feature order from both parquet schemas and verify
+            # they agree, so cross-continental scoring uses correct column alignment.
             src_train = resolve_parquet(source_region, "train_win5.parquet")
-            feature_cols = get_feature_cols(src_train)
-            print("  WARNING: feature_names_in_ not available — using parquet schema order")
+            tgt_train = resolve_parquet(target_region, "train_win5.parquet")
+            src_cols = get_feature_cols(src_train)
+            tgt_cols = get_feature_cols(tgt_train)
+            if src_cols != tgt_cols:
+                raise ValueError(
+                    f"RF feature_names_in_ not available and source/target parquet "
+                    f"schemas differ — cannot safely score cross-continental transfer.\n"
+                    f"Source ({source_region}): {src_cols}\n"
+                    f"Target ({target_region}): {tgt_cols}"
+                )
+            feature_cols = src_cols
+            print("  WARNING: feature_names_in_ not available — inferred from parquet "
+                  "schemas (source and target schemas verified identical)")
         n_estimators = model.n_estimators if hasattr(model, "n_estimators") else "?"
         predict_fn = lambda X, _m=model: _m.predict_proba(X)[:, 1].astype(np.float32)
         model_details = {"n_estimators": n_estimators}
@@ -1603,8 +1629,11 @@ def run_lobo_main(region: str, model_id: str) -> None:
                 "test/roc_auc":            m.get("roc_auc",            float("nan")),
                 "test/pr_auc":             m.get("pr_auc",             float("nan")),
                 "test/precision_at_1pct":  m.get("precision_at_1pct",  float("nan")),
-                "test/lift_at_1pct":       m.get("lift_at_1pct",       float("nan")),
                 "test/precision_at_5pct":  m.get("precision_at_5pct",  float("nan")),
+                "test/recall_at_1pct":     m.get("recall_at_1pct",     float("nan")),
+                "test/recall_at_5pct":     m.get("recall_at_5pct",     float("nan")),
+                "test/recall_at_10pct":    m.get("recall_at_10pct",    float("nan")),
+                "test/lift_at_1pct":       m.get("lift_at_1pct",       float("nan")),
                 "test/brier_score":        m.get("brier_score",        float("nan")),
                 "test/n_samples":          fold_result["test_data"].get("n_samples", 0),
                 "test/n_positive":         fold_result["test_data"].get("n_positive", 0),
@@ -1631,6 +1660,7 @@ def run_lobo_main(region: str, model_id: str) -> None:
 METRIC_COLS = [
     "roc_auc", "pr_auc",
     "precision_at_1pct", "precision_at_5pct", "precision_at_10pct",
+    "recall_at_1pct",    "recall_at_5pct",    "recall_at_10pct",
     "lift_at_1pct", "lift_at_5pct", "lift_at_10pct",
     "brier_score",
 ]
@@ -1703,7 +1733,9 @@ def run_lobo_aggregate_main(region: str) -> None:
         df = pd.DataFrame(rows).sort_values("fold_idx").reset_index(drop=True)
 
         summary_cols = [c for c in METRIC_COLS if c in df.columns]
-        valid_df     = df.dropna(subset=summary_cols, how="all")
+        # Exclude folds with fewer than MIN_POSITIVES test positives: their metrics
+        # (0.0 for PR-AUC, P@K, lift; NaN for ROC-AUC) would bias the aggregate.
+        valid_df = df[pd.to_numeric(df["n_test_pos"], errors="coerce").fillna(0) >= MIN_POSITIVES]
         mean_row: dict[str, Any] = {"fold_idx": "MEAN", "biome_name": "— MEAN —"}
         std_row:  dict[str, Any] = {"fold_idx": "STD",  "biome_name": "— STD —"}
         for c in summary_cols:
@@ -1717,8 +1749,8 @@ def run_lobo_aggregate_main(region: str) -> None:
         print("PER-BIOME RESULTS")
         print("=" * 70)
         print(f"\n{'Fold':>4}  {'Biome':<48} {'N_test':>8} {'Pos':>6} "
-              f"{'ROC-AUC':>8} {'PR-AUC':>8} {'P@1%':>7} {'Lift@1%':>8}")
-        print("-" * 110)
+              f"{'ROC-AUC':>8} {'PR-AUC':>8} {'P@1%':>7} {'R@5%':>7} {'Lift@1%':>8}")
+        print("-" * 120)
         for _, row in df_out.iterrows():
             idx_ = str(row["fold_idx"])
             bm   = str(row["biome_name"])[:48]
@@ -1727,8 +1759,9 @@ def run_lobo_aggregate_main(region: str) -> None:
             roc  = f"{row['roc_auc']:.4f}"         if pd.notna(row.get("roc_auc"))   else "   N/A "
             pr   = f"{row['pr_auc']:.4f}"          if pd.notna(row.get("pr_auc"))    else "   N/A "
             p1   = f"{row['precision_at_1pct']:.4f}" if pd.notna(row.get("precision_at_1pct")) else "  N/A "
-            l1   = f"{row['lift_at_1pct']:.1f}x"  if pd.notna(row.get("lift_at_1pct"))   else "  N/A"
-            print(f"{idx_:>4}  {bm:<48} {n} {pos} {roc:>8} {pr:>8} {p1:>7} {l1:>8}")
+            r5   = f"{row['recall_at_5pct']:.4f}"  if pd.notna(row.get("recall_at_5pct"))   else "  N/A "
+            l1   = f"{row['lift_at_1pct']:.1f}x"  if pd.notna(row.get("lift_at_1pct"))      else "  N/A"
+            print(f"{idx_:>4}  {bm:<48} {n} {pos} {roc:>8} {pr:>8} {p1:>7} {r5:>7} {l1:>8}")
 
         csv_path = cv_dir / f"lobo_summary_{timestamp}.csv"
         df_out.to_csv(csv_path, index=False)
@@ -1884,8 +1917,9 @@ def run_spatial_gen_main(region: str, model_id: str) -> None:
                     f"{prefix}/n_samples":   row.get("n_samples"),
                     f"{prefix}/n_positives": row.get("n_positives"),
                 }
-                for metric in ("roc_auc", "pr_auc", "precision_at_1pct",
-                               "precision_at_5pct", "precision_at_10pct"):
+                for metric in ("roc_auc", "pr_auc",
+                               "precision_at_1pct", "precision_at_5pct", "precision_at_10pct",
+                               "recall_at_1pct",    "recall_at_5pct",    "recall_at_10pct"):
                     v = row.get(metric)
                     if v is not None and not (isinstance(v, float) and np.isnan(v)):
                         log_dict[f"{prefix}/{metric}"] = v
