@@ -49,6 +49,6 @@ echo "PWD = $(pwd)"
   exit 1
 }
 # Run the script
-srun --cpu-bind=cores --distribution=block:block python -u "scripts/regions/usa/5_training/model2_LGBM"
+srun --cpu-bind=cores --distribution=block:block python -u "scripts/regions/usa/5_training/model2_LGBM" --eval-only
 
 echo "model2_LGBM script finished."

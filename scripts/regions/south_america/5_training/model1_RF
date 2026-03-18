@@ -1443,7 +1443,7 @@ def phase2_testing(
 
 
 
-def main(timestamp: str) -> None:
+def main(timestamp: str, eval_only: bool = False) -> None:
     start_time = time.time()
     repo_root = get_repo_root()
     
@@ -1467,7 +1467,34 @@ def main(timestamp: str) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     model_dir = repo_root / "data/south_america/ml/models"
     model_dir.mkdir(parents=True, exist_ok=True)
-    
+
+    if eval_only:
+        json_files = sorted(output_dir.glob("model1_rf_win5_metrics_*.json"))
+        if not json_files:
+            raise FileNotFoundError(f"No model1_rf_win5_metrics_*.json found in {output_dir}")
+        with open(json_files[-1]) as f:
+            prev = json.load(f)
+        prev_ts = prev["metadata"]["timestamp"]
+        model_path = model_dir / f"model1_rf_win5_{prev_ts}.joblib"
+        if not model_path.exists():
+            cands = sorted(model_dir.glob("model1_rf_win5_*.joblib"))
+            if not cands:
+                raise FileNotFoundError(f"No model1_rf_win5_*.joblib found in {model_dir}")
+            model_path = cands[-1]
+        feature_cols = prev["metadata"]["features"]
+        all_cols_test = pq.ParquetFile(test_path).schema_arrow.names
+        keep_cols_test = feature_cols + [TARGET_COL, 'year', 'row', 'col'] + [c for c in ['x', 'y'] if c in all_cols_test]
+        print(f"EVAL-ONLY: reusing {model_path.name} (metrics source: {json_files[-1].name})")
+        phase2_testing(
+            test_path, model_path, feature_cols, keep_cols_test, timestamp, output_dir,
+            False, TARGET_COL,
+            None, {}, 0.0, 0.0,
+            prev["data"]["train_positives"], prev["data"]["train_negatives"], prev["data"]["n_train_full"],
+            prev.get("best_params_from_json", best_params), prev.get("trained_params", {}), start_time,
+            prev.get("imbalance_handling", {}), prev.get("cross_validation", {}),
+        )
+        return
+
     use_wandb = False
     if wandb is not None:
         try:
@@ -1562,19 +1589,28 @@ def main(timestamp: str) -> None:
 
 
 if __name__ == "__main__":
-    # Set up output file capture
+    import argparse
+    parser = argparse.ArgumentParser(description="Random Forest Transition Model (5-Year Lookahead Prediction)")
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        default=False,
+        help="Skip training; reload existing model and recompute test metrics only.",
+    )
+    args = parser.parse_args()
+
     repo_root = get_repo_root()
     output_dir = repo_root / "outputs/south_america/results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = output_dir / f"model1_rf_win5_{timestamp}.txt"
-    
+
     tee = Tee(output_file)
     sys.stdout = tee
-    
+
     try:
-        main(timestamp)
+        main(timestamp, eval_only=args.eval_only)
     finally:
         sys.stdout = tee.stdout
         tee.close()

@@ -1509,7 +1509,7 @@ def phase2_testing(
         wandb.finish()
 
 
-def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True, num_boost_round: Optional[int] = None) -> None:
+def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True, num_boost_round: Optional[int] = None, eval_only: bool = False) -> None:
     start_time = time.time()
     repo_root = get_repo_root()
     train_path = resolve_parquet_file("train_win5.parquet")
@@ -1532,7 +1532,34 @@ def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True, 
     output_dir.mkdir(parents=True, exist_ok=True)
     model_dir = repo_root / "data/usa/ml/models"
     model_dir.mkdir(parents=True, exist_ok=True)
-    
+
+    if eval_only:
+        json_files = sorted(output_dir.glob("model2_lgbm_metrics_*.json"))
+        if not json_files:
+            raise FileNotFoundError(f"No model2_lgbm_metrics_*.json found in {output_dir}")
+        with open(json_files[-1]) as f:
+            prev = json.load(f)
+        prev_ts = prev["metadata"]["timestamp"]
+        model_path = model_dir / f"model2_lgbm_{prev_ts}.pkl"
+        if not model_path.exists():
+            cands = sorted(model_dir.glob("model2_lgbm_*.pkl"))
+            if not cands:
+                raise FileNotFoundError(f"No model2_lgbm_*.pkl found in {model_dir}")
+            model_path = cands[-1]
+        feature_cols = prev["metadata"]["features"]
+        all_cols_test = pq.ParquetFile(test_path).schema_arrow.names
+        keep_cols_test = feature_cols + [TARGET_COL, 'year', 'row', 'col'] + [c for c in ['x', 'y'] if c in all_cols_test]
+        print(f"EVAL-ONLY: reusing {model_path.name} (metrics source: {json_files[-1].name})")
+        phase2_testing(
+            test_path, model_path, feature_cols, keep_cols_test, timestamp, output_dir,
+            False, TARGET_COL,
+            None, {}, 0.0, 0.0,
+            prev["data"]["train_positives"], prev["data"]["train_negatives"], prev["data"]["n_train_full"],
+            prev.get("model_parameters", best_params), start_time,
+            prev.get("imbalance_handling", {}), prev.get("cross_validation", {}),
+        )
+        return
+
     use_wandb = False
     if wandb is not None:
         try:
@@ -1615,8 +1642,14 @@ if __name__ == "__main__":
         default=None,
         help="Number of boosting rounds to use when cv_mode='none'. If not provided, uses default from params."
     )
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        default=False,
+        help="Skip training; reload existing model and recompute test metrics only.",
+    )
     args = parser.parse_args()
-    
+
     repo_root = get_repo_root()
     output_dir = repo_root / "outputs/usa/results/ml_models"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1626,7 +1659,7 @@ if __name__ == "__main__":
     sys.stdout = tee
     try:
         # Always use time_weights=True
-        main(timestamp, cv_mode=args.cv_mode, use_time_weights=True, num_boost_round=args.num_boost_round)
+        main(timestamp, cv_mode=args.cv_mode, use_time_weights=True, num_boost_round=args.num_boost_round, eval_only=args.eval_only)
     finally:
         sys.stdout = tee.stdout
         tee.close()

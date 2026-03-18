@@ -53,6 +53,6 @@ echo "PWD = $(pwd)"
 export MAX_NEG_TRAIN=50000000      # Cap negative samples at 50M for training (keeps all positives)
 
 # Run the script
-python "scripts/regions/south_america/5_training/model1_RF"
+python "scripts/regions/south_america/5_training/model1_RF" --eval-only
 
 echo "model1_RF script finished."
