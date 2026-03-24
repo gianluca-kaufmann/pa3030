@@ -1241,11 +1241,16 @@ def _evaluate_model_layer2(
 
 
 # =============================================================================
-# Layer 2 helper — per-biome SHAP feature importance
+# Layer 2 helper — per-biome feature importance
 # =============================================================================
+# Both LGBM and RF use sklearn permutation importance so results are on the
+# same scale and directly comparable.  SHAP is avoided here because for RF
+# with 1 000 trees × depth 20 it costs O(n_trees×depth×samples) — hours.
+# LGBM global SHAP is still produced by results_core.py.
 
-_SHAP_ROWS_PER_BIOME = 1_000   # max sample size per biome for SHAP
+_SHAP_ROWS_PER_BIOME = 1_000   # max sample size per biome
 _SHAP_TOP_K          = 10      # features to report per biome
+_PERM_N_REPEATS      = 5       # repeats for permutation importance
 
 
 def _compute_biome_feature_importance(
@@ -1257,28 +1262,35 @@ def _compute_biome_feature_importance(
     n_per_biome: int = _SHAP_ROWS_PER_BIOME,
     top_k: int = _SHAP_TOP_K,
 ) -> Optional[pd.DataFrame]:
-    """Compute per-biome SHAP feature importance using the production model.
+    """Compute per-biome feature importance using the production model.
+
+    Both LGBM and RF use sklearn permutation importance so that results are on
+    the same scale (mean PR-AUC drop when a feature is permuted) and directly
+    comparable across models.  SHAP is intentionally avoided here: for RF with
+    1 000 trees × depth 20 it takes hours; using a different metric for LGBM
+    would make the two models incomparable.  LGBM SHAP is still computed
+    globally in the main results pipeline (results_core.py).
 
     Streams the test parquet in chunks, builds a stratified sample of up to
-    ``n_per_biome`` rows per biome, then runs SHAP TreeExplainer on each
-    biome's sample.  Returns a DataFrame with the top-``top_k`` features per
-    biome ranked by mean |SHAP|, or ``None`` if SHAP is unavailable or the
-    model/data files are not found.
+    ``n_per_biome`` rows per biome, then runs permutation importance per biome.
+    Returns a DataFrame with the top-``top_k`` features per biome, or ``None``
+    if the model/data files are not found.
 
-    Columns: model, biome, rank, feature, mean_abs_shap
+    Columns: model, biome, rank, feature, importance_score, method, n_samples
+      importance_score = mean PR-AUC drop under permutation (sklearn ``average_precision``)
     """
-    if _shap_lib is None:
-        print("  SHAP not installed (pip install shap) — skipping feature importance")
-        return None
+    method_label = "permutation"
+    print(f"  {model_type.upper()} model: permutation importance "
+          f"(n_repeats={_PERM_N_REPEATS}, scoring=PR-AUC / average_precision)")
 
     # ── Load production model ─────────────────────────────────────────────────
     try:
         model_path = resolve_trained_model(region, model_id, model_type)
     except FileNotFoundError as e:
-        print(f"  Model not found for SHAP ({model_type}): {e}")
+        print(f"  Model not found ({model_type}): {e}")
         return None
 
-    print(f"  Loading {model_type.upper()} model for SHAP: {model_path.name}")
+    print(f"  Loading {model_type.upper()} model: {model_path.name}")
     if model_type == "lgbm":
         with open(model_path, "rb") as fh:
             model = pickle.load(fh)
@@ -1290,14 +1302,14 @@ def _compute_biome_feature_importance(
                 feature_cols = get_feature_cols(tp)
                 print(f"  Resolved {len(feature_cols)} feature names from parquet schema")
             except FileNotFoundError:
-                print("  Cannot resolve feature names — skipping SHAP")
+                print("  Cannot resolve feature names — skipping")
                 del model; gc.collect()
                 return None
     else:
         try:
             import joblib as _joblib
         except ImportError:
-            print("  joblib not available — skipping SHAP for RF")
+            print("  joblib not available — skipping RF feature importance")
             return None
         model = _joblib.load(model_path)
         if hasattr(model, "feature_names_in_"):
@@ -1307,11 +1319,11 @@ def _compute_biome_feature_importance(
                 tp = resolve_parquet(region, "test_win5.parquet")
                 feature_cols = get_feature_cols(tp)
             except FileNotFoundError:
-                print("  Cannot resolve feature names — skipping SHAP")
+                print("  Cannot resolve feature names — skipping")
                 del model; gc.collect()
                 return None
 
-    print(f"  {len(feature_cols)} features for SHAP")
+    print(f"  {len(feature_cols)} features")
 
     # ── Find test parquet ─────────────────────────────────────────────────────
     try:
@@ -1321,22 +1333,29 @@ def _compute_biome_feature_importance(
         del model; gc.collect()
         return None
 
-    # Restrict to columns that actually exist in the parquet
     schema_names = set(pq.ParquetFile(test_path).schema_arrow.names)
-    load_cols = ["row", "col"] + [c for c in feature_cols
-                                   if c not in ("row", "col") and c in schema_names]
     actual_feat_cols = [c for c in feature_cols if c in schema_names]
     if not actual_feat_cols:
-        print("  No feature columns found in test parquet — skipping SHAP")
+        print("  No feature columns found in test parquet — skipping")
         del model; gc.collect()
         return None
 
-    # ── Stream test parquet, collect per-biome sample (first n_per_biome rows) ─
-    print(f"  Streaming {test_path.name} for biome samples "
-          f"(≤{n_per_biome} rows/biome)...")
+    if TARGET_COL not in schema_names:
+        print(f"  Target column '{TARGET_COL}' not in parquet — skipping")
+        del model; gc.collect()
+        return None
+
+    load_cols = (
+        [TARGET_COL, "row", "col"]
+        + [c for c in actual_feat_cols if c not in ("row", "col")]
+    )
+
+    # ── Stream test parquet, collect per-biome samples ────────────────────────
+    print(f"  Streaming {test_path.name} (≤{n_per_biome} rows/biome)...")
     t0 = time.time()
-    buffers: dict[str, list[np.ndarray]] = {}
-    counts:  dict[str, int]              = {}
+    x_buffers: dict[str, list[np.ndarray]] = {}
+    y_buffers: dict[str, list[np.ndarray]] = {}
+    counts:    dict[str, int]              = {}
 
     pf = pq.ParquetFile(test_path)
     for batch in pf.iter_batches(batch_size=500_000, columns=load_cols):
@@ -1354,52 +1373,68 @@ def _compute_biome_feature_importance(
             needed = n_per_biome - current
             X = grp[actual_feat_cols].to_numpy(dtype=np.float32)
             take = min(needed, len(X))
-            buffers.setdefault(biome_name, []).append(X[:take])
+            x_buffers.setdefault(biome_name, []).append(X[:take])
+            y = grp[TARGET_COL].to_numpy(dtype=np.int8)
+            y_buffers.setdefault(biome_name, []).append(y[:take])
             counts[biome_name] = current + take
         del chunk; gc.collect()
 
     print(f"  Sampling done in {time.time()-t0:.1f}s  "
-          f"({len(buffers)} biomes, {sum(counts.values()):,} total rows)")
+          f"({len(x_buffers)} biomes, {sum(counts.values()):,} total rows)")
 
-    if not buffers:
+    if not x_buffers:
         del model; gc.collect()
         return None
 
-    # ── Build SHAP explainer ──────────────────────────────────────────────────
-    print("  Building SHAP TreeExplainer...")
+    # ── Permutation importance — same metric for both LGBM and RF ────────────
     try:
-        explainer = _shap_lib.TreeExplainer(model)
-    except Exception as e:
-        print(f"  SHAP TreeExplainer failed: {e}")
+        from sklearn.inspection import permutation_importance as _perm_imp
+    except ImportError:
+        print("  sklearn.inspection not available — skipping feature importance")
         del model; gc.collect()
         return None
 
-    # ── Compute per-biome SHAP values ─────────────────────────────────────────
     model_label = model_type.upper()
     rows_out: list[dict[str, Any]] = []
-    for biome_name in sorted(buffers):
-        X_biome = np.vstack(buffers[biome_name])   # (n_sample, n_feat)
+
+    print(f"  Running permutation importance ({len(x_buffers)} biomes)...")
+    t_perm = time.time()
+    for biome_name in sorted(x_buffers):
+        X_biome = np.vstack(x_buffers[biome_name])
+        y_biome = np.concatenate(y_buffers[biome_name]).astype(int)
+        n_pos = int(y_biome.sum())
+        n_neg = len(y_biome) - n_pos
+        if n_pos < 1 or n_neg < 1:
+            # PR-AUC / average_precision needs at least one positive and one negative
+            print(f"  {biome_name}: need both classes (pos={n_pos}, neg={n_neg}) — skipping")
+            continue
         try:
-            sv = explainer.shap_values(X_biome)
-            # LightGBM binary output is a list [neg, pos]; take pos class
-            if isinstance(sv, list):
-                sv = sv[1]
-            mean_abs = np.abs(sv).mean(axis=0)      # (n_feat,)
-            top_idx  = np.argsort(mean_abs)[::-1][:top_k]
+            result = _perm_imp(
+                model, X_biome, y_biome,
+                n_repeats=_PERM_N_REPEATS,
+                scoring="average_precision",
+                random_state=42,
+                n_jobs=-1,
+            )
+            importance = result.importances_mean
+            top_idx = np.argsort(importance)[::-1][:top_k]
             for rank_i, feat_idx in enumerate(top_idx, start=1):
                 rows_out.append({
-                    "model":         model_label,
-                    "biome":         biome_name,
-                    "rank":          rank_i,
-                    "feature":       actual_feat_cols[feat_idx],
-                    "mean_abs_shap": float(mean_abs[feat_idx]),
-                    "n_shap_samples": int(X_biome.shape[0]),
+                    "model":            model_label,
+                    "biome":            biome_name,
+                    "rank":             rank_i,
+                    "feature":          actual_feat_cols[feat_idx],
+                    "importance_score": float(importance[feat_idx]),
+                    "method":           method_label,
+                    "n_samples":        int(X_biome.shape[0]),
                 })
         except Exception as e:
-            print(f"  SHAP failed for {biome_name}: {e}")
+            print(f"  Permutation importance failed for {biome_name}: {e}")
+    print(f"  Permutation importance done in {time.time()-t_perm:.1f}s")
 
-    del model, buffers; gc.collect()
-    print(f"  SHAP complete: {len(rows_out)} rows ({len(rows_out) // top_k} biomes)")
+    del model, x_buffers, y_buffers; gc.collect()
+    n_biomes = len(rows_out) // top_k if top_k else "?"
+    print(f"  Feature importance complete: {len(rows_out)} rows ({n_biomes} biomes)")
     return pd.DataFrame(rows_out) if rows_out else None
 
 
@@ -2048,14 +2083,14 @@ def run_spatial_gen_main(region: str, model_id: str) -> None:
 
         results = pd.concat(all_results, ignore_index=True)
 
-        # ── Step 3c: Per-biome SHAP feature importance ────────────────────────
+        # ── Step 3c: Per-biome permutation feature importance (both models)
         fi_frames: list[pd.DataFrame] = []
         for mt, mfile in (("lgbm", lgbm_file), ("rf", rf_file)):
             if mfile is None:
                 continue
             print("\n" + "=" * 70)
             print(f"STEP 3{'a' if mt == 'lgbm' else 'b'} (cont.): "
-                  f"{mt.upper()} BIOME FEATURE IMPORTANCE (SHAP)")
+                  f"{mt.upper()} BIOME FEATURE IMPORTANCE (PERMUTATION)")
             print("=" * 70)
             fi = _compute_biome_feature_importance(
                 region, model_id, mt, biome_raster, int_to_biome,
@@ -2078,10 +2113,10 @@ def run_spatial_gen_main(region: str, model_id: str) -> None:
             fi_all = pd.concat(fi_frames, ignore_index=True)
             fi_csv_path = eval_dir / f"biome_feature_importance_{timestamp}.csv"
             fi_all.to_csv(fi_csv_path, index=False)
-            print(f"  SHAP FI: {fi_csv_path}")
+            print(f"  Feature importance: {fi_csv_path}")
         else:
             fi_all = None
-            print("  SHAP feature importance: skipped (SHAP not available or no model found)")
+            print("  Feature importance: skipped (no model found)")
 
         print("\n" + "=" * 70)
         print("RESULTS SUMMARY")
@@ -2103,10 +2138,10 @@ def run_spatial_gen_main(region: str, model_id: str) -> None:
                 print(f"  {str(row['biome']):<50} {int(row['n_samples']):>8,} "
                       f"{int(row['n_positives']):>6} {npr:>9} {roc:>8} {pr:>8} {p1:>7}")
 
-        # Print SHAP feature importance summary (top 5 per biome)
+        # Print feature importance summary (top 5 per biome)
         if fi_all is not None and len(fi_all) > 0:
             print("\n" + "=" * 70)
-            print("BIOME FEATURE IMPORTANCE SUMMARY (SHAP, top 5 per biome)")
+            print("BIOME FEATURE IMPORTANCE SUMMARY (top 5 per biome)")
             print("=" * 70)
             for model_label in fi_all["model"].unique():
                 fi_m = fi_all[fi_all["model"] == model_label]
@@ -2135,15 +2170,16 @@ def run_spatial_gen_main(region: str, model_id: str) -> None:
                     if v is not None and not (isinstance(v, float) and np.isnan(v)):
                         log_dict[f"{prefix}/{metric}"] = v
                 wandb.log(log_dict)
-            # Log top-1 SHAP feature per biome as W&B summary
+            # Log top-1 feature importance per biome as W&B summary
             if fi_all is not None and len(fi_all) > 0:
                 fi_top1 = fi_all[fi_all["rank"] == 1]
                 for _, fi_row in fi_top1.iterrows():
-                    key = (f"shap/{fi_row['model']}/"
+                    method_prefix = fi_row.get("method", "fi")
+                    key = (f"{method_prefix}/{fi_row['model']}/"
                            f"{str(fi_row['biome']).replace(' ', '_')}/top1_feature")
                     wandb.log({key: fi_row["feature"],
-                               key.replace("top1_feature", "top1_mean_abs_shap"):
-                                   fi_row["mean_abs_shap"]})
+                               key.replace("top1_feature", "top1_importance_score"):
+                                   fi_row["importance_score"]})
             wandb.log({"timing/total_seconds": elapsed})
             wandb.finish()
 
