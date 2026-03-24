@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 RUN_REGION = os.environ.get("PA3030_RESULTS_REGION", "south_america").strip().lower()
-if RUN_REGION not in {"south_america", "usa"}:
+if RUN_REGION not in {"south_america", "usa", "se_asia"}:
     raise ValueError(f"Unsupported PA3030_RESULTS_REGION='{RUN_REGION}'")
 
 PROFILE = {
@@ -49,6 +49,24 @@ PROFILE = {
             ("Southeast",          -92,  -78, 25, 35),
         ],
     },
+    "se_asia": {
+        "region_slug": "se_asia",
+        "region_label": "South East Asia",
+        "model_id": "model3",
+        "model_label": "Model 3",
+        "x_limits": (90, 145),
+        "y_limits": (-11, 28),
+        "iso_codes": ['BRN', 'KHM', 'IDN', 'LAO', 'MYS', 'MMR', 'PHL', 'SGP', 'THA', 'TLS', 'VNM'],
+        "country_names": ['Brunei', 'Cambodia', 'Indonesia', 'Laos', 'Malaysia', 'Myanmar', 'Philippines', 'Singapore', 'Thailand', 'Timor-Leste', 'Vietnam'],
+        "probability_map_percentile_min": 25,
+        "probability_map_percentile_max": 98,
+        "probability_map_transformation": "sqrt",
+        "hotspot_regions": [
+            ("Borneo / Kalimantan",  108, 118,  -4,  7),
+            ("Mekong / Indochina",   100, 110,   9, 22),
+            ("Sumatra / Malay Pen.",  95, 110,  -6,  6),
+        ],
+    },
 }[RUN_REGION]
 
 REGION_SLUG     = PROFILE["region_slug"]
@@ -62,7 +80,12 @@ HOTSPOT_REGIONS = PROFILE["hotspot_regions"]
 PROBABILITY_MAP_PERCENTILE_MIN = PROFILE["probability_map_percentile_min"]
 PROBABILITY_MAP_PERCENTILE_MAX = PROFILE["probability_map_percentile_max"]
 PROBABILITY_MAP_TRANSFORMATION = PROFILE["probability_map_transformation"]
-CALIBRATE_SCRIPT = "calibrate_1" if MODEL_ID == "model1" else "calibrate_2"
+if MODEL_ID == "model1":
+    CALIBRATE_SCRIPT = "calibrate_1"
+elif MODEL_ID == "model2":
+    CALIBRATE_SCRIPT = "calibrate_2"
+else:
+    CALIBRATE_SCRIPT = "calibrate_3"
 DEFAULT_FUTURE_PARQUET_FILENAME = "val_win5.parquet"
 FALLBACK_FUTURE_PARQUET_FILENAME = "merged_panel_final.parquet"
 DEFAULT_FUTURE_YEARS_STR = "2020,2021,2022,2023,2024"

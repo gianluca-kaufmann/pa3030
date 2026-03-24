@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""
+Policy variables visualisation for SE Asia.
+
+Inputs:
+    Per-variable per-year rasters in ``data/se_asia/ready/policy/``:
+    - ``wgi_ge_YYYY.tif``            (WGI Government Effectiveness, ~-2.5 to +2.5)
+    - ``wgi_rl_YYYY.tif``            (WGI Rule of Law, ~-2.5 to +2.5)
+    - ``vdem_ldi_YYYY.tif``          (V-Dem Liberal Democracy Index, 0-1)
+    - ``dpi_exec_ideology_YYYY.tif`` (DPI Executive ideology, -1/0/+1)
+    - ``country_iso3.tif``           (uint8 country-ID debug raster)
+
+Process:
+    - Loads representative years for each policy variable and the country-ID
+      raster, then produces overview and per-variable maps.
+
+Outputs:
+    - PNG figures saved to ``outputs/se_asia/figures/policy_vis/``.
+"""
+
+import numpy as np
+import rasterio
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap, BoundaryNorm
+from pathlib import Path
+import json
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DATA_DIR = PROJECT_ROOT / "data" / "se_asia" / "ready" / "policy"
+OUTPUT_DIR = PROJECT_ROOT / "outputs" / "se_asia" / "figures" / "policy_vis"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Policy variable definitions
+POLICY_VARS = {
+    "wgi_ge": {
+        "title": "WGI Government Effectiveness",
+        "cmap": "RdYlGn",
+        "vmin": -2.5,
+        "vmax": 2.5,
+        "unit": "estimate (-2.5 to +2.5)",
+    },
+    "wgi_rl": {
+        "title": "WGI Rule of Law",
+        "cmap": "RdYlGn",
+        "vmin": -2.5,
+        "vmax": 2.5,
+        "unit": "estimate (-2.5 to +2.5)",
+    },
+    "vdem_ldi": {
+        "title": "V-Dem Liberal Democracy Index",
+        "cmap": "YlGnBu",
+        "vmin": 0.0,
+        "vmax": 1.0,
+        "unit": "index (0-1)",
+    },
+    "dpi_exec_ideology": {
+        "title": "DPI Executive Ideology",
+        "cmap": "RdBu",
+        "vmin": -1.0,
+        "vmax": 1.0,
+        "unit": "(-1=Left, 0=Center, +1=Right)",
+    },
+}
+
+YEARS = list(range(2000, 2025))
+SAMPLE_YEARS = [2000, 2005, 2010, 2015, 2020]
+
+
+# ---------------------------------------------------------------------------
+# Loading helpers
+# ---------------------------------------------------------------------------
+
+def load_raster(path: Path) -> np.ndarray | None:
+    """Load a single-band raster and return the array, or None if missing."""
+    if not path.exists():
+        return None
+    with rasterio.open(path) as src:
+        return src.read(1)
+
+
+def find_latest_available(var: str) -> tuple[int | None, np.ndarray | None]:
+    """Find and load the latest available year for a variable."""
+    for year in reversed(YEARS):
+        path = DATA_DIR / f"{var}_{year}.tif"
+        data = load_raster(path)
+        if data is not None and np.any(~np.isnan(data)):
+            return year, data
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# Visualisations
+# ---------------------------------------------------------------------------
+
+def plot_country_raster():
+    """Visualise the country-ID debug raster."""
+    print("Plotting country-ID raster...")
+    path = DATA_DIR / "country_iso3.tif"
+    data = load_raster(path)
+    if data is None:
+        print("  country_iso3.tif not found — skipping.")
+        return
+
+    # Load mapping if available
+    mapping_path = DATA_DIR / "country_iso3_mapping.json"
+    labels = {}
+    if mapping_path.exists():
+        with open(mapping_path) as f:
+            labels = json.load(f)
+
+    unique_ids = np.unique(data)
+    unique_ids = unique_ids[unique_ids > 0]
+
+    fig, ax = plt.subplots(figsize=(12, 10))
+    n = len(unique_ids)
+    cmap = plt.cm.get_cmap("tab20", max(n, 1))
+    im = ax.imshow(np.where(data == 0, np.nan, data), cmap=cmap,
+                   vmin=0.5, vmax=n + 0.5, interpolation="nearest")
+    ax.set_title("Country ID Raster — SE Asia", fontsize=14, fontweight="bold")
+    ax.set_axis_off()
+
+    cbar = plt.colorbar(im, ax=ax, shrink=0.7, ticks=unique_ids.tolist())
+    tick_labels = [f"{cid}: {labels.get(str(cid), '?')}" for cid in unique_ids]
+    cbar.ax.set_yticklabels(tick_labels, fontsize=8)
+    cbar.set_label("Country ID", rotation=270, labelpad=15)
+
+    n_countries = len(unique_ids)
+    n_assigned = int((data > 0).sum())
+    ax.text(0.02, 0.98, f"Countries: {n_countries}\nAssigned pixels: {n_assigned:,}",
+            transform=ax.transAxes, fontsize=11, verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+
+    plt.tight_layout()
+    out = OUTPUT_DIR / "policy_country_id.png"
+    plt.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {out.name}")
+
+
+def plot_four_panel_overview():
+    """Show the latest available year for all four policy variables side by side."""
+    print("Plotting four-panel policy overview...")
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 14))
+    axes = axes.flatten()
+
+    for idx, (var, info) in enumerate(POLICY_VARS.items()):
+        ax = axes[idx]
+        year, data = find_latest_available(var)
+
+        if data is None:
+            ax.text(0.5, 0.5, f"{info['title']}\nNo data found",
+                    transform=ax.transAxes, ha="center", va="center", fontsize=12)
+            ax.set_axis_off()
+            continue
+
+        display = np.where(np.isnan(data), np.nan, data)
+        im = ax.imshow(display, cmap=info["cmap"],
+                       vmin=info["vmin"], vmax=info["vmax"],
+                       interpolation="nearest")
+        ax.set_title(f"{info['title']} ({year})", fontsize=12, fontweight="bold")
+        ax.set_axis_off()
+
+        cbar = plt.colorbar(im, ax=ax, shrink=0.7)
+        cbar.set_label(info["unit"], rotation=270, labelpad=15, fontsize=9)
+
+        valid = data[~np.isnan(data)]
+        if len(valid) > 0:
+            ax.text(0.02, 0.98,
+                    f"Mean: {np.mean(valid):.3f}\nMin: {np.min(valid):.3f}\nMax: {np.max(valid):.3f}",
+                    transform=ax.transAxes, fontsize=9, verticalalignment="top",
+                    bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+
+    fig.suptitle("Policy Variables Overview — SE Asia",
+                 fontsize=16, fontweight="bold", y=0.98)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    out = OUTPUT_DIR / "policy_overview.png"
+    plt.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {out.name}")
+
+
+def plot_individual_variable(var: str, info: dict):
+    """Create maps for a single variable across sample years."""
+    available = []
+    for year in SAMPLE_YEARS:
+        path = DATA_DIR / f"{var}_{year}.tif"
+        data = load_raster(path)
+        if data is not None and np.any(~np.isnan(data)):
+            available.append((year, data))
+
+    if not available:
+        print(f"  {info['title']}: no data found for sample years — skipping.")
+        return
+
+    n = len(available)
+    cols = min(n, 3)
+    rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 5 * rows))
+    if n == 1:
+        axes = [axes]
+    else:
+        axes = np.array(axes).flatten()
+
+    for i, (year, data) in enumerate(available):
+        ax = axes[i]
+        display = np.where(np.isnan(data), np.nan, data)
+        im = ax.imshow(display, cmap=info["cmap"],
+                       vmin=info["vmin"], vmax=info["vmax"],
+                       interpolation="nearest")
+        ax.set_title(f"{year}", fontsize=12, fontweight="bold")
+        ax.set_axis_off()
+        plt.colorbar(im, ax=ax, shrink=0.7)
+
+    # Hide unused axes
+    for j in range(n, len(axes)):
+        axes[j].set_visible(False)
+
+    fig.suptitle(f"{info['title']} — SE Asia\n{info['unit']}",
+                 fontsize=14, fontweight="bold")
+    plt.tight_layout()
+    out = OUTPUT_DIR / f"policy_{var}_years.png"
+    plt.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: {out.name}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    print("Policy Variables Visualisation — SE Asia")
+    print("=" * 60)
+    print(f"Input:  {DATA_DIR}")
+    print(f"Output: {OUTPUT_DIR}")
+
+    plot_country_raster()
+    plot_four_panel_overview()
+
+    print("\nPlotting per-variable year panels...")
+    for var, info in POLICY_VARS.items():
+        plot_individual_variable(var, info)
+
+    print("\nVisualisation complete!")
+
+
+if __name__ == "__main__":
+    main()

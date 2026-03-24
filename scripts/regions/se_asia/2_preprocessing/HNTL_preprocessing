@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""
+HNTL nighttime lights preprocessing
+====================================
+
+Description:
+    Clip and resample global Harmonized Nighttime Lights (HNTL) GeoTIFFs to the
+    South East Asia backbone grid, producing one region-specific raster per year.
+
+Source data:
+    - Global HNTL GeoTIFFs in `data/shared/HNTL/` (2000-2020).
+      Files follow pattern: `Harmonized_DN_NTL_YYYY_{calDMSP|simVIIRS}.tif`.
+    - Backbone raster: `data/se_asia/ready/backbone/backbone.tif`
+      (defines target CRS, transform, bounds, and land mask).
+
+Process:
+    1. Load backbone raster as spatial template (CRS, transform, dimensions).
+    2. Create land mask from backbone (valid pixels only).
+    3. For each year 2000-2020:
+       - Find the matching global HNTL file in data/shared/HNTL/.
+       - Reproject and resample global data to match backbone grid (bilinear).
+       - Apply land mask (set ocean/invalid pixels to NaN).
+       - Save as regional raster in data/se_asia/ready/HNTL/.
+
+Outputs:
+    - `data/se_asia/ready/HNTL/HNTL_SEA_1km_YYYY.tif` for each year 2000-2020.
+    - All files will have identical dimensions and valid pixel locations matching
+      the backbone grid.
+
+Notes:
+    - The Harmonized NTL dataset covers 2000-2020 only. The merge script
+      automatically forward-fills HNTL 2020 values for years 2021-2024.
+"""
+
+import os
+import numpy as np
+import rasterio
+from rasterio.warp import reproject, calculate_default_transform
+from rasterio.enums import Resampling
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
+
+# Configuration — use $SCRATCH on cluster, otherwise local paths
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
+if "SCRATCH" in os.environ:
+    DATA_DIR = Path(os.environ["SCRATCH"]) / "data"
+else:
+    DATA_DIR = PROJECT_ROOT / "data"
+SHARED_HNTL_DIR = DATA_DIR / "shared" / "HNTL"
+BACKBONE_PATH = DATA_DIR / "se_asia" / "ready" / "backbone" / "backbone.tif"
+OUTPUT_DIR = DATA_DIR / "se_asia" / "ready" / "HNTL"
+REGION_TAG = "SA"
+YEARS = list(range(2000, 2021))  # 2000-2020
+
+
+def find_global_hntl_file(year: int) -> Path:
+    """Find the global HNTL file for a given year in the shared directory.
+
+    Files are named Harmonized_DN_NTL_YYYY_calDMSP.tif (2000-2013) or
+    Harmonized_DN_NTL_YYYY_simVIIRS.tif (2014-2020).
+    """
+    for suffix in ["calDMSP", "simVIIRS"]:
+        path = SHARED_HNTL_DIR / f"Harmonized_DN_NTL_{year}_{suffix}.tif"
+        if path.exists():
+            return path
+    # Also try a generic glob in case naming varies
+    matches = sorted(SHARED_HNTL_DIR.glob(f"*{year}*.tif"))
+    if matches:
+        return matches[0]
+    return None
+
+
+def load_backbone():
+    """Load backbone raster metadata and land mask."""
+    print(f"Loading backbone: {BACKBONE_PATH}")
+
+    if not BACKBONE_PATH.exists():
+        raise FileNotFoundError(
+            f"Backbone raster not found: {BACKBONE_PATH}. "
+            "Run backbone_preprocessing first."
+        )
+
+    with rasterio.open(BACKBONE_PATH) as src:
+        backbone_data = src.read(1)
+        land_mask = backbone_data == 1  # 1 = land in backbone
+
+        meta = {
+            'crs': src.crs,
+            'transform': src.transform,
+            'width': src.width,
+            'height': src.height,
+            'bounds': src.bounds,
+            'land_mask': land_mask,
+        }
+
+        valid_pixels = np.sum(land_mask)
+        print(f"  Dimensions: {meta['width']} x {meta['height']}")
+        print(f"  CRS: {meta['crs']}")
+        print(f"  Land pixels: {valid_pixels:,}")
+
+        return meta
+
+
+def process_year(year: int, backbone_meta: dict) -> bool:
+    """Process a single year: clip global HNTL to backbone grid.
+
+    Returns True if successful, False if skipped (file not found).
+    """
+    global_file = find_global_hntl_file(year)
+    if global_file is None:
+        print(f"  {year}: No global HNTL file found — skipped")
+        return False
+
+    print(f"  {year}: {global_file.name}")
+
+    # Create output array filled with NaN
+    dst_array = np.full(
+        (backbone_meta['height'], backbone_meta['width']),
+        np.nan,
+        dtype=np.float32
+    )
+
+    # Read global file and reproject to backbone grid
+    with rasterio.open(global_file) as src:
+        src_array = src.read(1).astype(np.float32)
+
+        # Mask source NoData values (e.g., -999) BEFORE reprojection to prevent
+        # bilinear interpolation from blending sentinel values with real data.
+        src_nodata = src.nodata
+        if src_nodata is not None:
+            src_array[src_array == src_nodata] = np.nan
+        else:
+            # HNTL commonly uses -999 as NoData even if not declared in metadata
+            src_array[src_array == -999.0] = np.nan
+
+        reproject(
+            source=src_array,
+            destination=dst_array,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            src_nodata=np.nan,
+            dst_transform=backbone_meta['transform'],
+            dst_crs=backbone_meta['crs'],
+            dst_nodata=np.nan,
+            resampling=Resampling.bilinear,
+        )
+
+    # Apply land mask: set ocean/invalid pixels to NaN
+    dst_array[~backbone_meta['land_mask']] = np.nan
+
+    # Report statistics
+    valid_pixels = np.sum(~np.isnan(dst_array))
+    print(f"         Valid pixels: {valid_pixels:,}")
+
+    # Write output
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = OUTPUT_DIR / f"HNTL_{REGION_TAG}_1km_{year}.tif"
+    profile = {
+        'driver': 'GTiff',
+        'height': backbone_meta['height'],
+        'width': backbone_meta['width'],
+        'count': 1,
+        'dtype': np.float32,
+        'crs': backbone_meta['crs'],
+        'transform': backbone_meta['transform'],
+        'nodata': np.nan,
+        'compress': 'lzw',
+        'tiled': True,
+        'blockxsize': 512,
+        'blockysize': 512,
+    }
+
+    with rasterio.open(out_path, 'w', **profile) as dst:
+        dst.write(dst_array, 1)
+
+    return True
+
+
+def verify_files(backbone_meta: dict):
+    """Verify all output files have matching spatial properties."""
+    print("\n" + "=" * 60)
+    print("Verification")
+    print("=" * 60)
+
+    expected_valid = np.sum(backbone_meta['land_mask'])
+    all_match = True
+
+    for year in YEARS:
+        out_path = OUTPUT_DIR / f"HNTL_{REGION_TAG}_1km_{year}.tif"
+        if not out_path.exists():
+            print(f"  {year}: MISSING")
+            all_match = False
+            continue
+
+        with rasterio.open(out_path) as tgt:
+            tgt_data = tgt.read(1)
+            tgt_valid = np.sum(~np.isnan(tgt_data))
+            match = (tgt_valid == expected_valid)
+            status = "ok" if match else "MISMATCH"
+            print(f"  {year}: {tgt_valid:,} pixels [{status}]")
+            if not match:
+                all_match = False
+
+    print()
+    if all_match:
+        print("All files match backbone land mask.")
+    else:
+        print("Some files don't match — check warnings above.")
+
+    return all_match
+
+
+def main():
+    print("=" * 60)
+    print("HNTL Preprocessing — South East Asia")
+    print("=" * 60)
+    print(f"Input:    {SHARED_HNTL_DIR}")
+    print(f"Backbone: {BACKBONE_PATH}")
+    print(f"Output:   {OUTPUT_DIR}")
+    print(f"Years:    {min(YEARS)}-{max(YEARS)}")
+
+    # Load backbone
+    backbone_meta = load_backbone()
+
+    # Process each year
+    print("\n" + "=" * 60)
+    print("Processing files")
+    print("=" * 60)
+
+    processed = 0
+    for year in YEARS:
+        if process_year(year, backbone_meta):
+            processed += 1
+
+    print(f"\nProcessed {processed}/{len(YEARS)} years")
+
+    # Verify
+    verify_files(backbone_meta)
+
+    print("\n" + "=" * 60)
+    print("Complete!")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""
+Economic Value Preprocessing — South East Asia
+=============================================
+
+Spatially allocates FAO national gross agricultural production value (GPV)
+across cropland and pasture pixels derived from MODIS land cover data.
+
+Inputs:
+  - data/shared/FAO/value_agr.prod.csv
+  - data/se_asia/ready/landcover/  (MODIS IGBP rasters, 1 km, 2000-2024)
+  - data/se_asia/ready/backbone/backbone.tif
+  - data/se_asia/ready/policy/country_iso3.tif + country_iso3_mapping.json
+    (preferred; fallback: Natural Earth 10 m admin boundaries)
+
+Outputs:
+  - data/se_asia/ready/economic_value/economic_value_{year}.tif
+    float32, LZW-compressed, tiled 512×512, nodata=NaN, 2000-2024
+  - data/se_asia/ready/economic_value/validation_totals.csv
+
+Algorithm (see scripts/regions/shared/preprocessing/economic_value.py for details)
+-----------------------------------------------------------------------
+For each agricultural pixel i in country c at year y:
+
+    value_usd_ha_i = FAO_GPV(c, y) * LC_WEIGHT[lc_class_i]
+                     / Σ_j (LC_WEIGHT[lc_class_j] * 100 ha)
+
+  Cropland pixels (IGBP 12, 14) → weight 1.0
+  Pasture/rangeland pixels (IGBP 8, 9, 10) → weight 0.3
+  All other pixels within country boundary → value 0
+  Pixels outside all country boundaries → NaN
+
+National totals are preserved exactly (to float32 precision).
+
+South East Asia coverage note
+-----------------------------
+This script uses the canonical South East Asia ISO3 coverage:
+BRN, KHM, IDN, LAO, MYS, MMR, PHL, SGP, THA, TLS, VNM.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# ── Import shared preprocessing ─────────────────────────────────────────────────
+
+_shared = Path(__file__).resolve().parents[2] / "shared"
+if str(_shared) not in sys.path:
+    sys.path.insert(0, str(_shared))
+from preprocessing.economic_value import (  # noqa: E402
+    YEAR_MIN,
+    YEAR_MAX,
+    build_country_raster_from_natural_earth,
+    build_fao_table,
+    load_backbone,
+    load_country_raster_from_policy,
+    write_yearly_rasters,
+)
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
+DATA_DIR = PROJECT_ROOT / "data"
+READY_DIR = DATA_DIR / "se_asia" / "ready"
+OUTPUT_DIR = READY_DIR / "economic_value"
+LANDCOVER_DIR = READY_DIR / "landcover"
+BACKBONE_PATH = READY_DIR / "backbone" / "backbone.tif"
+VALUE_PATH = DATA_DIR / "shared" / "FAO" / "value_agr.prod.csv"
+POLICY_RASTER = READY_DIR / "policy" / "country_iso3.tif"
+POLICY_MAP = READY_DIR / "policy" / "country_iso3_mapping.json"
+
+# ── Region constants ───────────────────────────────────────────────────────────
+
+SEA_COUNTRY_ID: dict[int, str] = {
+     1: "BRN",  2: "KHM",  3: "IDN",  4: "LAO",
+     5: "MYS",  6: "MMR",  7: "PHL",  8: "SGP",
+     9: "THA", 10: "TLS", 11: "VNM",
+}
+
+SEA_TERRITORIES: list[str] = list(SEA_COUNTRY_ID.values())
+SEA_POLICY_ISO3: set[str] = set(SEA_COUNTRY_ID.values())
+
+# Natural Earth ISO3 column search order (10 m dataset uses GU_A3 for territories).
+SEA_NE_ISO3_COL_PREFERENCE: list[str] = ["GU_A3", "ADM0_A3", "ISO_A3", "iso_a3"]
+
+SEA_PROXY_MAP: dict[str, list[str]] = {}
+
+
+# ── Country raster ─────────────────────────────────────────────────────────────
+
+
+def get_country_raster(backbone, shape, transform, crs):
+    """Load or build the country integer raster and id→ISO3 mapping.
+
+    Preferred path: pre-built policy raster + JSON.
+    Fallback: rasterise Natural Earth 10 m admin boundaries.
+
+    Uses pre-built policy raster when available, otherwise falls back to
+    Natural Earth rasterisation for the canonical South East Asia ISO set.
+    """
+    result = load_country_raster_from_policy(POLICY_RASTER, POLICY_MAP)
+    if result is None:
+        return build_country_raster_from_natural_earth(
+            backbone=backbone,
+            shape=shape,
+            transform=transform,
+            crs=crs,
+            territories=SEA_TERRITORIES,
+            country_id=SEA_COUNTRY_ID,
+            iso3_col_preference=SEA_NE_ISO3_COL_PREFERENCE,
+        )
+    country_raster, id_to_iso3 = result
+    return country_raster, id_to_iso3
+
+
+# ── Entry point ────────────────────────────────────────────────────────────────
+
+
+def main() -> None:
+    print("Economic Value Preprocessing — South East Asia")
+    print("=" * 60)
+
+    if not VALUE_PATH.exists():
+        raise FileNotFoundError(f"Missing FAO production value data: {VALUE_PATH}")
+    if not LANDCOVER_DIR.exists():
+        raise FileNotFoundError(
+            f"Land-cover directory not found: {LANDCOVER_DIR}\n"
+            "Run the MODIS land-cover extraction step first."
+        )
+
+    profile, backbone, transform, shape, crs = load_backbone(BACKBONE_PATH)
+    country_raster, id_to_iso3 = get_country_raster(backbone, shape, transform, crs)
+    print(f"Country IDs loaded: {id_to_iso3}")
+
+    fao_df = build_fao_table(
+        value_path=VALUE_PATH,
+        policy_iso3=SEA_POLICY_ISO3,
+        year_min=YEAR_MIN,
+        year_max=YEAR_MAX,
+        proxy_map=SEA_PROXY_MAP,
+    )
+
+    write_yearly_rasters(
+        fao_df=fao_df,
+        country_raster=country_raster,
+        id_to_iso3=id_to_iso3,
+        lc_dir=LANDCOVER_DIR,
+        output_dir=OUTPUT_DIR,
+        profile=profile,
+        year_min=YEAR_MIN,
+        year_max=YEAR_MAX,
+    )
+
+    print("\nDone.")
+
+
+if __name__ == "__main__":
+    main()

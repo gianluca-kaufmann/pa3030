@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 RUN_REGION = os.environ.get("PA3030_FORWARD_REGION", "south_america").strip().lower()
-if RUN_REGION not in {"south_america", "usa"}:
+if RUN_REGION not in {"south_america", "usa", "se_asia"}:
     raise ValueError(f"Unsupported PA3030_FORWARD_REGION='{RUN_REGION}'")
 
 PROFILE = {
@@ -41,6 +41,25 @@ PROFILE = {
             ("Pacific Northwest", -125, -110, 43, 50),
             ("Rocky Mountains",   -115, -100, 36, 48),
             ("Southeast",          -92,  -78, 25, 35),
+        ],
+    },
+    "se_asia": {
+        "region_slug": "se_asia",
+        "region_label": "South East Asia",
+        "model_prefix": "model3",
+        "x_limits": (90, 145),
+        "y_limits": (-11, 28),
+        "iso_codes": [
+            'BRN', 'KHM', 'IDN', 'LAO', 'MYS',
+            'MMR', 'PHL', 'SGP', 'THA', 'TLS', 'VNM',
+        ],
+        "data_subdir": "se_asia",
+        "outputs_subdir": "se_asia",
+        # (label, lon_min, lon_max, lat_min, lat_max)
+        "hotspot_regions": [
+            ("Borneo / Kalimantan",  108, 118,  -4,  7),
+            ("Mekong / Indochina",   100, 110,   9, 22),
+            ("Sumatra / Malay Pen.",  95, 110,  -6,  6),
         ],
     },
 }[RUN_REGION]

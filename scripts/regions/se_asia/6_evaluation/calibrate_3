@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""Calibration Script for model3 (LGBM, RF)
+
+Purpose: Fit isotonic or Platt scaling calibration on CV/earlystop predictions,
+         apply to test predictions, and save calibrated scores + reliability plot data.
+
+Input:   - CV/earlystop predictions parquet file (with columns: y_true, y_pred_proba, and optional metadata)
+         - Test predictions parquet file (from outputs/se_asia/results/ml_models):
+           - LGBM: model3_lgbm_scored_*.parquet (no win5)
+           - RF: model3_rf_win5_scored_*.parquet (with win5)
+
+Supports:
+  - LGBM: temporal_cv (default) or earlystop
+  - RF: earlystop (default)
+
+Output:  - Calibrated test predictions parquet file (in results/ml_models/{split_version}/)
+         - Reliability plot data JSON file (in results/ml_models/{split_version}/)
+         - Calibration metadata JSON file (in results/ml_models/{split_version}/)
+         - Brier score summary text file (in results/ml_models/{split_version}/)
+         - Reliability curve plots (PNG) in results/model3_{model_type}/{split_version}/
+           (co-located with other model evaluation figures)
+"""
+
+from __future__ import annotations
+
+import gc
+import json
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Literal, Optional
+
+# ── sys.path bootstrap: add repo root so scripts.regions.shared is importable ─
+_repo_root = Path(__file__).resolve().parents[4]
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+del _repo_root
+# ─────────────────────────────────────────────────────────────────────────────
+
+from scripts.regions.shared.evaluation.calibration_runner import run_calibration  # noqa: E402
+from scripts.regions.shared.evaluation.config import ModelEvalConfig  # noqa: E402
+
+
+class Tee:
+    """Write to both stdout and a file."""
+
+    def __init__(self, file_path: Path):
+        self.file = open(file_path, "w", encoding="utf-8")
+        self.stdout = sys.stdout
+
+    def write(self, text: str) -> None:
+        self.stdout.write(text)
+        self.file.write(text)
+        self.file.flush()
+
+    def flush(self) -> None:
+        self.stdout.flush()
+        self.file.flush()
+
+    def close(self) -> None:
+        self.file.close()
+
+
+def main(
+    cv_predictions_path: Optional[Path] = None,
+    test_predictions_path: Optional[Path] = None,
+    calibration_method: Literal["isotonic", "platt"] = "platt",
+    assume_oof: bool = False,
+    per_fold: bool = False,
+    require_temporal_cv: bool = False,
+    plot_binning: Literal["uniform", "quantile", "both"] = "both",
+    model_type: Literal["lgbm", "rf"] = "lgbm",
+    split_version: str = "main",
+) -> None:
+
+
+    config = ModelEvalConfig.for_region_model(
+        region="se_asia",
+        model_id="model3",
+        algorithm=model_type,
+    )
+
+    run_calibration(
+        config=config,
+        split_version=split_version,
+        cv_predictions_path=cv_predictions_path,
+        test_predictions_path=test_predictions_path,
+        calibration_method=calibration_method,
+        assume_oof=assume_oof,
+        per_fold=per_fold,
+        require_temporal_cv=require_temporal_cv,
+        plot_binning=plot_binning,
+    )
+
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Calibrate model predictions using isotonic or Platt scaling")
+    parser.add_argument(
+        "--cv-predictions",
+        type=Path,
+        default=None,
+        help="Path to CV predictions parquet file (default: find latest in outputs/se_asia/results/ml_models)"
+    )
+    parser.add_argument(
+        "--test-predictions",
+        type=Path,
+        default=None,
+        help="Path to test predictions parquet file (default: find latest based on model_type: model3_lgbm_scored_*.parquet or model3_rf_win5_scored_*.parquet)"
+    )
+    parser.add_argument(
+        "--method",
+        type=str,
+        choices=["isotonic", "platt", "auto"],
+        default="auto",
+        help="Calibration method: 'isotonic', 'platt', or 'auto' (default: auto — fits both and selects by test Brier)"
+    )
+    parser.add_argument(
+        "--assume-oof",
+        action="store_true",
+        help="Assume CV predictions are OOF when fold information is missing (required for isotonic without fold info)"
+    )
+    parser.add_argument(
+        "--per-fold",
+        action="store_true",
+        help="Use per-fold calibration when fold information is available (default: pooled calibration)"
+    )
+    parser.add_argument(
+        "--require-temporal-cv",
+        action="store_true",
+        help="Hard-fail if no temporal CV OOF file is found (default: allow fallback to other CV files)"
+    )
+    parser.add_argument(
+        "--plot-binning",
+        type=str,
+        choices=["uniform", "quantile", "both"],
+        default="both",
+        help="Binning method for reliability plots: 'uniform', 'quantile', or 'both' (default: both)"
+    )
+    parser.add_argument(
+        "--split-version",
+        type=str,
+        choices=["main", "robustness"],
+        default="main",
+        help="Split version: 'main' or 'robustness' (default: main)"
+    )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        choices=["lgbm", "rf"],
+        default="lgbm",
+        help="Model type: lgbm or rf (default: lgbm)"
+    )
+    
+    args = parser.parse_args()
+
+    # Use ModelEvalConfig to resolve paths consistently with the shared runner
+    config = ModelEvalConfig.for_region_model(
+        region="se_asia",
+        model_id="model3",
+        algorithm=args.model_type,
+    )
+    split_output_dir = config.metrics_root / args.split_version
+    split_output_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = split_output_dir / f"calibration_model3_{args.model_type}_{args.method}_{timestamp}.txt"
+    
+    tee = Tee(output_file)
+    sys.stdout = tee
+    
+    try:
+        main(
+            cv_predictions_path=args.cv_predictions,
+            test_predictions_path=args.test_predictions,
+            calibration_method=args.method,
+            assume_oof=args.assume_oof,
+            per_fold=args.per_fold,
+            require_temporal_cv=args.require_temporal_cv,
+            plot_binning=args.plot_binning,
+            model_type=args.model_type,
+            split_version=args.split_version
+        )
+    finally:
+        sys.stdout = tee.stdout
+        tee.close()
+        print(f"\nOutput saved to: {output_file}")
+

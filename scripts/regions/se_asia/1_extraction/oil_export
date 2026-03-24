@@ -1,0 +1,133 @@
+"""
+Dataset: EDF/OGIM/current Oil and Gas Infrastructure Mapping.
+Temporal coverage: Most recent EDF OGIM snapshot (accessed 2024) for South East Asia.
+Overview: Authenticates with Google Earth Engine, rasterises oil and gas infrastructure counts at 1 km resolution, and exports to Google Drive.
+Resampling & reprojection: Vector data are rasterised, unmasked to zero, and reprojected to EPSG:3857 at 1,000 m before clipping to South East Asia.
+Outputs: A single float32 GeoTIFF representing infrastructure counts per 1 km pixel across South East Asia.
+Usage: export EE_PROJECT_ID=<your-project-id> && python "scripts/data extraction/oil_export".
+"""
+
+import os
+
+import ee
+
+PROJECT_ID = os.environ.get("EE_PROJECT_ID")
+
+
+def initialize_earth_engine(project_id=None) -> None:
+    """Authenticate and initialize Earth Engine with an optional project."""
+    try:
+        if project_id:
+            ee.Initialize(project=project_id)
+        else:
+            ee.Initialize()
+        print("Earth Engine initialized.")
+    except Exception as exc:
+        print(f"Initialization failed: {exc}")
+        print("Attempting interactive authentication...")
+        ee.Authenticate()
+        if project_id:
+            ee.Initialize(project=project_id)
+        else:
+            ee.Initialize()
+        print("Earth Engine initialized after authentication.")
+
+
+initialize_earth_engine(PROJECT_ID)
+
+# ----------------------------
+# 1) Study area (South East Asia)
+# ----------------------------
+countries = ee.FeatureCollection('USDOS/LSIB_SIMPLE/2017')
+region_fc = countries.filter(ee.Filter.inList('wld_rgn', ['South East Asia']))
+region = region_fc.geometry()
+export_region = region.bounds()
+
+# ----------------------------
+# 2) Settings
+# ----------------------------
+CRS = 'EPSG:3857'
+KM = 1000
+
+# Load the Oil and Gas Infrastructure dataset
+OGIM = ee.FeatureCollection('EDF/OGIM/current')
+
+# ----------------------------
+# 3) Process and rasterize (most recent data)
+# ----------------------------
+def process_data() -> ee.Image:
+    """
+    Filter OGIM features within South East Asia bounds, rasterize to 1km resolution.
+    Uses the most recent data available in the dataset.
+    """
+    # Filter to features within South East Asia bounds (no year filtering)
+    filtered = OGIM.filterBounds(region)
+    
+    # Rasterize the features - count density of infrastructure
+    # Add a constant numeric property for counting, then rasterize
+    filtered_with_count = filtered.map(lambda f: f.set('count', 1))
+    
+    rasterized = filtered_with_count.reduceToImage(
+        properties=['count'],
+        reducer=ee.Reducer.sum()  # sum of 1s = count of features
+    ).rename('infrastructure_count')
+    
+    # Alternatively, if you want presence/absence:
+    # rasterized = ee.Image().byte().paint(filtered, 1).rename('infrastructure_presence')
+    
+    # Reproject to 1km resolution
+    img = (
+        rasterized
+        .unmask(0)
+        .reproject(crs=CRS, scale=KM)
+        .clip(region)
+        .toFloat()
+    )
+    
+    return img
+
+# ----------------------------
+# 4) Process data (most recent)
+# ----------------------------
+print('Processing most recent data...')
+image = process_data()
+
+# (Optional) sanity print
+print('Sample bands:', image.bandNames().getInfo())
+print('Sample projection:', image.projection().getInfo())
+
+# ----------------------------
+# 5) Export to Google Drive (most recent data)
+# ----------------------------
+task = ee.batch.Export.image.toDrive(
+    image=image,
+    description='Oil_Gas_Infrastructure_SEA_1km',
+    folder='GEE_exports',                 # change or remove as you like
+    fileNamePrefix='Oil_Gas_Infrastructure_SEA_1km',
+    region=export_region,
+    crs=CRS,
+    scale=KM,
+    maxPixels=1e13
+)
+task.start()
+print('Export started:', task.id)
+
+print('\nExport task started.')
+print('Check progress at: https://code.earthengine.google.com/tasks')
+
+# ----------------------------
+# (Optional) Export to Cloud Storage instead of Drive
+# ----------------------------
+# task_gcs = ee.batch.Export.image.toCloudStorage(
+#     image=image,
+#     description='Oil_Gas_Infrastructure_SEA_1km_gcs',
+#     bucket='your-gcs-bucket',
+#     fileNamePrefix='gee/Oil_Gas_Infrastructure_SEA_1km',
+#     region=export_region,
+#     crs=CRS,
+#     scale=KM,
+#     maxPixels=1e13
+# )
+# task_gcs.start()
+# print('GCS export started:', task_gcs.id)
+

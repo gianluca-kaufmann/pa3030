@@ -8,8 +8,8 @@ from pathlib import Path
 def _resolve_core_script(region: str) -> Path:
     normalized = region.strip().lower()
     shared_dir = Path(__file__).resolve().parent
-    if normalized not in {"south_america", "usa"}:
-        raise ValueError("Unsupported region '{}'. Supported: south_america, usa".format(region))
+    if normalized not in {"south_america", "usa", "se_asia"}:
+        raise ValueError("Unsupported region '{}'. Supported: south_america, usa, se_asia".format(region))
     return shared_dir / "results_core.py"
 
 

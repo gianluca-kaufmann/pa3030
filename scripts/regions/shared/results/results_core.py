@@ -659,7 +659,7 @@ def create_comparison_table(
     repo_root: Path,
     scratch_root: Optional[Path],
 ) -> None:
-    """Side-by-side performance comparison table for South America and USA.
+    """Side-by-side performance comparison table for all configured regions.
 
     Reads the already-written metrics_table.csv for each region and produces
     a two-column PDF table + LaTeX file.  Gracefully skips if neither or only
@@ -686,6 +686,7 @@ def create_comparison_table(
     REGIONS = [
         ("south_america", "model1", "Model 1 (SA)"),
         ("usa",           "model2", "Model 2 (USA)"),
+        ("se_asia",       "model3", "Model 3 (SEA)"),
     ]
 
     def find_metrics_csv(region_slug: str, model_id: str) -> Optional[Path]:
@@ -733,7 +734,7 @@ def create_comparison_table(
     ax.axis('off')
 
     display_row_labels = [display for _, display in ROWS]
-    cell_text = [[r[1], r[2]] for r in table_rows]
+    cell_text = [r[1:] for r in table_rows]
     tbl = ax.table(
         cellText=cell_text,
         rowLabels=display_row_labels,
@@ -783,7 +784,7 @@ def create_comparison_table(
     latex_lines += [
         "\\bottomrule",
         "\\end{tabular}",
-        "\\caption{Cross-region performance comparison (Model 1: South America, Model 2: USA).}",
+        "\\caption{Cross-region performance comparison (Model 1: South America, Model 2: USA, Model 3: South East Asia).}",
         "\\label{tab:comparison}",
         "\\end{table}",
     ]

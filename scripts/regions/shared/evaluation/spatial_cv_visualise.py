@@ -78,6 +78,7 @@ COLOR_REF     = "#888888"   # grey dashed line — random-model reference
 REGION_BOUNDS: dict[str, tuple[float, float, float, float]] = {
     "south_america": (-85.0, -57.0, -32.0, 15.0),
     "usa":           (-130.0, 23.0, -64.0, 52.0),
+    "se_asia":       (90.0, -11.0, 145.0, 28.0),
 }
 
 # Short axis labels for biome names

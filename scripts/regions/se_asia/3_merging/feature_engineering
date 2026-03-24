@@ -1,0 +1,954 @@
+#!/usr/bin/env python3
+
+"""Spatial Features Preprocessing Script
+
+Purpose: Add lagged status, spatial-context features, and a transition target to the merged panel data,
+         then apply Risk Set filtering.
+
+Processing order (per year):
+    1. Lag feature:
+       - Create `WDPA_prev` by joining each (row, col) in year t with `WDPA_b1` from year t-1
+         (first year is set to 0). `WDPA_prev` is stored as `uint8`.
+    2. Spatial features computed on the FULL grid (before Risk Set filtering):
+       - Protected-area distance:
+         - Create `dist_wdpa` as the Euclidean distance (in meters) from each pixel to the nearest
+           pixel with `WDPA_prev > 0` (t-1 protection), using a distance transform. This uses t-1
+           status to avoid using the same-year target in the distance computation.
+       - Static-feature distance transforms (computed once on reference footprint, then merged):
+         - For `oil_gas_b1`, `powerplants_b1`, `road_infrastructure_b1`, build a binary mask
+           (NaN -> 0, >0 -> 1) and apply an Euclidean distance transform multiplied by 1000,
+           using the same logic as `dist_wdpa`. These are computed once on a reference footprint
+           (default: most recent year) and merged into all years by (row, col). The original binary
+           columns are dropped and replaced with distance columns: `dist_oil_gas`, `dist_powerplant`, `dist_road`.
+       - Static smoothed features (computed once on reference footprint, then merged):
+       - For `elevation_b1` and `elevation_b2` (slope), compute uniform-filter smoothing over
+          window sizes 4, 16, and 64 once on the reference footprint (same logic as the
+          time-varying smoothed layers). The resulting columns (`elevation_b1_smooth4`,
+          `elevation_b1_smooth16`, `elevation_b1_smooth64`, `elevation_b2_smooth4`,
+          `elevation_b2_smooth16`, `elevation_b2_smooth64`) are merged into all years by
+          (row, col). Raw `elevation_b1` and `elevation_b2` are kept unchanged. NaN counts
+          are logged after merge as a safety check.
+       - Smoothed (moving-average) features:
+         - For selected variables (e.g. `NDVI_b1`, `GPW_b1`, `HNTL_b1`, ...),
+           compute uniform-filter smoothing over window sizes 16 and 64, creating new columns like
+           `NDVI_b1_smooth16`, `NDVI_b1_smooth64` (and similarly for the other variables).
+    3. Risk Set filter:
+       - Keep only rows where `WDPA_prev == 0` (pixels not previously protected in t-1).
+    4. Target variable:
+       - Create `transition_01` as `WDPA_b1` for the filtered Risk Set (NaN treated as 0),
+         stored as `uint8`.
+
+Input:  data/se_asia/ml/merged_panel_2000_2024.parquet (or $SCRATCH path on Euler)
+Output: data/se_asia/ml/merged_panel_final.parquet (Risk Set only, with transition_01 column)
+
+Processing: Year-by-year for memory efficiency with 500M+ rows.
+Spatial features are computed before filtering to reflect the full landscape context, then Risk Set
+filtering reduces the output size. Intermediate per-year outputs are written to a temp directory and
+concatenated into the final parquet.
+"""
+
+from __future__ import annotations
+
+import gc
+import logging
+import os
+import time
+import warnings
+from pathlib import Path
+from typing import Tuple
+
+import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
+import wandb
+from scipy.ndimage import distance_transform_edt, uniform_filter
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger(__name__)
+warnings.filterwarnings('ignore')
+
+DISTANCE_DECAY_SCALE = 10000
+SMOOTH_VARIABLES = ['NDVI_b1', 'GPW_b1', 'HNTL_b1', 'deforestation_b1', 
+                     'wildfire_b1', 'GSN_b1', 'GSN_b2', 'GSN_b3', 'GSN_b4', 'GSN_b5']
+SMOOTH_SIZES = [16, 64]
+# Mapping from input column names to output distance column names
+STATIC_DISTANCE_MAPPING = {
+    'road_infrastructure_b1': 'dist_road',
+    'oil_gas_b1': 'dist_oil_gas',
+    'powerplants_b1': 'dist_powerplant',
+    'indigenous_territories_b1': 'dist_indigenous',
+}
+STATIC_SMOOTH_VARIABLES = ['elevation_b1', 'elevation_b2']
+STATIC_SMOOTH_SIZES = [4, 16, 64]
+
+# Known NoData sentinel values that weren't properly masked during preprocessing or merge.
+# These must be replaced with NaN BEFORE any smoothing or distance computation, because
+# uniform_filter treats sentinels as real values and contaminates spatial neighborhoods.
+#
+# Root causes:
+#   - HNTL: preprocessing doesn't pass src_nodata to reproject(), so -999 leaks through
+#   - WorldClim/powerplants: Int16 storage optimization loses NoData metadata when the
+#     scaled sentinel overflows Int16 range; unscaling (÷100) produces -327.68
+SENTINEL_RULES: dict[str, tuple[float, float]] = {
+    # column prefix -> (lower_bound, upper_bound): values in this range are sentinels
+    'HNTL':        (-1100.0, -100.0),   # source NoData = -999; valid range is 0–63
+    'WorldClim_':  (-340.0, -320.0),    # -32768 ÷ 100 ≈ -327.68; legit temps > -300 (×10)
+    'powerplants_': (-340.0, -320.0),   # same Int16 overflow pattern
+}
+
+
+def clean_sentinel_values(df: pd.DataFrame) -> pd.DataFrame:
+    """Replace known NoData sentinel values with NaN.
+
+    Some rasters have NoData sentinel values (e.g., -999 for HNTL, -32768 for Int16
+    datasets) that weren't masked during preprocessing or merge because the raster
+    metadata was missing or corrupted during dtype conversion.
+
+    This function catches them before smoothing/distance computation to prevent
+    contamination of derived features.
+    """
+    total_cleaned = 0
+    for col in df.columns:
+        for prefix, (lo, hi) in SENTINEL_RULES.items():
+            if col.startswith(prefix):
+                mask = (df[col] >= lo) & (df[col] <= hi)
+                n_sentinel = mask.sum()
+                if n_sentinel > 0:
+                    df.loc[mask, col] = np.nan
+                    total_cleaned += n_sentinel
+                    logger.warning(
+                        f"    Sentinel cleanup: {col} — {n_sentinel:,} values "
+                        f"in [{lo}, {hi}] replaced with NaN"
+                    )
+                break
+    if total_cleaned > 0:
+        logger.info(f"  Total sentinel values cleaned: {total_cleaned:,}")
+    else:
+        logger.info(f"  Sentinel check passed — no sentinel values found")
+    return df
+
+
+def reconstruct_grid(df: pd.DataFrame, value_col: str) -> Tuple[np.ndarray, int, int, int, int]:
+    """Reconstruct 2D grid from panel data."""
+    min_row, max_row = df['row'].min(), df['row'].max()
+    min_col, max_col = df['col'].min(), df['col'].max()
+    
+    grid = np.full((max_row - min_row + 1, max_col - min_col + 1), np.nan, dtype=np.float32)
+    grid[(df['row'] - min_row).values, (df['col'] - min_col).values] = df[value_col].values
+    
+    return grid, min_row, max_row, min_col, max_col
+
+
+def grid_to_dataframe(grid: np.ndarray, df: pd.DataFrame, min_row: int, min_col: int) -> pd.Series:
+    """Convert grid back to DataFrame format."""
+    values = grid[(df['row'] - min_row).values, (df['col'] - min_col).values]
+    return pd.Series(values, index=df.index)
+
+
+def compute_distance_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute distance to WDPA and decay features using WDPA_prev (t-1) to avoid target leakage."""
+    logger.info("  Computing distance features from WDPA_prev (t-1)...")
+    
+    wdpa_grid, min_row, max_row, min_col, max_col = reconstruct_grid(df, 'WDPA_prev')
+    wdpa_binary = np.where(np.isnan(wdpa_grid), 0, wdpa_grid > 0).astype(np.uint8)
+    del wdpa_grid
+    
+    distance_grid = distance_transform_edt(1 - wdpa_binary) * 1000  # pixels to meters
+    del wdpa_binary
+    
+    df['dist_wdpa'] = grid_to_dataframe(distance_grid, df, min_row, min_col)
+    del distance_grid
+    
+    return df
+
+
+def compute_static_distance_features_once(df_ref: pd.DataFrame, distance_mapping: dict[str, str] | None = None) -> pd.DataFrame:
+    """Compute static distance transforms once on a reference footprint.
+    
+    Returns a lookup DataFrame with columns: row, col, dist_road, dist_oil_gas, dist_powerplant.
+    This is computed once and merged into all years to avoid redundant computation.
+    """
+    logger.info("  Computing static distance transforms on reference footprint...")
+    
+    if distance_mapping is None:
+        distance_mapping = STATIC_DISTANCE_MAPPING
+    
+    lookup_df = df_ref[['row', 'col']].drop_duplicates().copy()
+    
+    for input_col, output_col in distance_mapping.items():
+        if input_col not in df_ref.columns:
+            logger.warning(f"    Column {input_col} not found, skipping...")
+            continue
+        
+        logger.info(f"    Processing {input_col} -> {output_col}...")
+        
+        # Reconstruct grid from the binary feature
+        feature_grid, min_row, max_row, min_col, max_col = reconstruct_grid(df_ref, input_col)
+        
+        # Convert to binary: NaN -> 0, >0 -> 1 (1 where feature exists)
+        feature_binary = np.where(np.isnan(feature_grid), 0, feature_grid > 0).astype(np.uint8)
+        del feature_grid
+        
+        # Compute distance transform using same logic as dist_wdpa:
+        # distance_transform_edt(1 - binary) gives distance to nearest 0 (feature location)
+        # This is equivalent to distance to nearest feature
+        distance_grid = distance_transform_edt(1 - feature_binary) * 1000  # pixels to meters
+        del feature_binary
+        
+        # Create distance column in lookup
+        lookup_df[output_col] = grid_to_dataframe(distance_grid, lookup_df, min_row, min_col)
+        del distance_grid
+        
+        gc.collect()
+    
+    return lookup_df
+
+
+def merge_static_distances(df: pd.DataFrame, static_lookup: pd.DataFrame, distance_mapping: dict[str, str] | None = None) -> pd.DataFrame:
+    """Merge precomputed static distance features and drop original binary columns."""
+    if distance_mapping is None:
+        distance_mapping = STATIC_DISTANCE_MAPPING
+    
+    # Merge static distances
+    df = df.merge(static_lookup, on=['row', 'col'], how='left')
+    
+    # Drop original binary columns if they exist
+    for input_col in distance_mapping.keys():
+        if input_col in df.columns:
+            df = df.drop(columns=[input_col])
+    
+    return df
+
+
+def compute_static_smooth_features_once(df_ref: pd.DataFrame, smooth_variables: list[str] | None = None) -> pd.DataFrame:
+    """Compute smoothed elevation/slope once on a reference footprint.
+
+    Returns a lookup DataFrame with columns: row, col, and *_smooth{4,16,64}.
+    This is computed once and merged into all years by (row, col).
+    """
+    logger.info("  Computing static smooth features on reference footprint...")
+
+    if smooth_variables is None:
+        smooth_variables = STATIC_SMOOTH_VARIABLES
+
+    lookup_df = df_ref[['row', 'col']].drop_duplicates().copy()
+
+    for variable in smooth_variables:
+        if variable not in df_ref.columns:
+            logger.warning(f"    Column {variable} not found, skipping...")
+            continue
+        for window_size in STATIC_SMOOTH_SIZES:
+            col_name = f"{variable}_smooth{window_size}"
+            logger.info(f"    Processing {col_name}...")
+            lookup_df[col_name] = compute_smooth_feature(df_ref, variable, window_size).values
+            gc.collect()
+
+    return lookup_df
+
+
+def merge_static_smooth(df: pd.DataFrame, smooth_lookup: pd.DataFrame) -> pd.DataFrame:
+    """Merge precomputed static smooth features and log NaN counts as safety check."""
+    df = df.merge(smooth_lookup, on=['row', 'col'], how='left')
+
+    smooth_cols = [c for c in smooth_lookup.columns if c not in ('row', 'col')]
+    for col in smooth_cols:
+        n_nan = df[col].isna().sum()
+        if n_nan > 0:
+            logger.warning(f"    {col}: {n_nan:,} NaN values after merge")
+        else:
+            logger.info(f"    {col}: 0 NaN values after merge")
+
+    return df
+
+
+def compute_smooth_feature(df: pd.DataFrame, variable: str, window_size: int) -> pd.Series:
+    """Compute smoothed feature with given window size."""
+    grid, min_row, max_row, min_col, max_col = reconstruct_grid(df, variable)
+    valid_mask = ~np.isnan(grid)
+    grid_filled = np.where(np.isnan(grid), 0, grid)
+    del grid
+    
+    smoothed = uniform_filter(grid_filled, size=window_size, mode='reflect')
+    del grid_filled
+    
+    count = uniform_filter(valid_mask.astype(np.float32), size=window_size, mode='reflect')
+    del valid_mask
+    
+    smoothed = np.where(count > 0, smoothed / count, np.nan)
+    del count
+    
+    result = grid_to_dataframe(smoothed, df, min_row, min_col)
+    del smoothed
+    
+    return result
+
+
+def compute_all_smooth_features(df: pd.DataFrame, smooth_variables: list[str] | None = None) -> pd.DataFrame:
+    """Compute all smoothed features."""
+    logger.info("  Computing smoothed features...")
+    
+    if smooth_variables is None:
+        smooth_variables = SMOOTH_VARIABLES
+    
+    for variable in smooth_variables:
+        if variable not in df.columns:
+            continue
+        for window_size in SMOOTH_SIZES:
+            df[f"{variable}_smooth{window_size}"] = compute_smooth_feature(df, variable, window_size)
+            gc.collect()
+    
+    return df
+
+
+def compute_lag_feature(
+    input_path: Path,
+    year: int,
+    source_col: str,
+    output_col: str,
+    fill_value: float | int | None = None,
+) -> pd.DataFrame:
+    """Compute a generic 1-year lag feature for a given column."""
+    logger.info(f"  Computing lag feature ({output_col}) for year {year} using column '{source_col}'...")
+    
+    # Read minimal columns for current year
+    df_curr = pd.read_parquet(
+        input_path, 
+        columns=['row', 'col', 'year'],
+        filters=[('year', '==', year)]
+    )
+    
+    # Read minimal columns for previous year
+    df_prev = pd.read_parquet(
+        input_path,
+        columns=['row', 'col', 'year', source_col],
+        filters=[('year', '==', year - 1)]
+    )
+    
+    # Rename for join
+    df_prev = df_prev.rename(columns={source_col: output_col})
+    df_prev = df_prev.drop(columns=['year'])
+    
+    # Merge on spatial coordinates
+    df_merged = df_curr.merge(df_prev, on=['row', 'col'], how='left')
+    
+    if fill_value is not None:
+        # Fill missing where requested (e.g., WDPA_prev = 0)
+        df_merged[output_col] = df_merged[output_col].fillna(fill_value)
+    
+    # Keep only the new column
+    result = df_merged[['row', 'col', output_col]].copy()
+    
+    del df_curr, df_prev, df_merged
+    gc.collect()
+    
+    return result
+
+
+def process_year(
+    input_path: Path,
+    year: int,
+    temp_dir: Path,
+    is_first_year: bool,
+    static_lookup: pd.DataFrame,
+    smooth_lookup: pd.DataFrame,
+    distance_mapping: dict[str, str] | None = None,
+    smooth_time_vars: list[str] | None = None,
+    wdpa_col: str = 'WDPA_b1',
+    economic_value_col: str | None = None,
+) -> tuple[Path | None, dict]:
+    """Process a single year and return temp file path + metrics."""
+    start_time = time.time()
+    logger.info(f"\nProcessing year {year}...")
+    
+    df_year = pd.read_parquet(input_path, filters=[('year', '==', year)], engine='pyarrow')
+    n_rows_initial = len(df_year)
+    logger.info(f"  Loaded {n_rows_initial:,} rows")
+    
+    if n_rows_initial == 0:
+        return None, {}
+    
+    # Step 0: Clean sentinel values BEFORE any spatial computation
+    df_year = clean_sentinel_values(df_year)
+    
+    # Step 1: Add WDPA_prev (1-year lag)
+    if not is_first_year:
+        df_lag = compute_lag_feature(
+            input_path,
+            year,
+            source_col=wdpa_col,
+            output_col='WDPA_prev',
+            fill_value=0,
+        )
+        df_year = df_year.merge(df_lag, on=['row', 'col'], how='left')
+        n_nan_prev = df_year['WDPA_prev'].isna().sum()
+        if n_nan_prev > 0:
+            logger.warning(f"  Found {n_nan_prev:,} NaN values in WDPA_prev, filling with 0")
+        df_year['WDPA_prev'] = df_year['WDPA_prev'].fillna(0).astype(np.uint8)
+        del df_lag
+        gc.collect()
+    else:
+        logger.info(f"  First year {year}: setting WDPA_prev = 0")
+        df_year['WDPA_prev'] = np.uint8(0)
+
+    # Step 1b: Add lagged economic value and drop contemporaneous value to avoid simultaneity
+    if economic_value_col is not None:
+        if not is_first_year:
+            df_econ_lag = compute_lag_feature(
+                input_path,
+                year,
+                source_col=economic_value_col,
+                output_col='economic_value_lag1',
+                fill_value=None,
+            )
+            df_year = df_year.merge(df_econ_lag, on=['row', 'col'], how='left')
+            del df_econ_lag
+            gc.collect()
+        else:
+            # Keep dtype stable across years to avoid Parquet schema mismatch.
+            df_year['economic_value_lag1'] = np.float32(np.nan)
+
+        # Enforce one dtype for all yearly temp files (year_2000 + later years).
+        df_year['economic_value_lag1'] = df_year['economic_value_lag1'].astype(np.float32)
+
+        if economic_value_col in df_year.columns:
+            df_year = df_year.drop(columns=[economic_value_col])
+    
+    # Step 2: Compute spatial features on FULL grid (before Risk Set filtering)
+    logger.info(f"  Computing spatial features on full grid ({n_rows_initial:,} rows)...")
+    df_year = compute_distance_features(df_year)
+    df_year = merge_static_distances(df_year, static_lookup, distance_mapping)
+    df_year = merge_static_smooth(df_year, smooth_lookup)
+    df_year = compute_all_smooth_features(df_year, smooth_time_vars)
+    
+    # Step 3: Apply Risk Set filter (keep only WDPA_prev == 0)
+    df_year = df_year[df_year['WDPA_prev'] == 0].copy()
+    n_rows_filtered = len(df_year)
+    logger.info(f"  Risk Set filter: {n_rows_filtered:,} rows (kept {100*n_rows_filtered/n_rows_initial:.1f}%)")
+    
+    if n_rows_filtered == 0:
+        logger.warning(f"  No rows remaining after Risk Set filter for year {year}")
+        return None, {}
+    
+    # Step 4: Create transition_01 = WDPA column (since WDPA_prev guaranteed to be 0)
+    # Handle NaN values: treat missing WDPA status as not protected (0)
+    wdpa_values = df_year[wdpa_col].fillna(0)
+    n_nan = df_year[wdpa_col].isna().sum()
+    if n_nan > 0:
+        logger.warning(f"  Found {n_nan:,} NaN values in {wdpa_col}, filling with 0")
+    df_year['transition_01'] = wdpa_values.astype(np.uint8)
+    
+    temp_file = temp_dir / f"year_{year}_processed.parquet"
+    df_year.to_parquet(temp_file, engine='pyarrow', compression='snappy', index=False)
+    
+    del df_year
+    gc.collect()
+    
+    elapsed = time.time() - start_time
+    logger.info(f"  Year {year} complete in {elapsed:.1f}s")
+    
+    return temp_file, {
+        "year": year, 
+        "rows_initial": n_rows_initial,
+        "rows_filtered": n_rows_filtered,
+        "filter_ratio": n_rows_filtered / n_rows_initial,
+        "time_seconds": elapsed
+    }
+
+
+def validate_upstream_data(input_path: Path, wdpa_col: str, smooth_vars: list[str],
+                           sample_year: int | None = None) -> dict:
+    """Validate upstream merged panel data for critical quality issues.
+
+    Reads a single year's data (default: most recent) and checks for
+    all-NaN columns that would silently break downstream processing.
+
+    Returns a dict of column -> {total, nan_count, nan_pct, ok}.
+    Raises RuntimeError if WDPA is completely NaN (model would be useless).
+    """
+    logger.info("\n" + "=" * 80)
+    logger.info("UPSTREAM DATA VALIDATION")
+    logger.info("=" * 80)
+
+    if sample_year is None:
+        yrs = pd.read_parquet(input_path, columns=['year'])
+        sample_year = int(yrs['year'].max())
+        del yrs
+        gc.collect()
+    logger.info(f"  Sampling year {sample_year} for data-quality checks...")
+
+    check_cols = ['row', 'col', wdpa_col] + [v for v in smooth_vars if v not in ('row', 'col', wdpa_col)]
+    schema_names = set(pq.read_schema(input_path).names)
+    check_cols = [c for c in check_cols if c in schema_names]
+
+    df_check = pd.read_parquet(
+        input_path, columns=check_cols,
+        filters=[('year', '==', sample_year)], engine='pyarrow',
+    )
+
+    n = len(df_check)
+    logger.info(f"  Sample year {sample_year}: {n:,} rows")
+    if n == 0:
+        raise RuntimeError(
+            f"Year {sample_year} returned 0 rows from the merged panel.\n"
+            f"The upstream merge step may have failed."
+        )
+
+    report: dict[str, dict] = {}
+    for col in check_cols:
+        if col in ('row', 'col'):
+            continue
+        n_nan = int(df_check[col].isna().sum())
+        pct = 100.0 * n_nan / n if n else 0.0
+        ok = pct < 99.0
+        report[col] = {"total": n, "nan_count": n_nan, "nan_pct": pct, "ok": ok}
+        status = "OK" if ok else "BROKEN"
+        logger.info(f"    {col}: {n_nan:,}/{n:,} NaN ({pct:.1f}%) — {status}")
+
+    logger.info(f"  row range: [{df_check['row'].min()}, {df_check['row'].max()}]")
+    logger.info(f"  col range: [{df_check['col'].min()}, {df_check['col'].max()}]")
+
+    del df_check
+    gc.collect()
+
+    if wdpa_col in report and not report[wdpa_col]["ok"]:
+        raise RuntimeError(
+            f"\n{'=' * 80}\n"
+            f"CRITICAL: '{wdpa_col}' is {report[wdpa_col]['nan_pct']:.1f}% NaN "
+            f"in the merged panel (year {sample_year}).\n"
+            f"This means the upstream merge step did NOT write valid WDPA data.\n\n"
+            f"Likely causes:\n"
+            f"  1. The WDPA rasters are not aligned with the backbone raster.\n"
+            f"  2. The WDPA raster files are missing or corrupt in the data/se_asia/ready/WDPA/ directory.\n"
+            f"  3. The WDPA raster nodata value is set to 0, causing all 'not protected'\n"
+            f"     pixels to be treated as nodata and converted to NaN.\n\n"
+            f"Fix: Re-export WDPA using the SAME boundary dataset as the backbone,\n"
+            f"     or re-run the merge step after ensuring raster alignment.\n"
+            f"{'=' * 80}"
+        )
+
+    broken_smooth = [col for col in smooth_vars if col in report and not report[col]["ok"]]
+    if broken_smooth:
+        logger.warning(
+            f"  WARNING: Static smooth variables {broken_smooth} are ≥99% NaN.\n"
+            f"  Smooth features will be all NaN.\n"
+            f"  This is likely the same upstream raster-alignment issue as WDPA."
+        )
+
+    return report
+
+
+def validate_smooth_lookup(smooth_lookup: pd.DataFrame, df_ref: pd.DataFrame,
+                           input_path: Path | None = None,
+                           sample_year: int | None = None) -> None:
+    """Validate that the smooth lookup is usable: non-empty, has data, and keys match."""
+    logger.info("  Validating smooth lookup...")
+
+    smooth_cols = [c for c in smooth_lookup.columns if c not in ('row', 'col')]
+    n_lookup = len(smooth_lookup)
+
+    logger.info(f"    Lookup rows: {n_lookup:,}")
+    logger.info(f"    Lookup columns: {smooth_cols}")
+    logger.info(f"    Lookup row range: [{smooth_lookup['row'].min()}, {smooth_lookup['row'].max()}]")
+    logger.info(f"    Lookup col range: [{smooth_lookup['col'].min()}, {smooth_lookup['col'].max()}]")
+
+    if n_lookup == 0:
+        logger.error("    Smooth lookup is EMPTY — no static smooth features will be produced.")
+        return
+
+    for col in smooth_cols:
+        n_nan = int(smooth_lookup[col].isna().sum())
+        pct = 100.0 * n_nan / n_lookup if n_lookup else 0.0
+        status = "OK" if pct < 99.0 else "ALL NaN"
+        logger.info(f"    {col}: {n_nan:,}/{n_lookup:,} NaN ({pct:.1f}%) — {status}")
+
+    if input_path is not None and sample_year is not None:
+        df_sample = pd.read_parquet(
+            input_path, columns=['row', 'col'],
+            filters=[('year', '==', sample_year)], engine='pyarrow',
+        )
+        n_sample = len(df_sample)
+        if n_sample > 0:
+            lookup_keys = set(zip(smooth_lookup['row'], smooth_lookup['col']))
+            sample_keys = set(zip(df_sample['row'], df_sample['col']))
+            overlap = len(lookup_keys & sample_keys)
+            overlap_pct = 100.0 * overlap / n_sample
+            logger.info(f"    (row, col) overlap with year {sample_year}: "
+                        f"{overlap:,}/{n_sample:,} ({overlap_pct:.1f}%)")
+            if overlap_pct < 1.0:
+                logger.error(
+                    f"    CRITICAL: <1% (row,col) overlap between smooth lookup "
+                    f"(from reference year) and year {sample_year} data!\n"
+                    f"    Lookup row range: [{smooth_lookup['row'].min()}, {smooth_lookup['row'].max()}]\n"
+                    f"    Year {sample_year} row range: [{df_sample['row'].min()}, {df_sample['row'].max()}]\n"
+                    f"    This means the merge by (row, col) will produce 100% NaN.\n"
+                    f"    Likely cause: the reference footprint was built on a different grid."
+                )
+        del df_sample
+        gc.collect()
+
+
+def main() -> None:
+    """Main processing function."""
+    repo_root = Path(__file__).resolve().parents[4]
+    scratch_root = Path(os.environ["SCRATCH"]) if "SCRATCH" in os.environ else None
+
+    # Resolve input path with sensible defaults:
+    #  1) Explicit override via env var SPATIAL_FEATURES_INPUT_PATH
+    #  2) Common Euler location on $SCRATCH
+    #  3) Fallback to local repo path (original behaviour)
+    env_input = os.environ.get("SPATIAL_FEATURES_INPUT_PATH")
+    if env_input:
+        input_path = Path(env_input)
+        logger.info(f"Using input path from environment variable: {input_path}")
+    else:
+        candidate_paths = []
+        if scratch_root is not None:
+            candidate_paths.append(
+                scratch_root / "outputs/se_asia/results/merged_panel_2000_2024.parquet"
+            )
+            candidate_paths.append(
+                scratch_root / "data/se_asia/ml/merged_panel_2000_2024.parquet"
+            )
+        candidate_paths.append(
+            repo_root / "data/se_asia/ml/merged_panel_2000_2024.parquet"
+        )
+
+        # Default to the last candidate (original local path) if none exist
+        input_path = candidate_paths[-1]
+        for cand in candidate_paths:
+            if cand.exists():
+                input_path = cand
+                logger.info(f"Auto-detected input file: {input_path}")
+                break
+
+    # On clusters, write large outputs to $SCRATCH; locally keep them under the repo
+    if scratch_root is not None:
+        base_ml_dir = scratch_root / "data/se_asia/ml"
+    else:
+        base_ml_dir = repo_root / "data/se_asia/ml"
+
+    output_path = base_ml_dir / "merged_panel_final.parquet"
+    temp_dir = base_ml_dir / ".temp_spatial_features"
+    
+    # Initialize W&B
+    wandb.init(
+        project="ml-preprocessing-spatial",
+        name="spatial_features_preprocessing",
+        config={
+            "distance_decay_scale": DISTANCE_DECAY_SCALE,
+            "smooth_variables": SMOOTH_VARIABLES,
+            "smooth_sizes": SMOOTH_SIZES,
+            "static_distance_mapping": STATIC_DISTANCE_MAPPING,
+            "static_smooth_variables": STATIC_SMOOTH_VARIABLES,
+            "static_smooth_sizes": STATIC_SMOOTH_SIZES,
+        }
+    )
+    
+    logger.info("="*80)
+    logger.info("SPATIAL FEATURES PREPROCESSING")
+    logger.info("="*80)
+    logger.info(f"Input:  {input_path}")
+    logger.info(f"Output: {output_path}")
+    
+    # Validate input file exists and is readable
+    if not input_path.exists():
+        raise FileNotFoundError(
+            f"Input file not found: {input_path}\n"
+            f"Please ensure the merged panel data exists or set SPATIAL_FEATURES_INPUT_PATH environment variable."
+        )
+    
+    # Validate input file is not empty and has expected structure
+    try:
+        input_size_mb = input_path.stat().st_size / (1024**2)
+        logger.info(f"Input file size: {input_size_mb:.1f} MB")
+        if input_size_mb < 0.1:
+            raise ValueError(f"Input file is suspiciously small ({input_size_mb:.2f} MB)")
+    except Exception as e:
+        raise RuntimeError(f"Failed to validate input file: {e}")
+    
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Get metadata and validate required columns
+    logger.info("Reading metadata and validating structure...")
+    
+    # Check that all required columns are present
+    schema = pq.read_schema(input_path)
+    available_cols = set(schema.names)
+    logger.info(f"Available columns in input: {sorted(available_cols)}")
+    
+    # --- Resolve WDPA column name against actual schema ---
+    # The merge step may name the WDPA column differently depending on raster structure:
+    #   - Multi-band raster  ->  'WDPA_b1'
+    #   - Single-band raster ->  'WDPA'
+    if 'WDPA_b1' in available_cols:
+        wdpa_col = 'WDPA_b1'
+    elif 'WDPA' in available_cols:
+        wdpa_col = 'WDPA'
+        logger.info("  Column 'WDPA_b1' not found; using 'WDPA' instead")
+    else:
+        raise ValueError(
+            f"Input file is missing WDPA column (looked for 'WDPA_b1' and 'WDPA').\n"
+            f"Available columns: {schema.names}"
+        )
+    
+    required_cols = ['year', 'row', 'col', wdpa_col]
+    missing_cols = [col for col in required_cols if col not in available_cols]
+    if missing_cols:
+        raise ValueError(
+            f"Input file is missing required columns: {missing_cols}\n"
+            f"Available columns: {schema.names}\n"
+            f"Expected format: merged panel data with year, row, col, and WDPA column."
+        )
+    
+    # --- Resolve STATIC_SMOOTH_VARIABLES against actual schema ---
+    # The merge step may name columns differently depending on raster structure:
+    #   - Separate single-band rasters  ->  'elevation', 'slope'
+    #   - Combined multi-band raster    ->  'elevation_b1', 'elevation_b2'  (b2 = slope)
+    resolved_smooth_vars: list[str] = []
+    for var in STATIC_SMOOTH_VARIABLES:
+        if var in available_cols:
+            resolved_smooth_vars.append(var)
+        elif f"{var}_b1" in available_cols:
+            logger.info(f"  Column '{var}' not found; using '{var}_b1' instead")
+            resolved_smooth_vars.append(f"{var}_b1")
+        else:
+            # Check for the SA pattern: elevation_b1/elevation_b2 when we expected elevation/slope
+            logger.warning(f"  Column '{var}' not found in schema — skipping static smooth for it")
+    
+    # Special case: if 'slope' is missing but 'elevation_b2' exists, map it
+    if 'slope' in STATIC_SMOOTH_VARIABLES and 'slope' not in available_cols and 'elevation_b2' in available_cols:
+        if 'elevation_b2' not in resolved_smooth_vars:
+            logger.info("  Column 'slope' not found; using 'elevation_b2' (slope) instead")
+            resolved_smooth_vars.append('elevation_b2')
+    
+    if resolved_smooth_vars != list(STATIC_SMOOTH_VARIABLES):
+        logger.info(f"  Resolved STATIC_SMOOTH_VARIABLES: {STATIC_SMOOTH_VARIABLES} -> {resolved_smooth_vars}")
+    
+    # --- Resolve STATIC_DISTANCE_MAPPING against actual schema ---
+    resolved_distance_mapping: dict[str, str] = {}
+    for input_col, output_col in STATIC_DISTANCE_MAPPING.items():
+        if input_col in available_cols:
+            resolved_distance_mapping[input_col] = output_col
+        elif input_col.endswith('_b1'):
+            # Try base name without _b1 suffix (single-band raster naming)
+            base_name = input_col[:-3]
+            if base_name in available_cols:
+                logger.info(f"  Column '{input_col}' not found; using '{base_name}' instead for '{output_col}'")
+                resolved_distance_mapping[base_name] = output_col
+            else:
+                logger.warning(f"  Column '{input_col}' (and '{base_name}') not found in schema — skipping distance feature '{output_col}'")
+        else:
+            logger.warning(f"  Column '{input_col}' not found in schema — skipping distance feature '{output_col}'")
+    
+    if resolved_distance_mapping != STATIC_DISTANCE_MAPPING:
+        logger.info(f"  Resolved STATIC_DISTANCE_MAPPING: {resolved_distance_mapping}")
+    
+    # --- Resolve SMOOTH_VARIABLES against actual schema ---
+    resolved_smooth_time_vars: list[str] = []
+    for var in SMOOTH_VARIABLES:
+        if var in available_cols:
+            resolved_smooth_time_vars.append(var)
+        elif var.endswith('_b1'):
+            # Try base name without _b1 suffix (single-band raster naming)
+            base_name = var[:-3]
+            if base_name in available_cols:
+                logger.info(f"  Column '{var}' not found; using '{base_name}' instead")
+                resolved_smooth_time_vars.append(base_name)
+            else:
+                logger.warning(f"  Column '{var}' (and '{base_name}') not found in schema — skipping time-varying smooth for it")
+        else:
+            logger.warning(f"  Column '{var}' not found in schema — skipping time-varying smooth for it")
+    
+    if resolved_smooth_time_vars != list(SMOOTH_VARIABLES):
+        logger.info(f"  Resolved SMOOTH_VARIABLES: {resolved_smooth_time_vars}")
+
+    # Resolve economic value column for lagged feature creation (and dropping contemporaneous value)
+    economic_value_col: str | None = None
+    for candidate in ['economic_value_b1', 'economic_value']:
+        if candidate in available_cols:
+            economic_value_col = candidate
+            logger.info(f"  Economic value column detected: {economic_value_col} (will create economic_value_lag1)")
+            break
+    
+    df_sample = pd.read_parquet(input_path, columns=['year'])
+    years = sorted(df_sample['year'].unique())
+    total_rows = len(df_sample)
+    logger.info(f"Years: {years[0]}-{years[-1]} ({len(years)} years), Total rows: {total_rows:,}")
+    logger.info(f"Validation passed: Input file has correct structure")
+    del df_sample
+    gc.collect()
+    
+    wandb.log({"total_years": len(years), "total_rows": total_rows})
+    
+    # ---- Upstream data quality check (fail fast on broken data) ----
+    upstream_report = validate_upstream_data(
+        input_path, wdpa_col, resolved_smooth_vars, sample_year=years[-1]
+    )
+    
+    # Precompute static distance features once on reference footprint
+    logger.info("\n" + "="*80)
+    logger.info("Precomputing static distance features on reference footprint...")
+    logger.info("="*80)
+    
+    # Determine reference year (prefer 2024, fallback to most recent year)
+    ref_year = max(years) if years else None
+    if ref_year is None:
+        raise ValueError("No years found in input data")
+    
+    logger.info(f"Using year {ref_year} as reference footprint for static distances")
+    
+    # Load reference year data (columns needed for static distance + static smooth computation)
+    static_cols = ['row', 'col'] + list(resolved_distance_mapping.keys()) + resolved_smooth_vars
+    # Deduplicate while preserving order
+    static_cols = list(dict.fromkeys(static_cols))
+    logger.info(f"  Static columns to load: {static_cols}")
+    
+    df_ref = pd.read_parquet(
+        input_path, 
+        columns=static_cols,
+        filters=[('year', '==', ref_year)],
+        engine='pyarrow'
+    )
+    
+    if df_ref.empty:
+        logger.warning(f"Reference year {ref_year} is empty, trying union of all years...")
+        # Fallback: use union of all years
+        df_ref = pd.read_parquet(
+            input_path,
+            columns=static_cols,
+            engine='pyarrow'
+        )
+        df_ref = df_ref[['row', 'col'] + [c for c in static_cols if c in df_ref.columns]].drop_duplicates(subset=['row', 'col'])
+        logger.info(f"Using union footprint: {len(df_ref):,} unique pixels")
+    
+    # Clean sentinel values in reference data before computing static features
+    df_ref = clean_sentinel_values(df_ref)
+    
+    logger.info(f"  Reference footprint: {len(df_ref):,} pixels")
+    logger.info(f"  Reference row range: [{df_ref['row'].min()}, {df_ref['row'].max()}]")
+    logger.info(f"  Reference col range: [{df_ref['col'].min()}, {df_ref['col'].max()}]")
+    
+    # Compute static distances once (using resolved mapping)
+    static_lookup = compute_static_distance_features_once(df_ref, resolved_distance_mapping)
+    logger.info(f"  Computed static distances for {len(static_lookup):,} pixels")
+
+    # Compute static smooth features once (using resolved variables)
+    smooth_lookup = compute_static_smooth_features_once(df_ref, resolved_smooth_vars)
+    logger.info(f"  Computed static smooth features for {len(smooth_lookup):,} pixels")
+
+    # Validate the smooth lookup before using it
+    first_non_ref_year = years[0] if years[0] != ref_year else (years[1] if len(years) > 1 else years[0])
+    validate_smooth_lookup(
+        smooth_lookup, df_ref,
+        input_path=input_path, sample_year=first_non_ref_year,
+    )
+
+    del df_ref
+    gc.collect()
+    
+    # Process year by year
+    temp_files = []
+    total_rows_initial = 0
+    total_rows_filtered = 0
+    
+    for i, year in enumerate(years):
+        try:
+            is_first_year = (i == 0)
+            temp_file, metrics = process_year(
+                input_path, year, temp_dir, is_first_year,
+                static_lookup, smooth_lookup,
+                distance_mapping=resolved_distance_mapping,
+                smooth_time_vars=resolved_smooth_time_vars,
+                wdpa_col=wdpa_col,
+                economic_value_col=economic_value_col,
+            )
+            if temp_file is not None:
+                temp_files.append(temp_file)
+                wandb.log(metrics)
+                if 'rows_initial' in metrics:
+                    total_rows_initial += metrics['rows_initial']
+                    total_rows_filtered += metrics['rows_filtered']
+        except Exception as e:
+            logger.error(f"Error processing year {year}: {e}")
+            for tf in temp_files:
+                if tf.exists():
+                    tf.unlink()
+            if temp_dir.exists() and not list(temp_dir.iterdir()):
+                temp_dir.rmdir()
+            wandb.finish(exit_code=1)
+            raise
+    
+    # Clean up static lookups
+    del static_lookup, smooth_lookup
+    gc.collect()
+    
+    # Combine all years using streaming
+    logger.info("\n" + "="*80)
+    logger.info(f"Combining {len(temp_files)} files (streaming)...")
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    writer = None
+    total_rows_written = 0
+    concat_start = time.time()
+    
+    for i, temp_file in enumerate(temp_files):
+        logger.info(f"  [{i+1}/{len(temp_files)}] {temp_file.name}...")
+        table = pq.read_table(temp_file)
+        total_rows_written += len(table)
+        
+        if writer is None:
+            logger.info(f"  Initializing output ({len(table.column_names)} columns)...")
+            writer = pq.ParquetWriter(output_path, table.schema, compression='snappy')
+        
+        writer.write_table(table)
+        del table
+        gc.collect()
+        
+        wandb.log({"concatenation_progress": (i + 1) / len(temp_files)})
+    
+    if writer is None:
+        raise RuntimeError("No data was written!")
+    
+    writer.close()
+    concat_time = time.time() - concat_start
+    logger.info(f"  Wrote {total_rows_written:,} rows in {concat_time:.1f}s")
+    
+    # Clean up temp files
+    logger.info("\nCleaning up temp files...")
+    for temp_file in temp_files:
+        temp_file.unlink()
+    if temp_dir.exists() and not list(temp_dir.iterdir()):
+        temp_dir.rmdir()
+    
+    # Summary
+    file_size_mb = output_path.stat().st_size / (1024**2)
+    schema = pq.read_schema(output_path)
+    new_cols = [c for c in schema.names if c.startswith('dist_') or '_smooth' in c]
+    filter_ratio = total_rows_filtered / total_rows_initial if total_rows_initial > 0 else 0
+    
+    logger.info("\n" + "="*80)
+    logger.info("SUMMARY")
+    logger.info("="*80)
+    logger.info(f"Initial rows:   {total_rows_initial:,}")
+    logger.info(f"Filtered rows:  {total_rows_filtered:,} ({100*filter_ratio:.1f}% kept)")
+    logger.info(f"Risk Set filter removed: {total_rows_initial - total_rows_filtered:,} already-protected pixels")
+    logger.info(f"New columns: {len(new_cols)}")
+    logger.info(f"File size: {file_size_mb:.1f} MB")
+    logger.info("Processing complete!")
+    
+    wandb.log({
+        "initial_rows": total_rows_initial,
+        "final_rows": total_rows_filtered,
+        "filter_ratio": filter_ratio,
+        "rows_removed": total_rows_initial - total_rows_filtered,
+        "new_columns": len(new_cols),
+        "file_size_mb": file_size_mb,
+        "concatenation_time_seconds": concat_time
+    })
+    wandb.finish()
+
+
+if __name__ == "__main__":
+    main()
+

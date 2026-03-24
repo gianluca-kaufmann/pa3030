@@ -31,15 +31,15 @@ def run_region_forward(
     Parameters
     ----------
     region:
-        "south_america" or "usa"
+        "south_america", "usa", or "se_asia"
     stage:
         One of "coverage_baseline", "features", "predict", "results", "backtest"
     model_type:
         "lgbm" (default) or "rf"
     """
     normalized = region.strip().lower()
-    if normalized not in {"south_america", "usa"}:
-        raise ValueError("Unsupported region '{}'. Supported: south_america, usa".format(region))
+    if normalized not in {"south_america", "usa", "se_asia"}:
+        raise ValueError("Unsupported region '{}'. Supported: south_america, usa, se_asia".format(region))
     stage = stage.strip().lower()
     if stage not in _VALID_STAGES:
         raise ValueError(

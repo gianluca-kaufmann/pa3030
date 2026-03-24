@@ -1,0 +1,1660 @@
+#!/usr/bin/env python3
+"""LGBM Transition Model for Continent Dataset (5-Year Lookahead Prediction)
+Train LightGBM on pre-split parquet files. Final model trained on train+earlystop,
+using average best_iteration from CV folds (no early stopping), evaluated on test.
+Target: transition_01_win5 (1 if transition occurs within next 5 years, else 0)
+
+Features:
+- Temporal Cross-Validation: 3 folds with different train/earlystop year splits
+- Final Model: Uses average best_iteration from CV folds (no early stopping)
+- Time-based Sample Weighting: Later training years get higher weights
+  (Year 2000: weight 0.5, Year MAX: weight 1.0, linear interpolation in between)
+- Right-Censoring Protection: Earlystop and test data filtered to LAST_LABEL_YEAR
+  (LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS) to avoid evaluating on
+  labels that don't have complete 5-year lookahead information
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import os
+import sys
+import time
+import pickle
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any, Optional
+
+import numpy as np
+import pandas as pd
+try:
+    import wandb
+except ImportError:
+    wandb = None
+import pyarrow as pa
+import pyarrow.parquet as pq
+from sklearn.metrics import roc_auc_score, average_precision_score
+
+
+# ── Shared utility imports ────────────────────────────────────────────────────
+from scripts.regions.shared.training.utils import (  # noqa: E402
+    Tee,
+    get_repo_root,
+    report_memory_usage,
+    convert_numpy_types,
+    compute_precision_at_k,
+    extract_features_pyarrow_to_numpy,
+    compute_metrics,
+    compute_year_weights,
+    check_year_overlap,
+)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# Configuration
+RANDOM_STATE = 42
+EXCLUDE_COLS = {'transition_01', 'transition_01_win5', 'WDPA_b1', 'WDPA_prev', 'x', 'y', 'row', 'col', 'year'}
+TARGET_COL = "transition_01_win5"  # 5-year lookahead target
+LOOKAHEAD_YEARS = 5  # Number of years ahead for prediction
+WDPA_LAST_YEAR = 2024  # Last year with WDPA data
+LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS  # Last year we can reliably label (2019)
+TRAIN_YEARS = (2001, 2016)   # Train: 2001-2016 (excludes 2000 — stock PAs, not true transitions)
+EARLYSTOP_YEARS = (2014, min(2016, LAST_LABEL_YEAR))     # Earlystop: 2014-2016 (matches modelC main split)
+TEST_START = 2017
+TEST_END = 2019
+TEST_YEARS = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))    # Test: 2017-2019 (matches modelC main split)
+FIXED_PARAMS = {'random_state': RANDOM_STATE, 'boosting_type': 'gbdt', 'objective': 'binary', 'verbose': -1}
+
+# Batch size for data loading (can be overridden via BATCH_SIZE env var)
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "200000"))
+
+# Temporal Cross-Validation Folds
+# Matches modelC CV folds exactly (scale-up only)
+CV_FOLDS = [
+    ((2001, 2008), (2009, min(2011, LAST_LABEL_YEAR))),  # Fold 1: Train 2001-2008 → Earlystop 2009-2011
+    ((2001, 2011), (2012, min(2013, LAST_LABEL_YEAR))),  # Fold 2: Train 2001-2011 → Earlystop 2012-2013
+    ((2001, 2013), (2014, min(2016, LAST_LABEL_YEAR))),  # Fold 3: Train 2001-2013 → Earlystop 2014-2016
+]
+
+# Utility Functions
+
+def get_num_threads() -> int:
+    """Get thread count from SLURM (fallback to os.cpu_count())."""
+    slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+    if slurm_cpus:
+        try:
+            n = int(slurm_cpus)
+            if n > 0:
+                return n
+        except ValueError:
+            pass
+    return max(1, os.cpu_count() or 1)
+
+
+def configure_threading_env(num_threads: int) -> None:
+    """Set BLAS/OMP thread env vars (must be called before importing LightGBM)."""
+    n = str(max(1, int(num_threads)))
+    for k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[k] = n
+
+
+# Configure threading from SLURM before importing LightGBM
+NUM_THREADS = get_num_threads()
+configure_threading_env(NUM_THREADS)
+
+# Import LightGBM only after thread env vars are set
+import lightgbm as lgb
+
+
+
+
+def resolve_parquet_file(filename: str) -> Path:
+    """Locate parquet file (prefer $SCRATCH if present). Checks main/ subdirectory first."""
+    repo_root = get_repo_root()
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    candidates = []
+    if scratch_root is not None:
+        # Check main/ subdirectory first (standard location from preprocessing script with split_version='main')
+        candidates.append(scratch_root / f"outputs/se_asia/results/main/{filename}")
+        candidates.append(scratch_root / f"data/se_asia/ml/main/{filename}")
+        # Also check outputs/se_asia/results and data/se_asia/ml locations (for backward compatibility)
+        candidates.append(scratch_root / f"outputs/se_asia/results/{filename}")
+        candidates.append(scratch_root / f"data/se_asia/ml/{filename}")
+    # Check main/ subdirectory first in repo
+    candidates.append(repo_root / f"outputs/se_asia/results/main/{filename}")
+    candidates.append(repo_root / f"data/se_asia/ml/main/{filename}")
+    # Also check outputs/se_asia/results and data/se_asia/ml locations (for backward compatibility)
+    candidates.append(repo_root / f"outputs/se_asia/results/{filename}")
+    candidates.append(repo_root / f"data/se_asia/ml/{filename}")
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    # Provide detailed error message with all checked paths
+    error_msg = f"{filename} not found in expected locations.\n"
+    error_msg += "\nChecked locations:\n"
+    for cand in candidates:
+        error_msg += f"  - {cand}\n"
+    if scratch_root:
+        error_msg += f"\nSCRATCH root: {scratch_root}\n"
+    error_msg += f"Repository root: {repo_root}\n"
+    raise FileNotFoundError(error_msg)
+
+
+def resolve_metadata_file(filename: str) -> Optional[Path]:
+    """Locate metadata JSON file (prefer $SCRATCH if present)."""
+    repo_root = get_repo_root()
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    candidates = []
+    if scratch_root is not None:
+        # Check outputs/se_asia/results first (standard Euler location from preprocessing script)
+        candidates.append(scratch_root / f"outputs/se_asia/results/{filename}")
+        # Also check data/se_asia/ml location
+        candidates.append(scratch_root / f"data/se_asia/ml/{filename}")
+    candidates.append(repo_root / f"outputs/se_asia/results/{filename}")
+    candidates.append(repo_root / f"data/se_asia/ml/{filename}")
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    return None
+
+
+def resolve_best_params_json() -> Optional[Path]:
+    """Locate lgbm_best_params.json from canonical and tuning locations."""
+    repo_root = get_repo_root()
+    script_dir = Path(__file__).resolve().parent
+    scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+
+    candidates = []
+    # Canonical artifact (produced by tuning scripts)
+    candidates.append(script_dir / "lgbm_best_params.json")
+    # Backward-compatible fallback to tuning directory
+    candidates.append(script_dir / "tuning/lgbm_best_params.json")
+    # Optional scratch mirrors for cluster runs
+    if scratch_root is not None:
+        candidates.append(
+            scratch_root / "scripts/regions/se_asia/5_training/lgbm_best_params.json"
+        )
+        candidates.append(
+            scratch_root / "scripts/regions/se_asia/4_tuning/lgbm_best_params.json"
+        )
+        candidates.append(scratch_root / "lgbm_best_params.json")
+    candidates.append(
+        repo_root / "scripts/regions/se_asia/5_training/lgbm_best_params.json"
+    )
+    candidates.append(
+        repo_root / "scripts/regions/se_asia/4_tuning/lgbm_best_params.json"
+    )
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    return None
+
+
+def load_best_params(params_path: Optional[Path]) -> tuple[Dict[str, Any], Any]:
+    """Load and merge parameters: FIXED_PARAMS → json_fixed_params → best_params → guardrails (fill missing only).
+    Supports both flat JSON (direct param dict) and nested JSON (with 'fixed_params' and 'best_params' keys).
+    Treats JSON params as primary, guardrails only fill missing keys.
+    If params_path is None, returns default manual hyperparameters."""
+    if params_path is None:
+        # Use default manual hyperparameters when JSON file is not found
+        print("  lgbm_best_params.json not found, using default manual hyperparameters")
+        guardrail_params = {"max_depth": 8, "num_leaves": 255, "min_child_samples": 50, "subsample": 0.7,
+                           "subsample_freq": 1, "colsample_bytree": 0.7, "learning_rate": 0.03, "n_estimators": 3000,
+                           "reg_alpha": 1.0, "reg_lambda": 1.0, "metric": "average_precision", "num_threads": NUM_THREADS, "verbose": -1}
+        final_params = {**FIXED_PARAMS, **guardrail_params}
+        return final_params, None
+    
+    with open(params_path, 'r') as f:
+        params_data = json.load(f)
+    
+    # Support both flat and nested JSON formats
+    if isinstance(params_data, dict) and ('fixed_params' in params_data or 'best_params' in params_data):
+        # Nested format: {fixed_params: {...}, best_params: {...}, ...}
+        best_score = params_data.get('best_val_score', params_data.get('best_cv_score', None))
+        if best_score is None:
+            raise ValueError(
+                f"Invalid hyperparameter artifact at {params_path}: "
+                "best_val_score (or best_cv_score) is required and cannot be null."
+            )
+
+        metadata = params_data.get("metadata")
+        required_meta = ("dataset_fingerprint", "target_col", "feature_count", "year_split", "git_commit", "timestamp")
+        if not isinstance(metadata, dict):
+            raise ValueError(
+                f"Invalid hyperparameter artifact at {params_path}: missing 'metadata' section."
+            )
+        missing_meta = [key for key in required_meta if key not in metadata]
+        if missing_meta:
+            raise ValueError(
+                f"Invalid hyperparameter artifact at {params_path}: missing metadata fields {missing_meta}."
+            )
+        if metadata.get("target_col") != TARGET_COL:
+            raise ValueError(
+                f"Invalid hyperparameter artifact at {params_path}: "
+                f"metadata.target_col='{metadata.get('target_col')}' does not match expected '{TARGET_COL}'."
+            )
+
+        json_fixed = params_data.get('fixed_params', {})
+        json_best = params_data.get('best_params', {}).copy()
+        final_params = {**FIXED_PARAMS, **json_fixed, **json_best}
+    else:
+        # Flat format: direct parameter dictionary
+        final_params = {**FIXED_PARAMS, **(params_data.copy() if isinstance(params_data, dict) else {})}
+        best_score = None
+    
+    # Guardrails: only fill missing keys, don't overwrite existing ones
+    guardrail_params = {"max_depth": 8, "num_leaves": 255, "min_child_samples": 50, "subsample": 0.7,
+                       "subsample_freq": 1, "colsample_bytree": 0.7, "learning_rate": 0.03, "n_estimators": 3000,
+                       "reg_alpha": 1.0, "reg_lambda": 1.0, "metric": "average_precision", "num_threads": NUM_THREADS, "verbose": -1}
+    
+    # Only add guardrail params if key is missing
+    for key, value in guardrail_params.items():
+        if key not in final_params:
+            final_params[key] = value
+    
+    return final_params, best_score
+
+
+def load_numpy_arrays_two_pass(
+    df_path: Path, 
+    feature_cols: list, 
+    target_col: str, 
+    name: str = "",
+    batch_size: int = BATCH_SIZE,
+    year_range: Optional[tuple[int, int]] = None
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int, list]:
+    """
+    Two-pass NumPy loader: bypasses Pandas to minimize memory overhead.
+    
+    Pass 1: Count rows (after dropna on target and optional year filtering).
+    Pass 2: Pre-allocate float32 arrays and stream data directly into them.
+    
+    Args:
+        year_range: Optional tuple (min_year, max_year) to filter data. Inclusive on both ends.
+    
+    Returns:
+        X: Feature matrix (n_samples, n_features) as float32
+        y: Target vector (n_samples,) as int8
+        years_array: Array of years (n_samples,) as int32
+        pos: Number of positive samples
+        neg: Number of negative samples
+        years: Sorted list of unique years
+    """
+    year_filter_str = f" (years {year_range[0]}-{year_range[1]})" if year_range else ""
+    print(f"\nLoading {name or df_path.name}{year_filter_str} (two-pass NumPy loader)...")
+    load_start = time.time()
+    essential_cols = feature_cols + [target_col, 'year', 'WDPA_prev']
+    
+    # Pass 1: Count rows
+    print(f"  Pass 1: Counting rows...")
+    parquet_file = pq.ParquetFile(df_path)
+    n_samples = 0
+    years_set = set()
+    
+    try:
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols, use_threads=True):
+            # Convert batch to numpy arrays directly (bypass pandas)
+            batch_table = batch
+            # Use PyArrow null handling
+            null_mask = batch_table[target_col].is_null().to_numpy(zero_copy_only=False)
+            valid_mask = ~null_mask
+            if not valid_mask.any():
+                continue
+            
+            target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+            year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+            wdpa_prev_array = batch_table['WDPA_prev'].to_numpy(zero_copy_only=False)
+            
+            # Apply risk-set filtering: WDPA_prev == 0
+            risk_mask = (wdpa_prev_array == 0)
+            final_mask_pass1 = valid_mask & risk_mask
+            
+            if not final_mask_pass1.any():
+                continue
+            
+            target_valid = target_array[final_mask_pass1]
+            year_valid = year_array[final_mask_pass1]
+            
+            # Apply year filter if specified
+            if year_range is not None:
+                year_mask = (year_valid >= year_range[0]) & (year_valid <= year_range[1])
+                target_valid = target_valid[year_mask]
+                year_valid = year_valid[year_mask]
+            
+            if len(target_valid) == 0:
+                continue
+            
+            n_samples += len(target_valid)
+            years_set.update(year_valid.tolist())
+            
+            del batch_table, target_array, year_array, wdpa_prev_array, target_valid, year_valid, batch
+    finally:
+        del parquet_file
+        gc.collect()
+    
+    print(f"  Found {n_samples:,} samples")
+    
+    if n_samples == 0:
+        raise ValueError(f"No samples found in {name or df_path.name}{year_filter_str}")
+    
+    # Pass 2: Pre-allocate arrays and fill directly
+    print(f"  Pass 2: Pre-allocating arrays ({n_samples:,} samples, {len(feature_cols)} features)...")
+    X = np.empty((n_samples, len(feature_cols)), dtype=np.float32)
+    y = np.empty(n_samples, dtype=np.int8)
+    years_array = np.empty(n_samples, dtype=np.int32)
+    
+    parquet_file = pq.ParquetFile(df_path)
+    idx_offset = 0
+    batch_num = 0
+    _load_milestone = -1
+
+    try:
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols, use_threads=True):
+            batch_num += 1
+            batch_table = batch
+            
+            # Use PyArrow null handling
+            null_mask = batch_table[target_col].is_null().to_numpy(zero_copy_only=False)
+            valid_mask = ~null_mask
+            if not valid_mask.any():
+                del batch_table, batch
+                continue
+            
+            # Extract arrays directly from PyArrow
+            target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+            year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+            wdpa_prev_array = batch_table['WDPA_prev'].to_numpy(zero_copy_only=False)
+            
+            # Apply risk-set filtering: WDPA_prev == 0
+            risk_mask = (wdpa_prev_array == 0)
+            # Combine valid_mask and risk_mask
+            base_mask = valid_mask & risk_mask
+            if not base_mask.any():
+                del batch_table, target_array, year_array, wdpa_prev_array, batch
+                continue
+            
+            target_valid = target_array[base_mask]
+            year_valid = year_array[base_mask]
+            
+            # Apply year filter if specified
+            if year_range is not None:
+                year_mask = (year_valid >= year_range[0]) & (year_valid <= year_range[1])
+                if not year_mask.any():
+                    del batch_table, target_array, year_array, wdpa_prev_array, batch
+                    continue
+                target_valid = target_valid[year_mask]
+                year_valid = year_valid[year_mask]
+                
+                # Build final mask: map year_mask (applied to base_mask data) back to original indices
+                final_mask = base_mask.copy()
+                final_mask[base_mask] = year_mask  # Map year_mask back to positions where base_mask is True
+                
+                # Convert feature columns in bulk using pure PyArrow→NumPy path (no pandas)
+                feature_table = batch_table.select(feature_cols)
+                X_batch = extract_features_pyarrow_to_numpy(feature_table, final_mask)
+            else:
+                # Convert feature columns in bulk using pure PyArrow→NumPy path (no pandas, no year filter)
+                feature_table = batch_table.select(feature_cols)
+                X_batch = extract_features_pyarrow_to_numpy(feature_table, base_mask)
+            y_batch = (target_valid > 0).astype(np.int8)
+            
+            # Insert directly into pre-allocated arrays
+            batch_size_actual = len(y_batch)
+            X[idx_offset:idx_offset + batch_size_actual, :] = X_batch
+            y[idx_offset:idx_offset + batch_size_actual] = y_batch
+            years_array[idx_offset:idx_offset + batch_size_actual] = year_valid.astype(np.int32)
+            idx_offset += batch_size_actual
+            
+            del batch_table, target_array, year_array, wdpa_prev_array, target_valid, year_valid
+            del feature_table, X_batch, y_batch, batch
+
+            if batch_num % 25 == 0:
+                gc.collect()
+            _pct = idx_offset * 100 // n_samples if n_samples > 0 else 0
+            _ms  = _pct // 25
+            if _ms > _load_milestone:
+                _load_milestone = _ms
+                print(f"  {_pct}% — {idx_offset:,}/{n_samples:,} rows")
+                report_memory_usage(f"  {_pct}%")
+    finally:
+        del parquet_file
+        gc.collect()
+
+    if idx_offset != n_samples:
+        raise ValueError(f"Mismatch: expected {n_samples:,} samples but loaded {idx_offset:,}")
+    
+    # Compute stats
+    pos = int(y.sum())
+    neg = int((y == 0).sum())
+    years = sorted(years_set)
+    
+    load_time = time.time() - load_start
+    mem_gb = (X.nbytes + y.nbytes + years_array.nbytes) / 1024**3
+    print(f"  Loaded {n_samples:,} rows in {load_time:.1f}s ({mem_gb:.2f} GB)")
+    print(f"  {neg:,} neg, {pos:,} pos, ratio 1:{neg/max(pos,1):.1f}, years {years[0]}-{years[-1]}")
+    
+    return X, y, years_array, pos, neg, years
+
+
+
+
+def load_numpy_arrays_from_multiple_files(
+    df_paths: list[Path],
+    feature_cols: list,
+    target_col: str,
+    name: str = "",
+    batch_size: int = BATCH_SIZE,
+    year_range: Optional[tuple[int, int]] = None
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int, list]:
+    """
+    Load data from multiple parquet files with optional year filtering.
+    Combines data from all files and filters by year_range if specified.
+    
+    Args:
+        df_paths: List of paths to parquet files to load from
+        year_range: Optional tuple (min_year, max_year) to filter data. Inclusive on both ends.
+    
+    Returns:
+        X: Feature matrix (n_samples, n_features) as float32
+        y: Target vector (n_samples,) as int8
+        years_array: Array of years (n_samples,) as int32
+        pos: Number of positive samples
+        neg: Number of negative samples
+        years: Sorted list of unique years
+    """
+    year_filter_str = f" (years {year_range[0]}-{year_range[1]})" if year_range else ""
+    print(f"\nLoading from {len(df_paths)} files{year_filter_str} (two-pass NumPy loader)...")
+    load_start = time.time()
+    essential_cols = feature_cols + [target_col, 'year', 'WDPA_prev']
+    
+    # Pass 1: Count rows across all files
+    print(f"  Pass 1: Counting rows...")
+    n_samples = 0
+    years_set = set()
+    
+    for file_idx, df_path in enumerate(df_paths):
+        parquet_file = pq.ParquetFile(df_path)
+        try:
+            for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols, use_threads=True):
+                batch_table = batch
+                null_mask = batch_table[target_col].is_null().to_numpy(zero_copy_only=False)
+                valid_mask = ~null_mask
+                if not valid_mask.any():
+                    continue
+                
+                target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+                year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+                wdpa_prev_array = batch_table['WDPA_prev'].to_numpy(zero_copy_only=False)
+                
+                # Apply risk-set filtering: WDPA_prev == 0
+                risk_mask = (wdpa_prev_array == 0)
+                final_mask_pass1 = valid_mask & risk_mask
+                
+                if not final_mask_pass1.any():
+                    continue
+                
+                target_valid = target_array[final_mask_pass1]
+                year_valid = year_array[final_mask_pass1]
+                
+                if year_range is not None:
+                    year_mask = (year_valid >= year_range[0]) & (year_valid <= year_range[1])
+                    target_valid = target_valid[year_mask]
+                    year_valid = year_valid[year_mask]
+                
+                if len(target_valid) == 0:
+                    continue
+                
+                n_samples += len(target_valid)
+                years_set.update(year_valid.tolist())
+                
+                del batch_table, target_array, year_array, wdpa_prev_array, target_valid, year_valid, batch
+        finally:
+            del parquet_file
+            gc.collect()
+    
+    print(f"  Found {n_samples:,} samples")
+    
+    if n_samples == 0:
+        raise ValueError(f"No samples found in files{year_filter_str}")
+    
+    # Pass 2: Pre-allocate arrays and fill from all files
+    print(f"  Pass 2: Pre-allocating arrays ({n_samples:,} samples, {len(feature_cols)} features)...")
+    X = np.empty((n_samples, len(feature_cols)), dtype=np.float32)
+    y = np.empty(n_samples, dtype=np.int8)
+    years_array = np.empty(n_samples, dtype=np.int32)
+    idx_offset = 0
+    batch_num = 0
+    _load_milestone = -1
+
+    for file_idx, df_path in enumerate(df_paths):
+        parquet_file = pq.ParquetFile(df_path)
+        try:
+            for batch in parquet_file.iter_batches(batch_size=batch_size, columns=essential_cols, use_threads=True):
+                batch_num += 1
+                batch_table = batch
+                
+                null_mask = batch_table[target_col].is_null().to_numpy(zero_copy_only=False)
+                valid_mask = ~null_mask
+                if not valid_mask.any():
+                    del batch_table, batch
+                    continue
+                
+                target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+                year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+                wdpa_prev_array = batch_table['WDPA_prev'].to_numpy(zero_copy_only=False)
+                
+                # Apply risk-set filtering: WDPA_prev == 0
+                risk_mask = (wdpa_prev_array == 0)
+                # Combine valid_mask and risk_mask
+                base_mask = valid_mask & risk_mask
+                if not base_mask.any():
+                    del batch_table, target_array, year_array, wdpa_prev_array, batch
+                    continue
+                
+                target_valid = target_array[base_mask]
+                year_valid = year_array[base_mask]
+                
+                if year_range is not None:
+                    year_mask = (year_valid >= year_range[0]) & (year_valid <= year_range[1])
+                    if not year_mask.any():
+                        del batch_table, target_array, year_array, wdpa_prev_array, batch
+                        continue
+                    target_valid = target_valid[year_mask]
+                    year_valid = year_valid[year_mask]
+                    
+                    # Build final mask: map year_mask (applied to base_mask data) back to original indices
+                    final_mask = base_mask.copy()
+                    final_mask[base_mask] = year_mask
+                    
+                    # Convert feature columns in bulk using pure PyArrow→NumPy path (no pandas)
+                    feature_table = batch_table.select(feature_cols)
+                    X_batch = extract_features_pyarrow_to_numpy(feature_table, final_mask)
+                else:
+                    # Convert feature columns in bulk using pure PyArrow→NumPy path (no pandas, no year filter)
+                    feature_table = batch_table.select(feature_cols)
+                    X_batch = extract_features_pyarrow_to_numpy(feature_table, base_mask)
+                y_batch = (target_valid > 0).astype(np.int8)
+                
+                batch_size_actual = len(y_batch)
+                X[idx_offset:idx_offset + batch_size_actual, :] = X_batch
+                y[idx_offset:idx_offset + batch_size_actual] = y_batch
+                years_array[idx_offset:idx_offset + batch_size_actual] = year_valid.astype(np.int32)
+                idx_offset += batch_size_actual
+                
+                del batch_table, target_array, year_array, wdpa_prev_array, target_valid, year_valid
+                del feature_table, X_batch, y_batch, batch
+
+                if batch_num % 25 == 0:
+                    gc.collect()
+                _pct = idx_offset * 100 // n_samples if n_samples > 0 else 0
+                _ms  = _pct // 25
+                if _ms > _load_milestone:
+                    _load_milestone = _ms
+                    print(f"  {_pct}% — {idx_offset:,}/{n_samples:,} rows")
+                    report_memory_usage(f"  {_pct}%")
+        finally:
+            del parquet_file
+            gc.collect()
+
+    if idx_offset != n_samples:
+        raise ValueError(f"Mismatch: expected {n_samples:,} samples but loaded {idx_offset:,}")
+
+    pos = int(y.sum())
+    neg = int((y == 0).sum())
+    years = sorted(years_set)
+    
+    load_time = time.time() - load_start
+    mem_gb = (X.nbytes + y.nbytes + years_array.nbytes) / 1024**3
+    print(f"  Loaded {n_samples:,} rows in {load_time:.1f}s ({mem_gb:.2f} GB)")
+    print(f"  {neg:,} neg, {pos:,} pos, ratio 1:{neg/max(pos,1):.1f}, years {years[0]}-{years[-1]}")
+    
+    return X, y, years_array, pos, neg, years
+
+
+# =============================================================================
+# Main Pipeline
+# =============================================================================
+
+
+def train_single_cv_fold(
+    train_paths: list[Path],
+    earlystop_paths: list[Path],
+    feature_cols: list,
+    target_col: str,
+    train_years: tuple[int, int],
+    earlystop_years: tuple[int, int],
+    fold_idx: int,
+    best_params: Dict[str, Any],
+    use_wandb: bool,
+    use_time_weights: bool = True,
+) -> Dict[str, Any]:
+    """
+    Train and evaluate a single CV fold.
+    Earlystop is used ONLY for early stopping, NOT for metric reporting.
+    
+    Returns:
+        Dictionary containing fold metrics and metadata
+    """
+    print(f"\n{'='*70}")
+    print(f"CV FOLD {fold_idx + 1}/{len(CV_FOLDS)}")
+    print(f"Train: {train_years[0]}-{train_years[1]} → Earlystop: {earlystop_years[0]}-{earlystop_years[1]}")
+    print(f"{'='*70}")
+    
+    # Check for year overlap
+    earlystop_year_range = (earlystop_years[0], min(earlystop_years[1], LAST_LABEL_YEAR))
+    if check_year_overlap(train_years, earlystop_year_range, f"Fold {fold_idx+1} Earlystop"):
+        # Skip this fold if overlap detected
+        return {
+            "fold_idx": fold_idx,
+            "train_years": list(train_years),
+            "earlystop_years": list(earlystop_years),
+            "skipped": True,
+            "skip_reason": "year_overlap",
+        }
+    
+    # Load train data
+    X_train, y_train, train_years_array, train_pos, train_neg, train_years_list = load_numpy_arrays_from_multiple_files(
+        train_paths, feature_cols, target_col, f"Fold {fold_idx+1} Train", year_range=train_years
+    )
+    n_train_samples = len(X_train)
+    
+    # Load earlystop data (filter to LAST_LABEL_YEAR to avoid right-censored labels)
+    X_earlystop, y_earlystop, earlystop_years_array, earlystop_pos, earlystop_neg, earlystop_years_list = load_numpy_arrays_from_multiple_files(
+        earlystop_paths, feature_cols, target_col, f"Fold {fold_idx+1} Earlystop", year_range=earlystop_year_range
+    )
+    n_earlystop_samples = len(X_earlystop)
+    
+    print(f"\nFold {fold_idx+1}: Train {n_train_samples:,} samples, Earlystop {n_earlystop_samples:,} samples (earlystop years {earlystop_year_range[0]}-{earlystop_year_range[1]}, capped at LAST_LABEL_YEAR={LAST_LABEL_YEAR})")
+    print(f"  NOTE: Earlystop used ONLY for early stopping, NOT for metric reporting.")
+    
+    # Compute sample weights for training data (time-based weighting)
+    # Weight range: 2001 (weight 0.5) to train_years[1] (weight 1.0)
+    if use_time_weights:
+        train_weights = compute_year_weights(train_years_array, min_year=2001, max_year=train_years[1])
+        print(f"  Training sample weights: min={train_weights.min():.3f}, max={train_weights.max():.3f}, mean={train_weights.mean():.3f}")
+    else:
+        train_weights = None
+        print(f"  Training sample weights: DISABLED (use_time_weights=False)")
+    
+    # Compute scale_pos_weight from training data
+    # Formula: scale_pos_weight = n_neg / n_pos
+    scale_pos_weight = train_neg / max(train_pos, 1)
+    print(f"  Computed scale_pos_weight from training data: {scale_pos_weight:.6f} = {train_neg:,} / {train_pos:,}")
+    
+    # Train model
+    num_boost_round_earlystop = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
+    train_params = {**best_params, "is_unbalance": False}
+    train_params.pop("num_boost_round", None)
+    train_params.pop("n_estimators", None)
+    train_params.pop("n_jobs", None)  # Remove n_jobs if present (use num_threads instead)
+    # Remove any non-LGBM params that may have been in JSON
+    for key in ["sampling_strategy", "replacement", "bootstrap", "class_weight"]:
+        train_params.pop(key, None)
+    # Remove scale_pos_weight from best_params if present (always compute from data)
+    train_params.pop("scale_pos_weight", None)
+    # Ensure num_threads is set for optimal CPU usage
+    if "num_threads" not in train_params:
+        train_params["num_threads"] = get_num_threads()
+    # Set scale_pos_weight (computed from training data)
+    train_params["scale_pos_weight"] = scale_pos_weight
+    
+    print(f"  Creating datasets...")
+    if train_weights is not None:
+        train_dataset = lgb.Dataset(X_train, label=y_train, weight=train_weights, free_raw_data=True)
+    else:
+        train_dataset = lgb.Dataset(X_train, label=y_train, free_raw_data=True)
+    del X_train, y_train, train_years_array
+    if train_weights is not None:
+        del train_weights
+    gc.collect()
+    
+    earlystop_dataset = lgb.Dataset(X_earlystop, label=y_earlystop, free_raw_data=True, reference=train_dataset)
+    
+    print(f"  Training...")
+    train_start = time.time()
+    lgb_model = lgb.train(
+        train_params,
+        train_dataset,
+        num_boost_round=num_boost_round_earlystop,
+        valid_sets=[earlystop_dataset],
+        valid_names=["earlystop"],
+        callbacks=[lgb.early_stopping(500), lgb.log_evaluation(100)]
+    )
+    train_time = time.time() - train_start
+    best_iteration = lgb_model.best_iteration
+    
+    del train_dataset, earlystop_dataset; gc.collect()
+    
+    # Generate OOF predictions on earlystop set (true OOF for temporal CV)
+    # These predictions will be used for calibration
+    print(f"  Generating OOF predictions on earlystop set ({n_earlystop_samples:,} samples)...")
+    y_earlystop_proba = lgb_model.predict(X_earlystop, num_iteration=best_iteration if best_iteration else None).astype(np.float32)
+    
+    # DIAGNOSTIC ONLY (not used for model selection / early stopping): Compute CV fold metrics
+    fold_pr_auc = average_precision_score(y_earlystop, y_earlystop_proba)
+    fold_roc_auc = roc_auc_score(y_earlystop, y_earlystop_proba)
+    fold_base_rate = y_earlystop.mean()
+    fold_p_at_1pct = compute_precision_at_k(y_earlystop, y_earlystop_proba, 1)
+    
+    print(f"\n  DIAGNOSTIC ONLY (not used for model selection / early stopping):")
+    print(f"    PR-AUC: {fold_pr_auc:.4f}")
+    print(f"    ROC-AUC: {fold_roc_auc:.4f}")
+    print(f"    Base rate: {fold_base_rate:.4f}")
+    print(f"    Precision@1%: {fold_p_at_1pct:.4f}")
+    
+    if use_wandb:
+        wandb.log({
+            f"cv_fold_{fold_idx+1}/diag_pr_auc": float(fold_pr_auc),
+            f"cv_fold_{fold_idx+1}/diag_roc_auc": float(fold_roc_auc),
+            f"cv_fold_{fold_idx+1}/diag_base_rate": float(fold_base_rate),
+            f"cv_fold_{fold_idx+1}/diag_precision_at_1pct": float(fold_p_at_1pct),
+        })
+    
+    # Store diagnostic metrics in fold result
+    fold_diagnostics = {
+        "diag_pr_auc": float(fold_pr_auc),
+        "diag_roc_auc": float(fold_roc_auc),
+        "diag_base_rate": float(fold_base_rate),
+        "diag_precision_at_1pct": float(fold_p_at_1pct),
+    }
+    
+    # Store OOF predictions for this fold (make copies before cleanup)
+    oof_predictions = {
+        "y_true": y_earlystop.copy(),
+        "y_pred_proba": y_earlystop_proba.copy(),
+        "fold_idx": np.full(len(y_earlystop), fold_idx, dtype=np.int32)
+    }
+    
+    # Clean up earlystop data and model immediately after generating predictions
+    # This is critical for memory management, especially for large folds
+    del X_earlystop, y_earlystop, earlystop_years_array
+    del lgb_model, y_earlystop_proba
+    gc.collect()
+    report_memory_usage(f"after fold {fold_idx+1} predictions")
+    
+    if use_wandb:
+        wandb.log({
+            f"cv_fold_{fold_idx+1}/n_train": int(n_train_samples),
+            f"cv_fold_{fold_idx+1}/n_earlystop": int(n_earlystop_samples),
+            f"cv_fold_{fold_idx+1}/train_time_seconds": train_time,
+            f"cv_fold_{fold_idx+1}/best_iteration": int(best_iteration) if best_iteration is not None else None,
+        })
+    
+    return {
+        "fold_idx": fold_idx,
+        "train_years": list(train_years),
+        "earlystop_years": list(earlystop_years),
+        "n_train_samples": int(n_train_samples),
+        "n_earlystop_samples": int(n_earlystop_samples),
+        "train_positives": int(train_pos),
+        "train_negatives": int(train_neg),
+        "earlystop_positives": int(earlystop_pos),
+        "earlystop_negatives": int(earlystop_neg),
+        "train_time_seconds": train_time,
+        "best_iteration": int(best_iteration) if best_iteration is not None else None,
+        "oof_predictions": oof_predictions,  # Include OOF predictions for calibration
+        "diagnostics": fold_diagnostics,  # Diagnostic-only metrics (not used for model selection)
+    }
+
+
+def aggregate_cv_metrics(cv_results: list[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Aggregate metrics across CV folds.
+    Only aggregates training metadata (no validation/earlystop metrics).
+    """
+    aggregated = {}
+    
+    # Filter out skipped folds
+    valid_folds = [fold for fold in cv_results if not fold.get("skipped", False)]
+    
+    if not valid_folds:
+        return aggregated
+    
+    # Aggregate sample sizes
+    aggregated["n_train_mean"] = float(np.mean([fold.get("n_train_samples", fold.get("train_positives", 0) + fold.get("train_negatives", 0)) for fold in valid_folds]))
+    aggregated["n_earlystop_mean"] = float(np.mean([fold.get("n_earlystop_samples", fold.get("earlystop_positives", 0) + fold.get("earlystop_negatives", 0)) for fold in valid_folds]))
+    
+    # NO earlystop metrics aggregated - earlystop is used ONLY for early stopping
+    
+    return aggregated
+
+
+def phase1_training(
+    train_path: Path, earlystop_path: Path, params_path: Optional[Path], feature_cols: list, keep_cols_train: list,
+    best_params: Dict[str, Any], timestamp: str, model_dir: Path, output_dir: Path, use_wandb: bool, target_col: str,
+    cv_mode: str = "fold3", use_time_weights: bool = True, num_boost_round: Optional[int] = None,
+) -> tuple[Path, Dict[str, Any], Dict[str, Any], float, float, int, int, int, Dict[str, Any], Dict[str, Any]]:
+    """
+    Phase 1: Training with temporal cross-validation.
+    
+    Steps:
+    1. Run temporal CV folds to assess model stability (earlystop used only for early stopping, no metrics)
+    2. Train final model on full train+earlystop data (2000-2017)
+    
+    Returns:
+        Tuple including CV results as additional element
+    """
+    print("\n" + "="*70 + "\nPHASE 1: TRAINING WITH TEMPORAL CROSS-VALIDATION\n" + "="*70)
+    report_memory_usage("start of Phase 1")
+    
+    # =============================================================================
+    # STEP A: TEMPORAL CROSS-VALIDATION
+    # =============================================================================
+    print("\n" + "="*70 + "\nSTEP A: TEMPORAL CROSS-VALIDATION\n" + "="*70)
+    print(f"CV Mode: {cv_mode}")
+    
+    cv_results = []
+    
+    if cv_mode == "none":
+        print("  Skipping CV (cv_mode=none)")
+        # Use provided num_boost_round, or default from params
+        if num_boost_round is not None:
+            chosen_iteration = num_boost_round
+            print(f"  Using provided num_boost_round: {chosen_iteration}")
+        else:
+            chosen_iteration = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
+            print(f"  Using default best_iteration from params: {chosen_iteration}")
+        cv_aggregated = {}
+        best_iterations = []
+        train_rows_per_fold = []
+        fold3_best_iteration = None
+        cv_results = []
+    else:
+        # For CV, we need data from both train and earlystop files (2000-2017)
+        # Each fold will filter the appropriate year ranges
+        cv_train_paths = [train_path, earlystop_path]  # Both files contain data needed for CV
+        cv_earlystop_paths = [train_path, earlystop_path]    # Same, we filter by year_range
+        
+        # Determine which folds to run
+        if cv_mode == "fold3":
+            folds_to_run = [2]  # Only fold 3 (0-indexed: 2)
+            print(f"  Running only fold 3")
+        elif cv_mode == "full":
+            folds_to_run = list(range(len(CV_FOLDS)))  # All folds
+            print(f"  Running all {len(CV_FOLDS)} folds")
+        else:
+            raise ValueError(f"Invalid cv_mode: {cv_mode}. Must be one of: full, fold3, none")
+        
+        # Collect OOF predictions from all folds for calibration
+        all_oof_predictions = []
+        
+        for fold_idx in folds_to_run:
+            train_years, earlystop_years = CV_FOLDS[fold_idx]
+            fold_result = train_single_cv_fold(
+                cv_train_paths, cv_earlystop_paths, feature_cols, target_col,
+                train_years, earlystop_years, fold_idx, best_params, use_wandb, use_time_weights
+            )
+            
+            # Collect OOF predictions if available (skip if fold was skipped)
+            if not fold_result.get("skipped", False) and "oof_predictions" in fold_result:
+                all_oof_predictions.append(fold_result["oof_predictions"])
+                # Remove predictions from fold_result to avoid bloating JSON (they're saved separately)
+                fold_result_clean = {k: v for k, v in fold_result.items() if k != "oof_predictions"}
+                cv_results.append(fold_result_clean)
+            else:
+                cv_results.append(fold_result)
+            
+            gc.collect()
+        
+        # Save temporal CV OOF predictions for calibration
+        if all_oof_predictions:
+            print(f"\nSaving temporal CV OOF predictions ({len(all_oof_predictions)} folds)...")
+            try:
+                # Concatenate predictions from all folds
+                y_true_all = np.concatenate([pred["y_true"] for pred in all_oof_predictions])
+                y_pred_proba_all = np.concatenate([pred["y_pred_proba"] for pred in all_oof_predictions])
+                fold_idx_all = np.concatenate([pred["fold_idx"] for pred in all_oof_predictions])
+                
+                # Create DataFrame and save to parquet with temporal CV naming pattern
+                temporal_cv_predictions_df = pd.DataFrame({
+                    "y_true": y_true_all,
+                    "y_pred_proba": y_pred_proba_all,
+                    "fold_idx": fold_idx_all
+                })
+                
+                temporal_cv_predictions_path = output_dir / f"model3_lgbm_temporal_cv_predictions_{timestamp}.parquet"
+                temporal_cv_predictions_df.to_parquet(temporal_cv_predictions_path, index=False, engine="pyarrow")
+                print(f"  Temporal CV OOF predictions saved: {temporal_cv_predictions_path.name}")
+                print(f"  Total samples: {len(temporal_cv_predictions_df):,}")
+                print(f"  Folds: {sorted(np.unique(fold_idx_all).tolist())}")
+                
+                # Clean up
+                del temporal_cv_predictions_df, y_true_all, y_pred_proba_all, fold_idx_all, all_oof_predictions
+                gc.collect()
+            except Exception as e:
+                print(f"  WARNING: Failed to save temporal CV OOF predictions: {e}")
+                import traceback
+                traceback.print_exc()
+                # Don't exit - continue with training
+        
+        # Aggregate CV metrics (no metrics computed on earlystop sets)
+        cv_aggregated = aggregate_cv_metrics(cv_results)
+        
+        # Aggregate diagnostic metrics across non-skipped folds
+        valid_folds_for_diagnostics = [fold for fold in cv_results if not fold.get("skipped", False) and "diagnostics" in fold]
+        if valid_folds_for_diagnostics:
+            diag_pr_aucs = [fold["diagnostics"]["diag_pr_auc"] for fold in valid_folds_for_diagnostics]
+            diag_roc_aucs = [fold["diagnostics"]["diag_roc_auc"] for fold in valid_folds_for_diagnostics]
+            
+            cv_diagnostics = {
+                "pr_auc_mean": float(np.mean(diag_pr_aucs)),
+                "pr_auc_std": float(np.std(diag_pr_aucs)),
+                "roc_auc_mean": float(np.mean(diag_roc_aucs)),
+                "roc_auc_std": float(np.std(diag_roc_aucs)),
+            }
+            
+            print(f"\nCV Diagnostics (aggregated across {len(valid_folds_for_diagnostics)} non-skipped folds):")
+            print(f"  PR-AUC: {cv_diagnostics['pr_auc_mean']:.4f} ± {cv_diagnostics['pr_auc_std']:.4f}")
+            print(f"  ROC-AUC: {cv_diagnostics['roc_auc_mean']:.4f} ± {cv_diagnostics['roc_auc_std']:.4f}")
+            
+            if use_wandb:
+                wandb.log({
+                    "cv_diagnostics/pr_auc_mean": cv_diagnostics["pr_auc_mean"],
+                    "cv_diagnostics/pr_auc_std": cv_diagnostics["pr_auc_std"],
+                    "cv_diagnostics/roc_auc_mean": cv_diagnostics["roc_auc_mean"],
+                    "cv_diagnostics/roc_auc_std": cv_diagnostics["roc_auc_std"],
+                })
+        else:
+            cv_diagnostics = {}
+        
+        # Extract best_iterations and train_rows for each fold (skip folds that were skipped due to overlap)
+        best_iterations = [fold["best_iteration"] for fold in cv_results if fold.get("best_iteration") is not None and not fold.get("skipped", False)]
+        train_rows_per_fold = [fold["n_train_samples"] for fold in cv_results if not fold.get("skipped", False)]
+        
+        # Extract fold3's best_iteration (fold index 2) - skip if fold was skipped
+        fold3_best_iteration = None
+        for fold_result in cv_results:
+            if (fold_result.get("fold_idx") == 2 and 
+                fold_result.get("best_iteration") is not None and 
+                not fold_result.get("skipped", False)):
+                fold3_best_iteration = fold_result["best_iteration"]
+                break
+        
+        # Calculate chosen_iteration based on cv_mode
+        if cv_mode == "full":
+            if best_iterations and train_rows_per_fold:
+                # Weighted average: sum(iter_i * n_i) / sum(n_i) * 1.05
+                weighted_sum = sum(iter_i * n_i for iter_i, n_i in zip(best_iterations, train_rows_per_fold))
+                total_rows = sum(train_rows_per_fold)
+                chosen_iteration = int(np.round(weighted_sum / total_rows * 1.05))
+                print(f"\nCV best_iterations: {best_iterations}")
+                print(f"CV train_rows_per_fold: {train_rows_per_fold}")
+                print(f"Weighted average (before 1.05x): {weighted_sum / total_rows:.2f}")
+                print(f"Chosen iteration (weighted avg * 1.05): {chosen_iteration}")
+                
+                # Apply max constraint with fold3_best_iteration
+                if fold3_best_iteration is not None:
+                    chosen_iteration = max(chosen_iteration, fold3_best_iteration)
+                    print(f"After max with fold3_best_iteration ({fold3_best_iteration}): {chosen_iteration}")
+            else:
+                # Fallback: use default if no best_iteration found (e.g., all folds skipped)
+                skipped_count = len([f for f in cv_results if f.get("skipped", False)])
+                if skipped_count > 0:
+                    print(f"\nWarning: {skipped_count} fold(s) skipped due to year overlap. No best_iteration found in remaining folds.")
+                else:
+                    print(f"\nWarning: No best_iteration found in CV folds.")
+                chosen_iteration = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
+                print(f"  Using default iteration from params: {chosen_iteration}")
+        elif cv_mode == "fold3":
+            if fold3_best_iteration is not None:
+                # Use weighted avg * 1.05, clamped by fold3 (same logic as full mode)
+                # For fold3 mode, weighted avg is just fold3_best_iteration
+                weighted_avg = fold3_best_iteration
+                chosen_iteration = int(np.round(weighted_avg * 1.05))
+                print(f"\nFold3 best_iteration: {fold3_best_iteration}")
+                print(f"Weighted average (before 1.05x): {weighted_avg:.2f}")
+                print(f"Chosen iteration (weighted avg * 1.05): {chosen_iteration}")
+                
+                # Apply max constraint with fold3_best_iteration (clamp by fold3)
+                chosen_iteration = max(chosen_iteration, fold3_best_iteration)
+                print(f"After max with fold3_best_iteration ({fold3_best_iteration}): {chosen_iteration}")
+            else:
+                # Fallback: use default if fold3 best_iteration not found (e.g., fold3 was skipped)
+                fold3_result = next((f for f in cv_results if f.get("fold_idx") == 2), None)
+                if fold3_result and fold3_result.get("skipped", False):
+                    print(f"\nWarning: Fold 3 was skipped due to year overlap. fold3_best_iteration not available.")
+                else:
+                    print(f"\nWarning: fold3_best_iteration not found.")
+                chosen_iteration = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
+                print(f"  Using default iteration from params: {chosen_iteration}")
+        else:
+            # Fallback for any other mode
+            chosen_iteration = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
+            print(f"\nWarning: Unknown cv_mode, using default: {chosen_iteration}")
+    
+    print("\n" + "="*70)
+    print("TEMPORAL CV RESULTS (Aggregated)")
+    print("="*70)
+    print(f"CV Mode: {cv_mode}")
+    if cv_mode != "none":
+        print(f"Chosen iteration (for final model): {chosen_iteration}")
+        # Report number of skipped folds
+        skipped_folds = [fold for fold in cv_results if fold.get("skipped", False)]
+        if skipped_folds:
+            print(f"  WARNING: {len(skipped_folds)} fold(s) skipped due to year overlap")
+    else:
+        print(f"Chosen iteration (from params): {chosen_iteration}")
+    
+    # NO earlystop metrics displayed - earlystop is used ONLY for early stopping, not for evaluation
+    
+    print("="*70)
+    
+    if use_wandb:
+        wandb.log({
+            **{f"cv_aggregated/{k}": v for k, v in cv_aggregated.items() if not k.endswith("_values")}
+        })
+    
+    # =============================================================================
+    # STEP B: FINAL MODEL TRAINING (Full train+earlystop: 2000-2017)
+    # =============================================================================
+    print("\n" + "="*70 + "\nSTEP B: FINAL MODEL TRAINING\n" + "="*70)
+    print(f"Training final model on full dataset: {TRAIN_YEARS[0]}-{EARLYSTOP_YEARS[1]}")
+    report_memory_usage("before final model training")
+    
+    # Load full training data (2000-2017) from both files
+    print(f"\nLoading full training data ({TRAIN_YEARS[0]}-{EARLYSTOP_YEARS[1]})...")
+    X_train_full, y_train_full, train_years_array_full, train_pos_full, train_neg_full, train_years_full = load_numpy_arrays_from_multiple_files(
+        [train_path, earlystop_path], feature_cols, target_col, "full_train", 
+        year_range=(TRAIN_YEARS[0], EARLYSTOP_YEARS[1])
+    )
+    n_train_full = len(y_train_full)
+    
+    train_stats = {
+        "n_train": n_train_full,
+        "train_positives": int(train_pos_full),
+        "train_negatives": int(train_neg_full),
+        "train_positive_pct": float(train_pos_full / max(n_train_full, 1) * 100.0),
+        "train_years": f"{train_years_full[0]}-{train_years_full[-1]}",
+    }
+    report_memory_usage("after loading final data")
+    
+    print(f"\nFinal model training: train ({TRAIN_YEARS[0]}-{EARLYSTOP_YEARS[1]}): {len(X_train_full):,} rows")
+    print(f"Final training: no earlystop/val; num_boost_round fixed from CV to avoid leakage.")
+    
+    # Compute sample weights for training data (time-based weighting)
+    # Weight range: 2001 (weight 0.5) to EARLYSTOP_YEARS[1] (weight 1.0)
+    if use_time_weights:
+        train_weights = compute_year_weights(train_years_array_full, min_year=2001, max_year=EARLYSTOP_YEARS[1])
+        print(f"  Training sample weights: min={train_weights.min():.3f}, max={train_weights.max():.3f}, mean={train_weights.mean():.3f}")
+    else:
+        train_weights = None
+        print(f"  Training sample weights: DISABLED (use_time_weights=False)")
+    
+    # Compute scale_pos_weight from training data
+    # Formula: scale_pos_weight = n_neg / n_pos
+    scale_pos_weight = train_neg_full / max(train_pos_full, 1)
+    print(f"\nImbalance: Computed scale_pos_weight from training data: {scale_pos_weight:.6f} = {train_neg_full:,} / {train_pos_full:,}")
+    
+    imbalance_info = {
+        "neg": int(train_neg_full),
+        "pos": int(train_pos_full),
+        "scale_pos_weight": float(scale_pos_weight)
+    }
+    if use_wandb:
+        log_dict = {
+            "final_model/imbalance/scale_pos_weight": float(scale_pos_weight),
+        }
+        if train_weights is not None:
+            log_dict.update({
+                "final_model/sample_weights/min": float(train_weights.min()),
+                "final_model/sample_weights/max": float(train_weights.max()),
+                "final_model/sample_weights/mean": float(train_weights.mean()),
+            })
+        wandb.log(log_dict)
+    
+    print(f"\nTraining final model on {len(X_train_full):,} samples...")
+    report_memory_usage("before final training")
+    train_start = time.time()
+    train_params = {**best_params, "is_unbalance": False}
+    train_params.pop("num_boost_round", None)
+    train_params.pop("n_estimators", None)
+    train_params.pop("n_jobs", None)  # Remove n_jobs if present (use num_threads instead)
+    # Remove any non-LGBM params that may have been in JSON
+    for key in ["sampling_strategy", "replacement", "bootstrap", "class_weight"]:
+        train_params.pop(key, None)
+    # Remove early stopping parameters since we're training without validation set
+    train_params.pop("early_stopping_rounds", None)
+    train_params.pop("early_stopping", None)
+    # Remove scale_pos_weight from best_params if present (always compute from data)
+    train_params.pop("scale_pos_weight", None)
+    # Ensure num_threads is set for optimal CPU usage
+    if "num_threads" not in train_params:
+        train_params["num_threads"] = get_num_threads()
+    # Set scale_pos_weight (computed from training data)
+    train_params["scale_pos_weight"] = scale_pos_weight
+    
+    # Print final parameters before model creation
+    print(f"\nFinal model parameters:")
+    for key in sorted(train_params.keys()):
+        print(f"  {key}: {train_params[key]}")
+    
+    print(f"  Creating dataset...")
+    if train_weights is not None:
+        train_dataset = lgb.Dataset(X_train_full, label=y_train_full, weight=train_weights, free_raw_data=True)
+    else:
+        train_dataset = lgb.Dataset(X_train_full, label=y_train_full, free_raw_data=True)
+    del X_train_full, y_train_full, train_years_array_full
+    if train_weights is not None:
+        del train_weights
+    gc.collect()
+    report_memory_usage("after train dataset creation")
+    
+    print(f"  Starting training with num_boost_round={chosen_iteration} (fixed from CV, no validation set/early stopping)...")
+    print(f"  Progress will be logged every 100 iterations via LightGBM callback.")
+    lgb_model = lgb.train(
+        train_params,
+        train_dataset,
+        num_boost_round=chosen_iteration,
+        callbacks=[lgb.log_evaluation(100)]
+    )
+    train_time = time.time() - train_start
+    print(f"\nTraining done in {train_time:.1f}s. Used {chosen_iteration} iterations (chosen based on CV)")
+    
+    del train_dataset; gc.collect()
+    
+    earlystop_time = 0.0  # No earlystop prediction time (not computing metrics)
+    
+    model_path = model_dir / f"model3_lgbm_{timestamp}.pkl"
+    with open(model_path, 'wb') as f:
+        pickle.dump(lgb_model, f)
+    print(f"Final model saved: {model_path}")
+    gc.collect()
+    
+    if use_wandb:
+        wandb.log({
+            "final_model/data/n_features": len(feature_cols),
+            "final_model/data/n_train": train_stats["n_train"],
+            "final_model/data/train_positives": train_stats["train_positives"],
+            "final_model/data/train_negatives": train_stats["train_negatives"],
+            "final_model/data/train_positive_pct": train_stats["train_positive_pct"],
+            "final_model/training/train_time_seconds": train_time,
+            "final_model/training/train_time_minutes": train_time / 60,
+            "final_model/training/final_num_boost_round": chosen_iteration,
+            "final_model/training/chosen_iteration": chosen_iteration,
+        })
+    
+    print("Phase 1 completed.")
+    cv_info = {
+        "cv_mode": cv_mode,
+        "folds": cv_results,
+        "aggregated": cv_aggregated,
+        "cv_best_iterations": best_iterations,
+        "cv_train_rows_per_fold": train_rows_per_fold,
+        "fold3_best_iteration": int(fold3_best_iteration) if fold3_best_iteration is not None else None,
+        "final_num_boost_round": chosen_iteration,
+        "chosen_iteration": chosen_iteration  # Alias for backward compatibility
+    }
+    # Return None for earlystop_metrics - earlystop is not used for evaluation
+    return (model_path, None, train_stats, train_time, earlystop_time, train_pos_full, train_neg_full, n_train_full, imbalance_info, cv_info)
+
+
+def phase2_testing(
+    test_path: Path, model_path: Path, feature_cols: list, keep_cols_test: list, timestamp: str, output_dir: Path,
+    use_wandb: bool, target_col: str, earlystop_metrics: Optional[Dict[str, Any]], train_stats: Dict[str, Any],
+    train_time: float, earlystop_time: float, train_pos: int, train_neg: int, n_train_full: int,
+    best_params: Dict[str, Any], start_time: float, imbalance_info: Dict[str, Any], cv_info: Dict[str, Any],
+) -> None:
+    """Phase 2: Testing - loads test in batches, loads model, evaluates."""
+    print("\n" + "="*70 + "\nPHASE 2: TESTING\n" + "="*70)
+    report_memory_usage("start of Phase 2")
+    
+    # Check for year overlap between training and test
+    final_train_years = (TRAIN_YEARS[0], EARLYSTOP_YEARS[1])  # Full training period: 2001-2016
+    test_year_range = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))
+    
+    if check_year_overlap(final_train_years, test_year_range, "Test"):
+        print("\n" + "="*70)
+        print("ERROR: Cannot proceed with testing due to year overlap.")
+        print("="*70)
+        raise ValueError("Test years overlap with training years. Cannot evaluate.")
+    
+    print(f"\nLoading model from {model_path}")
+    with open(model_path, 'rb') as f:
+        lgb_model = pickle.load(f)
+    report_memory_usage("after loading model")
+    
+    # Use batch size from config (can be overridden via BATCH_SIZE env var)
+    batch_size = BATCH_SIZE
+    
+    print(f"Processing test in batches of {batch_size:,}...")
+    print(f"Test year range: {test_year_range[0]}-{test_year_range[1]} (capped at LAST_LABEL_YEAR={LAST_LABEL_YEAR})")
+    
+    # Pass 1: Count rows (pre-allocate arrays to avoid concatenation memory spike)
+    print(f"  Pass 1: Counting test rows (year_range={test_year_range})...")
+    parquet_file = pq.ParquetFile(test_path)
+    n_test_total = 0
+    test_years_set = set()
+    
+    try:
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=[target_col, 'year', 'WDPA_prev'], use_threads=True):
+            batch_table = batch
+            # Use PyArrow null handling
+            null_mask = batch_table[target_col].is_null().to_numpy(zero_copy_only=False)
+            valid_mask = ~null_mask
+            if valid_mask.any():
+                year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+                wdpa_prev_array = batch_table['WDPA_prev'].to_numpy(zero_copy_only=False)
+                # Apply risk-set filtering: WDPA_prev == 0
+                risk_mask = (wdpa_prev_array == 0)
+                # Filter by year range to exclude right-censored labels
+                year_mask = (year_array >= test_year_range[0]) & (year_array <= test_year_range[1])
+                final_mask = valid_mask & year_mask & risk_mask
+                if final_mask.any():
+                    n_test_total += int(final_mask.sum())
+                    test_years_set.update(year_array[final_mask].tolist())
+                del year_array, wdpa_prev_array
+            
+            del batch_table, batch
+    finally:
+        del parquet_file
+        gc.collect()
+    
+    print(f"  Found {n_test_total:,} test samples (filtered to year_range={test_year_range[0]}-{test_year_range[1]})")
+    
+    if n_test_total == 0:
+        raise ValueError("No test samples found")
+    
+    # Pre-allocate arrays
+    print(f"  Pre-allocating arrays for {n_test_total:,} samples...")
+    y_test = np.empty(n_test_total, dtype=np.int8)
+    y_proba = np.empty(n_test_total, dtype=np.float32)
+    report_memory_usage("after pre-allocation")
+    
+    # Get best iteration from CV info (chosen iteration from CV)
+    # Since final model doesn't use early stopping, we use the chosen iteration from CV
+    best_iteration = cv_info.get("final_num_boost_round", cv_info.get("chosen_iteration", None))
+    if best_iteration is None:
+        # Fallback: use model's num_trees if cv_info doesn't have it
+        best_iteration = getattr(lgb_model, 'num_trees', None)
+    print(f"  Using {best_iteration} iterations for predictions (chosen from CV)")
+    
+    # Pass 2: Process batches and fill pre-allocated arrays
+    print(f"  Pass 2: Processing test batches (year_range={test_year_range})...")
+    parquet_file = pq.ParquetFile(test_path)
+    scored_path = output_dir / f"model3_lgbm_scored_{timestamp}.parquet"
+    writer = None
+    test_pos = test_neg = batch_num = idx_offset = 0
+    _score_milestone = -1
+    pred_start = time.time()
+    
+    # Ensure WDPA_prev is included in columns to read
+    keep_cols_test_with_wdpa = keep_cols_test + ['WDPA_prev'] if 'WDPA_prev' not in keep_cols_test else keep_cols_test
+    
+    try:
+        for batch in parquet_file.iter_batches(batch_size=batch_size, columns=keep_cols_test_with_wdpa, use_threads=True):
+            batch_num += 1
+            batch_table = batch
+            
+            # Use PyArrow null handling
+            null_mask = batch_table[target_col].is_null().to_numpy(zero_copy_only=False)
+            valid_mask = ~null_mask
+            if not valid_mask.any():
+                del batch_table, batch
+                continue
+            
+            # Extract target array, year array, and WDPA_prev
+            target_array = batch_table[target_col].to_numpy(zero_copy_only=False)
+            year_array = batch_table['year'].to_numpy(zero_copy_only=False)
+            wdpa_prev_array = batch_table['WDPA_prev'].to_numpy(zero_copy_only=False)
+            
+            # Apply risk-set filtering: WDPA_prev == 0
+            risk_mask = (wdpa_prev_array == 0)
+            # Filter by year range to exclude right-censored labels
+            # year_range=(TEST_START, min(TEST_END, LAST_LABEL_YEAR))
+            year_mask = (year_array >= test_year_range[0]) & (year_array <= test_year_range[1])
+            final_mask = valid_mask & year_mask & risk_mask
+            if not final_mask.any():
+                del batch_table, target_array, year_array, wdpa_prev_array, batch
+                continue
+            
+            # Extract feature columns in bulk using pure PyArrow→NumPy path (no pandas)
+            feature_table = batch_table.select(feature_cols)
+            X_batch = extract_features_pyarrow_to_numpy(feature_table, final_mask)
+            target_valid = target_array[final_mask]
+            y_batch = (target_valid > 0).astype(np.int8)
+            
+            # Get predictions from model
+            y_proba_batch = lgb_model.predict(X_batch, num_iteration=best_iteration if best_iteration else None).astype(np.float32)
+            
+            # Fill pre-allocated arrays directly
+            batch_size_actual = len(y_batch)
+            y_test[idx_offset:idx_offset + batch_size_actual] = y_batch
+            y_proba[idx_offset:idx_offset + batch_size_actual] = y_proba_batch
+            idx_offset += batch_size_actual
+            
+            test_pos += int(y_batch.sum())
+            test_neg += int((y_batch == 0).sum())
+            
+            # Extract metadata arrays for writing results (using final_mask which includes year filtering)
+            row_array = batch_table['row'].to_numpy(zero_copy_only=False)[final_mask]
+            col_array = batch_table['col'].to_numpy(zero_copy_only=False)[final_mask]
+            year_array_valid = year_array[final_mask]
+            
+            # Build result arrays and create PyArrow table directly
+            result_arrays = {
+                'row': row_array.astype(np.int32),
+                'col': col_array.astype(np.int32),
+                'year': year_array_valid.astype(np.int32),
+                'y_true': y_batch,
+                'y_pred_proba': y_proba_batch
+            }
+            
+            # Add optional x, y coordinates if present
+            for coord_col in ['x', 'y']:
+                if coord_col in batch_table.column_names:
+                    coord_array = batch_table[coord_col].to_numpy(zero_copy_only=False)[final_mask]
+                    result_arrays[coord_col] = coord_array.astype(np.float32)
+            
+            # Create PyArrow table directly from arrays (avoiding pandas)
+            result_table = pa.table(result_arrays)
+            
+            if writer is None:
+                writer = pq.ParquetWriter(scored_path, result_table.schema)
+                print(f"Writing to {scored_path}")
+            writer.write_table(result_table)
+            
+            del batch_table, target_array, wdpa_prev_array, target_valid, feature_table, X_batch, y_batch, y_proba_batch
+            del row_array, col_array, year_array, year_array_valid, result_arrays, result_table, batch
+
+            if batch_num % 25 == 0:
+                gc.collect()
+            _pct = idx_offset * 100 // n_test_total if n_test_total > 0 else 0
+            _ms  = _pct // 25
+            if _ms > _score_milestone:
+                _score_milestone = _ms
+                print(f"  {_pct}% — {idx_offset:,}/{n_test_total:,} rows")
+                report_memory_usage(f"  {_pct}%")
+    finally:
+        if writer is not None:
+            writer.close()
+        del parquet_file; gc.collect()
+
+    if idx_offset != n_test_total:
+        raise ValueError(f"Mismatch: expected {n_test_total:,} samples but processed {idx_offset:,}")
+
+    pred_time = time.time() - pred_start
+    print(f"Completed {batch_num} batches in {pred_time:.1f}s, {n_test_total:,} rows")
+    report_memory_usage("after all predictions")
+    
+    test_years = sorted(test_years_set)
+    del test_years_set; gc.collect()
+    print(f"\nTest set: {test_neg:,} neg, {test_pos:,} pos, ratio 1:{test_neg/max(test_pos,1):.1f}, years {test_years[0]}-{test_years[-1]}")
+    
+    if use_wandb:
+        wandb.log({"data/n_test": int(n_test_total), "data/test_positives": test_pos, "data/test_negatives": test_neg,
+                  "data/test_positive_pct": test_pos/n_test_total*100})
+    
+    test_metrics = compute_metrics(y_test, y_proba)
+    baseline_rate = test_metrics['baseline_rate']
+    prec_at_k = {k: test_metrics[f'precision_at_{k}pct'] for k in [1, 5, 10]}
+    print(f"\nTest metrics: ROC-AUC {test_metrics['roc_auc']:.4f}, PR-AUC {test_metrics['pr_auc']:.4f}")
+    for k in [1, 5, 10]:
+        n_top_k = max(1, int(len(y_test) * k / 100))
+        n_protected = int(n_top_k * prec_at_k[k])
+        print(f"  P@{k}%: {prec_at_k[k]:.4f} ({n_protected:,}/{n_top_k:,}), lift {test_metrics[f'lift_at_{k}pct']:.2f}x")
+    
+    if use_wandb:
+        wandb.log({**{f"test/{k}": v for k, v in test_metrics.items()}})
+    
+    # Get feature importance from the model
+    try:
+        feature_importance = pd.DataFrame({
+            'feature': feature_cols, 
+            'importance': lgb_model.feature_importance()
+        }).sort_values('importance', ascending=False).head(20)
+        print("\nTop 20 features:\n" + feature_importance.to_string(index=False))
+    except Exception as e:
+        print(f"\nWarning: Could not extract feature importance: {e}")
+        feature_importance = pd.DataFrame({'feature': feature_cols, 'importance': [0] * len(feature_cols)}).head(20)
+    
+    # Free test data after metrics computation
+    del y_test, y_proba; gc.collect()
+    
+    metrics = {
+        "metadata": {
+            "timestamp": timestamp, 
+            "model": "LightGBM", 
+            "task": "transition_01_win5_prediction",
+            "target_column": TARGET_COL,
+            "lookahead_years": 5,
+            "random_state": RANDOM_STATE, 
+            "n_features": len(feature_cols), 
+            "features": feature_cols,
+            "test_probabilities": "uncalibrated",
+            "cv_mode": cv_info.get("cv_mode", "full"),
+            "use_time_weights": True
+        },
+        "data": {
+            "n_train_full": n_train_full, 
+            "n_test": int(n_test_total), 
+            "train_positives": train_pos,
+            "train_negatives": train_neg, 
+            "test_positives": test_pos, 
+            "test_negatives": test_neg
+        },
+        "temporal_split": {
+            "method": "strict_temporal_split", 
+            "train_years": list(TRAIN_YEARS),
+            "earlystop_years": list(EARLYSTOP_YEARS), 
+            "test_years": list(TEST_YEARS)
+        },
+        "cross_validation": cv_info,
+        "model_parameters": best_params,
+        "imbalance_handling": {
+            "method": "scale_pos_weight", 
+            "is_unbalance": False,
+            "scale_pos_weight": imbalance_info.get("scale_pos_weight"),
+            "neg": imbalance_info.get("neg"), 
+            "pos": imbalance_info.get("pos")
+        },
+        "test_performance": test_metrics, 
+        "feature_importance": feature_importance.head(20).to_dict('records'),
+        "timing": {
+            "train_seconds": train_time,
+            "prediction_seconds": pred_time, 
+            "total_seconds": time.time() - start_time
+        }
+    }
+    metrics = convert_numpy_types(metrics)
+    metrics_path = output_dir / f"model3_lgbm_metrics_{timestamp}.json"
+    with open(metrics_path, 'w') as f:
+        json.dump(metrics, f, indent=2)
+    print(f"\nMetrics saved: {metrics_path}")
+    del lgb_model; gc.collect()
+    
+    total_time = time.time() - start_time
+    cv_mode = cv_info.get("cv_mode", "full")
+    print("\n" + "="*70 + "\nSUMMARY\n" + "="*70)
+    print(f"Model: LightGBM, {len(feature_cols)} features")
+    print(f"\nTemporal Cross-Validation (CV Mode: {cv_mode}):")
+    if cv_mode != "none":
+        n_folds_run = len([f for f in cv_info.get("folds", []) if not f.get("skipped", False)])
+        n_folds_skipped = len([f for f in cv_info.get("folds", []) if f.get("skipped", False)])
+        print(f"  Folds run: {n_folds_run}")
+        if n_folds_skipped > 0:
+            print(f"  Folds skipped (year overlap): {n_folds_skipped}")
+    print(f"  Final num_boost_round (chosen): {cv_info.get('final_num_boost_round', 'N/A')}")
+    if cv_info.get('fold3_best_iteration') is not None:
+        print(f"  Fold3 best_iteration: {cv_info.get('fold3_best_iteration')}")
+    
+    # NO earlystop/validation metrics displayed - only CV metadata and test metrics
+    
+    print(f"\nTest ({TEST_YEARS[0]}-{TEST_YEARS[1]}, {n_test_total:,} samples, {test_pos/n_test_total*100:.3f}% pos): ROC-AUC {test_metrics['roc_auc']:.4f}, PR-AUC {test_metrics['pr_auc']:.4f}")
+    print(f"  P@1%: {prec_at_k[1]:.4f} ({test_metrics['lift_at_1pct']:.1f}x), P@5%: {prec_at_k[5]:.4f} ({test_metrics['lift_at_5pct']:.1f}x), P@10%: {prec_at_k[10]:.4f} ({test_metrics['lift_at_10pct']:.1f}x)")
+    print(f"\nTimings: train {train_time:.1f}s, pred {pred_time:.1f}s, total {total_time:.1f}s ({total_time/60:.1f}m)")
+    print("="*70 + "\nDone.")
+    
+    if use_wandb:
+        wandb.log({
+            "summary/total_time_seconds": total_time, 
+            "summary/total_time_minutes": total_time / 60, 
+            "status": "success"
+        })
+        wandb.finish()
+
+
+def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True, num_boost_round: Optional[int] = None, eval_only: bool = False) -> None:
+    start_time = time.time()
+    repo_root = get_repo_root()
+    train_path = resolve_parquet_file("train_win5.parquet")
+    earlystop_path = resolve_parquet_file("earlystop_win5.parquet")
+    test_path = resolve_parquet_file("test_win5.parquet")
+    params_path = resolve_best_params_json()
+    
+    # Load parameters before wandb.init() so we can log them
+    best_params, best_cv_score = load_best_params(params_path)
+    # Force threading from SLURM allocation (avoid hardcoded / mismatched defaults)
+    best_params["num_threads"] = NUM_THREADS
+    if params_path:
+        print(f"\nLoaded params from {params_path}")
+        if best_cv_score:
+            print(f"Best CV score: {best_cv_score:.4f}")
+    else:
+        print(f"\nUsing default manual hyperparameters (lgbm_best_params.json not found)")
+    
+    output_dir = repo_root / "outputs/se_asia/results/ml_models"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model_dir = repo_root / "data/se_asia/ml/models"
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    if eval_only:
+        json_files = sorted(output_dir.glob("model3_lgbm_metrics_*.json"))
+        if not json_files:
+            raise FileNotFoundError(f"No model3_lgbm_metrics_*.json found in {output_dir}")
+        with open(json_files[-1]) as f:
+            prev = json.load(f)
+        prev_ts = prev["metadata"]["timestamp"]
+        model_path = model_dir / f"model3_lgbm_{prev_ts}.pkl"
+        if not model_path.exists():
+            cands = sorted(model_dir.glob("model3_lgbm_*.pkl"))
+            if not cands:
+                raise FileNotFoundError(f"No model3_lgbm_*.pkl found in {model_dir}")
+            model_path = cands[-1]
+        feature_cols = prev["metadata"]["features"]
+        all_cols_test = pq.ParquetFile(test_path).schema_arrow.names
+        keep_cols_test = feature_cols + [TARGET_COL, 'year', 'row', 'col'] + [c for c in ['x', 'y'] if c in all_cols_test]
+        print(f"EVAL-ONLY: reusing {model_path.name} (metrics source: {json_files[-1].name})")
+        phase2_testing(
+            test_path, model_path, feature_cols, keep_cols_test, timestamp, output_dir,
+            False, TARGET_COL,
+            None, {}, 0.0, 0.0,
+            prev["data"]["train_positives"], prev["data"]["train_negatives"], prev["data"]["n_train_full"],
+            prev.get("model_parameters", best_params), start_time,
+            prev.get("imbalance_handling", {}), prev.get("cross_validation", {}),
+        )
+        return
+
+    use_wandb = False
+    if wandb is not None:
+        try:
+            wandb.init(
+            project="ml-training-model3", 
+            entity=os.environ.get("WANDB_ENTITY"), 
+            name=f"model3_lgbm_{timestamp}",
+            config={
+                "model": "LightGBM", 
+                "task": "transition_01_win5_prediction", 
+                "target_column": TARGET_COL,
+                "lookahead_years": 5,
+                "random_state": RANDOM_STATE,
+                "use_time_weights": use_time_weights,
+                "temporal_split": {
+                    "train_years": list(TRAIN_YEARS), 
+                    "earlystop_years": list(EARLYSTOP_YEARS),
+                    "test_years": list(TEST_YEARS)
+                },
+                "hyperparameters": best_params
+            }
+            )
+            use_wandb = True
+            print("W&B connected")
+        except Exception as err:
+            print(f"W&B failed: {err}")
+    else:
+        print("W&B not available (module not installed)")
+    
+    print("="*70 + "\nLGBM TRANSITION MODEL (CONTINENT DATASET - 5-YEAR LOOKAHEAD)\n" + "="*70)
+    print(f"Train: {train_path}\nEarlystop: {earlystop_path}\nTest: {test_path}\nParams: {params_path if params_path else 'Using default manual hyperparameters (lgbm_best_params.json not found)'}\nOutput: {output_dir}")
+    print(f"\nConfiguration:")
+    print(f"  CV Mode: {cv_mode}")
+    print(f"  Use Time Weights: {use_time_weights}")
+    print(f"  WDPA_LAST_YEAR: {WDPA_LAST_YEAR}")
+    print(f"  LOOKAHEAD_YEARS: {LOOKAHEAD_YEARS}")
+    print(f"  LAST_LABEL_YEAR: {LAST_LABEL_YEAR} (WDPA_LAST_YEAR - LOOKAHEAD_YEARS)")
+    print(f"  Earlystop/Test data filtered to years <= {LAST_LABEL_YEAR} to avoid right-censored labels")
+    
+    all_cols_train = pq.ParquetFile(train_path).schema_arrow.names
+    all_cols_test = pq.ParquetFile(test_path).schema_arrow.names
+    target_col = TARGET_COL
+    # Build feature columns from PyArrow schema only (avoid loading full parquet into pandas)
+    schema = pq.ParquetFile(train_path).schema_arrow
+    numeric_cols = [
+        name
+        for name, field in zip(schema.names, schema)
+        if pa.types.is_integer(field.type) or pa.types.is_floating(field.type)
+    ]
+    # Exclude target and coordinates from features (year is excluded)
+    feature_cols = [c for c in numeric_cols if c not in EXCLUDE_COLS]
+    required_cols = [target_col, 'year', 'row', 'col']
+    optional_cols = [col for col in ['x', 'y'] if col in all_cols_train]
+    keep_cols_train = feature_cols + required_cols + optional_cols
+    keep_cols_test = feature_cols + required_cols + [col for col in ['x', 'y'] if col in all_cols_test]
+    print(f"Selected {len(feature_cols)} features, loading {len(keep_cols_train)} cols from train, {len(keep_cols_test)} from test")
+    print(f"Target column: {target_col}")
+    
+    (model_path, earlystop_metrics, train_stats, train_time, earlystop_time, train_pos, train_neg, n_train_full, imbalance_info, cv_info) = phase1_training(
+        train_path, earlystop_path, params_path, feature_cols, keep_cols_train, best_params, timestamp, model_dir, output_dir, use_wandb, target_col, cv_mode, use_time_weights, num_boost_round=num_boost_round)
+    
+    phase2_testing(
+        test_path, model_path, feature_cols, keep_cols_test, timestamp, output_dir, use_wandb, target_col,
+        earlystop_metrics, train_stats, train_time, earlystop_time, train_pos, train_neg, n_train_full,
+        best_params, start_time, imbalance_info, cv_info)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="LGBM Transition Model for Continent Dataset (5-Year Lookahead Prediction)")
+    parser.add_argument(
+        "--cv-mode",
+        type=str,
+        choices=["full", "fold3", "none"],
+        default="fold3",
+        help="Cross-validation mode: 'full' (run all 3 folds), 'fold3' (run only fold 3 for fast dev), 'none' (skip CV)"
+    )
+    parser.add_argument(
+        "--num-boost-round",
+        type=int,
+        default=None,
+        help="Number of boosting rounds to use when cv_mode='none'. If not provided, uses default from params."
+    )
+    parser.add_argument(
+        "--eval-only",
+        action="store_true",
+        default=False,
+        help="Skip training; reload existing model and recompute test metrics only.",
+    )
+    args = parser.parse_args()
+
+    repo_root = get_repo_root()
+    output_dir = repo_root / "outputs/se_asia/results/ml_models"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = output_dir / f"model3_lgbm_{timestamp}.txt"
+    tee = Tee(output_file)
+    sys.stdout = tee
+    try:
+        # Always use time_weights=True
+        main(timestamp, cv_mode=args.cv_mode, use_time_weights=True, num_boost_round=args.num_boost_round, eval_only=args.eval_only)
+    finally:
+        sys.stdout = tee.stdout
+        tee.close()
+        print(f"\nOutput saved to: {output_file}")

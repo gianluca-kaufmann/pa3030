@@ -47,7 +47,7 @@ class ModelEvalConfig:
     in the evaluation logic and accept this config as an input.
     """
 
-    region: Literal["south_america", "usa"]
+    region: Literal["south_america", "usa", "se_asia"]
     model_id: str  # e.g. "model1", "model2"
 
     # Algorithm identifier used in filenames, e.g. "lgbm" or "rf"
@@ -77,7 +77,7 @@ class ModelEvalConfig:
 
     @staticmethod
     def for_region_model(
-        region: Literal["south_america", "usa"],
+        region: Literal["south_america", "usa", "se_asia"],
         model_id: str,
         algorithm: Literal["lgbm", "rf"],
         repo_root: Optional[Path] = None,

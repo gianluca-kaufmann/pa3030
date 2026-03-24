@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""Benchmark Evaluation Script for model3_LGBM
+
+Purpose: Extract final CV + test metrics from model3_LGBM training results,
+         create a benchmark JSON file with metrics, features, params, seed, and dataset hash.
+         Marks in-sample earlystop as NON-EVALUATIVE.
+
+Input:   - model3_lgbm_metrics_*.json (for LGBM) or model3_rf_win5_metrics_*.json (for RF)
+           (most recent file from outputs/se_asia/results/ml_models)
+         - train_win5.parquet, test_win5.parquet
+           (for dataset hash computation; earlystop/val excluded)
+
+Output:  - benchmark JSON file with:
+           - CV aggregated metrics
+           - Test performance metrics  
+           - Features, model parameters, random seed
+           - Dataset hash
+           - Earlystop marked as NON-EVALUATIVE
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from datetime import datetime
+from typing import Any, Dict
+
+# ── sys.path bootstrap: add repo root so scripts.regions.shared is importable ─
+_repo_root = Path(__file__).resolve().parents[4]
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+del _repo_root
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class Tee:
+    """Write to both stdout and a file."""
+    def __init__(self, file_path: Path):
+        self.file = open(file_path, 'w', encoding='utf-8')
+        self.stdout = sys.stdout
+    
+    def write(self, text: str) -> None:
+        self.stdout.write(text)
+        self.file.write(text)
+        self.file.flush()
+    
+    def flush(self) -> None:
+        self.stdout.flush()
+        self.file.flush()
+    
+    def close(self) -> None:
+        self.file.close()
+
+
+def _print_summary(
+    benchmark: Dict[str, Any],
+    metrics_path: Path,
+    benchmark_path: Path,
+    dataset_hash: str,
+) -> None:
+    cv_section = benchmark["evaluative_metrics"]["cross_validation"]
+    test_metrics = benchmark["evaluative_metrics"]["test_performance"]
+
+    print("=" * 70)
+    print("SUMMARY")
+    print("=" * 70)
+
+    print(f"\nSource metrics: {metrics_path.name}")
+    print(f"Benchmark file: {benchmark_path.name}")
+    print(f"\nDataset hash: {dataset_hash[:16]}...")
+
+    # Handle CV metrics (may not be available for RF/BRF)
+    if "aggregated" in cv_section and cv_section["aggregated"]:
+        cv_agg = cv_section["aggregated"]
+        print(f"\nCross-Validation (Aggregated across 3 folds):")
+        roc_auc_mean = cv_agg.get('roc_auc_mean', 'N/A')
+        roc_auc_std = cv_agg.get('roc_auc_std', 0)
+        roc_auc_mean_str = f"{roc_auc_mean:.4f}" if isinstance(roc_auc_mean, (int, float)) else str(roc_auc_mean)
+        roc_auc_std_str = f"{roc_auc_std:.4f}" if isinstance(roc_auc_std, (int, float)) else str(roc_auc_std)
+        print(f"  ROC-AUC: {roc_auc_mean_str} ± {roc_auc_std_str}")
+        pr_auc_mean = cv_agg.get('pr_auc_mean', 'N/A')
+        pr_auc_std = cv_agg.get('pr_auc_std', 0)
+        pr_auc_mean_str = f"{pr_auc_mean:.4f}" if isinstance(pr_auc_mean, (int, float)) else str(pr_auc_mean)
+        pr_auc_std_str = f"{pr_auc_std:.4f}" if isinstance(pr_auc_std, (int, float)) else str(pr_auc_std)
+        print(f"  PR-AUC:  {pr_auc_mean_str} ± {pr_auc_std_str}")
+        p1_mean = cv_agg.get('precision_at_1pct_mean', 'N/A')
+        p1_std = cv_agg.get('precision_at_1pct_std', 0)
+        p1_mean_str = f"{p1_mean:.4f}" if isinstance(p1_mean, (int, float)) else str(p1_mean)
+        p1_std_str = f"{p1_std:.4f}" if isinstance(p1_std, (int, float)) else str(p1_std)
+        print(f"  P@1%:    {p1_mean_str} ± {p1_std_str}")
+        p5_mean = cv_agg.get('precision_at_5pct_mean', 'N/A')
+        p5_std = cv_agg.get('precision_at_5pct_std', 0)
+        p5_mean_str = f"{p5_mean:.4f}" if isinstance(p5_mean, (int, float)) else str(p5_mean)
+        p5_std_str = f"{p5_std:.4f}" if isinstance(p5_std, (int, float)) else str(p5_std)
+        print(f"  P@5%:    {p5_mean_str} ± {p5_std_str}")
+        p10_mean = cv_agg.get('precision_at_10pct_mean', 'N/A')
+        p10_std = cv_agg.get('precision_at_10pct_std', 0)
+        p10_mean_str = f"{p10_mean:.4f}" if isinstance(p10_mean, (int, float)) else str(p10_mean)
+        p10_std_str = f"{p10_std:.4f}" if isinstance(p10_std, (int, float)) else str(p10_std)
+        print(f"  P@10%:   {p10_mean_str} ± {p10_std_str}")
+        r1_mean = cv_agg.get('recall_at_1pct_mean', 'N/A')
+        r1_std = cv_agg.get('recall_at_1pct_std', 0)
+        r1_mean_str = f"{r1_mean:.4f}" if isinstance(r1_mean, (int, float)) else str(r1_mean)
+        r1_std_str = f"{r1_std:.4f}" if isinstance(r1_std, (int, float)) else str(r1_std)
+        print(f"  R@1%:    {r1_mean_str} ± {r1_std_str}")
+        r5_mean = cv_agg.get('recall_at_5pct_mean', 'N/A')
+        r5_std = cv_agg.get('recall_at_5pct_std', 0)
+        r5_mean_str = f"{r5_mean:.4f}" if isinstance(r5_mean, (int, float)) else str(r5_mean)
+        r5_std_str = f"{r5_std:.4f}" if isinstance(r5_std, (int, float)) else str(r5_std)
+        print(f"  R@5%:    {r5_mean_str} ± {r5_std_str}")
+        r10_mean = cv_agg.get('recall_at_10pct_mean', 'N/A')
+        r10_std = cv_agg.get('recall_at_10pct_std', 0)
+        r10_mean_str = f"{r10_mean:.4f}" if isinstance(r10_mean, (int, float)) else str(r10_mean)
+        r10_std_str = f"{r10_std:.4f}" if isinstance(r10_std, (int, float)) else str(r10_std)
+        print(f"  R@10%:   {r10_mean_str} ± {r10_std_str}")
+    else:
+        print(f"\nCross-Validation: {cv_section.get('note', 'Not available')}")
+
+    print(f"\nTest Performance:")
+    test_roc_auc = test_metrics.get('roc_auc', 'N/A')
+    test_roc_auc_str = f"{test_roc_auc:.4f}" if isinstance(test_roc_auc, (int, float)) else str(test_roc_auc)
+    print(f"  ROC-AUC: {test_roc_auc_str}")
+    test_pr_auc = test_metrics.get('pr_auc', 'N/A')
+    test_pr_auc_str = f"{test_pr_auc:.4f}" if isinstance(test_pr_auc, (int, float)) else str(test_pr_auc)
+    print(f"  PR-AUC:  {test_pr_auc_str}")
+    test_p1 = test_metrics.get('precision_at_1pct', 'N/A')
+    test_p1_str = f"{test_p1:.4f}" if isinstance(test_p1, (int, float)) else str(test_p1)
+    print(f"  P@1%:    {test_p1_str}")
+    test_p5 = test_metrics.get('precision_at_5pct', 'N/A')
+    test_p5_str = f"{test_p5:.4f}" if isinstance(test_p5, (int, float)) else str(test_p5)
+    print(f"  P@5%:    {test_p5_str}")
+    test_p10 = test_metrics.get('precision_at_10pct', 'N/A')
+    test_p10_str = f"{test_p10:.4f}" if isinstance(test_p10, (int, float)) else str(test_p10)
+    print(f"  P@10%:   {test_p10_str}")
+    test_r1 = test_metrics.get('recall_at_1pct', 'N/A')
+    test_r1_str = f"{test_r1:.4f}" if isinstance(test_r1, (int, float)) else str(test_r1)
+    print(f"  R@1%:    {test_r1_str}")
+    test_r5 = test_metrics.get('recall_at_5pct', 'N/A')
+    test_r5_str = f"{test_r5:.4f}" if isinstance(test_r5, (int, float)) else str(test_r5)
+    print(f"  R@5%:    {test_r5_str}")
+    test_r10 = test_metrics.get('recall_at_10pct', 'N/A')
+    test_r10_str = f"{test_r10:.4f}" if isinstance(test_r10, (int, float)) else str(test_r10)
+    print(f"  R@10%:   {test_r10_str}")
+    
+    print(f"\nEarlystop Performance (NON-EVALUATIVE):")
+    earlystop_metrics = benchmark["non_evaluative_metrics"]["earlystop_performance"]
+    if "note" in earlystop_metrics and earlystop_metrics["note"] == "Not reported":
+        print(f"  {earlystop_metrics['note']}")
+    else:
+        earlystop_roc_auc = earlystop_metrics.get('roc_auc', 'N/A')
+        earlystop_roc_auc_str = f"{earlystop_roc_auc:.4f}" if isinstance(earlystop_roc_auc, (int, float)) else str(earlystop_roc_auc)
+        print(f"  ROC-AUC: {earlystop_roc_auc_str}")
+        earlystop_pr_auc = earlystop_metrics.get('pr_auc', 'N/A')
+        earlystop_pr_auc_str = f"{earlystop_pr_auc:.4f}" if isinstance(earlystop_pr_auc, (int, float)) else str(earlystop_pr_auc)
+        print(f"  PR-AUC:  {earlystop_pr_auc_str}")
+        print(f"  Note: This is in-sample earlystop on data used during training")
+    
+    print(f"\nModel Configuration:")
+    config = benchmark["model_config"]
+    print(f"  Random seed: {config.get('random_seed', 'N/A')}")
+    print(f"  Features: {config.get('n_features', 0)}")
+    
+    print("\n" + "=" * 70)
+    print("Done.")
+    print("=" * 70)
+
+
+def main(model_type: str, split_version: str = 'main') -> None:
+    """
+    South East Asia model3 benchmark entrypoint.
+
+    Delegates core logic to the shared evaluation module while preserving the
+    original console output structure.
+    """
+    from scripts.regions.shared.evaluation.config import ModelEvalConfig
+    from scripts.regions.shared.evaluation.benchmark_core import run_benchmark
+
+    config = ModelEvalConfig.for_region_model(
+        region="se_asia",
+        model_id="model3",
+        algorithm=model_type,  # "lgbm" or "rf"
+    )
+
+    ml_models_root = config.metrics_root
+    benchmark_output_dir = ml_models_root / split_version
+    benchmark_output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 70)
+    print(f"BENCHMARK EVALUATION: model3_{model_type.upper()} (Split: {split_version})")
+    print("=" * 70)
+    print(f"\nOutput directory: {benchmark_output_dir}")
+    print(f"Model type: {model_type}")
+    print(f"Split version: {split_version}")
+    if ml_models_root.exists():
+        print("  ✓ Directory exists")
+    else:
+        print("  ⚠ Directory does not exist yet, will be created if needed")
+
+    print("\n" + "=" * 70)
+    print("STEP 1-4: LOAD METRICS, COMPUTE DATASET HASH, CREATE BENCHMARK JSON")
+    print("=" * 70)
+
+    try:
+        result = run_benchmark(config=config, model_type=model_type, split_version=split_version)
+        print(f"\nBenchmark JSON structure created")
+        cv_note = result.benchmark["evaluative_metrics"]["cross_validation"].get("note", "")
+        if "Not available" in cv_note:
+            print(f"  Evaluative metrics: Test performance (CV: {cv_note})")
+        else:
+            print("  Evaluative metrics: CV aggregated + Test performance")
+        earlystop_note = result.benchmark["non_evaluative_metrics"]["earlystop_performance"].get("note", "")
+        if "Not reported" in earlystop_note:
+            print(f"  Non-evaluative metrics: Earlystop performance ({earlystop_note})")
+        else:
+            print("  Non-evaluative metrics: Earlystop performance (marked as NON-EVALUATIVE)")
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"\nERROR: Failed to create benchmark JSON: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+    print("\n" + "=" * 70)
+    print("STEP 5: SAVE BENCHMARK JSON")
+    print("=" * 70)
+    print(f"\nBenchmark JSON saved: {result.benchmark_path}")
+
+    _print_summary(
+        benchmark=result.benchmark,
+        metrics_path=result.metrics_path,
+        benchmark_path=result.benchmark_path,
+        dataset_hash=result.dataset_hash,
+    )
+
+
+if __name__ == "__main__":
+    import argparse
+    import os
+
+    parser = argparse.ArgumentParser(
+        description="Benchmark evaluation script for model3 (LGBM, RF)"
+    )
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        choices=["lgbm", "rf"],
+        default=os.environ.get("MODEL_TYPE", "lgbm"),
+        help="Model type: lgbm or rf (default: lgbm, or from MODEL_TYPE env var)"
+    )
+    parser.add_argument(
+        "--split-version",
+        type=str,
+        choices=["main", "robustness"],
+        default="main",
+        help="Split version: 'main' or 'robustness' (default: main)"
+    )
+    
+    args = parser.parse_args()
+    model_type = args.model_type.lower()
+    
+    if model_type not in ["lgbm", "rf"]:
+        print(f"ERROR: Invalid model_type '{model_type}'. Must be one of: lgbm, rf")
+        sys.exit(1)
+    
+    repo_root = Path(__file__).resolve().parents[4]
+    output_dir = repo_root / "outputs/se_asia/results/ml_models"
+    # Create split-specific output directory
+    split_output_dir = output_dir / args.split_version
+    split_output_dir.mkdir(parents=True, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_file = split_output_dir / f"benchmark_model3_{model_type}_{timestamp}.txt"
+    
+    tee = Tee(output_file)
+    sys.stdout = tee
+    
+    try:
+        main(model_type, args.split_version)
+    finally:
+        sys.stdout = tee.stdout
+        tee.close()
+        print(f"\nOutput saved to: {output_file}")
+
