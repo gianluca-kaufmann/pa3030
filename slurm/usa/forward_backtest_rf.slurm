@@ -48,6 +48,9 @@ echo "USA RF backtest task ${TASK_ID}: origin year T=${ORIGIN_YEAR}"
 mkdir -p "$SCRATCH/logs"
 mkdir -p "$SCRATCH/outputs/usa/results/forward/rf"
 
+# Cap negatives to avoid OOM — matches MAX_NEG_TRAIN used in production training_rf.slurm
+export MAX_NEG_TRAIN=50000000
+
 #------------------------------------------------------------------------------
 # Load modules
 #------------------------------------------------------------------------------

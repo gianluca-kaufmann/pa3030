@@ -70,6 +70,11 @@ from scripts.regions.shared.training.utils import (  # noqa: E402
     report_memory_usage,
 )
 
+try:
+    import wandb as _wandb
+except ImportError:
+    _wandb = None
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 RANDOM_STATE = 42
 EXCLUDE_COLS = {
@@ -80,6 +85,11 @@ TARGET_COL = "transition_01_win5"
 WDPA_LAST_YEAR = 2024
 LOOKAHEAD_YEARS = 5
 LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS  # 2019
+
+# Negative sampling cap (0 = no cap). Set MAX_NEG_TRAIN in SLURM scripts:
+#   LGBM: export MAX_NEG_TRAIN=100000000  (100M)
+#   RF:   export MAX_NEG_TRAIN=50000000   (50M, matches production training_rf.slurm)
+MAX_NEG_TRAIN = int(os.environ.get("MAX_NEG_TRAIN", "0"))
 
 
 # ── Coordinate + rasterization helpers (for false-positive map) ───────────────
@@ -333,9 +343,18 @@ def load_training_data(
     feature_cols: List[str],
     year_range: Tuple[int, int],
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
-    """Stream training data (WDPA_prev==0, year in range) from split parquets."""
+    """Stream training data (WDPA_prev==0, year in range) from split parquets.
+
+    If MAX_NEG_TRAIN > 0, caps negatives at that count via uniform random
+    sampling without replacement (all positives always kept). Uses the same
+    neg_keep index approach as spatial_cv_core.py to avoid peak-memory doubling.
+    """
     essential = feature_cols + [TARGET_COL, "year", "WDPA_prev"]
-    n_samples = 0
+    year_lo, year_hi = year_range
+
+    # ── Pass 1: count positives and negatives separately ─────────────────────
+    n_pos_total = 0
+    n_neg_total = 0
     for path in paths:
         pf = pq.ParquetFile(path)
         try:
@@ -347,19 +366,38 @@ def load_training_data(
                 wp  = batch["WDPA_prev"].to_numpy(zero_copy_only=False)
                 mask = (~null_mask
                         & (wp == 0)
-                        & (yr >= year_range[0]) & (yr <= year_range[1]))
-                n_samples += int(mask.sum())
+                        & (yr >= year_lo) & (yr <= year_hi))
+                if mask.any():
+                    n_pos_total += int((tgt[mask] > 0).sum())
+                    n_neg_total += int((tgt[mask] == 0).sum())
                 del batch, tgt_arr, tgt, null_mask, yr, wp, mask
         finally:
             del pf
 
+    do_neg_sample = MAX_NEG_TRAIN > 0 and n_neg_total > MAX_NEG_TRAIN
+    n_neg_final   = MAX_NEG_TRAIN if do_neg_sample else n_neg_total
+    n_samples     = n_pos_total + n_neg_final
+
     if n_samples == 0:
         raise ValueError(f"No training samples for years {year_range}")
 
-    X = np.empty((n_samples, len(feature_cols)), dtype=np.float32)
-    y = np.empty(n_samples, dtype=np.int8)
+    neg_cap_str = f", neg capped at {n_neg_final:,}" if do_neg_sample else ""
+    print(f"  Found {n_pos_total:,} pos + {n_neg_total:,} neg{neg_cap_str} → {n_samples:,} total")
+
+    # ── Pre-generate neg_keep indices (exact uniform sample) ─────────────────
+    if do_neg_sample:
+        rng      = np.random.default_rng(RANDOM_STATE)
+        neg_keep = np.sort(rng.choice(n_neg_total, size=n_neg_final, replace=False))
+    else:
+        neg_keep = None
+
+    # ── Pass 2: fill pre-allocated arrays (positives first, then negatives) ──
+    X         = np.empty((n_samples, len(feature_cols)), dtype=np.float32)
+    y         = np.empty(n_samples, dtype=np.int8)
     years_arr = np.empty(n_samples, dtype=np.int32)
-    idx = 0
+    pos_offset = 0
+    neg_offset = n_pos_total   # negatives placed after all positives
+    neg_seen   = 0             # global neg counter across batches
 
     for path in paths:
         pf = pq.ParquetFile(path)
@@ -372,24 +410,65 @@ def load_training_data(
                 wp  = batch["WDPA_prev"].to_numpy(zero_copy_only=False)
                 mask = (~null_mask
                         & (wp == 0)
-                        & (yr >= year_range[0]) & (yr <= year_range[1]))
+                        & (yr >= year_lo) & (yr <= year_hi))
                 if not mask.any():
                     del batch, tgt_arr, tgt, null_mask, yr, wp, mask
                     continue
-                X_b = extract_features_pyarrow_to_numpy(batch.select(feature_cols), mask)
-                y_b = (tgt[mask] > 0).astype(np.int8)
-                k = len(y_b)
-                X[idx:idx + k] = X_b
-                y[idx:idx + k] = y_b
-                years_arr[idx:idx + k] = yr[mask].astype(np.int32)
-                idx += k
-                del batch, tgt, yr, wp, mask, X_b, y_b
+
+                pos_final     = mask & (tgt > 0)
+                neg_final_all = mask & (tgt == 0)
+
+                # Positives: always keep all
+                if pos_final.any():
+                    X_b = extract_features_pyarrow_to_numpy(batch.select(feature_cols), pos_final)
+                    k   = len(X_b)
+                    X[pos_offset:pos_offset + k]         = X_b
+                    y[pos_offset:pos_offset + k]         = 1
+                    years_arr[pos_offset:pos_offset + k] = yr[pos_final].astype(np.int32)
+                    pos_offset += k
+
+                # Negatives: optional subsampling via pre-generated neg_keep
+                if neg_final_all.any():
+                    n_neg_b = int(neg_final_all.sum())
+                    if neg_keep is not None:
+                        batch_idx  = np.arange(neg_seen, neg_seen + n_neg_b, dtype=np.int64)
+                        lo         = np.searchsorted(neg_keep, batch_idx)
+                        lo_c       = np.minimum(lo, len(neg_keep) - 1)
+                        keep_local = neg_keep[lo_c] == batch_idx
+                        neg_seen  += n_neg_b
+                        if keep_local.any():
+                            neg_where    = np.where(neg_final_all)[0]
+                            kept_global  = neg_where[keep_local]
+                            neg_filtered = np.zeros(len(tgt), dtype=bool)
+                            neg_filtered[kept_global] = True
+                            X_b  = extract_features_pyarrow_to_numpy(batch.select(feature_cols), neg_filtered)
+                            n_k  = len(X_b)
+                            X[neg_offset:neg_offset + n_k]         = X_b
+                            y[neg_offset:neg_offset + n_k]         = 0
+                            years_arr[neg_offset:neg_offset + n_k] = yr[neg_filtered].astype(np.int32)
+                            neg_offset += n_k
+                    else:
+                        X_b = extract_features_pyarrow_to_numpy(batch.select(feature_cols), neg_final_all)
+                        k   = len(X_b)
+                        X[neg_offset:neg_offset + k]         = X_b
+                        y[neg_offset:neg_offset + k]         = 0
+                        years_arr[neg_offset:neg_offset + k] = yr[neg_final_all].astype(np.int32)
+                        neg_offset += k
+
+                del batch, tgt_arr, tgt, null_mask, yr, wp, mask
         finally:
             del pf
         gc.collect()
 
+    # Trim in case of minor rounding from parallel batches
+    n_filled = pos_offset + (neg_offset - n_pos_total)
+    if n_filled < n_samples:
+        X         = X[:n_filled]
+        y         = y[:n_filled]
+        years_arr = years_arr[:n_filled]
+
     n_pos = int(y.sum())
-    n_neg = n_samples - n_pos
+    n_neg = len(y) - n_pos
     return X, y, years_arr, n_pos, n_neg
 
 
@@ -828,10 +907,42 @@ def main() -> None:
     ]
     print(f"  feature_cols: {len(feature_cols)}")
 
-    run_single_origin(
+    result = run_single_origin(
         origin_year, model_type, best_params_lgbm, best_params_rf,
         feature_cols, split_paths, panel_path, output_dir,
     )
+
+    if _wandb is not None:
+        try:
+            from datetime import datetime as _dt
+            _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+            _wandb.init(
+                project="forward",
+                entity=os.environ.get("WANDB_ENTITY"),
+                name=f"backtest_{OUTPUTS_SUBDIR}_{model_type}_T{origin_year}_{_ts}",
+                config={
+                    "region":      OUTPUTS_SUBDIR,
+                    "stage":       "backtest",
+                    "model_type":  model_type,
+                    "origin_year": origin_year,
+                },
+            )
+            _log: dict = {
+                "backtest/origin_year":    origin_year,
+                "backtest/n_pixels_scored": result.get("n_pixels_scored"),
+                "backtest/n_evaluable":    result.get("n_evaluable"),
+                "backtest/n_pos_evaluable": result.get("n_pos_evaluable"),
+                "backtest/clean_window":   int(result.get("clean_5yr_window", False)),
+            }
+            if result.get("metrics"):
+                for _k, _v in result["metrics"].items():
+                    if isinstance(_v, (int, float)):
+                        _log[f"backtest/{_k}"] = _v
+            _wandb.log(_log)
+            _wandb.finish()
+            print("W&B: backtest metrics logged.")
+        except Exception as _wandb_err:
+            print(f"W&B logging failed (non-fatal): {_wandb_err}")
 
 
 if __name__ == "__main__":

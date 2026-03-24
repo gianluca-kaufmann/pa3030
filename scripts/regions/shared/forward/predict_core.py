@@ -35,6 +35,11 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+try:
+    import wandb as _wandb
+except ImportError:
+    _wandb = None
+
 from scripts.regions.shared.forward.config import (  # noqa: E402
     DATA_SUBDIR,
     MODEL_PREFIX,
@@ -252,6 +257,34 @@ def main() -> None:
     features_path  = resolve_features_parquet(forward_dir)
     out = run_inference(features_path, artifact_path, output_dir, model_type)
     print(f"\nDone. Output: {out}")
+
+    if _wandb is not None:
+        try:
+            from datetime import datetime as _dt
+            _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+            _wandb.init(
+                project="forward",
+                entity=os.environ.get("WANDB_ENTITY"),
+                name=f"predict_{OUTPUTS_SUBDIR}_{model_type}_{_ts}",
+                config={"region": OUTPUTS_SUBDIR, "stage": "inference",
+                        "model_type": model_type},
+            )
+            _stats = pq.read_table(out, columns=["y_pred_proba_calibrated"])
+            _arr = _stats.column("y_pred_proba_calibrated").to_numpy(zero_copy_only=False)
+            _wandb.log({
+                "inference/n_pixels":  int(len(_arr)),
+                "inference/prob_min":  float(_arr.min()),
+                "inference/prob_p50":  float(np.median(_arr)),
+                "inference/prob_p95":  float(np.percentile(_arr, 95)),
+                "inference/prob_p99":  float(np.percentile(_arr, 99)),
+                "inference/prob_max":  float(_arr.max()),
+                "inference/prob_mean": float(_arr.mean()),
+            })
+            del _arr, _stats
+            _wandb.finish()
+            print("W&B: inference stats logged.")
+        except Exception as _wandb_err:
+            print(f"W&B logging failed (non-fatal): {_wandb_err}")
 
 
 if __name__ == "__main__":

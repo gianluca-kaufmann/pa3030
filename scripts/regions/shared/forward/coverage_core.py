@@ -31,6 +31,11 @@ import numpy as np
 import rasterio
 
 from scripts.regions.shared.forward.config import DATA_SUBDIR, OUTPUTS_SUBDIR, REGION_LABEL, get_repo_root  # noqa: E402
+
+try:
+    import wandb as _wandb
+except ImportError:
+    _wandb = None
 from scripts.regions.shared.geo_utils import pixel_area_km2  # noqa: E402
 
 
@@ -257,12 +262,35 @@ def main() -> None:
     backbone_path = resolve_raster("backbone.tif", DATA_SUBDIR, subdirs=["backbone"])
     wdpa_2024_path = resolve_raster("WDPA_2024.tif", DATA_SUBDIR, subdirs=["WDPA", "wdpa"])
     output_dir = repo_root / f"outputs/{OUTPUTS_SUBDIR}/results/forward"
-    compute_coverage_baseline(
+    baseline = compute_coverage_baseline(
         backbone_path, wdpa_2024_path, output_dir,
         data_subdir=DATA_SUBDIR,
         region_label=REGION_LABEL,
         iso_codes=ISO_CODES,
     )
+
+    if _wandb is not None:
+        try:
+            from datetime import datetime as _dt
+            _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+            _wandb.init(
+                project="forward",
+                entity=os.environ.get("WANDB_ENTITY"),
+                name=f"coverage_{OUTPUTS_SUBDIR}_{_ts}",
+                config={"region": OUTPUTS_SUBDIR, "stage": "coverage_baseline"},
+            )
+            _wandb.log({
+                "coverage/total_land_km2":       baseline.get("total_land_km2"),
+                "coverage/protected_2024_km2":   baseline.get("protected_2024_km2"),
+                "coverage/coverage_pct_2024":    baseline.get("coverage_pct_2024"),
+                "coverage/km2_needed_for_30pct": baseline.get("km2_needed_for_30pct"),
+                "coverage/moderate_target_pct":  baseline.get("moderate_target_pct"),
+                "coverage/bau_km2":              baseline.get("bau_km2"),
+            })
+            _wandb.finish()
+            print("W&B: coverage baseline logged.")
+        except Exception as _wandb_err:
+            print(f"W&B logging failed (non-fatal): {_wandb_err}")
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@
 #SBATCH --time=120:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
-#SBATCH --mem-per-cpu=2G
+#SBATCH --mem-per-cpu=4G
 #SBATCH --output=/cluster/scratch/%u/logs/forward_deploy_%j.out
 #SBATCH --error=/cluster/scratch/%u/logs/forward_deploy_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
@@ -16,7 +16,7 @@
 # Stage 1:  Extract 2024 inference features from merged_panel_final.parquet
 # Stage 2:  Run calibrated batch inference → forward_scored_2024.parquet
 #
-# Memory budget: ~64 GB  (32 CPUs × 2 GB each)
+# Memory budget: ~128 GB  (32 CPUs × 4 GB each; deployment trains on 362M rows)
 #
 # Run AFTER:
 #   - model1_LGBM (evaluation model) has completed and produced split parquets
@@ -70,6 +70,11 @@ echo "Stage 0b: Training deployment model (2001-2019)..."
 echo "========================================================================="
 srun --cpu-bind=cores --distribution=block:block \
   python -u scripts/regions/south_america/5_training/model1_LGBM_deployment.py
+STAGE0B_EXIT=$?
+if [ "$STAGE0B_EXIT" -ne 0 ]; then
+  echo "ERROR: Stage 0b (deployment model training) failed (exit code $STAGE0B_EXIT). Aborting."
+  exit "$STAGE0B_EXIT"
+fi
 echo "Stage 0b complete."
 
 #------------------------------------------------------------------------------

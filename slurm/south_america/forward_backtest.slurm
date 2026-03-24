@@ -4,7 +4,7 @@
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
-#SBATCH --mem-per-cpu=2G
+#SBATCH --mem-per-cpu=4G
 #SBATCH --output=/cluster/scratch/%u/logs/forward_bt_%A_%a.out
 #SBATCH --error=/cluster/scratch/%u/logs/forward_bt_%A_%a.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
@@ -45,6 +45,9 @@ echo "Backtest task ${TASK_ID}: origin year T=${ORIGIN_YEAR}"
 
 mkdir -p "$SCRATCH/logs"
 mkdir -p "$SCRATCH/outputs/south_america/results/forward"
+
+# Cap negatives to avoid OOM when training on full panels (mirrors production training_lgbm.slurm)
+export MAX_NEG_TRAIN=100000000
 
 #------------------------------------------------------------------------------
 # Load modules
