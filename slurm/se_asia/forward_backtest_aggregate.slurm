@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=forward_bt_aggr_sa
+#SBATCH --job-name=forward_bt_aggr_sea
 #SBATCH --partition=normal.4h
 #SBATCH --time=1:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=4G
-#SBATCH --output=/cluster/scratch/%u/logs/forward_bt_aggr_sa_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/forward_bt_aggr_sa_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/forward_bt_aggr_sea_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/forward_bt_aggr_sea_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # ------------------------------------------------------------------------------
@@ -41,5 +41,5 @@ srun --cpu-bind=cores --distribution=block:block \
   python -u "$SCRIPT" --aggregate
 
 EXIT_CODE=$?
-echo "forward_backtest aggregate (SA LGBM) finished (exit code: ${EXIT_CODE})"
+echo "forward_backtest aggregate (SE Asia LGBM) finished (exit code: ${EXIT_CODE})"
 exit $EXIT_CODE

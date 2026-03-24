@@ -7,10 +7,10 @@ Entry points (called by thin region-specific wrappers):
     run_transfer_main()                      — Layer 3: cross-continental SA ↔ USA
 
 Wrappers live at:
-    scripts/regions/{south_america,usa}/6_evaluation/spatial_CV_1
-    scripts/regions/{south_america,usa}/6_evaluation/spatial_CV_1_aggregate
-    scripts/regions/{south_america,usa}/6_evaluation/spatial_CV_2
-    scripts/regions/south_america/6_evaluation/spatial_CV_3
+    scripts/regions/{south_america,usa,se_asia}/6_evaluation/spatial_CV_1
+    scripts/regions/{south_america,usa,se_asia}/6_evaluation/spatial_CV_1_aggregate
+    scripts/regions/{south_america,usa,se_asia}/6_evaluation/spatial_CV_2
+    scripts/regions/{south_america,se_asia}/6_evaluation/spatial_CV_3
 
 Spatial CV framework overview:
     Layer 1 (LOBO):     train on all biomes except one, evaluate on held-out biome.
@@ -2161,7 +2161,7 @@ def run_spatial_gen_main(region: str, model_id: str) -> None:
 # Entry point — Layer 3: cross-continental transfer SA ↔ USA
 # =============================================================================
 
-def run_transfer_main() -> None:
+def run_transfer_main(output_region: str = "south_america") -> None:
     """Cross-continental transfer evaluation: SA ↔ USA, for both LGBM and RF.
 
     Loads the production models trained in step 5 (no retraining) and scores
@@ -2172,7 +2172,7 @@ def run_transfer_main() -> None:
         SA-LGBM → USA,  USA-LGBM → SA
         SA-RF   → USA,  USA-RF   → SA
     """
-    output_dir = resolve_cv_output_dir("south_america", "transfer")
+    output_dir = resolve_cv_output_dir(output_region, "transfer")
     timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path   = output_dir / f"transfer_results_{timestamp}.txt"
     use_wandb  = False

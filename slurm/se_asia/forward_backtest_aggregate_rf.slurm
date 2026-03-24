@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=forward_bt_aggr_sa_rf
+#SBATCH --job-name=forward_bt_aggr_sea_rf
 #SBATCH --partition=normal.4h
 #SBATCH --time=1:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=4G
-#SBATCH --output=/cluster/scratch/%u/logs/forward_bt_aggr_sa_rf_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/forward_bt_aggr_sa_rf_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/forward_bt_aggr_sea_rf_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/forward_bt_aggr_sea_rf_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # ------------------------------------------------------------------------------
@@ -41,5 +41,5 @@ srun --cpu-bind=cores --distribution=block:block \
   python -u "$SCRIPT" --model-type rf --aggregate
 
 EXIT_CODE=$?
-echo "forward_backtest aggregate (SA RF) finished (exit code: ${EXIT_CODE})"
+echo "forward_backtest aggregate (SE Asia RF) finished (exit code: ${EXIT_CODE})"
 exit $EXIT_CODE

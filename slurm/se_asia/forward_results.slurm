@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=forward_results_sa
+#SBATCH --job-name=forward_results_sea
 #SBATCH --partition=normal.4h
 #SBATCH --time=4:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem-per-cpu=8G
-#SBATCH --output=/cluster/scratch/%u/logs/forward_results_sa_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/forward_results_sa_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/forward_results_sea_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/forward_results_sea_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # ------------------------------------------------------------------------------

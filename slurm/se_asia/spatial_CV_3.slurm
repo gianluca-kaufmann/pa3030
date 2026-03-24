@@ -22,8 +22,8 @@
 #   sbatch slurm/se_asia/spatial_CV_3.slurm
 #
 # Prerequisites:
-#   1. SA step-5 training done:  data/se_asia/ml/models/model3_lgbm_*.pkl
-#                                data/se_asia/ml/models/model3_rf_win5_*.joblib
+#   1. SA step-5 training done:  data/south_america/ml/models/model1_lgbm_*.pkl
+#                                data/south_america/ml/models/model1_rf_win5_*.joblib
 #   2. USA step-5 training done: data/usa/ml/models/model2_lgbm_*.pkl
 #                                data/usa/ml/models/model2_rf_win5_*.joblib
 #   3. Test parquets:            data/{region}/ml/main/test_win5.parquet

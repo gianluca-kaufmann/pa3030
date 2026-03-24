@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=hntl_preprocess_sa
+#SBATCH --job-name=hntl_preprocess_sea
 #SBATCH --partition=normal.24h
 #SBATCH --time=04:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=8G
-#SBATCH --output=/cluster/scratch/%u/logs/hntl_preprocess_sa_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/hntl_preprocess_sa_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/hntl_preprocess_sea_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/hntl_preprocess_sea_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # Create necessary folders on $SCRATCH if they don't exist

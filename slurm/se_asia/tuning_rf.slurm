@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=tuning_rf_sa
+#SBATCH --job-name=tuning_rf_sea
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
@@ -34,7 +34,7 @@ export TUNING_SPLIT_VERSION="${TUNING_SPLIT_VERSION:-main}"
 export ROLLING_FOLDS="${ROLLING_FOLDS:-5}"
 export MAX_NEG_PER_YEAR_PAPER="${MAX_NEG_PER_YEAR_PAPER:-150000}"
 export MAX_NEG_PER_YEAR_FAST="${MAX_NEG_PER_YEAR_FAST:-50000}"
-# SA-specific positive cap (see tuning_lgbm.slurm for rationale).
+# SE Asia-specific positive cap (see tuning_lgbm.slurm for rationale).
 # Critical for RF: RF uses a smaller row budget (500k) so the majority-positive
 # distortion is even more severe without a cap.
 export MAX_POS_PER_YEAR_PAPER="${MAX_POS_PER_YEAR_PAPER:-5000}"

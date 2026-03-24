@@ -15,6 +15,9 @@ Run interactively on the Euler login node (fast, ~1-2 min), from the repo root:
     python scripts/regions/shared/evaluation/select_lobo_biomes.py \\
         --region usa --n-biomes 6
 
+    python scripts/regions/shared/evaluation/select_lobo_biomes.py \\
+        --region se_asia --n-biomes 6
+
 The script writes the selected indices to slurm/{region}/lobo_biome_array.txt
 so SLURM files do not need to be edited manually.  Submit directly with:
 
@@ -157,7 +160,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--region", required=True,
-                        help="Region name, e.g. south_america or usa")
+                        help="Region name, e.g. south_america, usa, or se_asia")
     parser.add_argument("--n-biomes", type=int, required=True,
                         help="Number of biomes to select")
     parser.add_argument("--sample-rows", type=int, default=_DEFAULT_SAMPLE_ROWS,

@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=spatial_CV_2_SA
+#SBATCH --job-name=spatial_CV_2_SEA
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem-per-cpu=4G
-#SBATCH --output=/cluster/scratch/%u/logs/spatial_CV_2_SA_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/spatial_CV_2_SA_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/spatial_CV_2_SEA_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/spatial_CV_2_SEA_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # ------------------------------------------------------------------------------

@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=tuning_lgbm_sa
+#SBATCH --job-name=tuning_lgbm_sea
 #SBATCH --partition=normal.24h
 #SBATCH --time=24:00:00
 #SBATCH --ntasks=1
@@ -34,7 +34,7 @@ export TUNING_SPLIT_VERSION="${TUNING_SPLIT_VERSION:-main}"
 export ROLLING_FOLDS="${ROLLING_FOLDS:-5}"
 export MAX_NEG_PER_YEAR_PAPER="${MAX_NEG_PER_YEAR_PAPER:-150000}"
 export MAX_NEG_PER_YEAR_FAST="${MAX_NEG_PER_YEAR_FAST:-50000}"
-# SA-specific positive cap: the 5-year lookahead makes positives majority-class
+# SE Asia-specific positive cap: the 5-year lookahead makes positives majority-class
 # without a cap (~75% pos on 2.5M-row budget).  5000/year targets SPW ~30x,
 # matching the production rare-event regime and making PR-AUC meaningful.
 export MAX_POS_PER_YEAR_PAPER="${MAX_POS_PER_YEAR_PAPER:-5000}"

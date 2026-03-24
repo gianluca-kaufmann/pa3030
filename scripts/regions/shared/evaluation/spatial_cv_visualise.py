@@ -758,7 +758,7 @@ def run_spatial_cv_visualise(region: str, model_type: str = "lgbm") -> None:
         # ── Load data ────────────────────────────────────────────────────────
         print("\n--- Loading data ---")
         lobo_df   = load_lobo_results(region, model_type)
-        layer2_df = load_layer2_results(region)
+        layer2_df = load_layer2_results(region, model_label=model_type.upper())
 
         if lobo_df is None:
             print("\nERROR: LOBO summary not found — cannot produce figures.")

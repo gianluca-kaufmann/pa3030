@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=forward_cov_sa
+#SBATCH --job-name=forward_cov_sea
 #SBATCH --partition=normal.4h
 #SBATCH --time=2:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem-per-cpu=8G
-#SBATCH --output=/cluster/scratch/%u/logs/forward_cov_sa_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/forward_cov_sa_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/forward_cov_sea_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/forward_cov_sea_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # ------------------------------------------------------------------------------
@@ -69,5 +69,5 @@ srun --cpu-bind=cores --distribution=block:block \
   python -u "$SCRIPT"
 
 EXIT_CODE=$?
-echo "forward_coverage (SA) finished (exit code: ${EXIT_CODE})"
+echo "forward_coverage (SE Asia) finished (exit code: ${EXIT_CODE})"
 exit $EXIT_CODE

@@ -40,6 +40,7 @@ BRN, KHM, IDN, LAO, MYS, MMR, PHL, SGP, THA, TLS, VNM.
 
 from __future__ import annotations
 
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -48,15 +49,20 @@ from pathlib import Path
 _shared = Path(__file__).resolve().parents[2] / "shared"
 if str(_shared) not in sys.path:
     sys.path.insert(0, str(_shared))
-from preprocessing.economic_value import (  # noqa: E402
-    YEAR_MIN,
-    YEAR_MAX,
-    build_country_raster_from_natural_earth,
-    build_fao_table,
-    load_backbone,
-    load_country_raster_from_policy,
-    write_yearly_rasters,
-)
+_economic_value_path = _shared / "1_preprocessing" / "economic_value.py"
+_spec = importlib.util.spec_from_file_location("economic_value_shared", _economic_value_path)
+if _spec is None or _spec.loader is None:
+    raise ImportError(f"Could not load shared economic value module: {_economic_value_path}")
+_economic_value = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_economic_value)
+
+YEAR_MIN = _economic_value.YEAR_MIN
+YEAR_MAX = _economic_value.YEAR_MAX
+build_country_raster_from_natural_earth = _economic_value.build_country_raster_from_natural_earth
+build_fao_table = _economic_value.build_fao_table
+load_backbone = _economic_value.load_backbone
+load_country_raster_from_policy = _economic_value.load_country_raster_from_policy
+write_yearly_rasters = _economic_value.write_yearly_rasters
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
