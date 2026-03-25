@@ -31,11 +31,7 @@ import numpy as np
 import rasterio
 
 from scripts.regions.shared.forward.config import DATA_SUBDIR, OUTPUTS_SUBDIR, REGION_LABEL, get_repo_root  # noqa: E402
-
-try:
-    import wandb as _wandb
-except ImportError:
-    _wandb = None
+from scripts.regions.shared.forward.wandb_logging import log_forward_wandb  # noqa: E402
 from scripts.regions.shared.geo_utils import pixel_area_km2  # noqa: E402
 
 
@@ -71,6 +67,7 @@ def compute_coverage_baseline(
     data_subdir: str,
     region_label: str,
     iso_codes: list[str] | None = None,
+    wdpa_2019_basename: str | None = None,
 ) -> dict:
     """Compute total area, 2024 coverage, and scenario thresholds."""
     print("\n" + "=" * 70)
@@ -143,7 +140,9 @@ def compute_coverage_baseline(
     # ── 3. BAU target: historical 5-year designation volume (2019→2024) ───────
     bau_km2 = None  # float or None
     try:
-        wdpa_2019_path = resolve_raster("WDPA_2019.tif", data_subdir, subdirs=["WDPA", "wdpa"])
+        if not wdpa_2019_basename:
+            raise FileNotFoundError("no WDPA 2019 basename configured")
+        wdpa_2019_path = resolve_raster(wdpa_2019_basename, data_subdir, subdirs=["WDPA", "wdpa"])
         print(f"\nReading WDPA 2019 raster for BAU baseline: {wdpa_2019_path}")
         with rasterio.open(wdpa_2019_path) as src_2019:
             wdpa_2019_data = src_2019.read(1)
@@ -163,7 +162,7 @@ def compute_coverage_baseline(
         print(f"  Protected 2019: {protected_2019_km2:,.0f} km²")
         print(f"  BAU volume (2019→2024): {bau_km2:,.0f} km² over 5 years")
     except FileNotFoundError:
-        print("\n  WDPA_2019.tif not found — BAU km² will not be computed.")
+        print("\n  WDPA 2019 raster not found — BAU km² will not be computed.")
         print("  forward_results will fall back to top-0.5% proxy for BAU cutoff.")
 
     # ── 4. Scenario thresholds ────────────────────────────────────────────────
@@ -256,41 +255,43 @@ def compute_coverage_baseline(
 
 def main() -> None:
     # Re-import config here so the module-level reload in runner.py takes effect
-    from scripts.regions.shared.forward.config import DATA_SUBDIR, ISO_CODES, OUTPUTS_SUBDIR, REGION_LABEL  # noqa: F401
+    from datetime import datetime as _dt
+
+    from scripts.regions.shared.forward.config import (  # noqa: F401
+        DATA_SUBDIR,
+        ISO_CODES,
+        OUTPUTS_SUBDIR,
+        REGION_LABEL,
+        WDPA_2019_FILENAME,
+        WDPA_2024_FILENAME,
+    )
 
     repo_root = get_repo_root()
     backbone_path = resolve_raster("backbone.tif", DATA_SUBDIR, subdirs=["backbone"])
-    wdpa_2024_path = resolve_raster("WDPA_2024.tif", DATA_SUBDIR, subdirs=["WDPA", "wdpa"])
+    wdpa_2024_path = resolve_raster(WDPA_2024_FILENAME, DATA_SUBDIR, subdirs=["WDPA", "wdpa"])
     output_dir = repo_root / f"outputs/{OUTPUTS_SUBDIR}/results/forward"
     baseline = compute_coverage_baseline(
         backbone_path, wdpa_2024_path, output_dir,
         data_subdir=DATA_SUBDIR,
         region_label=REGION_LABEL,
         iso_codes=ISO_CODES,
+        wdpa_2019_basename=WDPA_2019_FILENAME,
     )
 
-    if _wandb is not None:
-        try:
-            from datetime import datetime as _dt
-            _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
-            _wandb.init(
-                project="forward",
-                entity=os.environ.get("WANDB_ENTITY"),
-                name=f"coverage_{OUTPUTS_SUBDIR}_{_ts}",
-                config={"region": OUTPUTS_SUBDIR, "stage": "coverage_baseline"},
-            )
-            _wandb.log({
-                "coverage/total_land_km2":       baseline.get("total_land_km2"),
-                "coverage/protected_2024_km2":   baseline.get("protected_2024_km2"),
-                "coverage/coverage_pct_2024":    baseline.get("coverage_pct_2024"),
-                "coverage/km2_needed_for_30pct": baseline.get("km2_needed_for_30pct"),
-                "coverage/moderate_target_pct":  baseline.get("moderate_target_pct"),
-                "coverage/bau_km2":              baseline.get("bau_km2"),
-            })
-            _wandb.finish()
-            print("W&B: coverage baseline logged.")
-        except Exception as _wandb_err:
-            print(f"W&B logging failed (non-fatal): {_wandb_err}")
+    _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+    log_forward_wandb(
+        stage="coverage_baseline",
+        run_name=f"coverage_{OUTPUTS_SUBDIR}_{_ts}",
+        config={"region": OUTPUTS_SUBDIR},
+        metrics={
+            "coverage/total_land_km2":       baseline.get("total_land_km2"),
+            "coverage/protected_2024_km2":   baseline.get("protected_2024_km2"),
+            "coverage/coverage_pct_2024":    baseline.get("coverage_pct_2024"),
+            "coverage/km2_needed_for_30pct": baseline.get("km2_needed_for_30pct"),
+            "coverage/moderate_target_pct":  baseline.get("moderate_target_pct"),
+            "coverage/bau_km2":              baseline.get("bau_km2"),
+        },
+    )
 
 
 if __name__ == "__main__":

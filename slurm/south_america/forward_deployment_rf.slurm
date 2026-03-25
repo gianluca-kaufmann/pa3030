@@ -48,6 +48,8 @@ module load eth_proxy
 VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
+export WANDB_MODE="${WANDB_MODE:-offline}"
+export MAX_NEG_TRAIN=50000000
 
 #------------------------------------------------------------------------------
 # Preflight checks
@@ -71,6 +73,11 @@ echo "Stage 0b: Training RF deployment model (2001-2019)..."
 echo "========================================================================="
 srun --cpu-bind=cores --distribution=block:block \
   python -u scripts/regions/south_america/5_training/model1_rf_deployment.py
+STAGE0B_EXIT=$?
+if [ "$STAGE0B_EXIT" -ne 0 ]; then
+  echo "ERROR: Stage 0b failed (exit code $STAGE0B_EXIT). Aborting."
+  exit "$STAGE0B_EXIT"
+fi
 echo "Stage 0b complete."
 
 #------------------------------------------------------------------------------

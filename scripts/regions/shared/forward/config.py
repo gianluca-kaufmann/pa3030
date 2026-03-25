@@ -26,6 +26,8 @@ PROFILE = {
             ("Cerrado / Atlantic Forest", -55, -36, -28, -8),
             ("Andes Foothills",           -81, -64, -22,  3),
         ],
+        "wdpa_2024_filename": "WDPA_SA_1km_2024.tif",
+        "wdpa_2019_filename": "WDPA_SA_1km_2019.tif",
     },
     "usa": {
         "region_slug": "usa",
@@ -42,6 +44,8 @@ PROFILE = {
             ("Rocky Mountains",   -115, -100, 36, 48),
             ("Southeast",          -92,  -78, 25, 35),
         ],
+        "wdpa_2024_filename": "WDPA_USA_1km_2024.tif",
+        "wdpa_2019_filename": "WDPA_USA_1km_2019.tif",
     },
     "se_asia": {
         "region_slug": "se_asia",
@@ -61,6 +65,8 @@ PROFILE = {
             ("Mekong / Indochina",   100, 110,   9, 22),
             ("Sumatra / Malay Pen.",  95, 110,  -6,  6),
         ],
+        "wdpa_2024_filename": "WDPA_SEA_1km_2024.tif",
+        "wdpa_2019_filename": "WDPA_SEA_1km_2019.tif",
     },
 }[RUN_REGION]
 
@@ -73,6 +79,8 @@ ISO_CODES       = PROFILE["iso_codes"]
 DATA_SUBDIR     = PROFILE["data_subdir"]
 OUTPUTS_SUBDIR  = PROFILE["outputs_subdir"]
 HOTSPOT_REGIONS = PROFILE["hotspot_regions"]
+WDPA_2024_FILENAME = PROFILE["wdpa_2024_filename"]
+WDPA_2019_FILENAME = PROFILE["wdpa_2019_filename"]
 
 
 def get_repo_root() -> Path:

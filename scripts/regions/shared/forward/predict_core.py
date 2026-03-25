@@ -35,23 +35,29 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-try:
-    import wandb as _wandb
-except ImportError:
-    _wandb = None
-
 from scripts.regions.shared.forward.config import (  # noqa: E402
     DATA_SUBDIR,
     MODEL_PREFIX,
     OUTPUTS_SUBDIR,
     get_repo_root,
 )
+from scripts.regions.shared.forward.wandb_logging import log_forward_wandb  # noqa: E402
 from scripts.regions.shared.training.utils import get_repo_root as _get_repo_root, report_memory_usage  # noqa: E402
 
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "500_000"))
 
 
 # ── Path helpers ──────────────────────────────────────────────────────────────
+
+def resolve_model_dir(data_subdir: str, repo_root: Path) -> Path:
+    """Prefer $SCRATCH/data/.../ml/models if it exists, else repo data path."""
+    scratch = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+    if scratch is not None:
+        cand = scratch / f"data/{data_subdir}/ml/models"
+        if cand.exists():
+            return cand
+    return repo_root / f"data/{data_subdir}/ml/models"
+
 
 def resolve_deployment_artifact(model_dir: Path, model_prefix: str, model_type: str) -> Path:
     """Find the most-recent {model_prefix}_{model_type}_deployment_*.pkl in model_dir."""
@@ -249,7 +255,7 @@ def main() -> None:
     model_type = os.environ.get("PA3030_FORWARD_MODEL_TYPE", "lgbm").strip().lower()
 
     repo_root   = get_repo_root()
-    model_dir   = repo_root / f"data/{DATA_SUBDIR}/ml/models"
+    model_dir   = resolve_model_dir(DATA_SUBDIR, repo_root)
     forward_dir = repo_root / f"outputs/{OUTPUTS_SUBDIR}/results/forward"
     output_dir  = forward_dir / model_type
 
@@ -258,33 +264,26 @@ def main() -> None:
     out = run_inference(features_path, artifact_path, output_dir, model_type)
     print(f"\nDone. Output: {out}")
 
-    if _wandb is not None:
-        try:
-            from datetime import datetime as _dt
-            _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
-            _wandb.init(
-                project="forward",
-                entity=os.environ.get("WANDB_ENTITY"),
-                name=f"predict_{OUTPUTS_SUBDIR}_{model_type}_{_ts}",
-                config={"region": OUTPUTS_SUBDIR, "stage": "inference",
-                        "model_type": model_type},
-            )
-            _stats = pq.read_table(out, columns=["y_pred_proba_calibrated"])
-            _arr = _stats.column("y_pred_proba_calibrated").to_numpy(zero_copy_only=False)
-            _wandb.log({
-                "inference/n_pixels":  int(len(_arr)),
-                "inference/prob_min":  float(_arr.min()),
-                "inference/prob_p50":  float(np.median(_arr)),
-                "inference/prob_p95":  float(np.percentile(_arr, 95)),
-                "inference/prob_p99":  float(np.percentile(_arr, 99)),
-                "inference/prob_max":  float(_arr.max()),
-                "inference/prob_mean": float(_arr.mean()),
-            })
-            del _arr, _stats
-            _wandb.finish()
-            print("W&B: inference stats logged.")
-        except Exception as _wandb_err:
-            print(f"W&B logging failed (non-fatal): {_wandb_err}")
+    from datetime import datetime as _dt
+
+    _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+    _stats = pq.read_table(out, columns=["y_pred_proba_calibrated"])
+    _arr = _stats.column("y_pred_proba_calibrated").to_numpy(zero_copy_only=False)
+    log_forward_wandb(
+        stage="inference",
+        run_name=f"predict_{OUTPUTS_SUBDIR}_{model_type}_{_ts}",
+        config={"region": OUTPUTS_SUBDIR, "model_type": model_type},
+        metrics={
+            "inference/n_pixels":  int(len(_arr)),
+            "inference/prob_min":  float(_arr.min()),
+            "inference/prob_p50":  float(np.median(_arr)),
+            "inference/prob_p95":  float(np.percentile(_arr, 95)),
+            "inference/prob_p99":  float(np.percentile(_arr, 99)),
+            "inference/prob_max":  float(_arr.max()),
+            "inference/prob_mean": float(_arr.mean()),
+        },
+    )
+    del _arr, _stats
 
 
 if __name__ == "__main__":

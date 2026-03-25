@@ -57,6 +57,7 @@ if str(_repo_root) not in sys.path:
 del _repo_root
 # ─────────────────────────────────────────────────────────────────────────────
 
+from scripts.regions.shared.forward.wandb_logging import log_forward_wandb  # noqa: E402
 from scripts.regions.shared.training.utils import (  # noqa: E402
     Tee,
     compute_metrics,
@@ -89,6 +90,7 @@ FIXED_PARAMS = {
     "verbose": -1,
 }
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "200_000"))
+MAX_NEG_TRAIN = int(os.environ.get("MAX_NEG_TRAIN", "0"))
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -214,51 +216,69 @@ def _stream_data(
     feature_cols: List[str],
     year_range: Tuple[int, int],
     name: str = "",
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
-    """Two-pass streaming loader from multiple parquet files."""
+    max_neg: int = 0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int, int, int, int]:
+    """Two-pass loader with optional negative cap (reservoir) and temporal years.
+
+    Pass 1 records uncapped n_pos_total / n_neg_total for scale_pos_weight.
+    """
     t0 = time.time()
     essential = feature_cols + [TARGET_COL, "year", "WDPA_prev"]
 
     print(f"  Pass 1: counting rows ({name}, years {year_range[0]}–{year_range[1]})…")
-    n_samples = 0
+    n_pos_total = 0
+    n_neg_total = 0
     for path in paths:
         pf = pq.ParquetFile(path)
         try:
             for batch in pf.iter_batches(batch_size=BATCH_SIZE, columns=essential, use_threads=True):
-                tgt_arr  = batch[TARGET_COL]
+                tgt_arr = batch[TARGET_COL]
                 null_mask = tgt_arr.is_null().to_numpy(zero_copy_only=False)
                 tgt = tgt_arr.to_numpy(zero_copy_only=False)
-                yr  = batch["year"].to_numpy(zero_copy_only=False)
-                wp  = batch["WDPA_prev"].to_numpy(zero_copy_only=False)
+                yr = batch["year"].to_numpy(zero_copy_only=False)
+                wp = batch["WDPA_prev"].to_numpy(zero_copy_only=False)
                 mask = (
                     ~null_mask
                     & (wp == 0)
                     & (yr >= year_range[0]) & (yr <= year_range[1])
                 )
-                n_samples += int(mask.sum())
+                if mask.any():
+                    tgt_m = (tgt[mask] > 0).astype(np.int8)
+                    n_pos_total += int(tgt_m.sum())
+                    n_neg_total += int((tgt_m == 0).sum())
                 del batch, tgt_arr, tgt, null_mask, yr, wp, mask
         finally:
             del pf
 
-    print(f"    Found {n_samples:,} samples")
+    if max_neg > 0 and n_neg_total > max_neg:
+        n_neg_use = max_neg
+        print(f"    {n_pos_total:,} pos / {n_neg_total:,} neg → capping neg to {n_neg_use:,}")
+    else:
+        n_neg_use = n_neg_total
+
+    n_samples = n_pos_total + n_neg_use
     if n_samples == 0:
         raise ValueError(f"No samples in {name} for years {year_range}")
+    print(f"    Using {n_samples:,} samples ({n_pos_total:,} pos / {n_neg_use:,} neg)")
 
     X = np.empty((n_samples, len(feature_cols)), dtype=np.float32)
     y = np.empty(n_samples, dtype=np.int8)
     years_arr = np.empty(n_samples, dtype=np.int32)
-    idx = 0
+    idx_pos = 0
+    idx_neg = 0
+    rng = np.random.RandomState(RANDOM_STATE) if (max_neg > 0 and n_neg_total > max_neg) else None
+    neg_seen = 0
     _mile = -1
 
     for path in paths:
         pf = pq.ParquetFile(path)
         try:
             for batch in pf.iter_batches(batch_size=BATCH_SIZE, columns=essential, use_threads=True):
-                tgt_arr  = batch[TARGET_COL]
+                tgt_arr = batch[TARGET_COL]
                 null_mask = tgt_arr.is_null().to_numpy(zero_copy_only=False)
                 tgt = tgt_arr.to_numpy(zero_copy_only=False)
-                yr  = batch["year"].to_numpy(zero_copy_only=False)
-                wp  = batch["WDPA_prev"].to_numpy(zero_copy_only=False)
+                yr = batch["year"].to_numpy(zero_copy_only=False)
+                wp = batch["WDPA_prev"].to_numpy(zero_copy_only=False)
                 mask = (
                     ~null_mask
                     & (wp == 0)
@@ -267,32 +287,66 @@ def _stream_data(
                 if not mask.any():
                     del batch, tgt_arr, tgt, null_mask, yr, wp, mask
                     continue
+
                 feat_tbl = batch.select(feature_cols)
                 X_b = extract_features_pyarrow_to_numpy(feat_tbl, mask)
                 y_b = (tgt[mask] > 0).astype(np.int8)
-                k = len(y_b)
-                X[idx:idx + k] = X_b
-                y[idx:idx + k] = y_b
-                years_arr[idx:idx + k] = yr[mask].astype(np.int32)
-                idx += k
-                pct = idx * 100 // n_samples
+                yr_sel = yr[mask].astype(np.int32)
+
+                pos_mask_b = y_b == 1
+                neg_mask_b = y_b == 0
+
+                np_b = int(pos_mask_b.sum())
+                if np_b > 0:
+                    X[idx_pos:idx_pos + np_b] = X_b[pos_mask_b]
+                    y[idx_pos:idx_pos + np_b] = 1
+                    years_arr[idx_pos:idx_pos + np_b] = yr_sel[pos_mask_b]
+                    idx_pos += np_b
+
+                X_neg = X_b[neg_mask_b]
+                yr_neg = yr_sel[neg_mask_b]
+                nn_b = len(X_neg)
+                if nn_b > 0:
+                    if rng is None:
+                        X[n_pos_total + idx_neg: n_pos_total + idx_neg + nn_b] = X_neg
+                        y[n_pos_total + idx_neg: n_pos_total + idx_neg + nn_b] = 0
+                        years_arr[n_pos_total + idx_neg: n_pos_total + idx_neg + nn_b] = yr_neg
+                        idx_neg += nn_b
+                    else:
+                        for i in range(nn_b):
+                            neg_seen += 1
+                            if idx_neg < n_neg_use:
+                                X[n_pos_total + idx_neg] = X_neg[i]
+                                y[n_pos_total + idx_neg] = 0
+                                years_arr[n_pos_total + idx_neg] = yr_neg[i]
+                                idx_neg += 1
+                            else:
+                                j = rng.randint(0, neg_seen)
+                                if j < n_neg_use:
+                                    X[n_pos_total + j] = X_neg[i]
+                                    years_arr[n_pos_total + j] = yr_neg[i]
+
+                loaded = idx_pos + idx_neg
+                pct = loaded * 100 // n_samples if n_samples > 0 else 0
                 ms = pct // 25
                 if ms > _mile:
                     _mile = ms
-                    print(f"    {pct}% — {idx:,}/{n_samples:,}")
+                    print(f"    {pct}% — {loaded:,}/{n_samples:,}")
+
                 del batch, tgt, yr, wp, mask, feat_tbl, X_b, y_b
         finally:
             del pf
         gc.collect()
 
-    if idx != n_samples:
-        raise ValueError(f"Row mismatch: expected {n_samples:,}, loaded {idx:,}")
-
-    n_pos = int(y.sum())
-    n_neg = n_samples - n_pos
+    actual = idx_pos + idx_neg
+    X = X[:actual]
+    y = y[:actual]
+    years_arr = years_arr[:actual]
+    n_pos_ld = int(y.sum())
+    n_neg_ld = actual - n_pos_ld
     elapsed = time.time() - t0
-    print(f"  Loaded {n_samples:,} rows in {elapsed:.1f}s ({n_neg:,} neg / {n_pos:,} pos)")
-    return X, y, years_arr, n_pos, n_neg
+    print(f"  Loaded {actual:,} rows in {elapsed:.1f}s ({n_neg_ld:,} neg / {n_pos_ld:,} pos)")
+    return X, y, years_arr, n_pos_ld, n_neg_ld, n_pos_total, n_neg_total
 
 
 # ── LightGBM training helper ──────────────────────────────────────────────────
@@ -317,11 +371,18 @@ def _train_lgb(
     min_year: int,
     max_year: int,
     label: str = "",
+    scale_pos_weight_override: float | None = None,
 ) -> lgb.Booster:
-    n_pos = int(y.sum())
-    n_neg = len(y) - n_pos
-    spw = n_neg / max(n_pos, 1)
-    print(f"  scale_pos_weight = {spw:.4f} = {n_neg:,} / {n_pos:,}")
+    if scale_pos_weight_override is not None:
+        spw = float(scale_pos_weight_override)
+        n_pos = int(y.sum())
+        n_neg = len(y) - n_pos
+        print(f"  scale_pos_weight = {spw:.4f} (full pass-1 counts; loaded {n_neg:,} neg / {n_pos:,} pos)")
+    else:
+        n_pos = int(y.sum())
+        n_neg = len(y) - n_pos
+        spw = n_neg / max(n_pos, 1)
+        print(f"  scale_pos_weight = {spw:.4f} = {n_neg:,} / {n_pos:,}")
 
     weights = compute_year_weights(years_arr, min_year=min_year, max_year=max_year)
     train_params = _build_train_params(best_params, spw)
@@ -360,16 +421,20 @@ def fit_deployment_calibrators(
     print(f"  Calibration held-out:  {AUX_CALIB_YEARS[0]}–{AUX_CALIB_YEARS[1]}")
     print("=" * 70)
 
-    X_aux, y_aux, yr_aux, _, _ = _stream_data(all_paths, feature_cols, AUX_TRAIN_YEARS, "aux_train")
+    X_aux, y_aux, yr_aux, _, _, n_pos_aux_f, n_neg_aux_f = _stream_data(
+        all_paths, feature_cols, AUX_TRAIN_YEARS, "aux_train", max_neg=MAX_NEG_TRAIN
+    )
+    spw_aux = n_neg_aux_f / max(n_pos_aux_f, 1)
     aux_model = _train_lgb(
         X_aux, y_aux, yr_aux, best_params, num_boost_round,
         min_year=AUX_TRAIN_YEARS[0], max_year=AUX_TRAIN_YEARS[1],
         label="auxiliary calibration model",
+        scale_pos_weight_override=spw_aux,
     )
 
     print("\nScoring calibration held-out set…")
-    X_cal, y_cal, _, n_pos_cal, n_neg_cal = _stream_data(
-        all_paths, feature_cols, AUX_CALIB_YEARS, "aux_calib"
+    X_cal, y_cal, _, n_pos_cal, n_neg_cal, _, _ = _stream_data(
+        all_paths, feature_cols, AUX_CALIB_YEARS, "aux_calib", max_neg=0
     )
     y_cal_proba = aux_model.predict(X_cal, num_iteration=num_boost_round).astype(np.float32)
     del aux_model, X_cal
@@ -452,17 +517,18 @@ def main() -> None:
     print("=" * 70)
     report_memory_usage("before loading deployment training data")
 
-    X_dep, y_dep, yr_dep, dep_pos, dep_neg = _stream_data(
-        all_paths, feature_cols, DEPLOY_TRAIN_YEARS, "deployment_train"
+    X_dep, y_dep, yr_dep, dep_pos, dep_neg, n_pos_full, n_neg_full = _stream_data(
+        all_paths, feature_cols, DEPLOY_TRAIN_YEARS, "deployment_train", max_neg=MAX_NEG_TRAIN
     )
     report_memory_usage("after loading deployment training data")
 
+    deploy_spw = n_neg_full / max(n_pos_full, 1)
     deploy_model = _train_lgb(
         X_dep, y_dep, yr_dep, best_params, num_boost_round,
         min_year=DEPLOY_TRAIN_YEARS[0], max_year=DEPLOY_TRAIN_YEARS[1],
         label="deployment model",
+        scale_pos_weight_override=deploy_spw,
     )
-    deploy_spw = dep_neg / max(dep_pos, 1)
     report_memory_usage("after training deployment model")
 
     # ── Step 2: Fit calibrators via auxiliary model ───────────────────────────
@@ -486,6 +552,8 @@ def main() -> None:
             "n_features": len(feature_cols),
             "deploy_n_pos": dep_pos,
             "deploy_n_neg": dep_neg,
+            "deploy_n_pos_full": n_pos_full,
+            "deploy_n_neg_full": n_neg_full,
             "deploy_scale_pos_weight": float(deploy_spw),
             "target_col": TARGET_COL,
             "params_path": str(params_path) if params_path else None,
@@ -497,6 +565,22 @@ def main() -> None:
     with open(model_path, "wb") as fh:
         pickle.dump(artifact, fh, protocol=5)
     print(f"\nSaved deployment artifact: {model_path}")
+
+    meta = artifact["metadata"]
+    log_forward_wandb(
+        stage="deployment",
+        run_name=f"deploy_lgbm_usa_{timestamp}",
+        config={"region": "usa", "model_type": "lgbm"},
+        metrics={
+            "deployment/deploy_n_pos": float(dep_pos),
+            "deployment/deploy_n_neg": float(dep_neg),
+            "deployment/deploy_n_pos_full": float(n_pos_full),
+            "deployment/deploy_n_neg_full": float(n_neg_full),
+            "deployment/scale_pos_weight": float(deploy_spw),
+            "deployment/n_features": float(len(feature_cols)),
+            "deployment/total_time_s": float(meta["total_time_s"]),
+        },
+    )
 
     elapsed = time.time() - start
     print("\n" + "=" * 70)

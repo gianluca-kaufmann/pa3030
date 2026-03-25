@@ -37,6 +37,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from scripts.regions.shared.forward.config import DATA_SUBDIR, OUTPUTS_SUBDIR, get_repo_root  # noqa: E402
+from scripts.regions.shared.forward.wandb_logging import log_forward_wandb  # noqa: E402
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 INFERENCE_YEAR = 2024
@@ -73,7 +74,7 @@ def resolve_panel(data_subdir: str) -> Path:
     )
 
 
-def extract_2024_features(panel_path: Path, output_dir: Path) -> Path:
+def extract_2024_features(panel_path: Path, output_dir: Path) -> tuple[Path, int, int, str]:
     print("\n" + "=" * 70)
     print(f"EXTRACTING 2024 INFERENCE FEATURES (year={INFERENCE_YEAR})")
     print("=" * 70)
@@ -182,18 +183,33 @@ def extract_2024_features(panel_path: Path, output_dir: Path) -> Path:
     print(f"\n  Written: {n_written:,} rows → {out_path}")
     if out_col_names is not None:
         print(f"  Columns: {out_col_names[:5]} … ({len(out_col_names)} total)")
-    return out_path
+    n_feature_cols = len(feature_cols)
+    return out_path, n_written, n_feature_cols, str(panel_path)
 
 
 def main() -> None:
+    from datetime import datetime as _dt
+
     # Re-import config after runner.py reload
     from scripts.regions.shared.forward.config import DATA_SUBDIR, OUTPUTS_SUBDIR  # noqa: F401
 
     repo_root = get_repo_root()
     panel_path = resolve_panel(DATA_SUBDIR)
     output_dir = repo_root / f"outputs/{OUTPUTS_SUBDIR}/results/forward"
-    out = extract_2024_features(panel_path, output_dir)
-    print(f"\nDone. Output: {out}")
+    out_path, n_rows, n_feat, panel_s = extract_2024_features(panel_path, output_dir)
+    print(f"\nDone. Output: {out_path}")
+    _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+    log_forward_wandb(
+        stage="features",
+        run_name=f"features_{OUTPUTS_SUBDIR}_{_ts}",
+        config={"region": OUTPUTS_SUBDIR},
+        metrics={
+            "features/n_rows": n_rows,
+            "features/n_feature_cols": n_feat,
+            "features/output_path": str(out_path),
+            "features/panel_path": panel_s,
+        },
+    )
 
 
 if __name__ == "__main__":

@@ -70,10 +70,7 @@ from scripts.regions.shared.training.utils import (  # noqa: E402
     report_memory_usage,
 )
 
-try:
-    import wandb as _wandb
-except ImportError:
-    _wandb = None
+from scripts.regions.shared.forward.wandb_logging import log_forward_wandb  # noqa: E402
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 RANDOM_STATE = 42
@@ -912,37 +909,30 @@ def main() -> None:
         feature_cols, split_paths, panel_path, output_dir,
     )
 
-    if _wandb is not None:
-        try:
-            from datetime import datetime as _dt
-            _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
-            _wandb.init(
-                project="forward",
-                entity=os.environ.get("WANDB_ENTITY"),
-                name=f"backtest_{OUTPUTS_SUBDIR}_{model_type}_T{origin_year}_{_ts}",
-                config={
-                    "region":      OUTPUTS_SUBDIR,
-                    "stage":       "backtest",
-                    "model_type":  model_type,
-                    "origin_year": origin_year,
-                },
-            )
-            _log: dict = {
-                "backtest/origin_year":    origin_year,
-                "backtest/n_pixels_scored": result.get("n_pixels_scored"),
-                "backtest/n_evaluable":    result.get("n_evaluable"),
-                "backtest/n_pos_evaluable": result.get("n_pos_evaluable"),
-                "backtest/clean_window":   int(result.get("clean_5yr_window", False)),
-            }
-            if result.get("metrics"):
-                for _k, _v in result["metrics"].items():
-                    if isinstance(_v, (int, float)):
-                        _log[f"backtest/{_k}"] = _v
-            _wandb.log(_log)
-            _wandb.finish()
-            print("W&B: backtest metrics logged.")
-        except Exception as _wandb_err:
-            print(f"W&B logging failed (non-fatal): {_wandb_err}")
+    from datetime import datetime as _dt
+
+    _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+    _log: dict = {
+        "backtest/origin_year":    origin_year,
+        "backtest/n_pixels_scored": result.get("n_pixels_scored"),
+        "backtest/n_evaluable":    result.get("n_evaluable"),
+        "backtest/n_pos_evaluable": result.get("n_pos_evaluable"),
+        "backtest/clean_window":   int(result.get("clean_5yr_window", False)),
+    }
+    if result.get("metrics"):
+        for _k, _v in result["metrics"].items():
+            if isinstance(_v, (int, float)):
+                _log[f"backtest/{_k}"] = _v
+    log_forward_wandb(
+        stage="backtest",
+        run_name=f"backtest_{OUTPUTS_SUBDIR}_{model_type}_T{origin_year}_{_ts}",
+        config={
+            "region": OUTPUTS_SUBDIR,
+            "model_type": model_type,
+            "origin_year": origin_year,
+        },
+        metrics=_log,
+    )
 
 
 if __name__ == "__main__":

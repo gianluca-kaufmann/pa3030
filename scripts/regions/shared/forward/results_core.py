@@ -68,10 +68,7 @@ from scripts.regions.shared.forward.config import (  # noqa: E402
 )
 warnings.filterwarnings("ignore", category=UserWarning)
 
-try:
-    import wandb as _wandb
-except ImportError:
-    _wandb = None
+from scripts.regions.shared.forward.wandb_logging import log_forward_wandb  # noqa: E402
 
 # ── Map style constants ───────────────────────────────────────────────────────
 MAP_FIGSIZE  = (14, 11)
@@ -1191,41 +1188,34 @@ def main() -> None:
         baseline, scenario_info, gap_metrics, country_df, biome_df, model_output_dir
     )
 
-    if _wandb is not None:
-        try:
-            from datetime import datetime as _dt
-            _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
-            _wandb.init(
-                project="forward",
-                entity=os.environ.get("WANDB_ENTITY"),
-                name=f"results_{OUTPUTS_SUBDIR}_{model_type}_{_ts}",
-                config={"region": OUTPUTS_SUBDIR, "stage": "results",
-                        "model_type": model_type},
-            )
-            _log: Dict[str, Any] = {
-                "results/n_unprotected_pixels":    len(df),
-                "results/coverage_pct_2024":       baseline.get("coverage_pct_2024"),
-                "results/protected_2024_km2":      baseline.get("protected_2024_km2"),
-                "results/km2_needed_for_30pct":    baseline.get("km2_needed_for_30pct"),
-                "results/bau_cutoff":              float(bau_cutoff),
-                "results/moderate_cutoff":         float(moderate_cutoff),
-                "results/full_cutoff":             float(full_cutoff),
-            }
-            if isinstance(scenario_info, dict):
-                for _sc, _sv in scenario_info.items():
-                    if isinstance(_sv, dict):
-                        for _k, _v in _sv.items():
-                            if isinstance(_v, (int, float)):
-                                _log[f"results/scenarios/{_sc}/{_k}"] = _v
-            if isinstance(gap_metrics, dict):
-                for _k, _v in gap_metrics.items():
+    from datetime import datetime as _dt
+
+    _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+    _log: Dict[str, Any] = {
+        "results/n_unprotected_pixels":    len(df),
+        "results/coverage_pct_2024":       baseline.get("coverage_pct_2024"),
+        "results/protected_2024_km2":      baseline.get("protected_2024_km2"),
+        "results/km2_needed_for_30pct":    baseline.get("km2_needed_for_30pct"),
+        "results/bau_cutoff":              float(bau_cutoff),
+        "results/moderate_cutoff":         float(moderate_cutoff),
+        "results/full_cutoff":             float(full_cutoff),
+    }
+    if isinstance(scenario_info, dict):
+        for _sc, _sv in scenario_info.items():
+            if isinstance(_sv, dict):
+                for _k, _v in _sv.items():
                     if isinstance(_v, (int, float)):
-                        _log[f"results/gap/{_k}"] = _v
-            _wandb.log(_log)
-            _wandb.finish()
-            print("W&B: results summary logged.")
-        except Exception as _wandb_err:
-            print(f"W&B logging failed (non-fatal): {_wandb_err}")
+                        _log[f"results/scenarios/{_sc}/{_k}"] = _v
+    if isinstance(gap_metrics, dict):
+        for _k, _v in gap_metrics.items():
+            if isinstance(_v, (int, float)):
+                _log[f"results/gap/{_k}"] = _v
+    log_forward_wandb(
+        stage="results",
+        run_name=f"results_{OUTPUTS_SUBDIR}_{model_type}_{_ts}",
+        config={"region": OUTPUTS_SUBDIR, "model_type": model_type},
+        metrics=_log,
+    )
 
     print("\n" + "=" * 70)
     print("FORWARD RESULTS COMPLETE")

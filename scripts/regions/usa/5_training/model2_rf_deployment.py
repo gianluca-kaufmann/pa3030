@@ -56,6 +56,7 @@ if str(_repo_root) not in sys.path:
 del _repo_root
 # ─────────────────────────────────────────────────────────────────────────────
 
+from scripts.regions.shared.forward.wandb_logging import log_forward_wandb  # noqa: E402
 from scripts.regions.shared.training.utils import (  # noqa: E402
     Tee,
     compute_metrics,
@@ -483,6 +484,20 @@ def main() -> None:
     with open(model_path, "wb") as fh:
         pickle.dump(artifact, fh, protocol=5)
     print(f"\nSaved deployment artifact: {model_path}")
+
+    meta = artifact["metadata"]
+    log_forward_wandb(
+        stage="deployment",
+        run_name=f"deploy_rf_usa_{timestamp}",
+        config={"region": "usa", "model_type": "rf"},
+        metrics={
+            "deployment/deploy_n_pos": float(dep_pos),
+            "deployment/deploy_n_neg": float(dep_neg),
+            "deployment/n_features": float(meta["n_features"]),
+            "deployment/n_estimators": float(meta.get("n_estimators") or 0),
+            "deployment/total_time_s": float(meta["total_time_s"]),
+        },
+    )
 
     elapsed = time.time() - start
     print("\n" + "=" * 70)
