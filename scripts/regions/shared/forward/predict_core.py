@@ -41,8 +41,11 @@ from scripts.regions.shared.forward.config import (  # noqa: E402
     OUTPUTS_SUBDIR,
     get_repo_root,
 )
-from scripts.regions.shared.forward.wandb_logging import log_forward_wandb  # noqa: E402
-from scripts.regions.shared.training.utils import get_repo_root as _get_repo_root, report_memory_usage  # noqa: E402
+from scripts.regions.shared.training.utils import (  # noqa: E402
+    get_repo_root as _get_repo_root,
+    report_memory_usage,
+    wandb_log_one_shot,
+)
 
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "500_000"))
 
@@ -269,10 +272,14 @@ def main() -> None:
     _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
     _stats = pq.read_table(out, columns=["y_pred_proba_calibrated"])
     _arr = _stats.column("y_pred_proba_calibrated").to_numpy(zero_copy_only=False)
-    log_forward_wandb(
-        stage="inference",
+    wandb_log_one_shot(
+        project="forward",
         run_name=f"predict_{OUTPUTS_SUBDIR}_{model_type}_{_ts}",
-        config={"region": OUTPUTS_SUBDIR, "model_type": model_type},
+        config={
+            "region": OUTPUTS_SUBDIR,
+            "model_type": model_type,
+            "forward_stage": "inference",
+        },
         metrics={
             "inference/n_pixels":  int(len(_arr)),
             "inference/prob_min":  float(_arr.min()),

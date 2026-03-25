@@ -37,7 +37,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from scripts.regions.shared.forward.config import DATA_SUBDIR, OUTPUTS_SUBDIR, get_repo_root  # noqa: E402
-from scripts.regions.shared.forward.wandb_logging import log_forward_wandb  # noqa: E402
+from scripts.regions.shared.training.utils import wandb_log_one_shot  # noqa: E402
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 INFERENCE_YEAR = 2024
@@ -199,10 +199,10 @@ def main() -> None:
     out_path, n_rows, n_feat, panel_s = extract_2024_features(panel_path, output_dir)
     print(f"\nDone. Output: {out_path}")
     _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
-    log_forward_wandb(
-        stage="features",
+    wandb_log_one_shot(
+        project="forward",
         run_name=f"features_{OUTPUTS_SUBDIR}_{_ts}",
-        config={"region": OUTPUTS_SUBDIR},
+        config={"region": OUTPUTS_SUBDIR, "forward_stage": "features"},
         metrics={
             "features/n_rows": n_rows,
             "features/n_feature_cols": n_feat,

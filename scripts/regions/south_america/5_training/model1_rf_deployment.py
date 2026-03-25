@@ -56,7 +56,6 @@ if str(_repo_root) not in sys.path:
 del _repo_root
 # ─────────────────────────────────────────────────────────────────────────────
 
-from scripts.regions.shared.forward.wandb_logging import log_forward_wandb  # noqa: E402
 from scripts.regions.shared.training.utils import (  # noqa: E402
     Tee,
     compute_metrics,
@@ -64,6 +63,7 @@ from scripts.regions.shared.training.utils import (  # noqa: E402
     extract_features_pyarrow_to_numpy,
     get_repo_root,
     report_memory_usage,
+    wandb_log_one_shot,
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -514,10 +514,14 @@ def main() -> None:
     print(f"\nSaved deployment artifact: {model_path}")
 
     meta = artifact["metadata"]
-    log_forward_wandb(
-        stage="deployment",
+    wandb_log_one_shot(
+        project="forward",
         run_name=f"deploy_rf_south_america_{timestamp}",
-        config={"region": "south_america", "model_type": "rf"},
+        config={
+            "region": "south_america",
+            "model_type": "rf",
+            "forward_stage": "deployment",
+        },
         metrics={
             "deployment/deploy_n_pos": float(dep_pos),
             "deployment/deploy_n_neg": float(dep_neg),

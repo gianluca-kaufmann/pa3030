@@ -68,7 +68,7 @@ from scripts.regions.shared.forward.config import (  # noqa: E402
 )
 warnings.filterwarnings("ignore", category=UserWarning)
 
-from scripts.regions.shared.forward.wandb_logging import log_forward_wandb  # noqa: E402
+from scripts.regions.shared.training.utils import wandb_log_one_shot  # noqa: E402
 
 # ── Map style constants ───────────────────────────────────────────────────────
 MAP_FIGSIZE  = (14, 11)
@@ -1210,10 +1210,14 @@ def main() -> None:
         for _k, _v in gap_metrics.items():
             if isinstance(_v, (int, float)):
                 _log[f"results/gap/{_k}"] = _v
-    log_forward_wandb(
-        stage="results",
+    wandb_log_one_shot(
+        project="forward",
         run_name=f"results_{OUTPUTS_SUBDIR}_{model_type}_{_ts}",
-        config={"region": OUTPUTS_SUBDIR, "model_type": model_type},
+        config={
+            "region": OUTPUTS_SUBDIR,
+            "model_type": model_type,
+            "forward_stage": "results",
+        },
         metrics=_log,
     )
 

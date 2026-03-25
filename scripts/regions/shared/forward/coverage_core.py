@@ -31,8 +31,8 @@ import numpy as np
 import rasterio
 
 from scripts.regions.shared.forward.config import DATA_SUBDIR, OUTPUTS_SUBDIR, REGION_LABEL, get_repo_root  # noqa: E402
-from scripts.regions.shared.forward.wandb_logging import log_forward_wandb  # noqa: E402
 from scripts.regions.shared.geo_utils import pixel_area_km2  # noqa: E402
+from scripts.regions.shared.training.utils import wandb_log_one_shot  # noqa: E402
 
 
 def resolve_raster(filename: str, data_subdir: str, subdirs: list[str] | None = None) -> Path:
@@ -58,6 +58,36 @@ def resolve_raster(filename: str, data_subdir: str, subdirs: list[str] | None = 
     raise FileNotFoundError(
         f"'{filename}' not found. Checked:\n" + "\n".join(f"  {c}" for c in candidates)
     )
+
+
+def _load_naturalearth_lowres() -> "gpd.GeoDataFrame":
+    """Load world countries GeoDataFrame, compatible with GeoPandas >= 1.0.
+
+    Priority:
+      1. ``geodatasets`` package (ships data locally; official geopandas 1.0 replacement).
+      2. Natural Earth 110m cultural shapefile via NACIS CDN (requires network / eth_proxy).
+    """
+    import geopandas as gpd
+
+    # 1. geodatasets (installed as a transitive dependency of geopandas >= 1.0)
+    try:
+        import geodatasets
+        return gpd.read_file(geodatasets.get_path("naturalearth lowres"))
+    except Exception:
+        pass
+
+    # 2. Natural Earth 110m countries — direct download (needs internet / eth_proxy)
+    url = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip"
+    gdf = gpd.read_file(url)
+    # 110m cultural uses uppercase column names; normalise to match naturalearth_lowres schema
+    rename = {}
+    if "ISO_A3" in gdf.columns:
+        rename["ISO_A3"] = "iso_a3"
+    if "NAME" in gdf.columns:
+        rename["NAME"] = "name"
+    if rename:
+        gdf = gdf.rename(columns=rename)
+    return gdf
 
 
 def compute_coverage_baseline(
@@ -181,13 +211,10 @@ def compute_coverage_baseline(
     if iso_codes:
         try:
             import geopandas as gpd
-            import warnings as _warnings
             from rasterio.features import rasterize as rio_rasterize
 
             print("\n  Computing per-country area stats (raster-based)...")
-            with _warnings.catch_warnings():
-                _warnings.simplefilter("ignore")
-                world_gdf = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres"))
+            world_gdf = _load_naturalearth_lowres()
             region_world = world_gdf[world_gdf["iso_a3"].isin(iso_codes)].copy()
             region_world = region_world.to_crs("EPSG:3857")
 
@@ -279,10 +306,10 @@ def main() -> None:
     )
 
     _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
-    log_forward_wandb(
-        stage="coverage_baseline",
+    wandb_log_one_shot(
+        project="forward",
         run_name=f"coverage_{OUTPUTS_SUBDIR}_{_ts}",
-        config={"region": OUTPUTS_SUBDIR},
+        config={"region": OUTPUTS_SUBDIR, "forward_stage": "coverage_baseline"},
         metrics={
             "coverage/total_land_km2":       baseline.get("total_land_km2"),
             "coverage/protected_2024_km2":   baseline.get("protected_2024_km2"),

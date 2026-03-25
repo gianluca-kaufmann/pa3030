@@ -68,9 +68,8 @@ from scripts.regions.shared.training.utils import (  # noqa: E402
     extract_features_pyarrow_to_numpy,
     get_repo_root as _get_repo_root,
     report_memory_usage,
+    wandb_log_one_shot,
 )
-
-from scripts.regions.shared.forward.wandb_logging import log_forward_wandb  # noqa: E402
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 RANDOM_STATE = 42
@@ -187,8 +186,10 @@ def create_false_positive_map(
 
 
 ORIGIN_YEARS = [2013, 2015, 2017, 2019]
-N_ESTIMATORS_LOCKED_LGBM = 2555   # LGBM backtest locked round count
-N_ESTIMATORS_LOCKED_RF   = 500    # RF uses fewer trees for speed
+# Tree counts can be overridden via env vars (set lower in SLURM scripts for faster backtests).
+# Defaults preserve backward-compatible behaviour; SLURM scripts set optimised values.
+N_ESTIMATORS_LOCKED_LGBM = int(os.environ.get("N_EST_BACKTEST_LGBM", "2555"))
+N_ESTIMATORS_LOCKED_RF   = int(os.environ.get("N_EST_BACKTEST_RF",   "500"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "200_000"))
 FIXED_PARAMS_LGBM = {
     "random_state": RANDOM_STATE, "boosting_type": "gbdt",
@@ -923,13 +924,14 @@ def main() -> None:
         for _k, _v in result["metrics"].items():
             if isinstance(_v, (int, float)):
                 _log[f"backtest/{_k}"] = _v
-    log_forward_wandb(
-        stage="backtest",
+    wandb_log_one_shot(
+        project="forward",
         run_name=f"backtest_{OUTPUTS_SUBDIR}_{model_type}_T{origin_year}_{_ts}",
         config={
             "region": OUTPUTS_SUBDIR,
             "model_type": model_type,
             "origin_year": origin_year,
+            "forward_stage": "backtest",
         },
         metrics=_log,
     )

@@ -32,7 +32,7 @@ module load eth_proxy
 VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
-export WANDB_MODE="${WANDB_MODE:-offline}"
+export WANDB_MODE="${WANDB_MODE:-online}"
 
 SCRIPT="scripts/regions/south_america/8_forward/5_forward_backtest.py"
 [ -f "$SCRIPT" ] || { echo "ERROR: $SCRIPT not found"; exit 1; }

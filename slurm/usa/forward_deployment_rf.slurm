@@ -47,7 +47,7 @@ module load eth_proxy
 VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
-export WANDB_MODE="${WANDB_MODE:-offline}"
+export WANDB_MODE="${WANDB_MODE:-online}"
 export MAX_NEG_TRAIN=50000000
 
 #------------------------------------------------------------------------------

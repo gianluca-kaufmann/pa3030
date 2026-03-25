@@ -16,7 +16,7 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Mapping
 
 import numpy as np
 import pyarrow as pa
@@ -277,3 +277,43 @@ def check_year_overlap(
         print(f"{'!' * 70}\n")
         return True
     return False
+
+
+def wandb_log_one_shot(
+    *,
+    project: str,
+    run_name: str,
+    config: Mapping[str, Any],
+    metrics: Mapping[str, Any],
+) -> None:
+    """Single short W&B run: ``init`` → ``log`` → ``finish``.
+
+    Mirrors ``scripts/regions/south_america/5_training/model1_LGBM`` ``main()``:
+    ``wandb.init(project=..., entity=os.environ.get("WANDB_ENTITY"), name=..., config=...)``
+    with no ``mode=`` keyword (same env behaviour as the training scripts).
+    """
+    try:
+        import wandb
+    except ImportError:
+        print("W&B not available (module not installed)")
+        return
+
+    started = False
+    try:
+        wandb.init(
+            project=project,
+            entity=os.environ.get("WANDB_ENTITY"),
+            name=run_name,
+            config=dict(config),
+        )
+        started = True
+        wandb.log(dict(metrics))
+        print("W&B connected")
+    except Exception as err:
+        print(f"W&B failed: {err}")
+    finally:
+        if started:
+            try:
+                wandb.finish()
+            except Exception:
+                pass

@@ -8,16 +8,16 @@
 #SBATCH --output=/cluster/scratch/%u/logs/forward_bt_usa_%A_%a.out
 #SBATCH --error=/cluster/scratch/%u/logs/forward_bt_usa_%A_%a.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
-#SBATCH --array=0-3
+#SBATCH --array=0-2
 
 # ------------------------------------------------------------------------------
 # Stage 0c (LGBM): Pseudo-forecast Backtesting — USA
 #
-# Validates the LGBM forward prediction methodology at 4 historical origins:
+# Validates the LGBM forward prediction methodology at 3 historical origins:
 #   SLURM_ARRAY_TASK_ID=0 → T=2013 (clean 5-yr window)
-#   SLURM_ARRAY_TASK_ID=1 → T=2015 (clean 5-yr window)
-#   SLURM_ARRAY_TASK_ID=2 → T=2017 (partial: only 2 years observable)
-#   SLURM_ARRAY_TASK_ID=3 → T=2019 (consistency check only)
+#   SLURM_ARRAY_TASK_ID=1 → T=2015 (4/5 years observable)
+#   SLURM_ARRAY_TASK_ID=2 → T=2017 (2/5 years observable, temporal stability check)
+#   T=2019 omitted: T+5=2024 > LAST_LABEL_YEAR=2019, zero evaluable labels
 #
 # Each task:
 #   1. Trains a historical LGBM deployment model on 2001–(T-1)
@@ -46,8 +46,13 @@ echo "USA LGBM backtest task ${TASK_ID}: origin year T=${ORIGIN_YEAR}"
 mkdir -p "$SCRATCH/logs"
 mkdir -p "$SCRATCH/outputs/usa/results/forward/lgbm"
 
-# Cap negatives to avoid OOM when training on full panels (mirrors production training_lgbm.slurm)
-export MAX_NEG_TRAIN=100000000
+# Backtest-specific caps: much lower than production — ranking metrics (ROC-AUC,
+# Precision@K, Lift@K) converge well below 100M negatives; scale_pos_weight handles
+# class imbalance. Reduces training time ~5x vs production cap.
+export MAX_NEG_TRAIN=20000000
+# Tree count kept at production value (2555) for methodological consistency:
+# the backtest simulates running the exact same pipeline at time T.
+# The 5x speedup from MAX_NEG_TRAIN alone is sufficient to meet the time limit.
 
 #------------------------------------------------------------------------------
 # Load modules
@@ -65,7 +70,7 @@ module load eth_proxy
 VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
-export WANDB_MODE="${WANDB_MODE:-offline}"
+export WANDB_MODE="${WANDB_MODE:-online}"
 
 #------------------------------------------------------------------------------
 # Preflight
@@ -89,9 +94,9 @@ srun --cpu-bind=cores --distribution=block:block \
 EXIT_CODE=$?
 echo "USA LGBM backtest T=${ORIGIN_YEAR} finished (exit code: ${EXIT_CODE})"
 
-if [ "${TASK_ID}" -eq 3 ]; then
+if [ "${TASK_ID}" -eq 2 ]; then
   echo ""
-  echo "Task 3 (T=2019) done. To aggregate all LGBM results and produce the summary plot, run:"
+  echo "Task 2 (T=2017) done. To aggregate all LGBM results and produce the summary plot, run:"
   echo "  python scripts/regions/usa/8_forward/5_forward_backtest.py --aggregate"
 fi
 
