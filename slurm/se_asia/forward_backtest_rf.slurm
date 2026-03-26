@@ -48,9 +48,6 @@ echo "RF backtest task ${TASK_ID}: origin year T=${ORIGIN_YEAR}"
 mkdir -p "$SCRATCH/logs"
 mkdir -p "$SCRATCH/outputs/se_asia/results/forward/rf"
 
-# Backtest-specific caps: much lower than production — ranking metrics converge
-# well below 50M negatives. Reduces training time ~5x vs production cap.
-export MAX_NEG_TRAIN=10000000
 # Tree count kept at production value (500) for methodological consistency:
 # the backtest simulates running the exact same pipeline at time T.
 
@@ -71,6 +68,9 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 export WANDB_MODE="${WANDB_MODE:-online}"
+# RF training cap: reservoir-sample negatives to keep X matrix within RAM budget.
+# SE Asia has ~100–150 M total rows; 20 M neg keeps X at ~6 GB (73 features × float32).
+export MAX_NEG_TRAIN="${MAX_NEG_TRAIN:-20000000}"
 
 #------------------------------------------------------------------------------
 # Preflight

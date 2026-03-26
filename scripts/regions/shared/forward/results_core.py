@@ -68,7 +68,7 @@ from scripts.regions.shared.forward.config import (  # noqa: E402
 )
 warnings.filterwarnings("ignore", category=UserWarning)
 
-from scripts.regions.shared.training.utils import wandb_log_one_shot  # noqa: E402
+from scripts.regions.shared.training.utils import WandbRunLogger  # noqa: E402
 
 # ── Map style constants ───────────────────────────────────────────────────────
 MAP_FIGSIZE  = (14, 11)
@@ -1096,6 +1096,20 @@ def main() -> None:
     )
 
     model_type = os.environ.get("PA3030_FORWARD_MODEL_TYPE", "lgbm").strip().lower()
+    from datetime import datetime as _dt
+
+    _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+    wb = WandbRunLogger(
+        project="forward",
+        run_name=f"results_{OUTPUTS_SUBDIR}_{model_type}_{_ts}",
+        config={
+            "region": OUTPUTS_SUBDIR,
+            "model_type": model_type,
+            "forward_stage": "results",
+        },
+    )
+    wb.start()
+    wb.log({"results/stage": "start"})
 
     repo_root   = get_repo_root()
     forward_dir = repo_root / f"outputs/{OUTPUTS_SUBDIR}/results/forward"
@@ -1165,6 +1179,7 @@ def main() -> None:
         df, baseline, bau_cutoff, moderate_cutoff, full_cutoff,
         model_output_dir, world_gdf, X_LIMITS, Y_LIMITS, ISO_CODES, REGION_LABEL,
     )
+    wb.log({"results/stage": "scenario_maps_done"})
 
     # ── Breakdowns ────────────────────────────────────────────────────────────
     country_df = create_country_breakdown(
@@ -1174,33 +1189,34 @@ def main() -> None:
     biome_df = create_biome_breakdown(
         df, bau_cutoff, full_cutoff, gsn_path, model_output_dir
     )
+    wb.log({"results/stage": "breakdowns_done"})
 
     # ── Gap analysis ──────────────────────────────────────────────────────────
     gap_metrics = create_gap_analysis(
         df, bau_cutoff, full_cutoff,
         model_output_dir, world_gdf, X_LIMITS, Y_LIMITS, ISO_CODES,
     )
+    wb.log({"results/stage": "gap_analysis_done"})
 
     # ── Economic exposure ─────────────────────────────────────────────────────
     create_economic_exposure(
         df, forward_dir, bau_cutoff, full_cutoff,
         model_output_dir, X_LIMITS, Y_LIMITS, world_gdf, ISO_CODES,
     )
+    wb.log({"results/stage": "economic_exposure_done"})
 
     # ── Hotspot zoom-ins ──────────────────────────────────────────────────────
     create_hotspot_maps(
         df, HOTSPOT_REGIONS, bau_cutoff,
         model_output_dir, world_gdf, ISO_CODES, REGION_LABEL,
     )
+    wb.log({"results/stage": "hotspot_maps_done"})
 
     # ── Summary JSON ──────────────────────────────────────────────────────────
     save_scenario_summary(
         baseline, scenario_info, gap_metrics, country_df, biome_df, model_output_dir
     )
 
-    from datetime import datetime as _dt
-
-    _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
     _log: Dict[str, Any] = {
         "results/n_unprotected_pixels":    len(df),
         "results/coverage_pct_2024":       baseline.get("coverage_pct_2024"),
@@ -1220,16 +1236,9 @@ def main() -> None:
         for _k, _v in gap_metrics.items():
             if isinstance(_v, (int, float)):
                 _log[f"results/gap/{_k}"] = _v
-    wandb_log_one_shot(
-        project="forward",
-        run_name=f"results_{OUTPUTS_SUBDIR}_{model_type}_{_ts}",
-        config={
-            "region": OUTPUTS_SUBDIR,
-            "model_type": model_type,
-            "forward_stage": "results",
-        },
-        metrics=_log,
-    )
+    _log["results/stage"] = "done"
+    wb.log(_log)
+    wb.finish()
 
     print("\n" + "=" * 70)
     print("FORWARD RESULTS COMPLETE")

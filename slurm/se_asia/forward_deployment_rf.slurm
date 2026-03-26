@@ -49,7 +49,9 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 export WANDB_MODE="${WANDB_MODE:-online}"
-export MAX_NEG_TRAIN=50000000
+# RF training cap: reservoir-sample negatives to keep X matrix within RAM budget.
+# SE Asia has ~100–150 M total rows; 20 M neg keeps X at ~6 GB (73 features × float32).
+export MAX_NEG_TRAIN="${MAX_NEG_TRAIN:-20000000}"
 
 #------------------------------------------------------------------------------
 # Preflight checks

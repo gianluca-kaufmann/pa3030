@@ -68,6 +68,9 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 export WANDB_MODE="${WANDB_MODE:-online}"
+# RF training cap: reservoir-sample negatives to keep X matrix within RAM budget.
+# USA has ~270 M total rows; 30 M neg keeps X at ~10 GB (73 features × float32).
+export MAX_NEG_TRAIN="${MAX_NEG_TRAIN:-30000000}"
 
 #------------------------------------------------------------------------------
 # Preflight

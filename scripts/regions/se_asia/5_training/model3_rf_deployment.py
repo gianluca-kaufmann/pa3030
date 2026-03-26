@@ -57,13 +57,13 @@ del _repo_root
 # ─────────────────────────────────────────────────────────────────────────────
 
 from scripts.regions.shared.training.utils import (  # noqa: E402
+    WandbRunLogger,
     Tee,
     compute_metrics,
     compute_precision_at_k,
     extract_features_pyarrow_to_numpy,
     get_repo_root,
     report_memory_usage,
-    wandb_log_one_shot,
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -430,6 +430,17 @@ def main() -> None:
     start = time.time()
     repo_root = get_repo_root()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    wb = WandbRunLogger(
+        project="forward",
+        run_name=f"deploy_rf_se_asia_{timestamp}",
+        config={
+            "region": "se_asia",
+            "model_type": "rf",
+            "forward_stage": "deployment",
+        },
+    )
+    wb.start()
+    wb.log({"deployment/stage": "start"})
 
     print("=" * 70)
     print("MODEL 1 RF — DEPLOYMENT MODEL (2001-2019)")
@@ -466,6 +477,7 @@ def main() -> None:
     ]
     feature_cols = [c for c in all_numeric if c not in EXCLUDE_COLS]
     print(f"\n  Feature columns: {len(feature_cols)}")
+    wb.log({"deployment/n_features": float(len(feature_cols)), "deployment/stage": "features_ready"})
 
     # ── Step 1: Train deployment model on 2001-2019 ───────────────────────────
     print("\n" + "=" * 70)
@@ -481,10 +493,18 @@ def main() -> None:
 
     deploy_model = _train_rf(X_dep, y_dep, rf_params, "deployment model")
     report_memory_usage("after training deployment model")
+    wb.log(
+        {
+            "deployment/deploy_n_pos": float(dep_pos),
+            "deployment/deploy_n_neg": float(dep_neg),
+            "deployment/stage": "train_done",
+        }
+    )
 
     # ── Step 2: Fit calibrators via auxiliary model ───────────────────────────
     platt_cal, iso_cal = fit_deployment_calibrators(all_paths, feature_cols, rf_params)
     report_memory_usage("after fitting calibrators")
+    wb.log({"deployment/stage": "calibration_done"})
 
     # ── Step 3: Save model + calibrators ─────────────────────────────────────
     artifact = {
@@ -514,22 +534,17 @@ def main() -> None:
     print(f"\nSaved deployment artifact: {model_path}")
 
     meta = artifact["metadata"]
-    wandb_log_one_shot(
-        project="forward",
-        run_name=f"deploy_rf_se_asia_{timestamp}",
-        config={
-            "region": "se_asia",
-            "model_type": "rf",
-            "forward_stage": "deployment",
-        },
-        metrics={
+    wb.log(
+        {
             "deployment/deploy_n_pos": float(dep_pos),
             "deployment/deploy_n_neg": float(dep_neg),
             "deployment/n_features": float(meta["n_features"]),
             "deployment/n_estimators": float(meta.get("n_estimators") or 0),
             "deployment/total_time_s": float(meta["total_time_s"]),
-        },
+            "deployment/stage": "done",
+        }
     )
+    wb.finish()
 
     # Print summary
     elapsed = time.time() - start

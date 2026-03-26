@@ -32,7 +32,7 @@ import rasterio
 
 from scripts.regions.shared.forward.config import DATA_SUBDIR, OUTPUTS_SUBDIR, REGION_LABEL, get_repo_root  # noqa: E402
 from scripts.regions.shared.geo_utils import pixel_area_km2  # noqa: E402
-from scripts.regions.shared.training.utils import wandb_log_one_shot  # noqa: E402
+from scripts.regions.shared.training.utils import WandbRunLogger  # noqa: E402
 
 
 def resolve_raster(filename: str, data_subdir: str, subdirs: list[str] | None = None) -> Path:
@@ -298,6 +298,15 @@ def main() -> None:
         WDPA_2024_FILENAME,
     )
 
+    _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+    wb = WandbRunLogger(
+        project="forward",
+        run_name=f"coverage_{OUTPUTS_SUBDIR}_{_ts}",
+        config={"region": OUTPUTS_SUBDIR, "forward_stage": "coverage_baseline"},
+    )
+    wb.start()
+    wb.log({"coverage/stage": "start"})
+
     repo_root = get_repo_root()
     backbone_path = resolve_raster("backbone.tif", DATA_SUBDIR, subdirs=["backbone"])
     wdpa_2024_path = resolve_raster(WDPA_2024_FILENAME, DATA_SUBDIR, subdirs=["WDPA", "wdpa"])
@@ -309,21 +318,18 @@ def main() -> None:
         iso_codes=ISO_CODES,
         wdpa_2019_basename=WDPA_2019_FILENAME,
     )
-
-    _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
-    wandb_log_one_shot(
-        project="forward",
-        run_name=f"coverage_{OUTPUTS_SUBDIR}_{_ts}",
-        config={"region": OUTPUTS_SUBDIR, "forward_stage": "coverage_baseline"},
-        metrics={
-            "coverage/total_land_km2":       baseline.get("total_land_km2"),
-            "coverage/protected_2024_km2":   baseline.get("protected_2024_km2"),
-            "coverage/coverage_pct_2024":    baseline.get("coverage_pct_2024"),
+    wb.log(
+        {
+            "coverage/total_land_km2": baseline.get("total_land_km2"),
+            "coverage/protected_2024_km2": baseline.get("protected_2024_km2"),
+            "coverage/coverage_pct_2024": baseline.get("coverage_pct_2024"),
             "coverage/km2_needed_for_30pct": baseline.get("km2_needed_for_30pct"),
-            "coverage/moderate_target_pct":  baseline.get("moderate_target_pct"),
-            "coverage/bau_km2":              baseline.get("bau_km2"),
-        },
+            "coverage/moderate_target_pct": baseline.get("moderate_target_pct"),
+            "coverage/bau_km2": baseline.get("bau_km2"),
+            "coverage/stage": "done",
+        }
     )
+    wb.finish()
 
 
 if __name__ == "__main__":

@@ -37,6 +37,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -62,13 +63,13 @@ from scripts.regions.shared.forward.config import (  # noqa: E402
     get_repo_root,
 )
 from scripts.regions.shared.training.utils import (  # noqa: E402
+    WandbRunLogger,
     compute_precision_at_k,
     compute_recall_at_k,
     compute_year_weights,
     extract_features_pyarrow_to_numpy,
     get_repo_root as _get_repo_root,
     report_memory_usage,
-    wandb_log_one_shot,
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -186,6 +187,10 @@ ORIGIN_YEARS = [2013, 2015, 2017, 2019]
 N_ESTIMATORS_LOCKED_LGBM = int(os.environ.get("N_EST_BACKTEST_LGBM", "2555"))
 N_ESTIMATORS_LOCKED_RF   = int(os.environ.get("N_EST_BACKTEST_RF",   "500"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "200_000"))
+# RF negative cap: set via SLURM to avoid OOM (sklearn RF needs full X in RAM).
+# 0 = no cap (uncapped, matches LGBM behaviour but risks OOM for large regions).
+# Recommended values by region: SA=40_000_000, USA=30_000_000, SE Asia=20_000_000.
+MAX_NEG_TRAIN = int(os.environ.get("MAX_NEG_TRAIN", "0"))
 FIXED_PARAMS_LGBM = {
     "random_state": RANDOM_STATE, "boosting_type": "gbdt",
     "objective": "binary", "verbose": -1,
@@ -329,17 +334,98 @@ def load_best_params_rf(params_path: Optional[Path], n_jobs: int) -> Dict[str, A
     return params
 
 
+# ── Lazy Sequence loading (LightGBM Sequence API) ─────────────────────────────
+
+@dataclass
+class _BatchRecord:
+    """Per-batch metadata collected during the label-loading pass."""
+    path_idx: int           # index into the paths list
+    parquet_batch_idx: int  # sequential batch number within that Parquet file
+    mask: np.ndarray        # boolean row-filter (length = raw batch row count)
+
+
+class _ParquetFeatureSequence:
+    """LightGBM Sequence: re-reads filtered feature batches from Parquet on demand.
+
+    Implements the LightGBM Sequence protocol (__len__ + __getitem__) so that
+    lgb.Dataset constructs its histogram representation one batch at a time,
+    never materialising the full feature matrix in RAM.
+
+    Design: LightGBM calls __getitem__(0), __getitem__(1), … in order during
+    Dataset.construct().  We maintain a persistent Parquet iterator per file
+    so each batch is an O(1) disk read (no rewinding for sequential access).
+    Out-of-order or repeated access causes a file rewind, which is safe but slow.
+    """
+
+    def __init__(
+        self,
+        batch_records: List[_BatchRecord],
+        paths: List[Path],
+        feature_cols: List[str],
+        batch_size: int,
+    ) -> None:
+        self._records = batch_records
+        self._paths = paths
+        self._feature_cols = feature_cols
+        self._batch_size = batch_size
+
+        self._iter_path_idx: Optional[int] = None
+        self._iter_pf = None
+        self._iter_gen = None
+        self._iter_pos: int = 0
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    def __getitem__(self, idx: int) -> np.ndarray:
+        rec = self._records[idx]
+
+        if (self._iter_path_idx != rec.path_idx
+                or self._iter_pos > rec.parquet_batch_idx):
+            self._open_file(rec.path_idx)
+
+        while self._iter_pos < rec.parquet_batch_idx:
+            next(self._iter_gen)
+            self._iter_pos += 1
+
+        batch = next(self._iter_gen)
+        self._iter_pos += 1
+
+        feat_tbl = batch.select(self._feature_cols)
+        return extract_features_pyarrow_to_numpy(feat_tbl, rec.mask)
+
+    def _open_file(self, path_idx: int) -> None:
+        self._iter_pf = pq.ParquetFile(self._paths[path_idx])
+        self._iter_gen = self._iter_pf.iter_batches(
+            batch_size=self._batch_size,
+            columns=self._feature_cols,
+            use_threads=True,
+        )
+        self._iter_path_idx = path_idx
+        self._iter_pos = 0
+
+    def close(self) -> None:
+        """Release open file handles."""
+        self._iter_pf = None
+        self._iter_gen = None
+
+
 # ── Data loaders ──────────────────────────────────────────────────────────────
 
 def load_training_data(
     paths: List[Path],
     feature_cols: List[str],
     year_range: Tuple[int, int],
+    max_neg: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
-    """Stream full risk-set training data (WDPA_prev==0, year in range) from split parquets.
+    """Stream training data from split parquets into a full feature matrix.
 
-    All positives and negatives are used (no subsampling), matching the evaluation
-    pipeline which builds full-risk-set splits via DuckDB.
+    Used by the RF path (sklearn cannot use the LightGBM Sequence API).
+    For LGBM use _load_training_labels + _ParquetFeatureSequence instead.
+
+    max_neg > 0: reservoir-sample negatives to at most max_neg rows (reduces RAM
+    at the cost of a smaller negative sample — appropriate for RF with 128 GB limit).
+    max_neg == 0: load all negatives (full risk set, may OOM for large regions).
 
     Pass 1 counts rows for pre-allocation; Pass 2 fills (positives first, then negatives).
     """
@@ -368,11 +454,18 @@ def load_training_data(
         finally:
             del pf
 
-    n_samples = n_pos_total + n_neg_total
+    if max_neg > 0 and n_neg_total > max_neg:
+        n_neg_use = max_neg
+        print(f"  Found {n_pos_total:,} pos + {n_neg_total:,} neg "
+              f"→ capping neg to {n_neg_use:,} (MAX_NEG_TRAIN)")
+    else:
+        n_neg_use = n_neg_total
+
+    n_samples = n_pos_total + n_neg_use
     if n_samples == 0:
         raise ValueError(f"No training samples for years {year_range}")
 
-    print(f"  Found {n_pos_total:,} pos + {n_neg_total:,} neg → {n_samples:,} total (full risk set)")
+    print(f"  Using {n_samples:,} samples ({n_pos_total:,} pos / {n_neg_use:,} neg)")
 
     # ── Pass 2: fill pre-allocated arrays (positives first, then negatives) ──
     X         = np.empty((n_samples, len(feature_cols)), dtype=np.float32)
@@ -380,6 +473,8 @@ def load_training_data(
     years_arr = np.empty(n_samples, dtype=np.int32)
     pos_offset = 0
     neg_offset = n_pos_total
+    rng = np.random.RandomState(RANDOM_STATE) if (max_neg > 0 and n_neg_total > max_neg) else None
+    neg_seen = 0
 
     for path in paths:
         pf = pq.ParquetFile(path)
@@ -409,12 +504,28 @@ def load_training_data(
                     pos_offset += k
 
                 if neg_final_all.any():
-                    X_b = extract_features_pyarrow_to_numpy(batch.select(feature_cols), neg_final_all)
-                    k   = len(X_b)
-                    X[neg_offset:neg_offset + k]         = X_b
-                    y[neg_offset:neg_offset + k]         = 0
-                    years_arr[neg_offset:neg_offset + k] = yr[neg_final_all].astype(np.int32)
-                    neg_offset += k
+                    X_neg = extract_features_pyarrow_to_numpy(batch.select(feature_cols), neg_final_all)
+                    yr_neg = yr[neg_final_all].astype(np.int32)
+                    nn_b = len(X_neg)
+                    if rng is None:
+                        X[neg_offset:neg_offset + nn_b]         = X_neg
+                        y[neg_offset:neg_offset + nn_b]         = 0
+                        years_arr[neg_offset:neg_offset + nn_b] = yr_neg
+                        neg_offset += nn_b
+                    else:
+                        for i in range(nn_b):
+                            neg_seen += 1
+                            slot = neg_offset - n_pos_total
+                            if slot < n_neg_use:
+                                X[neg_offset] = X_neg[i]
+                                y[neg_offset] = 0
+                                years_arr[neg_offset] = yr_neg[i]
+                                neg_offset += 1
+                            else:
+                                j = rng.randint(0, neg_seen)
+                                if j < n_neg_use:
+                                    X[n_pos_total + j] = X_neg[i]
+                                    years_arr[n_pos_total + j] = yr_neg[i]
 
                 del batch, tgt_arr, tgt, null_mask, yr, wp, mask
         finally:
@@ -430,6 +541,93 @@ def load_training_data(
     n_pos = int(y.sum())
     n_neg = len(y) - n_pos
     return X, y, years_arr, n_pos, n_neg
+
+
+def _load_training_labels(
+    paths: List[Path],
+    feature_cols: List[str],
+    year_range: Tuple[int, int],
+) -> Tuple[np.ndarray, np.ndarray, int, int, List[_BatchRecord]]:
+    """Two-pass label-only loader for the LightGBM path — feature matrix never allocated.
+
+    Pass 1: count filtered rows for pre-allocation + scale_pos_weight.
+    Pass 2: fill y + years_arr; collect per-batch metadata so that
+            _ParquetFeatureSequence can re-read X lazily during lgb.Dataset construction.
+
+    Returns (y, years_arr, n_pos, n_neg, batch_records).
+    Peak RAM: y + years_arr + masks — no feature matrix.
+    """
+    essential = feature_cols + [TARGET_COL, "year", "WDPA_prev"]
+    year_lo, year_hi = year_range
+
+    # ── Pass 1: count ─────────────────────────────────────────────────────────
+    n_pos_total = 0
+    n_neg_total = 0
+    for path in paths:
+        pf = pq.ParquetFile(path)
+        try:
+            for batch in pf.iter_batches(batch_size=BATCH_SIZE, columns=essential, use_threads=True):
+                tgt_arr  = batch[TARGET_COL]
+                null_mask = tgt_arr.is_null().to_numpy(zero_copy_only=False)
+                tgt = tgt_arr.to_numpy(zero_copy_only=False)
+                yr  = batch["year"].to_numpy(zero_copy_only=False)
+                wp  = batch["WDPA_prev"].to_numpy(zero_copy_only=False)
+                mask = (~null_mask & (wp == 0) & (yr >= year_lo) & (yr <= year_hi))
+                if mask.any():
+                    n_pos_total += int((tgt[mask] > 0).sum())
+                    n_neg_total += int((tgt[mask] == 0).sum())
+                del batch, tgt_arr, tgt, null_mask, yr, wp, mask
+        finally:
+            del pf
+
+    n_samples = n_pos_total + n_neg_total
+    if n_samples == 0:
+        raise ValueError(f"No training samples for years {year_range}")
+    print(f"  Found {n_pos_total:,} pos + {n_neg_total:,} neg → {n_samples:,} total (full risk set)")
+
+    # ── Pass 2: labels + batch metadata (no X) ────────────────────────────────
+    y         = np.empty(n_samples, dtype=np.int8)
+    years_arr = np.empty(n_samples, dtype=np.int32)
+    batch_records: List[_BatchRecord] = []
+    row_idx = 0
+    _mile = -1
+
+    for path_idx, path in enumerate(paths):
+        parquet_batch_idx = 0
+        pf = pq.ParquetFile(path)
+        try:
+            for batch in pf.iter_batches(batch_size=BATCH_SIZE, columns=essential, use_threads=True):
+                tgt_arr  = batch[TARGET_COL]
+                null_mask = tgt_arr.is_null().to_numpy(zero_copy_only=False)
+                tgt = tgt_arr.to_numpy(zero_copy_only=False)
+                yr  = batch["year"].to_numpy(zero_copy_only=False)
+                wp  = batch["WDPA_prev"].to_numpy(zero_copy_only=False)
+                mask = (~null_mask & (wp == 0) & (yr >= year_lo) & (yr <= year_hi))
+                if mask.any():
+                    n_b = int(mask.sum())
+                    y[row_idx:row_idx + n_b]         = (tgt[mask] > 0).astype(np.int8)
+                    years_arr[row_idx:row_idx + n_b] = yr[mask].astype(np.int32)
+                    batch_records.append(_BatchRecord(
+                        path_idx=path_idx,
+                        parquet_batch_idx=parquet_batch_idx,
+                        mask=mask,
+                    ))
+                    row_idx += n_b
+
+                    pct = row_idx * 100 // n_samples
+                    ms = pct // 25
+                    if ms > _mile:
+                        _mile = ms
+                        print(f"    {pct}% — {row_idx:,}/{n_samples:,}")
+
+                parquet_batch_idx += 1
+                del batch, tgt_arr, tgt, null_mask, yr, wp
+        finally:
+            del pf
+        gc.collect()
+
+    print(f"  Labels indexed — {n_samples:,} rows, {len(batch_records)} batches queued (X not in RAM)")
+    return y, years_arr, n_pos_total, n_neg_total, batch_records
 
 
 def load_inference_rows_and_wdpa(
@@ -531,7 +729,7 @@ def load_inference_rows_and_wdpa(
 # ── Training helpers ──────────────────────────────────────────────────────────
 
 def _train_lgbm(
-    X: np.ndarray,
+    X: "np.ndarray | _ParquetFeatureSequence",
     y: np.ndarray,
     years_arr: np.ndarray,
     best_params: Dict[str, Any],
@@ -554,6 +752,8 @@ def _train_lgbm(
     p.setdefault("num_threads", NUM_THREADS)
 
     ds = lgb.Dataset(X, label=y, weight=weights, free_raw_data=True)
+    if hasattr(X, "close"):
+        X.close()
     del X, y, years_arr, weights
     gc.collect()
 
@@ -699,6 +899,7 @@ def run_single_origin(
     split_paths: List[Path],
     panel_path: Path,
     output_dir: Path,
+    wb: WandbRunLogger | None = None,
 ) -> Dict[str, Any]:
     T = origin_year
     train_range = (2001, T - 1)
@@ -710,27 +911,48 @@ def run_single_origin(
     print(f"  Clean 5-year window: {clean_window}")
     print("=" * 70)
     report_memory_usage(f"start T={T}")
+    if wb is not None:
+        wb.log({"backtest/stage": "train_start", "backtest/origin_year": T})
 
     # ── Train historical deployment model ─────────────────────────────────────
-    X_tr, y_tr, yr_tr, n_pos_tr, n_neg_tr = load_training_data(
-        split_paths, feature_cols, train_range
-    )
-    print(f"  Training data: {len(y_tr):,} rows ({n_pos_tr:,} pos / {n_neg_tr:,} neg)")
-
     if model_type == "lgbm":
+        # Lazy-load: build y + years_arr only; X streamed on demand via Sequence API.
+        # Peak RAM: ~1.7 GB (labels) + ~26 GB (LightGBM histogram) — no full X matrix.
+        y_tr, yr_tr, n_pos_tr, n_neg_tr, bt_records = _load_training_labels(
+            split_paths, feature_cols, train_range
+        )
+        X_tr = _ParquetFeatureSequence(bt_records, split_paths, feature_cols, BATCH_SIZE)
+        print(f"  Training data: {n_pos_tr + n_neg_tr:,} rows ({n_pos_tr:,} pos / {n_neg_tr:,} neg)")
         n_est = int(lgbm_params.get("n_estimators", N_ESTIMATORS_LOCKED_LGBM))
         model = _train_lgbm(X_tr, y_tr, yr_tr, lgbm_params, n_est, train_range)
-    else:  # rf
+        del y_tr, yr_tr
+    else:  # rf — sklearn needs full X in RAM; use MAX_NEG_TRAIN cap to stay within budget
+        X_tr, y_tr, yr_tr, n_pos_tr, n_neg_tr = load_training_data(
+            split_paths, feature_cols, train_range, max_neg=MAX_NEG_TRAIN
+        )
+        print(f"  Training data: {len(y_tr):,} rows ({n_pos_tr:,} pos / {n_neg_tr:,} neg)")
         model = _train_rf(X_tr, y_tr, rf_params)
+        del X_tr, y_tr, yr_tr
 
-    del X_tr, y_tr, yr_tr
     gc.collect()
     report_memory_usage(f"after training T={T}")
+    if wb is not None:
+        wb.log({"backtest/stage": "train_done", "backtest/origin_year": T})
 
     # ── Load year-T inference set + 5-year labels ─────────────────────────────
     X_inf, row_col, label_5yr, evaluable, xy = load_inference_rows_and_wdpa(
         panel_path, feature_cols, T
     )
+    if wb is not None:
+        wb.log(
+            {
+                "backtest/stage": "inference_rows_loaded",
+                "backtest/origin_year": T,
+                "backtest/n_pixels_scored": int(len(X_inf)),
+                "backtest/n_evaluable": int(evaluable.sum()),
+                "backtest/n_pos_evaluable": int(label_5yr[evaluable].sum()),
+            }
+        )
 
     # ── Predict ───────────────────────────────────────────────────────────────
     print(f"\nScoring {len(X_inf):,} pixels…")
@@ -762,6 +984,15 @@ def run_single_origin(
         )
         metrics = compute_backtest_metrics(label_5yr[evaluable], y_proba[evaluable], window_label)
         result["metrics"] = metrics
+        if wb is not None:
+            _live = {
+                "backtest/stage": "metrics_done",
+                "backtest/origin_year": T,
+            }
+            for _k, _v in metrics.items():
+                if isinstance(_v, (int, float)):
+                    _live[f"backtest/{_k}"] = _v
+            wb.log(_live)
     else:
         print(f"  T={T}: no evaluable positive labels — skipping metrics")
 
@@ -819,6 +1050,20 @@ def main() -> None:
     output_dir  = forward_dir / model_type
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    from datetime import datetime as _dt
+
+    _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+    wb = WandbRunLogger(
+        project="forward",
+        run_name=f"backtest_{OUTPUTS_SUBDIR}_{model_type}_{_ts}",
+        config={
+            "region": OUTPUTS_SUBDIR,
+            "model_type": model_type,
+            "forward_stage": "backtest",
+        },
+    )
+    wb.start()
+
     # ── Aggregate mode ────────────────────────────────────────────────────────
     if args.aggregate:
         print(f"Aggregating backtest results ({model_type.upper()})…")
@@ -831,6 +1076,13 @@ def main() -> None:
             json.dump(all_results, f, indent=2)
         print(f"Saved: {out_json}")
         plot_backtest_precision(all_results, output_dir, model_type)
+        wb.log(
+            {
+                "backtest/stage": "aggregate_done",
+                "backtest/n_origins_aggregated": len(all_results),
+            }
+        )
+        wb.finish()
         return
 
     # ── Single origin ─────────────────────────────────────────────────────────
@@ -869,12 +1121,8 @@ def main() -> None:
 
     result = run_single_origin(
         origin_year, model_type, best_params_lgbm, best_params_rf,
-        feature_cols, split_paths, panel_path, output_dir,
+        feature_cols, split_paths, panel_path, output_dir, wb=wb,
     )
-
-    from datetime import datetime as _dt
-
-    _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
     _log: dict = {
         "backtest/origin_year":    origin_year,
         "backtest/n_pixels_scored": result.get("n_pixels_scored"),
@@ -886,17 +1134,9 @@ def main() -> None:
         for _k, _v in result["metrics"].items():
             if isinstance(_v, (int, float)):
                 _log[f"backtest/{_k}"] = _v
-    wandb_log_one_shot(
-        project="forward",
-        run_name=f"backtest_{OUTPUTS_SUBDIR}_{model_type}_T{origin_year}_{_ts}",
-        config={
-            "region": OUTPUTS_SUBDIR,
-            "model_type": model_type,
-            "origin_year": origin_year,
-            "forward_stage": "backtest",
-        },
-        metrics=_log,
-    )
+    _log["backtest/stage"] = "done"
+    wb.log(_log)
+    wb.finish()
 
 
 if __name__ == "__main__":

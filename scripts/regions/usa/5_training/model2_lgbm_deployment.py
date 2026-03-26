@@ -39,6 +39,7 @@ import os
 import pickle
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -58,6 +59,7 @@ del _repo_root
 # ─────────────────────────────────────────────────────────────────────────────
 
 from scripts.regions.shared.training.utils import (  # noqa: E402
+    WandbRunLogger,
     Tee,
     compute_metrics,
     compute_precision_at_k,
@@ -65,7 +67,6 @@ from scripts.regions.shared.training.utils import (  # noqa: E402
     extract_features_pyarrow_to_numpy,
     get_repo_root,
     report_memory_usage,
-    wandb_log_one_shot,
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -208,6 +209,82 @@ def load_best_params(params_path: Optional[Path]) -> Dict[str, Any]:
     return params
 
 
+# ── Lazy Sequence loading (LightGBM Sequence API) ─────────────────────────────
+
+@dataclass
+class _BatchRecord:
+    """Per-batch metadata collected during the label-loading pass."""
+    path_idx: int           # index into the paths list
+    parquet_batch_idx: int  # sequential batch number within that Parquet file
+    mask: np.ndarray        # boolean row-filter (length = raw batch row count)
+
+
+class _ParquetFeatureSequence:
+    """LightGBM Sequence: re-reads filtered feature batches from Parquet on demand.
+
+    Implements the LightGBM Sequence protocol (__len__ + __getitem__) so that
+    lgb.Dataset constructs its histogram representation one batch at a time,
+    never materialising the full feature matrix in RAM.
+
+    Design: LightGBM calls __getitem__(0), __getitem__(1), … in order during
+    Dataset.construct().  We maintain a persistent Parquet iterator per file
+    so each batch is an O(1) disk read (no rewinding for sequential access).
+    Out-of-order or repeated access causes a file rewind, which is safe but slow.
+    """
+
+    def __init__(
+        self,
+        batch_records: List[_BatchRecord],
+        paths: List[Path],
+        feature_cols: List[str],
+        batch_size: int,
+    ) -> None:
+        self._records = batch_records
+        self._paths = paths
+        self._feature_cols = feature_cols
+        self._batch_size = batch_size
+
+        self._iter_path_idx: Optional[int] = None
+        self._iter_pf = None
+        self._iter_gen = None
+        self._iter_pos: int = 0
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    def __getitem__(self, idx: int) -> np.ndarray:
+        rec = self._records[idx]
+
+        if (self._iter_path_idx != rec.path_idx
+                or self._iter_pos > rec.parquet_batch_idx):
+            self._open_file(rec.path_idx)
+
+        while self._iter_pos < rec.parquet_batch_idx:
+            next(self._iter_gen)
+            self._iter_pos += 1
+
+        batch = next(self._iter_gen)
+        self._iter_pos += 1
+
+        feat_tbl = batch.select(self._feature_cols)
+        return extract_features_pyarrow_to_numpy(feat_tbl, rec.mask)
+
+    def _open_file(self, path_idx: int) -> None:
+        self._iter_pf = pq.ParquetFile(self._paths[path_idx])
+        self._iter_gen = self._iter_pf.iter_batches(
+            batch_size=self._batch_size,
+            columns=self._feature_cols,
+            use_threads=True,
+        )
+        self._iter_path_idx = path_idx
+        self._iter_pos = 0
+
+    def close(self) -> None:
+        """Release open file handles."""
+        self._iter_pf = None
+        self._iter_gen = None
+
+
 # ── Data loading ──────────────────────────────────────────────────────────────
 
 def _stream_data(
@@ -325,6 +402,108 @@ def _stream_data(
     return X, y, years_arr, n_pos_ld, n_neg_ld
 
 
+def _stream_labels(
+    paths: List[Path],
+    feature_cols: List[str],
+    year_range: Tuple[int, int],
+    name: str = "",
+) -> Tuple[np.ndarray, np.ndarray, int, int, List[_BatchRecord]]:
+    """Two-pass label-only loader — feature matrix is never allocated.
+
+    Pass 1: count filtered rows (for array pre-allocation).
+    Pass 2: fill y + years_arr; record per-batch metadata (path, batch index,
+            row-filter mask) so that _ParquetFeatureSequence can re-read X
+            lazily during lgb.Dataset construction.
+
+    Returns (y, years_arr, n_pos, n_neg, batch_records).
+    Peak RAM: y + years_arr + masks ≈ 1.7 GB for 270M rows (no X matrix).
+    """
+    t0 = time.time()
+    essential = feature_cols + [TARGET_COL, "year", "WDPA_prev"]
+
+    print(f"  Pass 1: counting rows ({name}, years {year_range[0]}–{year_range[1]})…")
+    n_pos_total = 0
+    n_neg_total = 0
+    for path in paths:
+        pf = pq.ParquetFile(path)
+        try:
+            for batch in pf.iter_batches(batch_size=BATCH_SIZE, columns=essential, use_threads=True):
+                tgt_arr = batch[TARGET_COL]
+                null_mask = tgt_arr.is_null().to_numpy(zero_copy_only=False)
+                tgt = tgt_arr.to_numpy(zero_copy_only=False)
+                yr = batch["year"].to_numpy(zero_copy_only=False)
+                wp = batch["WDPA_prev"].to_numpy(zero_copy_only=False)
+                mask = (
+                    ~null_mask
+                    & (wp == 0)
+                    & (yr >= year_range[0]) & (yr <= year_range[1])
+                )
+                if mask.any():
+                    tgt_m = (tgt[mask] > 0).astype(np.int8)
+                    n_pos_total += int(tgt_m.sum())
+                    n_neg_total += int((tgt_m == 0).sum())
+                del batch, tgt_arr, tgt, null_mask, yr, wp, mask
+        finally:
+            del pf
+
+    n_samples = n_pos_total + n_neg_total
+    if n_samples == 0:
+        raise ValueError(f"No samples in {name} for years {year_range}")
+    print(f"    {n_samples:,} samples ({n_pos_total:,} pos / {n_neg_total:,} neg) — full risk set")
+
+    y = np.empty(n_samples, dtype=np.int8)
+    years_arr = np.empty(n_samples, dtype=np.int32)
+    batch_records: List[_BatchRecord] = []
+    row_idx = 0
+    _mile = -1
+
+    for path_idx, path in enumerate(paths):
+        parquet_batch_idx = 0
+        pf = pq.ParquetFile(path)
+        try:
+            for batch in pf.iter_batches(batch_size=BATCH_SIZE, columns=essential, use_threads=True):
+                tgt_arr = batch[TARGET_COL]
+                null_mask = tgt_arr.is_null().to_numpy(zero_copy_only=False)
+                tgt = tgt_arr.to_numpy(zero_copy_only=False)
+                yr = batch["year"].to_numpy(zero_copy_only=False)
+                wp = batch["WDPA_prev"].to_numpy(zero_copy_only=False)
+                mask = (
+                    ~null_mask
+                    & (wp == 0)
+                    & (yr >= year_range[0]) & (yr <= year_range[1])
+                )
+                if mask.any():
+                    n_b = int(mask.sum())
+                    y[row_idx:row_idx + n_b] = (tgt[mask] > 0).astype(np.int8)
+                    years_arr[row_idx:row_idx + n_b] = yr[mask].astype(np.int32)
+                    batch_records.append(_BatchRecord(
+                        path_idx=path_idx,
+                        parquet_batch_idx=parquet_batch_idx,
+                        mask=mask,
+                    ))
+                    row_idx += n_b
+
+                    pct = row_idx * 100 // n_samples
+                    ms = pct // 25
+                    if ms > _mile:
+                        _mile = ms
+                        print(f"    {pct}% — {row_idx:,}/{n_samples:,}")
+
+                parquet_batch_idx += 1
+                del batch, tgt_arr, tgt, null_mask, yr, wp
+        finally:
+            del pf
+        gc.collect()
+
+    elapsed = time.time() - t0
+    print(
+        f"  Labels indexed in {elapsed:.1f}s — {n_samples:,} rows "
+        f"({n_neg_total:,} neg / {n_pos_total:,} pos), "
+        f"{len(batch_records)} feature batches queued (X not in RAM)"
+    )
+    return y, years_arr, n_pos_total, n_neg_total, batch_records
+
+
 # ── LightGBM training helper ──────────────────────────────────────────────────
 
 def _build_train_params(best_params: Dict[str, Any], scale_pos_weight: float) -> Dict[str, Any]:
@@ -339,7 +518,7 @@ def _build_train_params(best_params: Dict[str, Any], scale_pos_weight: float) ->
 
 
 def _train_lgb(
-    X: np.ndarray,
+    X: "np.ndarray | _ParquetFeatureSequence",
     y: np.ndarray,
     years_arr: np.ndarray,
     best_params: Dict[str, Any],
@@ -368,6 +547,8 @@ def _train_lgb(
         print(f"    {k}: {train_params[k]}")
 
     ds = lgb.Dataset(X, label=y, weight=weights, free_raw_data=True)
+    if hasattr(X, "close"):
+        X.close()
     del X, y, years_arr, weights
     gc.collect()
 
@@ -397,9 +578,10 @@ def fit_deployment_calibrators(
     print(f"  Calibration held-out:  {AUX_CALIB_YEARS[0]}–{AUX_CALIB_YEARS[1]}")
     print("=" * 70)
 
-    X_aux, y_aux, yr_aux, n_pos_aux_f, n_neg_aux_f = _stream_data(
+    y_aux, yr_aux, n_pos_aux_f, n_neg_aux_f, aux_records = _stream_labels(
         all_paths, feature_cols, AUX_TRAIN_YEARS, "aux_train"
     )
+    X_aux = _ParquetFeatureSequence(aux_records, all_paths, feature_cols, BATCH_SIZE)
     spw_aux = n_neg_aux_f / max(n_pos_aux_f, 1)
     aux_model = _train_lgb(
         X_aux, y_aux, yr_aux, best_params, num_boost_round,
@@ -451,6 +633,17 @@ def main() -> None:
     start = time.time()
     repo_root = get_repo_root()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    wb = WandbRunLogger(
+        project="forward",
+        run_name=f"deploy_lgbm_usa_{timestamp}",
+        config={
+            "region": "usa",
+            "model_type": "lgbm",
+            "forward_stage": "deployment",
+        },
+    )
+    wb.start()
+    wb.log({"deployment/stage": "start"})
 
     print("=" * 70)
     print("MODEL 2 LGBM — DEPLOYMENT MODEL (2001-2019)")
@@ -485,18 +678,20 @@ def main() -> None:
         if pa.types.is_integer(field.type) or pa.types.is_floating(field.type)
     ]
     feature_cols = [c for c in all_numeric if c not in EXCLUDE_COLS]
+    wb.log({"deployment/n_features": float(len(feature_cols)), "deployment/stage": "features_ready"})
     print(f"\n  Feature columns: {len(feature_cols)}")
 
     # ── Step 1: Train deployment model on 2001-2019 ───────────────────────────
     print("\n" + "=" * 70)
     print("STEP 1: TRAINING DEPLOYMENT MODEL (2001-2019)")
     print("=" * 70)
-    report_memory_usage("before loading deployment training data")
+    report_memory_usage("before loading deployment training labels")
 
-    X_dep, y_dep, yr_dep, dep_pos, dep_neg = _stream_data(
+    y_dep, yr_dep, dep_pos, dep_neg, dep_records = _stream_labels(
         all_paths, feature_cols, DEPLOY_TRAIN_YEARS, "deployment_train"
     )
-    report_memory_usage("after loading deployment training data")
+    X_dep = _ParquetFeatureSequence(dep_records, all_paths, feature_cols, BATCH_SIZE)
+    report_memory_usage("after indexing deployment training data (X not in RAM)")
 
     deploy_spw = dep_neg / max(dep_pos, 1)
     deploy_model = _train_lgb(
@@ -506,12 +701,21 @@ def main() -> None:
         scale_pos_weight_override=deploy_spw,
     )
     report_memory_usage("after training deployment model")
+    wb.log(
+        {
+            "deployment/deploy_n_pos": float(dep_pos),
+            "deployment/deploy_n_neg": float(dep_neg),
+            "deployment/scale_pos_weight": float(deploy_spw),
+            "deployment/stage": "train_done",
+        }
+    )
 
     # ── Step 2: Fit calibrators via auxiliary model ───────────────────────────
     platt_cal, iso_cal = fit_deployment_calibrators(
         all_paths, feature_cols, best_params, num_boost_round
     )
     report_memory_usage("after fitting calibrators")
+    wb.log({"deployment/stage": "calibration_done"})
 
     # ── Step 3: Save model + calibrators ─────────────────────────────────────
     artifact = {
@@ -541,22 +745,17 @@ def main() -> None:
     print(f"\nSaved deployment artifact: {model_path}")
 
     meta = artifact["metadata"]
-    wandb_log_one_shot(
-        project="forward",
-        run_name=f"deploy_lgbm_usa_{timestamp}",
-        config={
-            "region": "usa",
-            "model_type": "lgbm",
-            "forward_stage": "deployment",
-        },
-        metrics={
+    wb.log(
+        {
             "deployment/deploy_n_pos": float(dep_pos),
             "deployment/deploy_n_neg": float(dep_neg),
             "deployment/scale_pos_weight": float(deploy_spw),
             "deployment/n_features": float(len(feature_cols)),
             "deployment/total_time_s": float(meta["total_time_s"]),
-        },
+            "deployment/stage": "done",
+        }
     )
+    wb.finish()
 
     elapsed = time.time() - start
     print("\n" + "=" * 70)

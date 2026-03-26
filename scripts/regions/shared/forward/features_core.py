@@ -37,7 +37,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from scripts.regions.shared.forward.config import DATA_SUBDIR, OUTPUTS_SUBDIR, get_repo_root  # noqa: E402
-from scripts.regions.shared.training.utils import wandb_log_one_shot  # noqa: E402
+from scripts.regions.shared.training.utils import WandbRunLogger  # noqa: E402
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 INFERENCE_YEAR = 2024
@@ -74,7 +74,9 @@ def resolve_panel(data_subdir: str) -> Path:
     )
 
 
-def extract_2024_features(panel_path: Path, output_dir: Path) -> tuple[Path, int, int, str]:
+def extract_2024_features(
+    panel_path: Path, output_dir: Path, wb: WandbRunLogger | None = None
+) -> tuple[Path, int, int, str]:
     print("\n" + "=" * 70)
     print(f"EXTRACTING 2024 INFERENCE FEATURES (year={INFERENCE_YEAR})")
     print("=" * 70)
@@ -94,6 +96,8 @@ def extract_2024_features(panel_path: Path, output_dir: Path) -> tuple[Path, int
     ]
     feature_cols = [c for c in all_numeric if c not in EXCLUDE_COLS]
     print(f"\n  Feature columns:  {len(feature_cols)}")
+    if wb is not None:
+        wb.log({"features/n_feature_cols": len(feature_cols), "features/stage": "schema"})
 
     # Metadata columns to preserve
     meta_cols = ["row", "col"]
@@ -124,6 +128,8 @@ def extract_2024_features(panel_path: Path, output_dir: Path) -> tuple[Path, int
         gc.collect()
 
     print(f"  Found {n_total:,} qualifying pixels")
+    if wb is not None:
+        wb.log({"features/n_rows_target": n_total, "features/stage": "pass1_done"})
     if n_total == 0:
         raise ValueError(
             f"No pixels found for year={INFERENCE_YEAR} with WDPA_prev==0 AND WDPA==0. "
@@ -169,6 +175,13 @@ def extract_2024_features(panel_path: Path, output_dir: Path) -> tuple[Path, int
             if ms > _mile:
                 _mile = ms
                 print(f"  {pct}% — {n_written:,}/{n_total:,}")
+                if wb is not None:
+                    wb.log(
+                        {
+                            "features/progress_pct": int(pct),
+                            "features/n_rows_written": int(n_written),
+                        }
+                    )
 
             del batch, yr, wp, wdpa, mask, out_arrays, out_table
     finally:
@@ -193,23 +206,30 @@ def main() -> None:
     # Re-import config after runner.py reload
     from scripts.regions.shared.forward.config import DATA_SUBDIR, OUTPUTS_SUBDIR  # noqa: F401
 
-    repo_root = get_repo_root()
-    panel_path = resolve_panel(DATA_SUBDIR)
-    output_dir = repo_root / f"outputs/{OUTPUTS_SUBDIR}/results/forward"
-    out_path, n_rows, n_feat, panel_s = extract_2024_features(panel_path, output_dir)
-    print(f"\nDone. Output: {out_path}")
     _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
-    wandb_log_one_shot(
+    wb = WandbRunLogger(
         project="forward",
         run_name=f"features_{OUTPUTS_SUBDIR}_{_ts}",
         config={"region": OUTPUTS_SUBDIR, "forward_stage": "features"},
-        metrics={
+    )
+    wb.start()
+    wb.log({"features/stage": "start"})
+
+    repo_root = get_repo_root()
+    panel_path = resolve_panel(DATA_SUBDIR)
+    output_dir = repo_root / f"outputs/{OUTPUTS_SUBDIR}/results/forward"
+    out_path, n_rows, n_feat, panel_s = extract_2024_features(panel_path, output_dir, wb=wb)
+    print(f"\nDone. Output: {out_path}")
+    wb.log(
+        {
             "features/n_rows": n_rows,
             "features/n_feature_cols": n_feat,
             "features/output_path": str(out_path),
             "features/panel_path": panel_s,
-        },
+            "features/stage": "done",
+        }
     )
+    wb.finish()
 
 
 if __name__ == "__main__":

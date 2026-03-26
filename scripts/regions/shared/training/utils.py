@@ -325,3 +325,59 @@ def wandb_log_one_shot(
                 wandb.finish()
             except Exception:
                 pass
+
+
+class WandbRunLogger:
+    """Best-effort W&B streaming logger for long-running scripts."""
+
+    def __init__(
+        self,
+        *,
+        project: str,
+        run_name: str,
+        config: Mapping[str, Any],
+    ) -> None:
+        self.project = project
+        self.run_name = run_name
+        self.config = dict(config)
+        self._wandb = None
+        self._started = False
+
+    def start(self) -> None:
+        try:
+            import wandb
+        except ImportError:
+            print("W&B not available (module not installed)")
+            return
+        try:
+            wandb.init(
+                project=self.project,
+                entity=os.environ.get("WANDB_ENTITY"),
+                name=self.run_name,
+                config=self.config,
+            )
+            self._wandb = wandb
+            self._started = True
+            run_url = getattr(wandb.run, "url", None)
+            print(f"W&B connected — run: {run_url or '(URL not available)'}")
+        except Exception as err:
+            print(f"W&B failed: {err}")
+            self._wandb = None
+            self._started = False
+
+    def log(self, metrics: Mapping[str, Any]) -> None:
+        if not self._started or self._wandb is None:
+            return
+        try:
+            safe_metrics = convert_numpy_types(dict(metrics))
+            self._wandb.log(safe_metrics)
+        except Exception as err:
+            print(f"W&B log failed: {err}")
+
+    def finish(self) -> None:
+        if not self._started or self._wandb is None:
+            return
+        try:
+            self._wandb.finish()
+        except Exception:
+            pass

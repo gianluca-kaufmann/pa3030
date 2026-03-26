@@ -42,9 +42,9 @@ from scripts.regions.shared.forward.config import (  # noqa: E402
     get_repo_root,
 )
 from scripts.regions.shared.training.utils import (  # noqa: E402
+    WandbRunLogger,
     get_repo_root as _get_repo_root,
     report_memory_usage,
-    wandb_log_one_shot,
 )
 
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "500_000"))
@@ -136,6 +136,7 @@ def run_inference(
     artifact_path: Path,
     output_dir: Path,
     model_type: str,
+    wb: WandbRunLogger | None = None,
 ) -> Path:
     print("\n" + "=" * 70)
     print(f"FORWARD INFERENCE — 2024 ({model_type.upper()})")
@@ -143,6 +144,8 @@ def run_inference(
     print(f"  Features:   {features_path}")
     print(f"  Artifact:   {artifact_path}")
     print(f"  Model type: {model_type}")
+    if wb is not None:
+        wb.log({"inference/stage": "start"})
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Load deployment artifact ───────────────────────────────────────────────
@@ -185,6 +188,8 @@ def run_inference(
     finally:
         del pf
     print(f"  {n_total:,} inference pixels")
+    if wb is not None:
+        wb.log({"inference/n_pixels_target": int(n_total), "inference/stage": "pass1_done"})
 
     # ── Pass 2: batch inference + write ───────────────────────────────────────
     out_path = output_dir / "forward_scored_2024.parquet"
@@ -226,6 +231,13 @@ def run_inference(
                 _mile = ms
                 print(f"  {pct}% — {n_written:,}/{n_total:,}")
                 report_memory_usage(f"  {pct}%")
+                if wb is not None:
+                    wb.log(
+                        {
+                            "inference/progress_pct": int(pct),
+                            "inference/n_pixels_written": int(n_written),
+                        }
+                    )
 
             del batch, X_batch, raw_proba, cal_proba, out_dict, out_table
             gc.collect()
@@ -256,6 +268,19 @@ def main() -> None:
     from scripts.regions.shared.forward.config import DATA_SUBDIR, MODEL_PREFIX, OUTPUTS_SUBDIR  # noqa: F401
 
     model_type = os.environ.get("PA3030_FORWARD_MODEL_TYPE", "lgbm").strip().lower()
+    from datetime import datetime as _dt
+
+    _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
+    wb = WandbRunLogger(
+        project="forward",
+        run_name=f"predict_{OUTPUTS_SUBDIR}_{model_type}_{_ts}",
+        config={
+            "region": OUTPUTS_SUBDIR,
+            "model_type": model_type,
+            "forward_stage": "inference",
+        },
+    )
+    wb.start()
 
     repo_root   = get_repo_root()
     model_dir   = resolve_model_dir(DATA_SUBDIR, repo_root)
@@ -264,33 +289,24 @@ def main() -> None:
 
     artifact_path  = resolve_deployment_artifact(model_dir, MODEL_PREFIX, model_type)
     features_path  = resolve_features_parquet(forward_dir)
-    out = run_inference(features_path, artifact_path, output_dir, model_type)
+    out = run_inference(features_path, artifact_path, output_dir, model_type, wb=wb)
     print(f"\nDone. Output: {out}")
-
-    from datetime import datetime as _dt
-
-    _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
     _stats = pq.read_table(out, columns=["y_pred_proba_calibrated"])
     _arr = _stats.column("y_pred_proba_calibrated").to_numpy(zero_copy_only=False)
-    wandb_log_one_shot(
-        project="forward",
-        run_name=f"predict_{OUTPUTS_SUBDIR}_{model_type}_{_ts}",
-        config={
-            "region": OUTPUTS_SUBDIR,
-            "model_type": model_type,
-            "forward_stage": "inference",
-        },
-        metrics={
-            "inference/n_pixels":  int(len(_arr)),
-            "inference/prob_min":  float(_arr.min()),
-            "inference/prob_p50":  float(np.median(_arr)),
-            "inference/prob_p95":  float(np.percentile(_arr, 95)),
-            "inference/prob_p99":  float(np.percentile(_arr, 99)),
-            "inference/prob_max":  float(_arr.max()),
+    wb.log(
+        {
+            "inference/n_pixels": int(len(_arr)),
+            "inference/prob_min": float(_arr.min()),
+            "inference/prob_p50": float(np.median(_arr)),
+            "inference/prob_p95": float(np.percentile(_arr, 95)),
+            "inference/prob_p99": float(np.percentile(_arr, 99)),
+            "inference/prob_max": float(_arr.max()),
             "inference/prob_mean": float(_arr.mean()),
-        },
+            "inference/stage": "done",
+        }
     )
     del _arr, _stats
+    wb.finish()
 
 
 if __name__ == "__main__":
