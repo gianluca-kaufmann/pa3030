@@ -49,7 +49,6 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 export WANDB_MODE="${WANDB_MODE:-online}"
-export MAX_NEG_TRAIN=50000000
 
 #------------------------------------------------------------------------------
 # Preflight checks

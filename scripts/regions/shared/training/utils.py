@@ -307,8 +307,16 @@ def wandb_log_one_shot(
             config=dict(config),
         )
         started = True
+        run_url = getattr(wandb.run, "url", None)
+        print(f"W&B connected — run: {run_url or '(URL not available)'}")
         wandb.log(dict(metrics))
-        print("W&B connected")
+        summary_parts = ", ".join(
+            f"{k.split('/')[-1]}={v:.4g}" if isinstance(v, float) else f"{k.split('/')[-1]}={v}"
+            for k, v in metrics.items()
+            if v is not None
+        )
+        if summary_parts:
+            print(f"W&B logged: {summary_parts}")
     except Exception as err:
         print(f"W&B failed: {err}")
     finally:

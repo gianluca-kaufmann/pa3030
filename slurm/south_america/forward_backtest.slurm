@@ -46,13 +46,8 @@ echo "Backtest task ${TASK_ID}: origin year T=${ORIGIN_YEAR}"
 mkdir -p "$SCRATCH/logs"
 mkdir -p "$SCRATCH/outputs/south_america/results/forward"
 
-# Backtest-specific caps: much lower than production — ranking metrics (ROC-AUC,
-# Precision@K, Lift@K) converge well below 100M negatives; scale_pos_weight handles
-# class imbalance. Reduces training time ~5x vs production cap.
-export MAX_NEG_TRAIN=20000000
 # Tree count kept at production value (2555) for methodological consistency:
 # the backtest simulates running the exact same pipeline at time T.
-# The 5x speedup from MAX_NEG_TRAIN alone is sufficient to meet the time limit.
 
 #------------------------------------------------------------------------------
 # Load modules

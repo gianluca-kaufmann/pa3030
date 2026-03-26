@@ -48,9 +48,6 @@ echo "USA RF backtest task ${TASK_ID}: origin year T=${ORIGIN_YEAR}"
 mkdir -p "$SCRATCH/logs"
 mkdir -p "$SCRATCH/outputs/usa/results/forward/rf"
 
-# Backtest-specific caps: much lower than production — ranking metrics converge
-# well below 50M negatives. Reduces training time ~5x vs production cap.
-export MAX_NEG_TRAIN=10000000
 # Tree count kept at production value (500) for methodological consistency:
 # the backtest simulates running the exact same pipeline at time T.
 

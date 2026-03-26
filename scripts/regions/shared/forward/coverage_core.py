@@ -144,17 +144,22 @@ def compute_coverage_baseline(
         print(f"  Shape: {src_wdpa.height} × {src_wdpa.width}")
         wdpa_data = src_wdpa.read(1)
 
-    # Protected = WDPA 2024 == 1 AND backbone == 1 (land pixels only)
+    # Protected = WDPA 2024 == 1 AND backbone == 1 (land pixels only).
+    # When raster shapes differ, clip both to the common (h_clip, w_clip) and keep
+    # valid_mask_clip aligned so all subsequent masks share the same dimensions.
     if wdpa_data.shape == valid_mask.shape:
+        h_clip, w_clip = valid_mask.shape
+        valid_mask_clip = valid_mask
         protected_mask = valid_mask & (wdpa_data == 1)
     else:
         print(
             f"  WARNING: WDPA shape {wdpa_data.shape} != backbone shape {valid_mask.shape}. "
             "Clipping to minimum common shape."
         )
-        h = min(valid_mask.shape[0], wdpa_data.shape[0])
-        w = min(valid_mask.shape[1], wdpa_data.shape[1])
-        protected_mask = valid_mask[:h, :w] & (wdpa_data[:h, :w] == 1)
+        h_clip = min(valid_mask.shape[0], wdpa_data.shape[0])
+        w_clip = min(valid_mask.shape[1], wdpa_data.shape[1])
+        valid_mask_clip = valid_mask[:h_clip, :w_clip]
+        protected_mask = valid_mask_clip & (wdpa_data[:h_clip, :w_clip] == 1)
 
     prot_rows, prot_cols = np.where(protected_mask)
     protected_pixels = int(len(prot_rows))
@@ -218,19 +223,19 @@ def compute_coverage_baseline(
             region_world = world_gdf[world_gdf["iso_a3"].isin(iso_codes)].copy()
             region_world = region_world.to_crs("EPSG:3857")
 
-            H, W = valid_mask.shape
+            # Use the clipped shape so all masks are broadcastable with protected_mask.
             for _, row in region_world.iterrows():
                 iso = row["iso_a3"]
                 country_name = row["name"]
                 c_mask = rio_rasterize(
                     [(row.geometry, 1)],
-                    out_shape=(H, W),
+                    out_shape=(h_clip, w_clip),
                     transform=transform,
                     fill=0,
                     dtype=np.uint8,
                 ).astype(bool)
 
-                land_rows, _ = np.where(valid_mask & c_mask)
+                land_rows, _ = np.where(valid_mask_clip & c_mask)
                 y_land = transform.f + (land_rows + 0.5) * transform.e
                 total_c_km2 = float(pixel_area_km2(y_land, pixel_size_m=PIXEL_SIZE_M).sum()) if len(land_rows) else 0.0
 

@@ -152,14 +152,10 @@ def resolve_gsn_raster(repo_root: Path, data_subdir: str) -> Optional[Path]:
 
 
 def resolve_country_shapefile() -> Optional[Any]:
-    """Load world country boundaries via geopandas naturalearth."""
+    """Load world country boundaries, compatible with GeoPandas ≥ 1.0."""
     try:
-        import geopandas as gpd
-        import warnings
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            world = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres"))
-        return world
+        from scripts.regions.shared.forward.coverage_core import _load_naturalearth_lowres
+        return _load_naturalearth_lowres()
     except Exception:
         return None
 
@@ -1124,6 +1120,20 @@ def main() -> None:
 
     df = load_scored(scored_path)
     df = add_area_col(df, pixel_size_m)
+
+    # Join GSN_b1 from features parquet (not present in scored output)
+    if "GSN_b1" not in df.columns:
+        feat_path = forward_dir / "forward_features_2024.parquet"
+        if feat_path.exists():
+            try:
+                feat_gsn = pd.read_parquet(feat_path, columns=["row", "col", "GSN_b1"])
+                df = df.merge(feat_gsn, on=["row", "col"], how="left")
+                print(f"  Joined GSN_b1 from features parquet ({feat_path.name}): "
+                      f"{df['GSN_b1'].notna().sum():,} non-null values")
+            except Exception as _e:
+                print(f"  WARNING: Could not join GSN_b1 from features parquet: {_e}")
+        else:
+            print(f"  NOTE: features parquet not found at {feat_path} — gap analysis will use placeholder")
 
     total_km2 = baseline.get("total_land_km2") or baseline.get("total_sa_km2", 1.0)
     print(f"\n  Total unprotected 2024 pixels: {len(df):,}")
