@@ -310,7 +310,8 @@ class _ParquetFeatureSequence(getattr(lgb, "Sequence", object)):
 
         feat_tbl = batch.select(self._feature_cols)
         mask = _unpack_mask(rec.mask_bits, rec.mask_len)
-        X_rec = extract_features_pyarrow_to_numpy(feat_tbl, mask).astype(np.float32, copy=False)
+        # LightGBM's Sequence path expects float64 ("double") arrays during sampling / init.
+        X_rec = extract_features_pyarrow_to_numpy(feat_tbl, mask).astype(np.float64, copy=False)
 
         self._cache_rec_idx = rec_idx
         self._cache_X = X_rec
@@ -333,10 +334,10 @@ class _ParquetFeatureSequence(getattr(lgb, "Sequence", object)):
             start = max(0, start)
             stop = min(self._n_rows, stop)
             if stop <= start:
-                return np.empty((0, self._n_cols), dtype=np.float32)
+                return np.empty((0, self._n_cols), dtype=np.float64)
 
             out_n = stop - start
-            out = np.empty((out_n, self._n_cols), dtype=np.float32)
+            out = np.empty((out_n, self._n_cols), dtype=np.float64)
 
             # Identify record blocks overlapping [start, stop).
             rec_start = bisect.bisect_right(self._row_starts, start) - 1
