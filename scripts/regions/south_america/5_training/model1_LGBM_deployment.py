@@ -36,6 +36,7 @@ Outputs:
 from __future__ import annotations
 
 import argparse
+import bisect
 import gc
 import json
 import os
@@ -239,17 +240,15 @@ def _unpack_mask(mask_bits: np.ndarray, mask_len: int) -> np.ndarray:
     return np.unpackbits(mask_bits, bitorder="little", count=mask_len).astype(np.bool_)
 
 
-class _ParquetFeatureSequence:
-    """LightGBM Sequence: re-reads filtered feature batches from Parquet on demand.
+class _ParquetFeatureSequence(getattr(lgb, "Sequence", object)):
+    """LightGBM Sequence: lazily re-reads filtered feature rows from Parquet.
 
-    Implements the LightGBM Sequence protocol (__len__ + __getitem__) so that
-    lgb.Dataset constructs its histogram representation one batch at a time,
-    never materialising the full feature matrix in RAM.
+    LightGBM's `lgb.Sequence` interface is *row-based*:
+    - `len(seq)` = number of rows
+    - `seq[start:stop]` = dense feature matrix for rows `[start, stop)`
 
-    Design: LightGBM calls __getitem__(0), __getitem__(1), … in order during
-    Dataset.construct().  We maintain a persistent Parquet iterator per file
-    so each batch is an O(1) disk read (no rewinding for sequential access).
-    Out-of-order or repeated access causes a file rewind, which is safe but slow.
+    We implement this contract while still reading features lazily in Parquet
+    chunks, so Dataset construction never materialises the full feature matrix.
     """
 
     def __init__(
@@ -263,6 +262,7 @@ class _ParquetFeatureSequence:
         self._paths = paths
         self._feature_cols = feature_cols
         self._batch_size = batch_size
+        self.batch_size = int(batch_size)  # for lgb.Sequence slice chunking
 
         # Persistent iterator state (sequential-access optimisation)
         self._iter_path_idx: Optional[int] = None
@@ -270,29 +270,109 @@ class _ParquetFeatureSequence:
         self._iter_gen = None
         self._iter_pos: int = 0  # next parquet-batch index the iterator will yield
 
+        # Row indexing metadata for LightGBM's row-based Sequence protocol.
+        self._n_rows = int(sum(r.mask_true_count for r in self._records))
+        self._n_cols = len(self._feature_cols)
+        self._row_starts = np.empty(len(self._records) + 1, dtype=np.int64)
+        self._row_starts[0] = 0
+        csum = 0
+        for i, r in enumerate(self._records):
+            csum += int(r.mask_true_count)
+            self._row_starts[i + 1] = csum
+
+        # Small cache: helps when slice boundaries overlap the same record.
+        self._cache_rec_idx: Optional[int] = None
+        self._cache_X: Optional[np.ndarray] = None
+
     def __len__(self) -> int:
-        return len(self._records)
+        return self._n_rows
 
-    def __getitem__(self, idx: int) -> np.ndarray:
-        rec = self._records[idx]
+    def _get_record_features(self, rec_idx: int) -> np.ndarray:
+        """Load and filter the Parquet batch for a given record index."""
+        if self._cache_rec_idx == rec_idx and self._cache_X is not None:
+            return self._cache_X
 
-        # Reopen if we switched files or have overshot the target batch
+        rec = self._records[rec_idx]
+
+        # Reopen if we switched files or have overshot the target batch.
         if (self._iter_path_idx != rec.path_idx
                 or self._iter_pos > rec.parquet_batch_idx):
             self._open_file(rec.path_idx)
 
-        # Skip (discard) any batches before the target
+        # Skip (discard) any batches before the target.
         while self._iter_pos < rec.parquet_batch_idx:
             next(self._iter_gen)
             self._iter_pos += 1
 
-        # Read the target batch (features only)
+        # Read the target batch (features only).
         batch = next(self._iter_gen)
         self._iter_pos += 1
 
         feat_tbl = batch.select(self._feature_cols)
         mask = _unpack_mask(rec.mask_bits, rec.mask_len)
-        return extract_features_pyarrow_to_numpy(feat_tbl, mask)
+        X_rec = extract_features_pyarrow_to_numpy(feat_tbl, mask).astype(np.float32, copy=False)
+
+        self._cache_rec_idx = rec_idx
+        self._cache_X = X_rec
+        return X_rec
+
+    def __getitem__(self, idx: int | slice | List[int]) -> np.ndarray:
+        if isinstance(idx, slice):
+            start = 0 if idx.start is None else int(idx.start)
+            stop = self._n_rows if idx.stop is None else int(idx.stop)
+            step = 1 if idx.step is None else int(idx.step)
+            if step != 1:
+                raise ValueError("lgb.Sequence requires step=1 for slice access")
+
+            # Normalize negative indices.
+            if start < 0:
+                start += self._n_rows
+            if stop < 0:
+                stop += self._n_rows
+
+            start = max(0, start)
+            stop = min(self._n_rows, stop)
+            if stop <= start:
+                return np.empty((0, self._n_cols), dtype=np.float32)
+
+            out_n = stop - start
+            out = np.empty((out_n, self._n_cols), dtype=np.float32)
+
+            # Identify record blocks overlapping [start, stop).
+            rec_start = bisect.bisect_right(self._row_starts, start) - 1
+            rec_end = bisect.bisect_right(self._row_starts, stop - 1) - 1
+
+            write_pos = 0
+            for rec_idx in range(rec_start, rec_end + 1):
+                rec_lo = int(self._row_starts[rec_idx])
+                # rec_hi = int(self._row_starts[rec_idx + 1])  # unused
+                X_rec = self._get_record_features(rec_idx)
+                lo_in_rec = max(0, start - rec_lo)
+                hi_in_rec = min(X_rec.shape[0], stop - rec_lo)
+                part = X_rec[lo_in_rec:hi_in_rec]
+                k = part.shape[0]
+                if k:
+                    out[write_pos:write_pos + k] = part
+                    write_pos += k
+
+            return out
+
+        if isinstance(idx, list):
+            # Dataset.subset() may request an arbitrary set of rows.
+            return np.stack([self[int(i)] for i in idx], axis=0)
+
+        # int indexing: LightGBM uses this for random sampling.
+        row_idx = int(idx)
+        if row_idx < 0:
+            row_idx += self._n_rows
+        if row_idx < 0 or row_idx >= self._n_rows:
+            raise IndexError("Sequence index out of range")
+
+        rec_idx = bisect.bisect_right(self._row_starts, row_idx) - 1
+        rec_lo = int(self._row_starts[rec_idx])
+        local_idx = row_idx - rec_lo
+        X_rec = self._get_record_features(rec_idx)
+        return X_rec[int(local_idx)]
 
     def _open_file(self, path_idx: int) -> None:
         self._iter_pf = pq.ParquetFile(self._paths[path_idx])
@@ -308,6 +388,8 @@ class _ParquetFeatureSequence:
         """Release open file handles."""
         self._iter_pf = None
         self._iter_gen = None
+        self._cache_rec_idx = None
+        self._cache_X = None
 
     def to_numpy(self) -> np.ndarray:
         """Materialise all queued feature batches into a dense matrix.
@@ -315,14 +397,12 @@ class _ParquetFeatureSequence:
         Fallback path for LightGBM builds that do not accept custom Sequence
         inputs during Dataset initialization.
         """
-        n_rows = int(sum(r.mask_true_count for r in self._records))
-        n_cols = len(self._feature_cols)
-        X = np.empty((n_rows, n_cols), dtype=np.float32)
+        X = np.empty((self._n_rows, self._n_cols), dtype=np.float32)
         row_idx = 0
-        for i in range(len(self._records)):
-            X_b = self[i]
-            n_b = X_b.shape[0]
-            X[row_idx:row_idx + n_b] = X_b
+        for rec_idx in range(len(self._records)):
+            X_rec = self._get_record_features(rec_idx)
+            n_b = X_rec.shape[0]
+            X[row_idx:row_idx + n_b] = X_rec
             row_idx += n_b
         return X
 

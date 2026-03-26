@@ -32,6 +32,7 @@ Aggregated (after all origins complete):
 from __future__ import annotations
 
 import argparse
+import bisect
 import gc
 import json
 import os
@@ -46,6 +47,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import lightgbm as lgb
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -344,18 +346,8 @@ class _BatchRecord:
     mask: np.ndarray        # boolean row-filter (length = raw batch row count)
 
 
-class _ParquetFeatureSequence:
-    """LightGBM Sequence: re-reads filtered feature batches from Parquet on demand.
-
-    Implements the LightGBM Sequence protocol (__len__ + __getitem__) so that
-    lgb.Dataset constructs its histogram representation one batch at a time,
-    never materialising the full feature matrix in RAM.
-
-    Design: LightGBM calls __getitem__(0), __getitem__(1), … in order during
-    Dataset.construct().  We maintain a persistent Parquet iterator per file
-    so each batch is an O(1) disk read (no rewinding for sequential access).
-    Out-of-order or repeated access causes a file rewind, which is safe but slow.
-    """
+class _ParquetFeatureSequence(getattr(lgb, "Sequence", object)):
+    """LightGBM row-based `lgb.Sequence` backed by lazy Parquet reads."""
 
     def __init__(
         self,
@@ -368,17 +360,36 @@ class _ParquetFeatureSequence:
         self._paths = paths
         self._feature_cols = feature_cols
         self._batch_size = batch_size
+        self.batch_size = int(batch_size)
 
         self._iter_path_idx: Optional[int] = None
         self._iter_pf = None
         self._iter_gen = None
         self._iter_pos: int = 0
 
-    def __len__(self) -> int:
-        return len(self._records)
+        # Row indexing metadata for LightGBM's row-based Sequence protocol.
+        self._row_counts = np.array([int(r.mask.sum()) for r in self._records], dtype=np.int64)
+        self._n_rows = int(self._row_counts.sum())
+        self._n_cols = len(self._feature_cols)
+        self._row_starts = np.empty(len(self._records) + 1, dtype=np.int64)
+        self._row_starts[0] = 0
+        csum = 0
+        for i, cnt in enumerate(self._row_counts):
+            csum += int(cnt)
+            self._row_starts[i + 1] = csum
 
-    def __getitem__(self, idx: int) -> np.ndarray:
-        rec = self._records[idx]
+        self._cache_rec_idx: Optional[int] = None
+        self._cache_X: Optional[np.ndarray] = None
+
+    def __len__(self) -> int:
+        return self._n_rows
+
+    def _get_record_features(self, rec_idx: int) -> np.ndarray:
+        """Load and filter the Parquet batch for a given record index."""
+        if self._cache_rec_idx == rec_idx and self._cache_X is not None:
+            return self._cache_X
+
+        rec = self._records[rec_idx]
 
         if (self._iter_path_idx != rec.path_idx
                 or self._iter_pos > rec.parquet_batch_idx):
@@ -392,7 +403,63 @@ class _ParquetFeatureSequence:
         self._iter_pos += 1
 
         feat_tbl = batch.select(self._feature_cols)
-        return extract_features_pyarrow_to_numpy(feat_tbl, rec.mask)
+        X_rec = extract_features_pyarrow_to_numpy(feat_tbl, rec.mask).astype(np.float32, copy=False)
+        self._cache_rec_idx = rec_idx
+        self._cache_X = X_rec
+        return X_rec
+
+    def __getitem__(self, idx: int | slice | List[int]) -> np.ndarray:
+        if isinstance(idx, slice):
+            start = 0 if idx.start is None else int(idx.start)
+            stop = self._n_rows if idx.stop is None else int(idx.stop)
+            step = 1 if idx.step is None else int(idx.step)
+            if step != 1:
+                raise ValueError("lgb.Sequence requires step=1 for slice access")
+
+            if start < 0:
+                start += self._n_rows
+            if stop < 0:
+                stop += self._n_rows
+
+            start = max(0, start)
+            stop = min(self._n_rows, stop)
+            if stop <= start:
+                return np.empty((0, self._n_cols), dtype=np.float32)
+
+            out = np.empty((stop - start, self._n_cols), dtype=np.float32)
+
+            rec_start = bisect.bisect_right(self._row_starts, start) - 1
+            rec_end = bisect.bisect_right(self._row_starts, stop - 1) - 1
+
+            write_pos = 0
+            for rec_idx in range(rec_start, rec_end + 1):
+                rec_lo = int(self._row_starts[rec_idx])
+                X_rec = self._get_record_features(rec_idx)
+                lo_in_rec = max(0, start - rec_lo)
+                hi_in_rec = min(X_rec.shape[0], stop - rec_lo)
+                part = X_rec[lo_in_rec:hi_in_rec]
+                k = part.shape[0]
+                if k:
+                    out[write_pos:write_pos + k] = part
+                    write_pos += k
+
+            return out
+
+        if isinstance(idx, list):
+            # Dataset.subset() may request an arbitrary set of rows.
+            return np.stack([self[int(i)] for i in idx], axis=0)
+
+        row_idx = int(idx)
+        if row_idx < 0:
+            row_idx += self._n_rows
+        if row_idx < 0 or row_idx >= self._n_rows:
+            raise IndexError("Sequence index out of range")
+
+        rec_idx = bisect.bisect_right(self._row_starts, row_idx) - 1
+        rec_lo = int(self._row_starts[rec_idx])
+        local_idx = row_idx - rec_lo
+        X_rec = self._get_record_features(rec_idx)
+        return X_rec[int(local_idx)]
 
     def _open_file(self, path_idx: int) -> None:
         self._iter_pf = pq.ParquetFile(self._paths[path_idx])
@@ -408,6 +475,8 @@ class _ParquetFeatureSequence:
         """Release open file handles."""
         self._iter_pf = None
         self._iter_gen = None
+        self._cache_rec_idx = None
+        self._cache_X = None
 
 
 # ── Data loaders ──────────────────────────────────────────────────────────────
