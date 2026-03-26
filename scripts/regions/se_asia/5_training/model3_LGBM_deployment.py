@@ -225,7 +225,21 @@ class _BatchRecord:
     """Per-batch metadata collected during the label-loading pass."""
     path_idx: int           # index into the paths list
     parquet_batch_idx: int  # sequential batch number within that Parquet file
-    mask: np.ndarray        # boolean row-filter (length = raw batch row count)
+    mask_bits: np.ndarray   # bit-packed boolean row-filter (uint8)
+    mask_len: int           # original (unpacked) boolean mask length
+    mask_true_count: int    # number of selected rows in mask
+
+
+def _pack_mask(mask: np.ndarray) -> tuple[np.ndarray, int, int]:
+    """Bit-pack a boolean mask to reduce RAM by ~8x."""
+    mask_bool = np.asarray(mask, dtype=np.bool_)
+    packed = np.packbits(mask_bool, bitorder="little")
+    return packed, int(mask_bool.size), int(mask_bool.sum())
+
+
+def _unpack_mask(mask_bits: np.ndarray, mask_len: int) -> np.ndarray:
+    """Restore boolean mask from packed representation."""
+    return np.unpackbits(mask_bits, bitorder="little", count=mask_len).astype(np.bool_)
 
 
 class _ParquetFeatureSequence:
@@ -276,7 +290,8 @@ class _ParquetFeatureSequence:
         self._iter_pos += 1
 
         feat_tbl = batch.select(self._feature_cols)
-        return extract_features_pyarrow_to_numpy(feat_tbl, rec.mask)
+        mask = _unpack_mask(rec.mask_bits, rec.mask_len)
+        return extract_features_pyarrow_to_numpy(feat_tbl, mask)
 
     def _open_file(self, path_idx: int) -> None:
         self._iter_pf = pq.ParquetFile(self._paths[path_idx])
@@ -508,10 +523,13 @@ def _stream_labels(
                     n_b = int(mask.sum())
                     y[row_idx:row_idx + n_b] = (tgt[mask] > 0).astype(np.int8)
                     years_arr[row_idx:row_idx + n_b] = yr[mask].astype(np.int32)
+                    mask_bits, mask_len, mask_true_count = _pack_mask(mask)
                     batch_records.append(_BatchRecord(
                         path_idx=path_idx,
                         parquet_batch_idx=parquet_batch_idx,
-                        mask=mask,
+                        mask_bits=mask_bits,
+                        mask_len=mask_len,
+                        mask_true_count=mask_true_count,
                     ))
                     row_idx += n_b
 
