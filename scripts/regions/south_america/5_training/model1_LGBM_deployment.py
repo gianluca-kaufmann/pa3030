@@ -293,6 +293,23 @@ class _ParquetFeatureSequence:
         self._iter_pf = None
         self._iter_gen = None
 
+    def to_numpy(self) -> np.ndarray:
+        """Materialise all queued feature batches into a dense matrix.
+
+        Fallback path for LightGBM builds that do not accept custom Sequence
+        inputs during Dataset initialization.
+        """
+        n_rows = int(sum(int(r.mask.sum()) for r in self._records))
+        n_cols = len(self._feature_cols)
+        X = np.empty((n_rows, n_cols), dtype=np.float32)
+        row_idx = 0
+        for i in range(len(self._records)):
+            X_b = self[i]
+            n_b = X_b.shape[0]
+            X[row_idx:row_idx + n_b] = X_b
+            row_idx += n_b
+        return X
+
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
@@ -558,10 +575,22 @@ def _train_lgb(
     for k in sorted(train_params):
         print(f"    {k}: {train_params[k]}")
 
-    ds = lgb.Dataset(X, label=y, weight=weights, free_raw_data=True)
-    # Close Sequence file handles before LightGBM takes over (it will re-open them)
-    if hasattr(X, "close"):
-        X.close()
+    try:
+        ds = lgb.Dataset(X, label=y, weight=weights, free_raw_data=True)
+        # Force construction now so Sequence incompatibility is handled early.
+        ds.construct()
+    except TypeError as e:
+        if isinstance(X, _ParquetFeatureSequence) and "_ParquetFeatureSequence" in str(e):
+            print("  LightGBM rejected Sequence input on this environment; falling back to dense NumPy matrix.")
+            X = X.to_numpy()
+            ds = lgb.Dataset(X, label=y, weight=weights, free_raw_data=True)
+            ds.construct()
+        else:
+            raise
+    finally:
+        # Close Sequence file handles once Dataset input has been prepared.
+        if hasattr(X, "close"):
+            X.close()
     del X, y, years_arr, weights
     gc.collect()
 
