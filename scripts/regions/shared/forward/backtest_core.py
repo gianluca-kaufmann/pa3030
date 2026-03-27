@@ -2,25 +2,32 @@
 """Stage 0c: Pseudo-forecast backtesting.
 
 Validates the forward prediction methodology by simulating the analysis at
-four historical time points: T ∈ {2013, 2015, 2017, 2019}.
+one historical time point: T=2019.
 
-For each origin year T:
-  1. Train a historical deployment model on 2001–(T-1) with locked hyperparams.
-  2. Score year-T feature rows for WDPA_prev==0 AND WDPA==0 pixels from
+For origin year T=2019:
+  1. Train a historical deployment model on 2001–2014 with locked hyperparams.
+     (Training cutoff = T − LOOKAHEAD_YEARS = 2019 − 5 = 2014, mirroring the
+     real deployment: last training year has a complete 5-yr lookahead window.)
+  2. Score year-2019 feature rows for WDPA_prev==0 AND WDPA==0 pixels from
      merged_panel_final.parquet.
-  3. Reconstruct 5-year window actuals from the WDPA column (years T+1…T+5)
+  3. Reconstruct 5-year window actuals from the WDPA column (years 2020–2024)
      — NOT from transition_01_win5 (which may be absent or unreliable).
   4. Evaluate: Precision@1/5/10%, Lift@1/5/10%, Forecast Capture Rate.
+
+Methodological alignment with the real deployment (5-year gap in both cases):
+  Real forward:    train 2001–2019, score 2024, predict 2025–2029  (gap: 5 yrs)
+  Backtest T=2019: train 2001–2014, score 2019, eval    2020–2024  (gap: 5 yrs)
+
+Note on LAST_LABEL_YEAR vs WDPA_LAST_YEAR:
+  LAST_LABEL_YEAR=2019 is a *training* right-censoring boundary — it prevents
+  model training from using labels whose 5-year lookahead window extends beyond
+  the available WDPA data. It does NOT limit what can be evaluated in the
+  backtest. For evaluation, the correct bound is WDPA_LAST_YEAR=2024.
 
 Model-type support:
   lgbm  — trains lgb.Booster with locked hyperparams; temporal weighting applied.
   rf    — trains RandomForestClassifier with class_weight="balanced_subsample";
           NO temporal weighting (consistent with existing RF training scripts).
-
-Right-censoring:
-  Pixels where T+5 > LAST_LABEL_YEAR (2019) are excluded from quantitative
-  evaluation.  T=2013 and T=2015 have clean 5-year windows.  T=2017 is
-  partial (only 2 years observable).  T=2019 is a consistency check only.
 
 Outputs (per origin T):
   outputs/{region}/results/forward/{model_type}/forward_backtest_T{T}.json
@@ -183,7 +190,7 @@ def create_false_positive_map(
     print(f"  Saved: {stem}.pdf")
 
 
-ORIGIN_YEARS = [2013, 2015, 2017, 2019]
+ORIGIN_YEARS = [2019]
 # Tree counts can be overridden via env vars (set lower in SLURM scripts for faster backtests).
 # Defaults preserve backward-compatible behaviour; SLURM scripts set optimised values.
 N_ESTIMATORS_LOCKED_LGBM = int(os.environ.get("N_EST_BACKTEST_LGBM", "2555"))
@@ -708,7 +715,7 @@ def load_inference_rows_and_wdpa(
     """Load year-T pixels (WDPA_prev==0, WDPA==0) + WDPA values for T+1…T+5."""
     T = origin_year
     window_years = list(range(T + 1, T + LOOKAHEAD_YEARS + 1))
-    is_evaluable_flag = (T + LOOKAHEAD_YEARS) <= LAST_LABEL_YEAR
+    is_evaluable_flag = (T + LOOKAHEAD_YEARS) <= WDPA_LAST_YEAR
 
     cols_inf = feature_cols + ["year", "WDPA_prev", "WDPA", "row", "col"]
     schema_cols = set(pq.ParquetFile(panel_path).schema_arrow.names)
@@ -755,7 +762,7 @@ def load_inference_rows_and_wdpa(
     pixel_idx = {(int(r), int(c)): i for i, (r, c) in enumerate(zip(rows_arr, cols_arr))}
     label_5yr = np.zeros(n_inf, dtype=np.int8)
 
-    years_to_check = [yr for yr in window_years if yr <= LAST_LABEL_YEAR]
+    years_to_check = [yr for yr in window_years if yr <= WDPA_LAST_YEAR]
     if years_to_check:
         print(f"  Reconstructing 5-year labels from years {years_to_check[0]}–{years_to_check[-1]}…")
         pf2 = pq.ParquetFile(panel_path)
@@ -783,7 +790,7 @@ def load_inference_rows_and_wdpa(
     if not is_evaluable_flag:
         evaluable_years = len(years_to_check)
         print(f"  NOTE: T={T} has only {evaluable_years}/{LOOKAHEAD_YEARS} years observable "
-              f"(T+5={T+LOOKAHEAD_YEARS} > LAST_LABEL_YEAR={LAST_LABEL_YEAR})")
+              f"(T+5={T+LOOKAHEAD_YEARS} > WDPA_LAST_YEAR={WDPA_LAST_YEAR})")
         evaluable[:] = (evaluable_years > 0)
 
     row_col = np.stack([rows_arr, cols_arr], axis=1)
@@ -972,12 +979,12 @@ def run_single_origin(
     wb: WandbRunLogger | None = None,
 ) -> Dict[str, Any]:
     T = origin_year
-    train_range = (2001, T - 1)
-    clean_window = (T + LOOKAHEAD_YEARS) <= LAST_LABEL_YEAR
+    train_range = (2001, T - LOOKAHEAD_YEARS)  # mirrors deployment: train ends at T-5
+    clean_window = (T + LOOKAHEAD_YEARS) <= WDPA_LAST_YEAR
 
     print("\n" + "=" * 70)
     print(f"BACKTEST [{model_type.upper()}]: origin year T={T}  "
-          f"(train 2001–{T-1}, eval {T+1}–{min(T+5, LAST_LABEL_YEAR)})")
+          f"(train 2001–{T-LOOKAHEAD_YEARS}, eval {T+1}–{min(T+5, WDPA_LAST_YEAR)})")
     print(f"  Clean 5-year window: {clean_window}")
     print("=" * 70)
     report_memory_usage(f"start T={T}")

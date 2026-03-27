@@ -205,7 +205,7 @@ def compute_scenario_cutoffs(
     moderate_target_pct: float,
     km2_needed_30: float,
     bau_km2: Optional[float] = None,
-) -> Tuple[float, float, float]:
+) -> Tuple[float, float, float, str]:
     """Compute BAU / moderate / 30x30 probability cutoffs.
 
     Returns (bau_cutoff, moderate_cutoff, full_30x30_cutoff) as probability
@@ -236,17 +236,19 @@ def compute_scenario_cutoffs(
     # otherwise fall back to top 0.5% of unprotected pixels as a proxy.
     if bau_km2 is not None and bau_km2 > 0:
         bau_cutoff = _cutoff(bau_km2, "BAU (historical 2019→2024 volume)")
+        bau_subtitle = f"Historical 2019→2024 designation volume ({bau_km2:,.0f} km²)"
     else:
         n_bau = max(1, int(len(df_sorted) * 0.005))
         bau_cutoff = float(df_sorted[PROBA_COL].iloc[n_bau - 1])
         bau_km2_actual = float(cum_area[n_bau - 1])
         print(f"  BAU (top 0.5% proxy — WDPA_2019 not available): "
               f"{n_bau:,} pixels ({bau_km2_actual:,.0f} km²), cutoff p={bau_cutoff:.6f}")
+        bau_subtitle = f"Top 0.5% highest-risk pixels (proxy — WDPA 2019 unavailable)"
 
     moderate_cutoff = _cutoff(km2_needed_moderate, f"Moderate (→{moderate_target_pct:.1%})")
     full_cutoff     = _cutoff(km2_needed_30,       "30x30 Full    (→30%)")
 
-    return bau_cutoff, moderate_cutoff, full_cutoff
+    return bau_cutoff, moderate_cutoff, full_cutoff, bau_subtitle
 
 
 # ── Rasterization helper ──────────────────────────────────────────────────────
@@ -452,6 +454,7 @@ def create_scenario_maps(
     y_limits: Tuple[float, float],
     iso_codes: List[str],
     region_label: str,
+    bau_subtitle: str = "BAU designation volume",
 ) -> Dict[str, Any]:
     print("\n" + "=" * 70)
     print("CREATING SCENARIO MAPS")
@@ -470,7 +473,7 @@ def create_scenario_maps(
     scenarios = [
         (proba >= bau_cutoff, "bau",
          f"BAU Forecast — Projected Designations (2025–2030) — {region_label}",
-         "Top 0.5% unprotected pixels by predicted probability",
+         bau_subtitle,
          SCENARIO_COLORS["bau"], "forward_risk_map_bau"),
         (proba >= moderate_cutoff, "moderate",
          f"Moderate Scenario (→{moderate_pct_str} {region_label} coverage)",
@@ -732,7 +735,7 @@ def create_gap_analysis(
     gsn_mask_for_fig = df["GSN_b1"].values.astype(bool) if has_gsn else np.zeros(len(df), dtype=bool)
 
     panel_defs = [
-        (bau_mask, "BAU Projected Designations\n(top 0.5% unprotected, 2025–2030)",
+        (bau_mask, "BAU Projected Designations\n(2025–2030)",
          SCENARIO_COLORS["bau"]),
         (gsn_mask_for_fig,
          "Biodiversity Priority (GSN_b1==1)\nHigh-priority unprotected pixels",
@@ -1161,7 +1164,7 @@ def main() -> None:
     # Fall back to the legacy 25% key if re-running against an old baseline JSON.
     km2_moderate = baseline.get("km2_needed_for_moderate") or baseline.get("km2_needed_for_25pct", 0.0)
     moderate_pct = baseline.get("moderate_target_pct", 0.25)
-    bau_cutoff, moderate_cutoff, full_cutoff = compute_scenario_cutoffs(
+    bau_cutoff, moderate_cutoff, full_cutoff, bau_subtitle = compute_scenario_cutoffs(
         df,
         km2_moderate,
         moderate_pct,
@@ -1178,6 +1181,7 @@ def main() -> None:
     scenario_info = create_scenario_maps(
         df, baseline, bau_cutoff, moderate_cutoff, full_cutoff,
         model_output_dir, world_gdf, X_LIMITS, Y_LIMITS, ISO_CODES, REGION_LABEL,
+        bau_subtitle=bau_subtitle,
     )
     wb.log({"results/stage": "scenario_maps_done"})
 
