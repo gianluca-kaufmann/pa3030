@@ -57,23 +57,35 @@ del _repo_root
 from scripts.regions.shared.geo_utils import pixel_area_km2  # noqa: E402
 from scripts.regions.shared.forward.config import (  # noqa: E402
     DATA_SUBDIR,
+    FORWARD_PA_HOLE_COLOR,
     HOTSPOT_REGIONS,
     ISO_CODES,
     MODEL_PREFIX,
     OUTPUTS_SUBDIR,
+    PROBABILITY_MAP_DISPLAY_GAMMA,
+    PROBABILITY_MAP_PERCENTILE_MAX,
+    PROBABILITY_MAP_PERCENTILE_MIN,
+    PROBABILITY_MAP_TRANSFORMATION,
     REGION_LABEL,
-    X_LIMITS,
-    Y_LIMITS,
     get_repo_root,
 )
+# Training-style boundaries expect PA3030_RESULTS_REGION to match forward region
+os.environ["PA3030_RESULTS_REGION"] = OUTPUTS_SUBDIR
+
+from scripts.regions.shared.results.boundaries import get_region_boundary  # noqa: E402
+from scripts.regions.shared.results.results_core import (  # noqa: E402
+    PROBABILITY_MAP_COLORMAP,
+    _add_latlon_ticks,
+    _plot_backbone_background,
+    points_to_raster,
+)
+
 warnings.filterwarnings("ignore", category=UserWarning)
 
 from scripts.regions.shared.training.utils import WandbRunLogger  # noqa: E402
 
 # ── Map style constants ───────────────────────────────────────────────────────
-MAP_FIGSIZE  = (14, 11)
 MAP_DPI      = 300
-WDPA_COLOR   = "#555555"     # existing PA overlay
 SCENARIO_COLORS = {
     "bau":      "#1a78c2",
     "moderate": "#e87e2b",
@@ -160,6 +172,81 @@ def resolve_country_shapefile() -> Optional[Any]:
         return None
 
 
+def resolve_backbone_path_for_plot(
+    repo_root: Path, data_subdir: str, baseline: Dict[str, Any],
+) -> Optional[Path]:
+    """Resolve backbone GeoTIFF for map underlay (same search order as pixel size)."""
+    raw = baseline.get("backbone_path")
+    if raw:
+        p = Path(str(raw))
+        if p.exists():
+            return p
+    scratch = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+    candidates: list[Path] = []
+    if scratch is not None:
+        candidates += [
+            scratch / f"data/{data_subdir}/ready/backbone.tif",
+            scratch / f"data/{data_subdir}/ready/backbone/backbone.tif",
+        ]
+    candidates += [
+        repo_root / f"data/{data_subdir}/ready/backbone.tif",
+        repo_root / f"data/{data_subdir}/ready/backbone/backbone.tif",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    return None
+
+
+def _forward_norm_params(proba: np.ndarray) -> Dict[str, Any]:
+    """Percentile edges for probability-map normalisation (full unprotected sample)."""
+    t = PROBABILITY_MAP_TRANSFORMATION
+    pmi, pma = PROBABILITY_MAP_PERCENTILE_MIN, PROBABILITY_MAP_PERCENTILE_MAX
+    if t == "log":
+        lv = np.log10(np.maximum(proba.astype(np.float64), 1e-10))
+        return {
+            "t": "log",
+            "lo": float(np.percentile(lv, pmi)),
+            "hi": float(np.percentile(lv, pma)),
+        }
+    lo = float(np.percentile(proba, pmi))
+    hi = float(np.percentile(proba, pma))
+    return {"t": t, "lo": lo, "hi": hi}
+
+
+def _forward_apply_norm(proba: np.ndarray, p: Dict[str, Any]) -> np.ndarray:
+    """Map raw probabilities to [0, 1] for display using params from _forward_norm_params."""
+    v = np.asarray(proba, dtype=np.float64)
+    if p["t"] == "log":
+        lv = np.log10(np.maximum(v, 1e-10))
+        span = max(p["hi"] - p["lo"], 1e-12)
+        n = np.clip((lv - p["lo"]) / span, 0.0, 1.0)
+    else:
+        span = max(p["hi"] - p["lo"], 1e-12)
+        cl = np.clip(v, p["lo"], p["hi"])
+        n = (cl - p["lo"]) / span
+        if p["t"] == "sqrt":
+            n = np.sqrt(n)
+    g = PROBABILITY_MAP_DISPLAY_GAMMA
+    if abs(g - 1.0) > 1e-9:
+        n = np.clip(n ** g, 0.0, 1.0)
+    return n.astype(np.float32)
+
+
+def _forward_norm_cbar_label(p: Dict[str, Any]) -> str:
+    t = p["t"]
+    pmi, pma = PROBABILITY_MAP_PERCENTILE_MIN, PROBABILITY_MAP_PERCENTILE_MAX
+    if t == "log":
+        core = f"log10 stretch ({pmi}–{pma} percentile of log p)"
+    elif t == "sqrt":
+        core = f"sqrt stretch ({pmi}–{pma} percentile)"
+    else:
+        core = f"linear stretch ({pmi}–{pma} percentile)"
+    if abs(PROBABILITY_MAP_DISPLAY_GAMMA - 1.0) > 1e-9:
+        core += f", γ={PROBABILITY_MAP_DISPLAY_GAMMA:.2f}"
+    return f"P(protection by 2030) — {core}"
+
+
 # ── Data loading ──────────────────────────────────────────────────────────────
 
 def load_scored(scored_path: Path) -> pd.DataFrame:
@@ -195,6 +282,26 @@ def epsg3857_to_lonlat(x: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.nda
     lon = np.degrees(x / R)
     lat = np.degrees(2.0 * np.arctan(np.exp(y / R)) - np.pi / 2.0)
     return lon, lat
+
+
+def lonlat_to_epsg3857(lon: np.ndarray, lat: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """WGS84 lon/lat (degrees) → EPSG:3857 metres (Web Mercator)."""
+    R = 6378137.0
+    lon_r = np.radians(np.asarray(lon, dtype=np.float64))
+    lat_r = np.radians(np.asarray(lat, dtype=np.float64))
+    x = R * lon_r
+    y = R * np.log(np.tan(np.pi / 4.0 + lat_r / 2.0))
+    return x, y
+
+
+def _lonlat_bounds_to_proj_bounds(
+    lon_min: float, lon_max: float, lat_min: float, lat_max: float,
+) -> Tuple[float, float, float, float]:
+    """Axis-aligned lon/lat box → tight EPSG:3857 bounds (corner transform)."""
+    lons = np.array([lon_min, lon_max, lon_max, lon_min], dtype=np.float64)
+    lats = np.array([lat_min, lat_min, lat_max, lat_max], dtype=np.float64)
+    xm, ym = lonlat_to_epsg3857(lons, lats)
+    return (float(xm.min()), float(ym.min()), float(xm.max()), float(ym.max()))
 
 
 # ── Scenario thresholds ───────────────────────────────────────────────────────
@@ -251,111 +358,94 @@ def compute_scenario_cutoffs(
     return bau_cutoff, moderate_cutoff, full_cutoff, bau_subtitle
 
 
-# ── Rasterization helper ──────────────────────────────────────────────────────
-
-def _rasterize(
-    lon: np.ndarray,
-    lat: np.ndarray,
-    values: np.ndarray,
-    resolution: float = 0.05,
-    x_lim: Tuple[float, float] = (-85, -32),
-    y_lim: Tuple[float, float] = (-56, 13),
-    agg: str = "max",
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Bin point data onto a regular grid.
-
-    Returns:
-        grid:  (ny, nx) float64
-        x_centres, y_centres: 1-D arrays of bin centres in degrees
-    """
-    x_bins = np.arange(x_lim[0], x_lim[1] + resolution, resolution)
-    y_bins = np.arange(y_lim[0], y_lim[1] + resolution, resolution)
-    nx, ny = len(x_bins) - 1, len(y_bins) - 1
-
-    xi = np.clip(np.searchsorted(x_bins, lon, side="right") - 1, 0, nx - 1)
-    yi = np.clip(np.searchsorted(y_bins, lat, side="right") - 1, 0, ny - 1)
-
-    linear_idx = yi * nx + xi
-    if agg == "max":
-        grid_flat = np.full(ny * nx, -np.inf)
-        np.maximum.at(grid_flat, linear_idx, values.astype(float))
-        grid_flat[grid_flat == -np.inf] = np.nan
-        grid = grid_flat.reshape(ny, nx)
-    else:  # mean
-        grid_sum = np.zeros(ny * nx)
-        grid_cnt = np.zeros(ny * nx, dtype=np.int32)
-        np.add.at(grid_sum, linear_idx, values)
-        np.add.at(grid_cnt, linear_idx, 1)
-        grid = np.where(grid_cnt > 0, grid_sum / np.maximum(grid_cnt, 1), np.nan).reshape(ny, nx)
-
-    x_centres = (x_bins[:-1] + x_bins[1:]) / 2.0
-    y_centres = (y_bins[:-1] + y_bins[1:]) / 2.0
-    return grid, x_centres, y_centres
-
-
-def _get_boundary(world_gdf: Optional[Any], iso_codes: List[str]) -> Optional[Any]:
-    if world_gdf is None:
-        return None
-    try:
-        region_gdf = world_gdf[world_gdf["iso_a3"].isin(iso_codes)]
-        return region_gdf
-    except Exception:
-        return None
-
-
-def _draw_boundary(ax: plt.Axes, region_gdf: Optional[Any]) -> None:
-    if region_gdf is not None:
-        try:
-            region_gdf.boundary.plot(ax=ax, color="black", linewidth=0.5, zorder=5)
-        except Exception:
-            pass
-
-
 # ── Map: probability ──────────────────────────────────────────────────────────
 
 def create_probability_map(
     df: pd.DataFrame,
     pixel_size_m: float,
     output_dir: Path,
-    world_gdf: Optional[Any],
-    x_limits: Tuple[float, float],
-    y_limits: Tuple[float, float],
-    iso_codes: List[str],
+    baseline: Dict[str, Any],
+    repo_root: Path,
     region_label: str,
 ) -> None:
+    """Web Mercator raster + backbone underlay; aspect matches training results maps."""
+    from matplotlib.patches import Patch
+
     print("\n" + "=" * 70)
     print("CREATING PROBABILITY MAP (BAU forecast)")
     print("=" * 70)
 
-    lon, lat = epsg3857_to_lonlat(df["x"].values, df["y"].values)
-    proba = df[PROBA_COL].values.astype(np.float32)
-
-    # sqrt transform for perceptual uniformity
-    p_min = np.percentile(proba, 25)
-    p_max = np.percentile(proba, 98)
-    proba_clip = np.clip(proba, p_min, p_max)
-    proba_stretch = np.sqrt((proba_clip - p_min) / max(p_max - p_min, 1e-9))
-
-    grid, xc, yc = _rasterize(
-        lon, lat, proba_stretch, resolution=0.05, x_lim=x_limits, y_lim=y_limits
+    proba = df[PROBA_COL].values.astype(np.float64)
+    norm_p = _forward_norm_params(proba)
+    proba_norm = _forward_apply_norm(proba, norm_p)
+    print(
+        f"  Probability colour scaling: {PROBABILITY_MAP_TRANSFORMATION}, "
+        f"percentiles {PROBABILITY_MAP_PERCENTILE_MIN}–{PROBABILITY_MAP_PERCENTILE_MAX}, "
+        f"γ={PROBABILITY_MAP_DISPLAY_GAMMA}",
     )
 
-    fig, ax = plt.subplots(figsize=MAP_FIGSIZE)
+    region_gdf = get_region_boundary(None)
+    if region_gdf.crs is None:
+        region_gdf = region_gdf.set_crs("EPSG:4326", allow_override=True)
+    region_proj = region_gdf.to_crs("EPSG:3857")
+    proj_bounds = tuple(region_proj.total_bounds.astype(float))
+
+    xm = df["x"].values.astype(np.float64)
+    ym = df["y"].values.astype(np.float64)
+    inside = (
+        (xm >= proj_bounds[0]) & (xm <= proj_bounds[2])
+        & (ym >= proj_bounds[1]) & (ym <= proj_bounds[3])
+    )
+    if inside.sum() < len(df):
+        print(f"  Clipping {len(df) - inside.sum():,} points outside region hull for map")
+    xm, ym, proba_norm = xm[inside], ym[inside], proba_norm[inside]
+
+    raster, extent = points_to_raster(
+        xm, ym, proba_norm,
+        target_resolution=1000.0,
+        agg_func="mean",
+        extent_bounds=proj_bounds,
+    )
+    print(f"  Raster shape: {raster.shape}, extent (3857): {extent}")
+
+    proj_width = proj_bounds[2] - proj_bounds[0]
+    proj_height = proj_bounds[3] - proj_bounds[1]
+    proj_aspect = proj_height / max(proj_width, 1e-9)
+    fig_width = 14.0
+    fig_height = fig_width * proj_aspect
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
+    backbone_path = resolve_backbone_path_for_plot(repo_root, DATA_SUBDIR, baseline)
+    used_bb = _plot_backbone_background(
+        ax, backbone_path, zorder=0, hole_color=FORWARD_PA_HOLE_COLOR,
+    )
+    if not used_bb:
+        region_proj.plot(
+            ax=ax, color=FORWARD_PA_HOLE_COLOR, edgecolor="none",
+            linewidth=0, zorder=0,
+        )
+
     im = ax.imshow(
-        np.flipud(grid),
-        extent=[x_limits[0], x_limits[1], y_limits[0], y_limits[1]],
-        cmap="plasma", vmin=0.0, vmax=1.0, aspect="auto", interpolation="nearest",
+        raster,
+        extent=extent,
+        cmap=PROBABILITY_MAP_COLORMAP,
+        vmin=0.0,
+        vmax=1.0,
+        origin="upper",
+        interpolation="nearest",
+        aspect="equal",
+        zorder=2,
     )
-    region_boundary = _get_boundary(world_gdf, iso_codes)
-    _draw_boundary(ax, region_boundary)
+    ax.set_xlim(proj_bounds[0], proj_bounds[2])
+    ax.set_ylim(proj_bounds[1], proj_bounds[3])
+    ax.set_aspect("equal", adjustable="box")
+    _add_latlon_ticks(ax, (proj_bounds[0], proj_bounds[2]), (proj_bounds[1], proj_bounds[3]))
 
-    cbar = plt.colorbar(im, ax=ax, fraction=0.03, pad=0.04)
-    cbar.set_label("P(protection by 2030) [sqrt-stretched]", fontsize=10)
-    cbar.set_ticks([0, 0.5, 1.0])
-    cbar.set_ticklabels(["low", "medium", "high"])
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label(_forward_norm_cbar_label(norm_p), fontsize=10, rotation=270, labelpad=18)
+    cbar.set_ticks([0.0, 1.0])
+    cbar.set_ticklabels(["Lower", "Higher"])
 
-    ax.set_xlim(x_limits)
-    ax.set_ylim(y_limits)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
     ax.set_title(
@@ -363,78 +453,120 @@ def create_probability_map(
         "Deployment model (2001–2019), unprotected pixels as of 2024",
         fontsize=12,
     )
-    plt.tight_layout()
+    ax.legend(
+        handles=[
+            Patch(
+                facecolor=FORWARD_PA_HOLE_COLOR,
+                edgecolor="none",
+                label="Existing protected areas (2024)",
+            ),
+        ],
+        loc="lower left",
+        fontsize=9,
+        framealpha=0.95,
+    )
+    ax.grid(True, alpha=0.25, linestyle="--", linewidth=0.5, zorder=3)
+    plt.tight_layout(pad=0.5)
 
     for ext in ["pdf", "png"]:
-        p = output_dir / f"forward_probability_map.{ext}"
-        plt.savefig(p, dpi=MAP_DPI, bbox_inches="tight")
-        print(f"  Saved: {p}")
+        outp = output_dir / f"forward_probability_map.{ext}"
+        plt.savefig(outp, dpi=MAP_DPI, bbox_inches="tight")
+        print(f"  Saved: {outp}")
     plt.close(fig)
 
 
 # ── Map: binary scenario ──────────────────────────────────────────────────────
 
 def _create_scenario_map(
-    lon: np.ndarray,
-    lat: np.ndarray,
+    x_m: np.ndarray,
+    y_m: np.ndarray,
     selected: np.ndarray,
     title: str,
     subtitle: str,
     color: str,
     filename_stem: str,
     output_dir: Path,
-    world_gdf: Optional[Any],
     n_pixels: int,
     area_km2: float,
     coverage_pct: float,
-    x_limits: Tuple[float, float],
-    y_limits: Tuple[float, float],
-    iso_codes: List[str],
+    proj_bounds: Tuple[float, float, float, float],
+    region_proj: Any,
+    backbone_path: Optional[Path],
 ) -> None:
-    grid, xc, yc = _rasterize(
-        lon[selected], lat[selected],
-        np.ones(selected.sum()), resolution=0.05, agg="max",
-        x_lim=x_limits, y_lim=y_limits,
+    """Scenario binary map in EPSG:3857 with backbone underlay (no country outlines)."""
+    bg_raster, bg_ext = points_to_raster(
+        x_m, y_m, np.ones(len(x_m), dtype=np.float32),
+        target_resolution=1000.0,
+        agg_func="max",
+        extent_bounds=proj_bounds,
     )
+    bg_disp = np.where(np.isnan(bg_raster), np.nan, 0.12)
 
-    fig, ax = plt.subplots(figsize=MAP_FIGSIZE)
-
-    # Background: grey for all unprotected pixels
-    bg_grid, _, _ = _rasterize(
-        lon, lat, np.ones(len(lon)), resolution=0.05, agg="max",
-        x_lim=x_limits, y_lim=y_limits,
+    sel_raster, _ = points_to_raster(
+        x_m[selected], y_m[selected], np.ones(int(selected.sum()), dtype=np.float32),
+        target_resolution=1000.0,
+        agg_func="max",
+        extent_bounds=proj_bounds,
     )
-    bg_masked = np.where(np.isnan(bg_grid), np.nan, 0.1)
+    sel_disp = np.where(np.isnan(sel_raster), np.nan, 1.0)
+
+    proj_width = proj_bounds[2] - proj_bounds[0]
+    proj_height = proj_bounds[3] - proj_bounds[1]
+    fig_width = 14.0
+    fig_height = fig_width * (proj_height / max(proj_width, 1e-9))
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
+    used_bb = _plot_backbone_background(
+        ax, backbone_path, zorder=0, hole_color=FORWARD_PA_HOLE_COLOR,
+    )
+    if not used_bb:
+        region_proj.plot(
+            ax=ax, color=FORWARD_PA_HOLE_COLOR, edgecolor="none",
+            linewidth=0, zorder=0,
+        )
+
     ax.imshow(
-        np.flipud(bg_masked),
-        extent=[x_limits[0], x_limits[1], y_limits[0], y_limits[1]],
-        cmap="Greys", vmin=0, vmax=1, aspect="auto", interpolation="nearest", alpha=0.3,
+        bg_disp,
+        extent=bg_ext,
+        cmap="Greys",
+        vmin=0,
+        vmax=1,
+        origin="upper",
+        interpolation="nearest",
+        aspect="equal",
+        alpha=0.45,
+        zorder=1,
     )
-
-    # Selected pixels
-    sel_masked = np.where(np.isnan(grid), np.nan, 1.0)
     cmap_sel = mcolors.ListedColormap([color])
     ax.imshow(
-        np.flipud(sel_masked),
-        extent=[x_limits[0], x_limits[1], y_limits[0], y_limits[1]],
-        cmap=cmap_sel, vmin=0, vmax=1, aspect="auto", interpolation="nearest", alpha=0.85,
+        sel_disp,
+        extent=bg_ext,
+        cmap=cmap_sel,
+        vmin=0,
+        vmax=1,
+        origin="upper",
+        interpolation="nearest",
+        aspect="equal",
+        alpha=0.88,
+        zorder=2,
     )
 
-    region_boundary = _get_boundary(world_gdf, iso_codes)
-    _draw_boundary(ax, region_boundary)
+    ax.set_xlim(proj_bounds[0], proj_bounds[2])
+    ax.set_ylim(proj_bounds[1], proj_bounds[3])
+    ax.set_aspect("equal", adjustable="box")
+    _add_latlon_ticks(ax, (proj_bounds[0], proj_bounds[2]), (proj_bounds[1], proj_bounds[3]))
 
     patch = mpatches.Patch(
         color=color,
         label=f"Projected designations ({n_pixels:,} pixels, {area_km2:,.0f} km²)",
     )
     ax.legend(handles=[patch], loc="lower left", fontsize=9)
-    ax.set_xlim(x_limits)
-    ax.set_ylim(y_limits)
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
     ax.set_title(f"{title}\n{subtitle}", fontsize=12)
+    ax.grid(True, alpha=0.25, linestyle="--", linewidth=0.5, zorder=3)
 
-    plt.tight_layout()
+    plt.tight_layout(pad=0.5)
     for ext in ["pdf", "png"]:
         p = output_dir / f"{filename_stem}.{ext}"
         plt.savefig(p, dpi=MAP_DPI, bbox_inches="tight")
@@ -449,10 +581,7 @@ def create_scenario_maps(
     moderate_cutoff: float,
     full_cutoff: float,
     output_dir: Path,
-    world_gdf: Optional[Any],
-    x_limits: Tuple[float, float],
-    y_limits: Tuple[float, float],
-    iso_codes: List[str],
+    repo_root: Path,
     region_label: str,
     bau_subtitle: str = "BAU designation volume",
 ) -> Dict[str, Any]:
@@ -460,7 +589,15 @@ def create_scenario_maps(
     print("CREATING SCENARIO MAPS")
     print("=" * 70)
 
-    lon, lat = epsg3857_to_lonlat(df["x"].values, df["y"].values)
+    region_gdf = get_region_boundary(None)
+    if region_gdf.crs is None:
+        region_gdf = region_gdf.set_crs("EPSG:4326", allow_override=True)
+    region_proj = region_gdf.to_crs("EPSG:3857")
+    proj_bounds = tuple(region_proj.total_bounds.astype(float))
+    backbone_path = resolve_backbone_path_for_plot(repo_root, DATA_SUBDIR, baseline)
+
+    x_m = df["x"].values.astype(np.float64)
+    y_m = df["y"].values.astype(np.float64)
     proba = df[PROBA_COL].values
     area  = df["area_km2"].values
     total_km2 = baseline.get("total_land_km2") or baseline.get("total_sa_km2", 1.0)
@@ -497,8 +634,8 @@ def create_scenario_maps(
         }
         if n > 0:
             _create_scenario_map(
-                lon, lat, mask, title, subtitle, color, stem, output_dir, world_gdf,
-                n, km2, coverage_new, x_limits, y_limits, iso_codes,
+                x_m, y_m, mask, title, subtitle, color, stem, output_dir,
+                n, km2, coverage_new, proj_bounds, region_proj, backbone_path,
             )
         else:
             print(f"  WARNING: no pixels selected for {key} scenario — target already met?")
@@ -686,10 +823,8 @@ def create_gap_analysis(
     bau_cutoff: float,
     full_cutoff: float,
     output_dir: Path,
-    world_gdf: Optional[Any],
-    x_limits: Tuple[float, float],
-    y_limits: Tuple[float, float],
-    iso_codes: List[str],
+    baseline: Dict[str, Any],
+    repo_root: Path,
 ) -> Dict[str, Any]:
     """Compute and visualise Biodiversity Capture Rate (BCR).
 
@@ -707,7 +842,8 @@ def create_gap_analysis(
 
     proba = df[PROBA_COL].values
     area  = df["area_km2"].values
-    lon, lat = epsg3857_to_lonlat(df["x"].values, df["y"].values)
+    xm = df["x"].values.astype(np.float64)
+    ym = df["y"].values.astype(np.float64)
 
     bau_mask  = proba >= bau_cutoff
     full_mask = proba >= full_cutoff
@@ -727,10 +863,20 @@ def create_gap_analysis(
             }
             print(f"  BCR {key}: {bcr:.4f} vs. random {gap_metrics[key]['random_bcr']:.4f}")
 
-    # ── 4-panel figure ────────────────────────────────────────────────────────
-    fig, axes = plt.subplots(2, 2, figsize=(18, 14))
+    region_gdf = get_region_boundary(None)
+    if region_gdf.crs is None:
+        region_gdf = region_gdf.set_crs("EPSG:4326", allow_override=True)
+    region_proj = region_gdf.to_crs("EPSG:3857")
+    proj_bounds = tuple(region_proj.total_bounds.astype(float))
+    backbone_path = resolve_backbone_path_for_plot(repo_root, DATA_SUBDIR, baseline)
+
+    proj_width = proj_bounds[2] - proj_bounds[0]
+    proj_height = proj_bounds[3] - proj_bounds[1]
+    pa = proj_height / max(proj_width, 1e-9)
+    panel_w = 7.0
+    panel_h = panel_w * pa
+    fig, axes = plt.subplots(2, 2, figsize=(panel_w * 2, panel_h * 2 + 1.2))
     fig.suptitle("Gap Analysis: BAU Forecast vs. Biodiversity Priority Areas", fontsize=14)
-    region_boundary = _get_boundary(world_gdf, iso_codes)
 
     gsn_mask_for_fig = df["GSN_b1"].values.astype(bool) if has_gsn else np.zeros(len(df), dtype=bool)
 
@@ -749,20 +895,37 @@ def create_gap_analysis(
     ]
 
     for ax, (mask, panel_title, color) in zip(axes.flat, panel_defs):
+        used_bb = _plot_backbone_background(
+            ax, backbone_path, zorder=0, hole_color=FORWARD_PA_HOLE_COLOR,
+        )
+        if not used_bb:
+            region_proj.plot(
+                ax=ax, color=FORWARD_PA_HOLE_COLOR, edgecolor="none",
+                linewidth=0, zorder=0,
+            )
         if mask.any():
-            grid, _, _ = _rasterize(
-                lon[mask], lat[mask], np.ones(mask.sum()),
-                resolution=0.05, agg="max", x_lim=x_limits, y_lim=y_limits,
+            grid, gext = points_to_raster(
+                xm[mask], ym[mask], np.ones(int(mask.sum()), dtype=np.float32),
+                target_resolution=1000.0,
+                agg_func="max",
+                extent_bounds=proj_bounds,
             )
             ax.imshow(
-                np.flipud(np.where(np.isnan(grid), np.nan, 1.0)),
-                extent=[x_limits[0], x_limits[1], y_limits[0], y_limits[1]],
-                cmap=mcolors.ListedColormap([color]), vmin=0, vmax=1,
-                aspect="auto", interpolation="nearest", alpha=0.85,
+                np.where(np.isnan(grid), np.nan, 1.0),
+                extent=gext,
+                cmap=mcolors.ListedColormap([color]),
+                vmin=0,
+                vmax=1,
+                origin="upper",
+                interpolation="nearest",
+                aspect="equal",
+                alpha=0.88,
+                zorder=2,
             )
-        _draw_boundary(ax, region_boundary)
-        ax.set_xlim(x_limits)
-        ax.set_ylim(y_limits)
+        ax.set_xlim(proj_bounds[0], proj_bounds[2])
+        ax.set_ylim(proj_bounds[1], proj_bounds[3])
+        ax.set_aspect("equal", adjustable="box")
+        _add_latlon_ticks(ax, (proj_bounds[0], proj_bounds[2]), (proj_bounds[1], proj_bounds[3]))
         ax.set_title(panel_title, fontsize=10)
         n_px = int(mask.sum())
         km2 = float(area[mask].sum()) if mask.any() else 0.0
@@ -771,6 +934,7 @@ def create_gap_analysis(
             transform=ax.transAxes, fontsize=8, color="black",
             bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7),
         )
+        ax.grid(True, alpha=0.2, linestyle="--", linewidth=0.4, zorder=3)
 
     if has_gsn and gap_metrics:
         bcr_bau  = gap_metrics.get("bau", {}).get("bcr", "N/A")
@@ -823,10 +987,8 @@ def create_economic_exposure(
     bau_cutoff: float,
     full_cutoff: float,
     output_dir: Path,
-    x_limits: Tuple[float, float],
-    y_limits: Tuple[float, float],
-    world_gdf: Optional[Any],
-    iso_codes: List[str],
+    baseline: Dict[str, Any],
+    repo_root: Path,
 ) -> pd.DataFrame:
     """Quantify economic proxy values in top-1% / top-5% / BAU risk zones.
 
@@ -904,39 +1066,56 @@ def create_economic_exposure(
     print(f"  Saved: {csv_path}")
     print(exposure_df.to_string(index=False))
 
-    # ── Map: BAU risk zone coloured by NTL ───────────────────────────────────
+    # ── Map: BAU risk zone coloured by NTL (EPSG:3857, backbone underlay) ───
     if ntl_col is not None:
         bau_sub = merged[bau_mask].dropna(subset=[ntl_col])
         if len(bau_sub) > 0:
-            lon_b, lat_b = epsg3857_to_lonlat(
-                bau_sub["x"].values, bau_sub["y"].values,
+            xm = bau_sub["x"].values.astype(np.float64)
+            ym = bau_sub["y"].values.astype(np.float64)
+            ntl_vals = bau_sub[ntl_col].values.astype(np.float32)
+
+            region_gdf = get_region_boundary(None)
+            if region_gdf.crs is None:
+                region_gdf = region_gdf.set_crs("EPSG:4326", allow_override=True)
+            region_proj = region_gdf.to_crs("EPSG:3857")
+            proj_bounds = tuple(region_proj.total_bounds.astype(float))
+            backbone_path = resolve_backbone_path_for_plot(repo_root, DATA_SUBDIR, baseline)
+
+            grid, gext = points_to_raster(
+                xm, ym, ntl_vals,
+                target_resolution=1000.0,
+                agg_func="mean",
+                extent_bounds=proj_bounds,
             )
-            ntl_vals = bau_sub[ntl_col].values
 
-            # Rasterize mean NTL per grid cell
-            res = 0.1
-            x_bins = np.arange(x_limits[0], x_limits[1] + res, res)
-            y_bins = np.arange(y_limits[0], y_limits[1] + res, res)
-            nx, ny = len(x_bins) - 1, len(y_bins) - 1
-            xi = np.clip(np.searchsorted(x_bins, lon_b, side="right") - 1, 0, nx - 1)
-            yi = np.clip(np.searchsorted(y_bins, lat_b, side="right") - 1, 0, ny - 1)
-            grid_sum = np.zeros(ny * nx)
-            grid_cnt = np.zeros(ny * nx, dtype=np.int32)
-            lin = yi * nx + xi
-            np.add.at(grid_sum, lin, ntl_vals)
-            np.add.at(grid_cnt, lin, 1)
-            grid = np.where(grid_cnt > 0, grid_sum / np.maximum(grid_cnt, 1), np.nan).reshape(ny, nx)
+            proj_width = proj_bounds[2] - proj_bounds[0]
+            proj_height = proj_bounds[3] - proj_bounds[1]
+            fig_w = 14.0
+            fig_h = fig_w * (proj_height / max(proj_width, 1e-9))
+            fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
-            fig, ax = plt.subplots(figsize=(12, 9))
+            used_bb = _plot_backbone_background(
+                ax, backbone_path, zorder=0, hole_color=FORWARD_PA_HOLE_COLOR,
+            )
+            if not used_bb:
+                region_proj.plot(
+                    ax=ax, color=FORWARD_PA_HOLE_COLOR, edgecolor="none",
+                    linewidth=0, zorder=0,
+                )
+
             im = ax.imshow(
-                np.flipud(grid),
-                extent=[x_limits[0], x_limits[1], y_limits[0], y_limits[1]],
-                cmap="plasma", aspect="auto", interpolation="nearest",
+                grid,
+                extent=gext,
+                cmap="plasma",
+                origin="upper",
+                interpolation="nearest",
+                aspect="equal",
+                zorder=2,
             )
-            region_boundary = _get_boundary(world_gdf, iso_codes)
-            _draw_boundary(ax, region_boundary)
-            ax.set_xlim(x_limits)
-            ax.set_ylim(y_limits)
+            ax.set_xlim(proj_bounds[0], proj_bounds[2])
+            ax.set_ylim(proj_bounds[1], proj_bounds[3])
+            ax.set_aspect("equal", adjustable="box")
+            _add_latlon_ticks(ax, (proj_bounds[0], proj_bounds[2]), (proj_bounds[1], proj_bounds[3]))
             ax.set_title(
                 "Economic Exposure in BAU Risk Zone\n"
                 f"BAU-designated pixels coloured by nighttime light intensity ({ntl_col})",
@@ -944,9 +1123,10 @@ def create_economic_exposure(
             )
             ax.set_xlabel("Longitude")
             ax.set_ylabel("Latitude")
-            cbar = plt.colorbar(im, ax=ax, fraction=0.03, pad=0.04)
-            cbar.set_label(f"{ntl_col} (mean per 0.1° cell)", fontsize=9)
-            plt.tight_layout()
+            ax.grid(True, alpha=0.25, linestyle="--", linewidth=0.5, zorder=3)
+            cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            cbar.set_label(f"{ntl_col} (mean per ~1 km cell)", fontsize=9)
+            plt.tight_layout(pad=0.5)
             for ext in ["pdf", "png"]:
                 p = output_dir / f"forward_economic_exposure_map.{ext}"
                 plt.savefig(p, dpi=MAP_DPI, bbox_inches="tight")
@@ -963,14 +1143,13 @@ def create_hotspot_maps(
     hotspot_regions: List[Tuple],
     bau_cutoff: float,
     output_dir: Path,
-    world_gdf: Optional[Any],
-    iso_codes: List[str],
+    baseline: Dict[str, Any],
+    repo_root: Path,
     region_label: str,
 ) -> None:
-    """Produce a figure with one panel per hotspot region showing zoomed
-    probability maps with BAU designation pixels highlighted.
+    """Zoomed probability + BAU panels per hotspot (Web Mercator, backbone underlay).
 
-    hotspot_regions: list of (label, lon_min, lon_max, lat_min, lat_max)
+    hotspot_regions: list of (label, lon_min, lon_max, lat_min, lat_max) in WGS84.
     Output: forward_hotspot_maps.pdf/.png
     """
     print("\n" + "=" * 70)
@@ -981,12 +1160,31 @@ def create_hotspot_maps(
         print("  No hotspot regions defined — skipping.")
         return
 
-    lon_all, lat_all = epsg3857_to_lonlat(df["x"].values, df["y"].values)
-    proba = df[PROBA_COL].values
+    xm_all = df["x"].values.astype(np.float64)
+    ym_all = df["y"].values.astype(np.float64)
+    lon_all, lat_all = epsg3857_to_lonlat(xm_all, ym_all)
+    proba = df[PROBA_COL].values.astype(np.float64)
+    norm_p = _forward_norm_params(proba)
     bau_mask = proba >= bau_cutoff
 
+    region_gdf = get_region_boundary(None)
+    if region_gdf.crs is None:
+        region_gdf = region_gdf.set_crs("EPSG:4326", allow_override=True)
+    region_proj = region_gdf.to_crs("EPSG:3857")
+    backbone_path = resolve_backbone_path_for_plot(repo_root, DATA_SUBDIR, baseline)
+
     n = len(hotspot_regions)
-    fig, axes = plt.subplots(2, n, figsize=(6 * n, 12))
+    # Figure width from first valid hotspot aspect (fallback 4:3)
+    panel_w, panel_h = 5.0, 4.0
+    for _lbl, x0, x1, y0, y1 in hotspot_regions:
+        zb = _lonlat_bounds_to_proj_bounds(x0, x1, y0, y1)
+        pw = zb[2] - zb[0]
+        ph = zb[3] - zb[1]
+        if pw > 1e-6:
+            panel_w, panel_h = 5.0, 5.0 * (ph / pw)
+            break
+
+    fig, axes = plt.subplots(2, n, figsize=(panel_w * n, panel_h * 2 + 0.8))
     if n == 1:
         axes = axes.reshape(2, 1)
 
@@ -997,7 +1195,7 @@ def create_hotspot_maps(
     )
 
     for col_idx, (label, x0, x1, y0, y1) in enumerate(hotspot_regions):
-        # Spatial filter
+        zoom_bounds = _lonlat_bounds_to_proj_bounds(x0, x1, y0, y1)
         in_box = (lon_all >= x0) & (lon_all <= x1) & (lat_all >= y0) & (lat_all <= y1)
         if not in_box.any():
             print(f"  WARNING: no pixels in hotspot '{label}' — check coordinates")
@@ -1006,53 +1204,98 @@ def create_hotspot_maps(
             continue
 
         print(f"  {label}: {in_box.sum():,} pixels")
-        lon_h = lon_all[in_box]
-        lat_h = lat_all[in_box]
-        res   = 0.02  # higher resolution for zoomed maps
+        xm_h = xm_all[in_box]
+        ym_h = ym_all[in_box]
+        proba_norm = _forward_apply_norm(proba[in_box], norm_p)
 
-        # Row 0: continuous probability
+        # Row 0: continuous probability (same normalisation as continental map)
         ax0 = axes[0, col_idx]
-        grid_p, _, _ = _rasterize(
-            lon_h, lat_h, proba[in_box], resolution=res,
-            agg="max", x_lim=(x0, x1), y_lim=(y0, y1),
+        used_bb0 = _plot_backbone_background(
+            ax0, backbone_path, zorder=0, hole_color=FORWARD_PA_HOLE_COLOR,
+        )
+        if not used_bb0:
+            region_proj.plot(
+                ax=ax0, color=FORWARD_PA_HOLE_COLOR, edgecolor="none",
+                linewidth=0, zorder=0,
+            )
+        grid_p, gext_p = points_to_raster(
+            xm_h, ym_h, proba_norm,
+            target_resolution=1000.0,
+            agg_func="mean",
+            extent_bounds=zoom_bounds,
         )
         im = ax0.imshow(
-            np.flipud(np.sqrt(np.clip(grid_p, 0, 1))),
-            extent=[x0, x1, y0, y1], cmap="plasma",
-            vmin=0, vmax=1, aspect="auto", interpolation="nearest",
+            grid_p,
+            extent=gext_p,
+            cmap=PROBABILITY_MAP_COLORMAP,
+            vmin=0.0,
+            vmax=1.0,
+            origin="upper",
+            interpolation="nearest",
+            aspect="equal",
+            zorder=2,
         )
-        _draw_boundary(ax0, _get_boundary(world_gdf, iso_codes))
-        ax0.set_xlim(x0, x1)
-        ax0.set_ylim(y0, y1)
+        ax0.set_xlim(zoom_bounds[0], zoom_bounds[2])
+        ax0.set_ylim(zoom_bounds[1], zoom_bounds[3])
+        ax0.set_aspect("equal", adjustable="box")
+        _add_latlon_ticks(
+            ax0, (zoom_bounds[0], zoom_bounds[2]), (zoom_bounds[1], zoom_bounds[3]),
+        )
         ax0.set_title(label, fontsize=10)
         if col_idx == 0:
-            ax0.set_ylabel("P(protection by 2030) [√-stretch]", fontsize=8)
+            ax0.set_ylabel(
+                "P(protection by 2030)\n(same stretch as continental map)",
+                fontsize=8,
+            )
+        ax0.grid(True, alpha=0.25, linestyle="--", linewidth=0.5, zorder=3)
         plt.colorbar(im, ax=ax0, fraction=0.04, pad=0.03)
 
         # Row 1: BAU designation zone
         ax1 = axes[1, col_idx]
+        used_bb1 = _plot_backbone_background(
+            ax1, backbone_path, zorder=0, hole_color=FORWARD_PA_HOLE_COLOR,
+        )
+        if not used_bb1:
+            region_proj.plot(
+                ax=ax1, color=FORWARD_PA_HOLE_COLOR, edgecolor="none",
+                linewidth=0, zorder=0,
+            )
         bau_in = bau_mask & in_box
+        n_bau = int(bau_in.sum())
         if bau_in.any():
-            grid_b, _, _ = _rasterize(
-                lon_all[bau_in], lat_all[bau_in],
-                np.ones(bau_in.sum()), resolution=res,
-                agg="max", x_lim=(x0, x1), y_lim=(y0, y1),
+            grid_b, gext_b = points_to_raster(
+                xm_all[bau_in], ym_all[bau_in],
+                np.ones(int(bau_in.sum()), dtype=np.float32),
+                target_resolution=1000.0,
+                agg_func="max",
+                extent_bounds=zoom_bounds,
             )
             ax1.imshow(
-                np.flipud(np.where(np.isnan(grid_b), np.nan, 1.0)),
-                extent=[x0, x1, y0, y1],
+                np.where(np.isnan(grid_b), np.nan, 1.0),
+                extent=gext_b,
                 cmap=mcolors.ListedColormap([SCENARIO_COLORS["bau"]]),
-                vmin=0, vmax=1, aspect="auto", interpolation="nearest", alpha=0.85,
+                vmin=0,
+                vmax=1,
+                origin="upper",
+                interpolation="nearest",
+                aspect="equal",
+                alpha=0.88,
+                zorder=2,
             )
-        _draw_boundary(ax1, _get_boundary(world_gdf, iso_codes))
-        ax1.set_xlim(x0, x1)
-        ax1.set_ylim(y0, y1)
-        n_bau = int(bau_in.sum())
-        ax1.text(0.02, 0.02, f"{n_bau:,} BAU pixels",
-                 transform=ax1.transAxes, fontsize=8,
-                 bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7))
+        ax1.set_xlim(zoom_bounds[0], zoom_bounds[2])
+        ax1.set_ylim(zoom_bounds[1], zoom_bounds[3])
+        ax1.set_aspect("equal", adjustable="box")
+        _add_latlon_ticks(
+            ax1, (zoom_bounds[0], zoom_bounds[2]), (zoom_bounds[1], zoom_bounds[3]),
+        )
+        ax1.text(
+            0.02, 0.02, f"{n_bau:,} BAU pixels",
+            transform=ax1.transAxes, fontsize=8,
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7),
+        )
         if col_idx == 0:
             ax1.set_ylabel("BAU designation zone", fontsize=8)
+        ax1.grid(True, alpha=0.25, linestyle="--", linewidth=0.5, zorder=3)
 
     plt.tight_layout()
     for ext in ["pdf", "png"]:
@@ -1095,7 +1338,7 @@ def main() -> None:
     # Re-import config after runner.py reload
     from scripts.regions.shared.forward.config import (  # noqa: F401
         DATA_SUBDIR, HOTSPOT_REGIONS, ISO_CODES, MODEL_PREFIX, OUTPUTS_SUBDIR,
-        REGION_LABEL, X_LIMITS, Y_LIMITS,
+        REGION_LABEL,
     )
 
     model_type = os.environ.get("PA3030_FORWARD_MODEL_TYPE", "lgbm").strip().lower()
@@ -1174,13 +1417,12 @@ def main() -> None:
 
     # ── Maps ──────────────────────────────────────────────────────────────────
     create_probability_map(
-        df, pixel_size_m, model_output_dir, world_gdf,
-        X_LIMITS, Y_LIMITS, ISO_CODES, REGION_LABEL,
+        df, pixel_size_m, model_output_dir, baseline, repo_root, REGION_LABEL,
     )
 
     scenario_info = create_scenario_maps(
         df, baseline, bau_cutoff, moderate_cutoff, full_cutoff,
-        model_output_dir, world_gdf, X_LIMITS, Y_LIMITS, ISO_CODES, REGION_LABEL,
+        model_output_dir, repo_root, REGION_LABEL,
         bau_subtitle=bau_subtitle,
     )
     wb.log({"results/stage": "scenario_maps_done"})
@@ -1197,22 +1439,21 @@ def main() -> None:
 
     # ── Gap analysis ──────────────────────────────────────────────────────────
     gap_metrics = create_gap_analysis(
-        df, bau_cutoff, full_cutoff,
-        model_output_dir, world_gdf, X_LIMITS, Y_LIMITS, ISO_CODES,
+        df, bau_cutoff, full_cutoff, model_output_dir, baseline, repo_root,
     )
     wb.log({"results/stage": "gap_analysis_done"})
 
     # ── Economic exposure ─────────────────────────────────────────────────────
     create_economic_exposure(
         df, forward_dir, bau_cutoff, full_cutoff,
-        model_output_dir, X_LIMITS, Y_LIMITS, world_gdf, ISO_CODES,
+        model_output_dir, baseline, repo_root,
     )
     wb.log({"results/stage": "economic_exposure_done"})
 
     # ── Hotspot zoom-ins ──────────────────────────────────────────────────────
     create_hotspot_maps(
         df, HOTSPOT_REGIONS, bau_cutoff,
-        model_output_dir, world_gdf, ISO_CODES, REGION_LABEL,
+        model_output_dir, baseline, repo_root, REGION_LABEL,
     )
     wb.log({"results/stage": "hotspot_maps_done"})
 

@@ -52,6 +52,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import lightgbm as lgb
@@ -93,21 +94,9 @@ LOOKAHEAD_YEARS = 5
 LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS  # 2019
 
 
-# ── Coordinate + rasterization helpers (for false-positive map) ───────────────
+# ── False-positive map (same visual language as forward/results_core maps) ────
 
-def _bt_lonlat(x: np.ndarray, y: np.ndarray):
-    """EPSG:3857 → WGS84 lon/lat (degrees)."""
-    R = 6378137.0
-    return np.degrees(x / R), np.degrees(2.0 * np.arctan(np.exp(y / R)) - np.pi / 2.0)
-
-
-def _bt_rasterize(lon, lat, resolution, x_lim, y_lim):
-    """Count pixels per cell; returns (H, W) float array with NaN for empty."""
-    x_bins = np.arange(x_lim[0], x_lim[1] + resolution, resolution)
-    y_bins = np.arange(y_lim[0], y_lim[1] + resolution, resolution)
-    H, _, _ = np.histogram2d(lat, lon, bins=[y_bins, x_bins])
-    H[H == 0] = np.nan
-    return H
+FP_MAP_DPI = 300
 
 
 def create_false_positive_map(
@@ -117,23 +106,40 @@ def create_false_positive_map(
     xy: dict,
     origin_year: int,
     output_dir: Path,
+    repo_root: Path,
+    baseline: Dict[str, Any],
 ) -> None:
-    """Map true vs false positives in the top-5% risk zone at origin year T.
+    """Map TP/FP in the top-5% risk zone (Web Mercator, backbone underlay, 1 km raster).
 
-    Only runs when x/y coordinates are available (requires panel to include
-    x, y columns) and when the origin year has a clean 5-year window.
+    Only runs when x/y are in the panel (EPSG:3857). Matches forward results maps:
+    no country outlines, ``FORWARD_PA_HOLE_COLOR`` holes, ``points_to_raster`` @ 1 km.
+
     Outputs: forward_backtest_T{T}_false_positives.pdf/.png
     """
     if not (xy.get("x") is not None and xy.get("y") is not None):
         print(f"  T={origin_year}: skipping FP map — no x/y coords in panel.")
         return
 
-    # Local config import (values correct after runner.py reload)
-    from scripts.regions.shared.forward.config import REGION_LABEL, X_LIMITS, Y_LIMITS
+    from scripts.regions.shared.forward.config import (
+        DATA_SUBDIR,
+        FORWARD_PA_HOLE_COLOR,
+        OUTPUTS_SUBDIR,
+        REGION_LABEL,
+    )
+    from scripts.regions.shared.forward.results_core import resolve_backbone_path_for_plot
+    from scripts.regions.shared.results.boundaries import get_region_boundary
+    from scripts.regions.shared.results.results_core import (
+        _add_latlon_ticks,
+        _plot_backbone_background,
+        points_to_raster,
+    )
+
+    os.environ["PA3030_RESULTS_REGION"] = OUTPUTS_SUBDIR
 
     x_arr = xy["x"]
     y_arr = xy["y"]
-    lon, lat = _bt_lonlat(x_arr.astype(np.float64), y_arr.astype(np.float64))
+    xm = x_arr.astype(np.float64)
+    ym = y_arr.astype(np.float64)
 
     # Top-5% probability threshold
     threshold = float(np.percentile(y_proba, 95))
@@ -151,8 +157,19 @@ def create_false_positive_map(
         print("  Nothing to plot — skipping FP map.")
         return
 
-    res = 0.15
-    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    region_gdf = get_region_boundary(None)
+    if region_gdf.crs is None:
+        region_gdf = region_gdf.set_crs("EPSG:4326", allow_override=True)
+    region_proj = region_gdf.to_crs("EPSG:3857")
+    proj_bounds = tuple(region_proj.total_bounds.astype(float))
+    backbone_path = resolve_backbone_path_for_plot(repo_root, DATA_SUBDIR, baseline)
+
+    proj_width = proj_bounds[2] - proj_bounds[0]
+    proj_height = proj_bounds[3] - proj_bounds[1]
+    pa = proj_height / max(proj_width, 1e-9)
+    panel_w = 7.0
+    panel_h = panel_w * pa
+    fig, axes = plt.subplots(1, 2, figsize=(panel_w * 2, panel_h + 0.9))
     fig.suptitle(
         f"False Positive Analysis — T={origin_year} Backtest ({REGION_LABEL})\n"
         f"Top-5% risk zone: {n_tp:,} true positives (green) / {n_fp:,} false positives (red)  "
@@ -165,27 +182,53 @@ def create_false_positive_map(
         (fp_mask, "False Positives\n(high-risk → NOT protected in window)", "#d62728"),
     ]
     for ax, (mask, title, color) in zip(axes, panel_defs):
-        if mask.any():
-            grid = _bt_rasterize(lon[mask], lat[mask], res, X_LIMITS, Y_LIMITS)
-            ax.imshow(
-                np.flipud(grid), origin="lower",
-                extent=[X_LIMITS[0], X_LIMITS[1], Y_LIMITS[0], Y_LIMITS[1]],
-                cmap=matplotlib.colors.LinearSegmentedColormap.from_list("c", ["white", color]),
-                aspect="auto", interpolation="nearest",
+        used_bb = _plot_backbone_background(
+            ax, backbone_path, zorder=0, hole_color=FORWARD_PA_HOLE_COLOR,
+        )
+        if not used_bb:
+            region_proj.plot(
+                ax=ax, color=FORWARD_PA_HOLE_COLOR, edgecolor="none",
+                linewidth=0, zorder=0,
             )
-        ax.set_xlim(X_LIMITS)
-        ax.set_ylim(Y_LIMITS)
+        if mask.any():
+            grid, gext = points_to_raster(
+                xm[mask], ym[mask],
+                np.ones(int(mask.sum()), dtype=np.float32),
+                target_resolution=1000.0,
+                agg_func="max",
+                extent_bounds=proj_bounds,
+            )
+            cmap_fp = mcolors.LinearSegmentedColormap.from_list("fp", ["#ffffff", color])
+            ax.imshow(
+                np.where(np.isnan(grid), np.nan, 1.0),
+                extent=gext,
+                cmap=cmap_fp,
+                vmin=0.0,
+                vmax=1.0,
+                origin="upper",
+                interpolation="nearest",
+                aspect="equal",
+                alpha=0.88,
+                zorder=2,
+            )
+        ax.set_xlim(proj_bounds[0], proj_bounds[2])
+        ax.set_ylim(proj_bounds[1], proj_bounds[3])
+        ax.set_aspect("equal", adjustable="box")
+        _add_latlon_ticks(ax, (proj_bounds[0], proj_bounds[2]), (proj_bounds[1], proj_bounds[3]))
         ax.set_title(title, fontsize=10)
         ax.set_xlabel("Longitude")
         ax.set_ylabel("Latitude")
+        ax.grid(True, alpha=0.25, linestyle="--", linewidth=0.5, zorder=3)
         n_px = int(mask.sum())
-        ax.text(0.02, 0.02, f"{n_px:,} pixels", transform=ax.transAxes,
-                fontsize=8, bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7))
+        ax.text(
+            0.02, 0.02, f"{n_px:,} pixels", transform=ax.transAxes,
+            fontsize=8, bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7),
+        )
 
-    plt.tight_layout()
+    plt.tight_layout(pad=0.5)
     stem = output_dir / f"forward_backtest_T{origin_year}_false_positives"
     for ext in ["pdf", "png"]:
-        plt.savefig(f"{stem}.{ext}", dpi=150, bbox_inches="tight")
+        plt.savefig(f"{stem}.{ext}", dpi=FP_MAP_DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {stem}.pdf")
 
@@ -976,6 +1019,7 @@ def run_single_origin(
     split_paths: List[Path],
     panel_path: Path,
     output_dir: Path,
+    repo_root: Path,
     wb: WandbRunLogger | None = None,
 ) -> Dict[str, Any]:
     T = origin_year
@@ -1075,7 +1119,19 @@ def run_single_origin(
 
     # False-positive spatial analysis (only for clean 5-year windows)
     if clean_window:
-        create_false_positive_map(y_proba, label_5yr, evaluable, xy, T, output_dir)
+        forward_dir = output_dir.parent
+        baseline_path = forward_dir / "forward_coverage_baseline.json"
+        baseline_bt: Dict[str, Any] = {}
+        if baseline_path.exists():
+            with open(baseline_path) as f:
+                baseline_bt = json.load(f)
+        else:
+            print(
+                f"  NOTE: {baseline_path.name} not found — FP map uses repo/scratch backbone paths only",
+            )
+        create_false_positive_map(
+            y_proba, label_5yr, evaluable, xy, T, output_dir, repo_root, baseline_bt,
+        )
 
     del y_proba, label_5yr, evaluable, row_col
     gc.collect()
@@ -1198,7 +1254,7 @@ def main() -> None:
 
     result = run_single_origin(
         origin_year, model_type, best_params_lgbm, best_params_rf,
-        feature_cols, split_paths, panel_path, output_dir, wb=wb,
+        feature_cols, split_paths, panel_path, output_dir, repo_root, wb=wb,
     )
     _log: dict = {
         "backtest/origin_year":    origin_year,

@@ -28,6 +28,11 @@ PROFILE = {
         ],
         "wdpa_2024_filename": "WDPA_SA_1km_2024.tif",
         "wdpa_2019_filename": "WDPA_SA_1km_2019.tif",
+        "probability_map_percentile_min": 40,
+        "probability_map_percentile_max": 99.5,
+        "probability_map_transformation": "linear",
+        "probability_map_display_gamma": 1.0,
+        "forward_pa_hole_color": "#505050",
     },
     "usa": {
         "region_slug": "usa",
@@ -46,6 +51,11 @@ PROFILE = {
         ],
         "wdpa_2024_filename": "WDPA_USA_1km_2024.tif",
         "wdpa_2019_filename": "WDPA_USA_1km_2019.tif",
+        "probability_map_percentile_min": 0,
+        "probability_map_percentile_max": 99.9,
+        "probability_map_transformation": "log",
+        "probability_map_display_gamma": 1.28,
+        "forward_pa_hole_color": "#505050",
     },
     "se_asia": {
         "region_slug": "se_asia",
@@ -67,6 +77,11 @@ PROFILE = {
         ],
         "wdpa_2024_filename": "WDPA_SEA_1km_2024.tif",
         "wdpa_2019_filename": "WDPA_SEA_1km_2019.tif",
+        "probability_map_percentile_min": 40,
+        "probability_map_percentile_max": 99.5,
+        "probability_map_transformation": "linear",
+        "probability_map_display_gamma": 1.0,
+        "forward_pa_hole_color": "#505050",
     },
 }[RUN_REGION]
 
@@ -81,6 +96,11 @@ OUTPUTS_SUBDIR  = PROFILE["outputs_subdir"]
 HOTSPOT_REGIONS = PROFILE["hotspot_regions"]
 WDPA_2024_FILENAME = PROFILE["wdpa_2024_filename"]
 WDPA_2019_FILENAME = PROFILE["wdpa_2019_filename"]
+PROBABILITY_MAP_PERCENTILE_MIN = PROFILE["probability_map_percentile_min"]
+PROBABILITY_MAP_PERCENTILE_MAX = PROFILE["probability_map_percentile_max"]
+PROBABILITY_MAP_TRANSFORMATION = PROFILE["probability_map_transformation"]
+PROBABILITY_MAP_DISPLAY_GAMMA = PROFILE["probability_map_display_gamma"]
+FORWARD_PA_HOLE_COLOR = PROFILE["forward_pa_hole_color"]
 
 
 def get_repo_root() -> Path:

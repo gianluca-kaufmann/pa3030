@@ -1089,6 +1089,7 @@ def _plot_backbone_background(
     ax,
     backbone_path: Optional[Path],
     zorder: int = 0,
+    hole_color: Optional[str] = None,
 ) -> bool:
     """Plot the backbone raster as the gray background layer for PA holes.
 
@@ -1100,7 +1101,8 @@ def _plot_backbone_background(
     genuine PA holes visible in gray.
 
     Returns True if the backbone was plotted successfully, False if the caller
-    should fall back to the Natural Earth polygon.
+    should fall back to the region hull polygon (no country outlines;
+    ``get_region_boundary`` / GeoJSON), filled with *hole_color*.
     """
     if backbone_path is None:
         return False
@@ -1120,10 +1122,11 @@ def _plot_backbone_background(
         backbone_masked = np.ma.masked_invalid(backbone_float)
 
         from matplotlib.colors import ListedColormap
+        fill_color = hole_color if hole_color is not None else PA_HOLE_COLOR
         ax.imshow(
             backbone_masked,
             extent=extent,
-            cmap=ListedColormap([PA_HOLE_COLOR]),
+            cmap=ListedColormap([fill_color]),
             vmin=0.5, vmax=1.5,
             origin='upper',
             interpolation='nearest',
@@ -1133,13 +1136,15 @@ def _plot_backbone_background(
         print(f"  Backbone background plotted from: {backbone_path}")
         return True
     except Exception as exc:
-        print(f"  Warning: could not plot backbone raster ({exc}); falling back to Natural Earth polygon.")
+        print(f"  Warning: could not plot backbone raster ({exc}); use region hull fallback (no backbone).")
         return False
 
 
 def points_to_raster(x: np.ndarray, y: np.ndarray, values: np.ndarray,
                      target_resolution: Optional[float] = None,
-                     agg_func: str = 'mean') -> tuple[np.ndarray, tuple]:
+                     agg_func: str = 'mean',
+                     extent_bounds: Optional[tuple[float, float, float, float]] = None,
+                     ) -> tuple[np.ndarray, tuple]:
     """Convert point data to a raster grid for pixel-perfect visualization.
     
     Uses histogram-based binning for maximum precision and performance.
@@ -1153,14 +1158,22 @@ def points_to_raster(x: np.ndarray, y: np.ndarray, values: np.ndarray,
         target_resolution: Target resolution in same units as coordinates. If None, auto-detects from data.
         agg_func: Aggregation for points in same cell: 'mean' (default) or 'max'.
                   Use 'max' for categorical rasters so overlap wins (e.g. risk map).
+        extent_bounds: Optional (xmin, xmax, ymin, ymax) in the same CRS as x/y.
+            When set, the raster grid covers this box exactly (no extra padding),
+            so stacked map layers share the same geometry.
     
     Returns:
         Tuple of (raster_array, extent) where extent is (xmin, xmax, ymin, ymax)
         Raster array has shape (nrows, ncols) and may contain NaN for empty cells
     """
     # Calculate bounds
-    x_min, x_max = x.min(), x.max()
-    y_min, y_max = y.min(), y.max()
+    if extent_bounds is not None:
+        x_min, x_max, y_min, y_max = extent_bounds
+    elif len(x) > 0:
+        x_min, x_max = float(x.min()), float(x.max())
+        y_min, y_max = float(y.min()), float(y.max())
+    else:
+        raise ValueError("points_to_raster: empty coordinates and extent_bounds not provided")
     
     # Determine grid resolution
     if target_resolution is None:
@@ -1197,14 +1210,23 @@ def points_to_raster(x: np.ndarray, y: np.ndarray, values: np.ndarray,
     y_res = min(y_res, (y_max - y_min) / 100)
     
     # Create grid edges
-    # Extend slightly beyond bounds to ensure all points are included
-    padding = max(x_res, y_res) * 0.1
+    if extent_bounds is not None:
+        padding = 0.0
+    else:
+        # Extend slightly beyond bounds to ensure all points are included
+        padding = max(x_res, y_res) * 0.1
     x_edges = np.arange(x_min - padding, x_max + padding + x_res, x_res)
     y_edges = np.arange(y_min - padding, y_max + padding + y_res, y_res)
     
     # Calculate grid dimensions
     ncols = len(x_edges) - 1
     nrows = len(y_edges) - 1
+
+    if len(x) == 0:
+        raster = np.full((nrows, ncols), np.nan, dtype=np.float32)
+        raster = np.flipud(raster)
+        extent = (x_edges[0], x_edges[-1], y_edges[0], y_edges[-1])
+        return raster, extent
     
     # Use digitize for binning (no pandas - pure NumPy for 47M+ row scalability)
     x_idx = np.digitize(x, x_edges) - 1
