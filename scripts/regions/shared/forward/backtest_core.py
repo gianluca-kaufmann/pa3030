@@ -226,6 +226,7 @@ def create_false_positive_map(
         )
 
     plt.tight_layout(pad=0.5)
+    output_dir.mkdir(parents=True, exist_ok=True)
     stem = output_dir / f"forward_backtest_T{origin_year}_false_positives"
     for ext in ["pdf", "png"]:
         plt.savefig(f"{stem}.{ext}", dpi=FP_MAP_DPI, bbox_inches="tight")
@@ -967,6 +968,7 @@ def compute_backtest_metrics(y_true: np.ndarray, y_proba: np.ndarray, label: str
 # ── Plotting ──────────────────────────────────────────────────────────────────
 
 def plot_backtest_precision(all_results: List[Dict], output_dir: Path, model_type: str) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
     clean   = [r for r in all_results if r.get("clean_5yr_window")]
     partial = [r for r in all_results if not r.get("clean_5yr_window") and r.get("metrics")]
 
@@ -1022,6 +1024,7 @@ def run_single_origin(
     repo_root: Path,
     wb: WandbRunLogger | None = None,
 ) -> Dict[str, Any]:
+    output_dir.mkdir(parents=True, exist_ok=True)
     T = origin_year
     train_range = (2001, T - LOOKAHEAD_YEARS)  # mirrors deployment: train ends at T-5
     clean_window = (T + LOOKAHEAD_YEARS) <= WDPA_LAST_YEAR

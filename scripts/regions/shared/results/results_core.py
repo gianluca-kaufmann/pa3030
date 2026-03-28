@@ -410,6 +410,7 @@ def create_false_positive_map(
                 bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7))
 
     plt.tight_layout()
+    output_dir.mkdir(parents=True, exist_ok=True)
     for ext in ["pdf", "png"]:
         p = output_dir / f"false_positive_map.{ext}"
         plt.savefig(p, dpi=150, bbox_inches="tight")
