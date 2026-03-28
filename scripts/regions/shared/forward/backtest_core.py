@@ -235,10 +235,12 @@ def create_false_positive_map(
 
 
 ORIGIN_YEARS = [2019]
-# Tree counts can be overridden via env vars (set lower in SLURM scripts for faster backtests).
-# Defaults preserve backward-compatible behaviour; SLURM scripts set optimised values.
+# LGBM: N_EST_BACKTEST_LGBM is the fallback num_boost_round only when n_estimators
+#       is absent from lgbm_best_params.json (optional faster runs).
+# RF:    n_estimators follow rf_best_params.json like deployment training. Set
+#       N_EST_BACKTEST_RF only to force a different tree count (e.g. faster jobs).
 N_ESTIMATORS_LOCKED_LGBM = int(os.environ.get("N_EST_BACKTEST_LGBM", "2555"))
-N_ESTIMATORS_LOCKED_RF   = int(os.environ.get("N_EST_BACKTEST_RF",   "500"))
+DEFAULT_RF_N_ESTIMATORS_BACKTEST = 400
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "200_000"))
 # RF negative cap: set via SLURM to avoid OOM (sklearn RF needs full X in RAM).
 # 0 = no cap (uncapped, matches LGBM behaviour but risks OOM for large regions).
@@ -321,26 +323,55 @@ def resolve_split_parquets(data_subdir: str) -> List[Path]:
 
 
 def resolve_best_params_json(model_prefix: str, data_subdir: str, model_type: str) -> Optional[Path]:
-    """Find {model_type}_best_params.json for the given region."""
-    repo_root = get_repo_root()
-    # The training script lives at scripts/regions/{data_subdir}/5_training/
-    training_dir = repo_root / f"scripts/regions/{data_subdir}/5_training"
-    scratch = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
+    """Find {model_type}_best_params.json for the given region.
 
+    Search order matches evaluation training scripts: 5_training, 5_training/tuning/,
+    4_tuning, then scratch mirrors (and scratch root fallback).
+    """
+    _ = model_prefix  # reserved for future per-model filenames
+    repo_root = get_repo_root()
+    scratch = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
     json_name = f"{model_type}_best_params.json"
-    candidates = [training_dir / json_name]
+    training_dir = repo_root / f"scripts/regions/{data_subdir}/5_training"
+    tuning_dir = repo_root / f"scripts/regions/{data_subdir}/4_tuning"
+
+    candidates: list[Path] = [
+        training_dir / json_name,
+        training_dir / "tuning" / json_name,
+        tuning_dir / json_name,
+    ]
     if scratch is not None:
-        candidates.append(
-            scratch / f"scripts/regions/{data_subdir}/5_training/{json_name}"
+        candidates.extend(
+            [
+                scratch / f"scripts/regions/{data_subdir}/5_training/{json_name}",
+                scratch / f"scripts/regions/{data_subdir}/5_training/tuning/{json_name}",
+                scratch / f"scripts/regions/{data_subdir}/4_tuning/{json_name}",
+                scratch / json_name,
+            ]
         )
-    candidates.append(repo_root / f"scripts/regions/{data_subdir}/5_training/{json_name}")
+
+    seen: set[Path] = set()
     for c in candidates:
+        if c in seen:
+            continue
+        seen.add(c)
         if c.exists():
             return c
     return None
 
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
+
+def _sanitize_rf_param_keys(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip sklearn Pipeline-style ``rf__`` prefixes (same as model1_RF / deployment)."""
+    out: Dict[str, Any] = {}
+    for key, value in params.items():
+        if key.startswith("rf__"):
+            out[key.replace("rf__", "", 1)] = value
+        else:
+            out[key] = value
+    return out
+
 
 def load_best_params_lgbm(params_path: Optional[Path], num_threads: int) -> Dict[str, Any]:
     if params_path is None:
@@ -364,7 +395,7 @@ def load_best_params_lgbm(params_path: Optional[Path], num_threads: int) -> Dict
 
 def load_best_params_rf(params_path: Optional[Path], n_jobs: int) -> Dict[str, Any]:
     defaults = {
-        "n_estimators": N_ESTIMATORS_LOCKED_RF,
+        "n_estimators": DEFAULT_RF_N_ESTIMATORS_BACKTEST,
         "max_depth": None,
         "min_samples_leaf": 1,
         "max_features": "sqrt",
@@ -376,14 +407,18 @@ def load_best_params_rf(params_path: Optional[Path], n_jobs: int) -> Dict[str, A
         with open(params_path) as f:
             data = json.load(f)
         if isinstance(data, dict) and "best_params" in data:
-            loaded = {**data.get("fixed_params", {}), **data["best_params"]}
+            loaded = {
+                **_sanitize_rf_param_keys(data.get("fixed_params", {})),
+                **_sanitize_rf_param_keys(data["best_params"]),
+            }
         else:
-            loaded = data if isinstance(data, dict) else {}
+            loaded = _sanitize_rf_param_keys(data) if isinstance(data, dict) else {}
         params = {**defaults, **loaded}
-    # For backtest, use the locked RF estimator count (faster)
-    params["n_estimators"] = N_ESTIMATORS_LOCKED_RF
     params["random_state"] = RANDOM_STATE
     params["n_jobs"] = n_jobs
+    env_n_est = os.environ.get("N_EST_BACKTEST_RF")
+    if env_n_est is not None and str(env_n_est).strip() != "":
+        params["n_estimators"] = int(env_n_est)
     return params
 
 
