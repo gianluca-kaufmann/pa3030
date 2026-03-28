@@ -1,0 +1,187 @@
+drwxr-xr-x 10 gikaufmann gikaufmann-group 4096 Mar 18 15:57 /cluster/home/gikaufmann/master_thesis
+PWD = /cluster/home/gikaufmann/master_thesis
+
+=========================================================================
+Stage 0b: Training USA RF deployment model (2001-2019)...
+=========================================================================
+W&B connected — run: https://wandb.ai/gikaufmann-eth-z-rich/forward/runs/8bhtjjbj
+======================================================================
+MODEL 2 RF — DEPLOYMENT MODEL (2001-2019)
+======================================================================
+  train:     /cluster/scratch/gikaufmann/data/usa/ml/main/train_win5.parquet
+  earlystop: /cluster/scratch/gikaufmann/data/usa/ml/main/earlystop_win5.parquet
+  test:      /cluster/scratch/gikaufmann/data/usa/ml/main/test_win5.parquet
+  params:    /cluster/home/gikaufmann/master_thesis/scripts/regions/usa/5_training/rf_best_params.json
+  n_jobs:    32
+  MAX_NEG_TRAIN: 30000000
+
+  n_estimators: 300
+
+  Feature columns: 73
+
+======================================================================
+STEP 1: TRAINING DEPLOYMENT MODEL (2001-2019)
+======================================================================
+  [Memory before loading deployment training data] RSS: 0.34 GB
+  Pass 1: counting rows (deployment_train, years 2001–2019)…
+    360,885 pos / 269,900,690 neg → capping neg to 30,000,000
+    Using 30,360,885 samples (360,885 pos / 30,000,000 neg)
+  Loaded 30,360,885 rows in 2014.7s (30,000,000 neg / 360,885 pos)
+  [Memory after loading deployment training data] RSS: 9.21 GB
+
+  Training RF deployment model — 30,360,885 samples (360,885 pos / 30,000,000 neg)
+    bootstrap: True
+    class_weight: balanced_subsample
+    max_depth: None
+    max_features: sqrt
+    min_samples_leaf: 7
+    min_samples_split: 23
+    n_estimators: 300
+    n_jobs: 32
+    random_state: 42
+    verbose: 0
+  Done in 7058.7s
+  [Memory after training deployment model] RSS: 11.58 GB
+
+======================================================================
+DEPLOYMENT CALIBRATION SPLIT (RF)
+  Auxiliary model train: 2001–2016
+  Calibration held-out:  2017–2019
+======================================================================
+  Pass 1: counting rows (aux_train, years 2001–2016)…
+    346,098 pos / 233,148,644 neg → capping neg to 30,000,000
+    Using 30,346,098 samples (346,098 pos / 30,000,000 neg)
+  Loaded 30,346,098 rows in 1711.1s (30,000,000 neg / 346,098 pos)
+
+  Training RF auxiliary calibration model — 30,346,098 samples (346,098 pos / 30,000,000 neg)
+    bootstrap: True
+    class_weight: balanced_subsample
+    max_depth: None
+    max_features: sqrt
+    min_samples_leaf: 7
+    min_samples_split: 23
+    n_estimators: 300
+    n_jobs: 32
+    random_state: 42
+    verbose: 0
+  Done in 6570.7s
+
+Scoring calibration held-out set…
+  Pass 1: counting rows (aux_calib, years 2017–2019)…
+    Using 36,766,833 samples (14,787 pos / 36,752,046 neg)
+  Loaded 36,766,833 rows in 75.9s (36,752,046 neg / 14,787 pos)
+  Aux RF on calib set: PR-AUC 0.4233, ROC-AUC 0.9984, P@1% 0.0395
+
+Fitting Platt calibrator…
+Fitting isotonic calibrator…
+  Brier score — raw: 0.000467, Platt: 0.000292, isotonic: 0.000284
+  [Memory after fitting calibrators] RSS: 12.28 GB
+
+Saved deployment artifact: /cluster/home/gikaufmann/master_thesis/data/usa/ml/models/model2_rf_deployment_20260328_013851.pkl
+
+======================================================================
+SUMMARY
+======================================================================
+  Model:           RandomForest deployment (2001-2019)
+  Features:        73
+  Train samples:   30,360,885 (360,885 pos / 30,000,000 neg)
+  n_estimators:    300
+  class_weight:    balanced_subsample (no temporal weighting)
+  Calibrators:     Platt + isotonic (deployment calibration split)
+  Artifact:        /cluster/home/gikaufmann/master_thesis/data/usa/ml/models/model2_rf_deployment_20260328_013851.pkl
+  Total time:      17547.1s (292.5min)
+======================================================================
+
+Log saved: /cluster/home/gikaufmann/master_thesis/outputs/usa/results/forward/model2_rf_deployment_20260328_013851.txt
+Stage 0b complete.
+
+=========================================================================
+Stage 1: Extracting 2024 inference features...
+=========================================================================
+W&B connected — run: https://wandb.ai/gikaufmann-eth-z-rich/forward/runs/3npqyj8n
+
+======================================================================
+EXTRACTING 2024 INFERENCE FEATURES (year=2024)
+======================================================================
+  Source: /cluster/scratch/gikaufmann/data/usa/ml/merged_panel_final.parquet
+
+  Feature columns:  73
+  Coordinate cols:  ['x', 'y']
+
+  Pass 1: counting year==2024, WDPA_prev==0, WDPA==0 rows…
+  Found 12,218,241 qualifying pixels
+
+  Pass 2: streaming and writing to forward_features_2024.parquet…
+  0% — 36,259/12,218,241
+  26% — 3,232,346/12,218,241
+  50% — 6,224,752/12,218,241
+  75% — 9,220,333/12,218,241
+  100% — 12,218,241/12,218,241
+
+  Written: 12,218,241 rows → /cluster/home/gikaufmann/master_thesis/outputs/usa/results/forward/forward_features_2024.parquet
+  Columns: ['row', 'col', 'x', 'y', 'elevation_b1'] … (77 total)
+
+Done. Output: /cluster/home/gikaufmann/master_thesis/outputs/usa/results/forward/forward_features_2024.parquet
+Stage 1 complete.
+
+=========================================================================
+Stage 2: Running calibrated RF forward inference...
+=========================================================================
+W&B connected — run: https://wandb.ai/gikaufmann-eth-z-rich/forward/runs/xkuxraxn
+
+======================================================================
+FORWARD INFERENCE — 2024 (RF)
+======================================================================
+  Features:   /cluster/home/gikaufmann/master_thesis/outputs/usa/results/forward/forward_features_2024.parquet
+  Artifact:   /cluster/scratch/gikaufmann/data/usa/ml/models/model2_rf_deployment_20260328_013851.pkl
+  Model type: rf
+
+Loading deployment artifact…
+  Model trained on years: [2001, 2019]
+  feature_cols:           73
+  calibrators:            platt=True, isotonic=True
+  [Memory after loading artifact] RSS: 2.48 GB
+
+Pass 1: counting rows…
+  12,218,241 inference pixels
+
+Pass 2: inference → forward_scored_2024.parquet…
+  4% — 500,000/12,218,241
+  [Memory   4%] RSS: 3.45 GB
+  12% — 1,500,000/12,218,241
+  [Memory   12%] RSS: 3.50 GB
+  20% — 2,500,000/12,218,241
+  [Memory   20%] RSS: 3.51 GB
+  32% — 4,000,000/12,218,241
+  [Memory   32%] RSS: 3.57 GB
+  40% — 5,000,000/12,218,241
+  [Memory   40%] RSS: 3.56 GB
+  53% — 6,500,000/12,218,241
+  [Memory   53%] RSS: 3.58 GB
+  61% — 7,500,000/12,218,241
+  [Memory   61%] RSS: 3.56 GB
+  73% — 9,000,000/12,218,241
+  [Memory   73%] RSS: 3.58 GB
+  81% — 10,000,000/12,218,241
+  [Memory   81%] RSS: 3.56 GB
+  90% — 11,000,000/12,218,241
+  [Memory   90%] RSS: 3.59 GB
+  100% — 12,218,241/12,218,241
+  [Memory   100%] RSS: 3.59 GB
+
+Written: 12,218,241 rows → /cluster/home/gikaufmann/master_thesis/outputs/usa/results/forward/rf/forward_scored_2024.parquet
+
+Sampling calibrated probability statistics…
+  min:    0.000000
+  p50:    0.000000
+  p95:    0.000031
+  p99:    0.000129
+  max:    0.998805
+
+Done. Output: /cluster/home/gikaufmann/master_thesis/outputs/usa/results/forward/rf/forward_scored_2024.parquet
+Stage 2 complete.
+
+forward_deployment_rf (USA RF) job finished. Next steps:
+  1. Run 1_forward_coverage_baseline.py (if not already done)
+  2. Run 4_forward_results.py --model-type rf for maps and scenario analysis
+  3. Run forward_backtest_rf.slurm (usa) for RF backtesting validation

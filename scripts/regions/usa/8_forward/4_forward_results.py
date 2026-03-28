@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Stage 3: USA forward results — maps, scenarios, breakdowns (thin wrapper).
 
-Passes --model-type lgbm|rf from command line.
+Default model type: PA3030_FORWARD_MODEL_TYPE env (else lgbm).
+Override: --model-type lgbm|rf
 """
+import os
 import sys
 from pathlib import Path
 
@@ -13,7 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 from scripts.regions.shared.forward import run_region_forward
 
 if __name__ == "__main__":
-    model_type = "lgbm"
+    model_type = os.environ.get("PA3030_FORWARD_MODEL_TYPE", "lgbm").strip().lower()
     args = sys.argv[1:]
     if "--model-type" in args:
         idx = args.index("--model-type")
