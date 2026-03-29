@@ -71,6 +71,7 @@ from scripts.regions.shared.forward.config import (  # noqa: E402
     MODEL_PREFIX,
     OUTPUTS_SUBDIR,
     get_repo_root,
+    resolve_forward_dir,
 )
 from scripts.regions.shared.training.utils import (  # noqa: E402
     WandbRunLogger,
@@ -1199,7 +1200,12 @@ def aggregate_backtest_results(output_dir: Path) -> List[Dict]:
 
 def main() -> None:
     # Re-import config after runner.py reload
-    from scripts.regions.shared.forward.config import DATA_SUBDIR, MODEL_PREFIX, OUTPUTS_SUBDIR  # noqa: F401
+    from scripts.regions.shared.forward.config import (  # noqa: F401
+        DATA_SUBDIR,
+        MODEL_PREFIX,
+        OUTPUTS_SUBDIR,
+        resolve_forward_dir,
+    )
 
     model_type = os.environ.get("PA3030_FORWARD_MODEL_TYPE", "lgbm").strip().lower()
 
@@ -1217,7 +1223,7 @@ def main() -> None:
         model_type = args.model_type.strip().lower()
 
     repo_root   = get_repo_root()
-    forward_dir = repo_root / f"outputs/{OUTPUTS_SUBDIR}/results/forward"
+    forward_dir = resolve_forward_dir(repo_root, OUTPUTS_SUBDIR)
     output_dir  = forward_dir / model_type
     output_dir.mkdir(parents=True, exist_ok=True)
 

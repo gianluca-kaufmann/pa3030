@@ -103,8 +103,14 @@ PROBABILITY_MAP_DISPLAY_GAMMA = PROFILE["probability_map_display_gamma"]
 FORWARD_PA_HOLE_COLOR = PROFILE["forward_pa_hole_color"]
 
 
+# ── Path layout (scratch-first on Euler) ─────────────────────────────────────
+# Same idea as ModelEvalConfig (evaluation/config.py): when SCRATCH is set,
+# large artifacts use $SCRATCH/data/... and $SCRATCH/outputs/... instead of home.
+# Optional overrides: PA3030_FORWARD_OUTPUT_DIR, PA3030_ML_MODELS_DIR (absolute paths).
+
+
 def get_repo_root() -> Path:
-    """Get repository root directory."""
+    """Repository root (PROJECT_ROOT / REPO_ROOT, or search upward for README.md)."""
     env_root = os.environ.get("PROJECT_ROOT") or os.environ.get("REPO_ROOT")
     if env_root:
         return Path(env_root).resolve()
@@ -123,3 +129,53 @@ def get_repo_root() -> Path:
         f"Repository root not found. Searched upward from {script_dir} for README.md.\n"
         "Set PROJECT_ROOT or REPO_ROOT environment variable, or ensure README.md exists in repo root."
     )
+
+
+def _repo_forward_dir(repo_root: Path, outputs_subdir: str) -> Path:
+    return repo_root / f"outputs/{outputs_subdir}/results/forward"
+
+
+def resolve_forward_dir(repo_root: Path, outputs_subdir: str) -> Path:
+    """Forward outputs root: features parquet, baseline JSON, lgbm/ | rf/ subdirs."""
+    override = os.environ.get("PA3030_FORWARD_OUTPUT_DIR", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    scratch = os.environ.get("SCRATCH", "").strip()
+    if scratch:
+        return (Path(scratch) / f"outputs/{outputs_subdir}/results/forward").resolve()
+    return _repo_forward_dir(repo_root, outputs_subdir).resolve()
+
+
+def forward_dir_search_paths(repo_root: Path, outputs_subdir: str) -> list[Path]:
+    """Read order: primary (scratch policy), then legacy repo path."""
+    primary = resolve_forward_dir(repo_root, outputs_subdir)
+    legacy = _repo_forward_dir(repo_root, outputs_subdir).resolve()
+    out: list[Path] = [primary]
+    if legacy != primary:
+        out.append(legacy)
+    return out
+
+
+def _repo_ml_models_dir(repo_root: Path, data_subdir: str) -> Path:
+    return repo_root / f"data/{data_subdir}/ml/models"
+
+
+def resolve_ml_models_dir(repo_root: Path, data_subdir: str) -> Path:
+    """Deployment *.pkl directory (data/.../ml/models)."""
+    override = os.environ.get("PA3030_ML_MODELS_DIR", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    scratch = os.environ.get("SCRATCH", "").strip()
+    if scratch:
+        return (Path(scratch) / f"data/{data_subdir}/ml/models").resolve()
+    return _repo_ml_models_dir(repo_root, data_subdir).resolve()
+
+
+def ml_models_dir_search_paths(repo_root: Path, data_subdir: str) -> list[Path]:
+    """Read order for *_deployment_*.pkl: scratch policy, then repo."""
+    primary = resolve_ml_models_dir(repo_root, data_subdir)
+    legacy = _repo_ml_models_dir(repo_root, data_subdir).resolve()
+    out: list[Path] = [primary]
+    if legacy != primary:
+        out.append(legacy)
+    return out

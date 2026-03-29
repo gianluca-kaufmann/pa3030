@@ -16,6 +16,7 @@ Deployment calibration split:
 
 Outputs:
   data/usa/ml/models/model2_rf_deployment_{timestamp}.pkl
+      (resolve_ml_models_dir — $SCRATCH/data/.../ml/models on Euler when SCRATCH is set)
       Pickle dict:
         {
           'model':        RandomForestClassifier (deployment model, 2001-2019),
@@ -26,7 +27,7 @@ Outputs:
           'metadata':     dict,
         }
   outputs/usa/results/forward/model2_rf_deployment_{timestamp}.txt
-      Run log.
+      Run log (resolve_forward_dir — $SCRATCH/outputs/.../forward on Euler when set).
 """
 
 from __future__ import annotations
@@ -56,6 +57,7 @@ if str(_repo_root) not in sys.path:
 del _repo_root
 # ─────────────────────────────────────────────────────────────────────────────
 
+from scripts.regions.shared.forward.config import resolve_forward_dir, resolve_ml_models_dir  # noqa: E402
 from scripts.regions.shared.training.utils import (  # noqa: E402
     WandbRunLogger,
     Tee,
@@ -425,8 +427,8 @@ def main() -> None:
     all_paths      = [train_path, earlystop_path, test_path]
     params_path    = resolve_best_params_json()
 
-    model_dir  = repo_root / "data/usa/ml/models"
-    output_dir = repo_root / "outputs/usa/results/forward"
+    model_dir  = resolve_ml_models_dir(repo_root, "usa")
+    output_dir = resolve_forward_dir(repo_root, "usa")
     model_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -535,7 +537,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     repo_root = get_repo_root()
-    output_dir = repo_root / "outputs/usa/results/forward"
+    output_dir = resolve_forward_dir(repo_root, "usa")
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = output_dir / f"model2_rf_deployment_{timestamp}.txt"

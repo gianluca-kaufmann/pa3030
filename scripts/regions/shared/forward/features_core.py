@@ -15,6 +15,7 @@ Selects the same numeric training features (minus EXCLUDE_COLS) plus the y
 
 Output:
     outputs/{region}/results/forward/forward_features_2024.parquet
+    (under repo, or $SCRATCH/outputs/.../forward when SCRATCH is set — see resolve_forward_dir)
     (columns: row, col, x, y, <feature cols>)
 """
 
@@ -36,7 +37,12 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from scripts.regions.shared.forward.config import DATA_SUBDIR, OUTPUTS_SUBDIR, get_repo_root  # noqa: E402
+from scripts.regions.shared.forward.config import (  # noqa: E402
+    DATA_SUBDIR,
+    OUTPUTS_SUBDIR,
+    get_repo_root,
+    resolve_forward_dir,
+)
 from scripts.regions.shared.training.utils import WandbRunLogger  # noqa: E402
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -204,7 +210,11 @@ def main() -> None:
     from datetime import datetime as _dt
 
     # Re-import config after runner.py reload
-    from scripts.regions.shared.forward.config import DATA_SUBDIR, OUTPUTS_SUBDIR  # noqa: F401
+    from scripts.regions.shared.forward.config import (  # noqa: F401
+        DATA_SUBDIR,
+        OUTPUTS_SUBDIR,
+        resolve_forward_dir,
+    )
 
     _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
     wb = WandbRunLogger(
@@ -217,7 +227,7 @@ def main() -> None:
 
     repo_root = get_repo_root()
     panel_path = resolve_panel(DATA_SUBDIR)
-    output_dir = repo_root / f"outputs/{OUTPUTS_SUBDIR}/results/forward"
+    output_dir = resolve_forward_dir(repo_root, OUTPUTS_SUBDIR)
     out_path, n_rows, n_feat, panel_s = extract_2024_features(panel_path, output_dir, wb=wb)
     print(f"\nDone. Output: {out_path}")
     wb.log(

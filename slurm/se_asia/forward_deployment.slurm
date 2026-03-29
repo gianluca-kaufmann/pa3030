@@ -48,6 +48,8 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 export WANDB_MODE="${WANDB_MODE:-online}"
+export WANDB_DIR="${WANDB_DIR:-$SCRATCH/wandb}"
+mkdir -p "$WANDB_DIR"
 export MAX_NEG_TRAIN=100000000
 
 #------------------------------------------------------------------------------

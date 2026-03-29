@@ -30,7 +30,13 @@ del _repo_root
 import numpy as np
 import rasterio
 
-from scripts.regions.shared.forward.config import DATA_SUBDIR, OUTPUTS_SUBDIR, REGION_LABEL, get_repo_root  # noqa: E402
+from scripts.regions.shared.forward.config import (  # noqa: E402
+    DATA_SUBDIR,
+    OUTPUTS_SUBDIR,
+    REGION_LABEL,
+    get_repo_root,
+    resolve_forward_dir,
+)
 from scripts.regions.shared.geo_utils import pixel_area_km2  # noqa: E402
 from scripts.regions.shared.training.utils import WandbRunLogger  # noqa: E402
 
@@ -296,6 +302,7 @@ def main() -> None:
         REGION_LABEL,
         WDPA_2019_FILENAME,
         WDPA_2024_FILENAME,
+        resolve_forward_dir,
     )
 
     _ts = _dt.now().strftime("%Y%m%d_%H%M%S")
@@ -310,7 +317,7 @@ def main() -> None:
     repo_root = get_repo_root()
     backbone_path = resolve_raster("backbone.tif", DATA_SUBDIR, subdirs=["backbone"])
     wdpa_2024_path = resolve_raster(WDPA_2024_FILENAME, DATA_SUBDIR, subdirs=["WDPA", "wdpa"])
-    output_dir = repo_root / f"outputs/{OUTPUTS_SUBDIR}/results/forward"
+    output_dir = resolve_forward_dir(repo_root, OUTPUTS_SUBDIR)
     baseline = compute_coverage_baseline(
         backbone_path, wdpa_2024_path, output_dir,
         data_subdir=DATA_SUBDIR,

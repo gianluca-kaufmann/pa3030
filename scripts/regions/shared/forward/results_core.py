@@ -25,7 +25,8 @@ Summary JSON
 All km² figures use pixel_area_km2() with pixel_size_m extracted from the
 backbone raster transform.
 
-Outputs are written to outputs/{region}/results/forward/{model_type}/.
+Outputs are written under resolve_forward_dir (repo or $SCRATCH/outputs/.../forward
+when SCRATCH is set) in the {model_type}/ subfolder.
 """
 
 from __future__ import annotations
@@ -67,6 +68,7 @@ from scripts.regions.shared.forward.config import (  # noqa: E402
     PROBABILITY_MAP_PERCENTILE_MIN,
     PROBABILITY_MAP_TRANSFORMATION,
     REGION_LABEL,
+    forward_dir_search_paths,
     get_repo_root,
 )
 # Training-style boundaries expect PA3030_RESULTS_REGION to match forward region
@@ -99,25 +101,31 @@ RAW_COL   = "y_pred_proba_raw"
 
 # ── Path helpers ──────────────────────────────────────────────────────────────
 
-def resolve_scored_parquet(model_output_dir: Path) -> Path:
-    cand = model_output_dir / "forward_scored_2024.parquet"
-    if cand.exists():
-        return cand
+def resolve_scored_parquet(forward_dirs: List[Path], model_type: str) -> Path:
+    for fd in forward_dirs:
+        cand = fd / model_type / "forward_scored_2024.parquet"
+        if cand.exists():
+            return cand
+    checked = "\n".join(f"  {fd / model_type}" for fd in forward_dirs)
     raise FileNotFoundError(
-        f"forward_scored_2024.parquet not found in {model_output_dir}.\n"
+        "forward_scored_2024.parquet not found. Checked:\n"
+        f"{checked}\n"
         "Run predict_core (3_forward_predict.py) first."
     )
 
 
-def resolve_coverage_baseline(forward_dir: Path) -> Dict:
-    cand = forward_dir / "forward_coverage_baseline.json"
-    if not cand.exists():
-        raise FileNotFoundError(
-            f"forward_coverage_baseline.json not found in {forward_dir}.\n"
-            "Run coverage_core (1_forward_coverage_baseline.py) first."
-        )
-    with open(cand) as f:
-        return json.load(f)
+def resolve_coverage_baseline(forward_dirs: List[Path]) -> Dict:
+    for fd in forward_dirs:
+        cand = fd / "forward_coverage_baseline.json"
+        if cand.exists():
+            with open(cand) as f:
+                return json.load(f)
+    checked = "\n".join(f"  {fd}" for fd in forward_dirs)
+    raise FileNotFoundError(
+        "forward_coverage_baseline.json not found. Checked:\n"
+        f"{checked}\n"
+        "Run coverage_core (1_forward_coverage_baseline.py) first."
+    )
 
 
 def resolve_backbone_pixel_size(repo_root: Path, data_subdir: str) -> float:
@@ -1338,7 +1346,7 @@ def main() -> None:
     # Re-import config after runner.py reload
     from scripts.regions.shared.forward.config import (  # noqa: F401
         DATA_SUBDIR, HOTSPOT_REGIONS, ISO_CODES, MODEL_PREFIX, OUTPUTS_SUBDIR,
-        REGION_LABEL,
+        REGION_LABEL, forward_dir_search_paths,
     )
 
     model_type = os.environ.get("PA3030_FORWARD_MODEL_TYPE", "lgbm").strip().lower()
@@ -1357,18 +1365,25 @@ def main() -> None:
     wb.start()
     wb.log({"results/stage": "start"})
 
-    repo_root   = get_repo_root()
-    forward_dir = repo_root / f"outputs/{OUTPUTS_SUBDIR}/results/forward"
+    repo_root     = get_repo_root()
+    forward_dirs  = forward_dir_search_paths(repo_root, OUTPUTS_SUBDIR)
+    forward_dir   = forward_dirs[0]
+    features_forward_dir = forward_dir
+    for _fd in forward_dirs:
+        if (_fd / "forward_features_2024.parquet").exists():
+            features_forward_dir = _fd
+            break
     model_output_dir = forward_dir / model_type
     model_output_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
     print(f"FORWARD RESULTS — MAPS, SCENARIOS, BREAKDOWNS, GAP ANALYSIS ({model_type.upper()})")
     print("=" * 70)
+    print(f"  Forward output root: {forward_dir}")
 
-    # ── Load inputs ───────────────────────────────────────────────────────────
-    scored_path  = resolve_scored_parquet(model_output_dir)
-    baseline     = resolve_coverage_baseline(forward_dir)
+    # ── Load inputs (search scratch + legacy repo paths) ──────────────────────
+    scored_path  = resolve_scored_parquet(forward_dirs, model_type)
+    baseline     = resolve_coverage_baseline(forward_dirs)
     pixel_size_m = resolve_backbone_pixel_size(repo_root, DATA_SUBDIR)
     # Fall back to value stored in baseline (from coverage_baseline run)
     if pixel_size_m == 1000.0 and "pixel_size_m" in baseline:
@@ -1383,8 +1398,13 @@ def main() -> None:
 
     # Join GSN_b1 from features parquet (not present in scored output)
     if "GSN_b1" not in df.columns:
-        feat_path = forward_dir / "forward_features_2024.parquet"
-        if feat_path.exists():
+        feat_path = None
+        for _fd in forward_dirs:
+            _p = _fd / "forward_features_2024.parquet"
+            if _p.exists():
+                feat_path = _p
+                break
+        if feat_path is not None:
             try:
                 feat_gsn = pd.read_parquet(feat_path, columns=["row", "col", "GSN_b1"])
                 df = df.merge(feat_gsn, on=["row", "col"], how="left")
@@ -1393,7 +1413,10 @@ def main() -> None:
             except Exception as _e:
                 print(f"  WARNING: Could not join GSN_b1 from features parquet: {_e}")
         else:
-            print(f"  NOTE: features parquet not found at {feat_path} — gap analysis will use placeholder")
+            print(
+                "  NOTE: forward_features_2024.parquet not found under forward output dirs — "
+                "gap analysis will use placeholder",
+            )
 
     total_km2 = baseline.get("total_land_km2") or baseline.get("total_sa_km2", 1.0)
     print(f"\n  Total unprotected 2024 pixels: {len(df):,}")
@@ -1445,7 +1468,7 @@ def main() -> None:
 
     # ── Economic exposure ─────────────────────────────────────────────────────
     create_economic_exposure(
-        df, forward_dir, bau_cutoff, full_cutoff,
+        df, features_forward_dir, bau_cutoff, full_cutoff,
         model_output_dir, baseline, repo_root,
     )
     wb.log({"results/stage": "economic_exposure_done"})

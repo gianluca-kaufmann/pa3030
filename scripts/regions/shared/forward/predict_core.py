@@ -7,6 +7,7 @@ feature set produced by features_core.py.
 
 Output:
     outputs/{region}/results/forward/{model_type}/forward_scored_2024.parquet
+    (repo or $SCRATCH/outputs/... when SCRATCH is set — see resolve_forward_dir)
     Columns: row, col, x, y, y_pred_proba_raw, y_pred_proba_calibrated
 
 Model-type support:
@@ -39,7 +40,10 @@ from scripts.regions.shared.forward.config import (  # noqa: E402
     DATA_SUBDIR,
     MODEL_PREFIX,
     OUTPUTS_SUBDIR,
+    forward_dir_search_paths,
     get_repo_root,
+    ml_models_dir_search_paths,
+    resolve_forward_dir,
 )
 from scripts.regions.shared.training.utils import (  # noqa: E402
     WandbRunLogger,
@@ -52,38 +56,39 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "500_000"))
 
 # ── Path helpers ──────────────────────────────────────────────────────────────
 
-def resolve_model_dir(data_subdir: str, repo_root: Path) -> Path:
-    """Prefer $SCRATCH/data/.../ml/models if it exists, else repo data path."""
-    scratch = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
-    if scratch is not None:
-        cand = scratch / f"data/{data_subdir}/ml/models"
+def resolve_deployment_artifact(
+    repo_root: Path, data_subdir: str, model_prefix: str, model_type: str
+) -> Path:
+    """Find the most-recent {model_prefix}_{model_type}_deployment_*.pkl (scratch, then repo)."""
+    pattern = f"{model_prefix}_{model_type}_deployment_*.pkl"
+    for model_dir in ml_models_dir_search_paths(repo_root, data_subdir):
+        candidates = sorted(model_dir.glob(pattern), reverse=True)
+        if not candidates:
+            continue
+        chosen = candidates[0]
+        if len(candidates) > 1:
+            print(
+                f"  Found {len(candidates)} deployment artifacts in {model_dir}; "
+                f"using most recent: {chosen.name}",
+            )
+        return chosen
+    checked = "\n".join(f"  {d}" for d in ml_models_dir_search_paths(repo_root, data_subdir))
+    raise FileNotFoundError(
+        f"No {pattern} found. Checked:\n{checked}\n"
+        f"Run the {model_prefix}_{model_type}_deployment.py training script first.",
+    )
+
+
+def resolve_features_parquet(repo_root: Path, outputs_subdir: str) -> Path:
+    """Locate forward_features_2024.parquet (scratch forward dir, then repo)."""
+    for fd in forward_dir_search_paths(repo_root, outputs_subdir):
+        cand = fd / "forward_features_2024.parquet"
         if cand.exists():
             return cand
-    return repo_root / f"data/{data_subdir}/ml/models"
-
-
-def resolve_deployment_artifact(model_dir: Path, model_prefix: str, model_type: str) -> Path:
-    """Find the most-recent {model_prefix}_{model_type}_deployment_*.pkl in model_dir."""
-    pattern = f"{model_prefix}_{model_type}_deployment_*.pkl"
-    candidates = sorted(model_dir.glob(pattern), reverse=True)
-    if not candidates:
-        raise FileNotFoundError(
-            f"No {pattern} found in {model_dir}.\n"
-            f"Run the {model_prefix}_{model_type}_deployment.py training script first."
-        )
-    chosen = candidates[0]
-    if len(candidates) > 1:
-        print(f"  Found {len(candidates)} deployment artifacts; using most recent: {chosen.name}")
-    return chosen
-
-
-def resolve_features_parquet(forward_dir: Path) -> Path:
-    cand = forward_dir / "forward_features_2024.parquet"
-    if cand.exists():
-        return cand
+    checked = "\n".join(str(d) for d in forward_dir_search_paths(repo_root, outputs_subdir))
     raise FileNotFoundError(
-        f"forward_features_2024.parquet not found in {forward_dir}.\n"
-        "Run features_core (2_forward_features.py) first."
+        f"forward_features_2024.parquet not found. Checked:\n{checked}\n"
+        "Run features_core (2_forward_features.py) first.",
     )
 
 
@@ -265,7 +270,14 @@ def run_inference(
 
 def main() -> None:
     # Re-import config after runner.py reload
-    from scripts.regions.shared.forward.config import DATA_SUBDIR, MODEL_PREFIX, OUTPUTS_SUBDIR  # noqa: F401
+    from scripts.regions.shared.forward.config import (  # noqa: F401
+        DATA_SUBDIR,
+        MODEL_PREFIX,
+        OUTPUTS_SUBDIR,
+        forward_dir_search_paths,
+        ml_models_dir_search_paths,
+        resolve_forward_dir,
+    )
 
     model_type = os.environ.get("PA3030_FORWARD_MODEL_TYPE", "lgbm").strip().lower()
     from datetime import datetime as _dt
@@ -283,12 +295,11 @@ def main() -> None:
     wb.start()
 
     repo_root   = get_repo_root()
-    model_dir   = resolve_model_dir(DATA_SUBDIR, repo_root)
-    forward_dir = repo_root / f"outputs/{OUTPUTS_SUBDIR}/results/forward"
+    forward_dir = resolve_forward_dir(repo_root, OUTPUTS_SUBDIR)
     output_dir  = forward_dir / model_type
 
-    artifact_path  = resolve_deployment_artifact(model_dir, MODEL_PREFIX, model_type)
-    features_path  = resolve_features_parquet(forward_dir)
+    artifact_path  = resolve_deployment_artifact(repo_root, DATA_SUBDIR, MODEL_PREFIX, model_type)
+    features_path  = resolve_features_parquet(repo_root, OUTPUTS_SUBDIR)
     out = run_inference(features_path, artifact_path, output_dir, model_type, wb=wb)
     print(f"\nDone. Output: {out}")
     _stats = pq.read_table(out, columns=["y_pred_proba_calibrated"])
