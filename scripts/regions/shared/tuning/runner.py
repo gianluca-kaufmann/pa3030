@@ -143,7 +143,7 @@ def _init_wandb_tuning(cfg: RuntimeConfig, optimizer_used: str) -> Any | None:
     try:
         os.environ.setdefault("WANDB_CONSOLE", "wrap")
         run_name = f"{cfg.region}_{cfg.model}_tuning_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        model_family = "model1" if cfg.region == "south_america" else "model2" if cfg.region == "usa" else cfg.region
+        model_family = "model1" if cfg.region == "south_america" else "model2" if cfg.region == "usa" else "model3" if cfg.region == "se_asia" else cfg.region
         run = wandb.init(
             project=f"ml-tuning-{model_family}",
             entity=os.environ.get("WANDB_ENTITY"),

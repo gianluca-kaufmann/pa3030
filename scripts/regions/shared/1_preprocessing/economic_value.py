@@ -171,7 +171,8 @@ def build_country_raster_from_natural_earth(
 # ── FAO data ──────────────────────────────────────────────────────────────────
 
 # Direct mapping from FAO area names → ISO3.
-# Covers all South American countries + USA. Extend if new regions are added.
+# Covers South America, USA, and South East Asia. Extend if new regions are added.
+# Spellings must match the ``Area`` column in ``value_agr_prod.csv`` (FAOSTAT).
 _FAO_AREA_TO_ISO3: dict[str, str] = {
     "Argentina": "ARG",
     "Bolivia (Plurinational State of)": "BOL",
@@ -187,6 +188,18 @@ _FAO_AREA_TO_ISO3: dict[str, str] = {
     "Uruguay": "URY",
     "Venezuela (Bolivarian Republic of)": "VEN",
     "United States of America": "USA",
+    # South East Asia (canonical SEA pipeline ISO3 set)
+    "Brunei Darussalam": "BRN",
+    "Cambodia": "KHM",
+    "Indonesia": "IDN",
+    "Lao People's Democratic Republic": "LAO",
+    "Malaysia": "MYS",
+    "Myanmar": "MMR",
+    "Philippines": "PHL",
+    "Singapore": "SGP",
+    "Thailand": "THA",
+    "Timor-Leste": "TLS",
+    "Viet Nam": "VNM",
 }
 
 
@@ -199,12 +212,16 @@ def load_fao_value(
 
     Returns a DataFrame with columns: iso3, year, gross_value_usd.
 
-    Name → ISO3 mapping uses the built-in ``_FAO_AREA_TO_ISO3`` table, which
-    covers all South American territories including French Guiana (GUF) as a
-    separate entry. ``extra_iso3_overrides`` may provide additional mappings
+    Name → ISO3 mapping uses the built-in ``_FAO_AREA_TO_ISO3`` table (South
+    America, USA, South East Asia). ``extra_iso3_overrides`` may provide
+    additional mappings
     (FAO area name → ISO3) not present in the built-in table.
     """
-    df = pd.read_csv(value_path, dtype={"Area Code (M49)": str})
+    df = pd.read_csv(
+        value_path,
+        dtype={"Area Code (M49)": str},
+        encoding="utf-8-sig",
+    )
     df = df[df["Element Code"] == 58].copy()
     df["year"] = pd.to_numeric(df["Year"], errors="coerce").astype("Int64")
     df["gross_value_usd"] = pd.to_numeric(df["Value"], errors="coerce") * 1000.0
@@ -233,7 +250,7 @@ def build_fao_table(
     Parameters
     ----------
     value_path:
-        Path to ``value_agr.prod.csv`` (FAO).
+        Path to ``value_agr_prod.csv`` (FAO FAOSTAT QV export).
     policy_iso3:
         Set of ISO3 codes for countries/territories to include.
     year_min, year_max:

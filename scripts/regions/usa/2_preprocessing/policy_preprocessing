@@ -56,6 +56,109 @@ from scipy.ndimage import distance_transform_edt
 
 warnings.filterwarnings("ignore")
 
+# DPI ``ifs`` may be ISO3 strings or ISO-3166 numeric codes (same for all regions).
+ISO3166_NUMERIC_TO_ALPHA3: dict[int, str] = {
+    96: "BRN",
+    116: "KHM",
+    360: "IDN",
+    418: "LAO",
+    458: "MYS",
+    104: "MMR",
+    608: "PHL",
+    702: "SGP",
+    764: "THA",
+    626: "TLS",
+    704: "VNM",
+    32: "ARG",
+    68: "BOL",
+    76: "BRA",
+    152: "CHL",
+    170: "COL",
+    218: "ECU",
+    250: "FRA",
+    328: "GUY",
+    600: "PRY",
+    604: "PER",
+    740: "SUR",
+    858: "URY",
+    862: "VEN",
+    840: "USA",
+}
+
+
+def normalize_dpi_ifs_to_iso3(ifs: pd.Series) -> pd.Series:
+    """Map DPI ``ifs`` to ISO3 (alpha or numeric). Unrecognized → NaN."""
+    out: list = []
+    unmapped_numeric: set[int] = set()
+    for v in ifs:
+        if pd.isna(v):
+            out.append(np.nan)
+            continue
+        if isinstance(v, str):
+            s = v.strip()
+            if len(s) == 3 and s.isalpha():
+                out.append(s.upper())
+                continue
+            try:
+                num = int(float(s))
+            except ValueError:
+                out.append(np.nan)
+                continue
+        else:
+            try:
+                num = int(v)
+            except (TypeError, ValueError):
+                out.append(np.nan)
+                continue
+        iso = ISO3166_NUMERIC_TO_ALPHA3.get(num)
+        if iso is None:
+            unmapped_numeric.add(num)
+            out.append(np.nan)
+        else:
+            out.append(iso)
+    if unmapped_numeric:
+        sample = sorted(unmapped_numeric)[:15]
+        print(
+            f"  Warning: DPI `ifs` numeric codes without ISO3 mapping (dropped): "
+            f"{sample}{'...' if len(unmapped_numeric) > 15 else ''}"
+        )
+    return pd.Series(out, index=ifs.index, dtype=object)
+
+
+def dpi_execrlc_to_ideology(execrlc: pd.Series) -> pd.Series:
+    """Map DPI ``execrlc`` to {-1, 0, 1} or NaN."""
+    ideology_map = {"Left": -1.0, "Center": 0.0, "Right": 1.0}
+    result = np.full(len(execrlc), np.nan, dtype=np.float64)
+    for i, raw in enumerate(execrlc):
+        if pd.isna(raw):
+            continue
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            if raw in (-1, 0, 1):
+                result[i] = float(raw)
+            continue
+        s = str(raw).strip()
+        if s in ideology_map:
+            result[i] = ideology_map[s]
+            continue
+        try:
+            n = float(s)
+            if n in (-1.0, 0.0, 1.0):
+                result[i] = n
+        except ValueError:
+            pass
+    return pd.Series(result, index=execrlc.index, dtype="float64")
+
+
+def apply_dpi_executive_forward_fill(policy: pd.DataFrame) -> None:
+    """Forward-fill ``dpi_exec_ideology`` within each ``iso3`` (sticky institutions after last DPI year)."""
+    if "dpi_exec_ideology" not in policy.columns or "iso3" not in policy.columns:
+        return
+    policy["dpi_exec_ideology"] = (
+        policy.groupby("iso3", sort=False)["dpi_exec_ideology"]
+        .transform(lambda s: s.ffill())
+    )
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -179,6 +282,9 @@ def load_dpi() -> pd.DataFrame:
 
     Accepts both CSV (original download) and XLSX (alternative download format).
     When read from XLSX, the year column comes as datetime64 and is converted to int.
+
+    The ``ifs`` column may contain ISO3 strings or ISO-3166 numeric codes; both are
+    normalized before filtering to the regional country list.
     """
     print("Loading DPI data...")
     suffix = DPI_PATH.suffix.lower()
@@ -189,11 +295,11 @@ def load_dpi() -> pd.DataFrame:
         # Excel stores the year column as datetime; extract the integer year
         if pd.api.types.is_datetime64_any_dtype(df["year"]):
             df["year"] = df["year"].dt.year
-    df = df.rename(columns={"ifs": "iso3"})
     df["year"] = pd.to_numeric(df["year"], errors="coerce").dropna().astype(int)
+    df["iso3"] = normalize_dpi_ifs_to_iso3(df["ifs"])
+    df = df.drop(columns=["ifs"])
     df = df[df["iso3"].isin(USA_POLICY_ISO3)].copy()
-    ideology_map = {"Left": -1.0, "Center": 0.0, "Right": 1.0}
-    df["dpi_exec_ideology"] = df["execrlc"].map(ideology_map)
+    df["dpi_exec_ideology"] = dpi_execrlc_to_ideology(df["execrlc"])
     df = df.drop(columns=["execrlc"])
     df = df.sort_values(["iso3", "year"]).reset_index(drop=True)
     print(f"  DPI: {len(df)} rows, "
@@ -220,8 +326,8 @@ def build_policy_table() -> pd.DataFrame:
 
     # Expand to a complete (iso3, year) grid for YEAR_MIN..YEAR_MAX so that
     # biennial WGI gaps (e.g. 2001 is absent from WGI) are filled by carry-forward
-    # from the most recent available value.  DPI values beyond 2020 intentionally
-    # stay NaN — they are not forward-filled here.
+    # from the most recent available value. DPI is separately forward-filled so
+    # 2021+ keeps the last observed executive-ideology value.
     all_iso3 = sorted(policy["iso3"].unique())
     full_idx = pd.MultiIndex.from_product(
         [all_iso3, list(range(YEAR_MIN, YEAR_MAX + 1))],
@@ -233,14 +339,15 @@ def build_policy_table() -> pd.DataFrame:
         .reindex(full_idx)
         .reset_index()
     )
-    # Forward-fill only WGI and V-Dem columns (continuous surveys with biennial gaps).
-    # DPI ends in 2020 by design — do not propagate those values into 2021+.
+    # Forward/back-fill WGI and V-Dem (biennial gaps, edges).
     wgi_vdem_cols = [c for c in ["wgi_ge", "wgi_rl", "vdem_ldi"] if c in policy.columns]
     if wgi_vdem_cols:
         policy[wgi_vdem_cols] = (
             policy.groupby("iso3")[wgi_vdem_cols]
             .transform(lambda s: s.ffill().bfill())
         )
+
+    apply_dpi_executive_forward_fill(policy)
 
     policy = policy.sort_values(["iso3", "year"]).reset_index(drop=True)
 

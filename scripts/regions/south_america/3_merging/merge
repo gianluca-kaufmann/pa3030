@@ -50,7 +50,7 @@ Yearly datasets (year in filename, time-varying):
   forward-fills with HNTL 2020 values.
 
 Outputs:
-- Parquet panel: ``outputs/south_america/results/merged_panel_<start>_<end>.parquet`` storing coordinates plus all bands (backbone=1 only).
+- Parquet panel: ``data/south_america/ml/merged_panel_<start>_<end>.parquet`` storing coordinates plus all bands (backbone=1 only).
 
 Policy variables:
   Policy rasters (``wgi_ge``, ``wgi_rl``, ``vdem_ldi``, ``dpi_exec_ideology``)
@@ -127,13 +127,9 @@ READY_ROOT = DATA_ROOT / "south_america" / "ready"
 # The script will auto-detect Int16 dtype and unscale accordingly
 INT16_SCALED_DATASETS = {"WorldClim", "GSN", "powerplants", "oil_gas"}
 
-# Use $SCRATCH if on cluster, otherwise use local outputs
-if "SCRATCH" in os.environ:
-    OUTPUT_ROOT = Path(os.environ["SCRATCH"]) / "outputs" / "south_america" / "results"
-else:
-    OUTPUT_ROOT = PROJECT_ROOT / "outputs" / "south_america" / "results"
-
-OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+# Parquet panel: same region ML dir as downstream feature_engineering (not under outputs/)
+ML_ROOT = DATA_ROOT / "south_america" / "ml"
+ML_ROOT.mkdir(parents=True, exist_ok=True)
 
 # YEARS will be determined dynamically from available data
 TILE_SIZE = 512
@@ -678,7 +674,7 @@ def main():
     YEARS = detect_year_range(catalog)
     
     # Dynamic Parquet path based on detected year range
-    PARQUET_PATH = OUTPUT_ROOT / f"merged_panel_{min(YEARS)}_{max(YEARS)}.parquet"
+    PARQUET_PATH = ML_ROOT / f"merged_panel_{min(YEARS)}_{max(YEARS)}.parquet"
     
     # Now initialize wandb with detected years
     wandb.init(
@@ -691,7 +687,7 @@ def main():
             "num_years": len(YEARS),
             "data_root": str(DATA_ROOT),
             "ready_root": str(READY_ROOT),
-            "output_root": str(OUTPUT_ROOT),
+            "ml_root": str(ML_ROOT),
             "scratch_mode": "SCRATCH" in os.environ,
             "int16_auto_unscaling_enabled": True,
             "int16_scaled_datasets": list(INT16_SCALED_DATASETS),
