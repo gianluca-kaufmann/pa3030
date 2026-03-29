@@ -1313,6 +1313,333 @@ def create_hotspot_maps(
     plt.close(fig)
 
 
+# ── Forecast confidence ───────────────────────────────────────────────────────
+
+def create_forecast_confidence_summary(model_output_dir: Path) -> Dict[str, Any]:
+    """Load backtest results and compute confidence bounds for the 2030 forecast.
+
+    Uses historical backtesting windows (e.g. T2013, T2015, T2017) to estimate
+    expected precision and recall for the actual 2024→2030 deployment window.
+    T2019 is excluded because it has no evaluable pixels (WDPA only covers to 2024).
+    """
+    print("\n" + "=" * 70)
+    print("FORECAST CONFIDENCE SUMMARY (from backtesting)")
+    print("=" * 70)
+
+    backtest_path = model_output_dir / "forward_backtest_results.json"
+    if not backtest_path.exists():
+        # Search one level up (in case model_output_dir is model-type subdir)
+        backtest_path = model_output_dir.parent / "forward_backtest_results.json"
+    if not backtest_path.exists():
+        print("  WARNING: forward_backtest_results.json not found — skipping confidence summary")
+        return {}
+
+    with open(backtest_path) as f:
+        backtest_results = json.load(f)
+
+    # Only use windows that have evaluable pixels and non-null metrics
+    valid = [r for r in backtest_results if r.get("metrics") and r["n_pos_evaluable"] > 0]
+    if not valid:
+        print("  WARNING: No valid backtest windows found — skipping confidence summary")
+        return {}
+
+    p1  = [r["metrics"]["precision_at_1pct"]  for r in valid]
+    p5  = [r["metrics"]["precision_at_5pct"]  for r in valid]
+    r1  = [r["metrics"]["recall_at_1pct"]     for r in valid]
+    r5  = [r["metrics"]["recall_at_5pct"]     for r in valid]
+    roc = [r["metrics"]["roc_auc"]            for r in valid]
+    years = [r["origin_year"] for r in valid]
+
+    # Use the window most analogous to the actual deployment (latest clean window)
+    # T2013 uses a complete 5-year lookahead and is the most conservative estimate
+    clean_windows = [r for r in valid if r.get("clean_5yr_window")]
+    primary = clean_windows[-1] if clean_windows else valid[-1]
+
+    confidence = {
+        "backtest_windows": years,
+        "n_valid_windows": len(valid),
+        "primary_window": {
+            "origin_year": primary["origin_year"],
+            "note": "most conservative estimate (complete 5-yr lookahead)",
+            "n_pos_evaluable": primary["n_pos_evaluable"],
+            "precision_at_1pct": round(primary["metrics"]["precision_at_1pct"], 4),
+            "precision_at_5pct": round(primary["metrics"]["precision_at_5pct"], 4),
+            "recall_at_1pct":    round(primary["metrics"]["recall_at_1pct"],    4),
+            "recall_at_5pct":    round(primary["metrics"]["recall_at_5pct"],    4),
+            "roc_auc":           round(primary["metrics"]["roc_auc"],           4),
+        },
+        "range_across_windows": {
+            "precision_at_1pct_min": round(min(p1), 4),
+            "precision_at_1pct_max": round(max(p1), 4),
+            "precision_at_5pct_min": round(min(p5), 4),
+            "precision_at_5pct_max": round(max(p5), 4),
+            "recall_at_1pct_min":    round(min(r1), 4),
+            "recall_at_1pct_max":    round(max(r1), 4),
+            "recall_at_5pct_min":    round(min(r5), 4),
+            "recall_at_5pct_max":    round(max(r5), 4),
+            "roc_auc_min":           round(min(roc), 4),
+            "roc_auc_max":           round(max(roc), 4),
+        },
+        "interpretation": (
+            f"In the most conservative backtest window (origin {primary['origin_year']}), "
+            f"the model achieved Precision@1% = {primary['metrics']['precision_at_1pct']:.1%} "
+            f"and Recall@1% = {primary['metrics']['recall_at_1pct']:.1%}. "
+            f"Across all {len(valid)} valid windows, Precision@1% ranged "
+            f"{min(p1):.1%}–{max(p1):.1%} and Recall@1% ranged {min(r1):.1%}–{max(r1):.1%}."
+        ),
+    }
+
+    print(f"  Valid windows: {years}")
+    print(f"  Primary (conservative) window: {primary['origin_year']}")
+    print(f"  Precision@1% range: {min(p1):.1%}–{max(p1):.1%}")
+    print(f"  Recall@1%    range: {min(r1):.1%}–{max(r1):.1%}")
+    print(f"  Precision@5% range: {min(p5):.1%}–{max(p5):.1%}")
+    print(f"  Recall@5%    range: {min(r5):.1%}–{max(r5):.1%}")
+    return confidence
+
+
+# ── Conservation alignment ────────────────────────────────────────────────────
+
+def create_conservation_alignment_map(
+    df: pd.DataFrame,
+    bau_cutoff: float,
+    full_cutoff: float,
+    output_dir: Path,
+    baseline: Dict[str, Any],
+    repo_root: Path,
+) -> None:
+    """Create a single-map 'Conservation Alignment' visualisation.
+
+    Shows four pixel categories in one map:
+      - Green  : Sweet spot — predicted to be designated AND biodiversity priority
+      - Orange : Conservation gap — biodiversity priority but NOT predicted for designation
+      - Blue   : Misdirected — predicted for designation but NOT biodiversity priority
+      - Beige  : Background (neither)
+
+    Companion to the 4-panel gap analysis; designed for presentations.
+    """
+    print("\n" + "=" * 70)
+    print("CONSERVATION ALIGNMENT MAP (sweet spots vs gaps)")
+    print("=" * 70)
+
+    has_gsn = "GSN_b1" in df.columns
+    if not has_gsn:
+        print("  NOTE: 'GSN_b1' not available — skipping alignment map")
+        return
+
+    proba   = df[PROBA_COL].values
+    area    = df["area_km2"].values
+    xm      = df["x"].values.astype(np.float64)
+    ym      = df["y"].values.astype(np.float64)
+    gsn     = df["GSN_b1"].values.astype(bool)
+    bau     = proba >= bau_cutoff
+    full    = proba >= full_cutoff
+
+    # Alignment categories (30x30 scenario for maximum impact)
+    sweet_spot   =  full & gsn          # designated AND biodiversity priority
+    gap          = ~full & gsn          # biodiversity priority NOT designated
+    misdirected  =  full & ~gsn         # designated but NOT biodiversity priority
+
+    total_sweet_km2      = float(area[sweet_spot].sum())
+    total_gap_km2        = float(area[gap].sum())
+    total_misdirected_km2= float(area[misdirected].sum())
+    total_biodiv_km2     = float(area[gsn].sum())
+    alignment_pct = total_sweet_km2 / max(total_biodiv_km2, 1.0) * 100
+
+    print(f"  Sweet spots (both):    {total_sweet_km2:,.0f} km²")
+    print(f"  Conservation gaps:     {total_gap_km2:,.0f} km²")
+    print(f"  Misdirected:           {total_misdirected_km2:,.0f} km²")
+    print(f"  Alignment score:       {alignment_pct:.1f}% of biodiversity priority covered")
+
+    region_gdf = get_region_boundary(None)
+    if region_gdf.crs is None:
+        region_gdf = region_gdf.set_crs("EPSG:4326", allow_override=True)
+    region_proj = region_gdf.to_crs("EPSG:3857")
+    proj_bounds = tuple(region_proj.total_bounds.astype(float))
+    backbone_path = resolve_backbone_path_for_plot(repo_root, DATA_SUBDIR, baseline)
+
+    proj_width  = proj_bounds[2] - proj_bounds[0]
+    proj_height = proj_bounds[3] - proj_bounds[1]
+    fig_w, fig_h = 9.0, 9.0 * (proj_height / max(proj_width, 1e-9))
+    fig, ax = plt.subplots(1, 1, figsize=(fig_w, fig_h))
+
+    used_bb = _plot_backbone_background(
+        ax, backbone_path, zorder=0, hole_color=FORWARD_PA_HOLE_COLOR,
+    )
+    if not used_bb:
+        region_proj.plot(ax=ax, color=FORWARD_PA_HOLE_COLOR, edgecolor="none",
+                         linewidth=0, zorder=0)
+
+    def _overlay(mask: np.ndarray, color: str, alpha: float, zorder: int) -> None:
+        if not mask.any():
+            return
+        grid, gext = points_to_raster(
+            xm[mask], ym[mask], np.ones(int(mask.sum()), dtype=np.float32),
+            target_resolution=1000.0, agg_func="max", extent_bounds=proj_bounds,
+        )
+        ax.imshow(
+            np.where(np.isnan(grid), np.nan, 1.0),
+            extent=gext, cmap=mcolors.ListedColormap([color]),
+            vmin=0, vmax=1, origin="upper", interpolation="nearest",
+            aspect="equal", alpha=alpha, zorder=zorder,
+        )
+
+    # Draw in order: gaps first, misdirected second, sweet spots on top
+    _overlay(gap,         "#e87e2b", 0.80, 2)   # orange  — conservation gap
+    _overlay(misdirected, "#4c96d7", 0.65, 3)   # blue    — misdirected designation
+    _overlay(sweet_spot,  "#2ca02c", 0.90, 4)   # green   — sweet spot
+
+    ax.set_xlim(proj_bounds[0], proj_bounds[2])
+    ax.set_ylim(proj_bounds[1], proj_bounds[3])
+    ax.set_aspect("equal", adjustable="box")
+    _add_latlon_ticks(ax, (proj_bounds[0], proj_bounds[2]), (proj_bounds[1], proj_bounds[3]))
+    ax.set_title(
+        "Conservation Alignment: Where 30×30 Targets Biodiversity",
+        fontsize=13, fontweight="bold", pad=10,
+    )
+
+    # Legend patches
+    legend_elements = [
+        mpatches.Patch(color="#2ca02c", label=f"Sweet spot — designated & priority  ({total_sweet_km2:,.0f} km²)"),
+        mpatches.Patch(color="#e87e2b", label=f"Conservation gap — priority, not designated  ({total_gap_km2:,.0f} km²)"),
+        mpatches.Patch(color="#4c96d7", label=f"Misdirected — designated, not priority  ({total_misdirected_km2:,.0f} km²)"),
+    ]
+    ax.legend(handles=legend_elements, loc="lower left", fontsize=8,
+              framealpha=0.85, edgecolor="gray")
+
+    # Alignment score annotation
+    ax.text(
+        0.98, 0.02,
+        f"Alignment score: {alignment_pct:.1f}%\nof biodiversity priority covered\nby 30×30 scenario",
+        transform=ax.transAxes, fontsize=9, ha="right", va="bottom",
+        bbox=dict(boxstyle="round,pad=0.4", fc="lightyellow", alpha=0.85, ec="gray"),
+    )
+    ax.grid(True, alpha=0.2, linestyle="--", linewidth=0.4, zorder=5)
+
+    plt.tight_layout()
+    for ext in ["pdf", "png"]:
+        p = output_dir / f"forward_conservation_alignment.{ext}"
+        plt.savefig(p, dpi=MAP_DPI, bbox_inches="tight")
+        print(f"  Saved: {p}")
+    plt.close(fig)
+
+
+def create_country_conservation_alignment(
+    df: pd.DataFrame,
+    full_cutoff: float,
+    output_dir: Path,
+    world_gdf,
+    iso_codes: List[str],
+) -> pd.DataFrame:
+    """Bar chart: % of 30x30 new designations that overlap biodiversity priority, by country.
+
+    This answers: 'Which countries are targeting biodiversity when they designate?'
+    Higher = better conservation efficiency.
+    """
+    print("\n" + "=" * 70)
+    print("COUNTRY CONSERVATION ALIGNMENT SCORES")
+    print("=" * 70)
+
+    has_gsn = "GSN_b1" in df.columns
+    if not has_gsn:
+        print("  NOTE: 'GSN_b1' not available — skipping country alignment")
+        return pd.DataFrame()
+
+    if world_gdf is None:
+        print("  NOTE: Country shapefile not available — skipping country alignment")
+        return pd.DataFrame()
+
+    proba = df[PROBA_COL].values
+    area  = df["area_km2"].values
+    gsn   = df["GSN_b1"].values.astype(bool)
+    full  = proba >= full_cutoff
+
+    # Spatial join: assign country to each pixel using lon/lat
+    try:
+        lon, lat = epsg3857_to_lonlat(df["x"].values, df["y"].values)
+    except Exception as e:
+        print(f"  WARNING: coordinate conversion failed ({e}) — skipping")
+        return pd.DataFrame()
+
+    try:
+        import geopandas as gpd
+
+        pts = gpd.GeoDataFrame(
+            {"idx": np.arange(len(df)), "area_km2": area, "is_full": full, "is_gsn": gsn},
+            geometry=gpd.points_from_xy(lon, lat),
+            crs="EPSG:4326",
+        )
+
+        world_4326 = world_gdf.to_crs("EPSG:4326") if world_gdf.crs is not None else world_gdf
+        iso_col = next(
+            (c for c in ["ISO_A3", "ADM0_A3", "iso_a3", "GID_0"] if c in world_4326.columns),
+            world_4326.columns[0],
+        )
+        name_col = next(
+            (c for c in ["NAME", "ADMIN", "name", "NAME_LONG"] if c in world_4326.columns),
+            iso_col,
+        )
+        joined = gpd.sjoin(pts, world_4326[[iso_col, name_col, "geometry"]],
+                           how="left", predicate="within")
+    except Exception as e:
+        print(f"  WARNING: spatial join failed ({e}) — skipping")
+        return pd.DataFrame()
+
+    joined = joined[joined[iso_col].isin(iso_codes)].copy()
+    if joined.empty:
+        print("  WARNING: no pixels matched target ISO codes — skipping")
+        return pd.DataFrame()
+
+    records = []
+    for iso, grp in joined.groupby(iso_col):
+        name     = grp[name_col].iloc[0] if name_col != iso_col else iso
+        new_km2  = float(grp.loc[grp["is_full"],  "area_km2"].sum())
+        sweet_km2= float(grp.loc[grp["is_full"] & grp["is_gsn"], "area_km2"].sum())
+        bio_km2  = float(grp.loc[grp["is_gsn"],   "area_km2"].sum())
+        align    = sweet_km2 / max(new_km2, 1.0) * 100  # % of new designations that are biodiversity priority
+        records.append({
+            "iso": iso, "country": name,
+            "new_designated_km2": round(new_km2, 0),
+            "sweet_spot_km2": round(sweet_km2, 0),
+            "biodiv_priority_km2": round(bio_km2, 0),
+            "alignment_pct": round(align, 1),
+        })
+
+    result_df = pd.DataFrame(records).sort_values("alignment_pct", ascending=False)
+    if result_df.empty:
+        return result_df
+
+    # Save CSV
+    csv_path = output_dir / "forward_country_alignment.csv"
+    result_df.to_csv(csv_path, index=False)
+    print(f"  Saved: {csv_path}")
+    print(result_df[["country", "new_designated_km2", "sweet_spot_km2", "alignment_pct"]].to_string(index=False))
+
+    # Bar chart
+    fig, ax = plt.subplots(figsize=(8, max(4, len(result_df) * 0.55)))
+    bars = ax.barh(result_df["country"], result_df["alignment_pct"],
+                   color=["#2ca02c" if v >= 40 else "#e87e2b" if v >= 20 else "#d62728"
+                          for v in result_df["alignment_pct"]],
+                   edgecolor="white", linewidth=0.5)
+    ax.set_xlabel("% of new 30×30 designations targeting biodiversity priority land", fontsize=10)
+    ax.set_title("Conservation Alignment by Country (30×30 Scenario)", fontsize=11, fontweight="bold")
+    ax.axvline(x=result_df["alignment_pct"].mean(), color="gray", linestyle="--", linewidth=1.2,
+               label=f"Mean: {result_df['alignment_pct'].mean():.1f}%")
+    ax.legend(fontsize=9)
+    ax.set_xlim(0, max(result_df["alignment_pct"].max() * 1.15, 10))
+    for bar, val in zip(bars, result_df["alignment_pct"]):
+        ax.text(val + 0.5, bar.get_y() + bar.get_height() / 2,
+                f"{val:.0f}%", va="center", ha="left", fontsize=8)
+    plt.tight_layout()
+    for ext in ["pdf", "png"]:
+        p = output_dir / f"forward_country_alignment.{ext}"
+        plt.savefig(p, dpi=MAP_DPI, bbox_inches="tight")
+        print(f"  Saved: {p}")
+    plt.close(fig)
+
+    return result_df
+
+
 # ── Summary JSON ──────────────────────────────────────────────────────────────
 
 def save_scenario_summary(
@@ -1322,6 +1649,8 @@ def save_scenario_summary(
     country_df: pd.DataFrame,
     biome_df: pd.DataFrame,
     output_dir: Path,
+    forecast_confidence: Optional[Dict] = None,
+    country_alignment_df: Optional[pd.DataFrame] = None,
 ) -> None:
     summary = {
         "coverage_baseline": baseline,
@@ -1334,6 +1663,10 @@ def save_scenario_summary(
             biome_df.head(10).to_dict("records") if not biome_df.empty else []
         ),
     }
+    if forecast_confidence:
+        summary["forecast_confidence"] = forecast_confidence
+    if country_alignment_df is not None and not country_alignment_df.empty:
+        summary["country_alignment"] = country_alignment_df.to_dict("records")
     out = output_dir / "forward_scenario_summary.json"
     with open(out, "w") as f:
         json.dump(summary, f, indent=2, default=str)
@@ -1480,9 +1813,22 @@ def main() -> None:
     )
     wb.log({"results/stage": "hotspot_maps_done"})
 
+    # ── Forecast confidence (from backtesting) ────────────────────────────────
+    forecast_confidence = create_forecast_confidence_summary(model_output_dir)
+
+    # ── Conservation alignment map & country scores ───────────────────────────
+    create_conservation_alignment_map(
+        df, bau_cutoff, full_cutoff, model_output_dir, baseline, repo_root,
+    )
+    country_alignment_df = create_country_conservation_alignment(
+        df, full_cutoff, model_output_dir, world_gdf, ISO_CODES,
+    )
+
     # ── Summary JSON ──────────────────────────────────────────────────────────
     save_scenario_summary(
-        baseline, scenario_info, gap_metrics, country_df, biome_df, model_output_dir
+        baseline, scenario_info, gap_metrics, country_df, biome_df, model_output_dir,
+        forecast_confidence=forecast_confidence,
+        country_alignment_df=country_alignment_df,
     )
 
     _log: Dict[str, Any] = {
@@ -1522,6 +1868,9 @@ def main() -> None:
         "forward_economic_exposure.csv",
         "forward_hotspot_maps.pdf",
         "forward_scenario_summary.json",
+        "forward_conservation_alignment.pdf",
+        "forward_country_alignment.pdf",
+        "forward_country_alignment.csv",
     ]
     for fn in outputs:
         p = model_output_dir / fn

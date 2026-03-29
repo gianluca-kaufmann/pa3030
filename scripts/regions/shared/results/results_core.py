@@ -1286,9 +1286,10 @@ def create_risk_map(
     future_years: Optional[Sequence[int]] = None,
     sa_gdf: Optional[gpd.GeoDataFrame] = None,
     backbone_path: Optional[Path] = None,
-) -> Optional[Dict[str, float]]:
+    pixel_size_m: float = 1000.0,
+) -> Optional[Dict[str, Any]]:
     """Create SIMPLIFIED risk map showing model predictions vs actual PA establishments.
-    
+
     SIMPLIFIED DESIGN (radically simplified from previous complex version):
     - Shows 3-4 categories with clear, distinct colors:
       * Predicted high-risk (top threshold_pct%) - BLUE
@@ -1312,6 +1313,12 @@ def create_risk_map(
             using `derive_test_years`.
         future_parquet_path: Optional path to future period parquet (e.g., validation set for 2020-2024).
         future_years: List of years to consider as "future" for temporal validation (e.g., [2020, 2021, 2022, 2023, 2024]).
+        pixel_size_m: Side length of one pixel in metres (default 1000 = 1 km raster).
+
+    Returns:
+        Dict with threshold_pct, total_pa_pixels/km2, captured_pixels/km2, recall_pct,
+        precision_pct, and optionally future_capture_rate / combined_recall.
+        Always returned (not None) so callers can build capture_summary.csv.
     """
     print("\n" + "=" * 70)
     print("CREATING SIMPLIFIED RISK MAP")
@@ -1690,13 +1697,21 @@ def create_risk_map(
     plt.close()
     print(f"✓ Simplified risk map complete!")
 
-    # Return future capture metrics for inclusion in metrics table (when available)
+    # Always return capture stats for inclusion in summary tables
+    px_km2 = (pixel_size_m / 1000.0) ** 2  # km² per pixel (1.0 for 1-km raster)
+    stats: Dict[str, Any] = {
+        "threshold_pct": threshold_pct,
+        "total_pa_pixels": total_actual_establishments,
+        "total_pa_km2": round(total_actual_establishments * px_km2, 0),
+        "captured_pixels": overlap_count,
+        "captured_km2": round(overlap_count * px_km2, 0),
+        "recall_pct": round(recall_pct, 2),
+        "precision_pct": round(hit_rate, 2) if predicted_count > 0 else 0.0,
+    }
     if has_future_establishments and total_future_establishments > 0:
-        return {
-            "future_capture_rate": future_capture_rate,
-            "combined_recall": combined_recall_pct,
-        }
-    return None
+        stats["future_capture_rate"] = round(future_capture_rate, 2)
+        stats["combined_recall"] = round(combined_recall_pct, 2)
+    return stats
 
 
 def create_p1pct_diagnostic_map(
@@ -3519,9 +3534,10 @@ def main() -> None:
     print("\nResolving backbone raster for map backgrounds...")
     backbone_path = find_backbone_path()
 
-    # Risk map generation (1%, 5%, 10%) - run first to get future capture metrics for table
+    # Risk map generation (1%, 5%, 10%) - run first to get capture metrics for tables
     thresholds = [1, 5, 10]
     future_metrics = None
+    all_threshold_stats = []
     for threshold_pct in thresholds:
         result = create_risk_map(
             df,
@@ -3537,8 +3553,27 @@ def main() -> None:
             sa_gdf=sa_gdf,
             backbone_path=backbone_path,
         )
-        if result is not None and future_metrics is None:
-            future_metrics = result
+        if result is not None:
+            all_threshold_stats.append(result)
+            if future_metrics is None and "future_capture_rate" in result:
+                future_metrics = {
+                    "future_capture_rate": result["future_capture_rate"],
+                    "combined_recall": result["combined_recall"],
+                }
+    # Save capture summary CSV with absolute pixel counts and km²
+    if all_threshold_stats:
+        capture_cols = [
+            "threshold_pct", "total_pa_pixels", "total_pa_km2",
+            "captured_pixels", "captured_km2", "recall_pct", "precision_pct",
+        ]
+        capture_df = pd.DataFrame(all_threshold_stats)
+        # Reorder to standard columns (add optional future cols at end if present)
+        extra_cols = [c for c in capture_df.columns if c not in capture_cols]
+        capture_df = capture_df[[c for c in capture_cols if c in capture_df.columns] + extra_cols]
+        capture_csv = output_dir / "capture_summary.csv"
+        capture_df.to_csv(capture_csv, index=False)
+        print(f"\nSaved capture summary: {capture_csv}")
+        print(capture_df.to_string(index=False))
     # Generate outputs (metrics table includes future capture when available)
     create_metrics_table(metrics_data, output_dir, args.model_type, df=df, extra_metrics=future_metrics)
     create_pr_curve(df, metrics_data, output_dir, args.model_type)
