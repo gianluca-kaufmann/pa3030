@@ -97,7 +97,13 @@ SCENARIO_COLORS = {
 }
 
 
-def _safe_savefig(path: Path, *, dpi: int, bbox_inches: str = "tight") -> bool:
+def _safe_savefig(
+    path: Path,
+    *,
+    dpi: int,
+    bbox_inches: str = "tight",
+    pad_inches: float = 0.20,
+) -> bool:
     """Save a figure (PNG reliably; PDF best-effort).
 
     Some macOS + Matplotlib/Python builds can fail when writing large PDFs due to
@@ -111,9 +117,19 @@ def _safe_savefig(path: Path, *, dpi: int, bbox_inches: str = "tight") -> bool:
                 return False
             # Prefer TrueType (Type 42) over Type 3 fonts.
             with matplotlib.rc_context({"pdf.fonttype": 42, "ps.fonttype": 42}):
-                plt.savefig(path, dpi=dpi, bbox_inches=bbox_inches)
+                plt.savefig(
+                    path,
+                    dpi=dpi,
+                    bbox_inches=bbox_inches,
+                    pad_inches=pad_inches if bbox_inches == "tight" else 0.0,
+                )
         else:
-            plt.savefig(path, dpi=dpi, bbox_inches=bbox_inches)
+            plt.savefig(
+                path,
+                dpi=dpi,
+                bbox_inches=bbox_inches,
+                pad_inches=pad_inches if bbox_inches == "tight" else 0.0,
+            )
         return True
     except Exception as e:
         msg = f"  WARNING: Failed to save figure: {path} ({type(e).__name__}: {e})"
@@ -384,8 +400,17 @@ def create_feature_importance_plot(
     print(f"  Artifact: {artifact_path}")
 
     import pickle
-    with open(artifact_path, "rb") as f:
-        artifact = pickle.load(f)
+    try:
+        with open(artifact_path, "rb") as f:
+            artifact = pickle.load(f)
+    except ModuleNotFoundError as e:
+        # Deployment artifacts may pickle model objects that require optional deps
+        # (e.g. LightGBM) not present in lightweight analysis environments.
+        print(f"  Skipping — cannot unpickle deployment artifact ({e}).")
+        return
+    except Exception as e:
+        print(f"  Skipping — failed to load deployment artifact ({type(e).__name__}: {e}).")
+        return
 
     model = artifact.get("model")
     feature_cols = artifact.get("feature_cols") or []
@@ -1250,16 +1275,20 @@ def create_country_breakdown(
             "country", "total_km2", "current_pct_protected",
             "30x30_new_km2", "projected_pct_2030_30x30", "gap_to_30pct_km2",
         ]
-        country_df[tex_cols].head(13).to_latex(
-            tex_path, index=False, float_format="%.4g",
-            caption=(
-                "Country-level breakdown: total land area, current protection (end-2024), "
-                "projected new designations under the 30×30 scenario, "
-                "projected coverage by 2030, and remaining gap to the 30\\% target."
-            ),
-            label="tab:forward_country",
-        )
-        print(f"  Saved: {tex_path}")
+        try:
+            country_df[tex_cols].head(13).to_latex(
+                tex_path, index=False, float_format="%.4g",
+                caption=(
+                    "Country-level breakdown: total land area, current protection (end-2024), "
+                    "projected new designations under the 30×30 scenario, "
+                    "projected coverage by 2030, and remaining gap to the 30\\% target."
+                ),
+                label="tab:forward_country",
+            )
+            print(f"  Saved: {tex_path}")
+        except Exception as e:
+            # Pandas >=2.0 uses the Styler backend for to_latex, which requires optional deps (jinja2).
+            print(f"  NOTE: could not write LaTeX table ({type(e).__name__}: {e})")
         return country_df
 
     except Exception as e:
