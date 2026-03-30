@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-HNTL nighttime lights visualization for SE Asia (2000-2022).
+HNTL nighttime lights visualization for SE Asia (2000-2020).
 
 Inputs:
-- GeoTIFF rasters in `data/se_asia/ready/HNTL`, named `HNTL_SEA_1km_<year>.tif` for years 2000-2022.
+- GeoTIFF rasters in `data/se_asia/ready/HNTL`, named `HNTL_SEA_1km_<year>.tif` for years 2000-2020 (Harmonized NTL coverage).
 
 Process:
 - Loads annual HNTL radiance rasters, computes shared statistics, and generates overview, change, and temporal visualisations.
@@ -12,6 +12,7 @@ Outputs:
 - PNG figures saved to `outputs/se_asia/figures/HNTL_vis`.
 """
 
+import os
 import numpy as np
 import rasterio
 import matplotlib.pyplot as plt
@@ -21,52 +22,81 @@ from matplotlib.colors import LinearSegmentedColormap
 
 warnings.filterwarnings('ignore')
 
-# Set up paths
+# Set up paths (match scripts/regions/se_asia/2_preprocessing/HNTL_preprocessing)
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-hntl_dir = PROJECT_ROOT / "data" / "se_asia" / "ready" / "HNTL"
+if "SCRATCH" in os.environ:
+    DATA_ROOT = Path(os.environ["SCRATCH"]) / "data"
+else:
+    DATA_ROOT = PROJECT_ROOT / "data"
+hntl_dir = DATA_ROOT / "se_asia" / "ready" / "HNTL"
 output_dir = PROJECT_ROOT / "outputs" / "se_asia" / "figures" / "HNTL_vis"
 output_dir.mkdir(parents=True, exist_ok=True)
 
 # Years to process
-YEARS = [2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019, 2020, 2021, 2022]
+YEARS = list(range(2000, 2021))  # 2000-2020; same as preprocessing / merge forward-fill rules
 
 # HNTL visualization settings
 HNTL_COLORMAP = 'plasma'  # Good for nighttime lights
 HNTL_COLOR = '#FFD700'  # Gold color for nighttime lights
 
+
+def _hntl_raster_path(year: int) -> Path | None:
+    """Prefer HNTL_SEA_* (current); fall back to HNTL_SA_* (legacy preprocessing tag)."""
+    for name in (f"HNTL_SEA_1km_{year}.tif", f"HNTL_SA_1km_{year}.tif"):
+        p = hntl_dir / name
+        if p.is_file():
+            return p
+    return None
+
+
 def load_hntl_data():
     """Load the HNTL nighttime lights data for all years"""
     print("Loading HNTL nighttime lights data for all years...")
-    
-    all_data = {}
-    
+    print(f"   HNTL directory: {hntl_dir}")
+
+    all_data: dict = {}
+    missing_years: list = []
+
     for year in YEARS:
-        hntl_file = hntl_dir / f"HNTL_SEA_1km_{year}.tif"
-        
-        if not hntl_file.exists():
-            print(f"   Warning: File not found: {hntl_file.name}")
+        hntl_file = _hntl_raster_path(year)
+        if hntl_file is None:
+            missing_years.append(year)
             continue
-            
         try:
             with rasterio.open(hntl_file) as src:
                 data = src.read()
-                
-                print(f"   {year}: Shape: {data.shape}, Valid pixels: {np.sum(~np.isnan(data)):,}")
-                
+                print(
+                    f"   {year}: Shape: {data.shape}, "
+                    f"Valid pixels: {np.sum(~np.isnan(data)):,}"
+                )
                 all_data[year] = {
-                    'data': data,
-                    'src': src,
-                    'file_path': hntl_file
+                    "data": data,
+                    "src": src,
+                    "file_path": hntl_file,
                 }
-                
         except Exception as e:
             print(f"   Error loading {year}: {e}")
-            continue
-    
+            missing_years.append(year)
+
     if not all_data:
-        print("   No data loaded successfully")
+        print()
+        print("   No HNTL rasters found under the directory above.")
+        if not hntl_dir.is_dir():
+            print("   The directory does not exist yet.")
+        print()
+        print("   To produce these files locally:")
+        print("     1) Add global Harmonized NTL GeoTIFFs under data/shared/HNTL/")
+        print("     2) Run: python scripts/regions/se_asia/2_preprocessing/HNTL_preprocessing")
+        print("        (writes HNTL_SEA_1km_<year>.tif for 2000–2020).")
+        if "SCRATCH" in os.environ:
+            print(f"   Using DATA_ROOT from $SCRATCH: {DATA_ROOT}")
         return None
-    
+
+    if missing_years:
+        print(
+            f"   Partial load: missing {len(missing_years)} year(s): "
+            f"{missing_years[:10]}{'…' if len(missing_years) > 10 else ''}"
+        )
     print(f"   Successfully loaded {len(all_data)} years")
     return all_data
 
@@ -156,7 +186,7 @@ def create_temporal_comparison(all_data):
     
     # Create figure with subplots
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    fig.suptitle('Temporal Comparison of HNTL Nighttime Lights (2013-2022)', 
+    fig.suptitle('Temporal Comparison of HNTL Nighttime Lights (2000-2020)', 
                 fontsize=16, fontweight='bold')
     
     years = sorted(temporal_data.keys())
@@ -261,7 +291,7 @@ def create_summary_statistics(all_data):
     
     # Create figure
     fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    fig.suptitle('HNTL Nighttime Lights Summary Statistics (2013-2022)', 
+    fig.suptitle('HNTL Nighttime Lights Summary Statistics (2000-2020)', 
                 fontweight='bold', fontsize=16)
     
     years = sorted([s['year'] for s in all_stats])
@@ -406,7 +436,7 @@ def create_change_detection(all_data):
 
 def main():
     """Main visualization function"""
-    print("HNTL Nighttime Lights Visualization - SE Asia 2013-2022")
+    print("HNTL Nighttime Lights Visualization - SE Asia 2000-2020")
     print("=" * 70)
     
     # Load data

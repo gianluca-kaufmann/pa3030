@@ -91,9 +91,9 @@ from scripts.regions.shared.training.utils import WandbRunLogger  # noqa: E402
 MAP_DPI      = 300
 FORWARD_BACKGROUND_COLOR = "#F2F2F2"  # very light gray: visible vs white, but unobtrusive
 SCENARIO_COLORS = {
-    "bau":      "#1a78c2",
+    "bau":      "#d62728",
     "moderate": "#e87e2b",
-    "30x30":    "#d62728",
+    "30x30":    "#1a78c2",
 }
 
 
@@ -142,6 +142,12 @@ def _safe_savefig(
 # ── Column names ──────────────────────────────────────────────────────────────
 PROBA_COL = "y_pred_proba_calibrated"
 RAW_COL   = "y_pred_proba_raw"
+
+# GSN: regional merge stacks `ready/GSN/gsn_*_mask_1km.tif` alphabetically → band order
+# is climate stabilisation (b1), high biodiversity (b2), … — see gsn_preprocessing /
+# 3_merging merge (sorted glob). technical_guide.md treats GSN_b2 as biodiversity.
+GSN_BIODIVERSITY_COL = "GSN_b2"
+GSN_CLIMATE_STABILISATION_COL = "GSN_b1"
 
 
 # ── Path helpers ──────────────────────────────────────────────────────────────
@@ -1004,6 +1010,12 @@ def _create_scenario_map(
     )
     bg_disp = np.where(np.isnan(bg_raster), np.nan, 0.12)
 
+    proj_width = proj_bounds[2] - proj_bounds[0]
+    proj_height = proj_bounds[3] - proj_bounds[1]
+    fig_width = 14.0
+    fig_height = fig_width * (proj_height / max(proj_width, 1e-9))
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+
     sel_raster, _ = points_to_raster(
         x_m[selected], y_m[selected], np.ones(int(selected.sum()), dtype=np.float32),
         target_resolution=1000.0,
@@ -1012,11 +1024,20 @@ def _create_scenario_map(
     )
     sel_disp = np.where(np.isnan(sel_raster), np.nan, 1.0)
 
-    proj_width = proj_bounds[2] - proj_bounds[0]
-    proj_height = proj_bounds[3] - proj_bounds[1]
-    fig_width = 14.0
-    fig_height = fig_width * (proj_height / max(proj_width, 1e-9))
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    # Halo/outline: draw only the border of selected pixels in black underneath.
+    sel_bin = ~np.isnan(sel_raster)
+    if sel_bin.any():
+        p = np.pad(sel_bin.astype(np.uint8), 1, mode="constant", constant_values=0)
+        nbh = [
+            p[0:-2, 0:-2], p[0:-2, 1:-1], p[0:-2, 2:],
+            p[1:-1, 0:-2], p[1:-1, 1:-1], p[1:-1, 2:],
+            p[2:,   0:-2], p[2:,   1:-1], p[2:,   2:],
+        ]
+        all_neigh = np.all(np.stack(nbh, axis=0).astype(bool), axis=0)
+        outline = sel_bin & (~all_neigh)
+        outline_disp = np.where(outline, 1.0, np.nan).astype(np.float32)
+    else:
+        outline_disp = np.full_like(sel_disp, np.nan, dtype=np.float32)
 
     used_bb = _plot_backbone_background(
         ax, backbone_path, zorder=0, hole_color=FORWARD_PA_HOLE_COLOR,
@@ -1040,6 +1061,19 @@ def _create_scenario_map(
         alpha=1.0,
         zorder=1,
     )
+    # Black halo/outline under the selected pixels
+    ax.imshow(
+        outline_disp,
+        extent=bg_ext,
+        cmap=mcolors.ListedColormap(["#111111"]),
+        vmin=0,
+        vmax=1,
+        origin="upper",
+        interpolation="nearest",
+        aspect="equal",
+        alpha=0.90,
+        zorder=2,
+    )
     cmap_sel = mcolors.ListedColormap([color])
     ax.imshow(
         sel_disp,
@@ -1050,8 +1084,8 @@ def _create_scenario_map(
         origin="upper",
         interpolation="nearest",
         aspect="equal",
-        alpha=0.88,
-        zorder=2,
+        alpha=0.98,
+        zorder=3,
     )
 
     ax.set_xlim(proj_bounds[0], proj_bounds[2])
@@ -1370,7 +1404,7 @@ def create_gap_analysis(
 ) -> Dict[str, Any]:
     """Compute and visualise Biodiversity Capture Rate (BCR).
 
-    BCR = area(top-K ∩ GSN_b1==1) / area(all unprotected GSN_b1==1)
+    BCR = area(top-K ∩ biodiversity mask) / area(all unprotected biodiversity pixels)
     """
     print("\n" + "=" * 70)
     print("GAP ANALYSIS (Biodiversity Capture Rate)")
@@ -1378,9 +1412,9 @@ def create_gap_analysis(
 
     gap_metrics: Dict[str, Any] = {}
 
-    has_gsn = "GSN_b1" in df.columns
+    has_gsn = GSN_BIODIVERSITY_COL in df.columns
     if not has_gsn:
-        print("  NOTE: 'GSN_b1' column not found — using placeholder.")
+        print(f"  NOTE: '{GSN_BIODIVERSITY_COL}' column not found — using placeholder.")
 
     proba = df[PROBA_COL].values
     area  = df["area_km2"].values
@@ -1391,7 +1425,7 @@ def create_gap_analysis(
     full_mask = proba >= full_cutoff
 
     if has_gsn:
-        gsn_mask         = df["GSN_b1"].values.astype(bool)
+        gsn_mask         = df[GSN_BIODIVERSITY_COL].values.astype(bool)
         total_biodiv_km2 = float(area[gsn_mask].sum())
 
         for key, sel_mask in [("bau", bau_mask), ("30x30_full", full_mask)]:
@@ -1417,13 +1451,15 @@ def create_gap_analysis(
     fig, axes = plt.subplots(2, 2, figsize=(panel_w * 2, panel_h * 2 + 1.2))
     fig.suptitle("Gap Analysis: BAU Forecast vs. Biodiversity Priority Areas", fontsize=14)
 
-    gsn_mask_for_fig = df["GSN_b1"].values.astype(bool) if has_gsn else np.zeros(len(df), dtype=bool)
+    gsn_mask_for_fig = (
+        df[GSN_BIODIVERSITY_COL].values.astype(bool) if has_gsn else np.zeros(len(df), dtype=bool)
+    )
 
     panel_defs = [
         (bau_mask, "BAU Projected Designations\n(2025–2030)",
          SCENARIO_COLORS["bau"]),
         (gsn_mask_for_fig,
-         "Biodiversity Priority (GSN_b1==1)\nHigh-priority unprotected pixels",
+         f"Biodiversity Priority ({GSN_BIODIVERSITY_COL}==1)\nHigh-priority unprotected pixels",
          "#2ca02c"),
         (bau_mask & gsn_mask_for_fig,
          "Overlap: BAU ∩ Biodiversity Priority\n(correctly-targeted designations)",
@@ -1933,7 +1969,7 @@ def create_conservation_alignment_map(
         output_dir=output_dir,
         baseline=baseline,
         repo_root=repo_root,
-        priority_col="GSN_b1",
+        priority_col=GSN_BIODIVERSITY_COL,
         title="Conservation Alignment: Where 30×30 Targets Biodiversity",
         annotation_subject="biodiversity priority",
         out_stem="conservation_alignment",
@@ -1957,7 +1993,7 @@ def create_climate_alignment_map(
         output_dir=output_dir,
         baseline=baseline,
         repo_root=repo_root,
-        priority_col="GSN_b2",
+        priority_col=GSN_CLIMATE_STABILISATION_COL,
         title="Climate Alignment: Where 30×30 Targets Climate Stabilisation",
         annotation_subject="climate stabilisation priority",
         out_stem="climate_stabilisation_alignment",
@@ -2098,14 +2134,14 @@ def create_country_conservation_alignment(
     print("COUNTRY CONSERVATION ALIGNMENT SCORES")
     print("=" * 70)
 
-    has_gsn = "GSN_b1" in df.columns
+    has_gsn = GSN_BIODIVERSITY_COL in df.columns
     if not has_gsn:
-        print("  NOTE: 'GSN_b1' not available — skipping country alignment")
+        print(f"  NOTE: '{GSN_BIODIVERSITY_COL}' not available — skipping country alignment")
         return pd.DataFrame()
 
     proba = df[PROBA_COL].values
     area  = df["area_km2"].values
-    gsn   = df["GSN_b1"].values.astype(bool)
+    gsn   = df[GSN_BIODIVERSITY_COL].values.astype(bool)
     full  = proba >= full_cutoff
 
     # Prefer raster-based ISO3 assignment (policy preprocessing output).
