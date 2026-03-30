@@ -284,7 +284,8 @@ def compute_coverage_baseline(
         "total_sa_km2": round(total_km2, 2),
     }
 
-    out_path = output_dir / "forward_coverage_baseline.json"
+    # Keep filenames short (the folder already encodes "forward").
+    out_path = output_dir / "coverage_baseline.json"
     with open(out_path, "w") as f:
         json.dump(baseline, f, indent=2)
     print(f"\nSaved: {out_path}")

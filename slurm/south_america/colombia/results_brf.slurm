@@ -31,6 +31,10 @@ module load eth_proxy
 #------------------------------------------------------------------------------
 VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
+export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
+
+# Results runs: enable W&B explicitly (local defaults are off)
+export PA3030_WANDB=1
 
 #------------------------------------------------------------------------------
 # Run the modelC_results script

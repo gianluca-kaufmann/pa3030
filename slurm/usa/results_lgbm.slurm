@@ -33,6 +33,9 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
+# Results runs: enable W&B explicitly (local defaults are off)
+export PA3030_WANDB=1
+
 #------------------------------------------------------------------------------
 # Set threading/CPU hints for faster NumPy/PyArrow (use all allocated CPUs)
 #------------------------------------------------------------------------------

@@ -32,7 +32,9 @@ PROFILE = {
         "probability_map_percentile_max": 99.5,
         "probability_map_transformation": "linear",
         "probability_map_display_gamma": 1.0,
-        "forward_pa_hole_color": "#505050",
+        # Existing protected areas (2024) tone used across all forward maps.
+        # Kept light so it doesn't compete with scenario/prediction overlays.
+        "forward_pa_hole_color": "#D0D0D0",
     },
     "usa": {
         "region_slug": "usa",
@@ -51,11 +53,18 @@ PROFILE = {
         ],
         "wdpa_2024_filename": "WDPA_USA_1km_2024.tif",
         "wdpa_2019_filename": "WDPA_USA_1km_2019.tif",
-        "probability_map_percentile_min": 0,
+        # For USA the calibrated probabilities are extremely concentrated near 0.
+        # Using the 0th percentile as the lower bound with a log stretch makes the
+        # “typical” low probabilities look mid-range on the map. A higher lower
+        # percentile keeps most pixels visually “low”, and reserves mid/high colors
+        # for genuinely high-risk areas.
+        # Tighten the lower bound slightly so most pixels render “low risk”
+        # (the calibrated distribution is extremely concentrated near 0).
+        "probability_map_percentile_min": 25,
         "probability_map_percentile_max": 99.9,
         "probability_map_transformation": "log",
-        "probability_map_display_gamma": 1.28,
-        "forward_pa_hole_color": "#505050",
+        "probability_map_display_gamma": 1.35,
+        "forward_pa_hole_color": "#D0D0D0",
     },
     "se_asia": {
         "region_slug": "se_asia",
@@ -81,7 +90,7 @@ PROFILE = {
         "probability_map_percentile_max": 99.5,
         "probability_map_transformation": "linear",
         "probability_map_display_gamma": 1.0,
-        "forward_pa_hole_color": "#505050",
+        "forward_pa_hole_color": "#D0D0D0",
     },
 }[RUN_REGION]
 

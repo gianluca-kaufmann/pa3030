@@ -37,6 +37,10 @@ mkdir -p "$SCRATCH/outputs/se_asia/results/forward/rf"
 
 export PA3030_FORWARD_MODEL_TYPE=rf
 
+# Results runs: enable W&B + PDFs explicitly (local defaults are off)
+export PA3030_WANDB=1
+export PA3030_SAVE_PDF=1
+
 #------------------------------------------------------------------------------
 # Load modules
 #------------------------------------------------------------------------------

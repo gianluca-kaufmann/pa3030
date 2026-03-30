@@ -3214,9 +3214,11 @@ def main() -> None:
     )
     args = parser.parse_args()
     
-    # Optional W&B run (for streaming logs and metrics)
+    # Optional W&B run (for streaming logs and metrics).
+    # Default: disabled for local runs. Enable explicitly (e.g. in SLURM) via PA3030_WANDB=1.
     use_wandb = False
-    if wandb is not None:
+    wandb_enabled = os.environ.get("PA3030_WANDB", "0").strip().lower() not in {"0", "false", "no", "off"}
+    if wandb_enabled and wandb is not None:
         try:
             run_name = f"results_{MODEL_ID}_{args.model_type}_{args.split_version}"
             wandb.init(

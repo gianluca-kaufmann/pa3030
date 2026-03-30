@@ -292,6 +292,10 @@ def wandb_log_one_shot(
     ``wandb.init(project=..., entity=os.environ.get("WANDB_ENTITY"), name=..., config=...)``
     with no ``mode=`` keyword (same env behaviour as the training scripts).
     """
+    # Default: disabled for local runs. Enable explicitly (e.g. in SLURM) via PA3030_WANDB=1.
+    if os.environ.get("PA3030_WANDB", "0").strip().lower() in {"0", "false", "no", "off"}:
+        return
+
     try:
         import wandb
     except ImportError:
@@ -344,6 +348,9 @@ class WandbRunLogger:
         self._started = False
 
     def start(self) -> None:
+        # Default: disabled for local runs. Enable explicitly (e.g. in SLURM) via PA3030_WANDB=1.
+        if os.environ.get("PA3030_WANDB", "0").strip().lower() in {"0", "false", "no", "off"}:
+            return
         try:
             import wandb
         except ImportError:
