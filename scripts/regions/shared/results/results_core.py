@@ -1159,17 +1159,19 @@ def points_to_raster(x: np.ndarray, y: np.ndarray, values: np.ndarray,
         target_resolution: Target resolution in same units as coordinates. If None, auto-detects from data.
         agg_func: Aggregation for points in same cell: 'mean' (default) or 'max'.
                   Use 'max' for categorical rasters so overlap wins (e.g. risk map).
-        extent_bounds: Optional (xmin, xmax, ymin, ymax) in the same CRS as x/y.
+        extent_bounds: Optional (xmin, ymin, xmax, ymax) in the same CRS as x/y
+            (standard GIS / rasterio bounding-box order).
             When set, the raster grid covers this box exactly (no extra padding),
             so stacked map layers share the same geometry.
     
     Returns:
         Tuple of (raster_array, extent) where extent is (xmin, xmax, ymin, ymax)
-        Raster array has shape (nrows, ncols) and may contain NaN for empty cells
+        (Matplotlib imshow order). Raster array has shape (nrows, ncols) and may
+        contain NaN for empty cells.
     """
     # Calculate bounds
     if extent_bounds is not None:
-        x_min, x_max, y_min, y_max = extent_bounds
+        x_min, y_min, x_max, y_max = extent_bounds  # GIS order: left, bottom, right, top
     elif len(x) > 0:
         x_min, x_max = float(x.min()), float(x.max())
         y_min, y_max = float(y.min()), float(y.max())

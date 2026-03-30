@@ -48,7 +48,7 @@ echo "PWD = $(pwd)"
   find scripts -maxdepth 6 -type f -name "model3_LGBM"
   exit 1
 }
-# Run the script
-srun --cpu-bind=cores --distribution=block:block python -u "scripts/regions/se_asia/5_training/model3_LGBM" --eval-only
+# Full train + test (omit --eval-only). Use --eval-only only after a prior run produced model3_lgbm_metrics_*.json.
+srun --cpu-bind=cores --distribution=block:block python -u "scripts/regions/se_asia/5_training/model3_LGBM"
 
 echo "model3_LGBM script finished."

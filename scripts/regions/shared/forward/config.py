@@ -28,7 +28,7 @@ PROFILE = {
         ],
         "wdpa_2024_filename": "WDPA_SA_1km_2024.tif",
         "wdpa_2019_filename": "WDPA_SA_1km_2019.tif",
-        "probability_map_percentile_min": 40,
+        "probability_map_percentile_min": 37,
         "probability_map_percentile_max": 99.5,
         "probability_map_transformation": "linear",
         "probability_map_display_gamma": 1.0,

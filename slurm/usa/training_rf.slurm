@@ -52,7 +52,7 @@ echo "PWD = $(pwd)"
 # OOM-safe configuration for large datasets (500M rows)
 export MAX_NEG_TRAIN=50000000      # Cap negative samples at 50M for training (keeps all positives)
 
-# Run the script
-python "scripts/regions/usa/5_training/model2_RF" --eval-only
+# Full train + test (omit --eval-only). Use --eval-only only after a prior run produced model2_rf_win5_metrics_*.json.
+python "scripts/regions/usa/5_training/model2_RF"
 
 echo "model2_RF script finished."

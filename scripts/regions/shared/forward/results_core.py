@@ -2004,12 +2004,17 @@ def _create_alignment_map(
     total_gap_km2         = float(area[gap].sum())
     total_misdirected_km2 = float(area[misdirected].sum())
     total_priority_km2    = float(area[priority].sum())
-    alignment_pct = total_sweet_km2 / max(total_priority_km2, 1.0) * 100
+    total_designated_km2  = float(area[full].sum())
+    # We want: "How focused are new 30×30 designations on the priority layer?"
+    # i.e., % of the 30×30 establishment area that falls inside the priority mask.
+    alignment_pct = total_sweet_km2 / max(total_designated_km2, 1.0) * 100
 
     print(f"  Sweet spots (both):    {total_sweet_km2:,.0f} km²")
     print(f"  Conservation gaps:     {total_gap_km2:,.0f} km²")
     print(f"  Misdirected:           {total_misdirected_km2:,.0f} km²")
-    print(f"  Alignment score:       {alignment_pct:.1f}% of {annotation_subject} covered")
+    print(f"  Total designated (30×30): {total_designated_km2:,.0f} km²")
+    print(f"  Total priority area:      {total_priority_km2:,.0f} km²")
+    print(f"  Alignment score:          {alignment_pct:.1f}% of 30×30 establishments inside {annotation_subject}")
 
     region_proj = None
     proj_bounds = _resolve_plot_bounds_3857(repo_root, DATA_SUBDIR, baseline)
@@ -2060,7 +2065,7 @@ def _create_alignment_map(
 
     ax.text(
         0.98, 0.02,
-        f"Alignment score: {alignment_pct:.1f}%\nof {annotation_subject} covered\nby 30×30 scenario",
+        f"Alignment score: {alignment_pct:.1f}%\nof 30×30 establishments\ninside {annotation_subject}",
         transform=ax.transAxes, fontsize=9, ha="right", va="bottom",
         bbox=dict(boxstyle="round,pad=0.4", fc="lightyellow", alpha=0.85, ec="gray"),
     )
