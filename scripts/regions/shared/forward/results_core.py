@@ -1143,10 +1143,10 @@ def create_scenario_maps(
     scenario_info: Dict[str, Any] = {}
     moderate_pct = baseline.get("moderate_target_pct", 0.25)
     moderate_pct_str = f"{moderate_pct:.0%}"
+    coverage_now_pct = float(baseline.get("coverage_pct_2024") or 0.0)
 
     scenarios = [
-        (proba >= bau_cutoff, "bau",
-         f"BAU Forecast — Projected Designations (2025–2030) — {region_label}",
+        (proba >= bau_cutoff, "bau", None,
          bau_subtitle,
          SCENARIO_COLORS["bau"], "risk_map_bau"),
         (proba >= moderate_cutoff, "moderate",
@@ -1169,6 +1169,11 @@ def create_scenario_maps(
             "area_km2": round(km2, 2),
             "projected_total_coverage_pct": round(coverage_new, 6),
         }
+        if key == "bau":
+            title = (
+                f"BAU Forecast ({coverage_now_pct:.1%} → {coverage_new:.1%} "
+                f"{region_label} coverage) — Projected Designations (2025–2030)"
+            )
         if n > 0:
             _create_scenario_map(
                 x_m, y_m, mask, title, subtitle, color, stem, output_dir,

@@ -28,10 +28,12 @@ PROFILE = {
         ],
         "wdpa_2024_filename": "WDPA_SA_1km_2024.tif",
         "wdpa_2019_filename": "WDPA_SA_1km_2019.tif",
-        "probability_map_percentile_min": 30,
-        "probability_map_percentile_max": 97.0,
-        "probability_map_transformation": "linear",
-        "probability_map_display_gamma": 1.0,
+        # Forward-only display: calibrated scores are massed at low p; raise lower
+        # percentile + mild γ so typical pixels stay dark and high-risk tail reads yellow.
+        "probability_map_percentile_min": 32,
+        "probability_map_percentile_max": 98,
+        "probability_map_transformation": "sqrt",
+        "probability_map_display_gamma": 1.2,
         # Existing protected areas (2024) tone used across all forward maps.
         # Kept light so it doesn't compete with scenario/prediction overlays.
         "forward_pa_hole_color": "#D0D0D0",
@@ -53,17 +55,13 @@ PROFILE = {
         ],
         "wdpa_2024_filename": "WDPA_USA_1km_2024.tif",
         "wdpa_2019_filename": "WDPA_USA_1km_2019.tif",
-        # For USA the calibrated probabilities are extremely concentrated near 0.
-        # Using the 0th percentile as the lower bound with a log stretch makes the
-        # “typical” low probabilities look mid-range on the map. A higher lower
-        # percentile keeps most pixels visually “low”, and reserves mid/high colors
-        # for genuinely high-risk areas.
-        # Tighten the lower bound slightly so most pixels render “low risk”
-        # (the calibrated distribution is extremely concentrated near 0).
-        "probability_map_percentile_min": 25,
-        "probability_map_percentile_max": 99.9,
+        # USA calibrated forward scores collapse most mass into a narrow log band;
+        # a high lower percentile + strong γ avoids a flat red “midfield” and
+        # reserves bright colors for the rare high-likelihood tail.
+        "probability_map_percentile_min": 47,
+        "probability_map_percentile_max": 99,
         "probability_map_transformation": "log",
-        "probability_map_display_gamma": 1.35,
+        "probability_map_display_gamma": 2.0,
         "forward_pa_hole_color": "#D0D0D0",
     },
     "se_asia": {
@@ -86,10 +84,11 @@ PROFILE = {
         ],
         "wdpa_2024_filename": "WDPA_SEA_1km_2024.tif",
         "wdpa_2019_filename": "WDPA_SEA_1km_2019.tif",
-        "probability_map_percentile_min": 30,
-        "probability_map_percentile_max": 97.0,
-        "probability_map_transformation": "linear",
-        "probability_map_display_gamma": 1.0,
+        # Same intent as south_america but slightly milder (see comments there).
+        "probability_map_percentile_min": 32,
+        "probability_map_percentile_max": 98,
+        "probability_map_transformation": "sqrt",
+        "probability_map_display_gamma": 1.12,
         "forward_pa_hole_color": "#D0D0D0",
     },
 }[RUN_REGION]
