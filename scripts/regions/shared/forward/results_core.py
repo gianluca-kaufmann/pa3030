@@ -1540,9 +1540,10 @@ def create_gap_analysis(
 # ── Economic exposure ──────────────────────────────────────────────────────────
 
 _NTL_CANDIDATES = [
-    "ntl", "NTL", "ntl_mean", "VIIRS_ntl", "nighttime_lights", "lights_mean",
+    "HNTL", "ntl", "NTL", "ntl_mean", "VIIRS_ntl", "nighttime_lights", "lights_mean",
     "BU_ntl", "viirs_ntl",
 ]
+_INFRA_CANDIDATES = ["dist_road", "dist_oil_gas"]
 _POP_CANDIDATES = [
     "pop_density", "population_density", "pop", "GPW_pop", "population",
     "pop_dens", "GPW",
@@ -1558,6 +1559,71 @@ def _detect_col(candidates: List[str], available: set) -> Optional[str]:
         if c.lower() in avail_lower:
             return avail_lower[c.lower()]
     return None
+
+
+def _plot_exposure_barchart(
+    exposure_df: "pd.DataFrame",
+    ntl_col: Optional[str],
+    pop_col: Optional[str],
+    infra_cols: List[str],
+    output_dir: Path,
+) -> None:
+    """Bar chart comparing economic proxy values across risk zones."""
+    panels = []
+    if pop_col:
+        panels.append((f"{pop_col}_mean", "Population density\n(persons / km²)", False))
+    if ntl_col:
+        panels.append((f"{ntl_col}_mean", "Night-time light\nintensity (VIIRS DN)", False))
+    for ic in infra_cols:
+        panels.append((f"{ic}_median_km", f"Median {ic.replace('dist_', '').replace('_', '/')} distance (km)", True))
+
+    if not panels:
+        return
+
+    zones_order = ["All unprotected (baseline)", "BAU risk zone", "Top 5% risk", "Top 1% risk"]
+    zone_labels  = ["Baseline", "BAU", "Top 5%", "Top 1%"]
+    df = exposure_df.set_index("zone").reindex(zones_order).reset_index()
+
+    n = len(panels)
+    fig, axes = plt.subplots(1, n, figsize=(4.5 * n, 4.0), constrained_layout=True)
+    if n == 1:
+        axes = [axes]
+
+    COLORS = ["#AAAAAA", "#7FB3D3", "#2471A3", "#154360"]
+
+    for ax, (col, ylabel, lower_is_better) in zip(axes, panels):
+        if col not in df.columns:
+            ax.set_visible(False)
+            continue
+        vals = df[col].values.astype(float)
+        baseline = vals[0] if vals[0] != 0 else 1.0
+        bars = ax.bar(range(len(zones_order)), vals, color=COLORS,
+                      edgecolor="white", linewidth=0.8, width=0.6, zorder=2)
+        for i, (bar, v) in enumerate(zip(bars, vals)):
+            ratio = v / baseline
+            lbl = "ref" if i == 0 else f"×{ratio:.2f}"
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() * 1.025,
+                    lbl, ha="center", va="bottom", fontsize=8, fontweight="bold")
+        ax.set_xticks(range(len(zones_order)))
+        ax.set_xticklabels(zone_labels, fontsize=8.5)
+        ax.set_ylabel(ylabel, fontsize=9)
+        note = "(↓ = more accessible)" if lower_is_better else "(↑ = more activity)"
+        ax.text(0.97, 0.97, note, transform=ax.transAxes,
+                ha="right", va="top", fontsize=7.5, color="grey", style="italic")
+        ax.grid(axis="y", alpha=0.3, linestyle="--", linewidth=0.6, zorder=1)
+        ax.set_axisbelow(True)
+        ax.spines[["top", "right"]].set_visible(False)
+
+    fig.suptitle("Economic Exposure by Risk Zone", fontsize=11, fontweight="bold")
+    for ext in ("pdf", "png"):
+        p = output_dir / f"economic_exposure_barchart.{ext}"
+        if _safe_savefig(p, dpi=150, bbox_inches="tight"):
+            print(f"  Saved: {p}")
+    try:
+        plt.close(fig)
+    except Exception:
+        pass
 
 
 def create_economic_exposure(
@@ -1595,17 +1661,20 @@ def create_economic_exposure(
     schema_names = set(pq.ParquetFile(feat_path).schema_arrow.names)
     ntl_col = _detect_col(_NTL_CANDIDATES, schema_names)
     pop_col = _detect_col(_POP_CANDIDATES, schema_names)
+    infra_cols = [c for c in _INFRA_CANDIDATES if c in schema_names]
     print(f"  NTL column detected:        {ntl_col or 'none'}")
     print(f"  Population column detected: {pop_col or 'none'}")
+    print(f"  Infrastructure cols:        {infra_cols or 'none'}")
 
     proxy_cols = [c for c in [ntl_col, pop_col] if c is not None]
-    if not proxy_cols:
+    if not proxy_cols and not infra_cols:
         print("  No economic proxy columns found — skipping.")
         return pd.DataFrame()
 
     # ── Load and join features ────────────────────────────────────────────────
-    print(f"  Loading features: {proxy_cols} …")
-    feat_df = pq.read_table(feat_path, columns=["row", "col"] + proxy_cols).to_pandas()
+    load_cols = list(dict.fromkeys(proxy_cols + infra_cols))  # deduplicated
+    print(f"  Loading features: {load_cols} …")
+    feat_df = pq.read_table(feat_path, columns=["row", "col"] + load_cols).to_pandas()
     coord_cols = [c for c in ["x", "y"] if c in df.columns]
     merged  = df[["row", "col", PROBA_COL, "area_km2"] + coord_cols].merge(
         feat_df, on=["row", "col"], how="left"
@@ -1637,6 +1706,10 @@ def create_economic_exposure(
             row[f"{col}_mean"]   = round(float(vals.mean()), 3)   if len(vals) else None
             row[f"{col}_median"] = round(float(vals.median()), 3) if len(vals) else None
             row[f"{col}_p75"]    = round(float(np.percentile(vals, 75)), 3) if len(vals) else None
+        for col in infra_cols:
+            vals = sub[col].dropna() / 1000.0  # convert m → km
+            row[f"{col}_median_km"] = round(float(vals.median()), 2) if len(vals) else None
+            row[f"{col}_mean_km"]   = round(float(vals.mean()), 2)   if len(vals) else None
         rows.append(row)
 
     exposure_df = pd.DataFrame(rows)
@@ -1644,6 +1717,9 @@ def create_economic_exposure(
     exposure_df.to_csv(csv_path, index=False)
     print(f"  Saved: {csv_path}")
     print(exposure_df.to_string(index=False))
+
+    # ── Bar chart: compare risk tiers across all proxies ─────────────────────
+    _plot_exposure_barchart(exposure_df, ntl_col, pop_col, infra_cols, output_dir)
 
     # ── Map: BAU risk zone coloured by NTL (EPSG:3857, backbone underlay) ───
     if ntl_col is not None:
@@ -1709,6 +1785,231 @@ def create_economic_exposure(
                 pass
 
     return exposure_df
+
+
+# ── Economic activity index ────────────────────────────────────────────────────
+
+def _clip_norm(vals: np.ndarray, p_lo: float = 1.0, p_hi: float = 99.0) -> np.ndarray:
+    """Clip to [p_lo, p_hi] percentile range then normalise to [0, 1].
+    NaN values are preserved; percentiles are computed ignoring NaN."""
+    lo = float(np.nanpercentile(vals, p_lo))
+    hi = float(np.nanpercentile(vals, p_hi))
+    if hi == lo:
+        return np.zeros_like(vals, dtype=np.float32)
+    clipped = np.clip(vals, lo, hi)
+    return ((clipped - lo) / (hi - lo)).astype(np.float32)
+
+
+def create_economic_activity_analysis(
+    df: pd.DataFrame,
+    forward_dir: Path,
+    output_dir: Path,
+    baseline: Dict[str, Any],
+    repo_root: Path,
+    data_subdir: str,
+    region_label: str = "",
+) -> pd.DataFrame:
+    """Build a per-pixel Economic Activity Index (EAI) and analyse its spatial
+    relationship with predicted PA probability.
+
+    EAI = mean(norm_HNTL, norm_GPW, road_access)
+    where road_access = 1 - norm(dist_road),  all normalised to [0,1] via
+    1st-99th-percentile clipping across all unprotected pixels.
+
+    Outputs
+    -------
+    economic_activity_index.csv    -- Spearman r + quintile breakdown table
+    economic_activity_map.pdf/.png -- Choropleth of EAI across the landscape
+    economic_activity_vs_risk.pdf/.png -- Side-by-side: EAI map | PA prob map
+    """
+    print("\n" + "=" * 70)
+    print("ECONOMIC ACTIVITY INDEX ANALYSIS")
+    print("=" * 70)
+
+    feat_path = forward_dir / "forward_features_2024.parquet"
+    if not feat_path.exists():
+        print(f"  Skipping -- features parquet not found: {feat_path}")
+        return pd.DataFrame()
+
+    schema = set(pq.ParquetFile(feat_path).schema_arrow.names)
+    needed = [c for c in ["HNTL", "GPW", "dist_road"] if c in schema]
+    if len(needed) < 2:
+        print(f"  Skipping -- need at least 2 of HNTL/GPW/dist_road; found {needed}")
+        return pd.DataFrame()
+    print(f"  Using columns: {needed}")
+
+    # ── Load & merge ──────────────────────────────────────────────────────────
+    feat = pq.read_table(feat_path, columns=["row", "col"] + needed).to_pandas()
+    coord_cols = [c for c in ["x", "y"] if c in df.columns]
+    merged = df[["row", "col", PROBA_COL] + coord_cols].merge(
+        feat, on=["row", "col"], how="left"
+    )
+    del feat
+
+    # ── Build EAI ─────────────────────────────────────────────────────────────
+    components = []
+    if "HNTL" in needed:
+        components.append(_clip_norm(merged["HNTL"].values))
+    if "GPW" in needed:
+        components.append(_clip_norm(merged["GPW"].values))
+    if "dist_road" in needed:
+        # invert: shorter distance = more accessible = higher activity
+        components.append(1.0 - _clip_norm(merged["dist_road"].values))
+
+    eai = np.nanmean(np.stack(components, axis=1), axis=1).astype(np.float32)
+    merged["eai"] = eai
+    print(f"  EAI computed: mean={np.nanmean(eai):.3f}, std={np.nanstd(eai):.3f}, "
+          f"range=[{np.nanmin(eai):.3f}, {np.nanmax(eai):.3f}]")
+
+    # ── Spearman correlation ───────────────────────────────────────────────────
+    from scipy.stats import spearmanr
+    proba = merged[PROBA_COL].values.astype(np.float32)
+    rho, pval = spearmanr(eai, proba, nan_policy="omit")
+    print(f"  Spearman r(EAI, PA_prob) = {rho:.4f}  (p = {pval:.2e})")
+
+    # ── Quintile breakdown ─────────────────────────────────────────────────────
+    merged["eai_quintile"] = pd.qcut(merged["eai"], q=5, labels=["Q1\n(lowest)", "Q2", "Q3", "Q4", "Q5\n(highest)"])
+    qtable = (
+        merged.groupby("eai_quintile", observed=True)
+        .agg(
+            n_pixels=("eai", "count"),
+            eai_mean=("eai", "mean"),
+            pa_prob_mean=(PROBA_COL, "mean"),
+            pa_prob_median=(PROBA_COL, "median"),
+        )
+        .reset_index()
+        .rename(columns={"eai_quintile": "EAI quintile"})
+    )
+    qtable["eai_mean"] = qtable["eai_mean"].round(3)
+    qtable["pa_prob_mean"] = qtable["pa_prob_mean"].round(6)
+    qtable["pa_prob_median"] = qtable["pa_prob_median"].round(6)
+    print("\n  Quintile breakdown:")
+    print(qtable.to_string(index=False))
+
+    # Save CSV
+    summary_rows = [{"metric": "spearman_r", "value": round(float(rho), 4)},
+                    {"metric": "spearman_pval", "value": float(pval)}]
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df.to_csv(output_dir / "economic_activity_correlation.csv", index=False)
+    qtable.to_csv(output_dir / "economic_activity_quintiles.csv", index=False)
+    print(f"\n  Saved: {output_dir / 'economic_activity_correlation.csv'}")
+    print(f"  Saved: {output_dir / 'economic_activity_quintiles.csv'}")
+
+    # ── Maps ──────────────────────────────────────────────────────────────────
+    if "x" not in merged.columns or "y" not in merged.columns:
+        print("  Skipping maps -- no x/y coordinates in scored parquet.")
+        return qtable
+
+    xm = merged["x"].values.astype(np.float64)
+    ym = merged["y"].values.astype(np.float64)
+    proj_bounds = _resolve_plot_bounds_3857(repo_root, data_subdir, baseline)
+    backbone_path = resolve_backbone_path_for_plot(repo_root, data_subdir, baseline)
+
+    proj_w = proj_bounds[2] - proj_bounds[0]
+    proj_h = proj_bounds[3] - proj_bounds[1]
+    aspect = proj_h / max(proj_w, 1e-9)
+
+    # -- EAI map
+    eai_grid, eai_ext = points_to_raster(xm, ym, eai, target_resolution=1000.0,
+                                          agg_func="mean", extent_bounds=proj_bounds)
+    fig_w = 10.0
+    fig, ax = plt.subplots(figsize=(fig_w, fig_w * aspect))
+    _plot_backbone_background(ax, backbone_path, zorder=0)
+    im = ax.imshow(eai_grid, extent=eai_ext, cmap="YlOrRd", origin="upper",
+                   interpolation="nearest", aspect="equal", vmin=0, vmax=1, zorder=2)
+    ax.set_xlim(proj_bounds[0], proj_bounds[2])
+    ax.set_ylim(proj_bounds[1], proj_bounds[3])
+    ax.set_aspect("equal", adjustable="box")
+    _add_latlon_ticks(ax, (proj_bounds[0], proj_bounds[2]), (proj_bounds[1], proj_bounds[3]))
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Economic Activity Index (0 = low, 1 = high)", fontsize=9)
+    ax.set_title(f"Economic Activity Index\n{region_label} -- Unprotected pixels, 2024",
+                 fontsize=11, fontweight="bold")
+    ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
+    ax.grid(True, alpha=0.2, linestyle="--", linewidth=0.4, zorder=3)
+    for ext in ("pdf", "png"):
+        p = output_dir / f"economic_activity_map.{ext}"
+        if _safe_savefig(p, dpi=MAP_DPI, bbox_inches="tight"):
+            print(f"  Saved: {p}")
+    try:
+        plt.close(fig)
+    except Exception:
+        pass
+
+    # -- Side-by-side: EAI | PA probability
+    proba_grid, proba_ext = points_to_raster(xm, ym, proba, target_resolution=1000.0,
+                                              agg_func="mean", extent_bounds=proj_bounds)
+    fig, axes = plt.subplots(1, 2, figsize=(fig_w * 2, fig_w * aspect),
+                             constrained_layout=True)
+
+    for ax_i, (grid, gext, cmap, label, title) in enumerate([
+        (eai_grid,   eai_ext,   "YlOrRd", "Economic Activity Index",            "Economic Activity"),
+        (proba_grid, proba_ext, "Blues",  "PA Designation Probability (calibrated)", "PA Risk"),
+    ]):
+        ax = axes[ax_i]
+        _plot_backbone_background(ax, backbone_path, zorder=0)
+        im = ax.imshow(grid, extent=gext, cmap=cmap, origin="upper",
+                       interpolation="nearest", aspect="equal", zorder=2)
+        ax.set_xlim(proj_bounds[0], proj_bounds[2])
+        ax.set_ylim(proj_bounds[1], proj_bounds[3])
+        ax.set_aspect("equal", adjustable="box")
+        _add_latlon_ticks(ax, (proj_bounds[0], proj_bounds[2]), (proj_bounds[1], proj_bounds[3]))
+        cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label(label, fontsize=8)
+        ax.set_title(title, fontsize=11, fontweight="bold")
+        ax.set_xlabel("Longitude"); ax.set_ylabel("Latitude")
+        ax.grid(True, alpha=0.2, linestyle="--", linewidth=0.4, zorder=3)
+
+    fig.suptitle(
+        f"Economic Activity vs. PA Risk — {region_label}\n"
+        f"Spearman r = {rho:.3f}  (p = {pval:.1e})",
+        fontsize=12, fontweight="bold",
+    )
+    for ext in ("pdf", "png"):
+        p = output_dir / f"economic_activity_vs_risk.{ext}"
+        if _safe_savefig(p, dpi=MAP_DPI, bbox_inches="tight"):
+            print(f"  Saved: {p}")
+    try:
+        plt.close(fig)
+    except Exception:
+        pass
+
+    # -- Quintile bar chart
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4), constrained_layout=True)
+    qlabels = [str(q) for q in qtable["EAI quintile"]]
+    x = np.arange(len(qlabels))
+    COLORS = ["#FEE5D9", "#FCAE91", "#FB6A4A", "#DE2D26", "#A50F15"]
+
+    ax0 = axes[0]
+    ax0.bar(x, qtable["eai_mean"], color=COLORS, edgecolor="white", width=0.6, zorder=2)
+    ax0.set_xticks(x); ax0.set_xticklabels(qlabels, fontsize=8.5)
+    ax0.set_ylabel("Mean EAI", fontsize=9)
+    ax0.set_title("Economic Activity Index per quintile", fontsize=10, fontweight="bold")
+    ax0.grid(axis="y", alpha=0.3, linestyle="--", zorder=1); ax0.set_axisbelow(True)
+    ax0.spines[["top", "right"]].set_visible(False)
+
+    ax1 = axes[1]
+    pa_means = qtable["pa_prob_mean"].values * 1000  # scale to ‰ for readability
+    ax1.bar(x, pa_means, color=COLORS, edgecolor="white", width=0.6, zorder=2)
+    for i, (bar, v) in enumerate(zip(ax1.patches, pa_means)):
+        ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height() * 1.03,
+                 f"{v:.2f}", ha="center", va="bottom", fontsize=8, fontweight="bold")
+    ax1.set_xticks(x); ax1.set_xticklabels(qlabels, fontsize=8.5)
+    ax1.set_ylabel("Mean PA probability (‰)", fontsize=9)
+    ax1.set_title(f"PA probability by EAI quintile\nSpearman r = {rho:.3f}", fontsize=10, fontweight="bold")
+    ax1.grid(axis="y", alpha=0.3, linestyle="--", zorder=1); ax1.set_axisbelow(True)
+    ax1.spines[["top", "right"]].set_visible(False)
+
+    for ext in ("pdf", "png"):
+        p = output_dir / f"economic_activity_quintile_chart.{ext}"
+        if _safe_savefig(p, dpi=150, bbox_inches="tight"):
+            print(f"  Saved: {p}")
+    try:
+        plt.close(fig)
+    except Exception:
+        pass
+
+    return qtable
 
 
 # ── Hotspot zoom-in maps ───────────────────────────────────────────────────────
@@ -1965,9 +2266,9 @@ def create_conservation_alignment_map(
     output_dir: Path,
     baseline: Dict[str, Any],
     repo_root: Path,
-) -> None:
+) -> Dict[str, Any]:
     """Create a single-map 'Conservation Alignment' visualisation (biodiversity)."""
-    _create_alignment_map(
+    return _create_alignment_map(
         df=df,
         bau_cutoff=bau_cutoff,
         full_cutoff=full_cutoff,
@@ -1989,9 +2290,9 @@ def create_climate_alignment_map(
     output_dir: Path,
     baseline: Dict[str, Any],
     repo_root: Path,
-) -> None:
+) -> Dict[str, Any]:
     """Create a single-map 'Climate Alignment' visualisation (climate stabilisation areas)."""
-    _create_alignment_map(
+    return _create_alignment_map(
         df=df,
         bau_cutoff=bau_cutoff,
         full_cutoff=full_cutoff,
@@ -2018,7 +2319,7 @@ def _create_alignment_map(
     annotation_subject: str,
     out_stem: str,
     console_label: str,
-) -> None:
+) -> Dict[str, Any]:
     """Create a single-map 'Alignment' visualisation for any binary priority mask."""
     print("\n" + "=" * 70)
     print(console_label)
@@ -2026,7 +2327,7 @@ def _create_alignment_map(
 
     if priority_col not in df.columns:
         print(f"  NOTE: '{priority_col}' not available — skipping alignment map")
-        return
+        return {}
 
     proba   = df[PROBA_COL].values
     area    = df["area_km2"].values
@@ -2046,9 +2347,11 @@ def _create_alignment_map(
     total_misdirected_km2 = float(area[misdirected].sum())
     total_priority_km2    = float(area[priority].sum())
     total_designated_km2  = float(area[full].sum())
-    # We want: "How focused are new 30×30 designations on the priority layer?"
-    # i.e., % of the 30×30 establishment area that falls inside the priority mask.
+    # Two complementary overlap views:
+    # 1) designation-focused: % of 30×30 establishment area inside priority
+    # 2) priority-focused: % of priority area captured by 30×30 establishments
     alignment_pct = total_sweet_km2 / max(total_designated_km2, 1.0) * 100
+    priority_coverage_pct = total_sweet_km2 / max(total_priority_km2, 1.0) * 100
 
     print(f"  Sweet spots (both):    {total_sweet_km2:,.0f} km²")
     print(f"  Conservation gaps:     {total_gap_km2:,.0f} km²")
@@ -2056,6 +2359,7 @@ def _create_alignment_map(
     print(f"  Total designated (30×30): {total_designated_km2:,.0f} km²")
     print(f"  Total priority area:      {total_priority_km2:,.0f} km²")
     print(f"  Alignment score:          {alignment_pct:.1f}% of 30×30 establishments inside {annotation_subject}")
+    print(f"  Priority coverage:        {priority_coverage_pct:.1f}% of {annotation_subject} covered by 30×30 establishments")
 
     region_proj = None
     proj_bounds = _resolve_plot_bounds_3857(repo_root, DATA_SUBDIR, baseline)
@@ -2106,7 +2410,8 @@ def _create_alignment_map(
 
     ax.text(
         0.98, 0.02,
-        f"Alignment score: {alignment_pct:.1f}%\nof 30×30 establishments\ninside {annotation_subject}",
+        f"Alignment score: {alignment_pct:.1f}%\nof 30×30 establishments\ninside {annotation_subject}\n\n"
+        f"Priority coverage: {priority_coverage_pct:.1f}%\nof {annotation_subject}\ncovered by 30×30",
         transform=ax.transAxes, fontsize=9, ha="right", va="bottom",
         bbox=dict(boxstyle="round,pad=0.4", fc="lightyellow", alpha=0.85, ec="gray"),
     )
@@ -2121,6 +2426,44 @@ def _create_alignment_map(
         plt.close(fig)
     except Exception:
         pass
+
+    return {
+        "priority_col": priority_col,
+        "annotation_subject": annotation_subject,
+        "sweet_spot_km2": round(total_sweet_km2, 3),
+        "priority_area_km2": round(total_priority_km2, 3),
+        "designated_30x30_km2": round(total_designated_km2, 3),
+        "alignment_pct_designations_inside_priority": round(alignment_pct, 3),
+        "coverage_pct_priority_covered_by_designations": round(priority_coverage_pct, 3),
+    }
+
+
+def save_alignment_summary(
+    alignment_metrics: Dict[str, Dict[str, Any]],
+    output_dir: Path,
+) -> None:
+    """Save compact CSV/JSON with alignment metrics for biodiversity + climate."""
+    if not alignment_metrics:
+        return
+    rows = []
+    for layer, metrics in alignment_metrics.items():
+        if not metrics:
+            continue
+        row = {"layer": layer}
+        row.update(metrics)
+        rows.append(row)
+    if not rows:
+        return
+
+    df_out = pd.DataFrame(rows)
+    csv_path = output_dir / "alignment_summary.csv"
+    df_out.to_csv(csv_path, index=False)
+    print(f"  Saved: {csv_path}")
+
+    json_path = output_dir / "alignment_summary.json"
+    with open(json_path, "w") as f:
+        json.dump(rows, f, indent=2, default=str)
+    print(f"  Saved: {json_path}")
 
 
 def create_country_conservation_alignment(
@@ -2288,6 +2631,7 @@ def save_scenario_summary(
     output_dir: Path,
     forecast_confidence: Optional[Dict] = None,
     country_alignment_df: Optional[pd.DataFrame] = None,
+    alignment_metrics: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> None:
     summary = {
         "coverage_baseline": baseline,
@@ -2304,6 +2648,8 @@ def save_scenario_summary(
         summary["forecast_confidence"] = forecast_confidence
     if country_alignment_df is not None and not country_alignment_df.empty:
         summary["country_alignment"] = country_alignment_df.to_dict("records")
+    if alignment_metrics:
+        summary["alignment_metrics"] = alignment_metrics
     out = output_dir / "scenario_summary.json"
     with open(out, "w") as f:
         json.dump(summary, f, indent=2, default=str)
@@ -2475,6 +2821,13 @@ def main() -> None:
     )
     wb.log({"results/stage": "economic_exposure_done"})
 
+    # ── Economic activity index ────────────────────────────────────────────────
+    create_economic_activity_analysis(
+        df, features_forward_dir, model_output_dir,
+        baseline, repo_root, DATA_SUBDIR, REGION_LABEL,
+    )
+    wb.log({"results/stage": "economic_activity_done"})
+
     # ── Hotspot zoom-ins ──────────────────────────────────────────────────────
     create_hotspot_maps(
         df, HOTSPOT_REGIONS, bau_cutoff,
@@ -2486,12 +2839,17 @@ def main() -> None:
     forecast_confidence = create_forecast_confidence_summary(model_output_dir)
 
     # ── Conservation / climate alignment maps & country scores ───────────────
-    create_conservation_alignment_map(
+    biodiversity_alignment_metrics = create_conservation_alignment_map(
         df, bau_cutoff, full_cutoff, model_output_dir, baseline, repo_root,
     )
-    create_climate_alignment_map(
+    climate_alignment_metrics = create_climate_alignment_map(
         df, bau_cutoff, full_cutoff, model_output_dir, baseline, repo_root,
     )
+    alignment_metrics = {
+        "biodiversity": biodiversity_alignment_metrics,
+        "climate_stabilisation": climate_alignment_metrics,
+    }
+    save_alignment_summary(alignment_metrics, model_output_dir)
     country_alignment_df = create_country_conservation_alignment(
         df, full_cutoff, model_output_dir, world_gdf, ISO_CODES,
     )
@@ -2501,6 +2859,7 @@ def main() -> None:
         baseline, scenario_info, gap_metrics, country_df, biome_df, model_output_dir,
         forecast_confidence=forecast_confidence,
         country_alignment_df=country_alignment_df,
+        alignment_metrics=alignment_metrics,
     )
 
     _log: Dict[str, Any] = {
@@ -2522,6 +2881,12 @@ def main() -> None:
         for _k, _v in gap_metrics.items():
             if isinstance(_v, (int, float)):
                 _log[f"results/gap/{_k}"] = _v
+    if isinstance(alignment_metrics, dict):
+        for _layer, _vals in alignment_metrics.items():
+            if isinstance(_vals, dict):
+                for _k, _v in _vals.items():
+                    if isinstance(_v, (int, float)):
+                        _log[f"results/alignment/{_layer}/{_k}"] = _v
     _log["results/stage"] = "done"
     wb.log(_log)
     wb.finish()
@@ -2544,6 +2909,8 @@ def main() -> None:
         "climate_stabilisation_alignment.png",
         "country_alignment.png",
         "country_alignment.csv",
+        "alignment_summary.csv",
+        "alignment_summary.json",
         f"feature_importance_{model_type}.png",
     ]
     if os.environ.get("PA3030_SAVE_PDF", "0").strip().lower() not in {"0", "false", "no", "off"}:

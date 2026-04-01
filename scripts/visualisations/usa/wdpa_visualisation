@@ -1,339 +1,431 @@
 #!/usr/bin/env python3
 """
-WDPA protected-area coverage visualisation for the USA (2000-2024).
+WDPA protected areas visualization for USA (2000-2024).
 
 Inputs:
-    - Yearly GeoTIFFs in ``data/usa/ready/WDPA``, named
-      ``WDPA_USA_1km_<year>.tif`` for years 2000-2024.
-      Binary rasters: 1 = protected, 0 = not protected.
+- GeoTIFF rasters in `data/usa/ready/WDPA`, named `WDPA_USA_1km_<year>.tif` with binary protection masks.
 
 Process:
-    - Loads annual WDPA rasters, computes coverage statistics, and
-      generates overview maps, temporal trends, and change detection.
+- Loads annual protected area rasters, computes coverage statistics, and generates yearly maps, temporal comparisons, and summary plots.
 
 Outputs:
-    - PNG figures saved to ``outputs/usa/figures/WDPA_vis``.
+- PNG figures saved to `outputs/usa/figures/WDPA_vis`.
 """
 
-import warnings
-from pathlib import Path
-
-import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
+import matplotlib.pyplot as plt
+from pathlib import Path
+import warnings
+from matplotlib.colors import ListedColormap
 
-warnings.filterwarnings("ignore")
+warnings.filterwarnings('ignore')
 
-# Paths
+# Set up paths
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-WDPA_DIR = PROJECT_ROOT / "data" / "usa" / "ready" / "WDPA"
-OUTPUT_DIR = PROJECT_ROOT / "outputs" / "usa" / "figures" / "WDPA_vis"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+data_dir = PROJECT_ROOT / "data"
+wdpa_dir = data_dir / "usa" / "ready" / "WDPA"
+output_dir = PROJECT_ROOT / "outputs" / "usa" / "figures" / "WDPA_vis"
+output_dir.mkdir(parents=True, exist_ok=True)
 
-YEARS = list(range(2000, 2025))
-PA_COLOR = "#2ca02c"
-NON_PA_COLOR = "#d9d9d9"
+# Years to process
+YEARS = range(2000, 2025)
+
+# Color scheme for protected areas
+PROTECTED_COLOR = '#2E8B57'  # Sea Green
+UNPROTECTED_COLOR = '#F5F5F5'  # Light Gray
+BOUNDARY_COLOR = '#000000'  # Black
 
 
 def load_wdpa_data():
-    """Load all available WDPA yearly rasters."""
-    print("Loading WDPA protected-area data...")
+    """Load the WDPA protected area coverage data for all years"""
+    print("Loading WDPA protected area coverage data for all years...")
+
     all_data = {}
 
     for year in YEARS:
-        path = WDPA_DIR / f"WDPA_USA_1km_{year}.tif"
-        if not path.exists():
-            print(f"  Warning: {path.name} not found")
+        wdpa_file = wdpa_dir / f"WDPA_USA_1km_{year}.tif"
+
+        if not wdpa_file.exists():
+            print(f"   Warning: File not found: {wdpa_file.name}")
             continue
 
-        with rasterio.open(path) as src:
-            data = src.read(1)
-            transform = src.transform
+        try:
+            with rasterio.open(wdpa_file) as src:
+                data = src.read()
 
-        pa_pixels = int((data == 1).sum())
-        total_pixels = int(data.size)
-        pct = 100 * pa_pixels / total_pixels if total_pixels > 0 else 0
-        print(f"  {year}: shape={data.shape}, "
-              f"protected={pa_pixels:,} ({pct:.2f}%)")
-        all_data[year] = data
+                # WDPA data is single band binary (0 or 1)
+                protected_pixels = np.sum(data == 1)
+                total_pixels = np.sum(~np.isnan(data))
+                protected_percentage = (protected_pixels / total_pixels * 100) if total_pixels > 0 else 0
+
+                print(f"   {year}: Shape: {data.shape}, Protected pixels: {protected_pixels:,} ({protected_percentage:.2f}%)")
+
+                all_data[year] = {
+                    'data': data[0],  # Single band data
+                    'src': src,
+                    'file_path': wdpa_file,
+                    'protected_pixels': protected_pixels,
+                    'protected_percentage': protected_percentage
+                }
+
+        except Exception as e:
+            print(f"   Error loading {year}: {e}")
+            continue
 
     if not all_data:
-        print("  No data loaded.")
-        return None, None
+        print("   No data loaded successfully")
+        return None
 
-    # Return transform from last loaded file for plotting
-    return all_data, transform
-
-
-def plot_overview_maps(all_data):
-    """Create overview maps for selected years."""
-    print("Creating overview maps...")
-
-    # Pick a representative subset of years
-    available = sorted(all_data.keys())
-    if len(available) <= 6:
-        selected = available
-    else:
-        # First, last, and evenly spaced years in between
-        selected = [available[0]]
-        step = max(1, (len(available) - 1) // 4)
-        for i in range(step, len(available) - 1, step):
-            selected.append(available[i])
-        selected.append(available[-1])
-        selected = sorted(set(selected))
-
-    ncols = min(3, len(selected))
-    nrows = (len(selected) + ncols - 1) // ncols
-    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 7, nrows * 5))
-    fig.suptitle("WDPA Protected Areas — USA",
-                 fontsize=16, fontweight="bold", y=1.01)
-
-    if nrows * ncols == 1:
-        axes = np.array([axes])
-    axes_flat = axes.flatten() if hasattr(axes, "flatten") else [axes]
-
-    from matplotlib.colors import ListedColormap
-    pa_cmap = ListedColormap([NON_PA_COLOR, PA_COLOR])
-
-    for idx, ax in enumerate(axes_flat):
-        if idx >= len(selected):
-            ax.set_visible(False)
-            continue
-
-        year = selected[idx]
-        data = all_data[year]
-        pa_count = int((data == 1).sum())
-        total = data.size
-        pct = 100 * pa_count / total
-
-        ax.imshow(data, cmap=pa_cmap, vmin=0, vmax=1,
-                  interpolation="nearest")
-        ax.set_title(f"{year}\n{pa_count:,} pixels ({pct:.2f}%)",
-                     fontsize=11, fontweight="bold")
-        ax.set_axis_off()
-
-    plt.tight_layout()
-    out = OUTPUT_DIR / "wdpa_usa_overview_grid.png"
-    fig.savefig(out, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {out.name}")
+    print(f"   Successfully loaded {len(all_data)} years")
+    return all_data
 
 
-def plot_single_year_map(all_data):
-    """Plot a detailed map of the most recent year."""
-    print("Creating detailed latest-year map...")
-
-    latest_year = max(all_data.keys())
-    data = all_data[latest_year]
-
-    from matplotlib.colors import ListedColormap
-    pa_cmap = ListedColormap([NON_PA_COLOR, PA_COLOR])
-
-    pa_count = int((data == 1).sum())
-    total = data.size
-    pct = 100 * pa_count / total
-
-    fig, ax = plt.subplots(figsize=(14, 8))
-    im = ax.imshow(data, cmap=pa_cmap, vmin=0, vmax=1,
-                   interpolation="nearest")
-    ax.set_title(f"WDPA Protected Areas — USA ({latest_year})",
-                 fontsize=14, fontweight="bold")
-    ax.set_axis_off()
-
-    stats_text = (f"Protected: {pa_count:,} pixels ({pct:.2f}%)\n"
-                  f"Unprotected: {total - pa_count:,} pixels")
-    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
-            fontsize=11, verticalalignment="top",
-            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
-
-    # Legend
-    from matplotlib.patches import Patch
-    legend_elements = [
-        Patch(facecolor=PA_COLOR, label="Protected"),
-        Patch(facecolor=NON_PA_COLOR, edgecolor="grey", label="Not protected"),
-    ]
-    ax.legend(handles=legend_elements, loc="lower right", fontsize=10,
-              framealpha=0.9)
-
-    plt.tight_layout()
-    out = OUTPUT_DIR / f"wdpa_usa_{latest_year}_detail.png"
-    fig.savefig(out, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {out.name}")
-
-
-def plot_temporal_trend(all_data):
-    """Plot the growth of protected-area coverage over time."""
-    if len(all_data) < 2:
+def create_protected_area_maps(all_data):
+    """Create protected area maps for each year"""
+    if all_data is None:
         return
 
-    print("Creating temporal trend plot...")
+    print("Creating protected area maps for each year...")
+
+    # Create custom colormap for protected areas
+    colors = [UNPROTECTED_COLOR, PROTECTED_COLOR]
+    cmap = ListedColormap(colors)
+
+    for year, data_info in all_data.items():
+        data = data_info['data']
+        protected_percentage = data_info['protected_percentage']
+        nrows, ncols = data.shape
+
+        # Preserve raster proportions so the map is not stretched/squeezed.
+        width = 12
+        height = max(7, width * (nrows / ncols))
+        fig, ax = plt.subplots(figsize=(width, height))
+
+        # Create visualization
+        im = ax.imshow(data, cmap=cmap, aspect='equal', vmin=0, vmax=1)
+
+        # Set title with statistics
+        ax.set_title(f'Protected Areas Coverage - USA {year}\n'
+                    f'Protected Area: {protected_percentage:.2f}% of total land area',
+                    fontsize=14, fontweight='bold', pad=20)
+
+        # Add colorbar with custom labels
+        cbar = plt.colorbar(im, ax=ax, shrink=0.8, ticks=[0, 1])
+        cbar.set_ticklabels(['Not Protected', 'Protected'])
+        cbar.set_label('Protection Status', rotation=270, labelpad=20, fontsize=12)
+
+        # Remove axis labels for cleaner look
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+        # Add statistics text box
+        stats_text = f'Protected Pixels: {data_info["protected_pixels"]:,}\n'
+        stats_text += f'Percentage: {protected_percentage:.2f}%\n'
+        stats_text += f'Resolution: 1km'
+
+        ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
+                fontsize=10, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+        plt.tight_layout()
+
+        # Save the plot
+        output_file = output_dir / f"wdpa_coverage_usa_{year}.png"
+        plt.savefig(output_file, dpi=300, bbox_inches='tight')
+        print(f"   Saved: {output_file.name}")
+
+        plt.close()  # Close to free memory
+
+
+def create_temporal_comparison(all_data):
+    """Create temporal comparison of protected area coverage"""
+    if all_data is None or len(all_data) < 2:
+        return
+
+    print("Creating temporal comparison...")
+
+    # Extract protected area percentages over time
     years = sorted(all_data.keys())
-    pa_counts = []
-    pa_pcts = []
+    percentages = [all_data[year]['protected_percentage'] for year in years]
+    pixel_counts = [all_data[year]['protected_pixels'] for year in years]
 
-    for year in years:
-        data = all_data[year]
-        pa = int((data == 1).sum())
-        total = data.size
-        pa_counts.append(pa)
-        pa_pcts.append(100 * pa / total)
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+    fig.suptitle('Protected Area Coverage Evolution in USA (2000-2024)',
+                fontsize=16, fontweight='bold')
 
-    fig, ax1 = plt.subplots(figsize=(12, 6))
-    color_count = "#2ca02c"
-    color_pct = "#1f77b4"
+    # Plot 1: Protected area percentage over time
+    ax1.plot(years, percentages, marker='o', linewidth=3, markersize=8,
+             color=PROTECTED_COLOR, markerfacecolor='white', markeredgewidth=2)
+    ax1.set_title('Protected Area Percentage Over Time', fontweight='bold', fontsize=14)
+    ax1.set_xlabel('Year', fontsize=12)
+    ax1.set_ylabel('Protected Area (%)', fontsize=12)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xticks(years)
 
-    ax1.set_xlabel("Year", fontsize=12)
-    ax1.set_ylabel("Protected pixels", fontsize=12, color=color_count)
-    ax1.plot(years, pa_counts, color=color_count, linewidth=2.5,
-             marker="o", markersize=5, label="Protected pixels")
-    ax1.tick_params(axis="y", labelcolor=color_count)
-    ax1.yaxis.set_major_formatter(
-        plt.FuncFormatter(lambda x, _: f"{x:,.0f}"))
+    # Add value labels on points
+    for year, value in zip(years, percentages):
+        ax1.annotate(f'{value:.2f}%', (year, value),
+                    textcoords="offset points", xytext=(0, 10), ha='center', fontsize=10)
 
-    ax2 = ax1.twinx()
-    ax2.set_ylabel("Coverage (%)", fontsize=12, color=color_pct)
-    ax2.plot(years, pa_pcts, color=color_pct, linewidth=2.5,
-             marker="s", markersize=5, linestyle="--", label="Coverage %")
-    ax2.tick_params(axis="y", labelcolor=color_pct)
+    # Plot 2: Protected pixel counts over time
+    ax2.plot(years, pixel_counts, marker='s', linewidth=3, markersize=8,
+             color='#8B4513', markerfacecolor='white', markeredgewidth=2)
+    ax2.set_title('Protected Pixel Count Over Time', fontweight='bold', fontsize=14)
+    ax2.set_xlabel('Year', fontsize=12)
+    ax2.set_ylabel('Protected Pixels', fontsize=12)
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xticks(years)
 
-    # Add 30% target line
-    ax2.axhline(y=30, color="red", linestyle=":", linewidth=1.5,
-                alpha=0.7, label="30×30 target (30%)")
+    # Format y-axis to show millions
+    ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x/1e6:.1f}M'))
 
-    # Combined legend
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left",
-               fontsize=10, framealpha=0.9)
+    # Add value labels on points
+    for year, value in zip(years, pixel_counts):
+        ax2.annotate(f'{value/1e6:.1f}M', (year, value),
+                    textcoords="offset points", xytext=(0, 10), ha='center', fontsize=10)
 
-    ax1.set_title("WDPA Protected-Area Growth — USA (2000–2024)",
-                  fontsize=14, fontweight="bold")
+    plt.tight_layout()
+
+    # Save the plot
+    output_file = output_dir / "wdpa_temporal_comparison.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   Saved: {output_file.name}")
+
+    plt.show()
+
+
+def create_change_analysis(all_data):
+    """Create analysis of protected area changes between years"""
+    if all_data is None or len(all_data) < 2:
+        return
+
+    print("Creating change analysis...")
+
+    years = sorted(all_data.keys())
+
+    # Calculate year-to-year changes
+    changes = []
+    for i in range(1, len(years)):
+        prev_year = years[i - 1]
+        curr_year = years[i]
+
+        prev_pct = all_data[prev_year]['protected_percentage']
+        curr_pct = all_data[curr_year]['protected_percentage']
+        change = curr_pct - prev_pct
+
+        changes.append({
+            'year': curr_year,
+            'change_pct': change,
+            'prev_pct': prev_pct,
+            'curr_pct': curr_pct
+        })
+
+    # Create figure
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    fig.suptitle('Protected Area Change Analysis (2000-2024)',
+                fontsize=16, fontweight='bold')
+
+    # Plot 1: Year-to-year percentage changes
+    change_years = [c['year'] for c in changes]
+    change_values = [c['change_pct'] for c in changes]
+
+    colors = ['green' if x > 0 else 'red' for x in change_values]
+    bars = ax1.bar(change_years, change_values, color=colors, alpha=0.7, edgecolor='black')
+
+    ax1.set_title('Year-to-Year Change in Protected Area Percentage', fontweight='bold')
+    ax1.set_xlabel('Year', fontsize=12)
+    ax1.set_ylabel('Change in Protected Area (%)', fontsize=12)
+    ax1.grid(True, alpha=0.3)
+    ax1.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+
+    # Add value labels on bars
+    for bar, value in zip(bars, change_values):
+        height = bar.get_height()
+        ax1.annotate(f'{value:+.3f}%',
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3 if height > 0 else -15),
+                    textcoords="offset points", ha='center', va='bottom' if height > 0 else 'top')
+
+    # Plot 2: Cumulative growth
+    cumulative_growth = [all_data[year]['protected_percentage'] - all_data[years[0]]['protected_percentage']
+                        for year in years]
+
+    ax2.plot(years, cumulative_growth, marker='o', linewidth=3, markersize=8,
+             color=PROTECTED_COLOR, markerfacecolor='white', markeredgewidth=2)
+    ax2.set_title(f'Cumulative Growth Since {years[0]}', fontweight='bold')
+    ax2.set_xlabel('Year', fontsize=12)
+    ax2.set_ylabel('Cumulative Change (%)', fontsize=12)
+    ax2.grid(True, alpha=0.3)
+    ax2.axhline(y=0, color='black', linestyle='--', linewidth=0.5)
+
+    # Add value labels on points
+    for year, value in zip(years, cumulative_growth):
+        ax2.annotate(f'{value:+.2f}%', (year, value),
+                    textcoords="offset points", xytext=(0, 10), ha='center', fontsize=10)
+
+    plt.tight_layout()
+
+    # Save the plot
+    output_file = output_dir / "wdpa_change_analysis.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   Saved: {output_file.name}")
+
+    plt.show()
+
+
+def create_summary_statistics(all_data):
+    """Create summary statistics across all years"""
+    if all_data is None:
+        return
+
+    print("Creating summary statistics...")
+
+    # Extract statistics
+    years = sorted(all_data.keys())
+    percentages = [all_data[year]['protected_percentage'] for year in years]
+    pixel_counts = [all_data[year]['protected_pixels'] for year in years]
+
+    # Calculate summary statistics
+    stats = {
+        'mean_pct': np.mean(percentages),
+        'std_pct': np.std(percentages),
+        'min_pct': np.min(percentages),
+        'max_pct': np.max(percentages),
+        'total_change_pct': percentages[-1] - percentages[0],
+        'mean_pixels': np.mean(pixel_counts),
+        'total_change_pixels': pixel_counts[-1] - pixel_counts[0]
+    }
+
+    # Create figure
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('WDPA Protected Areas - Summary Statistics (2000-2024)',
+                fontsize=16, fontweight='bold')
+
+    # Plot 1: Protected area percentage distribution
+    ax1.hist(percentages, bins=8, color=PROTECTED_COLOR, alpha=0.7, edgecolor='black')
+    ax1.axvline(stats['mean_pct'], color='red', linestyle='--', linewidth=2, label=f"Mean: {stats['mean_pct']:.2f}%")
+    ax1.set_title('Distribution of Protected Area Percentages', fontweight='bold')
+    ax1.set_xlabel('Protected Area (%)', fontsize=12)
+    ax1.set_ylabel('Frequency', fontsize=12)
+    ax1.legend()
     ax1.grid(True, alpha=0.3)
 
-    plt.tight_layout()
-    out = OUTPUT_DIR / "wdpa_usa_temporal_trend.png"
-    fig.savefig(out, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {out.name}")
+    # Plot 2: Protected pixel count distribution
+    ax2.hist(pixel_counts, bins=8, color='#8B4513', alpha=0.7, edgecolor='black')
+    ax2.axvline(stats['mean_pixels'], color='red', linestyle='--', linewidth=2,
+               label=f"Mean: {stats['mean_pixels']/1e6:.1f}M pixels")
+    ax2.set_title('Distribution of Protected Pixel Counts', fontweight='bold')
+    ax2.set_xlabel('Protected Pixels', fontsize=12)
+    ax2.set_ylabel('Frequency', fontsize=12)
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    ax2.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x/1e6:.1f}M'))
 
+    # Plot 3: Summary statistics table
+    ax3.axis('off')
+    stats_text = f"""
+    Protected Area Coverage Statistics (2000-2024)
 
-def plot_change_detection(all_data):
-    """Compare first and last year; highlight newly protected pixels."""
-    if len(all_data) < 2:
-        return
+    Mean Coverage: {stats['mean_pct']:.2f}% ± {stats['std_pct']:.2f}%
+    Range: {stats['min_pct']:.2f}% - {stats['max_pct']:.2f}%
+    Total Change: {stats['total_change_pct']:+.2f}%
 
-    print("Creating change detection map...")
-    first_yr = min(all_data)
-    last_yr = max(all_data)
-    first = all_data[first_yr]
-    last = all_data[last_yr]
+    Mean Protected Pixels: {stats['mean_pixels']/1e6:.1f}M
+    Total Pixel Change: {stats['total_change_pixels']/1e6:+.1f}M
 
-    # 0 = never protected, 1 = already protected, 2 = newly protected
-    change = np.zeros_like(first, dtype=np.int8)
-    change[(first == 1) & (last == 1)] = 1   # persistent
-    change[(first == 0) & (last == 1)] = 2   # newly designated
-    # Note: degazettement (first==1, last==0) is rare but possible
+    Years Analyzed: {len(years)}
+    Time Period: {years[0]} - {years[-1]}
+    """
 
-    persistent = int((change == 1).sum())
-    newly = int((change == 2).sum())
-    lost = int(((first == 1) & (last == 0)).sum())
+    ax3.text(0.1, 0.9, stats_text, transform=ax3.transAxes, fontsize=12,
+             verticalalignment='top', fontfamily='monospace',
+             bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
 
-    from matplotlib.colors import ListedColormap
-    from matplotlib.patches import Patch
-    change_cmap = ListedColormap(["#f0f0f0", "#2ca02c", "#ff7f0e"])
-
-    fig, ax = plt.subplots(figsize=(14, 8))
-    ax.imshow(change, cmap=change_cmap, vmin=0, vmax=2,
-              interpolation="nearest")
-    ax.set_title(f"PA Change Detection ({first_yr} → {last_yr}) — USA",
-                 fontsize=14, fontweight="bold")
-    ax.set_axis_off()
-
-    legend_elements = [
-        Patch(facecolor="#f0f0f0", edgecolor="grey", label="Never protected"),
-        Patch(facecolor="#2ca02c", label=f"Already protected ({persistent:,})"),
-        Patch(facecolor="#ff7f0e", label=f"Newly designated ({newly:,})"),
-    ]
-    if lost > 0:
-        legend_elements.append(
-            Patch(facecolor="#d62728", label=f"Degazetted ({lost:,})")
-        )
-    ax.legend(handles=legend_elements, loc="lower right", fontsize=10,
-              framealpha=0.9)
-
-    stats_text = (f"Persistent: {persistent:,}\n"
-                  f"Newly designated: {newly:,}\n"
-                  f"Lost: {lost:,}")
-    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
-            fontsize=11, verticalalignment="top",
-            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8))
+    # Plot 4: Trend analysis
+    try:
+        from scipy import stats as scipy_stats
+        slope, intercept, r_value, p_value, std_err = scipy_stats.linregress(years, percentages)
+        ax4.plot(years, percentages, 'o-', color=PROTECTED_COLOR, linewidth=2, markersize=6, label='Data')
+        ax4.plot(years, [slope * year + intercept for year in years], '--', color='red', linewidth=2,
+                 label=f'Trend: {slope:.4f}%/year (R²={r_value**2:.3f})')
+        ax4.legend()
+    except Exception:
+        # Keep this visualization robust if scipy is unavailable.
+        ax4.plot(years, percentages, 'o-', color=PROTECTED_COLOR, linewidth=2, markersize=6, label='Data')
+        ax4.legend()
+    ax4.set_title('Protected Area Trend Analysis', fontweight='bold')
+    ax4.set_xlabel('Year', fontsize=12)
+    ax4.set_ylabel('Protected Area (%)', fontsize=12)
+    ax4.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    out = OUTPUT_DIR / f"wdpa_usa_change_{first_yr}_{last_yr}.png"
-    fig.savefig(out, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {out.name}")
 
+    # Save the plot
+    output_file = output_dir / "wdpa_summary_statistics.png"
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f"   Saved: {output_file.name}")
 
-def plot_annual_new_designations(all_data):
-    """Bar chart of newly designated pixels per year."""
-    if len(all_data) < 2:
-        return
-
-    print("Creating annual new-designations bar chart...")
-    years = sorted(all_data.keys())
-    new_per_year = []
-
-    for i in range(1, len(years)):
-        prev = all_data[years[i - 1]]
-        curr = all_data[years[i]]
-        newly = int(((prev == 0) & (curr == 1)).sum())
-        new_per_year.append((years[i], newly))
-
-    yr_labels = [str(y) for y, _ in new_per_year]
-    counts = [c for _, c in new_per_year]
-
-    fig, ax = plt.subplots(figsize=(14, 6))
-    bars = ax.bar(yr_labels, counts, color=PA_COLOR, edgecolor="white",
-                  linewidth=0.5)
-    ax.set_title("Annual Newly Designated PA Pixels — USA",
-                 fontsize=14, fontweight="bold")
-    ax.set_xlabel("Year", fontsize=12)
-    ax.set_ylabel("Newly protected pixels", fontsize=12)
-    ax.yaxis.set_major_formatter(
-        plt.FuncFormatter(lambda x, _: f"{x:,.0f}"))
-
-    # Rotate x-labels
-    plt.xticks(rotation=45, ha="right")
-    ax.grid(axis="y", alpha=0.3)
-
-    plt.tight_layout()
-    out = OUTPUT_DIR / "wdpa_usa_annual_new_designations.png"
-    fig.savefig(out, dpi=300, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved: {out.name}")
+    plt.show()
 
 
 def main():
-    print("WDPA Protected Areas Visualisation — USA")
-    print("=" * 60)
-    print(f"Input directory: {WDPA_DIR}")
-    print(f"Output directory: {OUTPUT_DIR}")
-    print()
+    """Main visualization function"""
+    print("WDPA Protected Areas Visualization - USA 2000-2024")
+    print("=" * 70)
 
-    all_data, transform = load_wdpa_data()
+    # Load data
+    all_data = load_wdpa_data()
+
     if all_data is None:
-        print("No data. Exiting.")
+        print("Failed to load data. Exiting.")
         return
 
-    plot_overview_maps(all_data)
-    plot_single_year_map(all_data)
-    plot_temporal_trend(all_data)
-    plot_change_detection(all_data)
-    plot_annual_new_designations(all_data)
+    # Create visualizations
+    print("\nCreating visualizations...")
 
-    print("\nWDPA visualisation complete!")
+    # 1. Protected area maps for each year
+    create_protected_area_maps(all_data)
+
+    # 2. Temporal comparison
+    create_temporal_comparison(all_data)
+
+    # 3. Change analysis
+    create_change_analysis(all_data)
+
+    # 4. Summary statistics
+    create_summary_statistics(all_data)
+
+    # Summary
+    print("\n" + "=" * 70)
+    print("VISUALIZATION SUMMARY")
+    print("=" * 70)
+
+    print(f"Years processed: {sorted(all_data.keys())}")
+    print(f"Total years: {len(all_data)}")
+
+    # Show data info for first year as example
+    first_year = min(all_data.keys())
+    data = all_data[first_year]['data']
+    print(f"Data shape per year: {data.shape}")
+    print(f"Total pixels per year: {data.shape[0] * data.shape[1]:,}")
+
+    # Show protected area statistics
+    percentages = [all_data[year]['protected_percentage'] for year in all_data.keys()]
+    print(f"\nProtected area coverage:")
+    print(f"  Mean: {np.mean(percentages):.2f}%")
+    print(f"  Range: {np.min(percentages):.2f}% - {np.max(percentages):.2f}%")
+    print(f"  Total change (2000-2024): {percentages[-1] - percentages[0]:+.2f}%")
+
+    print(f"\nOutput files saved to: {output_dir}")
+    for year in sorted(all_data.keys()):
+        print(f"   - wdpa_coverage_usa_{year}.png")
+    print("   - wdpa_temporal_comparison.png")
+    print("   - wdpa_change_analysis.png")
+    print("   - wdpa_summary_statistics.png")
+
+    print("\nVisualization complete! ")
 
 
 if __name__ == "__main__":

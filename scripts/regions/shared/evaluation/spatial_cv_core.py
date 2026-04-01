@@ -1253,13 +1253,31 @@ _SHAP_TOP_K          = 10      # features to report per biome
 _PERM_N_REPEATS      = 5       # repeats for permutation importance
 
 
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    """Parse integer environment variable with lower bound and fallback."""
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return max(minimum, default)
+    try:
+        return max(minimum, int(raw))
+    except (TypeError, ValueError):
+        return max(minimum, default)
+
+
+# Layer 2 permutation-importance controls
+# Default to conservative settings to avoid OOM on large Slurm nodes.
+PERM_N_REPEATS = _env_int("SPCV2_PERM_N_REPEATS", _PERM_N_REPEATS, minimum=1)
+PERM_N_JOBS = _env_int("SPCV2_PERM_N_JOBS", 1, minimum=1)
+SPCV2_ROWS_PER_BIOME = _env_int("SPCV2_ROWS_PER_BIOME", _SHAP_ROWS_PER_BIOME, minimum=100)
+
+
 def _compute_biome_feature_importance(
     region: str,
     model_id: str,
     model_type: str,
     biome_raster: np.ndarray,
     int_to_biome: dict[int, str],
-    n_per_biome: int = _SHAP_ROWS_PER_BIOME,
+    n_per_biome: int = SPCV2_ROWS_PER_BIOME,
     top_k: int = _SHAP_TOP_K,
 ) -> Optional[pd.DataFrame]:
     """Compute per-biome feature importance using the production model.
@@ -1281,7 +1299,8 @@ def _compute_biome_feature_importance(
     """
     method_label = "permutation"
     print(f"  {model_type.upper()} model: permutation importance "
-          f"(n_repeats={_PERM_N_REPEATS}, scoring=PR-AUC / average_precision)")
+          f"(n_repeats={PERM_N_REPEATS}, n_jobs={PERM_N_JOBS}, "
+          f"scoring=PR-AUC / average_precision)")
 
     # ── Load production model ─────────────────────────────────────────────────
     try:
@@ -1394,6 +1413,16 @@ def _compute_biome_feature_importance(
         del model; gc.collect()
         return None
 
+    # Avoid nested parallelism: permutation_importance uses joblib parallelism,
+    # while RF models may also use internal thread pools. Force single-thread
+    # model inference during permutation scoring.
+    if model_type == "rf" and hasattr(model, "set_params"):
+        try:
+            model.set_params(n_jobs=1)
+            print("  RF prediction threads forced to n_jobs=1 during permutation scoring")
+        except Exception as e:
+            print(f"  WARNING: could not force RF n_jobs=1 ({e})")
+
     model_label = model_type.upper()
     rows_out: list[dict[str, Any]] = []
 
@@ -1411,10 +1440,10 @@ def _compute_biome_feature_importance(
         try:
             result = _perm_imp(
                 model, X_biome, y_biome,
-                n_repeats=_PERM_N_REPEATS,
+                n_repeats=PERM_N_REPEATS,
                 scoring="average_precision",
                 random_state=42,
-                n_jobs=-1,
+                n_jobs=PERM_N_JOBS,
             )
             importance = result.importances_mean
             top_idx = np.argsort(importance)[::-1][:top_k]
