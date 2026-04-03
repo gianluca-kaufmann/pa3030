@@ -71,6 +71,8 @@ module load eth_proxy
 VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
+# W&B: WandbRunLogger only calls wandb.init if PA3030_WANDB=1 (utils.py).
+export PA3030_WANDB="${PA3030_WANDB:-1}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_DIR="${WANDB_DIR:-$SCRATCH/wandb}"
 mkdir -p "$WANDB_DIR"
