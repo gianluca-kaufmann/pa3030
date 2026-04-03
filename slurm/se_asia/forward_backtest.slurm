@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=forward_bt
-#SBATCH --partition=normal.24h
-#SBATCH --time=24:00:00
+#SBATCH --partition=normal.120h
+#SBATCH --time=120:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem-per-cpu=4G
