@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=cv1_agg_SA_rf
+#SBATCH --job-name=cv1_agg_SEA_rf
 #SBATCH --partition=normal.4h
 #SBATCH --time=1:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem-per-cpu=8G
-#SBATCH --output=/cluster/scratch/%u/logs/cv1_agg_SA_rf_%j.out
-#SBATCH --error=/cluster/scratch/%u/logs/cv1_agg_SA_rf_%j.err
+#SBATCH --output=/cluster/scratch/%u/logs/cv1_agg_SEA_rf_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/cv1_agg_SEA_rf_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # ------------------------------------------------------------------------------

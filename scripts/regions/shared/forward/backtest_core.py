@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
 """Stage 0c: Pseudo-forecast backtesting.
 
-Validates the forward prediction methodology by simulating the analysis at
-one historical time point: T=2019.
+Validates the forward prediction methodology by simulating the full pipeline at
+four historical origin years: T = 2013, 2015, 2017, 2019.
 
-For origin year T=2019:
-  1. Train a historical deployment model on 2001–2014 with locked hyperparams.
-     (Training cutoff = T − LOOKAHEAD_YEARS = 2019 − 5 = 2014, mirroring the
-     real deployment: last training year has a complete 5-yr lookahead window.)
-  2. Score year-2019 feature rows for WDPA_prev==0 AND WDPA==0 pixels from
+For each origin year T:
+  1. Train a historical deployment model on 2001–(T−5) with locked hyperparams.
+     (Training cutoff = T − LOOKAHEAD_YEARS, mirroring the real deployment:
+     the last training year always has a complete 5-year lookahead window.)
+  2. Score year-T feature rows for WDPA_prev==0 AND WDPA==0 pixels from
      merged_panel_final.parquet.
-  3. Reconstruct 5-year window actuals from the WDPA column (years 2020–2024)
+  3. Reconstruct 5-year window actuals from the WDPA column (years T+1–T+5)
      — NOT from transition_01_win5 (which may be absent or unreliable).
   4. Evaluate: Precision@1/5/10%, Lift@1/5/10%, Forecast Capture Rate.
+
+Origin years and their evaluation windows:
+  T=2013: train 2001–2008, score 2013, eval 2014–2018  (clean 5-yr window)
+  T=2015: train 2001–2010, score 2015, eval 2016–2020  (clean 5-yr window)
+  T=2017: train 2001–2012, score 2017, eval 2018–2022  (clean 5-yr window)
+  T=2019: train 2001–2014, score 2019, eval 2020–2024  (clean 5-yr window)
 
 Methodological alignment with the real deployment (5-year gap in both cases):
   Real forward:    train 2001–2019, score 2024, predict 2025–2029  (gap: 5 yrs)
   Backtest T=2019: train 2001–2014, score 2019, eval    2020–2024  (gap: 5 yrs)
+
+The multi-origin design lets the aggregate plot show precision-over-time,
+demonstrating that model skill is stable across different historical windows.
 
 Note on LAST_LABEL_YEAR vs WDPA_LAST_YEAR:
   LAST_LABEL_YEAR=2019 is a *training* right-censoring boundary — it prevents
@@ -235,7 +244,7 @@ def create_false_positive_map(
     print(f"  Saved: {stem}.pdf")
 
 
-ORIGIN_YEARS = [2019]
+ORIGIN_YEARS = [2013, 2015, 2017, 2019]
 # LGBM: N_EST_BACKTEST_LGBM is the fallback num_boost_round only when n_estimators
 #       is absent from lgbm_best_params.json (optional faster runs).
 # RF:    n_estimators follow rf_best_params.json like deployment training. Set

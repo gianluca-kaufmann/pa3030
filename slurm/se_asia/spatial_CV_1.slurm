@@ -1,12 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=lobo_SA
+#SBATCH --job-name=lobo_SEA
 #SBATCH --partition=normal.120h
 #SBATCH --time=120:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem-per-cpu=4G
-#SBATCH --output=/cluster/scratch/%u/logs/lobo_SA_%A_%a.out
-#SBATCH --error=/cluster/scratch/%u/logs/lobo_SA_%A_%a.err
+#SBATCH --output=/cluster/scratch/%u/logs/lobo_SEA_%A_%a.out
+#SBATCH --error=/cluster/scratch/%u/logs/lobo_SEA_%A_%a.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 #SBATCH --array=0-8
 

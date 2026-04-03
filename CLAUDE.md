@@ -56,28 +56,34 @@ The current model cannot distinguish these because it has no carbon data.
 ## Pipeline Architecture
 
 ```
-Continental regions (South America, USA):
+Continental regions (South America, USA, SE Asia):
   1_extraction/    -> Export from Google Earth Engine + external APIs to GeoTIFF rasters
   2_preprocessing/ -> Format harmonization, reprojection, storage optimization
   3_merging/       -> Build modeling panels (Parquet) + feature engineering
   4_tuning/        -> Hyperparameter search (Optuna / randomized, 3-fold temporal CV)
-  5_training/      -> Train/test splits + final model training (LightGBM, RF, BRF)
+  5_training/      -> Train/test splits + final model training (LightGBM, RF)
   6_evaluation/    -> Temporal CV, spatial CV, benchmarking, calibration
   7_results/       -> Metrics, visualizations, risk maps
   8_forward/       -> Forward predictions to 2030 (deployment model + calibrated inference + scenario analysis)
 
 Sub-region Colombia (south_america/colombia/):
-  3_merging/  -> Colombia-specific merge + feature engineering
+  preprocessing/ -> Colombia-specific feature extraction + backbone
+  3_merging/     -> Colombia-specific merge + feature engineering
   4_ml/
-    splits/   -> Train/validation/test data splits
-    training/ -> Model training + hyperparameter tuning (LightGBM, RF, BRF)
-    evaluation/ -> Calibration, benchmarking, spatial CV
-    results/  -> Figures, metrics tables, probability maps
+    splits/      -> Train/validation/test data splits
+    training/    -> Model training + hyperparameter tuning (LightGBM, RF, BRF)
+    evaluation/  -> Calibration, benchmarking, spatial CV
+    results/     -> Figures, metrics tables, probability maps
+  (Legacy sub-region used for early development; not on the critical path)
 
 Shared utilities (scripts/regions/shared/):
-  1_preprocessing/ -> 2_tuning/ -> 3_training/ -> 4_evaluation/ -> 5_results/
+  tuning/          -> Optuna HPO runner, CV, search spaces, artifacts
+  training/        -> Shared training utilities
+  evaluation/      -> benchmark_core, calibration_core, spatial_cv_core, spatial_cv_visualise
+  results/         -> results_core, boundaries, io, runner, config
   forward/         -> Shared forward-prediction core (coverage_core, features_core,
                       predict_core, results_core, backtest_core, config, runner)
+  1_preprocessing/ -> economic_value (shared preprocessing utility)
 ```
 
 ## Tech Stack
@@ -92,12 +98,13 @@ Shared utilities (scripts/regions/shared/):
 
 ## Regions & Models
 
-| Model | Region | Scale | Description |
-|-------|--------|-------|-------------|
-| Model 1 | South America (continental) | ~350M pixel-years | Full-scale production model |
-| Model 2 | USA (continental) | ~200M pixel-years | Mirrors Model 1 structure for cross-continental validation |
-| Model C | Colombia (sub-region) | ~7M pixel-years | Rapid validation & development |
-| Model E | South America | ~20M pixel-years | Satellite embedding experiments |
+| Model | Region | Scale | Status | Description |
+|-------|--------|-------|--------|-------------|
+| Model 1 | South America (continental) | ~350M pixel-years | ✅ Complete | Full-scale primary model |
+| Model 2 | USA (continental) | ~200M pixel-years | ✅ Complete | Cross-continental validation |
+| Model 3 | SE Asia (continental) | ~100M pixel-years | ✅ Complete | Third continental region |
+| Model C | Colombia (sub-region) | ~7M pixel-years | ✅ Legacy | Early dev sub-region; non-standard pipeline structure |
+| Model E | South America | ~20M pixel-years | ⚠️ Partial | Satellite embedding experiments; ML stages incomplete |
 
 ## Data Characteristics
 
@@ -151,8 +158,9 @@ Three-layer framework using WWF biomes from the GSN terrestrial ecoregions datas
   parquets from the full trained model, assigns WWF biome labels via GSN raster
   row/col lookup, computes per-biome metrics. Fast diagnostic; run after step 5.
 - **Layer 3 — Cross-continental transfer** (`spatial_CV_3`): Trains on SA, evaluates
-  on USA; then USA → SA. Uses features common to both regions. Strongest
-  generalization claim — success means patterns are continent-independent.
+  on USA and/or SE Asia; cross-transfers between regions. Uses features common to
+  all regions. Strongest generalization claim — success means patterns are
+  continent-independent. Scripts exist for SA and SE Asia.
 
 All logic lives in `scripts/regions/shared/evaluation/spatial_cv_core.py`.
 Region-specific scripts are thin wrappers (2–3 lines each).
@@ -255,53 +263,59 @@ Features that could improve predictive power but are not currently included:
 conda env create -f environment.yml
 conda activate pa3030
 
-# Run pipeline stages (Colombia example)
-python scripts/regions/south_america/colombia/3_merging/colombia_merge
-python scripts/regions/south_america/colombia/4_ml/splits/modelC_splits
-python scripts/regions/south_america/colombia/4_ml/training/modelC_LGBM
-python scripts/regions/south_america/colombia/4_ml/evaluation/calibrate_C
-python scripts/regions/south_america/colombia/4_ml/evaluation/benchmark_C
-python scripts/regions/south_america/colombia/4_ml/results/modelC_results
-
 # Run pipeline stages (South America continental example)
 python scripts/regions/south_america/4_tuning/model1_tuning_lgbm
 python scripts/regions/south_america/5_training/model1_splits
 python scripts/regions/south_america/5_training/model1_LGBM
 python scripts/regions/south_america/6_evaluation/calibrate_1
+python scripts/regions/south_america/6_evaluation/benchmark_1
 python scripts/regions/south_america/7_results/model1_results
 
-# Spatial CV — Layer 2 (after step 5 training)
+# Same structure for USA (model2_*) and SE Asia (model3_*)
+python scripts/regions/se_asia/4_tuning/model3_tuning_lgbm
+python scripts/regions/se_asia/5_training/model3_LGBM
+python scripts/regions/se_asia/6_evaluation/calibrate_3
+python scripts/regions/se_asia/6_evaluation/benchmark_3
+python scripts/regions/se_asia/7_results/model3_results
+
+# Spatial CV — Layer 2 (after step 5 training; fast, run locally)
 python scripts/regions/south_america/6_evaluation/spatial_CV_2
 python scripts/regions/usa/6_evaluation/spatial_CV_2
+python scripts/regions/se_asia/6_evaluation/spatial_CV_2
 
-# Spatial CV — Layer 1 LOBO (can run in parallel with step 5, on Euler)
-# Both LGBM and RF run the same wrapper but pass --model-type; outputs go to
-# separate subdirs: outputs/{region}/results/spatial_cv/{lgbm,rf}/
+# Spatial CV — Layer 1 LOBO (SLURM array jobs on Euler)
+# outputs go to outputs/{region}/results/spatial_cv/{lgbm,rf}/
 python scripts/regions/south_america/6_evaluation/spatial_CV_1 --list-biomes
-sbatch slurm/south_america/spatial_CV_1.slurm              # LGBM, all folds
-sbatch slurm/south_america/spatial_CV_1_rf.slurm           # RF, all folds
-sbatch --export=BIOME_IDX=3 --array=3 slurm/south_america/spatial_CV_1.slurm     # LGBM, single fold
-sbatch --export=BIOME_IDX=3 --array=3 slurm/south_america/spatial_CV_1_rf.slurm  # RF, single fold
-sbatch slurm/south_america/spatial_CV_1_aggregate.slurm    # aggregate LGBM folds
-sbatch slurm/south_america/spatial_CV_1_aggregate_rf.slurm # aggregate RF folds
+sbatch slurm/south_america/spatial_CV_1.slurm              # SA LGBM, all folds
+sbatch slurm/south_america/spatial_CV_1_rf.slurm           # SA RF, all folds
+sbatch slurm/usa/spatial_CV_1.slurm                        # USA LGBM, all folds
+sbatch slurm/usa/spatial_CV_1_rf.slurm                     # USA RF, all folds
+sbatch slurm/se_asia/spatial_CV_1.slurm                    # SE Asia LGBM, all folds
+sbatch slurm/se_asia/spatial_CV_1_rf.slurm                 # SE Asia RF, all folds
 
-# Spatial CV — Layer 3 cross-continental transfer (can run in parallel with step 5)
+# After all folds complete, aggregate:
+sbatch slurm/south_america/spatial_CV_1_aggregate.slurm
+sbatch slurm/south_america/spatial_CV_1_aggregate_rf.slurm
+sbatch slurm/usa/spatial_CV_1_aggregate.slurm
+sbatch slurm/usa/spatial_CV_1_aggregate_rf.slurm
+sbatch slurm/se_asia/spatial_CV_1_aggregate.slurm
+sbatch slurm/se_asia/spatial_CV_1_aggregate_rf.slurm
+
+# Spatial CV — Layer 3 cross-continental transfer
 sbatch slurm/south_america/spatial_CV_3.slurm
+sbatch slurm/se_asia/spatial_CV_3.slurm
 
-# Forward prediction pipeline (8_forward/)
-# Stage 0a: Coverage baseline (run locally or on cluster)
+# Forward prediction pipeline (8_forward/) — same for all three regions
+# Stage 0a: Coverage baseline
 python scripts/regions/south_america/8_forward/1_forward_coverage_baseline.py
-
-# Stages 0b + 1 + 2: Deployment model training + feature extraction + inference (Euler)
+# Stages 0b + 1 + 2: Deployment model + features + inference (Euler)
 sbatch slurm/south_america/forward_deployment.slurm
-
-# Stage 0c: Backtesting validation (Euler)
+# Stage 0c: Backtesting
 sbatch slurm/south_america/forward_backtest.slurm
-
-# Stage 3: Results — scenario maps, country breakdown, exposure analysis, hotspots
+# Stage 3: Results
 python scripts/regions/south_america/8_forward/4_forward_results.py
 
-# Same commands work for USA (replace south_america with usa)
+# Replace south_america with usa or se_asia for other regions
 
 # Run tests
 pytest tests/test_pipeline.py -v
@@ -312,44 +326,50 @@ pytest tests/test_pipeline.py -v
 ```
 /
 ├── scripts/regions/
-│   ├── south_america/            # Primary region
-│   │   ├── 1_extraction/
-│   │   ├── 2_preprocessing/
-│   │   ├── 3_merging/
-│   │   ├── 4_tuning/
-│   │   ├── 5_training/           # Includes splits scripts + best_params JSONs
-│   │   ├── 6_evaluation/
-│   │   ├── 7_results/
+│   ├── south_america/            # Model 1 — full 8-stage pipeline
+│   │   ├── 1_extraction/         # 11 GEE + API extraction scripts
+│   │   ├── 2_preprocessing/      # 11 preprocessing scripts
+│   │   ├── 3_merging/            # merge + feature_engineering
+│   │   ├── 4_tuning/             # model1_tuning_lgbm, model1_tuning_rf
+│   │   ├── 5_training/           # model1_LGBM, model1_RF + deployment + splits + best_params.json
+│   │   ├── 6_evaluation/         # calibrate_1, benchmark_1, spatial_CV_1/2/3 + aggregate
+│   │   ├── 7_results/            # model1_results
 │   │   ├── 8_forward/            # Forward predictions to 2030
 │   │   │   ├── 1_forward_coverage_baseline.py
 │   │   │   ├── 2_forward_features.py
 │   │   │   ├── 3_forward_predict.py
 │   │   │   ├── 4_forward_results.py
 │   │   │   └── 5_forward_backtest.py
-│   │   ├── colombia/             # Sub-region pipeline
+│   │   ├── colombia/             # Legacy sub-region (non-standard structure)
+│   │   │   ├── preprocessing/    # backbone, export, features
 │   │   │   ├── 3_merging/
-│   │   │   └── 4_ml/
-│   │   │       ├── splits/
-│   │   │       ├── training/
-│   │   │       ├── evaluation/
-│   │   │       └── results/
-│   │   └── embeddings/           # Satellite embedding pipeline
-│   ├── shared/                   # Shared utilities (1_preprocessing/ … 5_results/)
-│   │   ├── forward/              # Shared forward-prediction pipeline core
-│   │   │   ├── config.py         # Region profiles + env-var dispatch
-│   │   │   ├── runner.py         # Orchestrates stages 0a–3 via subprocess reload
-│   │   │   ├── coverage_core.py  # Stage 0a: coverage baseline + per-country stats
-│   │   │   ├── features_core.py  # Stage 1: extract 2024 inference features
-│   │   │   ├── predict_core.py   # Stage 2: calibrated batch inference
-│   │   │   ├── results_core.py   # Stage 3: scenario maps, tables, exposure, hotspots
-│   │   │   └── backtest_core.py  # Stage 0c: temporal backtesting validation
-│   │   └── results/              # Shared training-results core (results_core.py)
-│   ├── usa/                      # Mirrors SA continental structure (incl. 8_forward/)
-│   ├── se_asia/                  # Planned
-│   └── tropical_africa/          # Planned
-├── tests/                        # pytest suite (test_pipeline.py)
+│   │   │   ├── 4_ml/             # splits, training, evaluation, results
+│   │   │   └── visualisations/
+│   │   └── embeddings/           # Satellite embedding experiments (partial)
+│   ├── usa/                      # Model 2 — mirrors SA structure (incl. 8_forward/)
+│   ├── se_asia/                  # Model 3 — mirrors SA structure (incl. 8_forward/)
+│   ├── tropical_africa/          # Planned (empty)
+│   └── shared/                   # All shared utility code
+│       ├── tuning/               # Optuna HPO runner, CV, search spaces, artifacts
+│       ├── training/             # Training utilities
+│       ├── evaluation/           # benchmark_core, calibration_core, spatial_cv_core,
+│       │                         # spatial_cv_visualise, select_lobo_biomes
+│       ├── results/              # results_core, boundaries, io, runner, config
+│       ├── forward/              # coverage_core, features_core, predict_core,
+│       │                         # results_core, backtest_core, config, runner
+│       └── 1_preprocessing/      # economic_value (shared preprocessing)
+├── slurm/                        # SLURM job scripts (~116 files across 3 regions)
+│   ├── south_america/            # SA jobs: tuning, training, spatial_CV, forward
+│   ├── usa/                      # USA jobs: same structure as SA
+│   ├── se_asia/                  # SE Asia jobs: same structure as SA
+│   ├── create_env.sh
+│   ├── euler_run_instructions.md
+│   └── submit_spatial_cv.sh
 ├── outputs/                      # Figures, tables, metrics, predictions
-├── slurm/                        # SLURM job scripts for Euler cluster
+│   ├── south_america/            # results/, figures/, tables/, colombia/, embeddings/
+│   ├── usa/                      # results/, figures/, tables/
+│   └── se_asia/                  # results/, figures/, tables/
+├── tests/                        # pytest suite (test_pipeline.py)
 ├── environment.yml
 └── README.md
 ```
