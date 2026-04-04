@@ -259,6 +259,39 @@ def resolve_cv_output_dir(region: str, model_type: str = "lgbm") -> Path:
     return d
 
 
+def resolve_spatial_generalisation_output_dir(region: str) -> Path:
+    """Resolve Layer 2 ``spatial_generalisation`` output directory, preferring $SCRATCH.
+
+    On Euler, large CSV/Parquet outputs must not fill ``$HOME``; when ``SCRATCH``
+    is set, writes go under ``$SCRATCH/outputs/...`` with the same relative layout
+    as in the repo.
+    """
+    repo_root = get_repo_root()
+    scratch   = os.environ.get("SCRATCH")
+    subdir    = "spatial_generalisation"
+    if scratch:
+        d = Path(scratch) / f"outputs/{region}/results/{subdir}"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    d = repo_root / f"outputs/{region}/results/{subdir}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def resolve_spatial_cv_visualisation_output_dir(region: str) -> Path:
+    """Resolve ``spatial_cv_visualisation`` figure output directory, preferring $SCRATCH."""
+    repo_root = get_repo_root()
+    scratch   = os.environ.get("SCRATCH")
+    subdir    = "spatial_cv_visualisation"
+    if scratch:
+        d = Path(scratch) / f"outputs/{region}/results/{subdir}"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    d = repo_root / f"outputs/{region}/results/{subdir}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 # =============================================================================
 # Biome raster utilities
 # =============================================================================
@@ -1122,6 +1155,7 @@ def _compute_region_metrics_layer2(
         "n_positives":  n_pos,
         "positive_rate": float(y_true.mean()) if n > 0 else 0.0,
         "neg_pos_ratio": float(n_neg / n_pos) if n_pos > 0 else np.nan,
+        "mean_pred_prob": float(y_proba.mean()) if n > 0 else 0.0,
     }
     if n < MIN_SAMPLES or n_pos < MIN_POSITIVES or len(np.unique(y_true)) < 2:
         out.update(roc_auc=np.nan, pr_auc=np.nan,
@@ -2025,8 +2059,7 @@ def run_spatial_gen_main(region: str, model_id: str) -> None:
         if scratch and (Path(scratch) / f"outputs/{region}/results/ml_models").exists()
         else repo_root / f"outputs/{region}/results/ml_models"
     )
-    eval_dir = repo_root / f"outputs/{region}/results/spatial_generalisation"
-    eval_dir.mkdir(parents=True, exist_ok=True)
+    eval_dir = resolve_spatial_generalisation_output_dir(region)
     timestamp    = datetime.now().strftime("%Y%m%d_%H%M%S")
     region_label = region.replace("_", " ").upper()
     log_path     = eval_dir / f"spatial_generalisation_{timestamp}.txt"
@@ -2388,4 +2421,6 @@ __all__ = [
     "resolve_rf_best_params",
     "resolve_trained_model",
     "resolve_cv_output_dir",
+    "resolve_spatial_generalisation_output_dir",
+    "resolve_spatial_cv_visualisation_output_dir",
 ]

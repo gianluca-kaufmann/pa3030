@@ -34,6 +34,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import pickle
 import sys
 import warnings
 from pathlib import Path
@@ -382,6 +383,157 @@ def create_model_agreement_map_top1pct(
         print(f"  WARNING: could not write agreement JSON: {e}")
 
     return stats
+
+
+def create_eval_vs_deployment_scatter(
+    repo_root: Path,
+    outputs_subdir: str,
+    forward_dirs: List[Path],
+    output_dir: Path,
+    model_type: str = "lgbm",
+    n_sample: int = 100_000,
+    random_seed: int = 42,
+) -> None:
+    """Scatter comparing eval model vs deployment model calibrated probabilities.
+
+    Finds pixels that appear in both the evaluation model's calibrated test
+    predictions (stored under outputs/{region}/results/ml_models/main/) and
+    the deployment model's 2024 forward scores.  A high Pearson r and low
+    mean absolute deviation confirms the two models agree and that forward
+    predictions are not extrapolating into a different regime.
+
+    Outputs: eval_vs_deploy_scatter.png / .pdf
+    """
+    print("\n" + "=" * 70)
+    print("EVAL VS DEPLOYMENT MODEL SCATTER")
+    print("=" * 70)
+
+    # ── Find eval calibrated parquet ──────────────────────────────────────────
+    ml_results_dir = repo_root / "outputs" / outputs_subdir / "results" / "ml_models" / "main"
+    pattern = f"*{model_type}*scored_calibrated*.parquet"
+    eval_candidates = sorted(ml_results_dir.glob(pattern), reverse=True) if ml_results_dir.exists() else []
+    if not eval_candidates:
+        print(f"  Skipping — no eval calibrated parquet matching '{pattern}' in {ml_results_dir}")
+        return
+    eval_path = eval_candidates[0]
+    print(f"  Eval calibrated parquet: {eval_path.name}")
+
+    # ── Find deployment forward scored parquet ────────────────────────────────
+    deploy_path: Optional[Path] = None
+    for fd in forward_dirs:
+        cand = fd / model_type / "forward_scored_2024.parquet"
+        if cand.exists():
+            deploy_path = cand
+            break
+    if deploy_path is None:
+        print("  Skipping — forward_scored_2024.parquet not found in forward dirs")
+        return
+    print(f"  Deployment scored parquet: {deploy_path}")
+
+    # ── Load and intersect ────────────────────────────────────────────────────
+    print("  Loading eval calibrated predictions …")
+    eval_df = pq.read_table(eval_path, columns=["row", "col", "y_pred_proba_calibrated"]).to_pandas()
+    eval_df = eval_df.rename(columns={"y_pred_proba_calibrated": "eval_prob"})
+
+    print("  Loading deployment forward scores …")
+    deploy_df = pq.read_table(deploy_path, columns=["row", "col", "y_pred_proba_calibrated"]).to_pandas()
+    deploy_df = deploy_df.rename(columns={"y_pred_proba_calibrated": "deploy_prob"})
+
+    merged = eval_df.merge(deploy_df, on=["row", "col"], how="inner")
+    del eval_df, deploy_df
+    gc.collect()
+
+    print(f"  Pixels in both test-period (2017–2019) and 2024 unprotected: {len(merged):,}")
+    if len(merged) < 1_000:
+        print("  Too few matching pixels — skipping scatter")
+        return
+
+    # ── Stratified sample: bin by eval_prob decile, draw equally from each ───
+    rng = np.random.default_rng(random_seed)
+    if len(merged) > n_sample:
+        merged["_decile"] = pd.qcut(merged["eval_prob"], q=10, labels=False, duplicates="drop")
+        groups = merged.groupby("_decile", observed=True)
+        per_bin = max(1, n_sample // max(1, len(groups)))
+        parts = [g.sample(min(len(g), per_bin), random_state=int(rng.integers(1 << 31)))
+                 for _, g in groups]
+        sample = pd.concat(parts, ignore_index=True)
+        if len(sample) < n_sample:
+            remaining = merged.drop(sample.index, errors="ignore")
+            extra = remaining.sample(min(len(remaining), n_sample - len(sample)),
+                                     random_state=int(rng.integers(1 << 31)))
+            sample = pd.concat([sample, extra], ignore_index=True)
+    else:
+        sample = merged.copy()
+
+    x = sample["eval_prob"].values.astype(np.float64)
+    y = sample["deploy_prob"].values.astype(np.float64)
+    print(f"  Sample size: {len(x):,}")
+
+    # ── Statistics ────────────────────────────────────────────────────────────
+    r = float(np.corrcoef(x, y)[0, 1])
+    mad = float(np.mean(np.abs(x - y)))
+    rmse = float(np.sqrt(np.mean((x - y) ** 2)))
+
+    # ── Plot ──────────────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(6, 6))
+
+    hb = ax.hexbin(x, y, gridsize=90, bins="log", cmap="Blues", mincnt=1, linewidths=0.05)
+    plt.colorbar(hb, ax=ax, label="log₁₀(count + 1)", shrink=0.85)
+
+    lo = float(min(x.min(), y.min()))
+    hi = float(max(x.max(), y.max()))
+    ax.plot([lo, hi], [lo, hi], color="#d62728", lw=1.5, linestyle="--", label="1:1 line", zorder=5)
+
+    ax.text(0.04, 0.96,
+            f"Pearson r = {r:.4f}\nMean |Δ| = {mad:.5f}\nRMSE = {rmse:.5f}\nn = {len(x):,}",
+            transform=ax.transAxes, fontsize=8.5, va="top",
+            bbox=dict(boxstyle="round,pad=0.35", fc="white", alpha=0.88, edgecolor="#cccccc"))
+
+    ax.set_xlabel(
+        "Evaluation model  P(protection | 2017–2019 features, calibrated)",
+        fontsize=9,
+    )
+    ax.set_ylabel(
+        "Deployment model  P(protection | 2024 features, calibrated)",
+        fontsize=9,
+    )
+    ax.set_title(
+        f"Eval vs Deployment Model Consistency  [{model_type.upper()}]\n"
+        f"Pixels unprotected in both test period and 2024  (n = {len(x):,})",
+        fontsize=10,
+    )
+    ax.legend(fontsize=8.5, loc="lower right")
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True, alpha=0.25, linestyle="--", linewidth=0.5)
+    ax.spines[["top", "right"]].set_visible(False)
+
+    plt.tight_layout()
+    for ext in ["png", "pdf"]:
+        p = output_dir / f"eval_vs_deploy_scatter.{ext}"
+        if _safe_savefig(p, dpi=150, bbox_inches="tight"):
+            print(f"  Saved: {p}")
+    try:
+        plt.close(fig)
+    except Exception:
+        pass
+
+    # ── Save stats JSON ───────────────────────────────────────────────────────
+    stats = {
+        "n_matched_pixels": int(len(merged)),
+        "n_sample": int(len(x)),
+        "pearson_r": round(r, 6),
+        "mean_abs_deviation": round(mad, 6),
+        "rmse": round(rmse, 6),
+        "model_type": model_type,
+    }
+    stats_path = output_dir / "eval_vs_deploy_scatter_stats.json"
+    try:
+        stats_path.write_text(json.dumps(stats, indent=2))
+        print(f"  Saved: {stats_path}")
+    except Exception as e:
+        print(f"  WARNING: could not save stats JSON: {e}")
 
 
 def create_feature_importance_plot(
@@ -1548,6 +1700,19 @@ _POP_CANDIDATES = [
     "pop_density", "population_density", "pop", "GPW_pop", "population",
     "pop_dens", "GPW",
 ]
+_ECON_VALUE_CANDIDATES = ["economic_value_lag1", "economic_value", "econ_value"]
+
+# MODIS IGBP land cover class groupings (LC_Type1, values 0–17 in parquet)
+_IGBP_GROUPS: Dict[str, List[int]] = {
+    "Forest":              [1, 2, 3, 4, 5],
+    "Shrubland":           [6, 7],
+    "Savanna / Grassland": [8, 9, 10],
+    "Wetland":             [11],
+    "Agriculture":         [12, 14],
+    "Urban":               [13],
+    "Bare / Other":        [0, 15, 16, 17, 255],
+}
+_IGBP_AGRI_CODES: set = {12, 14}
 
 
 def _detect_col(candidates: List[str], available: set) -> Optional[str]:
@@ -1635,18 +1800,26 @@ def create_economic_exposure(
     baseline: Dict[str, Any],
     repo_root: Path,
 ) -> pd.DataFrame:
-    """Quantify economic proxy values in top-1% / top-5% / BAU risk zones.
+    """Quantify economic exposure in top-1% / top-5% / BAU risk zones.
 
-    Joins forward_features_2024.parquet (model-agnostic) to the scored
-    parquet on (row, col) to retrieve NTL and population density columns,
-    then computes summary statistics across three zones:
+    Joins forward_features_2024.parquet on (row, col) to retrieve:
+      - NTL and population density proxies
+      - Infrastructure distances (dist_road, dist_oil_gas)
+      - economic_value_lag1 (if present)
+      - land-cover class (MODIS IGBP)
+
+    Computes summary statistics and a land-cover breakdown across four zones:
       - All unprotected 2024 pixels (baseline)
+      - BAU risk zone
       - Top 5% by predicted probability
       - Top 1% by predicted probability
 
     Outputs:
-      forward_economic_exposure.csv
-      forward_economic_exposure_map.pdf/.png  (if NTL column found)
+      economic_exposure.csv           — proxy stats per zone
+      economic_exposure_barchart.png  — bar chart of proxy ratios
+      economic_exposure_map.png       — BAU zone coloured by NTL
+      economic_exposure_landcover.csv — IGBP land-cover breakdown
+      economic_exposure_landcover.tex — LaTeX table (paper-ready)
     """
     print("\n" + "=" * 70)
     print("ECONOMIC EXPOSURE ANALYSIS")
@@ -1659,24 +1832,29 @@ def create_economic_exposure(
 
     # ── Detect economic proxy columns ────────────────────────────────────────
     schema_names = set(pq.ParquetFile(feat_path).schema_arrow.names)
-    ntl_col = _detect_col(_NTL_CANDIDATES, schema_names)
-    pop_col = _detect_col(_POP_CANDIDATES, schema_names)
+    ntl_col   = _detect_col(_NTL_CANDIDATES,   schema_names)
+    pop_col   = _detect_col(_POP_CANDIDATES,   schema_names)
+    econ_col  = _detect_col(_ECON_VALUE_CANDIDATES, schema_names)
     infra_cols = [c for c in _INFRA_CANDIDATES if c in schema_names]
-    print(f"  NTL column detected:        {ntl_col or 'none'}")
-    print(f"  Population column detected: {pop_col or 'none'}")
-    print(f"  Infrastructure cols:        {infra_cols or 'none'}")
+    lc_col     = "landcover" if "landcover" in schema_names else None
+    print(f"  NTL column:           {ntl_col or 'none'}")
+    print(f"  Population column:    {pop_col or 'none'}")
+    print(f"  Economic value col:   {econ_col or 'none'}")
+    print(f"  Infrastructure cols:  {infra_cols or 'none'}")
+    print(f"  Land-cover column:    {lc_col or 'none'}")
 
-    proxy_cols = [c for c in [ntl_col, pop_col] if c is not None]
-    if not proxy_cols and not infra_cols:
-        print("  No economic proxy columns found — skipping.")
+    proxy_cols = [c for c in [ntl_col, pop_col, econ_col] if c is not None]
+    if not proxy_cols and not infra_cols and lc_col is None:
+        print("  No economic proxy or land-cover columns found — skipping.")
         return pd.DataFrame()
 
     # ── Load and join features ────────────────────────────────────────────────
-    load_cols = list(dict.fromkeys(proxy_cols + infra_cols))  # deduplicated
+    extra_cols = [c for c in [lc_col] if c is not None]
+    load_cols = list(dict.fromkeys(proxy_cols + infra_cols + extra_cols))
     print(f"  Loading features: {load_cols} …")
     feat_df = pq.read_table(feat_path, columns=["row", "col"] + load_cols).to_pandas()
     coord_cols = [c for c in ["x", "y"] if c in df.columns]
-    merged  = df[["row", "col", PROBA_COL, "area_km2"] + coord_cols].merge(
+    merged = df[["row", "col", PROBA_COL, "area_km2"] + coord_cols].merge(
         feat_df, on=["row", "col"], how="left"
     )
     del feat_df
@@ -1686,6 +1864,9 @@ def create_economic_exposure(
     top1_mask = merged[PROBA_COL] >= float(np.percentile(merged[PROBA_COL], 99))
     bau_mask  = merged[PROBA_COL] >= bau_cutoff
 
+    # p99 threshold value for headline number
+    top1_threshold = float(np.percentile(merged[PROBA_COL], 99))
+
     zones = [
         ("All unprotected (baseline)", np.ones(len(merged), dtype=bool)),
         ("BAU risk zone",              bau_mask),
@@ -1693,6 +1874,7 @@ def create_economic_exposure(
         ("Top 1% risk",               top1_mask),
     ]
 
+    # ── Proxy statistics per zone ─────────────────────────────────────────────
     rows = []
     for zone_name, mask in zones:
         sub = merged[mask]
@@ -1701,13 +1883,15 @@ def create_economic_exposure(
             "n_pixels": int(mask.sum()),
             "area_km2": round(float(sub["area_km2"].sum()), 0),
         }
-        for col in proxy_cols:
+        for col in [ntl_col, pop_col]:
+            if col is None:
+                continue
             vals = sub[col].dropna()
             row[f"{col}_mean"]   = round(float(vals.mean()), 3)   if len(vals) else None
             row[f"{col}_median"] = round(float(vals.median()), 3) if len(vals) else None
             row[f"{col}_p75"]    = round(float(np.percentile(vals, 75)), 3) if len(vals) else None
         for col in infra_cols:
-            vals = sub[col].dropna() / 1000.0  # convert m → km
+            vals = sub[col].dropna() / 1000.0  # m → km
             row[f"{col}_median_km"] = round(float(vals.median()), 2) if len(vals) else None
             row[f"{col}_mean_km"]   = round(float(vals.mean()), 2)   if len(vals) else None
         rows.append(row)
@@ -1718,10 +1902,102 @@ def create_economic_exposure(
     print(f"  Saved: {csv_path}")
     print(exposure_df.to_string(index=False))
 
-    # ── Bar chart: compare risk tiers across all proxies ─────────────────────
+    # ── Economic value concentration (new) ───────────────────────────────────
+    if econ_col is not None and econ_col in merged.columns:
+        total_econ = merged[econ_col].sum()
+        if total_econ > 0:
+            top1_econ  = merged.loc[top1_mask,  econ_col].sum()
+            top5_econ  = merged.loc[top5_mask,  econ_col].sum()
+            bau_econ   = merged.loc[bau_mask,   econ_col].sum()
+            print(f"\n  Economic value concentration ({econ_col}):")
+            print(f"    Top 1% zone: {100 * top1_econ / total_econ:.1f}% of continental economic value")
+            print(f"    Top 5% zone: {100 * top5_econ / total_econ:.1f}% of continental economic value")
+            print(f"    BAU zone:    {100 * bau_econ  / total_econ:.1f}% of continental economic value")
+
+    # ── Land-cover breakdown (new) ────────────────────────────────────────────
+    lc_breakdown: List[Dict[str, Any]] = []
+    if lc_col is not None and lc_col in merged.columns:
+        print("\n  Land-cover breakdown of risk zones:")
+        lc_vals = merged[lc_col].fillna(255).round().astype(int)
+        total_area_km2 = float(merged["area_km2"].sum())
+
+        # Build lookup: pixel index → IGBP group name
+        code_to_group: Dict[int, str] = {}
+        for gname, codes in _IGBP_GROUPS.items():
+            for c in codes:
+                code_to_group[c] = gname
+
+        zone_masks = {
+            "Baseline": np.ones(len(merged), dtype=bool),
+            "BAU":      bau_mask,
+            "Top 5%":   top5_mask,
+            "Top 1%":   top1_mask,
+        }
+        zone_totals = {k: float(merged.loc[v, "area_km2"].sum()) for k, v in zone_masks.items()}
+
+        lc_rows: List[Dict[str, Any]] = []
+        for group_name in _IGBP_GROUPS:
+            codes = set(_IGBP_GROUPS[group_name])
+            in_group = lc_vals.isin(codes)
+            group_row: Dict[str, Any] = {"land_cover_group": group_name}
+            for zone_label, zone_mask in zone_masks.items():
+                zone_group = zone_mask & in_group
+                area = float(merged.loc[zone_group, "area_km2"].sum())
+                group_row[f"{zone_label}_km2"] = round(area, 0)
+                zt = zone_totals[zone_label]
+                group_row[f"{zone_label}_pct"] = round(100.0 * area / zt, 1) if zt > 0 else 0.0
+            lc_rows.append(group_row)
+
+        lc_df = pd.DataFrame(lc_rows)
+        lc_csv = output_dir / "economic_exposure_landcover.csv"
+        lc_df.to_csv(lc_csv, index=False)
+        print(f"  Saved: {lc_csv}")
+
+        # Agricultural land headline number
+        agri_group_mask = lc_vals.isin(_IGBP_AGRI_CODES)
+        agri_top1 = merged.loc[top1_mask & agri_group_mask, "area_km2"].sum()
+        agri_total = merged.loc[agri_group_mask, "area_km2"].sum()
+        mean_score_top1 = float(merged.loc[top1_mask, PROBA_COL].mean())
+        print(f"\n  HEADLINE: {agri_top1:,.0f} km² of agricultural land is in the top-1% risk zone")
+        print(f"           ({100 * agri_top1 / agri_total:.1f}% of all unprotected agricultural land)")
+        print(f"           Mean predicted probability in top-1% zone: {mean_score_top1:.4f}")
+
+        # ── LaTeX table ────────────────────────────────────────────────────────
+        tex_lines = [
+            r"\begin{table}[htbp]",
+            r"  \centering",
+            r"  \small",
+            r"  \caption{Land-cover composition of forward-risk zones (2024 unprotected pixels, MODIS IGBP classes).}",
+            r"  \label{tab:landcover_exposure}",
+            r"  \begin{tabular}{lrrrrrrrr}",
+            r"    \toprule",
+            r"    & \multicolumn{2}{c}{Baseline} & \multicolumn{2}{c}{BAU} & \multicolumn{2}{c}{Top 5\%} & \multicolumn{2}{c}{Top 1\%} \\",
+            r"    \cmidrule(lr){2-3}\cmidrule(lr){4-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}",
+            r"    Land-cover group & km$^2$ & \% & km$^2$ & \% & km$^2$ & \% & km$^2$ & \% \\",
+            r"    \midrule",
+        ]
+        for _, r_lc in lc_df.iterrows():
+            tex_lines.append(
+                f"    {r_lc['land_cover_group']} & "
+                f"{int(r_lc['Baseline_km2']):,} & {r_lc['Baseline_pct']:.1f} & "
+                f"{int(r_lc['BAU_km2']):,} & {r_lc['BAU_pct']:.1f} & "
+                f"{int(r_lc['Top 5%_km2']):,} & {r_lc['Top 5%_pct']:.1f} & "
+                f"{int(r_lc['Top 1%_km2']):,} & {r_lc['Top 1%_pct']:.1f} \\\\"
+            )
+        tex_lines += [
+            r"    \bottomrule",
+            r"  \end{tabular}",
+            r"\end{table}",
+        ]
+        tex_path = output_dir / "economic_exposure_landcover.tex"
+        tex_path.write_text("\n".join(tex_lines) + "\n")
+        print(f"  Saved: {tex_path}")
+        lc_breakdown = lc_rows
+
+    # ── Bar chart: compare risk tiers across NTL/pop/infra proxies ───────────
     _plot_exposure_barchart(exposure_df, ntl_col, pop_col, infra_cols, output_dir)
 
-    # ── Map: BAU risk zone coloured by NTL (EPSG:3857, backbone underlay) ───
+    # ── Map: BAU risk zone coloured by NTL (EPSG:3857, backbone underlay) ────
     if ntl_col is not None:
         bau_sub = merged[bau_mask].dropna(subset=[ntl_col])
         if len(bau_sub) > 0:
@@ -1729,7 +2005,6 @@ def create_economic_exposure(
             ym = bau_sub["y"].values.astype(np.float64)
             ntl_vals = bau_sub[ntl_col].values.astype(np.float32)
 
-            region_proj = None
             proj_bounds = _resolve_plot_bounds_3857(repo_root, DATA_SUBDIR, baseline)
             backbone_path = resolve_backbone_path_for_plot(repo_root, DATA_SUBDIR, baseline)
 
@@ -1740,15 +2015,13 @@ def create_economic_exposure(
                 extent_bounds=proj_bounds,
             )
 
-            proj_width = proj_bounds[2] - proj_bounds[0]
+            proj_width  = proj_bounds[2] - proj_bounds[0]
             proj_height = proj_bounds[3] - proj_bounds[1]
             fig_w = 14.0
             fig_h = fig_w * (proj_height / max(proj_width, 1e-9))
             fig, ax = plt.subplots(figsize=(fig_w, fig_h))
 
-            used_bb = _plot_backbone_background(
-                ax, backbone_path, zorder=0, hole_color=FORWARD_PA_HOLE_COLOR,
-            )
+            _plot_backbone_background(ax, backbone_path, zorder=0, hole_color=FORWARD_PA_HOLE_COLOR)
             _overlay_current_pa_extent(ax, repo_root, DATA_SUBDIR, baseline, proj_bounds, zorder=1)
 
             im = ax.imshow(
@@ -2727,6 +3000,19 @@ def main() -> None:
         top_pct=0.01,
     )
 
+    # ── Eval vs deployment model consistency scatter ──────────────────────────
+    try:
+        create_eval_vs_deployment_scatter(
+            repo_root=repo_root,
+            outputs_subdir=OUTPUTS_SUBDIR,
+            forward_dirs=forward_dirs,
+            output_dir=model_output_dir,
+            model_type=model_type,
+        )
+    except Exception as _e:
+        print(f"  WARNING: eval vs deployment scatter failed: {_e}")
+    wb.log({"results/stage": "eval_deploy_scatter_done"})
+
     # Join GSN mask bands from features parquet (not present in scored output)
     if "GSN_b1" not in df.columns or "GSN_b2" not in df.columns:
         feat_path = None
@@ -2829,8 +3115,26 @@ def main() -> None:
     wb.log({"results/stage": "economic_activity_done"})
 
     # ── Hotspot zoom-ins ──────────────────────────────────────────────────────
+    # Prefer cluster-derived bounding boxes (from clustering_analysis.py) if available.
+    # Fall back to hardcoded HOTSPOT_REGIONS from config.
+    _cluster_boxes_path = model_output_dir / "cluster_hotspot_boxes.json"
+    _hotspot_regions_to_use = HOTSPOT_REGIONS
+    if _cluster_boxes_path.exists():
+        try:
+            with open(_cluster_boxes_path) as _f:
+                _cluster_data = json.load(_f)
+            _boxes = [
+                (c["label"], c["lon_min"], c["lon_max"], c["lat_min"], c["lat_max"])
+                for c in _cluster_data
+                if all(k in c for k in ["label", "lon_min", "lon_max", "lat_min", "lat_max"])
+            ]
+            if _boxes:
+                print(f"  Using {len(_boxes)} cluster-derived hotspot boxes from {_cluster_boxes_path.name}")
+                _hotspot_regions_to_use = _boxes
+        except Exception as _e:
+            print(f"  WARNING: could not load cluster boxes: {_e} — using config hotspot regions")
     create_hotspot_maps(
-        df, HOTSPOT_REGIONS, bau_cutoff,
+        df, _hotspot_regions_to_use, bau_cutoff,
         model_output_dir, baseline, repo_root, REGION_LABEL,
     )
     wb.log({"results/stage": "hotspot_maps_done"})

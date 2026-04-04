@@ -10,6 +10,8 @@ _VALID_STAGES = {
     "predict",
     "results",
     "backtest",
+    "pathway",
+    "clustering",
 }
 
 _STAGE_MODULE = {
@@ -18,6 +20,8 @@ _STAGE_MODULE = {
     "predict":           "scripts.regions.shared.forward.predict_core",
     "results":           "scripts.regions.shared.forward.results_core",
     "backtest":          "scripts.regions.shared.forward.backtest_core",
+    "pathway":           "scripts.regions.shared.forward.pathway_analysis",
+    "clustering":        "scripts.regions.shared.forward.clustering_analysis",
 }
 
 

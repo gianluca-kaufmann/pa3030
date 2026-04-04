@@ -1,34 +1,42 @@
 #!/usr/bin/env python3
 """Spatial CV visualisation — publication-ready figures for spatial generalisation.
 
-Produces three figures from LOBO (Layer 1) and biome-stratified (Layer 2) results:
+Produces four figures from LOBO (Layer 1) and biome-stratified (Layer 2) results:
 
-  bar_lobo_performance_<ts>.pdf
+  bar_lobo_performance_<model_type>.pdf
       Horizontal grouped bar chart with two panels:
         Left  — ROC-AUC: LOBO (out-of-distribution) vs. in-distribution
         Right — Recall@5%: same comparison
       Biomes sorted by LOBO ROC-AUC (best at top).
 
-  scatter_lobo_performance_<ts>.pdf
+  scatter_lobo_performance_<model_type>.pdf
       Bubble scatter:  x = biome PA prevalence (log scale)
                        y = LOBO ROC-AUC
                      size = √(PA events in held-out biome test set)
                     colour = LOBO Recall@5%
       Reveals whether generalisation correlates with event frequency.
 
-  map_lobo_performance_<ts>.pdf
+  map_lobo_performance_<model_type>.pdf
       Two-panel choropleth map of the region, coloured by biome:
-        Left  — LOBO ROC-AUC
+        Left  — LOBO ROC-AUC (colour scale 0.5–1.0)
         Right — LOBO Recall@5%
-      Country borders overlaid; grey = biome absent or too few test events.
+      Grey = biome absent or too few test events.
 
-Data sources (latest file found by mtime, auto-detected):
+  scatter_biome_calibration_<model_type>.pdf
+      Biome calibration scatter:  x = mean predicted probability (test set)
+                                  y = observed transition rate (test set)
+                                size = √(n test pixels)
+                               colour = biome ROC-AUC
+      1:1 diagonal = perfect calibration. Points below = over-prediction.
+      Requires spatial_CV_2 to be run after the 2026-04 update that adds
+      mean_pred_prob to biome_metrics output.
+
+Data sources (latest file found by mtime, auto-detected; $SCRATCH checked first when set):
   LOBO summary:   outputs/{region}/results/spatial_cv/{model_type}/lobo_summary_*.csv
   Layer 2:        outputs/{region}/results/spatial_generalisation/biome_metrics_*.csv
   Biome shapefile: data/shared/GlobalSafetyNet/terrestrial_ecoregions/Terrestrial_ecoregions.shp
-  Countries:      data/shared/admin/ne_110m_admin_0_countries.gpkg (auto-downloaded if absent)
 
-Output directory:
+Output directory (same relative path; under $SCRATCH when SCRATCH is set, else repo):
   outputs/{region}/results/spatial_cv_visualisation/
 
 Run after spatial_CV_1_aggregate (LOBO) and spatial_CV_2 (Layer 2).
@@ -38,9 +46,8 @@ from __future__ import annotations
 import os
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import matplotlib
 matplotlib.use("Agg")
@@ -203,67 +210,6 @@ def load_layer2_results(region: str, model_label: str = "LGBM") -> Optional[pd.D
 
     print(f"  {len(df)} biomes in Layer 2 results ({model_label})")
     return df
-
-
-def _load_world_countries(repo_root: Path) -> Optional["gpd.GeoDataFrame"]:
-    """Load world country boundaries, using the local cache when available.
-
-    Falls back to Natural Earth download (with caching) if the gpkg is absent.
-    Returns None if neither source is reachable.
-    """
-    if not GEOPANDAS_AVAILABLE:
-        return None
-
-    cache_path = (repo_root / "data" / "shared" / "admin" /
-                  "ne_110m_admin_0_countries.gpkg")
-    if cache_path.exists():
-        try:
-            return gpd.read_file(cache_path)
-        except Exception as e:
-            print(f"  Warning: cached countries file unreadable ({e})")
-
-    # Download from Natural Earth
-    import shutil, tempfile, urllib.request, zipfile
-
-    urls = [
-        "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip",
-        ("https://github.com/nvkelso/natural-earth-vector/raw/master/110m_cultural/"
-         "ne_110m_admin_0_countries.zip"),
-    ]
-    for url in urls:
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
-                urllib.request.urlretrieve(url, tmp.name)
-                extract_dir = tempfile.mkdtemp()
-                try:
-                    with zipfile.ZipFile(tmp.name, "r") as zf:
-                        zf.extractall(extract_dir)
-                    shps = list(Path(extract_dir).glob("*.shp"))
-                    if not shps:
-                        raise ValueError("No .shp in zip")
-                    gdf = gpd.read_file(shps[0])
-                finally:
-                    os.unlink(tmp.name)
-                    shutil.rmtree(extract_dir)
-            if gdf is not None and not gdf.empty:
-                # Normalise CRS
-                if gdf.crs is None:
-                    gdf = gdf.set_crs("EPSG:4326")
-                elif gdf.crs.to_epsg() != 4326:
-                    gdf = gdf.to_crs("EPSG:4326")
-                # Cache for subsequent runs
-                try:
-                    cache_path.parent.mkdir(parents=True, exist_ok=True)
-                    gdf.to_file(cache_path, driver="GPKG")
-                    print(f"  Cached world countries: {cache_path}")
-                except Exception:
-                    pass
-                return gdf
-        except Exception as e:
-            print(f"  Country boundary download failed ({url}): {e}")
-
-    print("  Warning: world country boundaries unavailable; map will skip borders.")
-    return None
 
 
 def _load_biome_geodataframe(region: str) -> Optional["gpd.GeoDataFrame"]:
@@ -516,51 +462,67 @@ def plot_prevalence_vs_performance(
     else:
         colors = COLOR_LOBO
 
-    fig, ax = plt.subplots(figsize=(9.5, 6.5))
+    # constrained_layout avoids tight_layout failures with log axes + colorbar + labels
+    fig, ax = plt.subplots(figsize=(10.0, 6.8), constrained_layout=True)
 
+    x_pct = df["positive_rate"].to_numpy(dtype=float) * 100.0
     ax.scatter(
-        df["positive_rate"] * 100, df["roc_auc"],
-        s=sizes, c=colors,
-        edgecolors="white", linewidths=0.9,
-        alpha=0.88, zorder=3,
+        x_pct,
+        df["roc_auc"],
+        s=sizes,
+        c=colors,
+        edgecolors="white",
+        linewidths=0.9,
+        alpha=0.88,
+        zorder=3,
     )
-
-    # Biome labels — offset slightly to avoid overlap with bubble centres
-    for _, row in df.iterrows():
-        ax.annotate(
-            _short(row["biome_name"]),
-            xy=(row["positive_rate"] * 100, row["roc_auc"]),
-            xytext=(7, 2), textcoords="offset points",
-            fontsize=8, color="#333333",
-        )
-
-    # Baseline reference
-    ax.axhline(0.5, color=COLOR_REF, lw=1.0, ls="--", alpha=0.7)
-    ax.text(ax.get_xlim()[0] * 1.05, 0.502, "AUC = 0.5 (random)",
-            fontsize=7.5, color=COLOR_REF, va="bottom")
 
     ax.set_xscale("log")
     ax.set_xlabel("Biome PA prevalence in test set (%, log scale)", fontsize=11)
     ax.set_ylabel("LOBO ROC-AUC", fontsize=11)
     ax.set_ylim(0.45, 1.05)
-    ax.grid(True, alpha=0.25, zorder=1)
+    ax.grid(True, which="both", alpha=0.25, zorder=1)
     ax.spines[["top", "right"]].set_visible(False)
     ax.set_title(
         "LOBO Generalisation vs. Biome PA Prevalence\n"
-        r"Bubble size $\propto$ $\sqrt{\mathrm{PA\ events\ in\ held\text{-}out\ test\ set}}$",
-        fontsize=11, fontweight="bold",
+        "Bubble size ∝ √(PA events in held-out test set)",
+        fontsize=11,
+        fontweight="bold",
     )
+
+    # Baseline reference (axes coords so it stays visible with log x)
+    ax.axhline(0.5, color=COLOR_REF, lw=1.0, ls="--", alpha=0.7, zorder=2)
+    ax.text(
+        0.02,
+        0.08,
+        "AUC = 0.5 (random)",
+        transform=ax.transAxes,
+        fontsize=7.5,
+        color=COLOR_REF,
+        va="bottom",
+    )
+
+    # Biome labels — offset slightly to avoid overlap with bubble centres
+    for i, row in df.iterrows():
+        ax.annotate(
+            _short(row["biome_name"]),
+            xy=(x_pct[i], row["roc_auc"]),
+            xytext=(7, 2),
+            textcoords="offset points",
+            fontsize=8,
+            color="#333333",
+            zorder=4,
+        )
 
     # Colorbar for recall
     if has_recall:
         sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
         sm.set_array([])
-        cbar = fig.colorbar(sm, ax=ax, shrink=0.65, pad=0.02, aspect=22)
+        cbar = fig.colorbar(sm, ax=ax, shrink=0.82, pad=0.03, aspect=24)
         cbar.set_label("LOBO Recall@top-5%", fontsize=10)
         cbar.ax.tick_params(labelsize=8)
 
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight")
+    fig.savefig(output_path, dpi=FIGURE_DPI)
     plt.close(fig)
     print(f"  Saved: {output_path.name}")
 
@@ -582,21 +544,16 @@ def plot_biome_performance_map(
     Both panels share the RdYlGn colormap (red = poor, green = strong).
     Grey fill denotes biomes absent from the LOBO results (either out of the
     region or skipped due to too few test-set PA events).
-    Country borders are overlaid in dark grey for spatial context.
+    ROC-AUC colour scale is fixed to [0.5, 1.0] so the full legend range is shown.
     """
     if not GEOPANDAS_AVAILABLE:
         print("  Skipping map (geopandas not available).")
         return
 
-    repo_root = get_repo_root()
-
     print("  Loading biome polygons...")
     biome_gdf = _load_biome_geodataframe(region)
     if biome_gdf is None:
         return
-
-    print("  Loading country boundaries...")
-    countries = _load_world_countries(repo_root)
 
     # ── Merge LOBO metrics onto biome geodataframe ───────────────────────────
     metrics = lobo_df[["biome_name", "roc_auc", "recall_at_5pct",
@@ -619,14 +576,8 @@ def plot_biome_performance_map(
     # ── Colormaps and normalisations ─────────────────────────────────────────
     cmap = _get_cmap("RdYlGn")
 
-    auc_vals = gdf["roc_auc"].dropna().to_numpy()
-    if len(auc_vals) > 0:
-        norm_auc = Normalize(
-            vmin=max(0.50, float(auc_vals.min()) - 0.04),
-            vmax=min(1.00, float(auc_vals.max()) + 0.01),
-        )
-    else:
-        norm_auc = Normalize(vmin=0.5, vmax=1.0)
+    # Full ROC-AUC colour scale (random = 0.5, perfect = 1.0) for interpretability
+    norm_auc = Normalize(vmin=0.5, vmax=1.0)
 
     if has_recall:
         r5_vals = gdf["recall_at_5pct"].dropna().to_numpy()
@@ -662,14 +613,6 @@ def plot_biome_performance_map(
         if not valid.empty:
             valid.plot(ax=ax, column=col, cmap=cmap, norm=norm,
                        edgecolor="#777777", linewidth=0.4, zorder=2)
-
-        # Country borders
-        if countries is not None:
-            try:
-                countries.boundary.plot(
-                    ax=ax, color="#333333", linewidth=0.65, zorder=4)
-            except Exception:
-                pass
 
         # Colorbar
         sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
@@ -729,6 +672,114 @@ def plot_biome_performance_map(
 # Entry point
 # =============================================================================
 
+def plot_biome_predicted_vs_actual(
+    layer2_df: pd.DataFrame,
+    output_path: Path,
+    region_label: str = "",
+) -> None:
+    """Scatter: biome-level mean predicted probability vs observed transition rate.
+
+    Requires the Layer 2 biome_metrics CSV to have a ``mean_pred_prob`` column
+    (produced by spatial_CV_2 after the 2026-04 update to spatial_cv_core.py).
+    Falls back gracefully if the column is absent.
+
+    x-axis: mean predicted probability (calibrated) across test-set pixels in biome
+    y-axis: observed transition rate (positive_rate) in the test period
+    Size:   sqrt(n_samples), scaled
+    Colour: biome ROC-AUC (RdYlGn)
+    Diagonal: 1:1 line — points below = over-prediction, above = under-prediction.
+    """
+    df = layer2_df.copy()
+
+    for col in ("mean_pred_prob", "positive_rate", "roc_auc", "n_samples"):
+        df[col] = pd.to_numeric(df.get(col), errors="coerce")
+
+    if "mean_pred_prob" not in df.columns or df["mean_pred_prob"].isna().all():
+        print("  Biome predicted-vs-actual scatter: mean_pred_prob column absent "
+              "— re-run spatial_CV_2 to generate it, then re-run this script.")
+        return
+
+    df = df.dropna(subset=["mean_pred_prob", "positive_rate"]).reset_index(drop=True)
+    if len(df) < 2:
+        print("  Not enough biome rows for scatter — skipping.")
+        return
+
+    x = df["mean_pred_prob"].to_numpy()
+    y = df["positive_rate"].to_numpy()
+
+    # Bubble sizes proportional to sqrt(n_samples)
+    n = df["n_samples"].clip(lower=1).fillna(1).to_numpy()
+    sizes = 60 + (np.sqrt(n) / np.sqrt(n).max()) * 700
+
+    # Colour by ROC-AUC
+    cmap = _get_cmap("RdYlGn")
+    roc  = df["roc_auc"].fillna(0.5).to_numpy()
+    norm = Normalize(vmin=0.5, vmax=1.0)
+    colors = [cmap(norm(v)) for v in roc]
+
+    # Axis range: cover both x and y to make the 1:1 line meaningful
+    lo = 0.0
+    hi = max(float(x.max()), float(y.max())) * 1.15
+
+    fig, ax = plt.subplots(figsize=(8.5, 7.0))
+
+    ax.scatter(x * 100, y * 100, s=sizes, c=colors,
+               edgecolors="white", linewidths=0.8, alpha=0.88, zorder=3)
+
+    # 1:1 diagonal
+    diag = np.linspace(lo * 100, hi * 100, 100)
+    ax.plot(diag, diag, color="#555555", lw=1.2, ls="--", zorder=2, label="1:1 (perfect calibration)")
+
+    # Biome labels
+    for _, row in df.iterrows():
+        ax.annotate(
+            _short(row.get("biome_name", "")),
+            xy=(row["mean_pred_prob"] * 100, row["positive_rate"] * 100),
+            xytext=(5, 2), textcoords="offset points",
+            fontsize=7.5, color="#333333",
+        )
+
+    ax.set_xlabel("Mean predicted probability — calibrated (%, test set)", fontsize=11)
+    ax.set_ylabel("Observed transition rate — actual PAs (%, test set)", fontsize=11)
+    ax.set_xlim(lo * 100, hi * 100)
+    ax.set_ylim(lo * 100, hi * 100)
+    ax.grid(True, alpha=0.22, zorder=1)
+    ax.spines[["top", "right"]].set_visible(False)
+    title_suffix = f" — {region_label}" if region_label else ""
+    ax.set_title(
+        f"Biome Calibration: Predicted vs Actual Designation Rate{title_suffix}\n"
+        r"Bubble size $\propto$ $\sqrt{n_{\mathrm{test\ pixels}}}$ · "
+        "Below diagonal = over-prediction · Above = under-prediction",
+        fontsize=10.5, fontweight="bold",
+    )
+    ax.legend(fontsize=9, framealpha=0.7)
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=ax, shrink=0.6, pad=0.02, aspect=22)
+    cbar.set_label("Biome ROC-AUC (full model)", fontsize=9.5)
+    cbar.ax.tick_params(labelsize=8)
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {output_path.name}")
+
+
+def _resolve_spatial_cv_visualisation_output_dir(region: str) -> Path:
+    """Figure output dir: ``$SCRATCH/outputs/...`` when SCRATCH is set, else repo."""
+    repo_root = get_repo_root()
+    scratch   = os.environ.get("SCRATCH")
+    subdir    = "spatial_cv_visualisation"
+    if scratch:
+        d = Path(scratch) / f"outputs/{region}/results/{subdir}"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    d = repo_root / f"outputs/{region}/results/{subdir}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def run_spatial_cv_visualise(region: str, model_type: str = "lgbm") -> None:
     """Produce all spatial CV visualisation figures for *region*.
 
@@ -736,12 +787,9 @@ def run_spatial_cv_visualise(region: str, model_type: str = "lgbm") -> None:
         region:     Region slug (e.g. 'south_america', 'usa').
         model_type: Model type whose LOBO folds to read ('lgbm' or 'rf').
     """
-    repo_root  = get_repo_root()
-    output_dir = repo_root / f"outputs/{region}/results/spatial_cv_visualisation"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path  = output_dir / f"visualise_{timestamp}.txt"
+    output_dir = _resolve_spatial_cv_visualisation_output_dir(region)
+    mt_safe    = model_type.lower().strip()
+    log_path   = output_dir / f"visualise_{mt_safe}.txt"
 
     tee = Tee(log_path)
     sys.stdout = tee
@@ -774,18 +822,27 @@ def run_spatial_cv_visualise(region: str, model_type: str = "lgbm") -> None:
 
         # ── Figure 1: Bar chart ───────────────────────────────────────────────
         print("\n--- Figure 1: Bar chart (LOBO vs in-distribution) ---")
-        fig1_path = output_dir / f"bar_lobo_performance_{timestamp}.pdf"
+        fig1_path = output_dir / f"bar_lobo_performance_{mt_safe}.pdf"
         plot_lobo_vs_indistribution(lobo_df, layer2_df, fig1_path)
 
         # ── Figure 2: Scatter ─────────────────────────────────────────────────
         print("\n--- Figure 2: Scatter (prevalence vs performance) ---")
-        fig2_path = output_dir / f"scatter_lobo_performance_{timestamp}.pdf"
+        fig2_path = output_dir / f"scatter_lobo_performance_{mt_safe}.pdf"
         plot_prevalence_vs_performance(lobo_df, fig2_path)
 
         # ── Figure 3: Map ─────────────────────────────────────────────────────
         print("\n--- Figure 3: Biome performance map ---")
-        fig3_path = output_dir / f"map_lobo_performance_{timestamp}.pdf"
+        fig3_path = output_dir / f"map_lobo_performance_{mt_safe}.pdf"
         plot_biome_performance_map(lobo_df, region, fig3_path)
+
+        # ── Figure 4: Biome predicted vs actual scatter ───────────────────────
+        print("\n--- Figure 4: Biome predicted vs actual scatter ---")
+        if layer2_df is not None:
+            fig4_path = output_dir / f"scatter_biome_calibration_{mt_safe}.pdf"
+            region_label = region.replace("_", " ").title()
+            plot_biome_predicted_vs_actual(layer2_df, fig4_path, region_label=region_label)
+        else:
+            print("  Skipping — Layer 2 data not available.")
 
         elapsed = time.time() - t0
         print(f"\n{'='*70}")
