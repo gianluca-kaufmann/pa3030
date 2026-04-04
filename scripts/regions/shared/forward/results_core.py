@@ -718,6 +718,13 @@ def resolve_country_iso3_raster(repo_root: Path, data_subdir: str) -> Tuple[Opti
             repo_root / f"data/{data_subdir}/ready/policy/country_iso3_mapping.json",
         )
     )
+    # Fallback: shared/ directory (used when region-specific raster isn't available locally)
+    candidates.append(
+        (
+            repo_root / "data/shared/country_iso3.tif",
+            repo_root / "data/shared/country_iso3_mapping.json",
+        )
+    )
     for tif, js in candidates:
         if tif.exists() and js.exists():
             return tif, js
@@ -1460,25 +1467,57 @@ def create_country_breakdown(
         country_df.to_csv(csv_path, index=False)
         print(f"  Saved: {csv_path}")
 
-        # LaTeX table (top 13 countries)
+        # LaTeX table (top 13 countries) — hand-built to avoid pandas Styler/Jinja2
+        # dependency and to produce properly formatted numbers (no scientific notation).
         tex_path = output_dir / "country_breakdown.tex"
-        tex_cols = [
-            "country", "total_km2", "current_pct_protected",
-            "30x30_new_km2", "projected_pct_2030_30x30", "gap_to_30pct_km2",
-        ]
         try:
-            country_df[tex_cols].head(13).to_latex(
-                tex_path, index=False, float_format="%.4g",
-                caption=(
-                    "Country-level breakdown: total land area, current protection (end-2024), "
-                    "projected new designations under the 30×30 scenario, "
-                    "projected coverage by 2030, and remaining gap to the 30\\% target."
+            col_headers = {
+                "country":                  "Country",
+                "total_km2":                r"Total (km$^2$)",
+                "current_pct_protected":    r"Protected 2024 (\%)",
+                "30x30_new_km2":            r"New 30$\times$30 (km$^2$)",
+                "projected_pct_2030_30x30": r"Proj.\ 2030 (\%)",
+                "gap_to_30pct_km2":         r"Gap to 30\% (km$^2$)",
+            }
+            tex_cols = list(col_headers.keys())
+            sub = country_df[tex_cols].head(13).copy()
+
+            def _fmt_row(row):
+                return (
+                    f"{row['country']} & "
+                    f"{int(row['total_km2']):,} & "
+                    f"{row['current_pct_protected']*100:.1f} & "
+                    f"{int(row['30x30_new_km2']):,} & "
+                    f"{row['projected_pct_2030_30x30']*100:.1f} & "
+                    f"{int(row['gap_to_30pct_km2']):,} \\\\"
+                )
+
+            header = " & ".join(col_headers[c] for c in tex_cols) + r" \\"
+            lines = [
+                r"\begin{table}[htbp]",
+                r"  \centering",
+                r"  \small",
+                (
+                    r"  \caption{Country-level breakdown: total land area, current protection "
+                    r"(end-2024), projected new designations under the 30$\times$30 scenario, "
+                    r"projected coverage by 2030, and remaining gap to the 30\% target.}"
                 ),
-                label="tab:forward_country",
-            )
+                r"  \label{tab:forward_country}",
+                r"  \begin{tabular}{lrrrrr}",
+                r"    \toprule",
+                f"    {header}",
+                r"    \midrule",
+            ]
+            for _, row in sub.iterrows():
+                lines.append(f"    {_fmt_row(row)}")
+            lines += [
+                r"    \bottomrule",
+                r"  \end{tabular}",
+                r"\end{table}",
+            ]
+            tex_path.write_text("\n".join(lines) + "\n")
             print(f"  Saved: {tex_path}")
         except Exception as e:
-            # Pandas >=2.0 uses the Styler backend for to_latex, which requires optional deps (jinja2).
             print(f"  NOTE: could not write LaTeX table ({type(e).__name__}: {e})")
         return country_df
 
