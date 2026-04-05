@@ -1462,6 +1462,9 @@ def create_country_breakdown(
                 "gap_to_30pct_km2": round(gap_km2, 0),
             })
 
+        if not rows:
+            print("  WARNING: no country rows produced — skipping country breakdown output.")
+            return
         country_df = pd.DataFrame(rows).sort_values("30x30_new_km2", ascending=False)
         csv_path = output_dir / "country_breakdown.csv"
         country_df.to_csv(csv_path, index=False)
@@ -2950,7 +2953,7 @@ def save_scenario_summary(
         "scenarios": scenario_info,
         "gap_analysis": gap_metrics,
         "country_breakdown_top10": (
-            country_df.head(10).to_dict("records") if not country_df.empty else []
+            country_df.head(10).to_dict("records") if country_df is not None and not country_df.empty else []
         ),
         "biome_breakdown_top10": (
             biome_df.head(10).to_dict("records") if not biome_df.empty else []

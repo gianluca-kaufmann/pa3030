@@ -57,7 +57,6 @@ from scripts.regions.shared.forward.results_core import (  # noqa: E402
     resolve_coverage_baseline,
     resolve_backbone_path_for_plot,
     resolve_country_iso3_raster,
-    _load_country_iso3_lookup,
     points_to_raster,
     _IGBP_GROUPS,
 )
@@ -117,7 +116,10 @@ def _build_country_lookup(
         with rasterio.open(iso_path) as src:
             iso_grid = src.read(1)
         h, w = iso_grid.shape
-        id2iso = _load_country_iso3_lookup(id2iso_path)
+        import json as _json
+        with open(id2iso_path) as _f:
+            _raw = _json.load(_f) or {}
+        id2iso = {int(k): v for k, v in _raw.items() if v is not None}
         valid = (row_arr >= 0) & (row_arr < h) & (col_arr >= 0) & (col_arr < w)
         ids = np.zeros(len(row_arr), dtype=np.int32)
         ids[valid] = iso_grid[row_arr[valid], col_arr[valid]].astype(np.int32)
