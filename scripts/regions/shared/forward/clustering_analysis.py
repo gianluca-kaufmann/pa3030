@@ -105,27 +105,74 @@ def _build_country_lookup(
     data_subdir: str,
     row_arr: np.ndarray,
     col_arr: np.ndarray,
+    x_arr: Optional[np.ndarray] = None,
+    y_arr: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """Return array of ISO3 strings (or '' for unresolved) for each pixel."""
-    iso_path, id2iso_path = resolve_country_iso3_raster(repo_root, data_subdir)
-    if iso_path is None or not iso_path.exists():
-        return np.full(len(row_arr), "", dtype=object)
+    """Return array of ISO3 strings (or '' for unresolved) for each pixel.
 
+    Tries a raster-based lookup (row/col) first, then falls back to a
+    geopandas spatial join using x/y (EPSG:3857) against
+    data/shared/admin/ne_110m_admin_0_countries.gpkg when the raster
+    lookup resolves fewer than 50% of pixels.  The geopandas path works
+    for all three regions (SA, USA, SE Asia).
+    """
+    # ── Raster-based lookup ───────────────────────────────────────────────────
+    iso_path, id2iso_path = resolve_country_iso3_raster(repo_root, data_subdir)
+    if iso_path is not None and iso_path.exists():
+        try:
+            import rasterio
+            with rasterio.open(iso_path) as src:
+                iso_grid = src.read(1)
+            h, w = iso_grid.shape
+            import json as _json
+            with open(id2iso_path) as _f:
+                _raw = _json.load(_f) or {}
+            id2iso = {int(k): v for k, v in _raw.items() if v is not None}
+            valid = (row_arr >= 0) & (row_arr < h) & (col_arr >= 0) & (col_arr < w)
+            ids = np.zeros(len(row_arr), dtype=np.int32)
+            ids[valid] = iso_grid[row_arr[valid], col_arr[valid]].astype(np.int32)
+            raster_result = np.array([id2iso.get(int(i), "") for i in ids], dtype=object)
+            resolved = float((raster_result != "").sum()) / max(len(raster_result), 1)
+            if resolved > 0.5:
+                return raster_result
+            print(f"  Country raster resolved {resolved:.1%} — trying geopandas fallback")
+        except Exception as e:
+            print(f"  WARNING: country raster lookup failed: {e}")
+
+    # ── Geopandas fallback using EPSG:3857 x/y coordinates ───────────────────
+    if x_arr is None or y_arr is None:
+        return np.full(len(row_arr), "", dtype=object)
     try:
-        import rasterio
-        with rasterio.open(iso_path) as src:
-            iso_grid = src.read(1)
-        h, w = iso_grid.shape
-        import json as _json
-        with open(id2iso_path) as _f:
-            _raw = _json.load(_f) or {}
-        id2iso = {int(k): v for k, v in _raw.items() if v is not None}
-        valid = (row_arr >= 0) & (row_arr < h) & (col_arr >= 0) & (col_arr < w)
-        ids = np.zeros(len(row_arr), dtype=np.int32)
-        ids[valid] = iso_grid[row_arr[valid], col_arr[valid]].astype(np.int32)
-        return np.array([id2iso.get(int(i), "") for i in ids], dtype=object)
+        import geopandas as gpd
+        from shapely import points as _shp_points
+
+        admin_path = repo_root / "data/shared/admin/ne_110m_admin_0_countries.gpkg"
+        if not admin_path.exists():
+            print(f"  Country geopandas fallback: admin file not found ({admin_path})")
+            return np.full(len(row_arr), "", dtype=object)
+
+        lon, lat = epsg3857_to_lonlat(
+            x_arr.astype(np.float64), y_arr.astype(np.float64)
+        )
+        pts = gpd.GeoDataFrame(
+            {"_idx": np.arange(len(lon))},
+            geometry=_shp_points(lon, lat),
+            crs="EPSG:4326",
+        )
+        countries = gpd.read_file(admin_path, columns=["ISO_A3", "geometry"])
+        joined = gpd.sjoin(pts, countries[["ISO_A3", "geometry"]], how="left", predicate="within")
+        # sjoin can produce duplicate rows (point on border). Take first match per _idx.
+        joined = joined.drop_duplicates(subset="_idx").set_index("_idx")
+        iso3_vals = joined.reindex(range(len(lon)))["ISO_A3"].fillna("").values
+        result = np.array(
+            ["" if (v == "" or v == "-99") else str(v) for v in iso3_vals],
+            dtype=object,
+        )
+        resolved = float((result != "").sum()) / max(len(result), 1)
+        print(f"  Country geopandas fallback: {resolved:.1%} pixels resolved")
+        return result
     except Exception as e:
-        print(f"  WARNING: country lookup failed: {e}")
+        print(f"  WARNING: country geopandas fallback failed: {e}")
         return np.full(len(row_arr), "", dtype=object)
 
 
@@ -235,7 +282,11 @@ def run_clustering(
     # ── Country + biome lookup for top pixels ─────────────────────────────────
     row_arr = top_df["row"].values.astype(int)
     col_arr = top_df["col"].values.astype(int)
-    top_df["country_iso3"] = _build_country_lookup(repo_root, DATA_SUBDIR, row_arr, col_arr)
+    x_arr   = top_df["x"].values.astype(np.float64) if "x" in top_df.columns else None
+    y_arr   = top_df["y"].values.astype(np.float64) if "y" in top_df.columns else None
+    top_df["country_iso3"] = _build_country_lookup(
+        repo_root, DATA_SUBDIR, row_arr, col_arr, x_arr=x_arr, y_arr=y_arr
+    )
     # (ecoregion lookup is optional — skip if raster not available locally)
     top_df["eco_id"] = _build_biome_lookup(repo_root, DATA_SUBDIR, row_arr, col_arr)
 

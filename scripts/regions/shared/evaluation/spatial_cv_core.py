@@ -221,6 +221,29 @@ def resolve_trained_model(region: str, model_id: str, model_type: str) -> Path:
     )
 
 
+def _load_lgbm_production_pickle(model_path: Path) -> tuple[Any, list[str], int]:
+    """Load step-5 Booster pickle or forward deployment dict artifact.
+
+    ``resolve_trained_model`` selects the newest ``{model_id}_lgbm_*.pkl``, which
+    can be a raw Booster from step 5 or a newer ``*_lgbm_deployment_*.pkl`` bundle
+    ``{'model': Booster, 'feature_cols': [...], 'metadata': {num_boost_round: ...}}``.
+
+    Returns ``(booster, feature_cols, num_boost_round)``.
+    """
+    with open(model_path, "rb") as fh:
+        loaded = pickle.load(fh)
+    if isinstance(loaded, dict) and "model" in loaded:
+        booster = loaded["model"]
+        cols = list(loaded.get("feature_cols") or [])
+        if not cols:
+            cols = list(booster.feature_name())
+        meta = loaded.get("metadata") or {}
+        n_iter = int(meta.get("num_boost_round", booster.num_trees()))
+        return booster, cols, n_iter
+    model = loaded
+    return model, list(model.feature_name()), int(model.num_trees())
+
+
 def resolve_rf_best_params(region: str) -> Optional[Path]:
     """Find rf_best_params.json for a region, checking $SCRATCH first."""
     repo_root = get_repo_root()
@@ -1345,9 +1368,7 @@ def _compute_biome_feature_importance(
 
     print(f"  Loading {model_type.upper()} model: {model_path.name}")
     if model_type == "lgbm":
-        with open(model_path, "rb") as fh:
-            model = pickle.load(fh)
-        feature_cols: list[str] = list(model.feature_name())
+        model, feature_cols, _ = _load_lgbm_production_pickle(model_path)
         # Generic "Column_N" names → resolve from parquet schema
         if feature_cols and feature_cols[0].startswith("Column_") and feature_cols[0][7:].isdigit():
             try:
@@ -1532,10 +1553,8 @@ def _run_transfer_direction(
     print(f"  Loading model: {model_path.name}")
 
     if model_type == "lgbm":
-        with open(model_path, "rb") as fh:
-            model = pickle.load(fh)
-        # LightGBM stores exact training column order
-        feature_cols = list(model.feature_name())
+        model, feature_cols, num_boost_round = _load_lgbm_production_pickle(model_path)
+        # LightGBM stores exact training column order (or deployment bundle lists them).
         # Production models trained on numpy arrays store generic names ("Column_0", ...).
         # Replace with parquet-derived names from the target region (same feature set,
         # same positional order) so that batch.select(feature_cols) works correctly.
@@ -1550,7 +1569,6 @@ def _run_transfer_direction(
                     f"Feature count mismatch: model has {len(feature_cols)} features "
                     f"(generic names), target parquet has {len(tgt_parquet_cols)}. "
                     f"Cannot infer correct column mapping.")
-        num_boost_round = model.num_trees()
         predict_fn: Callable[[np.ndarray], np.ndarray] = (
             lambda X, _m=model, _n=num_boost_round:
                 _m.predict(X, num_iteration=_n).astype(np.float32)
