@@ -1585,21 +1585,26 @@ def _run_transfer_direction(
             feature_cols = list(model.feature_names_in_)
         else:
             # Fallback: infer feature order from both parquet schemas and verify
-            # they agree, so cross-continental scoring uses correct column alignment.
+            # they share the same feature names, then use source column order
+            # (the order the RF model was trained on) so predictions are correct.
             src_train = resolve_parquet(source_region, "train_win5.parquet")
             tgt_train = resolve_parquet(target_region, "train_win5.parquet")
             src_cols = get_feature_cols(src_train)
             tgt_cols = get_feature_cols(tgt_train)
-            if src_cols != tgt_cols:
+            if set(src_cols) != set(tgt_cols):
                 raise ValueError(
                     f"RF feature_names_in_ not available and source/target parquet "
-                    f"schemas differ — cannot safely score cross-continental transfer.\n"
-                    f"Source ({source_region}): {src_cols}\n"
-                    f"Target ({target_region}): {tgt_cols}"
+                    f"feature sets differ — cannot safely score cross-continental transfer.\n"
+                    f"Source-only ({source_region}): {sorted(set(src_cols)-set(tgt_cols))}\n"
+                    f"Target-only ({target_region}): {sorted(set(tgt_cols)-set(src_cols))}"
                 )
-            feature_cols = src_cols
-            print("  WARNING: feature_names_in_ not available — inferred from parquet "
-                  "schemas (source and target schemas verified identical)")
+            feature_cols = src_cols  # use source order; PyArrow re-indexes target by name
+            if src_cols != tgt_cols:
+                print("  WARNING: feature_names_in_ not available — column order differs "
+                      "between regions; using source column order (target re-indexed by name).")
+            else:
+                print("  WARNING: feature_names_in_ not available — inferred from parquet "
+                      "schemas (source and target schemas verified identical)")
         n_estimators = model.n_estimators if hasattr(model, "n_estimators") else "?"
         predict_fn = lambda X, _m=model: _m.predict_proba(X)[:, 1].astype(np.float32)
         model_details = {"n_estimators": n_estimators}
@@ -2274,20 +2279,37 @@ def run_spatial_gen_main(region: str, model_id: str) -> None:
 
 
 # =============================================================================
-# Entry point — Layer 3: cross-continental transfer SA ↔ USA
+# Entry point — Layer 3: cross-continental transfer
 # =============================================================================
 
-def run_transfer_main(output_region: str = "south_america") -> None:
-    """Cross-continental transfer evaluation: SA ↔ USA, for both LGBM and RF.
+def run_transfer_main(
+    output_region: str = "south_america",
+    directions: Optional[list[tuple[str, str, str]]] = None,
+) -> None:
+    """Cross-continental transfer evaluation, for both LGBM and RF.
 
     Loads the production models trained in step 5 (no retraining) and scores
-    them on the other continent's test set.  SA and USA share identical 73-feature
+    them on another continent's test set.  All regions share identical 73-feature
     sets, so feature columns are taken directly from the loaded model.
 
-    Runs 4 combinations:
-        SA-LGBM → USA,  USA-LGBM → SA
-        SA-RF   → USA,  USA-RF   → SA
+    Args:
+        output_region: Region folder used for output paths.
+        directions: List of (source_region, source_model_id, target_region) tuples.
+            Defaults to the SA ↔ USA bidirectional pair:
+                [("south_america", "model1", "usa"),
+                 ("usa", "model2", "south_america")]
+            For SE Asia transfers pass:
+                [("se_asia", "model3", "south_america"),
+                 ("south_america", "model1", "se_asia"),
+                 ("se_asia", "model3", "usa"),
+                 ("usa", "model2", "se_asia")]
     """
+    if directions is None:
+        directions = [
+            ("south_america", "model1", "usa"),
+            ("usa",           "model2", "south_america"),
+        ]
+
     output_dir = resolve_cv_output_dir(output_region, "transfer")
     timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path   = output_dir / f"transfer_results_{timestamp}.txt"
@@ -2297,43 +2319,54 @@ def run_transfer_main(output_region: str = "south_america") -> None:
     sys.stdout = tee
     try:
         t_global = time.time()
+        regions_str = " / ".join(
+            f"{src.upper()} ↔ {tgt.upper()}"
+            for src, _, tgt in directions
+            if src < tgt  # avoid printing both directions twice
+        ) or " + ".join(f"{src}→{tgt}" for src, _, tgt in directions)
         print("=" * 70)
-        print("CROSS-CONTINENTAL TRANSFER EVALUATION — SA ↔ USA (Layer 3)")
+        print(f"CROSS-CONTINENTAL TRANSFER EVALUATION — {regions_str} (Layer 3)")
         print("Uses production models from step-5 training — no retraining.")
         print("=" * 70)
         print(f"Test years:   {TEST_START}-{TEST_END}")
         print(f"Output dir:   {output_dir}")
 
-        # ── Sanity check: confirm feature sets are identical ─────────────────
+        # ── Sanity check: confirm feature sets are identical across all regions ─
         print("\n" + "=" * 70)
         print("STEP 0: VERIFY FEATURE SETS")
         print("=" * 70)
-        sa_train_path  = resolve_parquet("south_america", "train_win5.parquet")
-        usa_train_path = resolve_parquet("usa",           "train_win5.parquet")
-        sa_cols  = get_feature_cols(sa_train_path)
-        usa_cols = get_feature_cols(usa_train_path)
-        sa_only  = set(sa_cols)  - set(usa_cols)
-        usa_only = set(usa_cols) - set(sa_cols)
-        print(f"SA features:  {len(sa_cols)}")
-        print(f"USA features: {len(usa_cols)}")
-        if sa_only:
-            print(f"WARNING — SA-only features ({len(sa_only)}): {sorted(sa_only)}")
-        if usa_only:
-            print(f"WARNING — USA-only features ({len(usa_only)}): {sorted(usa_only)}")
-        if not sa_only and not usa_only:
-            print("Feature sets are identical — cross-scoring is exact.")
+        unique_regions = list(dict.fromkeys(
+            r for src, _, tgt in directions for r in (src, tgt)
+        ))
+        region_cols: dict[str, list[str]] = {}
+        for reg in unique_regions:
+            train_path = resolve_parquet(reg, "train_win5.parquet")
+            region_cols[reg] = get_feature_cols(train_path)
+            print(f"{reg} features: {len(region_cols[reg])}")
+        ref_set = set(region_cols[unique_regions[0]])
+        for reg in unique_regions[1:]:
+            only_ref  = ref_set - set(region_cols[reg])
+            only_this = set(region_cols[reg]) - ref_set
+            if only_ref or only_this:
+                print(f"WARNING — {unique_regions[0]}-only ({len(only_ref)}): {sorted(only_ref)}")
+                print(f"WARNING — {reg}-only ({len(only_this)}): {sorted(only_this)}")
+            else:
+                print(f"  {unique_regions[0]} ↔ {reg}: feature sets identical.")
+        if len(unique_regions) == 1 or all(
+            set(region_cols[r]) == ref_set for r in unique_regions
+        ):
+            print("All regions share identical feature names — cross-scoring is exact.")
 
         if wandb is not None:
             try:
                 wandb.init(
                     project="spatial-cv",
                     entity=os.environ.get("WANDB_ENTITY"),
-                    name=f"transfer_sa_usa_{timestamp}",
+                    name=f"transfer_{output_region}_{timestamp}",
                     config={
-                        "n_sa_features":  len(sa_cols),
-                        "n_usa_features": len(usa_cols),
-                        "test_years":     [TEST_START, TEST_END],
-                        "layer":          3,
+                        "regions":    unique_regions,
+                        "test_years": [TEST_START, TEST_END],
+                        "layer":      3,
                     },
                 )
                 use_wandb = True
@@ -2341,11 +2374,6 @@ def run_transfer_main(output_region: str = "south_america") -> None:
             except Exception as _err:
                 print(f"W&B failed: {_err}")
 
-        # ── Run all 4 combinations ───────────────────────────────────────────
-        directions = [
-            ("south_america", "model1", "usa"),
-            ("usa",           "model2", "south_america"),
-        ]
         model_types_to_run = ["lgbm", "rf"]
 
         all_results: list[dict[str, Any]] = []

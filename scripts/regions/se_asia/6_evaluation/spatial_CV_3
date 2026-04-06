@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Cross-Continental Transfer — SA ↔ USA (Layer 3)
+"""Cross-Continental Transfer — SE Asia ↔ SA and SE Asia ↔ USA (Layer 3)
 
 Loads the production models from step-5 training (no retraining) and evaluates
-them on the other continent's test set.  Runs 4 combinations sequentially:
-    SA-LGBM → USA,  USA-LGBM → SA,  SA-RF → USA,  USA-RF → SA
+them across continents.  Runs 4 combinations sequentially:
+    SEA-LGBM → SA,  SA-LGBM → SEA,  SEA-LGBM → USA,  USA-LGBM → SEA
+    SEA-RF   → SA,  SA-RF   → SEA,  SEA-RF   → USA,  USA-RF   → SEA
 
-SA and USA share identical 73-feature sets, so feature columns are read directly
-from the loaded model (LGBM: model.feature_name(), RF: model.feature_names_in_).
+All three regions share identical 73-feature sets, so feature columns are read
+directly from the loaded model (LGBM: model.feature_name(), RF: model.feature_names_in_).
 
 Usage:
     python scripts/regions/se_asia/6_evaluation/spatial_CV_3
@@ -15,6 +16,8 @@ SLURM:
     sbatch slurm/se_asia/spatial_CV_3.slurm
 
 Prerequisites:
+    data/se_asia/ml/models/model3_lgbm_*.pkl
+    data/se_asia/ml/models/model3_rf_win5_*.joblib
     data/south_america/ml/models/model1_lgbm_*.pkl
     data/south_america/ml/models/model1_rf_win5_*.joblib
     data/usa/ml/models/model2_lgbm_*.pkl
@@ -31,5 +34,12 @@ See scripts/regions/shared/evaluation/spatial_cv_core.py for full implementation
 
 from scripts.regions.shared.evaluation.spatial_cv_core import run_transfer_main
 
+SEA_DIRECTIONS = [
+    ("se_asia",       "model3", "south_america"),
+    ("south_america", "model1", "se_asia"),
+    ("se_asia",       "model3", "usa"),
+    ("usa",           "model2", "se_asia"),
+]
+
 if __name__ == "__main__":
-    run_transfer_main(output_region="se_asia")
+    run_transfer_main(output_region="se_asia", directions=SEA_DIRECTIONS)
