@@ -23,6 +23,12 @@ squeue
 ```
 
 ---
+```bash
+#LaTeX compiling
+cd manuscript && pdflatex -interaction=nonstopmode -halt-on-error thesis.tex && bibtex thesis && pdflatex -interaction=nonstopmode -halt-on-error thesis.tex && pdflatex -interaction=nonstopmode -halt-on-error thesis.tex
+```
+
+---
 
 ```bash
 # Find the log files for successful and failed runs
