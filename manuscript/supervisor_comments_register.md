@@ -6,6 +6,64 @@
 
 ---
 
+## STATUS SUMMARY — New Draft (`thesis.tex`, written 2026-04-06)
+
+**Important:** All comments below refer to the OLD draft. The new draft rewrites the manuscript from scratch and addresses most structural issues. The status column reflects verification against `thesis.tex`.
+
+### Categories Broadly Resolved by the New Draft
+
+| Category | Old comments | Status in new draft |
+|----------|-------------|---------------------|
+| Structure / Section Placement | 12 | **Resolved**: Data (Sec 3) and Methods (Sec 4) are now separate sections; target variable and feature engineering are in the correct sections; lookahead window and rare-event definitions are introduced early in Methods (Sec 4.1). |
+| Terms Used Before Being Defined | 6 | **Resolved**: predictor variables, static/dynamic split, PA, risk set, and lookahead window are all defined before first use. |
+| Technical Depth / Equations | 12 | **Largely resolved**: Equations now present for target variable, scale_pos_weight, PR-AUC, ROC, lift, Brier, ECE, hazard-model framing; hyperparameter table added; calibration explained with example. |
+| Short section headers | Several | **Resolved (2026-04-07)**: "Machine Learning in Conservation: From Ecological Prediction to Policy Decisions" → "Machine Learning for Conservation Policy"; "The 30×30 Target, Economic Consequences, and Transition Risk" → "The 30×30 Target and Transition Risk"; "Spatial Biases and the Determinants of Protected-Area Siting" → "Spatial Biases in Protected-Area Siting". |
+| Sub-sections for single paragraphs | 2 | **Resolved (2026-04-07)**: US and SE Asia study areas converted from `\subsubsection` to `\paragraph`. |
+| Data vs Methods split | 1 (big one) | **Resolved**: Now Sec 3 = Data, Sec 4 = Methods. |
+| Colombia placement | 1 | **Resolved**: Colombia relegated to Appendix. |
+| Reproducibility section placement | 1 | **Resolved**: Reproducibility details merged into Methods Sec 4.4 (Training Design). |
+
+### Categories Requiring Manual Attention (still open)
+
+| Category | Remaining items | Notes |
+|----------|----------------|-------|
+| Citations missing | ~5–6 | SA selection reasons (3 claims need citations); EPSG:3857 and areal distortions; path dependence citation. All others (scale_pos_weight, F1, Davis 2006 metrics, calibration, hazard model) are now cited. |
+| Clarity / examples | ~10–15 | New draft adds many examples and simpler language. Scan carefully the Methods section (calibration, hyperparameter tuning) and the limitation of "conditional forecasts" framing. |
+| Wording / repetitions | ~5 | Check for repeated sentences (one duplicate in old forward section now fixed). |
+| Missing citations in Discussion | ~3–4 | Some claims in Discussion (p44-equivalent in new draft) may lack citations. Manual check needed. |
+| NA vs NaN | 1 | New draft uses NA; tree models handle NA natively. Clarify in text that NA is used rather than NaN. |
+| Measurement error discussion | 1 | Old p43 comment: "so therefore...what next?" — Missing values accepted as NA (tree models handle natively) should be stated more explicitly. |
+
+### Items Resolved in New Draft (checked off)
+
+- [x] Discrete-time hazard citation → `\citep{allison1982}` added (Sec 4.1)
+- [x] scale_pos_weight explained and cited → Equation + `\citep{ke2017}` (Sec 4.3)
+- [x] F1-score noted as uninformative → cited `\citep{davis2006}` (Sec 4.5)
+- [x] PR-AUC / ROC-AUC robustness claim → `\citep{davis2006}` (Sec 4.5)
+- [x] Calibration methods explained → `\citep{platt1999}` with worked example (Sec 4.3)
+- [x] What if a PA is de-listed → Addressed explicitly (Sec 3.2.1)
+- [x] Why 1 km resolution → Trade-off paragraph with data resolution justification (Sec 3.3)
+- [x] Temporal split design and "temporal honesty" → Now called "leakage prevention" with 4 safeguards listed (Sec 4.4)
+- [x] Class imbalance defined early → Defined in Sec 4.1 "Rare-event structure"
+- [x] Lookahead window defined early → Defined in Sec 4.1 "Problem formulation"
+- [x] RF example added → Concrete tree example with numerical values (Sec 4.3)
+- [x] Gradient boosting explained → GOSS/EFB and sequential ensemble description (Sec 4.3)
+- [x] Calibration example → "raw score 0.85 → calibrated 0.62" example (Sec 4.3)
+- [x] Data / Methods split → Sec 3 = Data, Sec 4 = Methods
+- [x] Section headers shortened → 3 headers shortened (2026-04-07)
+- [x] Single-paragraph sub-sections removed → US and SE Asia study areas (2026-04-07)
+- [x] Climate change connection added → New paragraph in Lit Review Sec 2.1 (2026-04-07)
+- [x] LOBO figures for all 3 regions → US and SE Asia LOBO bar charts added (2026-04-07)
+- [x] Forward scenario maps for all 3 regions → US and SE Asia maps added (2026-04-07)
+- [x] PR curve figure added for SA → Fig in Sec 5.1.1 (2026-04-07)
+- [x] r=0.34 factual error fixed → Corrected to r=0.36 (actual computed value) (2026-04-07)
+- [x] Duplicate paragraph in consistency check → Removed (2026-04-07)
+- [x] US forward consistency (r=0.07) → Discussed and contextualised (2026-04-07)
+- [x] Duplicate "Full metrics" reference in SE Asia section → Removed (2026-04-07)
+- [x] SA LOBO mean inconsistency → Fixed to 0.808 everywhere (2026-04-07)
+
+---
+
 ## Citations Missing (14 comments)
 
 *Add explicit citations wherever claims are made without a reference. Supervisor flags ~15 specific spots.*
