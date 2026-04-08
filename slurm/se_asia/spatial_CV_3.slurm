@@ -10,11 +10,14 @@
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
 # ------------------------------------------------------------------------------
-# Cross-continental transfer evaluation (SA <-> USA) — Layer 3 spatial CV
+# Cross-continental transfer evaluation (SEA ↔ SA and SEA ↔ USA) — Layer 3
 #
 # Loads the production models trained in step 5 (no retraining) and scores them
-# on the other continent's test set.  Runs 4 combinations sequentially:
-#   SA-LGBM → USA,  USA-LGBM → SA,  SA-RF → USA,  USA-RF → SA
+# across continents.  Runs 8 combinations sequentially (LGBM + RF each):
+#   SEA-LGBM → SA,   SA-LGBM  → SEA
+#   SEA-LGBM → USA,  USA-LGBM → SEA
+#   SEA-RF   → SA,   SA-RF    → SEA
+#   SEA-RF   → USA,  USA-RF   → SEA
 #
 # Missing model files (e.g. RF not yet trained) are skipped gracefully.
 #
@@ -22,11 +25,13 @@
 #   sbatch slurm/se_asia/spatial_CV_3.slurm
 #
 # Prerequisites:
-#   1. SA step-5 training done:  data/south_america/ml/models/model1_lgbm_*.pkl
+#   1. SEA step-5 training done: data/se_asia/ml/models/model3_lgbm_*.pkl
+#                                data/se_asia/ml/models/model3_rf_win5_*.joblib
+#   2. SA step-5 training done:  data/south_america/ml/models/model1_lgbm_*.pkl
 #                                data/south_america/ml/models/model1_rf_win5_*.joblib
-#   2. USA step-5 training done: data/usa/ml/models/model2_lgbm_*.pkl
+#   3. USA step-5 training done: data/usa/ml/models/model2_lgbm_*.pkl
 #                                data/usa/ml/models/model2_rf_win5_*.joblib
-#   3. Test parquets:            data/{region}/ml/main/test_win5.parquet
+#   4. Test parquets:            data/{region}/ml/main/test_win5.parquet
 #
 # Output:
 #   outputs/se_asia/results/spatial_cv/transfer/
@@ -69,9 +74,9 @@ SCRIPT="scripts/regions/se_asia/6_evaluation/spatial_CV_3"
 }
 
 #------------------------------------------------------------------------------
-# Run both transfer directions (SA→USA and USA→SA)
+# Run all transfer directions (SEA↔SA and SEA↔USA, LGBM + RF)
 #------------------------------------------------------------------------------
-echo "Starting cross-continental transfer evaluation..."
+echo "Starting cross-continental transfer evaluation (SEA ↔ SA and SEA ↔ USA)..."
 srun --cpu-bind=cores --distribution=block:block \
   python -u "$SCRIPT"
 
