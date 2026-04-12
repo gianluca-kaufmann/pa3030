@@ -61,6 +61,8 @@ from scripts.regions.shared.geo_utils import pixel_area_km2  # noqa: E402
 from scripts.regions.shared.forward.config import (  # noqa: E402
     DATA_SUBDIR,
     FORWARD_PA_HOLE_COLOR,
+    HOTSPOT_MAX_REGIONS,
+    HOTSPOT_REGION_INDICES,
     HOTSPOT_REGIONS,
     ISO_CODES,
     MODEL_PREFIX,
@@ -91,6 +93,7 @@ from scripts.regions.shared.training.utils import WandbRunLogger  # noqa: E402
 # ── Map style constants ───────────────────────────────────────────────────────
 MAP_DPI      = 300
 FORWARD_BACKGROUND_COLOR = "#F2F2F2"  # very light gray: visible vs white, but unobtrusive
+_EXISTING_PA_FILL_COLOR = "#4a7c59"   # muted forest green: existing PAs as distinct "holes"
 SCENARIO_COLORS = {
     "bau":      "#d62728",
     "moderate": "#e87e2b",
@@ -2329,6 +2332,50 @@ def create_economic_activity_analysis(
 
 # ── Hotspot zoom-in maps ───────────────────────────────────────────────────────
 
+def _load_country_borders_3857(repo_root: Path) -> Any:
+    """Load Natural Earth country boundaries reprojected to EPSG:3857.
+
+    Returns a GeoDataFrame or None if unavailable.
+    """
+    try:
+        import geopandas as gpd
+        candidates = [
+            repo_root / "data/shared/admin/ne_110m_admin_0_countries.gpkg",
+        ]
+        for p in candidates:
+            if p.exists():
+                world = gpd.read_file(str(p))
+                if world.crs is None or str(world.crs).upper() not in {"EPSG:4326", "WGS84"}:
+                    world = world.set_crs("EPSG:4326")
+                return world.to_crs("EPSG:3857")
+        return None
+    except Exception as exc:
+        print(f"  NOTE: could not load country borders ({exc}); skipping.")
+        return None
+
+
+def _add_country_borders_to_ax(ax: Any, world_3857: Any, zoom_bounds: Tuple, zorder: int = 5) -> None:
+    """Plot thin country border outlines clipped to zoom_bounds on the given axis."""
+    if world_3857 is None:
+        return
+    try:
+        import geopandas as gpd
+        from shapely.geometry import box as shapely_box
+        clip_box = shapely_box(zoom_bounds[0], zoom_bounds[1], zoom_bounds[2], zoom_bounds[3])
+        clipped = world_3857.clip(clip_box)
+        if clipped.empty:
+            return
+        clipped.boundary.plot(
+            ax=ax,
+            color="#555555",
+            linewidth=0.5,
+            alpha=0.6,
+            zorder=zorder,
+        )
+    except Exception:
+        pass
+
+
 def create_hotspot_maps(
     df: pd.DataFrame,
     hotspot_regions: List[Tuple],
@@ -2337,10 +2384,14 @@ def create_hotspot_maps(
     baseline: Dict[str, Any],
     repo_root: Path,
     region_label: str,
+    max_regions: Optional[int] = None,
+    region_indices: Optional[List[int]] = None,
 ) -> None:
     """Zoomed probability + BAU panels per hotspot (Web Mercator, backbone underlay).
 
     hotspot_regions: list of (label, lon_min, lon_max, lat_min, lat_max) in WGS84.
+    max_regions: if set and region_indices is None, keep only the first N regions.
+    region_indices: if set, select clusters at these specific positions (0-based).
     Output: hotspot_maps.pdf/.png
     """
     print("\n" + "=" * 70)
@@ -2351,6 +2402,16 @@ def create_hotspot_maps(
         print("  No hotspot regions defined — skipping.")
         return
 
+    # Select specific clusters or limit to first N
+    hotspot_regions = list(hotspot_regions)
+    if region_indices is not None:
+        selected = [hotspot_regions[i] for i in region_indices if i < len(hotspot_regions)]
+        print(f"  Selecting {len(selected)} hotspot region(s) by index: {region_indices}")
+        hotspot_regions = selected
+    elif max_regions is not None and max_regions > 0:
+        hotspot_regions = hotspot_regions[:max_regions]
+        print(f"  Limiting to {max_regions} hotspot region(s).")
+
     xm_all = df["x"].values.astype(np.float64)
     ym_all = df["y"].values.astype(np.float64)
     lon_all, lat_all = epsg3857_to_lonlat(xm_all, ym_all)
@@ -2359,6 +2420,7 @@ def create_hotspot_maps(
     bau_mask = proba >= bau_cutoff
 
     backbone_path = resolve_backbone_path_for_plot(repo_root, DATA_SUBDIR, baseline)
+    world_3857 = _load_country_borders_3857(repo_root)
 
     n = len(hotspot_regions)
     # Figure width from first valid hotspot aspect (fallback 4:3)
@@ -2377,7 +2439,8 @@ def create_hotspot_maps(
 
     fig.suptitle(
         f"Hotspot Zoom-ins — {region_label}\n"
-        "Top row: P(protection by 2030) | Bottom row: BAU designation zone",
+        "Top row: P(protection by 2030) | Bottom row: BAU designation zone"
+        " (green = existing PAs)",
         fontsize=12,
     )
 
@@ -2431,14 +2494,20 @@ def create_hotspot_maps(
                 fontsize=8,
             )
         ax0.grid(True, alpha=0.25, linestyle="--", linewidth=0.5, zorder=3)
+        _add_country_borders_to_ax(ax0, world_3857, zoom_bounds, zorder=4)
         plt.colorbar(im, ax=ax0, fraction=0.04, pad=0.03)
 
         # Row 1: BAU designation zone
+        # Existing PAs are shown as distinct green "holes"; BAU new designations in red.
         ax1 = axes[1, col_idx]
-        used_bb1 = _plot_backbone_background(
+        _plot_backbone_background(
             ax1, backbone_path, zorder=0, hole_color=FORWARD_PA_HOLE_COLOR,
         )
-        _overlay_current_pa_extent(ax1, repo_root, DATA_SUBDIR, baseline, zoom_bounds, zorder=1)
+        # Overlay existing PAs with a distinct green to make them readable as "already protected"
+        _overlay_current_pa_extent(
+            ax1, repo_root, DATA_SUBDIR, baseline, zoom_bounds,
+            color=_EXISTING_PA_FILL_COLOR, alpha=0.75, zorder=1,
+        )
         bau_in = bau_mask & in_box
         n_bau = int(bau_in.sum())
         if bau_in.any():
@@ -2467,6 +2536,7 @@ def create_hotspot_maps(
         _add_latlon_ticks(
             ax1, (zoom_bounds[0], zoom_bounds[2]), (zoom_bounds[1], zoom_bounds[3]),
         )
+        _add_country_borders_to_ax(ax1, world_3857, zoom_bounds, zorder=4)
         ax1.text(
             0.02, 0.02, f"{n_bau:,} BAU pixels",
             transform=ax1.transAxes, fontsize=8,
@@ -3178,6 +3248,8 @@ def main() -> None:
     create_hotspot_maps(
         df, _hotspot_regions_to_use, bau_cutoff,
         model_output_dir, baseline, repo_root, REGION_LABEL,
+        max_regions=HOTSPOT_MAX_REGIONS,
+        region_indices=HOTSPOT_REGION_INDICES,
     )
     wb.log({"results/stage": "hotspot_maps_done"})
 

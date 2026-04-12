@@ -26,6 +26,11 @@ PROFILE = {
             ("Cerrado / Atlantic Forest", -55, -36, -28, -8),
             ("Andes Foothills",           -81, -64, -22,  3),
         ],
+        "hotspot_max_regions": 2,
+        # Indices into cluster_hotspot_boxes.json to select for display.
+        # C1 (index 0): COL Forest — highest-ranked, most BAU pixels.
+        # C5 (index 4): CHL Bare/Other — different biome type, Andean foothills context.
+        "hotspot_region_indices": [0, 4],
         "wdpa_2024_filename": "WDPA_SA_1km_2024.tif",
         "wdpa_2019_filename": "WDPA_SA_1km_2019.tif",
         # Forward-only display: calibrated scores are massed at low p; raise lower
@@ -53,6 +58,8 @@ PROFILE = {
             ("Rocky Mountains",   -115, -100, 36, 48),
             ("Southeast",          -92,  -78, 25, 35),
         ],
+        "hotspot_max_regions": 2,
+        "hotspot_region_indices": None,  # use first max_regions by rank
         "wdpa_2024_filename": "WDPA_USA_1km_2024.tif",
         "wdpa_2019_filename": "WDPA_USA_1km_2019.tif",
         # USA calibrated forward scores collapse most mass into a narrow log band;
@@ -82,6 +89,8 @@ PROFILE = {
             ("Mekong / Indochina",   100, 110,   9, 22),
             ("Sumatra / Malay Pen.",  95, 110,  -6,  6),
         ],
+        "hotspot_max_regions": 2,
+        "hotspot_region_indices": None,  # use first max_regions by rank
         "wdpa_2024_filename": "WDPA_SEA_1km_2024.tif",
         "wdpa_2019_filename": "WDPA_SEA_1km_2019.tif",
         # Same intent as south_america but slightly milder (see comments there).
@@ -102,6 +111,8 @@ ISO_CODES       = PROFILE["iso_codes"]
 DATA_SUBDIR     = PROFILE["data_subdir"]
 OUTPUTS_SUBDIR  = PROFILE["outputs_subdir"]
 HOTSPOT_REGIONS = PROFILE["hotspot_regions"]
+HOTSPOT_MAX_REGIONS = PROFILE["hotspot_max_regions"]
+HOTSPOT_REGION_INDICES = PROFILE["hotspot_region_indices"]
 WDPA_2024_FILENAME = PROFILE["wdpa_2024_filename"]
 WDPA_2019_FILENAME = PROFILE["wdpa_2019_filename"]
 PROBABILITY_MAP_PERCENTILE_MIN = PROFILE["probability_map_percentile_min"]
