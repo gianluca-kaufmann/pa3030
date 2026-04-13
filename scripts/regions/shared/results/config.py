@@ -27,6 +27,16 @@ PROFILE = {
             ("Cerrado / Atlantic Forest", -55, -36, -28, -8),
             ("Andes Foothills",           -81, -64, -22,  3),
         ],
+        # Map annotation layout: SA has most whitespace in the bottom-right (Atlantic Ocean)
+        "map_inset_side": "right",
+        # Font sizes for map figures — both boxes use the same size for visual consistency
+        "map_legend_fontsize": 16,
+        "map_legend_markersize": 18,
+        "map_stats_fontsize": 16,
+        # Risk map colors — SA: blue=hit, gold=predicted-only, red=miss
+        "risk_map_predicted_color": "#FFC000", # predicted only, no PA established → gold
+        "risk_map_overlap_color":   "#4472C4", # correctly predicted (hit)         → slate blue
+        "risk_map_miss_color":      "#C0392B", # established, not predicted (miss)  → pomegranate red
     },
     "usa": {
         "region_slug": "usa",
@@ -48,6 +58,14 @@ PROFILE = {
             ("Rocky Mountains",   -115, -100, 36, 48),
             ("Southeast",          -92,  -78, 25, 35),
         ],
+        "map_inset_side": "left",
+        "map_legend_fontsize": 14,
+        "map_legend_markersize": 16,
+        "map_stats_fontsize": 12,
+        # Risk map colors — consistent with SA: gold=predicted-only, blue=hit, red=miss
+        "risk_map_predicted_color": "#FFC000", # predicted only, no PA established → gold
+        "risk_map_overlap_color":   "#4472C4", # correctly predicted (hit)         → slate blue
+        "risk_map_miss_color":      "#C0392B", # established, not predicted (miss)  → pomegranate red
     },
     "se_asia": {
         "region_slug": "se_asia",
@@ -66,6 +84,14 @@ PROFILE = {
             ("Mekong / Indochina",   100, 110,   9, 22),
             ("Sumatra / Malay Pen.",  95, 110,  -6,  6),
         ],
+        "map_inset_side": "left",
+        "map_legend_fontsize": 14,
+        "map_legend_markersize": 16,
+        "map_stats_fontsize": 12,
+        # Risk map colors — consistent with SA: gold=predicted-only, blue=hit, red=miss
+        "risk_map_predicted_color": "#FFC000", # predicted only, no PA established → gold
+        "risk_map_overlap_color":   "#4472C4", # correctly predicted (hit)         → slate blue
+        "risk_map_miss_color":      "#C0392B", # established, not predicted (miss)  → pomegranate red
     },
 }[RUN_REGION]
 
@@ -80,6 +106,13 @@ HOTSPOT_REGIONS = PROFILE["hotspot_regions"]
 PROBABILITY_MAP_PERCENTILE_MIN = PROFILE["probability_map_percentile_min"]
 PROBABILITY_MAP_PERCENTILE_MAX = PROFILE["probability_map_percentile_max"]
 PROBABILITY_MAP_TRANSFORMATION = PROFILE["probability_map_transformation"]
+MAP_INSET_SIDE         = PROFILE["map_inset_side"]        # 'right' or 'left'
+MAP_LEGEND_FONTSIZE    = PROFILE["map_legend_fontsize"]
+MAP_LEGEND_MARKERSIZE  = PROFILE["map_legend_markersize"]
+MAP_STATS_FONTSIZE     = PROFILE["map_stats_fontsize"]
+RISK_MAP_OVERLAP_COLOR = PROFILE["risk_map_overlap_color"]
+RISK_MAP_PREDICTED_COLOR = PROFILE["risk_map_predicted_color"]
+RISK_MAP_MISS_COLOR      = PROFILE["risk_map_miss_color"]
 if MODEL_ID == "model1":
     CALIBRATE_SCRIPT = "calibrate_1"
 elif MODEL_ID == "model2":

@@ -1535,18 +1535,23 @@ temporal: does the model identify the right \emph{places}, regardless of precise
 when designation occurs within the next five years?
 
 Event-level coverage answers this question directly: for each unique PA establishment
-event in the test period, the metric checks whether that event's location falls
-within the top-1\% risk zone at any point during the three test years. Under this
-aggregation, the LightGBM model captures 90.4\% of all protected-area establishments
-during the 2017--2019 test window within its highest-risk 1\% of pixels
-(approximately 156,000~km$^2$ out of 15.7~million~km$^2$ eligible). In other words,
-screening fewer than 1\% of candidate parcels would have flagged nine out of every
-ten actual new protected areas before they were designated. This result demonstrates
-that the model has strong spatial foresight: the moderate pixel--year PR-AUC reflects
-the inherent difficulty of predicting the exact year of a politically-driven
-administrative decision, not a failure of spatial targeting. The practical implication
-is direct: a risk analyst using the model's top-1\% risk zone as a geographic filter
-would capture the vast majority of future designation events well in advance.
+event within the five-year prediction window, the metric checks whether that event's
+location falls within the top-1\% risk zone. The prediction window for each test-year
+observation extends five years forward: 2017 test rows look ahead to 2022, 2018 to
+2023, and 2019 rows to 2024. This definition is identical to the
+\texttt{transition\_01\_win5} label used for all pixel--year metrics, making
+event-level recall directly comparable to Recall@K. Under this aggregation,
+the LightGBM model achieves a \textbf{Recall@1\% of 77.4\%} and a
+\textbf{Precision@1\% of 79.8\%}: nearly four in five of the top-1\% predicted
+pixels actually became protected areas, and three in four of all new protected areas
+fell within just 1\% of eligible land — approximately 159,000~km$^2$ out of
+15.9~million~km$^2$. In other words, a risk analyst screening fewer than 1\% of
+candidate parcels would flag roughly three-quarters of all future designation events
+well in advance, while maintaining a precision rate close to 80\%. This combination
+of high precision \emph{and} high recall at an extremely concentrated threshold is
+the defining result: the moderate pixel--year PR-AUC reflects the inherent
+difficulty of predicting the exact year of a politically-driven administrative
+decision, not a failure of spatial targeting.
 
 \subsubsection{Probability Calibration}
 \label{sec:results_sa_calibration}
@@ -1648,23 +1653,33 @@ Appendix~\ref{app:supp_figures}.
 Aggregate metrics confirm that the model discriminates well on average, but the
 primary deliverable is a spatially explicit risk surface. Figure~\ref{fig:riskmap_sa_top1}
 maps the top 1\% of predicted pixels across South America, overlaid with observed
-PA designations during the test period (2017--2019). High-risk pixels form spatially
+PA designations within the five-year prediction window (2017--2024). The observed
+category spans the full horizon that the model is trained to predict: all
+designations that occurred within five years of any test-period observation year
+(2017, 2018, or 2019), covering 2017--2022, 2017--2023, and 2017--2024 respectively.
+This means the map's recall is directly comparable to the Recall@1\% metric reported
+in the benchmark table; both denominators are identical. Of the total PA establishments
+captured, a subset occurred during the immediate test years (2017--2019) and the
+remainder in the subsequent window (2020--2024), demonstrating that the model's
+risk signal persists beyond the held-out evaluation period.
+
+High-risk pixels form spatially
 coherent clusters rather than a diffuse pattern, concentrated in the Amazon basin
 periphery, the Cerrado--Amazon transition zone, the Andean foothills, and parts of
-Chile's southern regions. The strong spatial correspondence between predicted
-high-risk zones and realised designations — visible in the figure and quantified
-by the 90.4\% event-level recall — confirms that the model produces geographically
-meaningful risk concentrations, not merely a good score on abstract metrics.
+Chile's southern regions. At Precision@1\% = 79.8\%, almost every cluster on the
+map corresponds to a place where a PA was in fact established — the model is not
+simply flagging the most biodiverse or remote areas in general, but identifying the
+specific locations where governments subsequently acted. The strong spatial
+correspondence between predicted high-risk zones and realised designations confirms
+that the model produces geographically meaningful risk concentrations, not merely a
+good score on abstract metrics.
 
 \begin{figure}[H]
 \centering
-\includegraphics[width=0.60\textwidth, keepaspectratio]{../outputs/south_america/results/model1_lgbm/risk_map_top1pct.pdf}
-\caption{South America risk map: top 1\% of predicted pixels (LightGBM). Grey areas
-indicate the top-1\% risk zone; overlaid coloured symbols mark observed PA
-establishments during the test period (2017--2019).}
+\includegraphics[width=0.65\textwidth, keepaspectratio]{../outputs/south_america/results/model1_lgbm/risk_map_top1pct.pdf}
+\caption{South America LightGBM risk map: top 1\% of predicted pixels (Recall@1\% = 77.4\%, Precision@1\% = 79.8\%). \textbf{Blue}: correctly predicted — pixel in the top-1\% risk zone \emph{and} PA established within the five-year prediction window (true positive). \textbf{Gold}: predicted high-risk but no PA established within the window (unconfirmed prediction). \textbf{Red}: PA established within the window but pixel not in the top-1\% zone (model miss). \textbf{Grey}: pixels already protected before the test period (excluded from the risk set). The observed category covers all PA designations within the five-year prediction horizon (up to 2024 for 2019 test rows), consistent with the \texttt{transition\_01\_win5} label used for all benchmark metrics. Pixel markers are slightly enlarged for print legibility.}
 \label{fig:riskmap_sa_top1}
 \end{figure}
-% [HUMAN ACTION NEEDED: Figure size/legend requires re-running the results script with improved parameters]
 
 The continuous probability map (Figure~\ref{fig:probmap_sa}) shows a strongly
 right-skewed distribution: the vast majority of pixels receive near-zero calibrated
@@ -1674,13 +1689,15 @@ landscape-scale processes rather than pixel-level noise.
 
 \begin{figure}[H]
 \centering
-\includegraphics[width=0.60\textwidth, keepaspectratio]{../outputs/south_america/results/model1_lgbm/probability_map.pdf}
+\includegraphics[width=0.65\textwidth, keepaspectratio]{../outputs/south_america/results/model1_lgbm/probability_map.pdf}
 \caption{Continuous calibrated transition probabilities from the South America
-LightGBM model. Probabilities represent the estimated five-year designation
-likelihood for each unprotected pixel, conditional on 2019 covariate values.}
+LightGBM model. Each pixel is coloured by its predicted five-year designation
+probability (square-root stretch from the 25th to the 98th percentile; dark purple
+= low probability, yellow = high probability). Grey pixels are existing protected
+areas excluded from the risk set. Probabilities reflect covariate values at the
+end of the test period.}
 \label{fig:probmap_sa}
 \end{figure}
-% [HUMAN ACTION NEEDED: Figure size/legend requires re-running the results script]
 
 \subsubsection{Spatial Generalisation (LOBO)}
 \label{sec:results_sa_lobo}

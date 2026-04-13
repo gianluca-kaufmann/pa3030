@@ -35,6 +35,10 @@ from .config import (
     CALIBRATE_SCRIPT,
     DEFAULT_FUTURE_YEARS_STR,
     HOTSPOT_REGIONS,
+    MAP_INSET_SIDE,
+    MAP_LEGEND_FONTSIZE as MAP_LEGEND_FONTSIZE_CFG,
+    MAP_LEGEND_MARKERSIZE as MAP_LEGEND_MARKERSIZE_CFG,
+    MAP_STATS_FONTSIZE,
     MODEL_ID,
     MODEL_LABEL,
     PROBABILITY_MAP_PERCENTILE_MIN,
@@ -42,6 +46,9 @@ from .config import (
     PROBABILITY_MAP_TRANSFORMATION,
     REGION_LABEL,
     REGION_SLUG,
+    RISK_MAP_MISS_COLOR,
+    RISK_MAP_OVERLAP_COLOR,
+    RISK_MAP_PREDICTED_COLOR,
     X_LIMITS,
     Y_LIMITS,
     get_repo_root,
@@ -1086,6 +1093,68 @@ def _add_latlon_ticks(ax, xlim_m: tuple, ylim_m: tuple) -> None:
     ax.set_ylabel('Latitude', fontsize=FONTSIZE_LABEL)
 
 
+def _add_scale_bar_3857(
+    ax,
+    proj_bounds: tuple,
+    ref_lat_deg: float = -20.0,
+    bar_km: int = 1000,
+    position: str = 'lower left',
+) -> None:
+    """Add a simple horizontal scale bar to an EPSG:3857 map axes.
+
+    Web Mercator (EPSG:3857) preserves angles but distorts distances with latitude.
+    We convert the desired ground distance to projected metres at *ref_lat_deg* so
+    the bar length is correct at that reference latitude.
+
+    Parameters
+    ----------
+    ax : matplotlib Axes
+    proj_bounds : (minx, miny, maxx, maxy) in EPSG:3857 metres
+    ref_lat_deg : reference latitude (degrees) for the distance conversion.
+    bar_km : scale bar length in km (default 1000).
+    position : one of 'lower left', 'lower right', 'upper left', 'upper right'.
+    """
+    import math
+
+    R = 6_378_137.0  # WGS-84 semi-major axis (metres)
+    cos_lat = math.cos(math.radians(ref_lat_deg))
+    bar_m = bar_km * 1_000.0 / cos_lat  # projected x-width for bar_km km at ref_lat
+
+    map_w = proj_bounds[2] - proj_bounds[0]
+    map_h = proj_bounds[3] - proj_bounds[1]
+    tick_h = 0.007 * map_h
+
+    # Horizontal anchor
+    if 'right' in position:
+        x1 = proj_bounds[0] + 0.94 * map_w
+        x0 = x1 - bar_m
+    else:
+        x0 = proj_bounds[0] + 0.06 * map_w
+        x1 = x0 + bar_m
+
+    if 'upper' in position:
+        y0 = proj_bounds[1] + 0.93 * map_h
+        label_va = 'bottom'
+        label_y = y0 + 1.8 * tick_h
+    else:
+        y0 = proj_bounds[1] + 0.04 * map_h
+        label_va = 'bottom'
+        label_y = y0 + 1.8 * tick_h
+
+    # Horizontal bar
+    ax.plot([x0, x1], [y0, y0], color='black', linewidth=2.0, zorder=12, solid_capstyle='butt')
+    # End ticks
+    for xk in (x0, x1):
+        ax.plot([xk, xk], [y0 - tick_h / 2, y0 + tick_h / 2], color='black', linewidth=1.5, zorder=12)
+    # Label centred above the bar
+    ax.text(
+        (x0 + x1) / 2, label_y,
+        f'{bar_km:,} km',
+        ha='center', va=label_va, fontsize=10, color='black', zorder=12,
+        bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1.5),
+    )
+
+
 def _plot_backbone_background(
     ax,
     backbone_path: Optional[Path],
@@ -1388,37 +1457,27 @@ def create_risk_map(
             has_actual_establishments = True
             print(f"    Joined via x/y: {(df['established_in_test_period'] == 1).sum():,} actual establishments")
     
-    # Define observed establishments: PREFER actual test-period data, ONLY fall back to y_true if unavailable
-    if has_actual_establishments:
-        df['is_observed'] = (df['established_in_test_period'] == 1).astype(int)
-        print(f"  ✓ Using actual test-period establishments (established_in_test_period)")
-    else:
-        df['is_observed'] = (df['y_true'] == 1).astype(int)
-        print(f"  ⚠ Falling back to y_true (5-year lookahead) - actual establishment data not available")
-    
-    # Update gdf with observed flag
-    gdf['is_observed'] = df['is_observed'].values
-    
-    # Step 1b: Load FUTURE PA establishments (2020-2024) if provided for temporal validation
+    # Step 1b: Load FUTURE PA establishments (post-test period) if provided.
+    # These are folded into is_observed so the map's recall matches the 5-year-horizon
+    # metrics (PR-AUC, Recall@K) which use transition_01_win5 as ground truth.
+    # The test-period subset is tracked separately for breakdown reporting only.
     has_future_establishments = False
     if future_parquet_path is not None and future_years is not None and len(future_years) > 0:
         future_df = load_future_pa_establishments(future_parquet_path, future_years)
         
         if future_df is not None and 'established_in_future_period' in future_df.columns:
-            print(f"  ✓ Future PA establishments loaded - temporal validation enabled")
+            print(f"  ✓ Future PA establishments loaded - folded into observed (5-yr prediction window)")
             
             # Determine join columns (same logic as test period)
             join_cols = ['row', 'col'] if all(col in df.columns for col in ['row', 'col']) and all(col in future_df.columns for col in ['row', 'col']) else ['x', 'y']
             
             if join_cols == ['row', 'col']:
-                # Row/col join (preferred)
                 join_df = future_df[['row', 'col', 'established_in_future_period']].drop_duplicates(subset=['row', 'col'])
                 df = df.merge(join_df, on=['row', 'col'], how='left')
                 df['established_in_future_period'] = df['established_in_future_period'].fillna(0).astype(int)
                 has_future_establishments = True
-                print(f"    Joined via row/col: {(df['established_in_future_period'] == 1).sum():,} future establishments")
+                print(f"    Joined via row/col: {(df['established_in_future_period'] == 1).sum():,} post-test establishments")
             elif join_cols == ['x', 'y']:
-                # X/y join with rounding (fallback)
                 df['x_rounded'] = df['x'].round(6)
                 df['y_rounded'] = df['y'].round(6)
                 join_df = future_df[['x', 'y', 'established_in_future_period']].copy()
@@ -1429,14 +1488,28 @@ def create_risk_map(
                 df = df.drop(columns=['x_rounded', 'y_rounded'])
                 df['established_in_future_period'] = df['established_in_future_period'].fillna(0).astype(int)
                 has_future_establishments = True
-                print(f"    Joined via x/y: {(df['established_in_future_period'] == 1).sum():,} future establishments")
+                print(f"    Joined via x/y: {(df['established_in_future_period'] == 1).sum():,} post-test establishments")
     
-    # Initialize future establishments flag if not loaded
     if not has_future_establishments:
         df['established_in_future_period'] = 0
     
-    # Update gdf with future establishments flag
-    gdf['is_future'] = df['established_in_future_period'].values
+    # Define is_observed as the union of test-period AND future-window establishments so
+    # the map's recall is identical to the Recall@K metrics (both use the 5-yr horizon).
+    # is_observed_test_only captures the 2017-2019 subset for breakdown reporting.
+    if has_actual_establishments:
+        df['is_observed_test_only'] = (df['established_in_test_period'] == 1).astype(int)
+        df['is_observed'] = (
+            (df['established_in_test_period'] == 1) | (df['established_in_future_period'] == 1)
+        ).astype(int)
+        print(f"  ✓ is_observed = test-period ({(df['established_in_test_period']==1).sum():,})"
+              f" OR post-test window ({(df['established_in_future_period']==1).sum():,}) establishments")
+    else:
+        df['is_observed'] = (df['y_true'] == 1).astype(int)
+        df['is_observed_test_only'] = df['is_observed']  # No period breakdown in fallback
+        print(f"  ⚠ Falling back to y_true (5-year lookahead) - actual establishment data not available")
+    
+    gdf['is_observed'] = df['is_observed'].values
+    gdf['is_observed_test_only'] = df['is_observed_test_only'].values
     
     # Step 2: Filter coordinate outliers BEFORE any analysis (using projected bounds)
     print(f"\n  Filtering coordinate outliers...")
@@ -1457,21 +1530,22 @@ def create_risk_map(
     gdf['y_proj'] = gdf.geometry.y
     
     # For predictions: take MAX probability across test years (most risky prediction for that location)
-    # For observations: take MAX (observed if established in ANY test year)
-    # For future: take MAX (future establishment if established in ANY future year)
+    # For observations: take MAX across test years (established in test period OR 5-yr window)
+    # is_observed_test_only: subset established during test period years only (for breakdown)
     pixel_agg = gdf.groupby(['row', 'col']).agg({
-        'y_pred_proba': 'max',  # Highest predicted probability for this pixel across test years
-        'is_observed': 'max',   # 1 if established in any test year, 0 otherwise
-        'is_future': 'max',     # 1 if established in any future year, 0 otherwise
-        'x_proj': 'first',      # Projected coordinates (meters)
+        'y_pred_proba': 'max',          # Highest predicted probability across test years
+        'is_observed': 'max',           # 1 if established within 5-yr prediction window
+        'is_observed_test_only': 'max', # 1 if established during test period only (breakdown)
+        'x_proj': 'first',
         'y_proj': 'first'
     }).reset_index()
     
     print(f"    {len(gdf):,} rows → {len(pixel_agg):,} unique pixels")
     
-    # Total actual establishments (computed once for Recall across all thresholds)
+    # Observed totals — full 5-yr window and test-period-only breakdown
     total_actual_establishments = int(pixel_agg['is_observed'].sum())
-    total_future_establishments = int(pixel_agg['is_future'].sum())
+    observed_in_test_only = int(pixel_agg['is_observed_test_only'].sum())
+    observed_in_future_window = total_actual_establishments - observed_in_test_only
     
     # Step 4: Select exactly top-threshold_pct% pixels using argpartition.
     # Using np.percentile + >= would include all ties at the boundary and over-select
@@ -1499,61 +1573,45 @@ def create_risk_map(
     overlap_count = int(((pixel_agg['is_predicted'] == 1) & (pixel_agg['is_observed'] == 1)).sum())
     predicted_only_count = predicted_count - overlap_count
     observed_only_count = observed_count - overlap_count
-    future_count = int(pixel_agg['is_future'].sum())
-    future_overlap_count = int(((pixel_agg['is_predicted'] == 1) & (pixel_agg['is_future'] == 1)).sum())
+    # Overlap breakdown: correctly predicted pixels from test-period vs post-test window
+    overlap_test_only = int(((pixel_agg['is_predicted'] == 1) & (pixel_agg['is_observed_test_only'] == 1)).sum())
+    overlap_future_window = overlap_count - overlap_test_only
 
     recall_pct = (overlap_count / total_actual_establishments * 100) if total_actual_establishments > 0 else 0.0
-    
-    # Calculate Future Capture Rate: % of future (2020-2024) PAs that fell in predicted high-risk areas
-    future_capture_rate = (future_overlap_count / total_future_establishments * 100) if total_future_establishments > 0 else 0.0
-    
-    # Calculate Combined Recall: % of ALL PAs (test + future) captured by predictions
-    total_combined_establishments = total_actual_establishments + total_future_establishments
-    combined_overlap_count = overlap_count + future_overlap_count
-    combined_recall_pct = (combined_overlap_count / total_combined_establishments * 100) if total_combined_establishments > 0 else 0.0
 
     print(f"\n  FINAL STATISTICS (pixel-level, after filtering):")
     print(f"    Total pixels: {len(pixel_agg):,}")
     print(f"    Predicted high-risk (top {threshold_pct}%): {predicted_count:,} "
           f"({predicted_count / len(pixel_agg) * 100:.2f}% of pixels)")
-    print(f"    Actual PA establishments (test period): {observed_count:,} "
+    print(f"    PA establishments (5-yr window): {observed_count:,} "
           f"({observed_count / len(pixel_agg) * 100:.3f}% of pixels)")
-    print(f"    Overlap (correct predictions): {overlap_count:,}")
+    print(f"      of which test period ({time_period}): {observed_in_test_only:,}")
+    if has_future_establishments and observed_in_future_window > 0:
+        future_year_str = f"{min(future_years)}-{max(future_years)}"
+        print(f"      of which post-test window ({future_year_str}): {observed_in_future_window:,}")
+    print(f"    Overlap (correctly predicted): {overlap_count:,}")
+    print(f"      of which test period: {overlap_test_only:,} | post-test window: {overlap_future_window:,}")
     if observed_count > 0:
-        print(f"    NOTE: With only {observed_count:,} actual establishments out of "
+        print(f"    NOTE: With only {observed_count:,} establishments out of "
               f"{len(pixel_agg):,} pixels, top-{threshold_pct}% selects "
-              f"{predicted_count:,} pixels — high recall can be legitimate if "
+              f"{predicted_count:,} pixels — high recall is legitimate if "
               f"designations are geographically concentrated.")
     if predicted_count > 0:
         hit_rate = overlap_count / predicted_count * 100
-        print(f"    Hit rate: {overlap_count:,}/{predicted_count:,} = {hit_rate:.1f}%")
+        print(f"    Hit rate (precision): {overlap_count:,}/{predicted_count:,} = {hit_rate:.1f}%")
     else:
         hit_rate = 0.0
         print(f"    Hit rate: N/A (no predictions)")
-    print(f"    Recall (test period): {overlap_count:,}/{total_actual_establishments:,} = {recall_pct:.1f}%")
-    
-    # Print future PA statistics if available
-    if has_future_establishments and total_future_establishments > 0:
-        future_year_str = f"{min(future_years)}-{max(future_years)}"
-        print(f"\n  TEMPORAL VALIDATION (Future PA Establishments {future_year_str}):")
-        print(f"    Future PA establishments: {future_count:,}")
-        print(f"    Future establishments in predicted areas: {future_overlap_count:,}")
-        print(f"    Future Capture Rate: {future_overlap_count:,}/{total_future_establishments:,} = {future_capture_rate:.1f}%")
-        print(f"\n  COMBINED STATISTICS (Test + Future):")
-        print(f"    Total PA establishments (test + future): {total_combined_establishments:,}")
-        print(f"    Total captured by predictions: {combined_overlap_count:,}")
-        print(f"    Combined Recall: {combined_overlap_count:,}/{total_combined_establishments:,} = {combined_recall_pct:.1f}%")
+    print(f"    Recall (5-yr window): {overlap_count:,}/{total_actual_establishments:,} = {recall_pct:.1f}%")
 
     # Step 6: Build category raster (pixel-perfect, same resolution as probability map)
-    # Category: 0=background, 1=predicted_only, 2=observed_only, 3=overlap, 4=future_only
-    # Priority: future (4) > overlap (3) > observed (2) > predicted (1) > background (0)
-    # This ensures future PAs are visible even if they overlap with other categories
+    # Category: 0=background, 1=predicted_only, 2=observed_only, 3=overlap
+    # Priority: overlap (3) > observed (2) > predicted (1) > background (0)
+    # Future-window establishments are now part of is_observed, so no separate category needed.
     category_codes = np.where(
-        pixel_agg['is_future'] == 1, 4,  # Future PAs take highest priority (yellow)
-        np.where(
-            (pixel_agg['is_predicted'] == 1) & (pixel_agg['is_observed'] == 1), 3,  # Overlap (green)
-            np.where(pixel_agg['is_observed'] == 1, 2,  # Observed only (orange)
-                     np.where(pixel_agg['is_predicted'] == 1, 1, 0))))  # Predicted only (blue) or background
+        (pixel_agg['is_predicted'] == 1) & (pixel_agg['is_observed'] == 1), 3,  # Correctly predicted (green)
+        np.where(pixel_agg['is_observed'] == 1, 2,                               # Established, not predicted (orange)
+                 np.where(pixel_agg['is_predicted'] == 1, 1, 0)))                 # Predicted only (blue) or background
     
     print(f"\n  Creating rasterized risk map...")
     category_raster, extent = points_to_raster(
@@ -1564,7 +1622,22 @@ def create_risk_map(
         agg_func='max'
     )
     print(f"  Category raster shape: {category_raster.shape}, extent: {extent}")
-    
+
+    # Dilate colored pixels for print visibility (top 1% is very sparse across a continent).
+    # Dilation is purely cosmetic — caption notes pixel size is enlarged for legibility.
+    # Use a slightly larger radius for the 1% map where dots are fewest.
+    from scipy.ndimage import binary_dilation
+    dilation_radius = 3 if threshold_pct <= 1.0 else 2
+    struct = np.ones((2 * dilation_radius + 1, 2 * dilation_radius + 1), dtype=bool)
+    for cat_val in [1, 2, 3]:
+        mask = category_raster == cat_val
+        if mask.any():
+            dilated = binary_dilation(mask, structure=struct)
+            # Only paint into cells that are NaN (background) or same category — don't overwrite higher-priority cats
+            paintable = np.isnan(category_raster) | (category_raster == cat_val)
+            category_raster = np.where(dilated & paintable, cat_val, category_raster)
+    print(f"  Applied {dilation_radius}-pixel dilation for print visibility")
+
     # Create background mask from all data points (shows where data exists; protected areas = holes)
     print(f"  Creating background mask from data coverage...")
     background_mask, _ = points_to_raster(
@@ -1602,21 +1675,15 @@ def create_risk_map(
               vmin=0, vmax=1, origin='upper', interpolation='nearest',
               aspect='equal', zorder=1)
 
-    # ListedColormap for 3-4 categories (Predicted, Observed, Overlap, Future)
-    COLOR_PREDICTED_ONLY = '#5B9BD5'  # Lighter, more visible blue
-    COLOR_OBSERVED_ONLY = '#D95A3C'   # Warm orange-red
-    COLOR_OVERLAP = '#2EBD8A'         # Slightly lighter green, more saturated
-    COLOR_FUTURE = '#FFD700'          # Bright yellow for future PAs
-    
-    # Use 4 colors if future establishments exist, otherwise 3
-    if has_future_establishments and future_count > 0:
-        cmap_categories = ListedColormap([COLOR_PREDICTED_ONLY, COLOR_OBSERVED_ONLY, COLOR_OVERLAP, COLOR_FUTURE])
-        norm_categories = BoundaryNorm([0.5, 1.5, 2.5, 3.5, 4.5], cmap_categories.N)
-        max_category = 4
-    else:
-        cmap_categories = ListedColormap([COLOR_PREDICTED_ONLY, COLOR_OBSERVED_ONLY, COLOR_OVERLAP])
-        norm_categories = BoundaryNorm([0.5, 1.5, 2.5, 3.5], cmap_categories.N)
-        max_category = 3
+    # Three-category colormap — all colors are region-configurable (see config.py).
+    # SA palette: gold=predicted-only, blue=hit, red=miss (intuitive: blue=correct, gold=unconfirmed)
+    COLOR_PREDICTED_ONLY = RISK_MAP_PREDICTED_COLOR  # SA: gold; others: blue
+    COLOR_OBSERVED_ONLY  = RISK_MAP_MISS_COLOR        # SA: pomegranate red; others: orange
+    COLOR_OVERLAP        = RISK_MAP_OVERLAP_COLOR     # SA: slate blue; others: green
+
+    cmap_categories = ListedColormap([COLOR_PREDICTED_ONLY, COLOR_OBSERVED_ONLY, COLOR_OVERLAP])
+    norm_categories = BoundaryNorm([0.5, 1.5, 2.5, 3.5], cmap_categories.N)
+    max_category = 3
 
     # Category raster - pixel-perfect resolution
     cat_no_bg = np.where((category_raster >= 1) & (category_raster <= max_category), category_raster, np.nan)
@@ -1629,52 +1696,40 @@ def create_risk_map(
     ax.set_ylim(proj_bounds[1], proj_bounds[3])
     ax.set_aspect('equal', adjustable='box')
 
+    # Country borders — barely-visible overlay for geographic orientation (Natural Earth 110m)
+    sa_gdf_proj.plot(ax=ax, facecolor='none', edgecolor='#777777', linewidth=0.25, alpha=0.4, zorder=4)
+
     # Styling — replace raw EPSG:3857 metre labels with lat/lon degree labels
     _add_latlon_ticks(ax, (proj_bounds[0], proj_bounds[2]), (proj_bounds[1], proj_bounds[3]))
-    establishment_source = "Actual Establishments" if has_actual_establishments else "5-yr Lookahead Targets"
-    ax.set_title(f'{MODEL_LABEL} ({model_type.upper()}): Predicted Risk vs {establishment_source} ({time_period})',
-                 fontsize=FONTSIZE_TITLE, fontweight='bold', pad=15)
 
-    # Legend with counts from pixel_agg (unique physical pixels)
+    # Legend — true positives first, then unconfirmed predictions, then misses, then existing PAs.
+    # Font size and marker size are region-configurable for manuscript readability.
     legend_elements = []
-    if predicted_only_count > 0:
-        legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=COLOR_PREDICTED_ONLY,
-                                      markersize=10, alpha=0.9, label=f'Predicted but not established (n={predicted_only_count:,})'))
-    if observed_only_count > 0:
-        legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=COLOR_OBSERVED_ONLY,
-                                      markersize=10, alpha=0.9, label=f'Established (not predicted) (n={observed_only_count:,})'))
     if overlap_count > 0:
         legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=COLOR_OVERLAP,
-                                      markersize=10, alpha=0.9, label=f'Correct predictions (n={overlap_count:,})'))
-    if has_future_establishments and future_count > 0:
-        future_year_str = f"{min(future_years)}-{max(future_years)}"
-        legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=COLOR_FUTURE,
-                                      markersize=10, alpha=0.9, label=f'Future PAs {future_year_str} (n={future_count:,})'))
-    # Always add existing PAs entry so readers know what the gray means
+                                      markersize=MAP_LEGEND_MARKERSIZE_CFG, alpha=0.9,
+                                      label=f'Correctly predicted — PA established (n={overlap_count:,})'))
+    if predicted_only_count > 0:
+        legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=COLOR_PREDICTED_ONLY,
+                                      markersize=MAP_LEGEND_MARKERSIZE_CFG, alpha=0.9,
+                                      label=f'Predicted high-risk, no PA established (n={predicted_only_count:,})'))
+    if observed_only_count > 0:
+        legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=COLOR_OBSERVED_ONLY,
+                                      markersize=MAP_LEGEND_MARKERSIZE_CFG, alpha=0.9,
+                                      label=f'PA established, not predicted (n={observed_only_count:,})'))
     legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=PA_HOLE_COLOR,
-                                  markersize=10, alpha=0.9, label=f'Existing protected areas (pre-{min(test_years)})'))
+                                  markersize=MAP_LEGEND_MARKERSIZE_CFG, alpha=0.9,
+                                  label=f'Existing PAs (pre-{min(test_years)})'))
+    # SA has Atlantic Ocean whitespace in the lower-right; other regions use upper-left.
+    legend_loc = 'lower right' if MAP_INSET_SIDE == 'right' else 'upper left'
     if legend_elements:
-        ax.legend(handles=legend_elements, loc='upper left', fontsize=FONTSIZE_LEGEND, framealpha=0.95)
+        ax.legend(handles=legend_elements, loc=legend_loc, fontsize=MAP_LEGEND_FONTSIZE_CFG,
+                  framealpha=0.95, borderpad=0.8, labelspacing=0.6)
 
-    # Stats box with key metrics
-    stats_lines = [
-        f"Pixels: {len(pixel_agg):,}",
-        f"Top {int(threshold_pct)}% threshold: {top_pct_threshold:.6f}",
-        f"Hit rate: {overlap_count:,}/{predicted_count:,} = {hit_rate:.1f}%",
-        f"Recall (test): {overlap_count:,}/{total_actual_establishments:,} = {recall_pct:.1f}%"
-    ]
-    
-    # Add future metrics if available
-    if has_future_establishments and total_future_establishments > 0:
-        stats_lines.append(f"Future Capture Rate: {future_overlap_count:,}/{total_future_establishments:,} = {future_capture_rate:.1f}%")
-        stats_lines.append(f"Combined Recall: {combined_overlap_count:,}/{total_combined_establishments:,} = {combined_recall_pct:.1f}%")
-    
-    stats_text = "\n".join(stats_lines)
-    ax.text(0.02, 0.02, stats_text, transform=ax.transAxes, fontsize=FONTSIZE_STATS,
-           verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat',
-           alpha=0.9, edgecolor='black', linewidth=1), zorder=10)
-
-    ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5, zorder=3)
+    # Scale bar — SA uses upper-right (legend occupies lower-right); others use lower-left
+    _scalebar_pos = 'upper right' if MAP_INSET_SIDE == 'right' else 'lower left'
+    _add_scale_bar_3857(ax, proj_bounds, ref_lat_deg=(Y_LIMITS[0] + Y_LIMITS[1]) / 2.0,
+                        bar_km=1000, position=_scalebar_pos)
 
     plt.tight_layout(pad=0.5)
 
@@ -1699,7 +1754,10 @@ def create_risk_map(
     plt.close()
     print(f"✓ Simplified risk map complete!")
 
-    # Always return capture stats for inclusion in summary tables
+    # Return capture stats for capture_summary.csv and metrics table.
+    # total_pa_pixels / recall_pct use the full 5-yr window, matching Recall@K in the
+    # benchmark JSON. The _test_only and _future_window breakdown fields are extra context
+    # for paper text ("of which X were established during 2017-2019, Y in 2020-2024").
     px_km2 = (pixel_size_m / 1000.0) ** 2  # km² per pixel (1.0 for 1-km raster)
     stats: Dict[str, Any] = {
         "threshold_pct": threshold_pct,
@@ -1709,10 +1767,9 @@ def create_risk_map(
         "captured_km2": round(overlap_count * px_km2, 0),
         "recall_pct": round(recall_pct, 2),
         "precision_pct": round(hit_rate, 2) if predicted_count > 0 else 0.0,
+        "observed_in_test_only": observed_in_test_only,
+        "observed_in_future_window": observed_in_future_window,
     }
-    if has_future_establishments and total_future_establishments > 0:
-        stats["future_capture_rate"] = round(future_capture_rate, 2)
-        stats["combined_recall"] = round(combined_recall_pct, 2)
     return stats
 
 
@@ -1993,8 +2050,6 @@ def create_p1pct_diagnostic_map(
            verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='wheat', 
            alpha=0.8, edgecolor='black', linewidth=1), zorder=10)
     
-    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5, zorder=3)
-
     plt.tight_layout(pad=0.5)
 
     # Save PDF (use low DPI first - diagnostic map has very large raster, avoids timeout/backend errors)
@@ -2233,66 +2288,81 @@ def create_probability_map(
     ax.set_ylim(proj_bounds[1], proj_bounds[3])
     ax.set_aspect('equal', adjustable='box')
 
-    # Add colorbar with custom formatter to show actual probability values
+    # Country borders — barely-visible overlay for geographic orientation (Natural Earth 110m)
+    sa_gdf_proj.plot(ax=ax, facecolor='none', edgecolor='#777777', linewidth=0.25, alpha=0.4, zorder=4)
+
+    # Colorbar with actual probability values back-computed from normalised positions
     cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    cbar.set_label('Predicted Probability', 
-                   fontsize=FONTSIZE_LABEL, rotation=270, labelpad=20)
-    
-    # Set colorbar ticks with text labels instead of numeric values
-    tick_positions = [0.0, 1.0]
-    tick_labels = ['Low probability', 'High probability']
-    cbar.set_ticks(tick_positions)
-    cbar.set_ticklabels(tick_labels)
+    cbar.set_label('5-year designation probability',
+                   fontsize=FONTSIZE_LABEL, rotation=270, labelpad=15)
+
+    # Five ticks evenly spaced in normalised [0,1] space; labels show real probability as %
+    tick_positions_norm = [0.0, 0.25, 0.5, 0.75, 1.0]
+    tick_labels_prob = []
+    for t in tick_positions_norm:
+        if PROBABILITY_MAP_TRANSFORMATION == 'log':
+            actual = 10 ** (log_pmin + t * (log_pmax - log_pmin))
+        elif PROBABILITY_MAP_TRANSFORMATION == 'sqrt':
+            actual = proba_pmin_param + (t ** 2) * proba_span_param
+        else:
+            actual = proba_pmin_param + t * proba_span_param
+        pct = actual * 100
+        if pct < 0.01:
+            tick_labels_prob.append(f'{pct:.3f}%')
+        elif pct < 0.1:
+            tick_labels_prob.append(f'{pct:.2f}%')
+        elif pct < 1.0:
+            tick_labels_prob.append(f'{pct:.1f}%')
+        else:
+            tick_labels_prob.append(f'{pct:.0f}%')
+    cbar.set_ticks(tick_positions_norm)
+    cbar.set_ticklabels(tick_labels_prob)
     cbar.ax.tick_params(labelsize=FONTSIZE_LEGEND)
     
     # Styling — replace raw EPSG:3857 metre labels with lat/lon degree labels
     _add_latlon_ticks(ax, (proj_bounds[0], proj_bounds[2]), (proj_bounds[1], proj_bounds[3]))
 
-    # Check if calibrated probabilities were used
-    calibration_note = ""
-    has_uncalibrated_col = 'y_pred_proba_uncalibrated' in df.columns
-    has_calibrated_col = 'y_pred_proba_calibrated' in df.columns
-    filename_has_calibrated = 'calibrated' in parquet_path.name.lower()
-    
-    if filename_has_calibrated or (has_uncalibrated_col and has_calibrated_col):
-        calibration_note = " (Calibrated Probabilities)"
-    
-    ax.set_title(f'{MODEL_LABEL} ({model_type.upper()}) Probability Map{calibration_note}',
-                 fontsize=FONTSIZE_TITLE, fontweight='bold', pad=15)
-    
-    # Gray patch legend: explain what the PA holes mean
+    # Legend — existing PAs; SA uses lower-right (Atlantic Ocean whitespace), others lower-left
+    prob_legend_loc = 'lower right' if MAP_INSET_SIDE == 'right' else 'lower left'
     from matplotlib.patches import Patch
     ax.legend(handles=[Patch(facecolor=PA_HOLE_COLOR, edgecolor='none',
-                             label=f'Existing protected areas (pre-{min(test_years_list)})')],
-              loc='lower left', fontsize=FONTSIZE_LEGEND, framealpha=0.95)
+                             label=f'Existing PAs (pre-{min(test_years_list)})')],
+              loc=prob_legend_loc, fontsize=MAP_LEGEND_FONTSIZE_CFG,
+              framealpha=0.95, borderpad=0.8)
 
-    # Add statistics text box
-    stats_text = (f"Min: {proba_min:.6f} | Max: {proba_max:.6f}\n"
-                  f"Mean: {proba_mean:.6f} | Median: {proba_median:.6f}")
-    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=FONTSIZE_STATS,
-           verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', 
-           alpha=0.9, edgecolor='black', linewidth=1), zorder=10)
-    
-    ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5, zorder=3)
+    # Scale bar — SA uses upper-right (legend occupies lower-right); others use lower-left
+    _scalebar_pos = 'upper right' if MAP_INSET_SIDE == 'right' else 'lower left'
+    _add_scale_bar_3857(ax, proj_bounds, ref_lat_deg=(Y_LIMITS[0] + Y_LIMITS[1]) / 2.0,
+                        bar_km=1000, position=_scalebar_pos)
 
     plt.tight_layout(pad=0.5)
 
-    # Save PDF (lower DPI + retry to avoid timeout/zlib errors on large raster)
+    # Save PDF (lower DPI + retry to avoid timeout/zlib/AttributeError on large raster)
     pdf_path = output_dir / f"probability_map.pdf"
-    for pdf_dpi in (300, 150):
+    png_path = output_dir / f"probability_map.png"
+    saved = False
+    for pdf_dpi in (150, 100):
         try:
+            if pdf_path.exists():
+                pdf_path.unlink(missing_ok=True)
             plt.savefig(pdf_path, dpi=pdf_dpi, bbox_inches='tight')
-            print(f"Saved PDF: {pdf_path} (dpi={pdf_dpi})")
+            print(f"✓ Saved probability map (PDF): {pdf_path} (dpi={pdf_dpi})")
+            saved = True
             break
-        except (TimeoutError, zlib.error, OSError) as e:
+        except (TimeoutError, zlib.error, OSError, AttributeError, RuntimeError) as e:
             if pdf_path.exists():
                 try:
                     pdf_path.unlink()
                 except OSError:
                     pass
-            if pdf_dpi == 150:
-                print(f"Warning: Could not save PDF after retry: {e}. Skipping PDF.")
-            continue
+            print(f"  PDF save failed at dpi={pdf_dpi}: {type(e).__name__}: {e}")
+    if not saved:
+        # Fall back to PNG so at least a raster copy is available
+        try:
+            plt.savefig(png_path, dpi=150, bbox_inches='tight')
+            print(f"✓ Saved probability map (PNG fallback): {png_path}")
+        except Exception as e2:
+            print(f"Warning: Could not save probability map in any format: {e2}")
     plt.close()
 
 
