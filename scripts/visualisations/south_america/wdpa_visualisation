@@ -358,11 +358,62 @@ def create_summary_statistics(all_data):
     
     plt.show()
 
+def create_pa_coverage_chart(all_data):
+    """Single-panel publication-quality chart: cumulative PA coverage (%) 2000-2024.
+
+    This is the thesis figure referenced at §5.3 (Descriptive Statistics).  It
+    shows only the percentage time-series — the pixel-count panel from
+    create_temporal_comparison is intentionally omitted here.
+    """
+    if all_data is None or len(all_data) < 2:
+        return
+
+    print("Creating single-panel PA coverage chart (thesis figure)...")
+
+    years = sorted(all_data.keys())
+    percentages = [all_data[year]['protected_percentage'] for year in years]
+
+    fig, ax = plt.subplots(figsize=(7, 3.8))
+
+    ax.plot(years, percentages,
+            color=PROTECTED_COLOR, linewidth=2, marker='o',
+            markersize=4, markerfacecolor='white', markeredgewidth=1.5,
+            zorder=3)
+
+    # 30x30 target reference line
+    ax.axhline(30, color='#CC4444', linewidth=1, linestyle='--',
+               label='30\\% target (30$\\times$30)', zorder=2)
+
+    ax.set_xlim(years[0] - 0.5, years[-1] + 0.5)
+    ax.set_ylim(0, max(percentages) * 1.25)
+    ax.set_xlabel('Year', fontsize=11)
+    ax.set_ylabel('Protected area (% of land)', fontsize=11)
+    ax.set_xticks([2000, 2005, 2010, 2015, 2020, 2024])
+    ax.grid(True, alpha=0.25, linestyle='--', linewidth=0.6)
+    ax.legend(fontsize=9, framealpha=0.8)
+    ax.tick_params(labelsize=10)
+
+    # Annotate first and last data points
+    ax.annotate(f'{percentages[0]:.1f}%', (years[0], percentages[0]),
+                textcoords='offset points', xytext=(6, 4),
+                fontsize=8, color=PROTECTED_COLOR)
+    ax.annotate(f'{percentages[-1]:.1f}%', (years[-1], percentages[-1]),
+                textcoords='offset points', xytext=(-30, 6),
+                fontsize=8, color=PROTECTED_COLOR)
+
+    plt.tight_layout()
+
+    output_file = output_dir / 'sa_pa_coverage_pct.pdf'
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f'   Saved: {output_file.name}')
+    plt.close()
+
+
 def main():
     """Main visualization function"""
     print("WDPA Protected Areas Visualization - South America 2013-2024")
     print("=" * 70)
-    
+
     # Load data
     all_data = load_wdpa_data()
     
@@ -378,7 +429,10 @@ def main():
     
     # 2. Temporal comparison
     create_temporal_comparison(all_data)
-    
+
+    # 2b. Single-panel coverage chart (thesis supplementary figure)
+    create_pa_coverage_chart(all_data)
+
     # 3. Change analysis
     create_change_analysis(all_data)
     
@@ -410,6 +464,7 @@ def main():
     for year in sorted(all_data.keys()):
         print(f"   - wdpa_coverage_sa_{year}.png")
     print("   - wdpa_temporal_comparison.png")
+    print("   - sa_pa_coverage_pct.pdf  (single-panel thesis figure)")
     print("   - wdpa_change_analysis.png")
     print("   - wdpa_summary_statistics.png")
     
