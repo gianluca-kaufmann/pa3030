@@ -132,8 +132,8 @@ RISK_MAP_ALPHA_BACKGROUND = 0.15  # Background category transparency
 RISK_MAP_ALPHA_PROTECTED = 0.6  # Protected areas overlay transparency
 
 # Existing PA holes color (pixels absent from scored parquet = already protected before test period)
-# Must contrast clearly with both the unprotected background (#F5F5F5) and the white ocean.
-PA_HOLE_COLOR = '#BEBEBE'  # Light gray — distinguishable from #F5F5F5 (unprotected) and white (ocean)
+# Must contrast clearly with both the unprotected background (#F0F0F0) and the white ocean.
+PA_HOLE_COLOR = '#D4D4D4'  # Lighter gray — distinguishable from #F0F0F0 (unprotected) and white (ocean)
 
 # Probability map color scheme
 PROBABILITY_MAP_COLORMAP = 'plasma'  # Colormap: dark purple -> yellow
@@ -1099,6 +1099,9 @@ def _add_scale_bar_3857(
     ref_lat_deg: float = -20.0,
     bar_km: int = 1000,
     position: str = 'lower left',
+    *,
+    anchor_x_frac: Optional[float] = None,
+    anchor_y_frac: Optional[float] = None,
 ) -> None:
     """Add a simple horizontal scale bar to an EPSG:3857 map axes.
 
@@ -1124,20 +1127,24 @@ def _add_scale_bar_3857(
     map_h = proj_bounds[3] - proj_bounds[1]
     tick_h = 0.007 * map_h
 
-    # Horizontal anchor
+    # Horizontal anchor (allow fine-grained placement via fractions of map extent)
     if 'right' in position:
-        x1 = proj_bounds[0] + 0.94 * map_w
+        x1_frac = 0.94 if anchor_x_frac is None else anchor_x_frac
+        x1 = proj_bounds[0] + x1_frac * map_w
         x0 = x1 - bar_m
     else:
-        x0 = proj_bounds[0] + 0.06 * map_w
+        x0_frac = 0.06 if anchor_x_frac is None else anchor_x_frac
+        x0 = proj_bounds[0] + x0_frac * map_w
         x1 = x0 + bar_m
 
     if 'upper' in position:
-        y0 = proj_bounds[1] + 0.93 * map_h
+        y0_frac = 0.93 if anchor_y_frac is None else anchor_y_frac
+        y0 = proj_bounds[1] + y0_frac * map_h
         label_va = 'bottom'
         label_y = y0 + 1.8 * tick_h
     else:
-        y0 = proj_bounds[1] + 0.04 * map_h
+        y0_frac = 0.04 if anchor_y_frac is None else anchor_y_frac
+        y0 = proj_bounds[1] + y0_frac * map_h
         label_va = 'bottom'
         label_y = y0 + 1.8 * tick_h
 
@@ -1152,6 +1159,51 @@ def _add_scale_bar_3857(
         f'{bar_km:,} km',
         ha='center', va=label_va, fontsize=10, color='black', zorder=12,
         bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1.5),
+    )
+
+
+def _add_north_arrow(
+    ax,
+    proj_bounds: tuple,
+    position: str = 'upper right',
+    *,
+    anchor_x_frac: Optional[float] = None,
+    anchor_y_frac: Optional[float] = None,
+) -> None:
+    """Add a simple N-arrow compass to an EPSG:3857 map axes.
+
+    Parameters
+    ----------
+    ax : matplotlib Axes
+    proj_bounds : (minx, miny, maxx, maxy) in EPSG:3857 metres
+    position : one of 'lower left', 'lower right', 'upper left', 'upper right'
+    """
+    map_w = proj_bounds[2] - proj_bounds[0]
+    map_h = proj_bounds[3] - proj_bounds[1]
+
+    # Arrow length and width proportional to map
+    arrow_len = 0.030 * map_h
+    x_frac = (0.030 if 'left' in position else 0.968) if anchor_x_frac is None else anchor_x_frac
+    y_frac = (0.040 if 'lower' in position else 0.940) if anchor_y_frac is None else anchor_y_frac
+    offset_x = x_frac * map_w
+    offset_y = y_frac * map_h
+
+    x = proj_bounds[0] + offset_x
+    y = proj_bounds[1] + offset_y
+
+    ax.annotate(
+        '',
+        xy=(x, y + arrow_len),
+        xytext=(x, y),
+        xycoords='data', textcoords='data',
+        arrowprops=dict(arrowstyle='->', color='black', lw=1.8),
+        zorder=13,
+    )
+    ax.text(
+        x, y + arrow_len * 1.35,
+        'N',
+        ha='center', va='bottom', fontsize=10, fontweight='bold',
+        color='black', zorder=13,
     )
 
 
@@ -1671,7 +1723,7 @@ def create_risk_map(
 
     # Plot background mask from actual data (shows data coverage; protected areas = natural holes)
     background_masked = np.ma.masked_where(np.isnan(background_mask), background_mask)
-    ax.imshow(background_masked, extent=extent, cmap=ListedColormap(['#F5F5F5']),
+    ax.imshow(background_masked, extent=extent, cmap=ListedColormap(['#EBEBEB']),
               vmin=0, vmax=1, origin='upper', interpolation='nearest',
               aspect='equal', zorder=1)
 
@@ -1726,10 +1778,34 @@ def create_risk_map(
         ax.legend(handles=legend_elements, loc=legend_loc, fontsize=MAP_LEGEND_FONTSIZE_CFG,
                   framealpha=0.95, borderpad=0.8, labelspacing=0.6)
 
-    # Scale bar — SA uses upper-right (legend occupies lower-right); others use lower-left
-    _scalebar_pos = 'upper right' if MAP_INSET_SIDE == 'right' else 'lower left'
-    _add_scale_bar_3857(ax, proj_bounds, ref_lat_deg=(Y_LIMITS[0] + Y_LIMITS[1]) / 2.0,
-                        bar_km=1000, position=_scalebar_pos)
+    # Scale bar + north arrow
+    # For South America, cluster both in the top-right, placed neatly side-by-side.
+    if MAP_INSET_SIDE == 'right':
+        _add_scale_bar_3857(
+            ax,
+            proj_bounds,
+            ref_lat_deg=(Y_LIMITS[0] + Y_LIMITS[1]) / 2.0,
+            bar_km=1000,
+            position='upper right',
+            anchor_x_frac=0.94,
+            anchor_y_frac=0.915,
+        )
+        _add_north_arrow(
+            ax,
+            proj_bounds,
+            position='upper right',
+            anchor_x_frac=0.865,
+            anchor_y_frac=0.900,
+        )
+    else:
+        _add_scale_bar_3857(
+            ax,
+            proj_bounds,
+            ref_lat_deg=(Y_LIMITS[0] + Y_LIMITS[1]) / 2.0,
+            bar_km=1000,
+            position='lower left',
+        )
+        _add_north_arrow(ax, proj_bounds, position='lower right')
 
     plt.tight_layout(pad=0.5)
 
@@ -2315,6 +2391,8 @@ def create_probability_map(
             tick_labels_prob.append(f'{pct:.1f}%')
         else:
             tick_labels_prob.append(f'{pct:.0f}%')
+    # Prefix the top tick with "≥" to indicate the colorbar is clipped at 98th percentile
+    tick_labels_prob[-1] = f'≥{tick_labels_prob[-1]}'
     cbar.set_ticks(tick_positions_norm)
     cbar.set_ticklabels(tick_labels_prob)
     cbar.ax.tick_params(labelsize=FONTSIZE_LEGEND)
@@ -2330,10 +2408,34 @@ def create_probability_map(
               loc=prob_legend_loc, fontsize=MAP_LEGEND_FONTSIZE_CFG,
               framealpha=0.95, borderpad=0.8)
 
-    # Scale bar — SA uses upper-right (legend occupies lower-right); others use lower-left
-    _scalebar_pos = 'upper right' if MAP_INSET_SIDE == 'right' else 'lower left'
-    _add_scale_bar_3857(ax, proj_bounds, ref_lat_deg=(Y_LIMITS[0] + Y_LIMITS[1]) / 2.0,
-                        bar_km=1000, position=_scalebar_pos)
+    # Scale bar + north arrow
+    # For South America, cluster both in the top-right, placed neatly side-by-side.
+    if MAP_INSET_SIDE == 'right':
+        _add_scale_bar_3857(
+            ax,
+            proj_bounds,
+            ref_lat_deg=(Y_LIMITS[0] + Y_LIMITS[1]) / 2.0,
+            bar_km=1000,
+            position='upper right',
+            anchor_x_frac=0.94,
+            anchor_y_frac=0.915,
+        )
+        _add_north_arrow(
+            ax,
+            proj_bounds,
+            position='upper right',
+            anchor_x_frac=0.865,
+            anchor_y_frac=0.900,
+        )
+    else:
+        _add_scale_bar_3857(
+            ax,
+            proj_bounds,
+            ref_lat_deg=(Y_LIMITS[0] + Y_LIMITS[1]) / 2.0,
+            bar_km=1000,
+            position='lower left',
+        )
+        _add_north_arrow(ax, proj_bounds, position='lower right')
 
     plt.tight_layout(pad=0.5)
 
@@ -2521,8 +2623,66 @@ def compute_shap_analysis(
     
     # Generate SHAP summary plot
     print(f"  Generating SHAP summary plot...")
-    plt.figure(figsize=(10, 8))
-    shap.summary_plot(shap_values_pos, X_shap, feature_names=feature_cols, show=False, plot_type="dot")
+
+    # Human-readable display names for SHAP plot axes (shorter for space)
+    SHAP_FEATURE_RENAME = {
+        "GSN_b2_smooth16":         "Biodiversity Priority (16 km)",
+        "GSN_b2_smooth64":         "Biodiversity Priority (64 km)",
+        "GSN_b2":                  "Biodiversity Priority",
+        "GSN_b3_smooth16":         "Intact Wilderness (16 km)",
+        "GSN_b3_smooth64":         "Intact Wilderness (64 km)",
+        "GSN_b3":                  "Intact Wilderness",
+        "policy_b4":               "Rule of Law (WGI)",
+        "policy_b2":               "Liberal Democracy (V-Dem)",
+        "policy_b3":               "Govt Effectiveness (WGI)",
+        "WorldClim_b7":            "Temp. Annual Range",
+        "WorldClim_b12":           "Annual Precipitation (mm)",
+        "WorldClim_b13":           "Precip. Wettest Month (mm)",
+        "WorldClim_b14":           "Precip. Driest Month (mm)",
+        "WorldClim_b17":           "Precipitation Seasonality",
+        "dist_indigenous":         "Dist. to Indigenous Land (km)",
+        "dist_wdpa":               "Dist. to Existing PA (km)",
+        "dist_road":               "Dist. to Road (km)",
+        "dist_oil_gas":            "Dist. to Oil/Gas Infra. (km)",
+        "dist_powerplant":         "Dist. to Power Plant (km)",
+        "WDPA":                    "Existing PA Coverage",
+        "WDPA_prev":               "Existing PA Coverage",
+        "economic_value_lag1":     "Agric. Land Value (lag 1yr)",
+        "elevation_b2_smooth16":   "Elevation (16 km smooth)",
+        "elevation_b2_smooth64":   "Elevation (64 km smooth)",
+        "elevation_b2":            "Elevation (m)",
+        "HNTL_smooth64":           "Night-time Lights (64 km)",
+        "HNTL_b1":                 "Night-time Lights",
+        "HNTL_b1_smooth64":        "Night-time Lights (64 km)",
+        "GPW":                     "Population Density",
+        "GPW_b1":                  "Population Density",
+        "landcover_b1":            "Land Cover (MODIS)",
+        "deforestation_b1":        "Annual Deforestation",
+        "wildfire_b1":             "Wildfire Occurrence",
+    }
+    display_names = [SHAP_FEATURE_RENAME.get(f, f) for f in feature_cols]
+
+    # shap.summary_plot manages its own figure size via `plot_size`; any prior
+    # plt.figure(figsize=...) call is overridden.  Pass plot_size as a (w, h)
+    # tuple — both values must be real numbers (None crashes matplotlib).
+    # 11 × 8 gives noticeably more horizontal room for the beeswarm dots while
+    # keeping a sensible aspect ratio in the manuscript.
+    # color_bar_label supported in shap >= 0.40; falls back gracefully in older versions
+    try:
+        shap.summary_plot(
+            shap_values_pos, X_shap,
+            feature_names=display_names,
+            show=False, plot_type="dot",
+            plot_size=(11, 8),
+            color_bar_label="Feature value (blue = low, red = high)",
+        )
+    except TypeError:
+        shap.summary_plot(
+            shap_values_pos, X_shap,
+            feature_names=display_names,
+            show=False, plot_type="dot",
+            plot_size=(11, 8),
+        )
     plt.tight_layout()
 
     summary_plot_path = output_dir / f"shap_summary.pdf"

@@ -359,47 +359,114 @@ def create_summary_statistics(all_data):
     plt.show()
 
 def create_pa_coverage_chart(all_data):
-    """Single-panel publication-quality chart: cumulative PA coverage (%) 2000-2024.
+    """Single-panel publication-quality chart: cumulative PA coverage (%) 2000-2030.
 
-    This is the thesis figure referenced at §5.3 (Descriptive Statistics).  It
-    shows only the percentage time-series — the pixel-count panel from
-    create_temporal_comparison is intentionally omitted here.
+    Historical data (2000-2024) from WDPA rasters, then three scenario projections
+    (BAU, Moderate, 30x30) extend to 2030.  Scenario parameters are read from
+    pathway_summary.json.
+
+    This is the thesis figure referenced at §5.3 (Descriptive Statistics).
     """
+    import json
+
     if all_data is None or len(all_data) < 2:
         return
 
-    print("Creating single-panel PA coverage chart (thesis figure)...")
+    print("Creating single-panel PA coverage chart with scenario projections...")
 
+    # ── Historical series ────────────────────────────────────────────────────
     years = sorted(all_data.keys())
     percentages = [all_data[year]['protected_percentage'] for year in years]
 
-    fig, ax = plt.subplots(figsize=(7, 3.8))
+    # ── Scenario data from pathway_summary.json ──────────────────────────────
+    pathway_json = (
+        PROJECT_ROOT / "outputs" / "south_america" / "results" /
+        "forward" / "pathway" / "pathway_summary.json"
+    )
 
+    # IMPORTANT: For visual continuity in the figure, always anchor the scenario
+    # projections to the *plotted* historical value at 2024 (from WDPA rasters).
+    # The forward-pipeline pathway JSON may compute coverage using slightly
+    # different masks/denominators, which can introduce a visible "jump".
+    cov_2024 = all_data.get(2024, all_data[years[-1]])["protected_percentage"]
+
+    bau_rate_pct_yr   = 0.061    # % per year (from region_milestone)
+    moderate_target   = 27.7831  # %
+    target_30x30      = 30.0
+    proj_years = list(range(2024, 2031))  # 2024 to 2030
+
+    if pathway_json.exists():
+        with open(pathway_json) as fh:
+            pj = json.load(fh)
+        milestone = pj.get("region_milestone", [{}])[0]
+
+        def _as_pct(value, fallback):
+            """Accept either fraction (0-1) or percent (0-100)."""
+            try:
+                v = float(value)
+            except Exception:
+                v = float(fallback)
+            return v * 100.0 if v <= 1.0 else v
+
+        bau_rate_pct_yr = float(milestone.get("bau_annual_rate_pct_yr", bau_rate_pct_yr))
+        moderate_target = _as_pct(pj.get("moderate_target_pct", moderate_target), moderate_target)
+        # NOTE: Do not override cov_2024 from JSON; we intentionally anchor to
+        # the WDPA-raster-derived 2024 point used in the historical series.
+
+    def _linear(start, end, years_list):
+        n = len(years_list) - 1
+        return [start + (end - start) * i / n for i in range(len(years_list))]
+
+    bau_end   = cov_2024 + bau_rate_pct_yr * (2030 - 2024)
+    bau_proj  = _linear(cov_2024, bau_end, proj_years)
+    mod_proj  = _linear(cov_2024, moderate_target, proj_years)
+    t30_proj  = _linear(cov_2024, target_30x30, proj_years)
+
+    # ── Plot ─────────────────────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(8, 4.2))
+
+    # Historical line
     ax.plot(years, percentages,
-            color=PROTECTED_COLOR, linewidth=2, marker='o',
-            markersize=4, markerfacecolor='white', markeredgewidth=1.5,
-            zorder=3)
+            color=PROTECTED_COLOR, linewidth=2.2, marker='o',
+            markersize=3.5, markerfacecolor='white', markeredgewidth=1.5,
+            zorder=4, label='Historical (WDPA)')
 
-    # 30x30 target reference line
-    ax.axhline(30, color='#CC4444', linewidth=1, linestyle='--',
-               label='30\\% target (30$\\times$30)', zorder=2)
+    # Vertical separator at 2024
+    ax.axvline(2024, color='#888888', linewidth=0.8, linestyle=':', zorder=2)
+    ax.text(2024.1, 1.5, 'Projection\n2025–2030', fontsize=7.5,
+            color='#888888', va='bottom')
 
-    ax.set_xlim(years[0] - 0.5, years[-1] + 0.5)
-    ax.set_ylim(0, max(percentages) * 1.25)
+    # Scenario projections (dashed lines from 2024)
+    ax.plot(proj_years, t30_proj, color='#CC2222', linewidth=1.8,
+            linestyle='--', zorder=3, label='30×30 scenario')
+    ax.plot(proj_years, mod_proj, color='#E08214', linewidth=1.8,
+            linestyle='--', zorder=3, label='Moderate scenario')
+    ax.plot(proj_years, bau_proj, color='#5E8FA2', linewidth=1.6,
+            linestyle='--', zorder=3, label='BAU scenario')
+
+    # 30x30 target reference line (horizontal)
+    ax.axhline(30, color='#CC2222', linewidth=0.7, linestyle=':',
+               alpha=0.5, zorder=2)
+    ax.text(2029.5, 30.2, '30%', fontsize=7.5, color='#CC2222',
+            ha='right', va='bottom')
+
+    ax.set_xlim(years[0] - 0.5, 2030.5)
+    ax.set_ylim(0, 32)
     ax.set_xlabel('Year', fontsize=11)
     ax.set_ylabel('Protected area (% of land)', fontsize=11)
-    ax.set_xticks([2000, 2005, 2010, 2015, 2020, 2024])
-    ax.grid(True, alpha=0.25, linestyle='--', linewidth=0.6)
-    ax.legend(fontsize=9, framealpha=0.8)
-    ax.tick_params(labelsize=10)
+    ax.set_xticks([2000, 2005, 2010, 2015, 2020, 2024, 2027, 2030])
+    ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5)
+    ax.legend(fontsize=8.5, framealpha=0.88, loc='upper left')
+    ax.tick_params(labelsize=9.5)
 
-    # Annotate first and last data points
+    # Annotate start (2000) — placed above the data point to avoid overlap
     ax.annotate(f'{percentages[0]:.1f}%', (years[0], percentages[0]),
-                textcoords='offset points', xytext=(6, 4),
-                fontsize=8, color=PROTECTED_COLOR)
+                textcoords='offset points', xytext=(4, 8),
+                fontsize=8, color=PROTECTED_COLOR, fontweight='bold')
+    # Annotate 2024 observed
     ax.annotate(f'{percentages[-1]:.1f}%', (years[-1], percentages[-1]),
-                textcoords='offset points', xytext=(-30, 6),
-                fontsize=8, color=PROTECTED_COLOR)
+                textcoords='offset points', xytext=(-32, 7),
+                fontsize=8, color=PROTECTED_COLOR, fontweight='bold')
 
     plt.tight_layout()
 

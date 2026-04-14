@@ -1290,7 +1290,7 @@ def _evaluate_model_layer2(
     del df; gc.collect()
     result = pd.DataFrame(rows)
     cols = ["model", "biome", "n_samples", "n_positives", "positive_rate",
-            "neg_pos_ratio",
+            "neg_pos_ratio", "mean_pred_prob",
             "roc_auc", "pr_auc",
             "precision_at_1pct",  "precision_at_5pct",  "precision_at_10pct",
             "recall_at_1pct",     "recall_at_5pct",     "recall_at_10pct"]

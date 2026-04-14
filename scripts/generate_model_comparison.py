@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.lines as mlines
 import numpy as np
+from scipy.interpolate import PchipInterpolator
 
 # ---------------------------------------------------------------------------
 # Data (read from metrics_table.csv outputs)
@@ -84,12 +85,14 @@ MODELS = {
 }
 
 REGION_COLORS = {
-    "South America": "#2166ac",   # blue
-    "United States": "#d6604d",   # red-orange
-    "SE Asia":       "#4dac26",   # green
+    # Colorblind-friendly (Okabe–Ito-ish) and more distinct than purple/red/blue
+    "South America": "#E69F00",   # orange / gold
+    "United States": "#0072B2",   # blue
+    "SE Asia":       "#7B2CBF",   # violet
 }
 
-THRESHOLDS = [1, 5, 10]          # top-K% values
+THRESHOLDS = [1, 5, 10]          # top-K% values with real data points
+X_SMOOTH = np.linspace(1, 100, 400)   # extended x range for smooth curves
 
 # ---------------------------------------------------------------------------
 # Figure layout
@@ -104,44 +107,53 @@ fig.subplots_adjust(wspace=0.36)
 # ---- Panel A: Precision-at-threshold profiles ----------------------------
 ax = ax_left
 
-# Plot LGBM lines (solid, thicker) and RF dashed (thinner)
+# X-axis shape: expand 1–10% (where the action is), compress 10–100% tail.
+K_BREAK = 10.0
+TAIL_COMPRESS = 0.18  # smaller = more compression of 10–100%
+
+def _k_forward(x):
+    x = np.asarray(x)
+    return np.where(x <= K_BREAK, x, K_BREAK + (x - K_BREAK) * TAIL_COMPRESS)
+
+def _k_inverse(x):
+    x = np.asarray(x)
+    return np.where(x <= K_BREAK, x, K_BREAK + (x - K_BREAK) / TAIL_COMPRESS)
+
+ax.set_xscale("function", functions=(_k_forward, _k_inverse))
+
 lgbm_keys = [k for k, v in MODELS.items() if v["algo"] == "LGBM"]
 rf_keys   = [k for k, v in MODELS.items() if v["algo"] == "RF"]
 
+def smooth_precision(m):
+    """PCHIP interpolation through 3 data points + baseline anchor at 100%."""
+    xs = np.array([1, 5, 10, 100])
+    ys = np.array([m["p1"], m["p5"], m["p10"], m["base"]])
+    interp = PchipInterpolator(xs, ys)
+    y_smooth = interp(X_SMOOTH)
+    return np.clip(y_smooth, 0, None)
+
+# Plot LGBM — smooth curve + dots at actual data points
 for key in lgbm_keys:
     m = MODELS[key]
     col = REGION_COLORS[m["region"]]
-    ys = [m["p1"], m["p5"], m["p10"]]
-    ax.plot(THRESHOLDS, ys, "o-", color=col, linewidth=2.2, markersize=6,
-            label=m["region"] + " – LightGBM", zorder=4)
+    ax.plot(X_SMOOTH, smooth_precision(m), "-", color=col, linewidth=0.75, zorder=4)
+    ax.plot(THRESHOLDS, [m["p1"], m["p5"], m["p10"]], "o",
+            color=col, markersize=4.2, zorder=5)
 
+# Plot RF — smooth dashed curve + square dots at actual data points
 for key in rf_keys:
     m = MODELS[key]
     col = REGION_COLORS[m["region"]]
-    ys = [m["p1"], m["p5"], m["p10"]]
-    ax.plot(THRESHOLDS, ys, "s--", color=col, linewidth=1.2, markersize=5,
-            alpha=0.65, label=m["region"] + " – RF", zorder=3)
-
-# Baseline precision lines (horizontal dotted)
-for region in ["South America", "SE Asia", "United States"]:
-    base = [v["base"] for v in MODELS.values() if v["region"] == region][0]
-    col  = REGION_COLORS[region]
-    ax.axhline(base, color=col, linestyle=":", linewidth=0.8, alpha=0.45)
-
-# Annotation for USA baseline
-ax.annotate(
-    "USA baseline\n= 0.04%",
-    xy=(10, 0.0035), xytext=(7.5, 0.045),
-    fontsize=7, color=REGION_COLORS["United States"],
-    arrowprops=dict(arrowstyle="->", color=REGION_COLORS["United States"],
-                    lw=0.8),
-    ha="center",
-)
+    ax.plot(X_SMOOTH, smooth_precision(m), "--", color=col, linewidth=0.55,
+            alpha=0.65, zorder=3)
+    ax.plot(THRESHOLDS, [m["p1"], m["p5"], m["p10"]], "s",
+            color=col, markersize=3.4, alpha=0.65, zorder=4)
 
 ax.set_xlabel("Top-$K$\\% risk zone", fontsize=9.5)
 ax.set_ylabel("Precision @ top-$K$\\%", fontsize=9.5)
-ax.set_xticks(THRESHOLDS)
-ax.set_xticklabels(["1\\%", "5\\%", "10\\%"], fontsize=9)
+ax.set_xlim(1, 100)
+ax.set_xticks([1, 5, 10, 25, 50, 100])
+ax.set_xticklabels(["1\\%", "5\\%", "10\\%", "25\\%", "50\\%", "100\\%"], fontsize=8)
 ax.set_ylim(-0.02, 0.72)
 ax.grid(True, alpha=0.25)
 ax.set_title("(a) Targeting Precision at Different Risk Thresholds",
@@ -149,13 +161,13 @@ ax.set_title("(a) Targeting Precision at Different Risk Thresholds",
 
 # Custom legend (LightGBM solid, RF dashed, colors by region)
 region_handles = [
-    mlines.Line2D([], [], color=col, linewidth=2, label=reg)
+    mlines.Line2D([], [], color=col, linewidth=0.9, label=reg)
     for reg, col in REGION_COLORS.items()
 ]
 algo_handles = [
-    mlines.Line2D([], [], color="0.3", linestyle="-",  linewidth=2, marker="o",
+    mlines.Line2D([], [], color="0.3", linestyle="-",  linewidth=0.9, marker="o",
                   markersize=5, label="LightGBM"),
-    mlines.Line2D([], [], color="0.3", linestyle="--", linewidth=1.2, marker="s",
+    mlines.Line2D([], [], color="0.3", linestyle="--", linewidth=0.65, marker="s",
                   markersize=4, alpha=0.7, label="Random Forest"),
 ]
 leg1 = ax.legend(handles=region_handles, loc="upper right",

@@ -45,6 +45,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
+from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
@@ -79,9 +80,18 @@ from scripts.regions.shared.forward.config import (  # noqa: E402
 os.environ["PA3030_RESULTS_REGION"] = OUTPUTS_SUBDIR
 
 from scripts.regions.shared.results.boundaries import get_region_boundary  # noqa: E402
+from scripts.regions.shared.results.config import (  # noqa: E402
+    MAP_INSET_SIDE,
+    MAP_LEGEND_FONTSIZE,
+    MAP_LEGEND_MARKERSIZE,
+    Y_LIMITS,
+)
 from scripts.regions.shared.results.results_core import (  # noqa: E402
+    FONTSIZE_LABEL,
     PROBABILITY_MAP_COLORMAP,
     _add_latlon_ticks,
+    _add_north_arrow,
+    _add_scale_bar_3857,
     _plot_backbone_background,
     points_to_raster,
 )
@@ -99,6 +109,9 @@ SCENARIO_COLORS = {
     "moderate": "#e87e2b",
     "30x30":    "#1a78c2",
 }
+# Dilation radius for BAU risk maps (sparse top-1% selection; needs wider dots for print).
+# Set to 0 for moderate/30x30 which are dense — dilation would blob everything together.
+_BAU_DILATION_RADIUS = 2
 
 
 def _safe_savefig(
@@ -1148,8 +1161,6 @@ def _create_scenario_map(
     x_m: np.ndarray,
     y_m: np.ndarray,
     selected: np.ndarray,
-    title: str,
-    subtitle: str,
     color: str,
     filename_stem: str,
     output_dir: Path,
@@ -1162,8 +1173,11 @@ def _create_scenario_map(
     repo_root: Path,
     baseline: Dict[str, Any],
     data_subdir: str,
+    dilation_radius: int = 0,
 ) -> None:
-    """Scenario binary map in EPSG:3857 with backbone underlay (no country outlines)."""
+    """Scenario binary map in EPSG:3857 with backbone underlay and country borders."""
+    from scipy.ndimage import binary_dilation
+
     bg_raster, bg_ext = points_to_raster(
         x_m, y_m, np.ones(len(x_m), dtype=np.float32),
         target_resolution=1000.0,
@@ -1172,10 +1186,11 @@ def _create_scenario_map(
     )
     bg_disp = np.where(np.isnan(bg_raster), np.nan, 0.12)
 
-    proj_width = proj_bounds[2] - proj_bounds[0]
-    proj_height = proj_bounds[3] - proj_bounds[1]
+    # Figure height from geographic aspect ratio (same approach as all other map functions).
+    proj_width_m = proj_bounds[2] - proj_bounds[0]
+    proj_height_m = proj_bounds[3] - proj_bounds[1]
     fig_width = 14.0
-    fig_height = fig_width * (proj_height / max(proj_width, 1e-9))
+    fig_height = fig_width * (proj_height_m / max(proj_width_m, 1e-9))
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
 
     sel_raster, _ = points_to_raster(
@@ -1184,10 +1199,14 @@ def _create_scenario_map(
         agg_func="max",
         extent_bounds=proj_bounds,
     )
-    sel_disp = np.where(np.isnan(sel_raster), np.nan, 1.0)
+    sel_bin = ~np.isnan(sel_raster)
+    if sel_bin.any() and dilation_radius > 0:
+        r = dilation_radius
+        struct = np.ones((2 * r + 1, 2 * r + 1), dtype=bool)
+        sel_bin = binary_dilation(sel_bin, structure=struct)
+    sel_disp = np.where(sel_bin, 1.0, np.nan).astype(np.float32)
 
     # Halo/outline: draw only the border of selected pixels in black underneath.
-    sel_bin = ~np.isnan(sel_raster)
     if sel_bin.any():
         p = np.pad(sel_bin.astype(np.uint8), 1, mode="constant", constant_values=0)
         nbh = [
@@ -1250,19 +1269,52 @@ def _create_scenario_map(
         zorder=3,
     )
 
+    # Country borders overlay — matches model1_results risk-map style.
+    _country_borders_3857 = _load_country_borders_3857(repo_root)
+    if _country_borders_3857 is not None:
+        _country_borders_3857.plot(
+            ax=ax, facecolor="none", edgecolor="#777777", linewidth=0.25, alpha=0.4, zorder=4,
+        )
+
     ax.set_xlim(proj_bounds[0], proj_bounds[2])
     ax.set_ylim(proj_bounds[1], proj_bounds[3])
     ax.set_aspect("equal", adjustable="box")
     _add_latlon_ticks(ax, (proj_bounds[0], proj_bounds[2]), (proj_bounds[1], proj_bounds[3]))
 
-    patch = mpatches.Patch(
-        color=color,
-        label=f"Projected designations ({n_pixels:,} pixels, {area_km2:,.0f} km²)",
+    legend_loc = "lower right" if MAP_INSET_SIDE == "right" else "upper left"
+    legend_elements = [
+        Line2D(
+            [0], [0], marker="s", color="w", markerfacecolor=color,
+            markersize=MAP_LEGEND_MARKERSIZE, alpha=0.98,
+            label=f"Projected designations ({n_pixels:,} pixels, {area_km2:,.0f} km²)",
+        ),
+        Line2D(
+            [0], [0], marker="s", color="w", markerfacecolor=FORWARD_PA_HOLE_COLOR,
+            markersize=MAP_LEGEND_MARKERSIZE, alpha=0.9,
+            label="Existing protected areas (2024)",
+        ),
+    ]
+    ax.legend(
+        handles=legend_elements, loc=legend_loc, fontsize=MAP_LEGEND_FONTSIZE,
+        framealpha=0.95, borderpad=0.8, labelspacing=0.6,
     )
-    ax.legend(handles=[patch], loc="lower left", fontsize=9)
-    ax.set_xlabel("Longitude")
-    ax.set_ylabel("Latitude")
-    ax.set_title(f"{title}\n{subtitle}", fontsize=12)
+    ax.set_xlabel("Longitude", fontsize=FONTSIZE_LABEL)
+    ax.set_ylabel("Latitude", fontsize=FONTSIZE_LABEL)
+
+    ref_lat = (float(Y_LIMITS[0]) + float(Y_LIMITS[1])) / 2.0
+    if MAP_INSET_SIDE == "right":
+        _add_scale_bar_3857(
+            ax, proj_bounds, ref_lat_deg=ref_lat, bar_km=1000,
+            position="upper right", anchor_x_frac=0.94, anchor_y_frac=0.915,
+        )
+        _add_north_arrow(
+            ax, proj_bounds, position="upper right",
+            anchor_x_frac=0.865, anchor_y_frac=0.900,
+        )
+    else:
+        _add_scale_bar_3857(ax, proj_bounds, ref_lat_deg=ref_lat, bar_km=1000, position="lower left")
+        _add_north_arrow(ax, proj_bounds, position="lower right")
+
     ax.grid(True, alpha=0.25, linestyle="--", linewidth=0.5, zorder=3)
 
     plt.tight_layout(pad=0.5)
@@ -1285,7 +1337,6 @@ def create_scenario_maps(
     output_dir: Path,
     repo_root: Path,
     region_label: str,
-    bau_subtitle: str = "BAU designation volume",
 ) -> Dict[str, Any]:
     print("\n" + "=" * 70)
     print("CREATING SCENARIO MAPS")
@@ -1303,25 +1354,16 @@ def create_scenario_maps(
     protected_2024_km2 = baseline["protected_2024_km2"]
 
     scenario_info: Dict[str, Any] = {}
-    moderate_pct = baseline.get("moderate_target_pct", 0.25)
-    moderate_pct_str = f"{moderate_pct:.0%}"
-    coverage_now_pct = float(baseline.get("coverage_pct_2024") or 0.0)
 
+    # BAU selects top-~1% of pixels (sparse) → dilation helps dots show in print.
+    # Moderate and 30×30 select many more pixels → no dilation (avoids solid blobs).
     scenarios = [
-        (proba >= bau_cutoff, "bau", None,
-         bau_subtitle,
-         SCENARIO_COLORS["bau"], "risk_map_bau"),
-        (proba >= moderate_cutoff, "moderate",
-         f"Moderate Scenario (→{moderate_pct_str} {region_label} coverage)",
-         f"Spatial projection if historical designation preferences continue to {moderate_pct_str} coverage",
-         SCENARIO_COLORS["moderate"], "scenario_moderate"),
-        (proba >= full_cutoff, "30x30",
-         f"30x30 Full Scenario (→30% {region_label} coverage)",
-         "Spatial projection if historical designation preferences continue to 30% coverage",
-         SCENARIO_COLORS["30x30"], "scenario_30x30"),
+        (proba >= bau_cutoff,      "bau",     SCENARIO_COLORS["bau"],     "risk_map_bau",       _BAU_DILATION_RADIUS),
+        (proba >= moderate_cutoff, "moderate", SCENARIO_COLORS["moderate"], "scenario_moderate", 0),
+        (proba >= full_cutoff,     "30x30",    SCENARIO_COLORS["30x30"],    "scenario_30x30",    0),
     ]
 
-    for mask, key, title, subtitle, color, stem in scenarios:
+    for mask, key, color, stem, dil_r in scenarios:
         n = int(mask.sum())
         km2 = float(area[mask].sum())
         coverage_new = (protected_2024_km2 + km2) / max(total_km2, 1.0)
@@ -1331,16 +1373,12 @@ def create_scenario_maps(
             "area_km2": round(km2, 2),
             "projected_total_coverage_pct": round(coverage_new, 6),
         }
-        if key == "bau":
-            title = (
-                f"BAU Forecast ({coverage_now_pct:.1%} → {coverage_new:.1%} "
-                f"{region_label} coverage) — Projected Designations (2025–2030)"
-            )
         if n > 0:
             _create_scenario_map(
-                x_m, y_m, mask, title, subtitle, color, stem, output_dir,
+                x_m, y_m, mask, color, stem, output_dir,
                 n, km2, coverage_new, proj_bounds, region_proj, backbone_path,
                 repo_root, baseline, DATA_SUBDIR,
+                dilation_radius=dil_r,
             )
         else:
             print(f"  WARNING: no pixels selected for {key} scenario — target already met?")
@@ -2857,6 +2895,7 @@ def create_country_conservation_alignment(
     output_dir: Path,
     world_gdf,
     iso_codes: List[str],
+    baseline: Dict[str, Any],
 ) -> pd.DataFrame:
     """Bar chart: % of 30x30 new designations that overlap biodiversity priority, by country.
 
@@ -3166,7 +3205,7 @@ def main() -> None:
     # Fall back to the legacy 25% key if re-running against an old baseline JSON.
     km2_moderate = baseline.get("km2_needed_for_moderate") or baseline.get("km2_needed_for_25pct", 0.0)
     moderate_pct = baseline.get("moderate_target_pct", 0.25)
-    bau_cutoff, moderate_cutoff, full_cutoff, bau_subtitle = compute_scenario_cutoffs(
+    bau_cutoff, moderate_cutoff, full_cutoff, _bau_subtitle = compute_scenario_cutoffs(
         df,
         km2_moderate,
         moderate_pct,
@@ -3182,7 +3221,6 @@ def main() -> None:
     scenario_info = create_scenario_maps(
         df, baseline, bau_cutoff, moderate_cutoff, full_cutoff,
         model_output_dir, repo_root, REGION_LABEL,
-        bau_subtitle=bau_subtitle,
     )
     wb.log({"results/stage": "scenario_maps_done"})
 
@@ -3269,7 +3307,7 @@ def main() -> None:
     }
     save_alignment_summary(alignment_metrics, model_output_dir)
     country_alignment_df = create_country_conservation_alignment(
-        df, full_cutoff, model_output_dir, world_gdf, ISO_CODES,
+        df, full_cutoff, model_output_dir, world_gdf, ISO_CODES, baseline,
     )
 
     # ── Summary JSON ──────────────────────────────────────────────────────────

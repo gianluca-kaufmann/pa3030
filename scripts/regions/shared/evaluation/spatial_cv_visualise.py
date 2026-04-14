@@ -285,31 +285,31 @@ def plot_lobo_vs_indistribution(
         Recall@5% = 0.05  (a random model selects 5% of positives at random)
     """
     # ── Build merged table ───────────────────────────────────────────────────
-    keep = ["biome_name", "roc_auc", "recall_at_5pct", "n_test_pos"]
+    keep = ["biome_name", "pr_auc", "recall_at_5pct", "n_test_pos", "positive_rate"]
     for c in keep:
         if c not in lobo_df.columns:
             lobo_df = lobo_df.copy()
             lobo_df[c] = np.nan
     df = lobo_df[keep].copy()
-    df.columns = ["biome_name", "lobo_roc", "lobo_r5", "n_pos"]
+    df.columns = ["biome_name", "lobo_pr", "lobo_r5", "n_pos", "pos_rate"]
 
     has_recall  = df["lobo_r5"].notna().any()
     has_layer2  = layer2_df is not None
     has_l2_r5   = has_layer2 and "recall_at_5pct" in layer2_df.columns
 
     if has_layer2:
-        l2_keep = ["biome_name", "roc_auc"]
+        l2_keep = ["biome_name", "pr_auc"]
         if has_l2_r5:
             l2_keep.append("recall_at_5pct")
         l2 = layer2_df[l2_keep].copy()
-        rename = {"roc_auc": "l2_roc"}
+        rename = {"pr_auc": "l2_pr"}
         if has_l2_r5:
             rename["recall_at_5pct"] = "l2_r5"
         l2 = l2.rename(columns=rename)
         df = df.merge(l2, on="biome_name", how="left")
 
-    # Sort ascending by LOBO ROC-AUC so best biome is at the top
-    df = df.sort_values("lobo_roc", ascending=True).reset_index(drop=True)
+    # Sort ascending by LOBO PR-AUC so best biome is at the top
+    df = df.sort_values("lobo_pr", ascending=True).reset_index(drop=True)
 
     short_names = [_short(n) for n in df["biome_name"]]
     n_b      = len(df)
@@ -364,22 +364,30 @@ def plot_lobo_vs_indistribution(
                     fontsize=7.5, color=COLOR_LOBO, fontweight="bold",
                 )
 
-    # ── Panel 1: ROC-AUC ────────────────────────────────────────────────────
-    l2_roc = df.get("l2_roc", pd.Series(dtype=float)).to_numpy()
+    # ── Panel 1: PR-AUC ────────────────────────────────────────────────────
+    l2_pr = df.get("l2_pr", pd.Series(dtype=float)).to_numpy()
+    pr_max = max(0.50, float(np.nanmax(df["lobo_pr"])) + 0.06)
     _panel(
         axes[0],
-        df["lobo_roc"].to_numpy(), l2_roc if has_layer2 else None,
-        xlabel="ROC-AUC",
-        ref_x=0.5, xmin=0.40, xmax=1.04,
+        df["lobo_pr"].to_numpy(), l2_pr if has_layer2 else None,
+        xlabel="PR-AUC",
+        ref_x=float(df["pos_rate"].mean()),   # mean positive rate as rough baseline
+        xmin=0.0, xmax=min(1.04, pr_max),
     )
-    axes[0].set_title("ROC-AUC by Biome", fontweight="bold", fontsize=12, pad=8)
+    axes[0].set_title("PR-AUC by Biome", fontweight="bold", fontsize=12, pad=8)
+    # Add note about varying baseline
+    axes[0].text(
+        float(df["pos_rate"].mean()) + 0.01, 0.5,
+        "≈ random\nbaseline",
+        fontsize=6.5, color=COLOR_REF, va="center",
+    )
 
     # Annotate n_pos on the left margin (each LOBO bar)
     for i, (_, row) in enumerate(df.iterrows()):
         n = row.get("n_pos")
         if pd.notna(n) and int(n) > 0:
             axes[0].text(
-                0.405, y_pos[i] + bh / 2,
+                0.005, y_pos[i] + bh / 2,
                 f"n={int(n):,}", va="center", ha="left",
                 fontsize=6.5, color="#555555",
             )
@@ -412,7 +420,7 @@ def plot_lobo_vs_indistribution(
 
     fig.suptitle(
         "Spatial Generalisation: LOBO vs. In-Distribution Performance\n"
-        r"Leave-One-Biome-Out CV — Test set 2017–2019",
+        r"Leave-One-Biome-Out CV — Test set 2017–2019 (primary metric: PR-AUC)",
         fontsize=11, y=1.01,
     )
     fig.tight_layout()
@@ -533,18 +541,21 @@ def plot_prevalence_vs_performance(
 
 def plot_biome_performance_map(
     lobo_df: pd.DataFrame,
+    layer2_df: Optional[pd.DataFrame],
     region: str,
     output_path: Path,
 ) -> None:
     """Two-panel choropleth map of biome-level LOBO performance.
 
-    Left panel:  LOBO ROC-AUC (ranking quality)
+    Left panel:  LOBO PR-AUC (precision-recall, primary metric under class imbalance)
     Right panel: LOBO Recall@5% (policy-relevant coverage)
 
     Both panels share the RdYlGn colormap (red = poor, green = strong).
-    Grey fill denotes biomes absent from the LOBO results (either out of the
-    region or skipped due to too few test-set PA events).
-    ROC-AUC colour scale is fixed to [0.5, 1.0] so the full legend range is shown.
+
+    Biomes not in the model's evaluation scope (e.g. ecoregions unrepresented
+    in the GSN raster for this region) are deliberately excluded from the
+    choropleth — the continent land-mask provides a neutral light-grey backdrop
+    so no misleadingly large "no data" polygons appear.
     """
     if not GEOPANDAS_AVAILABLE:
         print("  Skipping map (geopandas not available).")
@@ -555,45 +566,177 @@ def plot_biome_performance_map(
     if biome_gdf is None:
         return
 
-    # ── Merge LOBO metrics onto biome geodataframe ───────────────────────────
-    metrics = lobo_df[["biome_name", "roc_auc", "recall_at_5pct",
-                        "positive_rate", "n_test_pos"]].copy()
-    for c in ("roc_auc", "recall_at_5pct", "positive_rate", "n_test_pos"):
-        metrics[c] = pd.to_numeric(metrics.get(c), errors="coerce")
+    # ── Clip biome polygons to true region boundary ───────────────────────────
+    # Uses the local Natural Earth 110 m file (data/shared/admin/), with a
+    # network download as fallback so the script also works on Euler.
+    # For South America this cleanly excludes Central America / Panama.
+    boundary_gdf: Optional["gpd.GeoDataFrame"] = None
+    try:
+        if region == "south_america":
+            repo_root    = get_repo_root()
+            local_ne     = repo_root / "data" / "shared" / "admin" / "ne_110m_admin_0_countries.gpkg"
+            world: Optional["gpd.GeoDataFrame"] = None
+
+            if local_ne.exists():
+                world = gpd.read_file(local_ne)
+            else:
+                # Fallback: download from Natural Earth (requires network)
+                import tempfile
+                import urllib.request
+                import zipfile
+
+                ne_zip_url = (
+                    "https://naciscdn.org/naturalearth/110m/cultural/"
+                    "ne_110m_admin_0_countries.zip"
+                )
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    zip_path = Path(tmpdir) / "ne_countries.zip"
+                    urllib.request.urlretrieve(ne_zip_url, zip_path)  # nosec
+                    with zipfile.ZipFile(zip_path, "r") as zf:
+                        zf.extractall(tmpdir)
+                    shp_files = list(Path(tmpdir).glob("*.shp"))
+                    if not shp_files:
+                        raise RuntimeError("No .shp in Natural Earth download")
+                    world = gpd.read_file(shp_files[0])
+
+            if world.crs is None:
+                world = world.set_crs("EPSG:4326", allow_override=True)
+            elif world.crs.to_epsg() != 4326:
+                world = world.to_crs("EPSG:4326")
+
+            cont_col = next(
+                (c for c in ("CONTINENT", "continent") if c in world.columns), None
+            )
+            if cont_col is None:
+                raise RuntimeError("No continent column found in Natural Earth file")
+
+            boundary_gdf = world[world[cont_col] == "South America"].copy()
+            boundary_gdf = boundary_gdf[~boundary_gdf.geometry.is_empty].reset_index(drop=True)
+
+            boundary_union = boundary_gdf.unary_union
+            biome_gdf = biome_gdf.copy()
+            biome_gdf["geometry"] = biome_gdf.geometry.intersection(boundary_union)
+            biome_gdf = biome_gdf[~biome_gdf.geometry.is_empty].reset_index(drop=True)
+    except Exception as exc:
+        print(f"  Warning: could not clip biome polygons to boundary ({exc}).")
+
+    # ── Merge LOBO + Layer 2 metrics onto biome polygons ─────────────────────
+    # Primary metric: PR-AUC (main model metric — robust under class imbalance).
+    # Fall back to Layer 2 (in-distribution) when LOBO fold is missing.
+    lobo_cols = ["biome_name", "pr_auc", "recall_at_5pct", "positive_rate", "n_test_pos"]
+    for c in lobo_cols[1:]:
+        if c not in lobo_df.columns:
+            lobo_df = lobo_df.copy()
+            lobo_df[c] = np.nan
+    metrics = lobo_df[lobo_cols].copy()
+    for c in lobo_cols[1:]:
+        metrics[c] = pd.to_numeric(metrics[c], errors="coerce")
 
     gdf = biome_gdf.merge(metrics, on="biome_name", how="left")
 
-    has_recall = ("recall_at_5pct" in gdf.columns and
-                  gdf["recall_at_5pct"].notna().any())
+    if layer2_df is not None and not layer2_df.empty:
+        l2 = layer2_df.copy()
+        l2["biome_name"] = l2["biome_name"].astype(str).str.strip()
+        gdf["biome_name"]  = gdf["biome_name"].astype(str).str.strip()
+        l2_keep = {"biome_name"}
+        for col in ("pr_auc", "recall_at_5pct"):
+            if col in l2.columns:
+                l2_keep.add(col)
+        l2 = l2[list(l2_keep)].rename(
+            columns={"pr_auc": "l2_pr_auc", "recall_at_5pct": "l2_recall_at_5pct"}
+        )
+        gdf = gdf.merge(l2, on="biome_name", how="left")
+        if "l2_pr_auc" in gdf.columns:
+            gdf["pr_auc"] = gdf["pr_auc"].fillna(gdf["l2_pr_auc"])
+        if "l2_recall_at_5pct" in gdf.columns:
+            gdf["recall_at_5pct"] = gdf["recall_at_5pct"].fillna(gdf["l2_recall_at_5pct"])
+
+    has_recall = "recall_at_5pct" in gdf.columns and gdf["recall_at_5pct"].notna().any()
     n_panels   = 2 if has_recall else 1
 
-    # ── Map extent ───────────────────────────────────────────────────────────
-    bounds = gdf.total_bounds        # [minx, miny, maxx, maxy]
-    pad    = 1.5
-    xlim   = (bounds[0] - pad, bounds[2] + pad)
-    ylim   = (bounds[1] - pad, bounds[3] + pad)
+    # ── Two GDFs: full land-mask + evaluated biomes only ─────────────────────
+    # The land-mask is the dissolved outline of all clipped biome polygons.
+    # It provides a uniform grey backdrop for the whole continent — crucially,
+    # biomes with no evaluation data (e.g. Temperate Grasslands / Argentina
+    # pampas) are absent from the GSN raster used to build the model, so they
+    # never appear in LOBO or Layer 2 results.  Rather than drawing a large
+    # grey polygon for them (which looks like a bug), we simply omit those
+    # biome polygons from the choropleth and let the land-mask show through.
+    print("  Building land mask from biome polygon union...")
+    try:
+        land_mask_geom = biome_gdf.geometry.union_all()
+    except AttributeError:
+        # union_all added in geopandas 0.14; fall back to unary_union
+        land_mask_geom = biome_gdf.unary_union
+
+    land_mask = gpd.GeoDataFrame(geometry=[land_mask_geom], crs=biome_gdf.crs)
+
+    # Only keep biome rows that have at least one metric value
+    gdf_valid = gdf[gdf["pr_auc"].notna() | gdf["recall_at_5pct"].notna()].copy()
+    gdf_nodata = gdf[~(gdf["pr_auc"].notna() | gdf["recall_at_5pct"].notna())].copy()
+    print(f"  Biomes with metrics: {len(gdf_valid)} | without: {len(gdf_nodata)}")
+    if not gdf_nodata.empty:
+        print("  Biomes without metrics (outside model evaluation scope):")
+        for name in gdf_nodata["biome_name"].tolist():
+            print(f"    · {name}")
+
+    # Reproject to EPSG:3857 — equal-area for proper aspect ratio
+    land_mask_3857  = land_mask.to_crs("EPSG:3857")
+    gdf_valid_3857  = gdf_valid.to_crs("EPSG:3857")
+
+    bounds_m = land_mask_3857.total_bounds   # [minx, miny, maxx, maxy]
+    pad_m    = 200_000.0
+    xlim     = (bounds_m[0] - pad_m, bounds_m[2] + pad_m)
+    ylim     = (bounds_m[1] - pad_m, bounds_m[3] + pad_m)
 
     # ── Colormaps and normalisations ─────────────────────────────────────────
     cmap = _get_cmap("RdYlGn")
 
-    # Full ROC-AUC colour scale (random = 0.5, perfect = 1.0) for interpretability
-    norm_auc = Normalize(vmin=0.5, vmax=1.0)
+    def _observed_range_norm(
+        vals: np.ndarray,
+        *,
+        pad_lo: float,
+        pad_hi: float,
+    ) -> Normalize:
+        """Map colours across the *actual* min–max of plotted biomes.
+
+        Quantile cutoffs on the *low* side (e.g. 20th percentile as vmin) push
+        most polygons into the clipped-red end of RdYlGn — the wrong direction.
+        Here we anchor to observed extrema with small padding so the full ramp is
+        used for between-biome contrast.
+        """
+        vals = np.asarray(vals, dtype=float)
+        vals = vals[np.isfinite(vals)]
+        if len(vals) == 0:
+            return Normalize(vmin=0.0, vmax=1.0)
+        lo = float(np.nanmin(vals))
+        hi = float(np.nanmax(vals))
+        span = hi - lo
+        if span < 1e-12:
+            lo = max(0.0, lo - 0.02)
+            hi = min(1.0, hi + 0.02)
+        else:
+            lo = max(0.0, lo - pad_lo * span)
+            hi = min(1.0, hi + pad_hi * span)
+        if hi <= lo + 1e-12:
+            hi = lo + 1e-6
+        return Normalize(vmin=lo, vmax=hi, clip=True)
+
+    pr_vals = gdf_valid["pr_auc"].dropna().to_numpy()
+    # PR-AUC spans orders of magnitude across biomes — a bit more low-side pad
+    # stretches the yellow–green part relative to recall.
+    norm_pr = _observed_range_norm(pr_vals, pad_lo=0.12, pad_hi=0.06)
 
     if has_recall:
-        r5_vals = gdf["recall_at_5pct"].dropna().to_numpy()
-        norm_r5 = Normalize(
-            vmin=0.0,
-            vmax=min(1.0, float(r5_vals.max()) + 0.02) if len(r5_vals) else 1.0,
-        )
+        r5_vals = gdf_valid["recall_at_5pct"].dropna().to_numpy()
+        norm_r5 = _observed_range_norm(r5_vals, pad_lo=0.06, pad_hi=0.06)
 
     # ── Figure layout ────────────────────────────────────────────────────────
-    # Derive figure height from geographic aspect ratio
-    lon_span  = xlim[1] - xlim[0]
-    lat_span  = ylim[1] - ylim[0]
-    mid_lat   = (ylim[0] + ylim[1]) / 2.0
-    aspect    = lat_span / (lon_span * np.cos(np.radians(mid_lat)))
-    panel_w   = 7.5
-    panel_h   = panel_w * aspect
+    proj_w      = xlim[1] - xlim[0]
+    proj_h      = ylim[1] - ylim[0]
+    proj_aspect = proj_h / proj_w
+    panel_w     = 7.5
+    panel_h     = panel_w * proj_aspect
 
     fig, axes = plt.subplots(
         1, n_panels,
@@ -604,15 +747,30 @@ def plot_biome_performance_map(
 
     # ── Inner drawing function ───────────────────────────────────────────────
     def _draw_panel(ax, col, norm, title, cbar_label, ref_note=""):
-        # Grey fill for all biomes (background / no-data)
-        gdf.plot(ax=ax, color=COLOR_MISSING, edgecolor="#AAAAAA",
-                 linewidth=0.4, zorder=1)
+        # Layer 0: light grey continent land-mask (ocean stays white)
+        land_mask_3857.plot(
+            ax=ax,
+            color=COLOR_MISSING,
+            edgecolor="none",
+            zorder=1,
+        )
 
-        # Choropleth for biomes that have valid metric values
-        valid = gdf[gdf[col].notna()].copy()
+        # Layer 1: choropleth for biomes with valid data only
+        valid = gdf_valid_3857[gdf_valid_3857[col].notna()].copy()
         if not valid.empty:
-            valid.plot(ax=ax, column=col, cmap=cmap, norm=norm,
-                       edgecolor="#777777", linewidth=0.4, zorder=2)
+            valid.plot(
+                ax=ax, column=col, cmap=cmap, norm=norm,
+                edgecolor="#8A8A8A", linewidth=0.02, zorder=2,
+            )
+
+        # Layer 2: thin continent outline for geographic orientation
+        land_mask_3857.plot(
+            ax=ax,
+            facecolor="none",
+            edgecolor="#888888",
+            linewidth=0.12,
+            zorder=3,
+        )
 
         # Colorbar
         sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
@@ -624,26 +782,35 @@ def plot_biome_performance_map(
         # Map cosmetics
         ax.set_xlim(xlim)
         ax.set_ylim(ylim)
+        ax.set_aspect("equal", adjustable="box")
         ax.set_title(title, fontsize=11, fontweight="bold", pad=7)
-        ax.set_xlabel("Longitude", fontsize=8.5)
-        ax.set_ylabel("Latitude", fontsize=8.5)
-        ax.tick_params(labelsize=8)
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+        ax.set_xticks([])
+        ax.set_yticks([])
 
-        # Grey = no data note
+        # Legend: light grey = land not in biome evaluation scope
         grey_patch = mpatches.Patch(
-            color=COLOR_MISSING, label="No LOBO data (biome absent or skipped)")
-        ax.legend(handles=[grey_patch], loc="lower left",
-                  fontsize=7.5, framealpha=0.85, edgecolor="lightgray")
+            color=COLOR_MISSING,
+            label="Not in biome evaluation scope\n"
+                  "(ecoregions absent from GSN raster)",
+        )
+        ax.legend(
+            handles=[grey_patch], loc="lower left",
+            fontsize=7, framealpha=0.88, edgecolor="lightgray",
+        )
 
         if ref_note:
-            ax.text(0.99, 0.01, ref_note, transform=ax.transAxes,
-                    fontsize=6.5, color="#555555", ha="right", va="bottom")
+            ax.text(
+                0.99, 0.01, ref_note, transform=ax.transAxes,
+                fontsize=6.5, color="#555555", ha="right", va="bottom",
+            )
 
-    # ── Left panel: ROC-AUC ──────────────────────────────────────────────────
+    # ── Left panel: PR-AUC ───────────────────────────────────────────────────
     _draw_panel(
-        axes[0], "roc_auc", norm_auc,
-        title="LOBO ROC-AUC\n(model trained without this biome)",
-        cbar_label="ROC-AUC",
+        axes[0], "pr_auc", norm_pr,
+        title="LOBO PR-AUC\n(model trained without this biome)",
+        cbar_label="PR-AUC",
     )
 
     # ── Right panel: Recall@5% ───────────────────────────────────────────────
@@ -655,13 +822,6 @@ def plot_biome_performance_map(
             ref_note="Random baseline ≈ 0.05",
         )
 
-    # ── Overall title ────────────────────────────────────────────────────────
-    region_label = region.replace("_", " ").title()
-    fig.suptitle(
-        f"Biome-Level LOBO Spatial Generalisation — {region_label}\n"
-        r"Test period: 2017–2019  |  5-year PA designation lookahead window",
-        fontsize=11, fontweight="bold", y=1.01,
-    )
     fig.tight_layout()
     fig.savefig(output_path, dpi=MAP_DPI, bbox_inches="tight")
     plt.close(fig)
@@ -833,7 +993,7 @@ def run_spatial_cv_visualise(region: str, model_type: str = "lgbm") -> None:
         # ── Figure 3: Map ─────────────────────────────────────────────────────
         print("\n--- Figure 3: Biome performance map ---")
         fig3_path = output_dir / f"map_lobo_performance_{mt_safe}.pdf"
-        plot_biome_performance_map(lobo_df, region, fig3_path)
+        plot_biome_performance_map(lobo_df, layer2_df, region, fig3_path)
 
         # ── Figure 4: Biome predicted vs actual scatter ───────────────────────
         print("\n--- Figure 4: Biome predicted vs actual scatter ---")

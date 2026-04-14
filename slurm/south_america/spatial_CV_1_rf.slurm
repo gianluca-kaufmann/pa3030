@@ -8,7 +8,7 @@
 #SBATCH --output=/cluster/scratch/%u/logs/lobo_SA_rf_%A_%a.out
 #SBATCH --error=/cluster/scratch/%u/logs/lobo_SA_rf_%A_%a.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
-#SBATCH --array=0-8
+#SBATCH --array=0-4,6-11
 
 # ------------------------------------------------------------------------------
 # Leave-One-Biome-Out (LOBO) spatial CV — South America — Random Forest
