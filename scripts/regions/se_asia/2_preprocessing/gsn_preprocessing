@@ -202,8 +202,10 @@ def main() -> int:
     template_path = find_template_raster(project_root)
     transform, width, height, template_crs, t_bounds = read_template_info(template_path)
 
-    # 2) Target bbox polygon in template CRS
-    t_bbox_poly = gpd.GeoSeries([bbox_polygon(t_bounds)], crs=template_crs)
+    # Use EPSG:3857 explicitly: the SE Asia backbone may carry LOCAL_CS metadata from GEE
+    # exports, but all coordinates are in EPSG:3857 space. Hardcoding the EPSG code
+    # produces correctly-tagged output rasters without relying on crs_fix post-processing.
+    t_bbox_poly = gpd.GeoSeries([bbox_polygon(t_bounds)], crs="EPSG:3857")
 
     # 3) GSN vector layers
     layers = get_gsn_layers(project_root)
@@ -223,7 +225,7 @@ def main() -> int:
             # Reproject to template CRS
             if gdf.crs is None:
                 raise ValueError(f"Vector layer {vec_path} has undefined CRS.")
-            gdf = gdf.to_crs(template_crs)
+            gdf = gdf.to_crs("EPSG:3857")
 
             # Fix invalid geometries before clipping
             gdf['geometry'] = gdf.geometry.make_valid()
@@ -245,7 +247,7 @@ def main() -> int:
 
         out_name = f"gsn_{key}_mask_1km.tif"
         out_path = out_dir / out_name
-        save_geotiff(out_path, mask, transform, template_crs)
+        save_geotiff(out_path, mask, transform, "EPSG:3857")
         print(f"Saved {out_path}")
 
     print("Done.")

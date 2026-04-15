@@ -102,6 +102,7 @@ from scripts.regions.shared.training.utils import WandbRunLogger  # noqa: E402
 
 # ── Map style constants ───────────────────────────────────────────────────────
 MAP_DPI      = 300
+
 FORWARD_BACKGROUND_COLOR = "#F2F2F2"  # very light gray: visible vs white, but unobtrusive
 _EXISTING_PA_FILL_COLOR = "#4a7c59"   # muted forest green: existing PAs as distinct "holes"
 SCENARIO_COLORS = {
@@ -309,6 +310,15 @@ def create_model_agreement_map_top1pct(
 
     proj_bounds = _resolve_plot_bounds_3857(repo_root, DATA_SUBDIR, baseline)
     backbone_path = resolve_backbone_path_for_plot(repo_root, DATA_SUBDIR, baseline)
+    region_proj = None
+    try:
+        region_gdf = get_region_boundary(None)
+        if region_gdf is not None and not region_gdf.empty:
+            if region_gdf.crs is None:
+                region_gdf = region_gdf.set_crs("EPSG:4326", allow_override=True)
+            region_proj = region_gdf.to_crs("EPSG:3857")
+    except Exception:
+        region_proj = None
 
     grid, gext = points_to_raster(
         xm, ym, cat,
@@ -326,7 +336,7 @@ def create_model_agreement_map_top1pct(
     used_bb = _plot_backbone_background(
         ax, backbone_path, zorder=0, hole_color=FORWARD_PA_HOLE_COLOR,
     )
-    if not used_bb:
+    if (not used_bb) and (region_proj is not None):
         region_proj.plot(
             ax=ax, color=FORWARD_PA_HOLE_COLOR, edgecolor="none",
             linewidth=0, zorder=0,
@@ -820,22 +830,38 @@ def resolve_wdpa_2024_path_for_plot(
 def _resolve_plot_bounds_3857(
     repo_root: Path, data_subdir: str, baseline: Dict[str, Any],
 ) -> Tuple[float, float, float, float]:
-    """Map bounds in EPSG:3857 from our own rasters (no internet / boundaries needed)."""
+    """Map bounds in EPSG:3857 (minx, miny, maxx, maxy).
+
+    Prefer the same region hull as ``create_risk_map`` in ``results_core`` (Natural Earth
+    boundary projected to Web Mercator). That yields the elongated aspect — e.g. South
+    America north–south — instead of the backbone GeoTIFF envelope, which is often a
+    squarer grid extent.
+
+    Falls back to the backbone raster bounds if the boundary cannot be loaded (offline
+    edge cases).
+    """
+    try:
+        region_gdf = get_region_boundary(None)
+        if region_gdf is not None and not region_gdf.empty:
+            if region_gdf.crs is None:
+                region_gdf = region_gdf.set_crs("EPSG:4326", allow_override=True)
+            region_proj = region_gdf.to_crs("EPSG:3857")
+            b = region_proj.total_bounds.astype(float)
+            return (float(b[0]), float(b[1]), float(b[2]), float(b[3]))
+    except Exception:
+        pass
     try:
         import rasterio
         backbone = resolve_backbone_path_for_plot(repo_root, data_subdir, baseline)
         if backbone and Path(backbone).exists():
             with rasterio.open(backbone) as src:
-                b = src.bounds
-                return (float(b.left), float(b.bottom), float(b.right), float(b.top))
+                bb = src.bounds
+                return (float(bb.left), float(bb.bottom), float(bb.right), float(bb.top))
     except Exception:
         pass
-    # Fallback: region boundary polygon (may depend on Natural Earth availability).
-    region_gdf = get_region_boundary(None)
-    if region_gdf.crs is None:
-        region_gdf = region_gdf.set_crs("EPSG:4326", allow_override=True)
-    region_proj = region_gdf.to_crs("EPSG:3857")
-    return tuple(region_proj.total_bounds.astype(float))
+    raise RuntimeError(
+        "Could not resolve EPSG:3857 plot bounds: no region boundary and no backbone raster."
+    )
 
 
 def _overlay_current_pa_extent(
@@ -1186,11 +1212,12 @@ def _create_scenario_map(
     )
     bg_disp = np.where(np.isnan(bg_raster), np.nan, 0.12)
 
-    # Figure height from geographic aspect ratio (same approach as all other map functions).
+    # Figure dimensions match model1_results create_risk_map (14" wide, height from aspect).
     proj_width_m = proj_bounds[2] - proj_bounds[0]
     proj_height_m = proj_bounds[3] - proj_bounds[1]
+    proj_aspect = proj_height_m / max(proj_width_m, 1e-9)
     fig_width = 14.0
-    fig_height = fig_width * (proj_height_m / max(proj_width_m, 1e-9))
+    fig_height = fig_width * proj_aspect
     fig, ax = plt.subplots(figsize=(fig_width, fig_height))
 
     sel_raster, _ = points_to_raster(
@@ -1286,7 +1313,7 @@ def _create_scenario_map(
         Line2D(
             [0], [0], marker="s", color="w", markerfacecolor=color,
             markersize=MAP_LEGEND_MARKERSIZE, alpha=0.98,
-            label=f"Projected designations ({n_pixels:,} pixels, {area_km2:,.0f} km²)",
+            label="Projected designations (2025–2030)",
         ),
         Line2D(
             [0], [0], marker="s", color="w", markerfacecolor=FORWARD_PA_HOLE_COLOR,
@@ -1295,27 +1322,21 @@ def _create_scenario_map(
         ),
     ]
     ax.legend(
-        handles=legend_elements, loc=legend_loc, fontsize=MAP_LEGEND_FONTSIZE,
+        handles=legend_elements, loc=legend_loc, fontsize=MAP_LEGEND_FONTSIZE + 2,
         framealpha=0.95, borderpad=0.8, labelspacing=0.6,
     )
-    ax.set_xlabel("Longitude", fontsize=FONTSIZE_LABEL)
-    ax.set_ylabel("Latitude", fontsize=FONTSIZE_LABEL)
 
-    ref_lat = (float(Y_LIMITS[0]) + float(Y_LIMITS[1])) / 2.0
-    if MAP_INSET_SIDE == "right":
-        _add_scale_bar_3857(
-            ax, proj_bounds, ref_lat_deg=ref_lat, bar_km=1000,
-            position="upper right", anchor_x_frac=0.94, anchor_y_frac=0.915,
-        )
-        _add_north_arrow(
-            ax, proj_bounds, position="upper right",
-            anchor_x_frac=0.865, anchor_y_frac=0.900,
-        )
-    else:
-        _add_scale_bar_3857(ax, proj_bounds, ref_lat_deg=ref_lat, bar_km=1000, position="lower left")
-        _add_north_arrow(ax, proj_bounds, position="lower right")
-
-    ax.grid(True, alpha=0.25, linestyle="--", linewidth=0.5, zorder=3)
+    # Scale bar (upper right) + north arrow (upper left) — matches model1_results risk/probability maps
+    _add_scale_bar_3857(
+        ax,
+        proj_bounds,
+        ref_lat_deg=(Y_LIMITS[0] + Y_LIMITS[1]) / 2.0,
+        bar_km=1000,
+        position="upper right",
+        anchor_x_frac=0.94,
+        anchor_y_frac=0.915,
+    )
+    _add_north_arrow(ax, proj_bounds, position="upper left")
 
     plt.tight_layout(pad=0.5)
     for ext in ["png", "pdf"]:
@@ -2794,51 +2815,71 @@ def _create_alignment_map(
     fig, ax = plt.subplots(1, 1, figsize=(fig_w, fig_h))
 
     used_bb = _plot_backbone_background(
-        ax, backbone_path, zorder=0, hole_color=FORWARD_PA_HOLE_COLOR,
+        ax, backbone_path, zorder=0, hole_color="#E8E8E8",
     )
     _overlay_current_pa_extent(ax, repo_root, DATA_SUBDIR, baseline, proj_bounds, zorder=1)
 
-    def _overlay(mask: np.ndarray, color: str, alpha: float, zorder: int) -> None:
+    def _overlay(
+        mask: np.ndarray,
+        color: str,
+        alpha: float,
+        zorder: int,
+        *,
+        dilation_radius: int = 0,
+    ) -> None:
         if not mask.any():
             return
+        from scipy.ndimage import binary_dilation
+
         grid, gext = points_to_raster(
             xm[mask], ym[mask], np.ones(int(mask.sum()), dtype=np.float32),
             target_resolution=1000.0, agg_func="max", extent_bounds=proj_bounds,
         )
+        disp = np.where(np.isnan(grid), np.nan, 1.0).astype(np.float32)
+        if dilation_radius > 0:
+            sel_bin = ~np.isnan(grid)
+            if sel_bin.any():
+                r = int(dilation_radius)
+                struct = np.ones((2 * r + 1, 2 * r + 1), dtype=bool)
+                sel_bin = binary_dilation(sel_bin, structure=struct)
+                disp = np.where(sel_bin, 1.0, np.nan).astype(np.float32)
         ax.imshow(
-            np.where(np.isnan(grid), np.nan, 1.0),
+            disp,
             extent=gext, cmap=mcolors.ListedColormap([color]),
             vmin=0, vmax=1, origin="upper", interpolation="nearest",
             aspect="equal", alpha=alpha, zorder=zorder,
         )
 
     # Draw in order: gaps first, misdirected second, sweet spots on top
-    _overlay(gap,         "#e87e2b", 0.80, 2)   # orange  — conservation gap
-    _overlay(misdirected, "#4c96d7", 0.65, 3)   # blue    — misdirected designation
-    _overlay(sweet_spot,  "#2ca02c", 0.90, 4)   # green   — sweet spot
+    _overlay(gap,         "#f75454", 0.80, 2)   # darker red-orange — priority, not designated
+    _overlay(misdirected, "#de9c02", 0.65, 3)   # gold — designated, not priority
+    _overlay(sweet_spot,  "#027fde", 0.90, 4, dilation_radius=1)   # darker blue — designated & priority
 
     ax.set_xlim(proj_bounds[0], proj_bounds[2])
     ax.set_ylim(proj_bounds[1], proj_bounds[3])
     ax.set_aspect("equal", adjustable="box")
     _add_latlon_ticks(ax, (proj_bounds[0], proj_bounds[2]), (proj_bounds[1], proj_bounds[3]))
-    ax.set_title(title, fontsize=13, fontweight="bold", pad=10)
 
     legend_elements = [
-        mpatches.Patch(color="#2ca02c", label=f"Sweet spot — designated & priority  ({total_sweet_km2:,.0f} km²)"),
-        mpatches.Patch(color="#e87e2b", label=f"Conservation gap — priority, not designated  ({total_gap_km2:,.0f} km²)"),
-        mpatches.Patch(color="#4c96d7", label=f"Misdirected — designated, not priority  ({total_misdirected_km2:,.0f} km²)"),
+        mpatches.Patch(color="#f75454", label="Designated & priority"),
+        mpatches.Patch(color="#de9c02", label="Priority, not designated"),
+        mpatches.Patch(color="#027fde", label="Designated, not priority"),
     ]
-    ax.legend(handles=legend_elements, loc="lower left", fontsize=8,
-              framealpha=0.85, edgecolor="gray")
+    legend_loc = "lower right" if MAP_INSET_SIDE == "right" else "lower left"
+    ax.legend(handles=legend_elements, loc=legend_loc, fontsize=MAP_LEGEND_FONTSIZE,
+              framealpha=0.95, borderpad=0.8, labelspacing=0.6)
 
-    ax.text(
-        0.98, 0.02,
-        f"Alignment score: {alignment_pct:.1f}%\nof 30×30 establishments\ninside {annotation_subject}\n\n"
-        f"Priority coverage: {priority_coverage_pct:.1f}%\nof {annotation_subject}\ncovered by 30×30",
-        transform=ax.transAxes, fontsize=9, ha="right", va="bottom",
-        bbox=dict(boxstyle="round,pad=0.4", fc="lightyellow", alpha=0.85, ec="gray"),
+    # Scale bar (upper right) + north arrow (upper left) — matches model1_results risk/probability maps
+    _add_scale_bar_3857(
+        ax,
+        proj_bounds,
+        ref_lat_deg=(Y_LIMITS[0] + Y_LIMITS[1]) / 2.0,
+        bar_km=1000,
+        position="upper right",
+        anchor_x_frac=0.94,
+        anchor_y_frac=0.915,
     )
-    ax.grid(True, alpha=0.2, linestyle="--", linewidth=0.4, zorder=5)
+    _add_north_arrow(ax, proj_bounds, position="upper left")
 
     plt.tight_layout()
     for ext in ["png", "pdf"]:

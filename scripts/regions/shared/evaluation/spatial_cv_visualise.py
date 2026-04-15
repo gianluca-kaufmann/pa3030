@@ -21,6 +21,7 @@ Produces four figures from LOBO (Layer 1) and biome-stratified (Layer 2) results
         Left  — LOBO ROC-AUC (colour scale 0.5–1.0)
         Right — LOBO Recall@5%
       Grey = biome absent or too few test events.
+      No continental coastline stroke — only filled land-mask + coloured biomes.
 
   scatter_biome_calibration_<model_type>.pdf
       Biome calibration scatter:  x = mean predicted probability (test set)
@@ -684,6 +685,21 @@ def plot_biome_performance_map(
     land_mask_3857  = land_mask.to_crs("EPSG:3857")
     gdf_valid_3857  = gdf_valid.to_crs("EPSG:3857")
 
+    # ── Lift-based colour columns ─────────────────────────────────────────────
+    # Colouring by raw PR-AUC is misleading because the metric varies with
+    # biome prevalence.  We instead plot lift over the naive random baseline:
+    #   PR-AUC lift  = PR-AUC / positive_rate  (random classifier ≈ prevalence)
+    #   Recall lift  = Recall@5% / 0.05        (random classifier selects 5%)
+    # Lift = 1 means the model is no better than chance; vmin is anchored there.
+    gdf_valid_3857 = gdf_valid_3857.copy()
+    if "positive_rate" in gdf_valid_3857.columns and "pr_auc" in gdf_valid_3857.columns:
+        prev = pd.to_numeric(gdf_valid_3857["positive_rate"], errors="coerce").replace(0, np.nan)
+        gdf_valid_3857["pr_auc_lift"] = pd.to_numeric(
+            gdf_valid_3857["pr_auc"], errors="coerce") / prev
+    if "recall_at_5pct" in gdf_valid_3857.columns:
+        gdf_valid_3857["r5_lift"] = pd.to_numeric(
+            gdf_valid_3857["recall_at_5pct"], errors="coerce") / 0.05
+
     bounds_m = land_mask_3857.total_bounds   # [minx, miny, maxx, maxy]
     pad_m    = 200_000.0
     xlim     = (bounds_m[0] - pad_m, bounds_m[2] + pad_m)
@@ -692,44 +708,47 @@ def plot_biome_performance_map(
     # ── Colormaps and normalisations ─────────────────────────────────────────
     cmap = _get_cmap("RdYlGn")
 
-    def _observed_range_norm(
-        vals: np.ndarray,
-        *,
-        pad_lo: float,
-        pad_hi: float,
-    ) -> Normalize:
-        """Map colours across the *actual* min–max of plotted biomes.
+    def _lift_norm(vals: np.ndarray, label: str) -> Normalize:
+        """Normalise lift values; vmin anchored at 1 (= random baseline).
 
-        Quantile cutoffs on the *low* side (e.g. 20th percentile as vmin) push
-        most polygons into the clipped-red end of RdYlGn — the wrong direction.
-        Here we anchor to observed extrema with small padding so the full ramp is
-        used for between-biome contrast.
+        Prints the chosen vmin/vmax so the scale can be verified in the log.
         """
         vals = np.asarray(vals, dtype=float)
         vals = vals[np.isfinite(vals)]
         if len(vals) == 0:
-            return Normalize(vmin=0.0, vmax=1.0)
-        lo = float(np.nanmin(vals))
-        hi = float(np.nanmax(vals))
-        span = hi - lo
-        if span < 1e-12:
-            lo = max(0.0, lo - 0.02)
-            hi = min(1.0, hi + 0.02)
-        else:
-            lo = max(0.0, lo - pad_lo * span)
-            hi = min(1.0, hi + pad_hi * span)
-        if hi <= lo + 1e-12:
-            hi = lo + 1e-6
-        return Normalize(vmin=lo, vmax=hi, clip=True)
+            return Normalize(vmin=1.0, vmax=2.0)
+        hi = float(np.nanmax(vals)) * 1.05   # 5 % headroom at the top
+        hi = max(hi, 1.0 + 1e-6)
+        print(f"  Lift norm [{label}]: vmin=1.00 (random), vmax={hi:.2f}")
+        return Normalize(vmin=1.0, vmax=hi, clip=True)
 
-    pr_vals = gdf_valid["pr_auc"].dropna().to_numpy()
-    # PR-AUC spans orders of magnitude across biomes — a bit more low-side pad
-    # stretches the yellow–green part relative to recall.
-    norm_pr = _observed_range_norm(pr_vals, pad_lo=0.12, pad_hi=0.06)
+    use_pr_lift = "pr_auc_lift" in gdf_valid_3857.columns and \
+                  gdf_valid_3857["pr_auc_lift"].notna().any()
+    use_r5_lift = "r5_lift" in gdf_valid_3857.columns and \
+                  gdf_valid_3857["r5_lift"].notna().any()
+
+    if use_pr_lift:
+        col_pr, cbar_pr = "pr_auc_lift", "PR-AUC lift (×random baseline)"
+        norm_pr = _lift_norm(gdf_valid_3857["pr_auc_lift"].to_numpy(), "PR-AUC")
+    else:
+        col_pr, cbar_pr = "pr_auc", "PR-AUC"
+        pr_vals = gdf_valid["pr_auc"].dropna().to_numpy()
+        lo = max(0.0, float(np.nanmin(pr_vals)) - 0.12 * np.ptp(pr_vals))
+        hi = min(1.0, float(np.nanmax(pr_vals)) + 0.06 * np.ptp(pr_vals))
+        norm_pr = Normalize(vmin=lo, vmax=max(hi, lo + 1e-6), clip=True)
+        print(f"  PR-AUC norm (raw): vmin={lo:.3f}, vmax={hi:.3f}")
 
     if has_recall:
-        r5_vals = gdf_valid["recall_at_5pct"].dropna().to_numpy()
-        norm_r5 = _observed_range_norm(r5_vals, pad_lo=0.06, pad_hi=0.06)
+        if use_r5_lift:
+            col_r5, cbar_r5 = "r5_lift", "Recall@5% lift (×random baseline)"
+            norm_r5 = _lift_norm(gdf_valid_3857["r5_lift"].to_numpy(), "Recall@5%")
+        else:
+            col_r5, cbar_r5 = "recall_at_5pct", "Recall at top-5% of predictions"
+            r5_vals = gdf_valid["recall_at_5pct"].dropna().to_numpy()
+            lo5 = max(0.0, float(np.nanmin(r5_vals)) - 0.06 * np.ptp(r5_vals))
+            hi5 = min(1.0, float(np.nanmax(r5_vals)) + 0.06 * np.ptp(r5_vals))
+            norm_r5 = Normalize(vmin=lo5, vmax=max(hi5, lo5 + 1e-6), clip=True)
+            print(f"  Recall@5% norm (raw): vmin={lo5:.3f}, vmax={hi5:.3f}")
 
     # ── Figure layout ────────────────────────────────────────────────────────
     proj_w      = xlim[1] - xlim[0]
@@ -760,17 +779,8 @@ def plot_biome_performance_map(
         if not valid.empty:
             valid.plot(
                 ax=ax, column=col, cmap=cmap, norm=norm,
-                edgecolor="#8A8A8A", linewidth=0.02, zorder=2,
+                edgecolor="none", linewidth=0, zorder=2,
             )
-
-        # Layer 2: thin continent outline for geographic orientation
-        land_mask_3857.plot(
-            ax=ax,
-            facecolor="none",
-            edgecolor="#888888",
-            linewidth=0.12,
-            zorder=3,
-        )
 
         # Colorbar
         sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
@@ -806,20 +816,21 @@ def plot_biome_performance_map(
                 fontsize=6.5, color="#555555", ha="right", va="bottom",
             )
 
-    # ── Left panel: PR-AUC ───────────────────────────────────────────────────
+    # ── Left panel: PR-AUC (lift) ────────────────────────────────────────────
     _draw_panel(
-        axes[0], "pr_auc", norm_pr,
-        title="LOBO PR-AUC\n(model trained without this biome)",
-        cbar_label="PR-AUC",
+        axes[0], col_pr, norm_pr,
+        title="LOBO PR-AUC lift\n(model trained without this biome)",
+        cbar_label=cbar_pr,
+        ref_note="1× = random baseline",
     )
 
-    # ── Right panel: Recall@5% ───────────────────────────────────────────────
+    # ── Right panel: Recall@5% (lift) ────────────────────────────────────────
     if has_recall:
         _draw_panel(
-            axes[1], "recall_at_5pct", norm_r5,
-            title="LOBO Recall@top-5%\n(fraction of PA events captured)",
-            cbar_label="Recall at top-5% of predictions",
-            ref_note="Random baseline ≈ 0.05",
+            axes[1], col_r5, norm_r5,
+            title="LOBO Recall@5% lift\n(fraction of PA events captured)",
+            cbar_label=cbar_r5,
+            ref_note="1× = random baseline (Recall@5% = 0.05)",
         )
 
     fig.tight_layout()

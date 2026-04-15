@@ -3332,6 +3332,317 @@ def create_biome_breakdown(
     plt.close()
 
 
+def create_biome_scatter_comparison(
+    output_dir: Path,
+    repo_root: Path,
+    scratch_root: Optional[Path],
+) -> None:
+    """Cross-region biome-level precision@1% vs recall@1% scatter (all 3 regions).
+
+    Reads the latest biome_metrics_*.csv for each region from the
+    spatial_generalisation directory (written by spatial_CV_2).
+    Gracefully skips any region whose CSV is not yet available.
+    """
+    print("\n" + "=" * 70)
+    print("CREATING BIOME SCATTER (CROSS-REGION)")
+    print("=" * 70)
+
+    REGION_CONFIGS = [
+        ("south_america", "South America"),
+        ("usa",           "United States"),
+        ("se_asia",       "SE Asia"),
+    ]
+    BIOME_SHORT = {
+        "Deserts & Xeric Shrublands":                                    "Deserts",
+        "Flooded Grasslands & Savannas":                                 "Flooded Grass.",
+        "Mangroves":                                                     "Mangroves",
+        "Mediterranean Forests, Woodlands & Scrub":                     "Mediter. Forests",
+        "Montane Grasslands & Shrublands":                               "Montane Grass.",
+        "Temperate Broadleaf & Mixed Forests":                           "Temp. Broadleaf",
+        "Tropical & Subtropical Dry Broadleaf Forests":                  "Trop. Dry BL",
+        "Tropical & Subtropical Grasslands, Savannas & Shrublands":     "Trop. Grass.",
+        "Tropical & Subtropical Moist Broadleaf Forests":               "Trop. Moist BL",
+        "Temperate Conifer Forests":                                     "Temp. Conifers",
+        "Temperate Grasslands, Savannas & Shrublands":                   "Temp. Grass.",
+        "Tropical & Subtropical Coniferous Forests":                     "Trop. Conifers",
+        "Boreal Forests/Taiga":                                          "Boreal",
+    }
+
+    def _latest_biome_csv(slug: str) -> Optional[Path]:
+        search_dirs = []
+        if scratch_root:
+            search_dirs.append(scratch_root / f"outputs/{slug}/results/spatial_generalisation")
+        search_dirs.append(repo_root / f"outputs/{slug}/results/spatial_generalisation")
+        for d in search_dirs:
+            if d.exists():
+                matches = sorted(d.glob("biome_metrics_*.csv"))
+                if matches:
+                    return matches[-1]
+        return None
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    fig.suptitle(
+        "Biome-level Prediction Quality: Precision@1\\% vs. Recall@1\\% (LightGBM test set)",
+        fontsize=11, fontweight="bold", y=1.01,
+    )
+
+    any_data = False
+    for ax, (slug, label) in zip(axes, REGION_CONFIGS):
+        path = _latest_biome_csv(slug)
+        if path is None:
+            ax.set_title(f"{label}\n(biome_metrics CSV not found)")
+            print(f"  Skipping {label}: biome_metrics CSV not found in spatial_generalisation/")
+            continue
+
+        print(f"  {label}: {path}")
+        df_b = pd.read_csv(path)
+        df_b = df_b[df_b["model"] == "LGBM"].copy()
+        df_b = df_b[df_b["n_positives"] >= 20].copy()
+        if df_b.empty:
+            ax.set_title(f"{label}\n(no biomes with ≥20 positives)")
+            continue
+
+        any_data = True
+        precision = df_b["precision_at_1pct"].values
+        recall    = df_b["recall_at_1pct"].values
+        n_pos     = df_b["n_positives"].values
+        biomes    = df_b["biome"].values
+        pos_rate  = df_b["positive_rate"].values
+
+        sizes = np.clip(np.log1p(n_pos) * 12, 40, 600)
+        sc = ax.scatter(recall, precision, s=sizes, c=pos_rate, cmap="YlOrRd",
+                        alpha=0.85, edgecolors="0.3", linewidths=0.5, zorder=3)
+
+        for r, p, b in zip(recall, precision, biomes):
+            short = BIOME_SHORT.get(b, b[:15])
+            ax.annotate(short, (r, p), fontsize=6.5, ha="center", va="bottom",
+                        xytext=(0, 4), textcoords="offset points", zorder=4)
+
+        ax.plot([0, 1], [0, 1], "k--", linewidth=0.7, alpha=0.4, zorder=1)
+        ax.set_xlabel("Recall @ top-1\\%", fontsize=9)
+        ax.set_ylabel("Precision @ top-1\\%" if ax == axes[0] else "", fontsize=9)
+        ax.set_xlim(-0.02, 1.05)
+        ax.set_ylim(-0.02, 1.05)
+        ax.set_title(label, fontsize=10, fontweight="bold")
+        ax.grid(True, alpha=0.2, zorder=0)
+
+        cbar = fig.colorbar(sc, ax=ax, shrink=0.8, pad=0.02)
+        cbar.set_label("Positive rate", fontsize=7)
+        cbar.ax.tick_params(labelsize=6.5)
+
+    if not any_data:
+        plt.close()
+        print("  Skipped: no biome_metrics CSVs available.")
+        return
+
+    legend_elements = [
+        plt.scatter([], [], s=np.log1p(500) * 12, c="grey", alpha=0.6,
+                    edgecolors="0.3", label="N=500"),
+        plt.scatter([], [], s=np.log1p(5000) * 12, c="grey", alpha=0.6,
+                    edgecolors="0.3", label="N=5,000"),
+        plt.scatter([], [], s=np.log1p(50000) * 12, c="grey", alpha=0.6,
+                    edgecolors="0.3", label="N=50,000"),
+    ]
+    axes[1].legend(handles=legend_elements, title="N designations\n(bubble size)",
+                   fontsize=6.5, title_fontsize=7, loc="lower right", framealpha=0.8)
+
+    plt.tight_layout()
+    out_path = output_dir / "biome_scatter_pr.pdf"
+    plt.savefig(out_path, bbox_inches="tight", dpi=150)
+    plt.close()
+    print(f"  Saved: {out_path}")
+
+
+def create_model_comparison_landscape(
+    output_dir: Path,
+    repo_root: Path,
+    scratch_root: Optional[Path],
+) -> None:
+    """Two-panel cross-model performance landscape figure.
+
+    Panel A: Precision@K% threshold decay profiles (LGBM solid, RF dashed).
+    Panel B: ROC-AUC vs Lift@1% scatter for all 6 models (3 regions × 2 algos).
+
+    Reads metrics_table.csv written by Stage 7 for each region/algorithm.
+    Gracefully skips models where data is unavailable.
+    """
+    from scipy.interpolate import PchipInterpolator
+    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D as _Line2D
+
+    print("\n" + "=" * 70)
+    print("CREATING MODEL COMPARISON LANDSCAPE")
+    print("=" * 70)
+
+    REGION_CONFIGS = [
+        ("south_america", "model1", "South America"),
+        ("usa",           "model2", "United States"),
+        ("se_asia",       "model3", "SE Asia"),
+    ]
+    ALGO_CONFIGS = [
+        ("lgbm", "LightGBM", "-",  "o", 1.00),
+        ("rf",   "RF",       "--", "s", 0.65),
+    ]
+    REGION_COLORS = {
+        "South America": "#E69F00",
+        "United States": "#0072B2",
+        "SE Asia":       "#7B2CBF",
+    }
+
+    def _find_metrics_csv(slug: str, model_id: str, algo: str) -> Optional[Path]:
+        candidates = []
+        if scratch_root:
+            candidates.append(scratch_root / f"outputs/{slug}/results/{model_id}_{algo}/metrics_table.csv")
+        candidates.append(repo_root / f"outputs/{slug}/results/{model_id}_{algo}/metrics_table.csv")
+        for c in candidates:
+            if c.exists():
+                return c
+        return None
+
+    def _load_metrics(slug: str, model_id: str, algo: str) -> Optional[dict]:
+        path = _find_metrics_csv(slug, model_id, algo)
+        if path is None:
+            return None
+        df_m = pd.read_csv(path)
+        m = dict(zip(df_m["Metric"].str.strip(), df_m["Value"].astype(str)))
+        def _f(key: str) -> Optional[float]:
+            try:
+                return float(m[key]) if key in m else None
+            except (ValueError, TypeError):
+                return None
+        return {
+            "roc":   _f("ROC AUC"),
+            "lift1": _f("Lift @ 1%"),
+            "p1":    _f("Precision @ 1%"),
+            "p5":    _f("Precision @ 5%"),
+            "p10":   _f("Precision @ 10%"),
+            "base":  _f("Baseline Rate"),
+        }
+
+    all_models: dict[str, dict] = {}
+    for slug, model_id, region_label in REGION_CONFIGS:
+        for algo, algo_label, linestyle, marker, alpha in ALGO_CONFIGS:
+            data = _load_metrics(slug, model_id, algo)
+            if data:
+                data.update({"region": region_label, "algo": algo_label,
+                             "linestyle": linestyle, "marker": marker, "alpha": alpha})
+                all_models[f"{region_label} {algo_label}"] = data
+                print(f"  Loaded: {region_label} {algo_label}")
+            else:
+                print(f"  Not found: outputs/{slug}/results/{model_id}_{algo}/metrics_table.csv")
+
+    if not all_models:
+        print("  Skipped: no metrics_table.csv files found.")
+        return
+
+    THRESHOLDS = [1, 5, 10]
+    X_SMOOTH = np.linspace(1, 100, 400)
+
+    fig, (ax_left, ax_right) = plt.subplots(
+        1, 2, figsize=(11, 4.5),
+        gridspec_kw={"width_ratios": [1.35, 1]},
+    )
+    fig.subplots_adjust(wspace=0.36)
+
+    # ── Panel A: Precision-at-threshold profiles ───────────────────────────────
+    ax = ax_left
+    K_BREAK, TAIL_COMPRESS = 10.0, 0.18
+
+    def _k_fwd(x):
+        x = np.asarray(x)
+        return np.where(x <= K_BREAK, x, K_BREAK + (x - K_BREAK) * TAIL_COMPRESS)
+
+    def _k_inv(x):
+        x = np.asarray(x)
+        return np.where(x <= K_BREAK, x, K_BREAK + (x - K_BREAK) / TAIL_COMPRESS)
+
+    ax.set_xscale("function", functions=(_k_fwd, _k_inv))
+
+    for key, m in all_models.items():
+        vals = [m.get("p1"), m.get("p5"), m.get("p10"), m.get("base")]
+        if any(v is None for v in vals):
+            continue
+        smooth = np.clip(PchipInterpolator([1, 5, 10, 100], vals)(X_SMOOTH), 0, None)
+        col = REGION_COLORS.get(m["region"], "grey")
+        lw  = 0.75 if m["algo"] == "LightGBM" else 0.55
+        ms  = 4.2  if m["algo"] == "LightGBM" else 3.4
+        ax.plot(X_SMOOTH, smooth, m["linestyle"], color=col, linewidth=lw,
+                alpha=m["alpha"], zorder=4 if m["algo"] == "LightGBM" else 3)
+        ax.plot(THRESHOLDS, [m["p1"], m["p5"], m["p10"]], m["marker"],
+                color=col, markersize=ms, alpha=m["alpha"],
+                zorder=5 if m["algo"] == "LightGBM" else 4)
+
+    ax.set_xlabel("Top-$K$\\% risk zone", fontsize=9.5)
+    ax.set_ylabel("Precision @ top-$K$\\%", fontsize=9.5)
+    ax.set_xlim(1, 100)
+    ax.set_xticks([1, 5, 10, 25, 50, 100])
+    ax.set_xticklabels(["1\\%", "5\\%", "10\\%", "25\\%", "50\\%", "100\\%"], fontsize=8)
+    ax.set_ylim(-0.02, 0.72)
+    ax.grid(True, alpha=0.25)
+    ax.set_title("(a) Targeting Precision at Different Risk Thresholds",
+                 fontsize=9.5, fontweight="bold", pad=8)
+
+    present_regions = {m["region"] for m in all_models.values()}
+    region_handles = [
+        _Line2D([], [], color=col, linewidth=0.9, label=reg)
+        for reg, col in REGION_COLORS.items() if reg in present_regions
+    ]
+    algo_handles = [
+        _Line2D([], [], color="0.3", linestyle="-",  linewidth=0.9, marker="o",
+                markersize=5, label="LightGBM"),
+        _Line2D([], [], color="0.3", linestyle="--", linewidth=0.65, marker="s",
+                markersize=4, alpha=0.7, label="Random Forest"),
+    ]
+    leg1 = ax.legend(handles=region_handles, loc="upper right",
+                     fontsize=7.5, title="Region", title_fontsize=8,
+                     framealpha=0.85, handlelength=1.5)
+    ax.add_artist(leg1)
+    ax.legend(handles=algo_handles, loc="center right",
+              fontsize=7.5, title="Algorithm", title_fontsize=8,
+              framealpha=0.85, handlelength=1.8, bbox_to_anchor=(1.0, 0.45))
+
+    # ── Panel B: ROC-AUC vs Lift@1% scatter ───────────────────────────────────
+    ax = ax_right
+    for key, m in all_models.items():
+        roc, lift1 = m.get("roc"), m.get("lift1")
+        if roc is None or lift1 is None:
+            continue
+        col = REGION_COLORS.get(m["region"], "grey")
+        ax.scatter(roc, lift1,
+                   s=120 if m["algo"] == "LightGBM" else 80,
+                   c=col, marker=m["marker"],
+                   edgecolors="white", linewidths=1.0, alpha=0.92, zorder=4)
+        short = key.replace(" LightGBM", " LGB")
+        ax.annotate(short, (roc, lift1), textcoords="offset points",
+                    xytext=(5, 4) if m["algo"] == "LightGBM" else (5, -9),
+                    fontsize=7, color=col, fontweight="bold")
+
+    ax.set_xlabel("ROC-AUC", fontsize=9.5)
+    ax.set_ylabel("Lift @ top-1\\%", fontsize=9.5)
+    ax.grid(True, alpha=0.25)
+    ax.set_title("(b) Discrimination vs.\\ Targeting Effectiveness",
+                 fontsize=9.5, fontweight="bold", pad=8)
+
+    patch_handles = [
+        Patch(color=col, label=reg)
+        for reg, col in REGION_COLORS.items() if reg in present_regions
+    ]
+    algo_handles2 = [
+        _Line2D([], [], marker="o", color="0.3", linestyle="None",
+                markersize=7, label="LightGBM"),
+        _Line2D([], [], marker="s", color="0.3", linestyle="None",
+                markersize=6, label="RF"),
+    ]
+    leg3 = ax.legend(handles=patch_handles, fontsize=7.5, loc="lower right",
+                     title="Region", title_fontsize=8, framealpha=0.85)
+    ax.add_artist(leg3)
+    ax.legend(handles=algo_handles2, fontsize=7.5, loc="lower left",
+              title="Algorithm", title_fontsize=8, framealpha=0.85)
+
+    out_path = output_dir / "model_comparison_landscape.pdf"
+    plt.savefig(out_path, bbox_inches="tight", dpi=200)
+    plt.close()
+    print(f"  Saved: {out_path}")
 
 
 def main() -> None:
@@ -3884,6 +4195,10 @@ def main() -> None:
 
     # Cross-region comparison table (reads the other region's metrics_table.csv if available)
     create_comparison_table(output_dir, args.model_type, repo_root, scratch_root)
+    # Cross-region scatter: biome-level precision@1% vs recall@1% (needs spatial_CV_2 outputs)
+    create_biome_scatter_comparison(output_dir, repo_root, scratch_root)
+    # Cross-model landscape: precision-decay curves + ROC vs lift scatter (all 3 regions × 2 algos)
+    create_model_comparison_landscape(output_dir, repo_root, scratch_root)
 
     # Resolve model file for SHAP: explicit --model_pkl, or auto-discover configured model only.
     model_path = None

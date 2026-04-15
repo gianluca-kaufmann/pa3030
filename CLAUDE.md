@@ -63,7 +63,7 @@ Continental regions (South America, USA, SE Asia):
   4_tuning/        -> Hyperparameter search (Optuna / randomized, 3-fold temporal CV)
   5_training/      -> Train/test splits + final model training (LightGBM, RF)
   6_evaluation/    -> Temporal CV, spatial CV, benchmarking, calibration
-  7_results/       -> Metrics, visualizations, risk maps
+  7_results/       -> Metrics, visualizations, risk maps, cross-region figures
   8_forward/       -> Forward predictions to 2030 (deployment model + calibrated inference + scenario analysis)
 
 Sub-region Colombia (south_america/colombia/):
@@ -172,6 +172,9 @@ Region-specific scripts are thin wrappers (2–3 lines each).
 - Probability maps (continuous predictions across the continent)
 - LaTeX metrics tables (paper-ready)
 - SHAP feature importance plots (optional)
+- Cross-region comparison table (`comparison_table.pdf/.tex`)
+- Biome-level PR scatter across all 3 regions (`biome_scatter_pr.pdf`, needs `spatial_CV_2` outputs)
+- Model performance landscape: precision-decay + ROC vs lift (`model_comparison_landscape.pdf`)
 
 ## Important Scope Limitation: Prediction vs. Prescription
 
