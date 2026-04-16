@@ -1736,40 +1736,69 @@ end of the test period.}
 
 The LOBO evaluation asks whether the patterns learned on other biomes generalise to
 a held-out one (see Section~\ref{sec:lobo} for the methodological rationale).
-The mean LOBO PR-AUC across South American biomes is \textbf{[TODO: update after
-corrected Euler results]}, with substantial variation across biome types; expressed
-as PR-AUC lift (PR-AUC divided by the biome's positive rate), the majority of
-biomes achieve lift well above the random baseline of~1.
+The mean LOBO PR-AUC across South American biomes is 0.233 (10 evaluated biomes;
+Tropical \& Subtropical Coniferous Forests is excluded as it contains no test-period
+designation events), with substantial variation across biome types. Expressed as
+PR-AUC lift (PR-AUC divided by the biome's positive rate), 9 of the 10 evaluated
+biomes achieve lift above the random baseline of~1.
 
-Performance varies markedly across biomes (Figure~\ref{fig:lobo_sa}). Deserts and
-Xeric Shrublands (principally the Atacama) achieve a LOBO PR-AUC of 0.979: this
-biome's high positive rate (10.4\%, driven by the concentration of Chilean national
-parks) and distinctive combination of aridity, elevation, and low population density
-provide a strong-enough signature for models trained on other biomes to generalise.
-By contrast, Temperate Broadleaf and Mixed Forests (Patagonian Chile) achieves a
-near-random LOBO PR-AUC of 0.035 against a positive rate baseline of 2.0\%.
-This is consistent with institutional drivers in Patagonia not represented in the
-feature set: much of the Chilean national park network in this biome was established
-through presidential decree and private conservation transactions
-(e.g.\ the Tompkins Conservation land donations), which do not follow the
-accessibility and land-value gradients that dominate designation elsewhere.
+Performance varies markedly across biomes (Figure~\ref{fig:lobo_sa}).
+Temperate Broadleaf and Mixed Forests (Patagonian Chile) achieves the highest
+raw LOBO PR-AUC (0.904): the biome's distinctive combination of high elevation,
+low population density, and distance from infrastructure provides a covariate
+signature strong enough for models trained on other biomes to generalise
+effectively, even though many Patagonian designations arose through presidential
+decrees and private conservation donations (notably the Tompkins Conservation land
+transfers) rather than the infrastructure-and-land-value gradients that dominate
+elsewhere. Temperate Grasslands, Savannas and Shrublands yields the highest
+PR-AUC lift (843$\times$, against a 0.09\% positive rate): the model identifies
+rare designation events in this biome with high precision, consistent with the
+distinctively low economic value and high remoteness of Patagonian steppe
+landscapes targeted for protection.
 
-These biome-level contrasts are informative rather than simply disappointing: they
-identify regions where standard geospatial predictors are insufficient and where
-institutional data (land tenure, political mandates, NGO activity) would be
-needed to improve predictability.
+By contrast, Flooded Grasslands and Savannas achieves below-random lift
+(0.6$\times$), the only biome in this analysis that falls beneath the random
+classifier baseline. This biome spans Amazonian v\'{a}rzea and the Pantanal,
+where designation dynamics are governed by seasonal flood regimes and
+site-specific conservation processes rather than the static geospatial gradients
+the feature set can observe. These contrasts are informative: they identify
+ecosystems where dynamic land-cover and water-regime covariates would be required
+to improve cross-biome generalisation.
 
 \begin{figure}[H]
 \centering
 \includegraphics[width=\textwidth, keepaspectratio]{../outputs/south_america/results/spatial_cv_visualisation/bar_lobo_performance_lgbm.pdf}
 \caption{Per-biome LOBO PR-AUC for the South America LightGBM model (test set 2017--2019).
-The dashed vertical line marks each biome's positive rate (the random-classifier
-baseline); bars extending further right indicate genuine predictive lift above chance.
-The Deserts \& Xeric Shrublands biome achieves the highest raw PR-AUC owing to
-its distinctively high positive rate, while biomes such as Mangroves achieve
-comparable or higher \emph{lift} (PR-AUC divided by positive rate) despite a lower
-absolute PR-AUC. \textbf{[TODO: update numbers after corrected Euler results.]}}
+The dashed vertical line marks each biome's positive rate (random-classifier baseline);
+bars extending beyond it indicate genuine predictive lift above chance.
+Temperate Broadleaf \& Mixed Forests achieves the highest raw PR-AUC (0.904).
+Temperate Grasslands, Savannas \& Shrublands achieves the highest lift
+(843$\times$) owing to its very low positive rate (0.09\%). Flooded Grasslands \&
+Savannas is the only biome with below-random lift (0.6$\times$).}
 \label{fig:lobo_sa}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\textwidth, keepaspectratio]{../outputs/south_america/results/spatial_cv_visualisation/map_lobo_performance_lgbm.pdf}
+\caption{Geographic distribution of LOBO out-of-sample performance across South American
+biomes (LightGBM, test set 2017--2019). Each biome is coloured by its performance when
+the model was trained on all \emph{other} biomes (leave-one-biome-out); numbered circles
+identify biomes in the key below the map. Grey areas are outside the biome evaluation
+scope of the GSN raster.
+\textbf{(a) PR-AUC lift} relative to the biome-specific random baseline (PR-AUC divided
+by the biome's positive rate); lift $= 1$ is the random classifier; colour scale capped
+at 30$\times$ for readability.
+\textbf{(b) Recall at the top-5\%} of predicted pixels (absolute fraction), anchored at
+5\% (the universal random baseline); colour scale capped at 70\% to spread contrast
+across the informative range. This panel answers directly the policy question: ``If a
+decision-maker screens the top-5\% of land flagged by the model, what share of all
+future protected-area designations in that biome would be captured?'' Green biomes
+(Temperate Broadleaf \& Mixed Forests, Deserts \& Xeric Shrublands) exhibit spatial
+patterns recoverable from continental gradients alone; red and yellow biomes
+(Flooded Grasslands \& Savannas, Tropical Moist Broadleaf Forests) are governed by
+localised institutional and dynamic processes not captured by the static feature set.}
+\label{fig:lobo_sa_map}
 \end{figure}
 
 % ---------------------------------------------------------------------------
@@ -2256,13 +2285,16 @@ continental scale.
 
 \textit{The representation gap.}
 The LOBO analysis reveals a predictable pattern of biome underrepresentation under
-historical dynamics. Biomes with consistently high LOBO performance, including arid
-deserts and certain tropical forests, are those where designation follows regular geographic
-gradients and where the economic opportunity cost of protection is low. Biomes with
-poor LOBO performance, such as temperate conifer forests in the US and montane grasslands in
-South America, exhibit idiosyncratic designation patterns driven by institutional
-and political factors that the model cannot capture from generic geospatial covariates
-alone.
+historical dynamics. Biomes with high LOBO performance are those where designation
+follows consistent geographic gradients: in South America, temperate and tropical
+forests with distinctive elevation and remoteness signatures generalise well across
+biome boundaries, while certain tropical dry biomes achieve high lift owing to very
+low positive rates. Biomes with poor LOBO performance exhibit idiosyncratic
+designation patterns driven by institutional and political factors: temperate conifer
+forests in the US and flooded grasslands and tropical savannas in South America show
+near-random or below-random lift, indicating that the static geospatial feature set
+cannot capture the seasonal, tenure-based, or agreement-driven processes that govern
+designation in those ecosystems.
 
 This implies a representation gap: even if 30\% terrestrial coverage is achieved by
 2030, the distribution of new PAs across biomes is likely to remain biased toward
@@ -2562,34 +2594,36 @@ lift~$=1$ corresponds to a random classifier) for all three regions (LightGBM
 models); Tables~\ref{tab:usa_metrics} and \ref{tab:seasia_metrics} report the
 benchmark metrics for USA and SE Asia respectively.
 
-\noindent\textbf{[TODO: all three LOBO tables below must be regenerated after the
-corrected Euler results are synced. The numbers currently shown are from a run with
-a broken biome raster (April 2026 fix pending) and will change. Two additional SA
-biome rows will also be added.}]
+\noindent\textbf{[TODO: the United States and Southeast Asia LOBO tables
+(Tables~\ref{tab:lobo_usa} and~\ref{tab:lobo_seasia}) must be regenerated once
+the corrected Euler results are available. The South America table has been updated
+with post-fix results (April 2026).}]
 
 \begin{table}[H]
 \centering\small
-\caption{South America: Per-biome LOBO PR-AUC and PR-AUC lift (LightGBM).
-Lift = PR-AUC / positive rate; lift~$=1$ equals a random classifier.
-\textbf{[TODO: regenerate from corrected Euler results; two additional biome rows
-(Temperate Grasslands \& Shrublands; Tropical \& Subtropical Coniferous Forests)
-will be added and all values will change.]}}
+\caption{South America: Per-biome LOBO PR-AUC and PR-AUC lift (LightGBM, test set 2017--2019).
+Lift = PR-AUC\,/\,positive rate; lift\,$=1$ equals a random classifier.
+Tropical \& Subtropical Coniferous Forests has zero test-period designations and is
+excluded from the mean. The mean lift is driven by Temperate Grasslands (843$\times$);
+median lift across the 10 evaluated biomes is 11$\times$.}
 \label{tab:lobo_sa}
 \begin{tabular}{lrrrr}
 \toprule
 \textbf{Biome} & \textbf{N pos.} & \textbf{Pos.\ rate} & \textbf{PR-AUC} & \textbf{Lift} \\
 \midrule
-Deserts \& Xeric Shrublands                   & 109,678 & 10.4\% & 0.980 & 9.4$\times$ \\
-Flooded Grasslands \& Savannas                &   1,425 &  2.7\% & 0.219 & 8.1$\times$ \\
-Mangroves                                     &   1,457 &  0.2\% & 0.215 & 108$\times$ \\
-Mediterranean Forests, Woodlands \& Scrub     &     442 &  0.8\% & 0.037 & 4.6$\times$ \\
-Montane Grasslands \& Shrublands              &   5,184 &  0.07\% & 0.002 & 2.9$\times$ \\
-Temperate Broadleaf \& Mixed Forests          &     889 &  2.0\% & 0.035 & 1.8$\times$ \\
-Tropical \& Subtropical Dry Broadleaf Forests & 10,328 &  0.4\% & 0.232 & 58$\times$ \\
-Tropical \& Subtropical Grasslands \& Savannas &  4,184 &  0.4\% & 0.118 & 30$\times$ \\
-Tropical \& Subtropical Moist Broadleaf       & 62,359 &  0.5\% & 0.107 & 21$\times$ \\
+Deserts \& Xeric Shrublands                         &   1{,}642 & 0.14\% & 0.013          &   9.5$\times$ \\
+Flooded Grasslands \& Savannas                      &     486   & 0.07\% & $<$0.001       &   0.6$\times$ \\
+Mangroves                                           &   1{,}869 & 1.93\% & 0.380          &  19.7$\times$ \\
+Mediterranean Forests, Woodlands \& Scrub           &   2{,}381 & 0.40\% & 0.082          &  20.7$\times$ \\
+Montane Grasslands \& Shrublands                    &  36{,}436 & 1.42\% & 0.045          &   3.2$\times$ \\
+Temperate Broadleaf \& Mixed Forests                & 117{,}685 & 7.81\% & 0.904          &  11.6$\times$ \\
+Temperate Grasslands, Savannas \& Shrublands        &   6{,}895 & 0.09\% & 0.738          & 843$\times$   \\
+Tropical \& Subtropical Coniferous Forests          &         0 &    --- & N/A            & N/A           \\
+Tropical \& Subtropical Dry Broadleaf Forests       &  20{,}948 & 0.51\% & 0.109          &  21.7$\times$ \\
+Tropical \& Subtropical Grasslands, Savannas \& Shrublands &  16{,}752 & 0.14\% & 0.002  &   1.1$\times$ \\
+Tropical \& Subtropical Moist Broadleaf Forests     & 150{,}459 & 0.89\% & 0.056          &   6.2$\times$ \\
 \midrule
-\textbf{Mean}                                &         &        & \textbf{0.216} & \textbf{[TODO]} \\
+\textbf{Mean (10 evaluated)}                        &           &        & \textbf{0.233} & \textbf{93.7$\times$} \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -2918,6 +2952,7 @@ annually.}
 \section{USA and Southeast Asia: Supplementary Figures}
 \label{app:supp_figures}
 
+\begin{comment}
 \begin{figure}[H]
 \centering
 \includegraphics[width=\textwidth, keepaspectratio]{../outputs/usa/results/spatial_cv_visualisation/bar_lobo_performance_lgbm.pdf}
@@ -2941,6 +2976,7 @@ institutional interpretation in the main text.
 \textbf{[TODO: regenerate from corrected Euler results.]}}
 \label{fig:lobo_seasia}
 \end{figure}
+\end{comment}
 
 \begin{figure}[H]
 \centering

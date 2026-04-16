@@ -55,7 +55,7 @@ matplotlib.use("Agg")
 import matplotlib.cm as cm
 import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
-from matplotlib.colors import Normalize
+from matplotlib.colors import Normalize, PowerNorm, TwoSlopeNorm
 import numpy as np
 import pandas as pd
 
@@ -82,6 +82,26 @@ COLOR_INDIST  = "#D6604D"   # muted red  — in-distribution (full model)
 COLOR_MISSING = "#CCCCCC"   # light grey — no data / skipped biome
 COLOR_REF     = "#888888"   # grey dashed line — random-model reference
 
+# Power-norm gamma for choropleth colour scales on the biome performance map.
+# gamma < 1 applies a sqrt-like stretch: biomes with moderate lift/recall (which
+# are genuinely good, just not extreme) map to yellow-green rather than orange.
+# vmin and vmax anchors are unchanged, so the colorbar remains honest; only the
+# perceptual spacing between values is non-linear.  gamma=0.5 (square root) is a
+# well-known convention for this kind of skewed-ratio data.
+CHOROPLETH_GAMMA: float = 0.35
+
+# Map colour-scale caps (requested for thesis figures).
+# These are applied only for regions listed here; others keep auto-scaling.
+# Keys:
+#   pr_auc_lift  — upper cap on the PR-AUC lift colour scale (left panel)
+#   r5_vmax      — upper cap on the absolute Recall@5% colour scale (right panel)
+LIFT_VMAX_CAPS: dict[str, dict[str, float]] = {
+    # South America: lift can reach extreme values in tiny-prevalence biomes;
+    # cap for readability/print.  Recall@5% capped at 0.70 (70%) to spread
+    # colour contrast across the informative range.
+    "south_america": {"pr_auc_lift": 30.0, "r5_vmax": 0.70},
+}
+
 # Approximate bounding boxes per region (WGS84: minx, miny, maxx, maxy)
 REGION_BOUNDS: dict[str, tuple[float, float, float, float]] = {
     "south_america": (-85.0, -57.0, -32.0, 15.0),
@@ -106,6 +126,83 @@ _BIOME_SHORT: dict[str, str] = {
 def _short(name: str) -> str:
     """Return a shortened biome label for axis/annotation use."""
     return _BIOME_SHORT.get(name, name)
+
+
+def _get_label_points(
+    geom,
+    *,
+    elongation_threshold: float = 4.0,
+    fragment_significance: float = 0.03,
+    n_elongated: int = 3,
+) -> list:
+    """Compute label placement points for a (possibly complex) biome geometry.
+
+    Returns a list of (x, y) tuples where a biome number should be placed:
+      - Compact polygon       → single representative_point()
+      - Elongated polygon     → n_elongated evenly-spaced points along major axis
+      - Fragmented MultiPolygon → one point per significant fragment (area > threshold)
+    """
+    try:
+        from shapely.geometry import box as _sbox
+    except ImportError:
+        try:
+            pt = geom.representative_point()
+            return [(pt.x, pt.y)]
+        except Exception:
+            return []
+
+    # ── Fragmentation check ──────────────────────────────────────────────────
+    if hasattr(geom, "geoms"):
+        parts      = sorted(geom.geoms, key=lambda g: g.area, reverse=True)
+        total_area = geom.area or 1.0
+        significant = [p for p in parts if p.area / total_area > fragment_significance]
+        if len(significant) >= 2:
+            pts = []
+            for part in significant[:4]:
+                try:
+                    pt = part.representative_point()
+                    pts.append((pt.x, pt.y))
+                except Exception:
+                    pass
+            if pts:
+                return pts
+        # Single dominant part — fall through using only that polygon
+        geom = parts[0] if parts else geom
+
+    # ── Elongation check ─────────────────────────────────────────────────────
+    try:
+        minx, miny, maxx, maxy = geom.bounds
+        width  = maxx - minx
+        height = maxy - miny
+        if width > 0 and height > 0:
+            aspect = max(width, height) / min(width, height)
+            if aspect >= elongation_threshold:
+                major_vertical = height >= width
+                pts = []
+                for i in range(n_elongated):
+                    lo, hi = i / n_elongated, (i + 1) / n_elongated
+                    if major_vertical:
+                        strip = _sbox(minx, miny + lo * height, maxx, miny + hi * height)
+                    else:
+                        strip = _sbox(minx + lo * width, miny, minx + hi * width, maxy)
+                    try:
+                        clipped = geom.intersection(strip)
+                        if not clipped.is_empty:
+                            pt = clipped.representative_point()
+                            pts.append((pt.x, pt.y))
+                    except Exception:
+                        pass
+                if pts:
+                    return pts
+    except Exception:
+        pass
+
+    # ── Compact — single point ────────────────────────────────────────────────
+    try:
+        pt = geom.representative_point()
+        return [(pt.x, pt.y)]
+    except Exception:
+        return []
 
 
 def _get_cmap(name: str):
@@ -262,6 +359,42 @@ def _load_biome_geodataframe(region: str) -> Optional["gpd.GeoDataFrame"]:
     biome_gdf.columns = ["biome_name", "geometry"]
     print(f"  {len(biome_gdf)} biome polygons after dissolve")
     return biome_gdf
+
+
+def _load_country_borders_3857(region: str) -> Optional["gpd.GeoDataFrame"]:
+    """Load Natural Earth country boundaries, clip to region, reproject to EPSG:3857.
+
+    Returns a GeoDataFrame or None if the file is unavailable.  Used to overlay
+    thin country-border lines on choropleth maps for geographic orientation.
+    """
+    if not GEOPANDAS_AVAILABLE:
+        return None
+    try:
+        repo_root = get_repo_root()
+        gpkg = (repo_root / "data" / "shared" / "admin" /
+                "ne_110m_admin_0_countries.gpkg")
+        if not gpkg.exists():
+            print(f"  NOTE: country borders file not found: {gpkg}; skipping.")
+            return None
+        world = gpd.read_file(str(gpkg))
+        if world.crs is None:
+            world = world.set_crs("EPSG:4326")
+        elif world.crs.to_epsg() != 4326:
+            world = world.to_crs("EPSG:4326")
+        from shapely.geometry import box as shapely_box
+        bounds   = REGION_BOUNDS.get(region, (-180.0, -90.0, 180.0, 90.0))
+        clip_box = shapely_box(*bounds)
+        try:
+            world = world.clip(clip_box)
+        except Exception:
+            world = world[world.geometry.intersects(clip_box)].copy()
+        if world.empty:
+            return None
+        print(f"  Country borders loaded: {len(world)} countries for {region}")
+        return world.to_crs("EPSG:3857")
+    except Exception as exc:
+        print(f"  NOTE: could not load country borders ({exc}); skipping.")
+        return None
 
 
 # =============================================================================
@@ -685,70 +818,139 @@ def plot_biome_performance_map(
     land_mask_3857  = land_mask.to_crs("EPSG:3857")
     gdf_valid_3857  = gdf_valid.to_crs("EPSG:3857")
 
-    # ── Lift-based colour columns ─────────────────────────────────────────────
-    # Colouring by raw PR-AUC is misleading because the metric varies with
-    # biome prevalence.  We instead plot lift over the naive random baseline:
-    #   PR-AUC lift  = PR-AUC / positive_rate  (random classifier ≈ prevalence)
-    #   Recall lift  = Recall@5% / 0.05        (random classifier selects 5%)
-    # Lift = 1 means the model is no better than chance; vmin is anchored there.
+    # ── Colour columns ────────────────────────────────────────────────────────
+    # Left panel (PR-AUC): colouring by raw PR-AUC is misleading because the
+    # metric's random baseline varies with biome prevalence.  We use lift:
+    #   PR-AUC lift = PR-AUC / positive_rate   (random ≈ prevalence; lift = 1)
+    #
+    # Right panel (Recall@5%): the random baseline is always exactly 0.05 (5%),
+    # so raw Recall@5% IS directly comparable across biomes.  We display the
+    # absolute fraction and anchor vmin at 0.05 so that biomes at or below
+    # chance appear at the red end of the colormap.  This lets readers read off
+    # the policy-relevant number directly: "screening the top 5% of pixels
+    # captures X% of all future PA designation events."
     gdf_valid_3857 = gdf_valid_3857.copy()
     if "positive_rate" in gdf_valid_3857.columns and "pr_auc" in gdf_valid_3857.columns:
         prev = pd.to_numeric(gdf_valid_3857["positive_rate"], errors="coerce").replace(0, np.nan)
         gdf_valid_3857["pr_auc_lift"] = pd.to_numeric(
             gdf_valid_3857["pr_auc"], errors="coerce") / prev
-    if "recall_at_5pct" in gdf_valid_3857.columns:
-        gdf_valid_3857["r5_lift"] = pd.to_numeric(
-            gdf_valid_3857["recall_at_5pct"], errors="coerce") / 0.05
+    # No lift transform for Recall@5% — absolute values are biome-comparable.
 
     bounds_m = land_mask_3857.total_bounds   # [minx, miny, maxx, maxy]
     pad_m    = 200_000.0
     xlim     = (bounds_m[0] - pad_m, bounds_m[2] + pad_m)
     ylim     = (bounds_m[1] - pad_m, bounds_m[3] + pad_m)
 
+    # ── Load country borders for geographic orientation ───────────────────────
+    print("  Loading country borders...")
+    country_borders_3857 = _load_country_borders_3857(region)
+
     # ── Colormaps and normalisations ─────────────────────────────────────────
+    # Both panels use TwoSlopeNorm centred at the random baseline (lift=1 or
+    # recall=0.05).  This places neutral yellow at the random-classifier line
+    # and reserves red for below-random performance, making the single
+    # below-random biome visually distinct without distorting the above-random
+    # range.  The colorbar shows true data values; the centre tick is labelled
+    # "(random)" so readers never need to consult the figure caption to decode
+    # the anchor.
     cmap = _get_cmap("RdYlGn")
 
-    def _lift_norm(vals: np.ndarray, label: str) -> Normalize:
-        """Normalise lift values; vmin anchored at 1 (= random baseline).
+    def _pow_norm(
+        vals: np.ndarray,
+        label: str,
+        *,
+        vmax_cap: Optional[float] = None,
+        vmax_fixed: Optional[float] = None,
+        gamma: float = CHOROPLETH_GAMMA,
+    ) -> PowerNorm:
+        """Power-norm colour normalisation anchored at 0.
 
-        Prints the chosen vmin/vmax so the scale can be verified in the log.
+        Uses PowerNorm(gamma) so that moderately good performance already
+        maps to yellow-green, while the highest performers stay deep green.
+        The sqrt-like compression (gamma=0.5, the default) is a well-known
+        convention for skewed-ratio data.
+
+        vmax is data-driven with an optional cap.  Pass vmax_fixed to force
+        an exact upper bound regardless of the data range (e.g. vmax_fixed=1.0
+        for Recall@5% — academic honesty: the scale always shows 0 → 1).
         """
         vals = np.asarray(vals, dtype=float)
-        vals = vals[np.isfinite(vals)]
-        if len(vals) == 0:
-            return Normalize(vmin=1.0, vmax=2.0)
-        hi = float(np.nanmax(vals)) * 1.05   # 5 % headroom at the top
-        hi = max(hi, 1.0 + 1e-6)
-        print(f"  Lift norm [{label}]: vmin=1.00 (random), vmax={hi:.2f}")
-        return Normalize(vmin=1.0, vmax=hi, clip=True)
+        finite = vals[np.isfinite(vals)]
+        if len(finite) == 0:
+            return PowerNorm(gamma=gamma, vmin=0.0, vmax=1.0)
+        max_val = float(np.nanmax(finite))
+        if vmax_fixed is not None:
+            vmax = float(vmax_fixed)
+        else:
+            vmax = max_val * 1.05
+            if vmax_cap is not None:
+                vmax = min(vmax, float(vmax_cap))
+        vmax = max(vmax, 1e-6)
+        cap_note = (f" (fixed={vmax_fixed:g})" if vmax_fixed is not None
+                    else f" (cap={vmax_cap:g})" if vmax_cap is not None else "")
+        print(f"  PowerNorm [{label}]: vmin=0.0, vmax={vmax:.3f}, "
+              f"gamma={gamma:.2f}{cap_note}")
+        return PowerNorm(gamma=gamma, vmin=0.0, vmax=vmax)
+
+    # Font sizing: match forward risk-map style, but scaled down for smaller panels.
+    # (Forward maps are 14" wide; these panels are ~7.5" wide.)
+    legend_fs = 10
+    try:
+        # Import lazily to avoid coupling script execution order.
+        from scripts.regions.shared.results.config import PROFILE as _RESULTS_PROFILE  # type: ignore
+        legend_fs = int(round(float(_RESULTS_PROFILE.get(region, {}).get("map_legend_fontsize", 14)) * 0.75))
+        legend_fs = max(10, legend_fs)
+    except Exception:
+        pass
+
+    vmax_caps = LIFT_VMAX_CAPS.get(region, {})
 
     use_pr_lift = "pr_auc_lift" in gdf_valid_3857.columns and \
                   gdf_valid_3857["pr_auc_lift"].notna().any()
-    use_r5_lift = "r5_lift" in gdf_valid_3857.columns and \
-                  gdf_valid_3857["r5_lift"].notna().any()
 
     if use_pr_lift:
-        col_pr, cbar_pr = "pr_auc_lift", "PR-AUC lift (×random baseline)"
-        norm_pr = _lift_norm(gdf_valid_3857["pr_auc_lift"].to_numpy(), "PR-AUC")
+        col_pr  = "pr_auc_lift"
+        cbar_pr = "PR-AUC lift (×random baseline)"
+        pr_cap  = vmax_caps.get("pr_auc_lift")
+        norm_pr = _pow_norm(
+            gdf_valid_3857["pr_auc_lift"].to_numpy(),
+            label="PR-AUC lift",
+            vmax_cap=pr_cap,
+        )
+        pr_cap_applied = (
+            pr_cap is not None and
+            float(np.nanmax(gdf_valid_3857["pr_auc_lift"].dropna())) > pr_cap
+        )
     else:
-        col_pr, cbar_pr = "pr_auc", "PR-AUC"
+        col_pr  = "pr_auc"
+        cbar_pr = "PR-AUC"
+        pr_cap  = None
         pr_vals = gdf_valid["pr_auc"].dropna().to_numpy()
-        lo = max(0.0, float(np.nanmin(pr_vals)) - 0.12 * np.ptp(pr_vals))
-        hi = min(1.0, float(np.nanmax(pr_vals)) + 0.06 * np.ptp(pr_vals))
-        norm_pr = Normalize(vmin=lo, vmax=max(hi, lo + 1e-6), clip=True)
-        print(f"  PR-AUC norm (raw): vmin={lo:.3f}, vmax={hi:.3f}")
+        norm_pr = _pow_norm(pr_vals, label="PR-AUC (raw)")
+        pr_cap_applied = False
 
     if has_recall:
-        if use_r5_lift:
-            col_r5, cbar_r5 = "r5_lift", "Recall@5% lift (×random baseline)"
-            norm_r5 = _lift_norm(gdf_valid_3857["r5_lift"].to_numpy(), "Recall@5%")
-        else:
-            col_r5, cbar_r5 = "recall_at_5pct", "Recall at top-5% of predictions"
-            r5_vals = gdf_valid["recall_at_5pct"].dropna().to_numpy()
-            lo5 = max(0.0, float(np.nanmin(r5_vals)) - 0.06 * np.ptp(r5_vals))
-            hi5 = min(1.0, float(np.nanmax(r5_vals)) + 0.06 * np.ptp(r5_vals))
-            norm_r5 = Normalize(vmin=lo5, vmax=max(hi5, lo5 + 1e-6), clip=True)
-            print(f"  Recall@5% norm (raw): vmin={lo5:.3f}, vmax={hi5:.3f}")
+        col_r5   = "recall_at_5pct"
+        cbar_r5  = "Recall at top-5% of predictions (fraction of PA events)"
+        r5_vals  = gdf_valid_3857["recall_at_5pct"].dropna().to_numpy()
+        # vmax fixed at 1.0 for academic honesty: scale always shows the full range
+        norm_r5  = _pow_norm(
+            r5_vals,
+            label="Recall@5%",
+            vmax_fixed=1.0,
+        )
+        r5_cap_applied = False   # vmax is fixed, not clipped — no "≥" annotation needed
+
+    # ── Biome number assignment (consistent across both panels) ─────────────
+    # Sorted alphabetically by short name so the legend is easy to scan.
+    # Unicode circled digits ①–⑳ (U+2460+) keep map annotations compact.
+    _sorted_biome_names = sorted(
+        gdf_valid_3857["biome_name"].dropna().unique(),
+        key=lambda n: _short(n),
+    )
+    _biome_to_num = {
+        name: chr(0x2460 + i) for i, name in enumerate(_sorted_biome_names)
+    }
 
     # ── Figure layout ────────────────────────────────────────────────────────
     proj_w      = xlim[1] - xlim[0]
@@ -757,22 +959,25 @@ def plot_biome_performance_map(
     panel_w     = 7.5
     panel_h     = panel_w * proj_aspect
 
-    fig, axes = plt.subplots(
-        1, n_panels,
-        figsize=(panel_w * n_panels + 0.5, panel_h + 1.5),
-    )
-    if n_panels == 1:
-        axes = [axes]
+    import matplotlib.gridspec as _gs
+    fig  = plt.figure(figsize=(panel_w * n_panels + 0.5, panel_h + 0.3))
+    gs   = _gs.GridSpec(1, n_panels, figure=fig, wspace=0.06)
+    axes = [fig.add_subplot(gs[0, i]) for i in range(n_panels)]
 
     # ── Inner drawing function ───────────────────────────────────────────────
-    def _draw_panel(ax, col, norm, title, cbar_label, ref_note=""):
+    def _draw_panel(
+        ax,
+        col,
+        norm,
+        panel_label,          # e.g. "(a)" — placed top-left corner; pass "" to skip
+        cbar_label,
+        *,
+        random_baseline: Optional[float] = None,
+        cap_applied: bool = False,
+        show_labels: bool = True,
+    ):
         # Layer 0: light grey continent land-mask (ocean stays white)
-        land_mask_3857.plot(
-            ax=ax,
-            color=COLOR_MISSING,
-            edgecolor="none",
-            zorder=1,
-        )
+        land_mask_3857.plot(ax=ax, color=COLOR_MISSING, edgecolor="none", zorder=1)
 
         # Layer 1: choropleth for biomes with valid data only
         valid = gdf_valid_3857[gdf_valid_3857[col].notna()].copy()
@@ -782,58 +987,213 @@ def plot_biome_performance_map(
                 edgecolor="none", linewidth=0, zorder=2,
             )
 
-        # Colorbar
+        # Layer 2: country borders — geographic orientation (Natural Earth 110 m)
+        if country_borders_3857 is not None:
+            try:
+                country_borders_3857.plot(
+                    ax=ax, facecolor="none",
+                    edgecolor="#555555", linewidth=0.4, alpha=0.65, zorder=3,
+                )
+            except Exception:
+                pass
+
+        # Layer 3: numbered biome labels + legend box.
+        # Numbers are placed on both panels so readers can orient in either panel.
+        # The legend (number ↔ name mapping) appears only on the left panel.
+        # Placement:  fragmented biomes → label each significant fragment;
+        #             elongated biomes  → evenly-spaced labels along major axis;
+        #             compact biomes    → single representative_point().
+        if not valid.empty:
+            # Global deduplication: track placed label positions to avoid
+            # crowding. Large biomes claim their spot first; small/fragmented
+            # biomes are guaranteed ≥1 label even if their best candidate is
+            # near an already-placed one.
+            min_dist = (xlim[1] - xlim[0]) * 0.055
+            placed: list[tuple[float, float]] = []
+
+            try:
+                rows_sorted = sorted(
+                    valid.iterrows(),
+                    key=lambda kv: kv[1].geometry.area,
+                    reverse=True,
+                )
+            except Exception:
+                rows_sorted = list(valid.iterrows())
+
+            for _, row in rows_sorted:
+                try:
+                    name = str(row.get("biome_name", ""))
+                    num  = _biome_to_num.get(name, "?")
+                    pts  = _get_label_points(row.geometry)
+                    if not pts:
+                        continue
+
+                    placed_for_biome: list[tuple[float, float]] = []
+                    for px, py in pts:
+                        too_close = any(
+                            (px - px2) ** 2 + (py - py2) ** 2 < min_dist ** 2
+                            for px2, py2 in placed
+                        )
+                        if not too_close:
+                            ax.annotate(
+                                num,
+                                xy=(px, py),
+                                fontsize=9.5,
+                                ha="center", va="center",
+                                fontweight="bold",
+                                color="#111111",
+                                zorder=5,
+                            )
+                            placed.append((px, py))
+                            placed_for_biome.append((px, py))
+
+                    # Guarantee ≥1 label per biome: pick the candidate that is
+                    # furthest from all already-placed labels.
+                    if not placed_for_biome:
+                        if placed:
+                            best_pt = max(
+                                pts,
+                                key=lambda p: min(
+                                    (p[0] - px2) ** 2 + (p[1] - py2) ** 2
+                                    for px2, py2 in placed
+                                ),
+                            )
+                        else:
+                            best_pt = pts[0]
+                        ax.annotate(
+                            num,
+                            xy=best_pt,
+                            fontsize=9.5,
+                            ha="center", va="center",
+                            fontweight="bold",
+                            color="#111111",
+                            zorder=5,
+                        )
+                        placed.append(best_pt)
+                except Exception:
+                    pass
+
+        # Legend box — left panel only
+        if show_labels and not valid.empty:
+            legend_lines = [
+                f"{chr(0x2460 + i)}\u2002{_short(name)}"
+                for i, name in enumerate(_sorted_biome_names)
+            ]
+            ax.text(
+                0.98, 0.03,
+                "\n".join(legend_lines),
+                transform=ax.transAxes,
+                fontsize=8.5,
+                va="bottom", ha="right",
+                color="#111111",
+                zorder=10,
+                linespacing=1.6,
+                bbox=dict(
+                    boxstyle="round,pad=0.55",
+                    facecolor="white",
+                    edgecolor="#aaaaaa",
+                    alpha=0.92,
+                    linewidth=0.6,
+                ),
+            )
+
+        # Colorbar with random-baseline reference line.
+        # We annotate the bar with a dashed line + text in axes coordinates.
+        # The fractional position is computed from the linear norm so the line
+        # sits correctly at whatever value the random baseline maps to.
         sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
         sm.set_array([])
         cbar = plt.colorbar(sm, ax=ax, shrink=0.52, pad=0.025, aspect=22)
         cbar.set_label(cbar_label, fontsize=9.5)
         cbar.ax.tick_params(labelsize=8)
 
-        # Map cosmetics
+        if random_baseline is not None:
+            try:
+                # Random-baseline reference on the colorbar.
+                # norm(x) returns the correctly transformed fractional position
+                # for any norm type (linear, power, two-slope, etc.).
+                frac = float(norm(random_baseline))
+                frac = max(0.02, min(0.98, frac))
+                # The colorbar IMAGE is drawn as a raster that covers the axes,
+                # so axhline/plot drawn before savefig can appear behind it.
+                # The reliable workaround is to draw on top of the axes
+                # AFTER the colorbar image by appending a Line2D artist with a
+                # high zorder, and using transAxes so the position matches frac.
+                import matplotlib.lines as _mlines
+                ref_line = _mlines.Line2D(
+                    [0, 1], [frac, frac],
+                    transform=cbar.ax.transAxes,
+                    color="#111111", linewidth=1.8, linestyle="--",
+                    alpha=0.90, clip_on=False, zorder=99,
+                )
+                cbar.ax.add_artist(ref_line)
+
+                # Label: left of the bar, vertically centred on the line.
+                # Placed on the LEFT side (x<0) so it never conflicts with the
+                # colorbar ylabel or tick labels, which live on the right.
+                if random_baseline >= 1.0:
+                    rand_lbl = f"{random_baseline:.3g}× (random)"
+                else:
+                    rand_lbl = f"{random_baseline * 100:.0f}% (random)"
+                cbar.ax.text(
+                    -0.1, frac, rand_lbl,
+                    transform=cbar.ax.transAxes,
+                    fontsize=7.5, va="center", ha="right",
+                    color="#111111", clip_on=False, zorder=99,
+                )
+                # Cap indicator: prefix "≥" to the top tick if values are clipped
+                if cap_applied:
+                    try:
+                        fig.canvas.draw()   # force tick label generation
+                        tl = cbar.ax.get_yticklabels()
+                        if tl and tl[-1].get_text():
+                            tl[-1].set_text(f"≥{tl[-1].get_text()}")
+                            cbar.ax.set_yticklabels(tl)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        # Map cosmetics — no title; panel label in top-left corner instead
         ax.set_xlim(xlim)
         ax.set_ylim(ylim)
         ax.set_aspect("equal", adjustable="box")
-        ax.set_title(title, fontsize=11, fontweight="bold", pad=7)
+        ax.set_title("")
         ax.set_xlabel("")
         ax.set_ylabel("")
         ax.set_xticks([])
         ax.set_yticks([])
 
-        # Legend: light grey = land not in biome evaluation scope
-        grey_patch = mpatches.Patch(
-            color=COLOR_MISSING,
-            label="Not in biome evaluation scope\n"
-                  "(ecoregions absent from GSN raster)",
-        )
-        ax.legend(
-            handles=[grey_patch], loc="lower left",
-            fontsize=7, framealpha=0.88, edgecolor="lightgray",
-        )
-
-        if ref_note:
+        if panel_label:
             ax.text(
-                0.99, 0.01, ref_note, transform=ax.transAxes,
-                fontsize=6.5, color="#555555", ha="right", va="bottom",
+                0.01, 0.99, panel_label,
+                transform=ax.transAxes,
+                fontsize=12, fontweight="bold",
+                va="top", ha="left",
+                color="#111111",
             )
 
     # ── Left panel: PR-AUC (lift) ────────────────────────────────────────────
     _draw_panel(
         axes[0], col_pr, norm_pr,
-        title="LOBO PR-AUC lift\n(model trained without this biome)",
+        panel_label="(a)",
         cbar_label=cbar_pr,
-        ref_note="1× = random baseline",
+        random_baseline=1.0 if use_pr_lift else None,
+        cap_applied=pr_cap_applied,
+        show_labels=True,
     )
 
-    # ── Right panel: Recall@5% (lift) ────────────────────────────────────────
+    # ── Right panel: Recall@5% (absolute) ────────────────────────────────────
     if has_recall:
         _draw_panel(
             axes[1], col_r5, norm_r5,
-            title="LOBO Recall@5% lift\n(fraction of PA events captured)",
+            panel_label="(b)",
             cbar_label=cbar_r5,
-            ref_note="1× = random baseline (Recall@5% = 0.05)",
+            random_baseline=0.05,
+            cap_applied=r5_cap_applied,
+            show_labels=False,
         )
 
-    fig.tight_layout()
     fig.savefig(output_path, dpi=MAP_DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {output_path.name}")

@@ -1296,11 +1296,11 @@ def _create_scenario_map(
         zorder=3,
     )
 
-    # Country borders overlay — matches model1_results risk-map style.
+    # Country borders overlay — matches LOBO biome-map style for consistency.
     _country_borders_3857 = _load_country_borders_3857(repo_root)
     if _country_borders_3857 is not None:
         _country_borders_3857.plot(
-            ax=ax, facecolor="none", edgecolor="#777777", linewidth=0.25, alpha=0.4, zorder=4,
+            ax=ax, facecolor="none", edgecolor="#555555", linewidth=0.5, alpha=0.65, zorder=4,
         )
 
     ax.set_xlim(proj_bounds[0], proj_bounds[2])
