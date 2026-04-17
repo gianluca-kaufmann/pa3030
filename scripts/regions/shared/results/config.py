@@ -21,6 +21,9 @@ PROFILE = {
         "probability_map_percentile_min": 25,
         "probability_map_percentile_max": 98,
         "probability_map_transformation": "sqrt",
+        # Display gamma applied after normalisation (1.0 = none). Keep evaluation maps
+        # visually comparable to forward maps when desired.
+        "probability_map_display_gamma": 1.0,
         # (label, lon_min, lon_max, lat_min, lat_max)
         "hotspot_regions": [
             ("Amazon Basin",              -72, -48, -12,  4),
@@ -49,9 +52,11 @@ PROFILE = {
         "country_names": ['United States of America', 'United States'],
         # Probability map: log transform needed because calibration collapses >98% of values
         # to the same floor probability, making percentile-based linear/sqrt normalization fail.
-        "probability_map_percentile_min": 0,
-        "probability_map_percentile_max": 99.9,
+        # Match forward-map scaling so evaluation maps are comparable (less “purple” midfield).
+        "probability_map_percentile_min": 47,
+        "probability_map_percentile_max": 99,
         "probability_map_transformation": "log",
+        "probability_map_display_gamma": 2.0,
         # (label, lon_min, lon_max, lat_min, lat_max)
         "hotspot_regions": [
             ("Pacific Northwest", -125, -110, 43, 50),
@@ -79,6 +84,7 @@ PROFILE = {
         "probability_map_percentile_min": 25,
         "probability_map_percentile_max": 98,
         "probability_map_transformation": "sqrt",
+        "probability_map_display_gamma": 1.0,
         "hotspot_regions": [
             ("Borneo / Kalimantan",  108, 118,  -4,  7),
             ("Mekong / Indochina",   100, 110,   9, 22),
@@ -106,6 +112,7 @@ HOTSPOT_REGIONS = PROFILE["hotspot_regions"]
 PROBABILITY_MAP_PERCENTILE_MIN = PROFILE["probability_map_percentile_min"]
 PROBABILITY_MAP_PERCENTILE_MAX = PROFILE["probability_map_percentile_max"]
 PROBABILITY_MAP_TRANSFORMATION = PROFILE["probability_map_transformation"]
+PROBABILITY_MAP_DISPLAY_GAMMA = PROFILE.get("probability_map_display_gamma", 1.0)
 MAP_INSET_SIDE         = PROFILE["map_inset_side"]        # 'right' or 'left'
 MAP_LEGEND_FONTSIZE    = PROFILE["map_legend_fontsize"]
 MAP_LEGEND_MARKERSIZE  = PROFILE["map_legend_markersize"]

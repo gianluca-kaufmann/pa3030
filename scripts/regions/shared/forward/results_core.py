@@ -2861,9 +2861,10 @@ def _create_alignment_map(
     _add_latlon_ticks(ax, (proj_bounds[0], proj_bounds[2]), (proj_bounds[1], proj_bounds[3]))
 
     legend_elements = [
-        mpatches.Patch(color="#f75454", label="Designated & priority"),
-        mpatches.Patch(color="#de9c02", label="Priority, not designated"),
-        mpatches.Patch(color="#027fde", label="Designated, not priority"),
+        # Keep legend consistent with the actual overlay colors above.
+        mpatches.Patch(color="#f75454", label="Priority, not designated"),
+        mpatches.Patch(color="#de9c02", label="Designated, not priority"),
+        mpatches.Patch(color="#027fde", label="Designated & priority"),
     ]
     legend_loc = "lower right" if MAP_INSET_SIDE == "right" else "lower left"
     ax.legend(handles=legend_elements, loc=legend_loc, fontsize=MAP_LEGEND_FONTSIZE,

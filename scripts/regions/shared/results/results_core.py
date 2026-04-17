@@ -41,6 +41,7 @@ from .config import (
     MAP_STATS_FONTSIZE,
     MODEL_ID,
     MODEL_LABEL,
+    PROBABILITY_MAP_DISPLAY_GAMMA,
     PROBABILITY_MAP_PERCENTILE_MIN,
     PROBABILITY_MAP_PERCENTILE_MAX,
     PROBABILITY_MAP_TRANSFORMATION,
@@ -1755,31 +1756,35 @@ def create_risk_map(
     _add_latlon_ticks(ax, (proj_bounds[0], proj_bounds[2]), (proj_bounds[1], proj_bounds[3]))
 
     # Legend — true positives first, then unconfirmed predictions, then misses, then existing PAs.
-    # Font size and marker size are region-configurable for manuscript readability.
+    # Slightly downscale relative to the global map legend config to match the visual
+    # balance of the forward "overlap" maps (which are typically less dense visually).
+    legend_fontsize = max(MAP_LEGEND_FONTSIZE_CFG - 2, 6)
+    legend_markersize = max(MAP_LEGEND_MARKERSIZE_CFG - 2, 4)
     legend_elements = []
     if overlap_count > 0:
         legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=COLOR_OVERLAP,
-                                      markersize=MAP_LEGEND_MARKERSIZE_CFG, alpha=0.9,
+                                      markersize=legend_markersize, alpha=0.9,
                                       label=f'Correctly predicted — PA established (n={overlap_count:,})'))
     if predicted_only_count > 0:
         legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=COLOR_PREDICTED_ONLY,
-                                      markersize=MAP_LEGEND_MARKERSIZE_CFG, alpha=0.9,
+                                      markersize=legend_markersize, alpha=0.9,
                                       label=f'Predicted high-risk, no PA established (n={predicted_only_count:,})'))
     if observed_only_count > 0:
         legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=COLOR_OBSERVED_ONLY,
-                                      markersize=MAP_LEGEND_MARKERSIZE_CFG, alpha=0.9,
+                                      markersize=legend_markersize, alpha=0.9,
                                       label=f'PA established, not predicted (n={observed_only_count:,})'))
     legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=PA_HOLE_COLOR,
-                                  markersize=MAP_LEGEND_MARKERSIZE_CFG, alpha=0.9,
+                                  markersize=legend_markersize, alpha=0.9,
                                   label=f'Existing PAs (pre-{min(test_years)})'))
-    # SA has Atlantic Ocean whitespace in the lower-right; other regions use upper-left.
-    legend_loc = 'lower right' if MAP_INSET_SIDE == 'right' else 'upper left'
+    # Consistent evaluation-map layout across regions:
+    # legend bottom-right, north arrow top-left, scale bar top-right.
+    legend_loc = 'lower right'
     if legend_elements:
-        ax.legend(handles=legend_elements, loc=legend_loc, fontsize=MAP_LEGEND_FONTSIZE_CFG,
+        ax.legend(handles=legend_elements, loc=legend_loc, fontsize=legend_fontsize,
                   framealpha=0.95, borderpad=0.8, labelspacing=0.6)
 
     # Scale bar + north arrow
-    # For South America, cluster both in the top-right, placed neatly side-by-side.
+    # For South America, use: north arrow (top-left) + scale bar (top-right).
     if MAP_INSET_SIDE == 'right':
         _add_scale_bar_3857(
             ax,
@@ -1790,22 +1795,18 @@ def create_risk_map(
             anchor_x_frac=0.94,
             anchor_y_frac=0.915,
         )
-        _add_north_arrow(
-            ax,
-            proj_bounds,
-            position='upper right',
-            anchor_x_frac=0.865,
-            anchor_y_frac=0.900,
-        )
+        _add_north_arrow(ax, proj_bounds, position='upper left')
     else:
         _add_scale_bar_3857(
             ax,
             proj_bounds,
             ref_lat_deg=(Y_LIMITS[0] + Y_LIMITS[1]) / 2.0,
             bar_km=1000,
-            position='lower left',
+            position='upper right',
+            anchor_x_frac=0.94,
+            anchor_y_frac=0.915,
         )
-        _add_north_arrow(ax, proj_bounds, position='lower right')
+        _add_north_arrow(ax, proj_bounds, position='upper left')
 
     plt.tight_layout(pad=0.5)
 
@@ -2258,19 +2259,29 @@ def create_probability_map(
             log_v = np.log10(np.maximum(vals, 1e-10))
             span = log_pmax - log_pmin
             if span > 1e-6:
-                return np.clip((log_v - log_pmin) / span, 0.0, 1.0)
+                n = np.clip((log_v - log_pmin) / span, 0.0, 1.0)
             else:
-                return np.full_like(log_v, 0.5)
+                n = np.full_like(log_v, 0.5)
         else:
             clipped = np.clip(vals, proba_pmin, proba_pmin + proba_span)
             shifted = clipped - proba_pmin
             if proba_span > 1e-12:
                 linear = shifted / proba_span
             else:
-                return np.full_like(shifted, 0.5)
+                n = np.full_like(shifted, 0.5)
+                # Apply display gamma below
+                if abs(PROBABILITY_MAP_DISPLAY_GAMMA - 1.0) > 1e-9:
+                    n = np.clip(n ** PROBABILITY_MAP_DISPLAY_GAMMA, 0.0, 1.0)
+                return n
             if PROBABILITY_MAP_TRANSFORMATION == 'sqrt':
-                return np.sqrt(linear)
-            return linear  # linear fallback
+                n = np.sqrt(linear)
+            else:
+                n = linear  # linear fallback
+
+        # Optional display gamma (forward uses this to reserve bright colours for tails)
+        if abs(PROBABILITY_MAP_DISPLAY_GAMMA - 1.0) > 1e-9:
+            n = np.clip(n ** PROBABILITY_MAP_DISPLAY_GAMMA, 0.0, 1.0)
+        return n
 
     # Compute normalisation parameters from the FULL dataset (before coordinate filtering)
     if PROBABILITY_MAP_TRANSFORMATION == 'log':
@@ -2400,16 +2411,18 @@ def create_probability_map(
     # Styling — replace raw EPSG:3857 metre labels with lat/lon degree labels
     _add_latlon_ticks(ax, (proj_bounds[0], proj_bounds[2]), (proj_bounds[1], proj_bounds[3]))
 
-    # Legend — existing PAs; SA uses lower-right (Atlantic Ocean whitespace), others lower-left
-    prob_legend_loc = 'lower right' if MAP_INSET_SIDE == 'right' else 'lower left'
+    # Legend — consistent evaluation-map layout across regions (bottom-right).
+    # Keep legend slightly smaller for consistency with forward overlap maps.
+    legend_fontsize = max(MAP_LEGEND_FONTSIZE_CFG - 2, 6)
+    prob_legend_loc = 'lower right'
     from matplotlib.patches import Patch
     ax.legend(handles=[Patch(facecolor=PA_HOLE_COLOR, edgecolor='none',
                              label=f'Existing PAs (pre-{min(test_years_list)})')],
-              loc=prob_legend_loc, fontsize=MAP_LEGEND_FONTSIZE_CFG,
+              loc=prob_legend_loc, fontsize=legend_fontsize,
               framealpha=0.95, borderpad=0.8)
 
     # Scale bar + north arrow
-    # For South America, cluster both in the top-right, placed neatly side-by-side.
+    # For South America, use: north arrow (top-left) + scale bar (top-right).
     if MAP_INSET_SIDE == 'right':
         _add_scale_bar_3857(
             ax,
@@ -2420,22 +2433,18 @@ def create_probability_map(
             anchor_x_frac=0.94,
             anchor_y_frac=0.915,
         )
-        _add_north_arrow(
-            ax,
-            proj_bounds,
-            position='upper right',
-            anchor_x_frac=0.865,
-            anchor_y_frac=0.900,
-        )
+        _add_north_arrow(ax, proj_bounds, position='upper left')
     else:
         _add_scale_bar_3857(
             ax,
             proj_bounds,
             ref_lat_deg=(Y_LIMITS[0] + Y_LIMITS[1]) / 2.0,
             bar_km=1000,
-            position='lower left',
+            position='upper right',
+            anchor_x_frac=0.94,
+            anchor_y_frac=0.915,
         )
-        _add_north_arrow(ax, proj_bounds, position='lower right')
+        _add_north_arrow(ax, proj_bounds, position='upper left')
 
     plt.tight_layout(pad=0.5)
 
@@ -3242,14 +3251,16 @@ def create_biome_breakdown(
         n_top   = max(1, int(n_rows * 0.01))
         top_idx = np.argpartition(grp_proba, -n_top)[-n_top:]
         p_at_1pct = float(grp_true[top_idx].mean())
+        prevalence = n_pos / n_rows
         biome_records.append({
             'BIOME_NAME':     biome_name,
             'n_ecoregions':   len(grp_df),
             'n_pixel_years':  n_rows,
             'n_observed_PAs': n_pos,
-            'prevalence_pct': round(n_pos / n_rows * 100, 4),
+            'prevalence_pct': round(prevalence * 100, 4),
             'ROC_AUC':        round(roc_auc, 4),
             'Precision_at_1pct': round(p_at_1pct, 4),
+            'Lift_at_1pct':   round(p_at_1pct / prevalence, 2) if prevalence > 0 else 0.0,
         })
 
     if not biome_records:
@@ -3283,10 +3294,10 @@ def create_biome_breakdown(
         'Tundra':                                                  'Tundra',
     }
 
-    labels   = [SHORT_BIOME.get(b, b[:30]) for b in biome_df['BIOME_NAME']]
-    roc_vals = biome_df['ROC_AUC'].tolist()
-    p1_vals  = biome_df['Precision_at_1pct'].tolist()
-    n_vals   = biome_df['n_pixel_years'].tolist()
+    labels     = [SHORT_BIOME.get(b, b[:30]) for b in biome_df['BIOME_NAME']]
+    roc_vals   = biome_df['ROC_AUC'].tolist()
+    lift_vals  = biome_df['Lift_at_1pct'].tolist()
+    n_vals     = biome_df['n_pixel_years'].tolist()
     y_pos = np.arange(len(labels))
 
     fig, axes = plt.subplots(1, 2, figsize=(14, max(4, len(biome_df) * 0.55)))
@@ -3306,21 +3317,21 @@ def create_biome_breakdown(
         ax1.text(min(val + 0.01, 0.97), bar.get_y() + bar.get_height() / 2,
                 f'{val:.3f}  (n={n:,})', va='center', ha='left', fontsize=FONTSIZE_STATS)
 
-    # P@1% panel
+    # Lift@1% panel (Precision@1% normalised by positive rate — comparable across biomes)
     ax2 = axes[1]
-    bars2 = ax2.barh(y_pos, p1_vals, color='#E07B54', alpha=0.85)
+    bars2 = ax2.barh(y_pos, lift_vals, color='#E07B54', alpha=0.85)
     ax2.set_yticks(y_pos)
     ax2.set_yticklabels(labels, fontsize=FONTSIZE_STATS)
-    ax2.set_xlabel('Precision@1%', fontsize=FONTSIZE_LABEL)
-    ax2.set_title('Precision@1% by Biome', fontsize=FONTSIZE_TITLE, fontweight='bold')
-    p1_max = max(p1_vals) if p1_vals else 1
-    # Cap axis at 1.0 (precision is bounded) with a small right margin
-    ax2.set_xlim(0, min(p1_max * 1.3, 1.05))
+    ax2.set_xlabel('Lift@1% (×)', fontsize=FONTSIZE_LABEL)
+    ax2.set_title('Lift@1% by Biome', fontsize=FONTSIZE_TITLE, fontweight='bold')
+    ax2.axvline(x=1, color='red', linestyle='--', linewidth=1, alpha=0.7, label='Random (1×)')
+    lift_max = max(lift_vals) if lift_vals else 1
+    ax2.set_xlim(0, lift_max * 1.3)
+    ax2.legend(fontsize=FONTSIZE_LEGEND)
     ax2.grid(True, axis='x', alpha=0.3)
-    for bar, val, n in zip(bars2, p1_vals, n_vals):
-        n_str = f'n={n:,}'
-        ax2.text(min(val + p1_max * 0.01, p1_max * 1.25), bar.get_y() + bar.get_height() / 2,
-                f'{val:.4f}  ({n_str})', va='center', ha='left', fontsize=FONTSIZE_STATS)
+    for bar, val in zip(bars2, lift_vals):
+        ax2.text(min(val + lift_max * 0.01, lift_max * 1.25), bar.get_y() + bar.get_height() / 2,
+                f'{val:.1f}×', va='center', ha='left', fontsize=FONTSIZE_STATS)
 
     plt.suptitle(f'{MODEL_LABEL} ({model_type.upper()}) Performance by Biome (GSN Terrestrial Ecoregions)',
                 fontsize=FONTSIZE_TITLE, fontweight='bold', y=1.01)
@@ -3368,6 +3379,17 @@ def create_biome_scatter_comparison(
         "Boreal Forests/Taiga":                                          "Boreal",
     }
 
+    def _biome_annotate_label(raw: object) -> str:
+        """Short label for scatter annotations; biome column may be NaN or non-string."""
+        if raw is None:
+            return "?"
+        if isinstance(raw, (float, np.floating)) and pd.isna(raw):
+            return "?"
+        text = str(raw).strip()
+        if not text or text.lower() == "nan":
+            return "?"
+        return BIOME_SHORT.get(text, text[:15])
+
     def _latest_biome_csv(slug: str) -> Optional[Path]:
         search_dirs = []
         if scratch_root:
@@ -3414,7 +3436,7 @@ def create_biome_scatter_comparison(
                         alpha=0.85, edgecolors="0.3", linewidths=0.5, zorder=3)
 
         for r, p, b in zip(recall, precision, biomes):
-            short = BIOME_SHORT.get(b, b[:15])
+            short = _biome_annotate_label(b)
             ax.annotate(short, (r, p), fontsize=6.5, ha="center", va="bottom",
                         xytext=(0, 4), textcoords="offset points", zorder=4)
 

@@ -229,7 +229,18 @@ def get_region_boundary(region_boundary_path: Optional[Path] = None) -> gpd.GeoD
                     print(f"  Failed to load {candidate}: {e}")
                     continue
         
-        # Strategy 3: Fallback to URL download
+        # Strategy 3: Use cached Natural Earth countries (preferred; offline-friendly)
+        if gdf is None:
+            try:
+                print(f"Loading {REGION_LABEL} boundary from cached world countries...")
+                gdf = get_world_countries()
+                if gdf is not None and not gdf.empty:
+                    print("  Successfully loaded cached world countries dataset")
+            except Exception as e:
+                print(f"  Cached world countries load failed: {e}")
+                gdf = None
+
+        # Strategy 4: Fallback to URL download
         if gdf is None:
             print(f"Loading {REGION_LABEL} boundary from URL...")
             import urllib.request
