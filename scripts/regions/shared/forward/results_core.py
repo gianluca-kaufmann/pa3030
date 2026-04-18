@@ -1322,7 +1322,7 @@ def _create_scenario_map(
         ),
     ]
     ax.legend(
-        handles=legend_elements, loc=legend_loc, fontsize=MAP_LEGEND_FONTSIZE + 2,
+        handles=legend_elements, loc=legend_loc, fontsize=MAP_LEGEND_FONTSIZE,
         framealpha=0.95, borderpad=0.8, labelspacing=0.6,
     )
 

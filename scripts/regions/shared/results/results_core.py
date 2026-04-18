@@ -1756,10 +1756,8 @@ def create_risk_map(
     _add_latlon_ticks(ax, (proj_bounds[0], proj_bounds[2]), (proj_bounds[1], proj_bounds[3]))
 
     # Legend — true positives first, then unconfirmed predictions, then misses, then existing PAs.
-    # Slightly downscale relative to the global map legend config to match the visual
-    # balance of the forward "overlap" maps (which are typically less dense visually).
-    legend_fontsize = max(MAP_LEGEND_FONTSIZE_CFG - 2, 6)
-    legend_markersize = max(MAP_LEGEND_MARKERSIZE_CFG - 2, 4)
+    legend_fontsize = MAP_LEGEND_FONTSIZE_CFG
+    legend_markersize = MAP_LEGEND_MARKERSIZE_CFG
     legend_elements = []
     if overlap_count > 0:
         legend_elements.append(Line2D([0], [0], marker='s', color='w', markerfacecolor=COLOR_OVERLAP,
@@ -2412,8 +2410,7 @@ def create_probability_map(
     _add_latlon_ticks(ax, (proj_bounds[0], proj_bounds[2]), (proj_bounds[1], proj_bounds[3]))
 
     # Legend — consistent evaluation-map layout across regions (bottom-right).
-    # Keep legend slightly smaller for consistency with forward overlap maps.
-    legend_fontsize = max(MAP_LEGEND_FONTSIZE_CFG - 2, 6)
+    legend_fontsize = MAP_LEGEND_FONTSIZE_CFG
     prob_legend_loc = 'lower right'
     from matplotlib.patches import Patch
     ax.legend(handles=[Patch(facecolor=PA_HOLE_COLOR, edgecolor='none',
