@@ -1,0 +1,205 @@
+Starting model3_RF script...
+drwxr-xr-x 10 gikaufmann gikaufmann-group 4096 Apr  3 22:47 /cluster/home/gikaufmann/master_thesis
+PWD = /cluster/home/gikaufmann/master_thesis
+
+Loaded params from /cluster/home/gikaufmann/master_thesis/scripts/regions/se_asia/5_training/rf_best_params.json
+Best CV score: 0.8221
+W&B connected
+======================================================================
+RANDOM FOREST TRANSITION MODEL (5-YEAR LOOKAHEAD)
+======================================================================
+Train: /cluster/scratch/gikaufmann/data/se_asia/ml/main/train_win5.parquet
+Earlystop: /cluster/scratch/gikaufmann/data/se_asia/ml/main/earlystop_win5.parquet
+Test: /cluster/scratch/gikaufmann/data/se_asia/ml/main/test_win5.parquet
+Params: /cluster/home/gikaufmann/master_thesis/scripts/regions/se_asia/5_training/rf_best_params.json
+Output: /cluster/home/gikaufmann/master_thesis/outputs/se_asia/results/ml_models
+
+Configuration:
+  WDPA_LAST_YEAR: 2024
+  LOOKAHEAD_YEARS: 5
+  LAST_LABEL_YEAR: 2019 (WDPA_LAST_YEAR - LOOKAHEAD_YEARS)
+  Earlystop/Test data filtered to years <= 2019 to avoid right-censored labels
+  BATCH_SIZE: 100,000 (smaller batch = less memory per iteration)
+  MAX_NEG_TRAIN: 50,000,000 (negative samples will be downsampled to this cap)
+    -> This keeps ALL positives but samples negatives to control memory
+    -> For 500M rows, this is ESSENTIAL to avoid OOM
+
+Active configuration: SK_VERBOSE=0
+  CPUs: 32 (SLURM_CPUS_PER_TASK=32)
+
+======================================================================
+OOM SAFETY STATUS:
+  ✓ Configuration is OOM-safe for large datasets (500M rows)
+    - Batch size: 100,000 (manageable chunks)
+    - Negative sampling: 50,000,000 (memory bounded)
+    - All predictions use batch processing (no large arrays in memory)
+======================================================================
+
+Selected 73 features, loading 79 cols from train, 79 from test
+Target column: transition_01_win5
+
+======================================================================
+PHASE 1: TRAINING RANDOM FOREST MODEL
+======================================================================
+  [Memory start of Phase 1] RSS: 0.27 GB
+
+----------------------------------------------------------------------
+STEP 1: INTERMEDIATE MODEL → OOF EARLYSTOP PREDICTIONS FOR CALIBRATION
+----------------------------------------------------------------------
+Training intermediate model on 2001-2013 only...
+  Earlystop years (2014-2016) are excluded so that
+  scoring the earlystop set produces genuinely out-of-sample predictions.
+
+Loading train data (2001-2013)...
+
+Loading train_only (years 2001-2013) (max_neg=50,000,000) (two-pass NumPy loader)...
+  Pass 1: Counting rows...
+  Found 680,653 positives, 55,109,826 negatives (will sample to 50,000,000 negatives)
+  Pass 2: Pre-allocating arrays (50,680,653 samples, 73 features)...
+  98% — 50,019,348/50,680,653 rows
+  [Memory   98%] RSS: 1.10 GB
+  Loaded 50,680,653 rows in 207.2s (14.02 GB)
+  50,000,000 neg, 680,653 pos, ratio 1:73.5, years 2001-2013
+
+Training intermediate model on 50,680,653 samples...
+  n_estimators=300, max_depth=None, class_weight=balanced_subsample
+  [Memory before intermediate training] RSS: 14.82 GB
+Intermediate training done in 7306.5s
+  [Memory after intermediate training] RSS: 16.64 GB
+  [Memory after freeing intermediate train data] RSS: 2.62 GB
+
+Scoring earlystop set (2014-2016) — OOF by construction...
+  Year range capped at LAST_LABEL_YEAR=2019
+  Pass 1: Counting earlystop rows...
+  Found 12,664,050 earlystop samples: 12,445,235 neg, 218,815 pos
+  Years: 2014-2016
+  Pass 2: Generating predictions in batches...
+  Writing earlystop scored predictions to model3_rf_win5_earlystop_scored_20260408_000517.parquet
+  7% — 1,000,000/12,664,050 rows
+  [Memory   7%] RSS: 2.72 GB
+  31% — 4,000,000/12,664,050 rows
+  [Memory   31%] RSS: 2.72 GB
+  55% — 7,000,000/12,664,050 rows
+  [Memory   55%] RSS: 2.72 GB
+  78% — 10,000,000/12,664,050 rows
+  [Memory   78%] RSS: 2.72 GB
+Earlystop predictions generated in 45.4s (127 batches)
+Earlystop scored predictions saved: model3_rf_win5_earlystop_scored_20260408_000517.parquet
+  12,445,235 neg, 218,815 pos, ratio 1:56.9, years 2014-2016
+  [Memory after freeing intermediate model] RSS: 1.17 GB
+
+----------------------------------------------------------------------
+STEP 2: FINAL MODEL ON FULL LABELLED WINDOW (2001-2016)
+----------------------------------------------------------------------
+Training final model on 2001-2016...
+  Loading from train_path only: train_win5.parquet already spans 2001-2016.
+  earlystop_path is NOT loaded here — it is a subset of train and would duplicate rows.
+  [Memory before final model loading] RSS: 1.17 GB
+
+Loading full training data (2001-2016)...
+
+Loading full_train (years 2001-2016) (max_neg=50,000,000) (two-pass NumPy loader)...
+  Pass 1: Counting rows...
+  Found 899,468 positives, 67,555,061 negatives (will sample to 50,000,000 negatives)
+  Pass 2: Pre-allocating arrays (50,899,468 samples, 73 features)...
+  98% — 50,019,348/50,899,468 rows
+  [Memory   98%] RSS: 1.55 GB
+  Loaded 50,899,468 rows in 305.6s (14.08 GB)
+  50,000,000 neg, 899,468 pos, ratio 1:55.6, years 2001-2016
+  [Memory after loading final data] RSS: 15.30 GB
+
+Imbalance: 50,000,000 neg, 899,468 pos, ratio 1:55.6
+  Using class_weight: balanced_subsample
+
+Final model parameters:
+  bootstrap: True
+  class_weight: balanced_subsample
+  max_depth: None
+  max_features: log2
+  min_samples_leaf: 6
+  min_samples_split: 30
+  n_estimators: 300
+  n_jobs: 32
+  random_state: 42
+  verbose: 0
+
+Training final model on 50,899,468 samples...
+  [Memory before final training] RSS: 15.30 GB
+
+Training done in 7034.2s
+Final model saved: /cluster/home/gikaufmann/master_thesis/data/se_asia/ml/models/model3_rf_win5_20260408_000517.joblib
+Phase 1 completed.
+
+======================================================================
+PHASE 2: TESTING
+======================================================================
+  [Memory start of Phase 2] RSS: 1.16 GB
+
+Loading model from /cluster/home/gikaufmann/master_thesis/data/se_asia/ml/models/model3_rf_win5_20260408_000517.joblib
+  [Memory after loading model] RSS: 5.03 GB
+Processing test in batches of 100,000...
+Test year range: 2017-2019 (capped at LAST_LABEL_YEAR=2019)
+  Pass 1: Counting test rows (year_range=(2017, 2019))...
+  Found 12,503,260 test samples (filtered to year_range=2017-2019)
+  Pre-allocating arrays for 12,503,260 samples...
+  [Memory after pre-allocation] RSS: 5.04 GB
+  Pass 2: Processing test batches (year_range=(2017, 2019))...
+Writing to /cluster/home/gikaufmann/master_thesis/outputs/se_asia/results/ml_models/model3_rf_win5_scored_20260408_000517.parquet
+  7% — 1,000,000/12,503,260 rows
+  [Memory   7%] RSS: 5.07 GB
+  31% — 4,000,000/12,503,260 rows
+  [Memory   31%] RSS: 5.08 GB
+  55% — 7,000,000/12,503,260 rows
+  [Memory   55%] RSS: 5.10 GB
+  79% — 10,000,000/12,503,260 rows
+  [Memory   79%] RSS: 5.11 GB
+Completed 126 batches in 50.0s, 12,503,260 rows
+  [Memory after all predictions] RSS: 5.12 GB
+
+Test set: 12,428,756 neg, 74,504 pos, ratio 1:166.8, years 2017-2019
+
+Test metrics: ROC-AUC 0.9862, PR-AUC 0.7078
+  P@1%: 0.5390 (67,387/125,032), lift 90.45x
+  P@5%: 0.1144 (71,530/625,163), lift 19.20x
+  P@10%: 0.0577 (72,160/1,250,326), lift 9.69x
+
+Top 20 features:
+            feature  importance
+          policy_b2    0.077849
+          policy_b3    0.041840
+    dist_indigenous    0.040785
+                GPW    0.033973
+          policy_b4    0.033919
+       WorldClim_b2    0.029412
+       WorldClim_b7    0.028208
+      WorldClim_b19    0.026367
+       WorldClim_b4    0.024806
+       GPW_smooth16    0.023655
+       dist_oil_gas    0.023358
+       WorldClim_b3    0.023048
+      WorldClim_b17    0.021975
+economic_value_lag1    0.021954
+          policy_b1    0.021760
+    GSN_b5_smooth64    0.020820
+       GPW_smooth64    0.020558
+      WorldClim_b15    0.020173
+          landcover    0.019950
+    dist_powerplant    0.019517
+
+Metrics saved: /cluster/home/gikaufmann/master_thesis/outputs/se_asia/results/ml_models/model3_rf_win5_metrics_20260408_000517.json
+
+======================================================================
+SUMMARY
+======================================================================
+Model: RandomForest, 73 features
+  Class weight: balanced_subsample
+
+Test (2017-2019, 12,503,260 samples, 0.596% pos): ROC-AUC 0.9862, PR-AUC 0.7078
+  P@1%: 0.5390 (90.4x), P@5%: 0.1144 (19.2x), P@10%: 0.0577 (9.7x)
+
+Timings: train 7034.2s, pred 50.0s, total 14970.5s (249.5m)
+======================================================================
+Done.
+
+Output saved to: /cluster/home/gikaufmann/master_thesis/outputs/se_asia/results/ml_models/model3_rf_win5_20260408_000517.txt
+model3_RF script finished.
