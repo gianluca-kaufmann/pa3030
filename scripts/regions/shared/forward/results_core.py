@@ -86,6 +86,9 @@ from scripts.regions.shared.results.config import (  # noqa: E402
     MAP_LEGEND_MARKERSIZE,
     Y_LIMITS,
 )
+
+# Match training evaluation maps (results_core): slightly larger legend than map_legend_fontsize
+MAP_EVAL_LEGEND_FONTSIZE = MAP_LEGEND_FONTSIZE + 2
 from scripts.regions.shared.results.results_core import (  # noqa: E402
     FONTSIZE_LABEL,
     PROBABILITY_MAP_COLORMAP,
@@ -1164,7 +1167,7 @@ def create_probability_map(
             ),
         ],
         loc="lower left",
-        fontsize=9,
+        fontsize=MAP_EVAL_LEGEND_FONTSIZE,
         framealpha=0.95,
     )
     ax.grid(True, alpha=0.25, linestyle="--", linewidth=0.5, zorder=3)
@@ -1322,7 +1325,7 @@ def _create_scenario_map(
         ),
     ]
     ax.legend(
-        handles=legend_elements, loc=legend_loc, fontsize=MAP_LEGEND_FONTSIZE,
+        handles=legend_elements, loc=legend_loc, fontsize=MAP_EVAL_LEGEND_FONTSIZE,
         framealpha=0.95, borderpad=0.8, labelspacing=0.6,
     )
 

@@ -105,6 +105,9 @@ FONTSIZE_DESCRIPTION = 8  # Description text boxes
 FONTSIZE_LEGEND = 10  # Legend text
 FONTSIZE_STATS = 9  # Statistics/time period text
 
+# Risk / continuous-probability evaluation maps: slightly larger than regional map_legend_fontsize
+MAP_EVAL_LEGEND_FONTSIZE = MAP_LEGEND_FONTSIZE_CFG + 2
+
 # Risk map color scheme
 # Category colors using viridis colormap samples
 # Compute viridis colors at module load to ensure accuracy while maintaining consistency
@@ -148,6 +151,7 @@ PROBABILITY_MAP_COLORMAP = 'plasma'  # Colormap: dark purple -> yellow
 # PR curve figure dimensions
 PR_CURVE_FIGSIZE = (8, 6)
 PR_CURVE_DPI = 300
+PR_CURVE_LEGEND_FONTSIZE = 12  # Slightly larger than FONTSIZE_LEGEND for readability
 CUMULATIVE_GAINS_MAX_PLOT_POINTS = 20000
 
 
@@ -828,17 +832,16 @@ def create_pr_curve(df: pd.DataFrame, metrics_data: Dict[str, Any], output_dir: 
     # Create figure
     fig, ax = plt.subplots(figsize=PR_CURVE_FIGSIZE)
     
-    # Plot PR curve
-    ax.plot(recall, precision, linewidth=2, label=f'Model (AP = {pr_auc:.4f})')
+    # Plot PR curve (legend labels omit numeric AP/prevalence; cite those in prose)
+    ax.plot(recall, precision, linewidth=2, label='Model')
     
     # Plot baseline (horizontal line at baseline rate)
-    ax.axhline(y=baseline_rate, color='r', linestyle='--', linewidth=2, 
-               label=f'Baseline (prevalence = {baseline_rate:.6f})')
+    ax.axhline(y=baseline_rate, color='r', linestyle='--', linewidth=2, label='Baseline')
     
     ax.set_xlabel('Recall', fontsize=FONTSIZE_LABEL)
     ax.set_ylabel('Precision', fontsize=FONTSIZE_LABEL)
     ax.set_title(f'{MODEL_LABEL} ({model_type.upper()}) Precision-Recall Curve', fontsize=FONTSIZE_TITLE, fontweight='bold')
-    ax.legend(loc='best', fontsize=FONTSIZE_LEGEND)
+    ax.legend(loc='lower left', fontsize=PR_CURVE_LEGEND_FONTSIZE)
     ax.grid(True, alpha=0.3)
     ax.set_xlim([0, 1])
     ax.set_ylim([0, 1])
@@ -944,7 +947,7 @@ def create_cumulative_gains_chart(df: pd.DataFrame, output_dir: Path, model_type
     ax.set_xlabel('% of Area Searched', fontsize=FONTSIZE_LABEL)
     ax.set_ylabel('% of PAs Captured', fontsize=FONTSIZE_LABEL)
     ax.set_title(f'{MODEL_LABEL} ({model_type.upper()}) Cumulative Gains (Search Efficiency)', fontsize=FONTSIZE_TITLE, fontweight='bold')
-    ax.legend(loc='best', fontsize=FONTSIZE_LEGEND)
+    ax.legend(loc='lower right', fontsize=PR_CURVE_LEGEND_FONTSIZE)
     ax.grid(True, alpha=0.3)
     ax.set_xlim([0, 100])
     ax.set_ylim([0, 100])
@@ -1158,7 +1161,7 @@ def _add_scale_bar_3857(
     ax.text(
         (x0 + x1) / 2, label_y,
         f'{bar_km:,} km',
-        ha='center', va=label_va, fontsize=10, color='black', zorder=12,
+        ha='center', va=label_va, fontsize=14, color='black', zorder=12,
         bbox=dict(facecolor='white', alpha=0.75, edgecolor='none', pad=1.5),
     )
 
@@ -1756,7 +1759,7 @@ def create_risk_map(
     _add_latlon_ticks(ax, (proj_bounds[0], proj_bounds[2]), (proj_bounds[1], proj_bounds[3]))
 
     # Legend — true positives first, then unconfirmed predictions, then misses, then existing PAs.
-    legend_fontsize = MAP_LEGEND_FONTSIZE_CFG
+    legend_fontsize = MAP_EVAL_LEGEND_FONTSIZE
     legend_markersize = MAP_LEGEND_MARKERSIZE_CFG
     legend_elements = []
     if overlap_count > 0:
@@ -2410,7 +2413,7 @@ def create_probability_map(
     _add_latlon_ticks(ax, (proj_bounds[0], proj_bounds[2]), (proj_bounds[1], proj_bounds[3]))
 
     # Legend — consistent evaluation-map layout across regions (bottom-right).
-    legend_fontsize = MAP_LEGEND_FONTSIZE_CFG
+    legend_fontsize = MAP_EVAL_LEGEND_FONTSIZE
     prob_legend_loc = 'lower right'
     from matplotlib.patches import Patch
     ax.legend(handles=[Patch(facecolor=PA_HOLE_COLOR, edgecolor='none',
@@ -2534,17 +2537,17 @@ def compute_shap_analysis(
         with open(model_path, 'rb') as f:
             model = pickle.load(f)
     
-    # Select data source (priority: train → earlystop → test)
-    data_source_priority = ['train', 'earlystop', 'test']
+    # When --allow_test_shap is set we WANT the test set (thesis claims out-of-sample
+    # SHAP on 2017-2019); otherwise fall back to train → earlystop for quick local runs.
+    if allow_test_shap:
+        data_source_priority = ['test', 'earlystop', 'train']
+    else:
+        data_source_priority = ['train', 'earlystop']
     selected_source = None
     selected_path = None
-    
+
     for source in data_source_priority:
         if source in data_sources and data_sources[source] is not None and data_sources[source].exists():
-            # Check if test set requires explicit flag
-            if source == 'test' and not allow_test_shap:
-                print(f"  Skipping test set (requires --allow_test_shap flag)")
-                continue
             selected_source = source
             selected_path = data_sources[source]
             break
@@ -3531,6 +3534,7 @@ def create_model_comparison_landscape(
                 return None
         return {
             "roc":   _f("ROC AUC"),
+            "prauc": _f("PR AUC"),
             "lift1": _f("Lift @ 1%"),
             "p1":    _f("Precision @ 1%"),
             "p5":    _f("Precision @ 5%"),
@@ -3578,27 +3582,30 @@ def create_model_comparison_landscape(
     ax.set_xscale("function", functions=(_k_fwd, _k_inv))
 
     for key, m in all_models.items():
-        vals = [m.get("p1"), m.get("p5"), m.get("p10"), m.get("base")]
-        if any(v is None for v in vals):
+        p1, p5, p10, base = m.get("p1"), m.get("p5"), m.get("p10"), m.get("base")
+        if any(v is None for v in [p1, p5, p10, base]) or base <= 0:
             continue
-        smooth = np.clip(PchipInterpolator([1, 5, 10, 100], vals)(X_SMOOTH), 0, None)
+        lift_vals = [p1 / base, p5 / base, p10 / base, 1.0]
+        smooth = np.clip(PchipInterpolator([1, 5, 10, 100], lift_vals)(X_SMOOTH), 0, None)
         col = REGION_COLORS.get(m["region"], "grey")
         lw  = 0.75 if m["algo"] == "LightGBM" else 0.55
         ms  = 4.2  if m["algo"] == "LightGBM" else 3.4
         ax.plot(X_SMOOTH, smooth, m["linestyle"], color=col, linewidth=lw,
                 alpha=m["alpha"], zorder=4 if m["algo"] == "LightGBM" else 3)
-        ax.plot(THRESHOLDS, [m["p1"], m["p5"], m["p10"]], m["marker"],
+        ax.plot(THRESHOLDS, [p1 / base, p5 / base, p10 / base], m["marker"],
                 color=col, markersize=ms, alpha=m["alpha"],
                 zorder=5 if m["algo"] == "LightGBM" else 4)
 
+    ax.axhline(1.0, color="0.5", linewidth=0.7, linestyle=":", zorder=2)
+
     ax.set_xlabel("Top-$K$\\% risk zone", fontsize=9.5)
-    ax.set_ylabel("Precision @ top-$K$\\%", fontsize=9.5)
+    ax.set_ylabel("Lift @ top-$K$\\%  (Precision / baseline rate)", fontsize=9.5)
     ax.set_xlim(1, 100)
     ax.set_xticks([1, 5, 10, 25, 50, 100])
     ax.set_xticklabels(["1\\%", "5\\%", "10\\%", "25\\%", "50\\%", "100\\%"], fontsize=8)
-    ax.set_ylim(-0.02, 0.72)
+    ax.set_ylim(0, 115)
     ax.grid(True, alpha=0.25)
-    ax.set_title("(a) Targeting Precision at Different Risk Thresholds",
+    ax.set_title("(a) Targeting Lift at Different Risk Thresholds",
                  fontsize=9.5, fontweight="bold", pad=8)
 
     present_regions = {m["region"] for m in all_models.values()}
@@ -3620,23 +3627,23 @@ def create_model_comparison_landscape(
               fontsize=7.5, title="Algorithm", title_fontsize=8,
               framealpha=0.85, handlelength=1.8, bbox_to_anchor=(1.0, 0.45))
 
-    # ── Panel B: ROC-AUC vs Lift@1% scatter ───────────────────────────────────
+    # ── Panel B: PR-AUC vs Lift@1% scatter ────────────────────────────────────
     ax = ax_right
     for key, m in all_models.items():
-        roc, lift1 = m.get("roc"), m.get("lift1")
-        if roc is None or lift1 is None:
+        prauc, lift1 = m.get("prauc"), m.get("lift1")
+        if prauc is None or lift1 is None:
             continue
         col = REGION_COLORS.get(m["region"], "grey")
-        ax.scatter(roc, lift1,
+        ax.scatter(prauc, lift1,
                    s=120 if m["algo"] == "LightGBM" else 80,
                    c=col, marker=m["marker"],
                    edgecolors="white", linewidths=1.0, alpha=0.92, zorder=4)
-        short = key.replace(" LightGBM", " LGB")
-        ax.annotate(short, (roc, lift1), textcoords="offset points",
+        short = key.replace(" LightGBM", " LGBM")
+        ax.annotate(short, (prauc, lift1), textcoords="offset points",
                     xytext=(5, 4) if m["algo"] == "LightGBM" else (5, -9),
                     fontsize=7, color=col, fontweight="bold")
 
-    ax.set_xlabel("ROC-AUC", fontsize=9.5)
+    ax.set_xlabel("PR-AUC", fontsize=9.5)
     ax.set_ylabel("Lift @ top-1\\%", fontsize=9.5)
     ax.grid(True, alpha=0.25)
     ax.set_title("(b) Discrimination vs.\\ Targeting Effectiveness",
