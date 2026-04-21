@@ -8,7 +8,7 @@
 #SBATCH --output=/cluster/scratch/%u/logs/forward_bt_%A_%a.out
 #SBATCH --error=/cluster/scratch/%u/logs/forward_bt_%A_%a.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
-#SBATCH --array=0-3
+#SBATCH --array=3
 
 # ------------------------------------------------------------------------------
 # Stage 0c: Pseudo-forecast Backtesting — South America (LGBM)
@@ -94,7 +94,7 @@ EXIT_CODE=$?
 echo "Backtest T=${ORIGIN_YEAR} finished (exit code: ${EXIT_CODE})"
 
 echo ""
-echo "Task ${TASK_ID} (T=${ORIGIN_YEAR}) done. After all 4 tasks finish, aggregate with:"
+echo "Task ${TASK_ID} (T=${ORIGIN_YEAR}) done. Aggregate with:"
 echo "  sbatch slurm/south_america/forward_backtest_aggregate.slurm"
 
 exit $EXIT_CODE

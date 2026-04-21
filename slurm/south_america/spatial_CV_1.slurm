@@ -78,6 +78,23 @@ SCRIPT="scripts/regions/south_america/6_evaluation/spatial_CV_1"
 }
 
 #------------------------------------------------------------------------------
+# Sync num_boost_round with the evaluation model's CV-chosen iteration
+# so LOBO isolates spatial generalization only (not a different boosting horizon).
+# Reads cross_validation.final_num_boost_round from the most recent metrics JSON.
+#------------------------------------------------------------------------------
+METRICS_JSON=$(ls -t "$SCRATCH/outputs/south_america/results/ml_models/model1_lgbm_metrics_"*.json 2>/dev/null | head -1)
+if [ -z "$METRICS_JSON" ]; then
+  METRICS_JSON=$(ls -t "$HOME/master_thesis/outputs/south_america/results/ml_models/model1_lgbm_metrics_"*.json 2>/dev/null | head -1)
+fi
+if [ -n "$METRICS_JSON" ]; then
+  LOBO_NBR=$(python3 -c "import json; d=json.load(open('$METRICS_JSON')); print(d['cross_validation']['final_num_boost_round'])")
+  export LOBO_NUM_BOOST_ROUND="$LOBO_NBR"
+  echo "LOBO_NUM_BOOST_ROUND=${LOBO_NUM_BOOST_ROUND} (from $(basename $METRICS_JSON))"
+else
+  echo "WARNING: no model1_lgbm_metrics_*.json found; LOBO will use lgbm_best_params.json n_estimators"
+fi
+
+#------------------------------------------------------------------------------
 # Run the LOBO fold
 #------------------------------------------------------------------------------
 echo "Starting LOBO fold ${FOLD_IDX} (South America)..."

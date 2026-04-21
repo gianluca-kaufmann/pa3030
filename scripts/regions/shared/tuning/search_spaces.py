@@ -119,7 +119,7 @@ def get_lgbm_optuna_bounds(mode: str, auto_scale_pos_weight: float) -> Dict:
             "reg_lambda": (1e-6, 20.0),
             "min_split_gain": (1e-6, 1.0),
             "path_smooth": (1e-3, 20.0),
-            "n_estimators": (400, 3000),
+            "n_estimators": (300, 1500),
         }
     return {
         "num_leaves": (31, 127),
@@ -139,7 +139,7 @@ def get_lgbm_optuna_bounds(mode: str, auto_scale_pos_weight: float) -> Dict:
 def get_rf_optuna_bounds(mode: str) -> Dict:
     if mode.lower() == "paper":
         return {
-            "n_estimators": (200, 1200),
+            "n_estimators": (200, 800),
             "max_depth_choices": [None, 15, 20, 25, 30, 40],
             "max_features_choices": ["sqrt", "log2", 0.2, 0.3, 0.5],
             "min_samples_leaf": (1, 15),

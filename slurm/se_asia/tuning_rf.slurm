@@ -40,7 +40,7 @@ export MAX_NEG_PER_YEAR_FAST="${MAX_NEG_PER_YEAR_FAST:-50000}"
 export MAX_POS_PER_YEAR_PAPER="${MAX_POS_PER_YEAR_PAPER:-5000}"
 export MAX_POS_PER_YEAR_FAST="${MAX_POS_PER_YEAR_FAST:-2000}"
 # 15 trials fits in 24h (~82 min/trial); override to 60 for full tuning if you have more time
-export N_ITER_RF_PAPER="${N_ITER_RF_PAPER:-15}"
+export N_ITER_RF_PAPER="${N_ITER_RF_PAPER:-10}"
 export N_ITER_RF_FAST="${N_ITER_RF_FAST:-25}"
 export TUNING_RANDOM_STATE="${TUNING_RANDOM_STATE:-42}"
 

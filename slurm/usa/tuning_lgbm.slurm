@@ -52,7 +52,7 @@ export MAX_NEG_PER_YEAR_FAST="${MAX_NEG_PER_YEAR_FAST:-50000}"
 # Fast mode: 200/yr keeps jobs quick while staying in the rare-event regime.
 export MAX_POS_PER_YEAR_PAPER="${MAX_POS_PER_YEAR_PAPER:-500}"
 export MAX_POS_PER_YEAR_FAST="${MAX_POS_PER_YEAR_FAST:-200}"
-export N_ITER_LGBM_PAPER="${N_ITER_LGBM_PAPER:-70}"
+export N_ITER_LGBM_PAPER="${N_ITER_LGBM_PAPER:-40}"
 export N_ITER_LGBM_FAST="${N_ITER_LGBM_FAST:-50}"
 export TUNING_RANDOM_STATE="${TUNING_RANDOM_STATE:-42}"
 
