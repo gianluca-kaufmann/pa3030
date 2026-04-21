@@ -139,7 +139,7 @@ def get_lgbm_optuna_bounds(mode: str, auto_scale_pos_weight: float) -> Dict:
 def get_rf_optuna_bounds(mode: str) -> Dict:
     if mode.lower() == "paper":
         return {
-            "n_estimators": (200, 800),
+            "n_estimators": (150, 400),
             "max_depth_choices": [None, 15, 20, 25, 30, 40],
             "max_features_choices": ["sqrt", "log2", 0.2, 0.3, 0.5],
             "min_samples_leaf": (1, 15),
@@ -147,7 +147,7 @@ def get_rf_optuna_bounds(mode: str) -> Dict:
             "bootstrap_choices": [True],
         }
     return {
-        "n_estimators": (150, 600),
+        "n_estimators": (100, 300),
         "max_depth_choices": [None, 15, 20, 25],
         "max_features_choices": ["sqrt", "log2", 0.3],
         "min_samples_leaf": (1, 10),
