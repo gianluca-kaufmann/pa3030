@@ -85,7 +85,7 @@ EARLYSTOP_YEARS  = (2014, 2016)
 TEST_START       = 2017
 TEST_END         = min(2019, LAST_LABEL_YEAR)
 EXCLUDE_COLS     = {
-    'transition_01', 'transition_01_win5', 'WDPA_b1', 'WDPA_prev',
+    'transition_01', 'transition_01_win5', 'WDPA_b1', 'WDPA_prev', 'WDPA',
     'x', 'y', 'row', 'col', 'year',
 }
 FIXED_PARAMS     = {

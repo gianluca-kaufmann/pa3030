@@ -95,7 +95,7 @@ from scripts.regions.shared.training.utils import (  # noqa: E402
 # ── Constants ─────────────────────────────────────────────────────────────────
 RANDOM_STATE = 42
 EXCLUDE_COLS = {
-    "transition_01", "transition_01_win5", "WDPA_b1", "WDPA_prev",
+    "transition_01", "transition_01_win5", "WDPA_b1", "WDPA_prev", "WDPA",
     "x", "y", "row", "col", "year",
 }
 TARGET_COL = "transition_01_win5"

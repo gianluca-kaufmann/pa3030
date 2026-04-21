@@ -48,7 +48,7 @@ from scripts.regions.shared.training.utils import WandbRunLogger  # noqa: E402
 # ── Constants ─────────────────────────────────────────────────────────────────
 INFERENCE_YEAR = 2024
 EXCLUDE_COLS = {
-    "transition_01", "transition_01_win5", "WDPA_b1", "WDPA_prev",
+    "transition_01", "transition_01_win5", "WDPA_b1", "WDPA_prev", "WDPA",
     "x", "y", "row", "col", "year",
 }
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "200_000"))

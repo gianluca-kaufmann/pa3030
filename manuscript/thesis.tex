@@ -1205,8 +1205,8 @@ All random components (tree construction, bootstrap sampling, Optuna trial
 initialisation) are controlled via a fixed random seed. The full
 pipeline is implemented in Python~3.12 using scikit-learn~1.4, LightGBM~4.3
 \citep{ke2017,pedregosa2011}, and GeoPandas~0.14, with intermediate outputs stored in
-Apache Parquet format for efficient column-oriented access. Large-scale model training
-(involving panels of 100--350 million rows) is executed on the ETH Zurich Euler
+Apache Parquet format for efficient column-oriented access. Panels of 100--350 million rows exceed available memory, so all pipeline
+stages use batch-streaming I/O; model training is executed on the ETH Zurich Euler
 high-performance computing cluster. Jobs are submitted as SLURM array tasks.
 Key library versions, data release dates, and SLURM job templates are recorded in the
 repository's \texttt{environment.yml} and \texttt{data\_provenance.csv}.
@@ -1569,34 +1569,44 @@ have been translated from internal codes to interpretable labels.}
 
 Three co-determining channels emerge from the SHAP rankings:
 
-\textbf{Ecological conservation priority.} The top-ranked features by mean
-$|\text{SHAP}|$ include High Biodiversity Areas and Intact Wilderness at
-neighbourhood-scale smoothings (16~km and 64~km), with positive SHAP values
-confirming that pixels embedded in globally significant biodiversity and wilderness
-areas attract designation \citep{mouillot2024}. Smoothed versions dominate over
-raw pixel-level indicators, consistent with designation being a landscape-scale
-process responding to the \emph{ecological neighbourhood}.
+\textbf{Ecological conservation priority.} Biodiversity indicators dominate the
+top of the ranking: \texttt{GSN\_b2\_smooth16} (high-biodiversity areas, 16~km
+neighbourhood) ranks first (81.0\% of observations positive), and
+\texttt{GSN\_b3\_smooth16} (Intact Wilderness) ranks fourth (80.2\% positive),
+confirming that ecologically significant landscapes attract designation
+\citep{mouillot2024}. Smoothed neighbourhood versions consistently outrank
+raw pixel-level indicators, reflecting designation as a landscape-scale process.
+Existing PA coverage (\texttt{WDPA}, rank~9) shows the sharpest directional signal
+in the top ten---98.9\% of observations positive---an accretion pattern in which
+new designations cluster around established reserves.
 
-\textbf{Institutional capacity.} WGI Rule of Law (\texttt{policy\_b4}), V-Dem
-Liberal Democracy Index (\texttt{policy\_b2}), and WGI Government Effectiveness
-(\texttt{policy\_b3}) rank among the top individual features. Their positive SHAP
-values indicate that stronger governance raises designation probability, consistent
-with institutional capacity translating international commitments into on-the-ground
-action \citep{watson2014}.
+\textbf{Institutional capacity.} WGI Rule of Law (\texttt{policy\_b4}, rank~2)
+carries a clearly positive mean SHAP ($+0.129$; 78.5\% of observations positive),
+indicating that stronger rule of law consistently increases designation probability
+across South America \citep{watson2014}. The V-Dem Liberal Democracy Index
+(\texttt{policy\_b2}, rank~12) shows a near-neutral split (51.9\% positive, mean
+$-0.064$), suggesting this broader democratic index carries a weaker signal at
+continental scale.
 
-\textbf{Economic opportunity cost.} Agricultural land value has predominantly
-negative SHAP values: high-value agricultural pixels are systematically suppressed
-from high-risk zones, consistent with the opportunity-cost mechanism \citep{joppa2009}.
-Distance to indigenous territories shows mixed-sign SHAP, reflecting their dual
-role as both designation anchors and buffers. Infrastructure variables (night-time
-lights, roads, population density) show consistent negative SHAP, confirming that
-economic activity deters designation.
+\textbf{Economic opportunity cost.} Agricultural land value
+(\texttt{economic\_value\_lag1}, rank~5) carries a negative mean SHAP ($-0.107$;
+46.6\% positive), and infrastructure proxies---night-time lights (rank~16, 21.3\%
+positive) and road access (rank~15, 24.5\% positive)---are each negative for over
+three-quarters of observations, confirming that economically active,
+road-accessible pixels are suppressed from the high-risk tier \citep{joppa2009}.
+Distance to indigenous territories (\texttt{dist\_indigenous}, rank~6) is
+near-neutral (53.6\% positive), reflecting its dual role as a co-management anchor
+in Amazonia and a remoteness proxy elsewhere.
 
-Designation is most probable where ecological priority is high, governance is strong,
-and economic opportunity cost is low --- the three conditions rarely co-occur with
-high agricultural value, explaining the historical bias toward marginal land
-\citep{joppa2009, venter2018}. SHAP dependence plots for the four most important
-features are provided in Appendix~\ref{app:shap_dep}.
+Designation probability peaks where ecological priority is high, governance is
+strong, and opportunity cost is low. Dry-season precipitation
+(\texttt{WorldClim\_b14}, rank~3; 78.7\% positive) also enters the top three,
+likely acting as a biome-level proxy: seasonally drier landscapes outside the core
+Amazon carry a distinct designation signature. This overall pattern is consistent
+with the historical concentration of South American designations in remote,
+ecologically significant land adjoining existing PAs \citep{joppa2009, venter2018}.
+SHAP dependence plots for the four most important features are in
+Appendix~\ref{app:shap_dep}.
 
 \subsubsection{Spatial Risk Maps}
 \label{sec:results_sa_maps}
@@ -1801,6 +1811,27 @@ The spatial distribution of predicted probabilities across the US is shown in
 Figure~\ref{fig:probmap_usa} (Appendix~\ref{app:supp_figures}).
 Full metrics tables for the US are provided in Appendix~\ref{app:lobo}.
 
+\paragraph{Feature Importance (SHAP).}
+The US LightGBM SHAP analysis (test set) shows a distinct driver profile.
+Proximity to the existing PA network (\texttt{dist\_wdpa}, rank~1; 63.6\% positive)
+is the leading predictor, consistent with the contiguous-expansion dynamic in South
+America. Intact Wilderness (\texttt{GSN\_b3\_smooth16}, rank~4; 66.9\% positive)
+and higher terrain (\texttt{elevation\_b1}, rank~10; 74.4\% positive) confirm that
+biodiversity priority and topography contribute positively, consistent with the
+concentration of US federal designations in remote upland areas.
+
+Unlike in the other two regions, WGI Rule of Law (\texttt{policy\_b4}, rank~2)
+carries a strongly negative mean SHAP ($-0.566$; only 12.6\% positive). Because
+all US observations share a single national WGI score that varies only year to
+year, this signal most likely captures a temporal trend in the training data rather
+than a cross-sectional governance effect. Agricultural land value
+(\texttt{economic\_value\_lag1}, rank~3; 24.9\% positive, mean $-0.407$) is
+consistently negative, indicating that higher-value land is suppressed from the
+high-risk tier even within the federal estate. DPI executive ideology
+(\texttt{policy\_b1}, rank~14; 97.8\% positive, mean $+0.278$) is nearly
+universally positive, suggesting political alignment of the executive is the
+dominant institutional driver of US PA designation.
+
 US forward projections should be interpreted as spatial risk \emph{rankings} rather than calibrated absolute probabilities; the extreme class imbalance means LGBM scores here do not carry the same probability accuracy as South America or Southeast Asia.
 
 % ---------------------------------------------------------------------------
@@ -1836,6 +1867,21 @@ reflecting that a large share of this small fold was designated during the test 
 Three biome folds (Montane Grasslands \& Shrublands, Temperate Broadleaf \& Mixed
 Forests, Tropical \& Subtropical Grasslands, Savannas \& Shrublands) contain zero
 test-period designations and are excluded from the mean.
+
+\paragraph{Feature Importance (SHAP).}
+The Southeast Asia LightGBM SHAP results show a profile driven by governance and
+deforestation pressure. The top feature by mean absolute SHAP is the V-Dem Liberal
+Democracy Index (\texttt{policy\_b2}, rank~1), with a mean SHAP of $+0.128$ and
+56.7\% of observations positive: stronger democratic governance is associated with
+\emph{higher} designation probability, consistent with findings in South America.
+The second feature, smoothed deforestation (\texttt{deforestation\_b1\_smooth64},
+rank~2), has a mean SHAP of $-0.813$ with only 19.5\% positive observations:
+areas of elevated recent forest loss are strongly less likely to be designated,
+indicating that deforestation pressure in Southeast Asia outpaces conservation
+responses rather than triggering them. Biodiversity indicators retain positive
+contributions (\texttt{GSN\_b2\_smooth16}, rank~4; 66.1\% positive), and distance
+to power plants (\texttt{dist\_powerplant}, rank~3; 64.0\% positive) confirms that
+remote areas away from energy infrastructure are preferentially designated.
 
 The spatial distribution of predicted probabilities is shown in
 Figure~\ref{fig:probmap_seasia} (Appendix~\ref{app:supp_figures}).
@@ -2092,25 +2138,38 @@ concentrating new designations in lower-priority land.
 
 \subsection{Designation Drivers}
 \label{sec:disc_drivers}
-The SHAP analysis suggests a driver hierarchy in which biodiversity value and
-governance quality are the most influential predictors in the fitted model,
-with economic opportunity cost entering as a secondary but substantive predictor.
-A formal ablation study removing each predictor group in turn would provide stronger
-evidence for this ordering; as it stands, the hierarchy rests on mean absolute SHAP
-values and is subject to multicollinearity among groups. These are predictive
-associations, not causal claims: the framework cannot
-establish whether stronger governance causes higher designation rates, or whether
-both reflect deeper country-level characteristics such as income or international
-integration.
-GSN conservation-priority indicators rank above all other variable groups;
-governance indicators (WGI Rule of Law, V-Dem Liberal Democracy Index) rank second,
-ahead of infrastructure-based proxies for economic activity. This is not the
-purely cost-driven ``least-resistance'' story that early empirical work suggested
-\citep{joppa2009, venter2018}: rather, institutional capacity to act on conservation commitments is a binding constraint
-of comparable importance to economic opportunity cost. The two channels are
-complementary rather than competing: regions combine all three conditions,
-ecological priority, institutional capacity, and low economic cost, for the
-bulk of their historical designations.
+The SHAP analysis identifies biodiversity value as the most consistently
+important predictor group across all three regions, with economic opportunity cost
+and governance each making substantive contributions. A formal ablation study
+removing each predictor group in turn would provide stronger evidence for this
+ordering; as it stands, the hierarchy rests on mean absolute SHAP values and is
+subject to multicollinearity among groups. These are predictive associations, not
+causal claims: the framework cannot establish whether governance quality causes
+higher designation rates, or whether both reflect deeper country-level
+characteristics such as income or international integration.
+
+GSN biodiversity indicators carry predominantly positive SHAP in all three regions,
+confirming ecological priority as a near-universal criterion for designation.
+The governance signal is region-specific in character but broadly positive where
+it is interpretable. In South America, WGI Rule of Law (\texttt{policy\_b4}) ranks
+second in absolute importance with a clearly positive mean SHAP ($+0.129$; 78.5\%
+of observations positive), confirming that stronger rule of law increases
+designation probability across most of the continent \citep{watson2014}. In
+Southeast Asia, V-Dem Liberal Democracy Index is the single most important predictor
+with a positive mean SHAP ($+0.128$; 56.7\% positive), consistent with democratic
+governance enabling designation. The United States is the exception: WGI Rule of
+Law carries a strongly negative mean SHAP ($-0.566$; 12.6\% positive), but because
+all US observations share one national score that varies only year to year, this
+most likely reflects a temporal confound rather than a genuine governance effect;
+DPI executive ideology ($+0.278$; 97.8\% positive) is the dominant institutional
+signal in the US, suggesting presidential discretion matters more than institutional
+quality per se in that context.
+
+Economic opportunity cost deters designation in all three regions: agricultural land
+value carries a negative mean SHAP in South America ($-0.107$), the United States
+($-0.407$), and Southeast Asia ($-0.123$) alike, and infrastructure proxies
+(night-time lights, road access) are consistently negative where they appear in the
+top features.
 
 The implication for the 30$\times$30 target is therefore twofold. First, in
 countries with weak institutions, even ecologically important areas may remain
@@ -3030,9 +3089,10 @@ LightGBM model.
   \centering
   \includegraphics[width=\textwidth, keepaspectratio]{../outputs/south_america/results/model1_lgbm/shap_dep_policy_b4.pdf}
   \caption{SHAP dependence plot for \texttt{policy\_b4} (WGI Rule of Law, country level).
-  The monotone positive relationship shows that stronger rule-of-law institutions are
-  associated with a higher marginal SHAP contribution towards designation, consistent
-  with governance quality carrying predictive information beyond ecological covariates.}
+  The relationship is positively sloped --- stronger rule of law increases SHAP --- and
+  the continental mean SHAP is $+0.129$ (78.5\% of observations positive), indicating
+  that governance is an enabling condition for PA designation across most of South
+  America.}
   \label{fig:shap_dep_pol}
 \end{subfigure}
 
@@ -3042,9 +3102,10 @@ LightGBM model.
   \centering
   \includegraphics[width=\textwidth, keepaspectratio]{../outputs/south_america/results/model1_lgbm/shap_dep_dist_indigenous.pdf}
   \caption{SHAP dependence plot for \texttt{dist\_indigenous} (distance to nearest
-  indigenous or community-managed land, km). Proximity to indigenous territories is
-  associated with higher designation probability, consistent with co-management pathways
-  and the overlap between indigenous territories and high-biodiversity areas in the Amazon.}
+  indigenous or community-managed land, km). The effect is mixed: proximity to
+  indigenous territories raises designation probability in co-management contexts
+  (Amazonia), while greater distance acts as an economic-remoteness signal elsewhere,
+  yielding near-neutral mean SHAP overall.}
   \label{fig:shap_dep_indigenous}
 \end{subfigure}
 \hfill
