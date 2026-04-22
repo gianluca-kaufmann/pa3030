@@ -1024,26 +1024,17 @@ def phase1_training(
                 print(f"  Using default iteration from params: {chosen_iteration}")
         elif cv_mode == "fold3":
             if fold3_best_iteration is not None:
-                # Use weighted avg * 1.05, clamped by fold3 (same logic as full mode)
-                # For fold3 mode, weighted avg is just fold3_best_iteration
-                weighted_avg = fold3_best_iteration
-                chosen_iteration = int(np.round(weighted_avg * 1.05))
-                print(f"\nFold3 best_iteration: {fold3_best_iteration}")
-                print(f"Weighted average (before 1.05x): {weighted_avg:.2f}")
-                print(f"Chosen iteration (weighted avg * 1.05): {chosen_iteration}")
-                
-                # Apply max constraint with fold3_best_iteration (clamp by fold3)
-                chosen_iteration = max(chosen_iteration, fold3_best_iteration)
-                print(f"After max with fold3_best_iteration ({fold3_best_iteration}): {chosen_iteration}")
+                print(f"\nFold3 early-stopping best_iteration: {fold3_best_iteration} (logged only)")
+                print(f"  Not used to set chosen_iteration — Optuna n_estimators used instead for consistency with deployment/LOBO.")
             else:
-                # Fallback: use default if fold3 best_iteration not found (e.g., fold3 was skipped)
                 fold3_result = next((f for f in cv_results if f.get("fold_idx") == 2), None)
                 if fold3_result and fold3_result.get("skipped", False):
                     print(f"\nWarning: Fold 3 was skipped due to year overlap. fold3_best_iteration not available.")
                 else:
                     print(f"\nWarning: fold3_best_iteration not found.")
-                chosen_iteration = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
-                print(f"  Using default iteration from params: {chosen_iteration}")
+            # Always use Optuna n_estimators from JSON — same value as deployment and LOBO
+            chosen_iteration = int(best_params.get("n_estimators", best_params.get("num_boost_round", 3000)))
+            print(f"  Chosen iteration (Optuna n_estimators from JSON): {chosen_iteration}")
         else:
             # Fallback for any other mode
             chosen_iteration = best_params.get("num_boost_round", best_params.get("n_estimators", 3000))
