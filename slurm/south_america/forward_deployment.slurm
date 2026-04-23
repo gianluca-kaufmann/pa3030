@@ -50,6 +50,7 @@ export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_DIR="${WANDB_DIR:-$SCRATCH/wandb}"
 mkdir -p "$WANDB_DIR"
+export PA3030_WANDB=1
 
 #------------------------------------------------------------------------------
 # Preflight checks

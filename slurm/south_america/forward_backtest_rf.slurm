@@ -8,7 +8,7 @@
 #SBATCH --output=/cluster/scratch/%u/logs/forward_bt_rf_%A_%a.out
 #SBATCH --error=/cluster/scratch/%u/logs/forward_bt_rf_%A_%a.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
-#SBATCH --array=0-3
+#SBATCH --array=3
 
 # ------------------------------------------------------------------------------
 # Stage 0c (RF): Pseudo-forecast Backtesting — South America (RF)

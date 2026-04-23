@@ -50,6 +50,7 @@ export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 export WANDB_DIR="${WANDB_DIR:-$SCRATCH/wandb}"
 mkdir -p "$WANDB_DIR"
+export PA3030_WANDB=1
 # RF training cap: reservoir-sample negatives to keep X matrix within RAM budget.
 # USA has ~270 M total rows; 30 M neg keeps X at ~10 GB (73 features × float32).
 export MAX_NEG_TRAIN="${MAX_NEG_TRAIN:-30000000}"
