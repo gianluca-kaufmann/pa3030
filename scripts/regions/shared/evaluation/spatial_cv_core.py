@@ -1540,7 +1540,7 @@ def _run_transfer_direction(
     Feature columns are read from the model itself, guaranteeing that the target
     region's data is extracted in exactly the order the model expects.
 
-    SA and USA share identical 73-feature sets, so cross-scoring is exact.
+    SA and USA share identical 72-feature sets, so cross-scoring is exact.
     """
     label = f"{source_region}_to_{target_region}_{model_type}"
     print("\n" + "=" * 70)
@@ -2289,7 +2289,7 @@ def run_transfer_main(
     """Cross-continental transfer evaluation, for both LGBM and RF.
 
     Loads the production models trained in step 5 (no retraining) and scores
-    them on another continent's test set.  All regions share identical 73-feature
+    them on another continent's test set.  All regions share identical 72-feature
     sets, so feature columns are taken directly from the loaded model.
 
     Args:

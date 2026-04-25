@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""Group A / Group B leakage diagnostic — South America (Model 1)
+
+Splits test positives by designation-year cohort to quantify how much of
+the model's test performance comes from pixels that were already seen as
+positives during training vs. genuinely unseen future designations.
+
+  Group A (D=2018-2019): soft label leakage present — test result upper bound
+  Group B (D=2023-2024): never in any training row — genuine OOS signal
+  Ambiguous (D=2020-2022): unresolvable from test data alone; reported separately
+
+Usage:
+    python scripts/regions/south_america/6_evaluation/group_ab_diagnostic
+    python scripts/regions/south_america/6_evaluation/group_ab_diagnostic --model rf
+    python scripts/regions/south_america/6_evaluation/group_ab_diagnostic --model lgbm
+
+Input:
+    outputs/south_america/results/ml_models/main/model1_{rf,lgbm}_scored_*.parquet
+    data/south_america/ml/main/test_win5.parquet
+
+Output:
+    outputs/south_america/results/ml_models/main/model1_{rf,lgbm}_win5_group_ab_<ts>.json
+
+See scripts/regions/shared/evaluation/group_ab_diagnostic_core.py for full details.
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+_repo_root = Path(__file__).resolve().parents[4]
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+
+from scripts.regions.shared.evaluation.group_ab_diagnostic_core import run_group_ab_main
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument(
+        "--model",
+        choices=["lgbm", "rf", "both"],
+        default="both",
+        help="Algorithm(s) to run (default: both)",
+    )
+    p.add_argument("--split-version", default="main")
+    args = p.parse_args()
+    run_group_ab_main(
+        region="south_america",
+        models=args.model,
+        split_version=args.split_version,
+        repo_root=_repo_root,
+    )

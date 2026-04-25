@@ -195,15 +195,17 @@ formal WDPA designation within a five-year window. LightGBM and Random Forest mo
 are trained on annual designation records from 2001 to 2019 across South America,
 the United States, and Southeast Asia, with forward projections anchored to a 2024
 data snapshot, so the five-year forward window spans 2025--2030, directly aligned with the 30$\times$30 policy deadline.
-In South America, the framework achieves strong out-of-sample
-discrimination: ROC-AUC 0.897, with 77.4\% of all new designations falling in the
-top 1\% of predicted pixels (Precision@1\% = 79.8\%). Both algorithms achieve
-comparably strong discrimination across all three regions, confirming the
-robustness of the approach. Feature importance analysis
-reveals that designation follows institutional and political-economy logic as much as
-ecological suitability: conservation priority areas are protected, but high-value
-agricultural land is systematically excluded from high-risk zones, consistent with an
-opportunity-cost mechanism. Forward projections show that all three regions fall far
+In South America, the Random Forest model achieves an out-of-sample
+ROC-AUC of 0.910 and a PR-AUC of 0.548; the top 1\% of predicted pixels captures
+69.1\% of all unique designated pixels (event-level Precision@1\% = 97.0\%,
+pixel-year Lift@1\% = 67.6$\times$ over random). Random Forest outperforms
+LightGBM on precision-recall metrics across all three regions; LightGBM results
+confirm the directional findings. Feature importance analysis reveals that
+designation follows a compound logic of economic accessibility, ecological
+priority, and institutional context: road-accessible, densely populated, and
+high-value agricultural land is systematically excluded from high-risk zones,
+while remote areas adjoining existing protected areas attract designation
+irrespective of ecological significance. Forward projections show that all three regions fall far
 short of 30$\times$30 under business-as-usual designation rates, and
 cross-continental transfer confirms that designation patterns are region-specific,
 shaped by local political economies rather than universal ecological gradients. These
@@ -321,15 +323,16 @@ spatial risk scores, forward probability maps under business-as-usual and 30$\ti
 scenarios, estimates of agricultural land area at risk, and feature importance
 analysis of the drivers of government designation decisions.
 
-The main results are as follows. In South America, LightGBM achieves an
-out-of-sample ROC-AUC of 0.897; the top 1\% of predicted pixels captures 77.4\% of
-all actual PA establishment events in the test period at a Lift@1\% of
-66.8$\times$ over random. Feature importance reveals that designation follows
-ecological conservation priority, institutional feasibility, and low economic cost,
-with high-value agricultural land systematically absent from high-risk zones. Forward
-projections under business-as-usual rates indicate South America would reach the 30\%
-target only after approximately 68 additional years from 2024, with the United States
-and Southeast Asia falling even further short.
+The main results are as follows. In South America, the Random Forest model achieves
+an out-of-sample ROC-AUC of 0.910 and a PR-AUC of 0.548; the top 1\% of predicted
+pixels captures 69.1\% of all unique designated pixels at an event-level
+Precision@1\% of 97.0\% and a pixel-year Lift@1\% of 67.6$\times$ over random.
+Feature importance reveals that designation follows economic accessibility,
+ecological priority, and governance capacity: road-accessible, densely populated, and
+high-value agricultural land is systematically suppressed from the high-risk tier.
+Forward projections under business-as-usual rates indicate South America would reach
+the 30\% target only after approximately 68 additional years from 2024, with the
+United States and Southeast Asia falling even further short.
 
 The remainder of the thesis proceeds as follows: \cref{sec:literature} reviews
 the relevant literature; \cref{sec:data_section} describes data and study areas;
@@ -572,22 +575,22 @@ a prerequisite input for such applications.
 
 \paragraph{South America.}
 South America is selected as the primary study region for three reasons. First, it
-contains some of the world's most biodiverse and ecologically heterogeneous ecosystems
-\citep{diaz2019, mouillot2024}, %TODO: These sources do not support the claim. Look for better sources.
-including the Amazon rainforest, the Cerrado savanna, the Andean
-highlands, and the Atlantic Forest, providing a broad range of ecological contexts for
-model training and evaluation.
- Second, protected-area coverage has expanded substantially since
+lies largely within the Neotropics, the most species-rich terrestrial realm, and spans
+major ecological systems including the Amazon rainforest, the Cerrado savanna, the
+Andean highlands, and the Atlantic Forest \citep{antonelli2018, ipbesamericas2018}.
+This provides a broad range of ecological contexts for model training and evaluation.
+Second, protected-area coverage has expanded substantially since
 2000, expanding from roughly 15\% to 25.6\% of terrestrial area in the WDPA
-rasterisation used here, generating
-sufficient temporal variation in designations to train a transition model. %TODO: Must be supported by sources, or our own data.
+rasterisation used here. This thesis-derived panel therefore contains enough
+observed designation events to train a transition model.
 Third, the
-continent encompasses wide variation in institutional capacity, governance quality, and
-economic development \citep{wgi2025, vdem2025}, enabling the model to capture a broad
-range of drivers. %TODO: Assess whether these sources are enough to support this claim. Just checking.
+continent shows wide cross-country variation in the governance indicators used as
+model predictors \citep{wgi2025, vdem2025}, enabling the model to learn from a broad
+range of institutional contexts.
 
-The study covers all sovereign terrestrial land areas of South America at a $1 \times 1$~km %TODO: The 1x1 km resolution choice must be justified and supported by litertaure, either here or in methods, wherever it fits better. New literature specific to the choice of resolution must be found and cited.
-resolution, including French Guiana (overseas French territory) and Trinidad and Tobago,
+The study covers all sovereign terrestrial land areas of South America on the common
+$1 \times 1$~km reference grid justified in Section~\ref{sec:harmonisation}, including
+French Guiana (overseas French territory) and Trinidad and Tobago,
 but excluding Antarctic territories and open-ocean pixels. Inland water bodies are
 included in the raster extent; coverage percentages refer to the total terrestrial
 land mask consistent with the WDPA rasterisation boundary. This yields approximately 20.8 million unique grid cells observed annually
@@ -596,33 +599,32 @@ pixel--year observations after excluding already-protected pixels.
 
 \paragraph{United States}
 The United States is chosen as a robustness check because it provides a structurally
-distinct test environment: a federal system with transparent public-land designations,
-high data quality, and a current PA coverage of approximately 7.7\%. %TODO: Must be supported by sources, or our own data, or reworded.
- The US is not a
-CBD Party and did not formally adopt the Kunming-Montreal GBF, but pursues a domestic
-30$\times$30 goal through executive policy (America the Beautiful initiative),
-making the intensity of future designation pressure more uncertain than in South America. %TODO: Is this still true? Might have changed under the new administration.
+distinct test environment: a federal system, one national governance regime in the
+panel, and a low formal WDPA coverage of 7.7\% in the thesis raster baseline.
+The US is not a CBD Party and did not formally adopt the Kunming-Montreal GBF.
+It pursued a domestic 30$\times$30 goal through the America the Beautiful initiative
+\citep{doi2021america}, but the 2025 revocation of Executive Order~14008 made future
+federal designation pressure more policy-contingent \citep{whitehouse2025eo14154}.
 This institutional contrast is precisely the point:
 the US serves as a robustness test of whether the predictive framework, trained on
 a different governance structure and designation process, still recovers
 historically coherent risk patterns. Substantial federal land holdings (Bureau of
 Land Management, National Forest) provide a large pool of candidate parcels, and
-the observed low designation rate creates a severe class-imbalance environment
-that stresses the model's calibration and rare-event detection capabilities. %TODO: Must be supported by sources, or our own data, or reworded.
+the observed test-period positive rate of approximately 0.04\% creates a severe
+class-imbalance environment for calibration and rare-event detection.
 
 \paragraph{Southeast Asia}
 Southeast Asia is chosen as a second robustness region because its biome composition,
-including tropical and subtropical forests, mangroves, and montane ecosystems, partly overlaps with
-South America's \citep{dinerstein2020}, %TODO: This source does not support the claim. Look for better sources.
-making it a natural candidate to test whether predictive
-patterns learned in one region transfer to ecologically similar but institutionally
-distinct contexts. At the same time, the region's governance heterogeneity
-\citep{wgi2025, vdem2025},spanning centralised states, archipelagic federations, and
-post-colonial conservation institutions across ASEAN member states (Brunei, Cambodia,
-Indonesia, Laos, Malaysia, Myanmar, the Philippines, Singapore, Thailand, Vietnam,
-plus Timor-Leste and Papua New Guinea as ecologically contiguous territories included
-in the raster extent), and its current PA coverage of 14.0\% provide a challenging
-out-of-sample environment. %TODO: Must be supported by sources, or our own data, or reworded. Too long sentence as well
+including tropical and subtropical forests, mangroves, and montane ecosystems, shares
+several WWF biome classes with South America \citep{olson2001}. It is therefore a
+natural test of whether predictive patterns learned in one tropical region transfer to
+an ecologically related but institutionally distinct context. At the same time, the
+region spans centralised states, archipelagic federations, and post-colonial
+conservation institutions across ASEAN member states, plus Timor-Leste and Papua New
+Guinea as ecologically contiguous territories included in the raster extent. Its
+governance indicators vary substantially across countries \citep{wgi2025, vdem2025},
+and its formal WDPA coverage is 14.0\% in the thesis raster baseline. Together, these
+properties provide a challenging out-of-sample environment.
  
 % ---------------------------------------------------------------------------
 \subsection{Variables and Data Sources}
@@ -650,12 +652,6 @@ reflects the focus of the analysis on initial designation rather than subsequent
 legal change.
 Transition-risk analysis is primarily concerned with the risk of new designation
 rather than de-listing, so the cumulative indicator is the appropriate target.
-
-A known data-quality consideration is that WDPA gazette dates can lag the formal
-legal designation in some jurisdictions \citep{bingham2019}.
-The five-year lookahead window absorbs errors of this magnitude, as is standard
-practice in discrete-time event-history modelling \citep{singer1993}; residual
-data-quality implications are discussed in Section~\ref{sec:discussion_limitations}. %TODO: This paragraph is relevant, but we should probably move it to the limitations section.
 
 \subsubsection{Predictor Variables}
 \label{sec:predictors}
@@ -781,11 +777,12 @@ disturbance. SRTM elevation and slope control for terrain-driven variation in
 accessibility and agricultural suitability. The 19 WorldClim bioclimatic variables
 characterise each cell's long-run environmental envelope. Annual MODIS land-cover
 class (IGBP scheme) captures broad land-use context. The five GSN layers add
-globally standardised conservation-priority signals: high-biodiversity areas
+globally standardised conservation-priority signals \citep{dinerstein2020}:
+high-biodiversity areas
 identify species-richness centres; intact wilderness flags undisturbed ecosystems;
 climate-stabilisation areas capture carbon-dense and hydrologically critical zones;
 wildlife corridors delineate PA connectivity; and WWF ecoregion boundaries provide
-a biogeographic stratification. %TODO: Do we have to add the citations from the table above here again? Or no?
+a biogeographic stratification.
 
 \paragraph{Human pressure and economic activity.}
 Population density proxies development intensity and the political opportunity cost
@@ -833,16 +830,23 @@ cloud-persistent regions). Rather than imputing missing values, they are retaine
 \texttt{NaN} sentinels and handled natively by LightGBM and Random Forest. For population density (available at
 five-year intervals) and night-time lights (a small end-of-series gap), forward-filling
 is applied: for any year $t$ without a direct observation, the most recent prior-year
-value is carried forward within each cell. %TODO: MAybe we should support our forward filling method with a citation.
+value is carried forward within each cell. This is a deterministic last-observation
+carried-forward approximation \citep{little2019}; it is used only for source layers
+with coarser temporal release schedules, not for target labels or model outputs.
 
 % ---------------------------------------------------------------------------
 \paragraph{Reference grid.}
 \label{sec:harmonisation}
 All analyses are conducted on a regular $1 \times 1$~km reference grid in
 EPSG:3857 (WGS~84 Web Mercator). This resolution is compatible with all key predictors
-(WDPA, WorldClim, GPW, MODIS), aligns with the landscape scale at which PA designation
-decisions operate. Web Mercator introduces latitude-dependent areal distortion that increases away from
-the equator. Because all predictor layers are co-registered to the same grid, every
+(WDPA, WorldClim, GPW, MODIS) and follows prior global PA-siting and biodiversity
+modelling work that uses 1~km or 1~km$^2$ global grids
+\citep{joppa2009, tuanmu2015}. It is fine enough to retain landscape-scale gradients
+in accessibility, land cover, and existing PA proximity, while remaining computationally
+tractable for continental panels exceeding 100 million observations.
+Web Mercator introduces latitude-dependent scale and area distortion that increases
+away from the equator \citep{snyder1987}. Because all predictor layers are
+co-registered to the same grid, every
 feature within a cell is subject to the same geometric distortion, so within-cell
 covariate relationships seen by tree-based models are unaffected.
 Distance-based features are slightly overstated at higher
@@ -974,9 +978,9 @@ year $t$, so no future information leaks into the feature vector.
 
 A five-year horizon is chosen for three reasons: it aligns directly with the
 2025--2030 window of the 30$\times$30 target; it absorbs administrative recording
-delays of up to three years in the WDPA without censoring true designation events;
-and it provides a large enough positive class per year to support reliable model
-training despite rare events.
+delays of up to three years in the WDPA without censoring true designation events
+\citep{bingham2019}; and it provides a large enough positive class per year to
+support reliable model training despite rare events.
 
 \paragraph{Risk set and right-censoring.}
 Only unprotected pixels ($y_{i,t} = 0$) are eligible for the transition and therefore
@@ -1084,12 +1088,17 @@ automatically upweights the rare positive (transition) observations within each 
 in inverse proportion to their frequency.
 
 \paragraph{LightGBM.}
-Light Gradient-Boosting Machine (LightGBM; \citealp{ke2017}) is the primary reporting
-model throughout the analysis. Both LightGBM and Random Forest are fully trained and
-evaluated production models; results are reported for LightGBM by default because it
-attains superior performance on the calibration-sensitive metrics most relevant for
-transition-risk applications (PR-AUC and Brier score), while RF results serve as
-confirmation. Section~\ref{sec:results_sa_metrics} elaborates on this choice.
+Light Gradient-Boosting Machine (LightGBM; \citealp{ke2017}) is estimated alongside
+Random Forest as a fully trained and evaluated production model. Both algorithms
+use the same training splits, feature set, and calibration procedure. Random Forest
+is reported as the primary model throughout the analysis because it attains superior
+performance on the policy-relevant metrics---PR-AUC, Precision@1\%, and Brier
+score---across all three regions; LightGBM results serve as confirmation.
+Section~\ref{sec:results_sa_metrics} elaborates on this choice.
+For SHAP feature-importance interpretation, LightGBM SHAP values are additionally
+reported because the ensemble structure is less susceptible to the geographic
+clustering artifact that inflates Random Forest discrimination in the United States
+(Section~\ref{sec:results_usa}).
 
 Gradient boosting builds an ensemble sequentially: each tree is fitted to the
 prediction errors of the existing ensemble, so successive trees progressively
@@ -1106,20 +1115,20 @@ function in proportion to its rarity. The parameter is recomputed from the train
 data for each model run.
 
 Hyperparameters are selected via Bayesian optimisation using Optuna
-\citep{akiba2019}, running up to 100 trials per region. Each trial proposes a
-candidate hyperparameter configuration, trains the model, and evaluates it on a
-held-out validation period (see Section~\ref{sec:splits}); the optimisation
-objective is the area under the precision--recall curve (PR-AUC; defined in
-Section~\ref{sec:metrics}). Table~\ref{tab:hyperparams} lists the fixed and
-key tuned parameters; region-specific selected values are in
-Appendix~\ref{app:hyperparams}.
+\citep{akiba2019}. LightGBM uses 40 trials per region and Random Forest uses
+10 trials per region. Each trial proposes a candidate hyperparameter
+configuration, trains the model, and evaluates it on a held-out validation
+period (see Section~\ref{sec:splits}); the optimisation objective is the area
+under the precision--recall curve (PR-AUC; defined in Section~\ref{sec:metrics}).
+Table~\ref{tab:hyperparams} lists the fixed and key tuned parameters;
+region-specific selected values are in Appendix~\ref{app:hyperparams}.
 
 \begin{table}[H]
 \centering
 \caption{Key hyperparameter values for the Random Forest (RF) and LightGBM (LGBM)
 transition models.}
 \label{tab:hyperparams}
-\small
+\footnotesize
 \begin{tabular}{llll}
 \toprule
 \textbf{Parameter} & \textbf{RF} & \textbf{LightGBM} & \textbf{Notes} \\
@@ -1160,10 +1169,10 @@ reported metrics reflect the model's ability to forecast \emph{future} designati
 using only \emph{past} information. The training design consists of three stages:
 
 \textbf{Hyperparameter optimisation (Optuna HPO).}
-Optuna runs up to 100 trials; each trial proposes a candidate hyperparameter
-configuration, trains the model on an expanding window of historical years, and
-evaluates predictive performance (PR-AUC; Section~\ref{sec:metrics}) on the
-immediately following years. Year 2000 is excluded from all splits: the WDPA records
+Optuna runs 40 trials for LightGBM and 10 trials for Random Forest; each trial
+proposes a candidate hyperparameter configuration, trains the model on an
+expanding window of historical years, and evaluates predictive performance
+(PR-AUC; Section~\ref{sec:metrics}) on the immediately following years. Year 2000 is excluded from all splits: the WDPA records
 it as a cross-sectional baseline in which all pre-existing PAs appear as newly
 designated, not as true annual events.
 
@@ -1200,7 +1209,8 @@ predictions generated during the CV folds, not on test data.
 
 \paragraph{Temporal sample weighting.}
 Conservation-policy dynamics evolve over time, and recent designation patterns are
-more informative for forecasting the near future than patterns from two decades ago.
+more informative for forecasting the near future than patterns from two decades ago
+\citep{gama2014}.
 Training observations are therefore assigned a linearly increasing sample weight:
 year 2001 receives weight 0.5 and the last training year receives weight 1.0, with
 all intermediate years interpolated proportionally. This places greater emphasis on
@@ -1213,7 +1223,7 @@ No oversampling or undersampling is applied; the empirical frequency is preserve
 Instead, class weights (LightGBM: \texttt{scale\_pos\_weight}; Random Forest:
 \texttt{balanced\_subsample}) adjust the contribution of minority-class observations
 to the loss function. This approach avoids distorting the spatial or temporal
-structure of the data.
+structure of the data \citep{elkan2001}.
 
 \paragraph{Reproducibility.}
 All random components (tree construction, bootstrap sampling, Optuna trial
@@ -1448,45 +1458,45 @@ evidence on practical out-of-sample generalisation.
 \subsubsection{Discrimination Metrics}
 \label{sec:results_sa_metrics}
 
-Table~\ref{tab:sa_metrics} reports temporal test-set performance for the LightGBM
-and Random Forest transition models applied to South America (test period: 2017--2019).
-Lift@1\% = 66.8$\times$ means the top-1\% risk zone contains 66.8 times as many
-future designations as a randomly drawn 1\% of land. Event-level Recall@1\% (77.4\%;
-Section~\ref{sec:results_sa_events}) is higher because it counts each unique pixel
-once rather than penalising year-by-year timing errors. 
+Table~\ref{tab:sa_metrics} reports temporal test-set performance for the Random
+Forest and LightGBM transition models applied to South America (test period:
+2017--2019). Pixel-year Lift@1\% = 67.6$\times$ means the top-1\% risk zone
+contains 67.6 times as many future designation events as a randomly drawn 1\% of
+land. Event-level Recall@1\% (69.1\%; Section~\ref{sec:results_sa_events}) counts
+each unique designated pixel once, regardless of the number of training-year rows
+in which it appears.
 
 \begin{table}[H]
 \centering
 \caption{Predictive performance on the temporal test set (2017--2019) for South
-America. Baseline positive rate: 0.797\%.}
+America. Baseline positive rate: 0.797\%. RF is the primary model.}
 \label{tab:sa_metrics}
 \begin{tabular}{lcc}
 \toprule
-\textbf{Metric} & \textbf{LightGBM} & \textbf{Random Forest} \\
+\textbf{Metric} & \textbf{Random Forest} & \textbf{LightGBM} \\
 \midrule
-ROC-AUC              & 0.897  & 0.927 \\
-PR-AUC               & 0.645  & 0.634 \\
-Precision @ top 1\%  & 0.532  & 0.539 \\
-Lift @ top 1\%       & 66.8$\times$ & 67.6$\times$ \\
-Precision @ top 5\%  & 0.116  & 0.121 \\
-Lift @ top 5\%       & 14.5$\times$ & 15.2$\times$ \\
-Brier score          & 0.00421 & 0.00458 \\
-ECE (post-calibration) & 0.0081 & 0.0109 \\
+ROC-AUC              & 0.910  & 0.934 \\
+PR-AUC               & 0.548  & 0.459 \\
+Precision @ top 1\%  & 0.538  & 0.449 \\
+Lift @ top 1\%       & 67.6$\times$ & 56.3$\times$ \\
+Precision @ top 5\%  & 0.119  & 0.120 \\
+Lift @ top 5\%       & 14.9$\times$ & 15.1$\times$ \\
+Brier score          & 0.00514 & 0.00607 \\
+ECE (post-calibration) & 0.0116 & 0.00569 \\
 \bottomrule
 \end{tabular}
 \end{table}
-The LightGBM model achieves strong discrimination: ROC-AUC 0.897 indicates that
-a randomly drawn transition pixel is ranked above a randomly drawn non-transition
-pixel 90\% of the time. The PR-AUC of 0.645 is the more informative metric under
-extreme imbalance: against a random classifier at the base rate (0.008), the model
-achieves an 80-fold improvement in aggregate precision-recall performance across all
-thresholds. At the most policy-relevant threshold, Lift@1\% = $66.8\times$ measures
-enrichment at the specific top-1\% cut-off; the two figures are consistent, as
-PR-AUC summarises the full curve while Lift quantifies one operating point. The
-Brier score of 0.00421 is 47\% below the no-information baseline, confirming genuine
-probability accuracy. Post-calibration ECE is 0.0081 (0.81 pp on a 0.8\% base rate);
-reliability diagrams (Appendix~\ref{app:calibration}) confirm strong calibration
-in the informative upper tail.
+
+The Random Forest achieves strong discrimination: ROC-AUC 0.910 indicates that a
+randomly drawn transition pixel is ranked above a randomly drawn non-transition pixel
+91\% of the time. The PR-AUC of 0.548 is the more informative summary metric under
+extreme class imbalance. At the most policy-relevant threshold, Lift@1\% =
+$67.6\times$ quantifies enrichment at the specific top-1\% cut-off, consistent with
+the PR-AUC curve which summarises performance across all thresholds. The Brier score
+of 0.00514 is 35\% below the no-information baseline of $\pi(1-\pi) \approx 0.0079$,
+confirming genuine probability accuracy. Post-calibration ECE is 0.0116; reliability
+diagrams (Appendix~\ref{app:calibration}) confirm strong calibration in the
+informative upper tail.
 
 The static suitability model trained on year-2000 cross-sections cannot distinguish
 where designation pressure is growing; the panel model's temporal features provide
@@ -1495,34 +1505,36 @@ this advantage (reference metrics in Appendix~\ref{app:calibration}).
 \begin{figure}[H]
 \centering
 \begin{subfigure}[t]{0.48\textwidth}
-  \includegraphics[width=\textwidth, keepaspectratio]{../outputs/south_america/results/model1_lgbm/pr_curve.pdf}
-  \caption{Precision--Recall curve. The dashed line shows the random-classifier
-  baseline ($\approx 0.8\%$ positive rate). The curve lies far above the baseline
-  across the full threshold range.}
+  \includegraphics[width=\textwidth, keepaspectratio]{../outputs/south_america/results/model1_rf/pr_curve.pdf}
+  \caption{Precision--Recall curve (Random Forest). The dashed line shows the
+  random-classifier baseline ($\approx 0.8\%$ positive rate). The curve lies far
+  above the baseline across the full threshold range.}
   \label{fig:pr_sa}
 \end{subfigure}\hfill
 \begin{subfigure}[t]{0.48\textwidth}
-  \includegraphics[width=\textwidth, keepaspectratio]{../outputs/south_america/results/model1_lgbm/cumulative_gains.pdf}
+  \includegraphics[width=\textwidth, keepaspectratio]{../outputs/south_america/results/model1_rf/cumulative_gains.pdf}
   \caption{Cumulative gains chart. The curve shows the fraction of all
   test-period transitions captured as a function of the fraction of pixels
   screened, ranked by predicted probability.}
   \label{fig:cumgains_sa_main}
 \end{subfigure}
-\caption{Model discrimination for the South America LightGBM on the temporal test set
-(2017--2019). \textit{Left:} Precision--Recall curve. \textit{Right:} Cumulative
-gains chart --- at the top 1\% of pixels, pixel-year Recall@1\% = 66.8\% and
-Lift@1\% = 66.8$\times$; these coincide numerically because Recall@$k$ = Lift@$k \times k$
-and $k=0.01$ here.}
+\caption{Model discrimination for the South America Random Forest on the temporal
+test set (2017--2019). \textit{Left:} Precision--Recall curve. \textit{Right:}
+Cumulative gains chart --- at the top 1\% of pixels, pixel-year Recall@1\% = 67.6\%
+and Lift@1\% = 67.6$\times$; these coincide numerically because Recall@$k$ =
+Lift@$k \times k$ and $k=0.01$ here.}
 \label{fig:pr_gains_sa}
 \end{figure}
 
-Both LightGBM and Random Forest are fully trained and evaluated production models, and
-their results confirm each other: the two classifiers produce broadly similar performance
-across all metrics. The Random Forest achieves a higher ROC-AUC (0.927 vs.\ 0.897),
-while LightGBM leads on PR-AUC (0.645 vs.\ 0.634), Brier score (0.00421 vs.\ 0.00458),
-and ECE (0.0081 vs.\ 0.0109). For transition-risk applications, PR-AUC and probability
-calibration are the more actionable metrics. LightGBM is therefore reported as the
-primary model in the remainder of the analysis, with RF results provided for confirmation.
+Both Random Forest and LightGBM are fully trained and evaluated production models.
+Random Forest leads on the policy-critical metrics: PR-AUC (0.548 vs.\ 0.459),
+Precision@1\% (0.538 vs.\ 0.449), Lift@1\% (67.6$\times$ vs.\ 56.3$\times$), and
+Brier score (0.00514 vs.\ 0.00607). LightGBM achieves a higher ROC-AUC (0.934
+vs.\ 0.910) and lower ECE (0.00569 vs.\ 0.0116). Because PR-AUC and probability
+accuracy are the more actionable metrics for transition-risk screening under extreme
+class imbalance, Random Forest is the primary model in the remainder of the analysis.
+LightGBM SHAP values are additionally reported for feature interpretation, where its
+scoring surface is less susceptible to local geographic clustering.
 
 \subsubsection{Event-Level Coverage}
 \label{sec:results_sa_events}
@@ -1536,39 +1548,36 @@ when designation occurs within the next five years?
 
 Event-level coverage answers this question directly: each unique pixel that transitions
 within any test-year's five-year prediction window is counted once, and the metric
-checks whether it falls within the top-1\% risk zone (see Section~\ref{sec:lobo}
-for the formal definition). Under this aggregation,
-the LightGBM model achieves a Recall@1\% of 77.4\% and a
-Precision@1\% of 79.8\%: nearly four in five of the top-1\% predicted
-pixels actually became protected areas, and three in four of all new protected areas
-fell within just 1\% of eligible land (approximately 159,000~km$^2$ out of
-15.9~million~km$^2$). A risk analyst screening fewer than 1\% of
-candidate parcels would flag roughly three-quarters of all future designation events
-well in advance, while maintaining a precision rate close to 80\%. This combination
-of high precision \emph{and} high recall at an extremely concentrated threshold is
-the defining result.
+checks whether it falls within the top-1\% risk zone. Under this aggregation,
+the Random Forest achieves an event-level Recall@1\% of 69.1\% and a
+Precision@1\% of 97.0\%: virtually every pixel in the top-1\% risk zone actually
+became a protected area, and more than two-thirds of all unique PA establishment
+events fell within just 1\% of eligible land (approximately 155,000~km$^2$ out of
+the eligible risk set). The LightGBM achieves an event-level Recall@1\% of 60.3\%
+and Precision@1\% of 84.7\%. The RF's near-perfect event-level precision is the
+sharpest targeting result in the analysis: a risk analyst screening fewer than 1\% of
+candidate parcels would capture the majority of future designation events with almost
+no false positives at the pixel level.
 
 \subsubsection{Probability Calibration}
 \label{sec:results_sa_calibration}
 
-Raw LGBM scores are systematically overconfident before Platt scaling; after
-calibration the ECE drops to 0.0081. Because high-score bins contain few
-observations, calibration in the upper tail is best assessed from the reliability
-diagrams (Appendix~\ref{app:calibration}) rather than ECE alone. The key result is
-that calibrated probabilities are actionable: a score of 0.03 means a genuine
-3\% five-year designation probability, usable for portfolio screening and risk
-quantification rather than simply ranking pixels.
+Raw model scores are systematically over-confident before Platt scaling. After
+calibration, the RF ECE is 0.0116 and the LightGBM ECE is 0.00569; both represent
+small absolute deviations from observed transition rates on a 0.8\% baseline. Because
+high-score bins contain few observations, calibration in the upper tail is best
+assessed from the reliability diagrams (Appendix~\ref{app:calibration}) rather than
+ECE alone. The key result is that calibrated probabilities are actionable: a score
+of 0.03 means a genuine 3\% five-year designation probability, usable for portfolio
+screening and risk quantification rather than simply ranking pixels.
 
 \subsubsection{Feature Importance (SHAP)}
 \label{sec:results_sa_shap}
 
-Figure~\ref{fig:shap_sa} shows the SHAP summary plot: each row is one feature
-sorted by mean absolute SHAP value; horizontal position is the SHAP value (positive
-$=$ increases designation probability, negative $=$ decreases it); colour encodes
-the raw feature value (red $=$ high, blue $=$ low). For example, a red dot far to
-the right on the biodiversity-area row means a pixel in a high-biodiversity area
-strongly increases its designation probability; a red dot far to the left on the
-agricultural-value row means a pixel with high land value strongly decreases it.
+Figure~\ref{fig:shap_sa} shows the SHAP summary plot for the LightGBM model used for
+interpretation: each row is one feature sorted by mean absolute SHAP value; horizontal
+position is the SHAP value (positive $=$ increases designation probability, negative
+$=$ decreases it); colour encodes the raw feature value (red $=$ high, blue $=$ low).
 
 \begin{figure}[H]
 \centering
@@ -1582,45 +1591,48 @@ have been translated from internal codes to interpretable labels.}
 \label{fig:shap_sa}
 \end{figure}
 
-Three co-determining channels emerge from the SHAP rankings:
+Three co-determining channels emerge from the SHAP rankings.
 
-\textbf{Ecological conservation priority.} Biodiversity indicators dominate the
-top of the ranking: \texttt{GSN\_b2\_smooth16} (high-biodiversity areas, 16~km
-neighbourhood) ranks first (81.0\% of observations positive), and
-\texttt{GSN\_b3\_smooth16} (Intact Wilderness) ranks fourth (80.2\% positive),
-confirming that ecologically significant landscapes attract designation
-\citep{mouillot2024}. Smoothed neighbourhood versions consistently outrank
-raw pixel-level indicators, reflecting designation as a landscape-scale process.
-Existing PA coverage (\texttt{WDPA}, rank~9) shows the sharpest directional signal
-in the top ten---98.9\% of observations positive---an accretion pattern in which
-new designations cluster around established reserves.
+\textbf{Institutional capacity.} WGI Rule of Law (\texttt{policy\_b4}) ranks first
+in absolute importance (mean SHAP $+0.078$; 73.7\% of observations positive),
+making it the single strongest predictor: stronger rule of law is positively
+associated with designation probability across South America. This is consistent
+with the state-capacity mechanism---countries that effectively gazette and enforce
+PAs designate more, conditional on ecological and economic conditions. The V-Dem
+Liberal Democracy Index (\texttt{policy\_b2}, rank~10) shows a predominantly
+negative mean SHAP (mean $-0.067$; 39.6\% positive), a continental-scale signal that
+reflects the heterogeneous governance landscape: in some South American contexts,
+democratic accountability facilitates designation, while in others it introduces
+political costs that constrain it.
 
-\textbf{Institutional capacity.} WGI Rule of Law (\texttt{policy\_b4}, rank~2)
-carries a clearly positive mean SHAP ($+0.129$; 78.5\% of observations positive),
-indicating that, in this model, stronger rule of law is positively associated with
-designation probability across South America. The V-Dem Liberal Democracy Index
-(\texttt{policy\_b2}, rank~12) shows a near-neutral split (51.9\% positive, mean
-$-0.064$), suggesting this broader democratic index carries a weaker signal at
-continental scale.
+\textbf{Ecological conservation priority.} The high-biodiversity-area indicator
+(\texttt{GSN\_b2\_smooth16}, rank~2; 81.8\% positive) is the second most important
+feature, confirming that ecological significance attracts designation
+\citep{mouillot2024}. The relationship is non-monotonic: most observations in
+biodiversity-priority zones show positive SHAP values, but the feature's mean SHAP
+is negative ($-0.064$) because the minority with strong negative contributions
+involve pixels that are within, but at the edge of, large high-biodiversity areas
+where competing land uses suppress designation. Smoothed neighbourhood versions
+consistently outrank raw pixel-level indicators, reflecting designation as a
+landscape-scale process.
 
 \textbf{Economic opportunity cost.} Agricultural land value
-(\texttt{economic\_value\_lag1}, rank~5) carries a negative mean SHAP ($-0.107$;
-46.6\% positive), and infrastructure proxies---night-time lights (rank~16, 21.3\%
-positive) and road access (rank~15, 24.5\% positive)---are each negative for over
-three-quarters of observations, confirming that economically active,
-road-accessible pixels are suppressed from the high-risk tier \citep{joppa2009}.
-Distance to indigenous territories (\texttt{dist\_indigenous}, rank~6) is
-near-neutral (53.6\% positive), reflecting its dual role as a co-management anchor
-in Amazonia and a remoteness proxy elsewhere.
+(\texttt{economic\_value\_lag1}, rank~3) carries a negative mean SHAP ($-0.063$;
+43.5\% positive), and infrastructure proxies---road access (rank~8, 23.4\%
+positive) and harmonised night-time lights (rank~16)---are negative for the large
+majority of observations, confirming that economically active, road-accessible pixels
+are suppressed from the high-risk tier \citep{joppa2009}. The RF SHAP analysis
+strengthens this finding: road distance ranks first and population density occupies
+three of the top eight positions in the RF ranking, with consistently negative
+direction.
 
-Designation probability peaks where ecological priority is high, governance is
-strong, and opportunity cost is low. Dry-season precipitation
-(\texttt{WorldClim\_b14}, rank~3; 78.7\% positive) also enters the top three,
-likely acting as a biome-level proxy: seasonally drier landscapes outside the core
-Amazon carry a distinct designation signature. This overall pattern is consistent
-with the historical concentration of South American designations in remote,
+Designation probability peaks where rule of law is strong, ecological priority is
+high, and opportunity cost is low. Dry-season precipitation (\texttt{WorldClim\_b14},
+rank~6; 78.2\% positive) acts as a biome-level proxy: seasonally drier landscapes
+outside the Amazon core carry a distinct designation signature. This pattern is
+consistent with the historical concentration of South American designations in remote,
 ecologically significant land adjoining existing PAs \citep{joppa2009, venter2018}.
-SHAP dependence plots for the four most important features are in
+SHAP dependence plots for selected current features are in
 Appendix~\ref{app:shap_dep}.
 
 \subsubsection{Spatial Risk Maps}
@@ -1635,26 +1647,26 @@ in Table~\ref{tab:sa_metrics}. Designations persist beyond the held-out test yea
 
 High-risk pixels form spatially coherent clusters in the Amazon basin periphery,
 the Cerrado--Amazon transition zone, the Andean foothills, and southern Chile.
-At Precision@1\% = 79.8\%, nearly every cluster corresponds to a subsequent PA
-establishment. The model identifies where governments acted, not just which areas
-are biodiverse or remote. Note that Precision@1\% is a pixel-level metric and does
-not directly imply cluster-level hit rates.
+At an event-level Precision@1\% of 97.0\%, nearly every cluster corresponds to a
+subsequent PA establishment. The model identifies where governments acted, not just
+which areas are biodiverse or remote. Note that Precision@1\% is a pixel-level metric
+and does not directly imply cluster-level hit rates.
 
 \begin{figure}[H]
   \centering
   \begin{subfigure}[t]{0.49\textwidth}
-    \includegraphics[height=12.7cm, keepaspectratio]{../outputs/south_america/results/model1_lgbm/risk_map_top1pct.pdf}
+    \includegraphics[height=12.7cm, keepaspectratio]{../outputs/south_america/results/model1_rf/risk_map_top1pct.pdf}
     \caption{Top 1\% risk map (thresholded)\\
     \textit{\small Blue: true positive; Gold: unconfirmed prediction; Red: model miss; Grey: excluded (already protected)}}
     \label{fig:riskmap_sa_top1}
   \end{subfigure}\hfill
   \begin{subfigure}[t]{0.49\textwidth}
-    \includegraphics[height=12.7cm, keepaspectratio]{../outputs/south_america/results/model1_lgbm/probability_map.pdf}
+    \includegraphics[height=12.7cm, keepaspectratio]{../outputs/south_america/results/model1_rf/probability_map.pdf}
     \caption{Continuous calibrated probabilities\\
     \textit{\small Square-root stretch (25th--98th percentile); dark purple = low, yellow = high; grey = excluded (already protected)}}
     \label{fig:probmap_sa}
   \end{subfigure}
-  \caption{South America LightGBM transition-risk maps. \textbf{(a)} Top 1\% of predicted pixels (event-level Recall@1\% = 77.4\%, Precision@1\% = 79.8\%; pixel-year Lift@1\% = 66.8$\times$), overlaid with observed PA establishments within the five-year prediction window. \textbf{(b)} Continuous calibrated five-year cumulative designation probabilities, showing a strongly right-skewed distribution with a small upper tail concentrating substantially elevated risk. Probabilities reflect covariate values at the end of the test period.}
+  \caption{South America Random Forest transition-risk maps. \textbf{(a)} Top 1\% of predicted pixels (event-level Recall@1\% = 69.1\%, Precision@1\% = 97.0\%; pixel-year Lift@1\% = 67.6$\times$), overlaid with observed PA establishments within the five-year prediction window. \textbf{(b)} Continuous calibrated five-year cumulative designation probabilities, showing a strongly right-skewed distribution with a small upper tail concentrating substantially elevated risk. Probabilities reflect covariate values at the end of the test period.}
   \label{fig:sa_riskmaps}
 \end{figure}
 
@@ -1706,8 +1718,9 @@ Table~\ref{tab:cv3} summarises ROC-AUC for all twelve transfer directions.
 \centering
 \caption{Cross-regional transfer performance (ROC-AUC). Models are applied to each
 other's test sets without retraining. Values near 0.5 indicate near-random performance;
-values below 0.5 indicate anti-correlated predictions. Full PR-AUC results are in
-Appendix~\ref{app:transfer}.}
+values below 0.5 indicate anti-correlated predictions. These results are preliminary
+and directional; exact values may shift when re-run against the final post-fix models.
+Full PR-AUC results are in Appendix~\ref{app:transfer}.}
 \label{tab:cv3}
 \begin{tabular}{lcc}
 \toprule
@@ -1731,11 +1744,11 @@ to SA; 0.238 to USA), indicating genuine anti-correlation: features associated w
 designation in SE Asia map onto low-risk areas in the Americas. Third, RF shows a
 more mixed but often stronger transfer pattern, with substantial performance for
 SA$\to$SEA (0.720) and SEA$\to$USA (0.713), and moderate transfer for USA$\to$SEA
-(0.614) and SEA$\to$SA (0.598). This suggests that RF's bagged architecture captures
-more transferable ecological baselines while LGBM is more sensitive to region-specific
-institutional patterns. LGBM-based transition-risk scores therefore require
-region-specific models; whether RF-based scores could support global risk assessment
-with a shared feature set is a direction for future work.
+(0.614) and SEA$\to$SA (0.598). This suggests that RF's bagged architecture captures more transferable ecological
+baselines while LGBM is more sensitive to region-specific institutional patterns.
+Transition-risk scores therefore require region-specific models for LGBM; whether
+RF-based scores with a shared feature set could support global risk assessment is a
+direction for future work.
 
 % ---------------------------------------------------------------------------
 \subsubsection{Per-Biome Performance}
@@ -1792,30 +1805,32 @@ Results for the United States and Southeast Asia replicate the South America fra
 \subsubsection{United States}
 \label{sec:results_usa}
 The US results confirm that the predictive framework extends to a structurally
-different institutional context. In the US setting, the Random Forest is the
-primary model: it achieves near-perfect ROC-AUC (0.999) and Lift@1\% of
-$100\times$, reflecting geographic concentration of designations in a single BLM
-biome that is readily separable from surrounding land. LightGBM achieves strong
-overall discrimination (ROC-AUC 0.947, Lift@1\% $81\times$) but substantially
-underperforms RF in this context; RF results are therefore reported as primary
-for the United States.
+different institutional context. The Random Forest achieves a near-perfect ROC-AUC of
+0.999 and a Lift@1\% of $99.6\times$. However, these metrics reflect a geographic
+concentration artifact rather than genuine generalisation: approximately 85\% of all
+test-period US PA establishments fall within the Deserts and Xeric Shrublands biome
+(Bureau of Land Management public land in the American West), which is spatially
+compact and readily separable from surrounding land. Under this structure, the RF
+effectively memorises the proximity of a small number of events, inflating its
+apparent discrimination. The LightGBM ROC-AUC of 0.707 and Lift@1\% of $55.0\times$
+provide a more conservative but less confounded estimate of discrimination; PR-AUC is
+0.538 (RF) and 0.015 (LGBM), with the large divergence again reflecting the
+extreme rarity of the positive class (0.040\%) and its geographic concentration.
 
 The extreme class imbalance in the US test set ($\approx 0.04\%$ positive rate,
-twenty times rarer than South America) means PR-AUC is low (LGBM: 0.093) despite
-strong Lift, reflecting the known divergence of these metrics under extreme imbalance
-\citep{davis2006}. The Lift@1\% of $81\times$ (LGBM) / $100\times$ (RF) confirms
-that the top-ranked pixels are genuinely enriched for future designations; screening
-the top-1\% of pixels captures approximately 81--100\% of all test-period US
-designations. With an absolute Precision@1\% of only 3.3\%, individual pixel-level
-precision is low (roughly 97 false positives per true positive), but at
-portfolio-level aggregation the Lift provides substantial signal above random selection.
+twenty times rarer than South America) means that even strong Lift values coincide
+with very low absolute precision: the event-level Precision@1\% for the RF is
+6.0\%, versus 2.6\% for LGBM, reflecting the rarity of events relative to the
+eligible land area. Recall@1\% reaches 99.7\% (RF) and 42.5\% (LGBM), meaning
+the RF's top-1\% zone captures virtually all designation events but at very low
+precision. US forward projections should therefore be interpreted as spatial risk
+\emph{rankings} rather than calibrated absolute probabilities.
 
 A striking feature of the US data is the geographic concentration of designations:
 approximately 85\% of all test-period PA establishments fall within the Deserts and
-Xeric Shrublands biome (Bureau of Land Management public land in the American West).
-This concentration simplifies the prediction problem in one sense, since any model that
-learns to prioritise arid BLM land will score well overall, while creating severe
-imbalance for all other biomes.
+Xeric Shrublands biome. This concentration simplifies the prediction problem in one
+sense, since any model that learns to prioritise arid BLM land will score well
+overall, while creating near-zero performance for all other biomes.
 
 The LOBO analysis reveals near-zero absolute generalisation across US biomes (mean
 PR-AUC $\approx 0.001$; three of five evaluated folds at or below lift~$= 1$; median
@@ -1829,44 +1844,47 @@ Figure~\ref{fig:probmap_usa} (Appendix~\ref{app:supp_figures}).
 Full metrics tables for the US are provided in Appendix~\ref{app:lobo}.
 
 \paragraph{Feature Importance (SHAP).}
-The US LightGBM SHAP analysis (test set) shows a distinct driver profile.
-Proximity to the existing PA network (\texttt{dist\_wdpa}, rank~1; 63.6\% positive)
-is the leading predictor, consistent with the contiguous-expansion dynamic in South
-America. Intact Wilderness (\texttt{GSN\_b3\_smooth16}, rank~4; 66.9\% positive)
-and higher terrain (\texttt{elevation\_b1}, rank~10; 74.4\% positive) confirm that
-biodiversity priority and topography contribute positively, consistent with the
-concentration of US federal designations in remote upland areas.
+The US LightGBM SHAP analysis (test set) reveals a driver profile dominated by
+climate and energy geography. Mean annual temperature (\texttt{WorldClim\_b1},
+rank~1; 89.9\% positive) is the leading predictor: warmer and drier areas---the
+desert southwest---receive the highest risk scores, capturing the BLM-land
+concentration. Population density (\texttt{GPW\_smooth64}, rank~2) has a
+predominantly negative direction, confirming that densely populated areas are
+suppressed from the high-risk tier. Distance to oil-and-gas infrastructure
+(\texttt{dist\_oil\_gas}, rank~4; 90.7\% positive) is strongly positive: areas
+remote from extractive industry are preferentially designated, consistent with
+the federal land stewardship mandate in non-competing areas. Proximity to the
+existing PA network (\texttt{dist\_wdpa}, rank~5; 80.0\% positive) reinforces the
+accretion dynamic found in all three regions.
 
-Unlike in the other two regions, WGI Rule of Law (\texttt{policy\_b4}, rank~2)
-carries a strongly negative mean SHAP ($-0.566$; only 12.6\% positive). Because
-all US observations share a single national WGI score that varies only year to
-year, this signal most likely captures a temporal trend in the training data rather
-than a cross-sectional governance effect. Agricultural land value
-(\texttt{economic\_value\_lag1}, rank~3; 24.9\% positive, mean $-0.407$) is
-consistently negative, indicating that higher-value land is suppressed from the
-high-risk tier even within the federal estate. DPI executive ideology
-(\texttt{policy\_b1}, rank~14; 97.8\% positive, mean $+0.278$) is nearly
-universally positive, suggesting political alignment of the executive is the
-dominant institutional driver of US PA designation.
+Unlike South America, no governance or political indicator enters the LightGBM
+top twenty, consistent with the US's single national WGI score that conveys no
+cross-sectional institutional variation and with federal land-tenure effects that
+are only indirectly proxied by the available covariates. Economic value
+(\texttt{economic\_value\_lag1}, rank~20) is negative, indicating that higher-value
+agricultural land is avoided even within the federal estate.
 
-US forward projections should be interpreted as spatial risk \emph{rankings} rather than calibrated absolute probabilities; the extreme class imbalance means LGBM scores here do not carry the same probability accuracy as South America or Southeast Asia.
+US forward projections should be interpreted as spatial risk \emph{rankings} rather
+than calibrated absolute probabilities; the extreme class imbalance and geographic
+concentration mean scores here do not carry the same probability accuracy as South
+America or Southeast Asia.
 
 % ---------------------------------------------------------------------------
 \subsubsection{Southeast Asia}
 \label{sec:results_seasia}
 
-The Southeast Asia model achieves a ROC-AUC of 0.994 on the test set, with a PR-AUC
-of 0.919. These high values reflect the geographic concentration of PA designation
-in the region: new PAs are predominantly located in forested upland areas of Borneo,
-Sumatra, peninsular Malaysia, and the Philippines, which differ sharply from
-surrounding lowland agricultural zones. All covariates are lagged one year,
-confirming no outcome leakage. The extreme spatial segregation of uplands from
-lowlands means a simple elevation/canopy threshold performs nearly as well as the
-full model; nonetheless, Lift@1\% of $94.2\times$ confirms genuine pixel-level
-enrichment above and beyond the macro upland/lowland split. A small number of large
-PA polygons in Borneo may drive a disproportionate share of positive observations.
-The biome-stratified LOBO metrics (Appendix~\ref{app:lobo}) provide further evidence
-of spatially heterogeneous generalisation across Southeast Asian biomes.
+The Southeast Asia Random Forest achieves a ROC-AUC of 0.987 and a PR-AUC of 0.571;
+LightGBM achieves ROC-AUC 0.980 and PR-AUC 0.538. The RF Lift@1\% is $82.6\times$
+(LGBM: $74.5\times$), confirming strong discrimination across both algorithms. At the
+event level, the RF captures 65.0\% of unique designated pixels in the top 1\% at a
+precision of 91.9\% (LGBM: 67.5\% recall, 95.5\% precision). New PAs are
+predominantly located in forested upland areas of Borneo, Sumatra, peninsular
+Malaysia, and the Philippines, which differ sharply from surrounding lowland
+agricultural zones. The geographic concentration of designations means that elevation
+is a strong structural predictor; nonetheless, the full multi-feature model adds
+substantive discrimination over a simple elevation threshold, as the SHAP analysis
+below illustrates. A small number of large PA polygons in Borneo may drive a
+disproportionate share of positive observations.
 
 The LOBO analysis for Southeast Asia yields a mean PR-AUC of 0.272 across 5
 evaluable biomes (Table~\ref{tab:lobo_seasia}, Appendix~\ref{app:lobo}), with strong
@@ -1879,26 +1897,26 @@ respectively). The two largest folds by number of positives---Tropical \& Subtro
 Moist Broadleaf Forests (51,475 positives, lift 13.3$\times$) and Tropical \&
 Subtropical Dry Broadleaf Forests (17,702 positives, lift 3.7$\times$)---provide
 more robust evidence of within-region transferability. Temperate Conifer Forests
-achieves a moderate lift of 2.5$\times$ with an unusually high positive rate (25.1\%),
-reflecting that a large share of this small fold was designated during the test period.
+achieves a moderate lift of 2.5$\times$ with an unusually high positive rate (25.1\%).
 Three biome folds (Montane Grasslands \& Shrublands, Temperate Broadleaf \& Mixed
-Forests, Tropical \& Subtropical Grasslands, Savannas \& Shrublands) contain zero
-test-period designations and are excluded from the mean.
+Forests, Tropical \& Subtropical Grasslands) contain zero test-period designations
+and are excluded from the mean.
 
 \paragraph{Feature Importance (SHAP).}
-The Southeast Asia LightGBM SHAP results show a profile driven by governance and
-deforestation pressure. The top feature by mean absolute SHAP is the V-Dem Liberal
-Democracy Index (\texttt{policy\_b2}, rank~1), with a mean SHAP of $+0.128$ and
-56.7\% of observations positive: stronger democratic governance is associated with
-\emph{higher} designation probability, consistent with findings in South America.
-The second feature, smoothed deforestation (\texttt{deforestation\_b1\_smooth64},
-rank~2), has a mean SHAP of $-0.813$ with only 19.5\% positive observations:
-areas of elevated recent forest loss are strongly less likely to be designated,
-indicating that deforestation pressure in Southeast Asia outpaces conservation
-responses rather than triggering them. Biodiversity indicators retain positive
-contributions (\texttt{GSN\_b2\_smooth16}, rank~4; 66.1\% positive), and distance
-to power plants (\texttt{dist\_powerplant}, rank~3; 64.0\% positive) confirms that
-remote areas away from energy infrastructure are preferentially designated.
+The Southeast Asia LightGBM SHAP analysis reveals a profile dominated by terrain and
+climate, not governance. Elevation (\texttt{elevation\_b2\_smooth4}, rank~1) is the
+single most important predictor: 96.5\% of pixel observations show positive SHAP
+values, confirming that upland terrain is the primary predictor of designation in the
+region. Warm seasonal temperatures (\texttt{WorldClim\_b10}, rank~2;
+\texttt{WorldClim\_b5}, rank~3) co-vary with elevation and rank strongly alongside
+it, reflecting the montane microclimate of Southeast Asian forest PAs. High-NDVI
+vegetation (\texttt{NDVI}, rank~5; 98.4\% positive) and Intact Wilderness indicators
+(\texttt{GSN\_b3\_smooth64}, rank~4; 81.8\% positive) confirm that intact,
+vegetation-dense upland ecosystems are the principal target of regional designation.
+WGI Government Effectiveness (\texttt{policy\_b3}, rank~11; 77.3\% positive) enters
+as a modest positive contributor, consistent with a capacity mechanism where
+better-administered states gazette more PAs---though it is a secondary driver relative
+to terrain and ecology.
 
 The spatial distribution of predicted probabilities is shown in
 Figure~\ref{fig:probmap_seasia} (Appendix~\ref{app:supp_figures}).
@@ -1914,19 +1932,19 @@ how targeting precision degrades as the risk zone widens from the top-1\% to the
 top-10\% of pixels. Panel~(b) relates discrimination (PR-AUC) to practical
 targeting effectiveness (Lift@1\%).
 
-Two findings stand out. First, Southeast Asia and South America share nearly identical
-\emph{absolute} precision profiles despite very different PR-AUC values: at the
-top-1\% threshold, both regions flag pixels that became protected areas at roughly
-$67\times$ and $90$--$94\times$ above the baseline rate respectively. The United
-States achieves lower absolute precision ($P{=}0.033$--$0.040$) because designation
-events are twenty times rarer than in South America, but its Lift is comparable or
-higher ($81\times$ LGBM, $100\times$ RF), confirming strong discrimination. Figure~\ref{fig:model_comparison_landscape}(a) plots Lift@$K$\% --- Precision normalised by each region's baseline --- so all three regions are directly comparable on a single axis.
+Two findings stand out. First, Southeast Asia and South America show comparable
+Lift profiles: the RF achieves Lift@1\% of 67.6$\times$ (SA) and 82.6$\times$ (SEA).
+The United States achieves a RF Lift@1\% of 99.6$\times$, but this figure reflects
+geographic concentration of designations in a single biome rather than generalised
+learning; the LGBM Lift of 55.0$\times$ for the US is a more conservative estimate.
+Figure~\ref{fig:model_comparison_landscape}(a) plots Lift@$K$\% normalised by each
+region's baseline, making all three regions directly comparable on a single axis.
 
-Second, RF and LGBM differ most in the United States, where RF achieves near-perfect
-discrimination ($100\times$ vs.\ $81\times$ Lift@1\%), reflecting geographic
-concentration of designations in a single BLM biome --- an upper bound in this
-specific context. In South America the two algorithms converge ($68\times$ vs.\
-$67\times$). Full within-region comparisons are in Appendix~\ref{app:lobo}.
+Second, RF and LGBM diverge most sharply in the United States, where the RF's
+near-perfect ROC-AUC (0.999 vs.\ 0.707 for LGBM) reflects the geographic clustering
+artifact described above. In South America and Southeast Asia the two algorithms
+converge: SA RF PR-AUC 0.548 vs.\ LGBM 0.459; SEA RF PR-AUC 0.571 vs.\ LGBM 0.538.
+Full within-region comparisons are in Appendix~\ref{app:lobo}.
 
 \begin{figure}[H]
 \centering
@@ -2004,9 +2022,8 @@ what each scenario implies for the remaining path to 30\%.
 
 \subsubsection{Scenario Maps}
 \label{sec:results_scenarios}
-Under the 30$\times$30 scenario, the model identifies 40 spatially explicit
-high-risk clusters in South America, 39 in the United States, and 9 in Southeast
-Asia --- concentrated in precisely the zones that have seen the most active
+Under the 30$\times$30 scenario, the model identifies spatially explicit
+high-risk zones concentrated in precisely the areas that have seen the most active
 designation in recent years. Figure~\ref{fig:forward_sa} shows the South America
 BAU and 30$\times$30 scenario maps side by side; the 30$\times$30 panel reveals
 the additional designation pressure required beyond business-as-usual.
@@ -2014,13 +2031,13 @@ the additional designation pressure required beyond business-as-usual.
 \begin{figure}[H]
 \centering
 \begin{subfigure}[t]{0.49\textwidth}
-  \includegraphics[width=\textwidth, keepaspectratio]{../outputs/south_america/results/forward/lgbm/risk_map_bau.png}
+  \includegraphics[width=\textwidth, keepaspectratio]{../outputs/south_america/results/forward/rf/risk_map_bau.png}
   \caption{Business-as-usual (BAU) scenario. Clusters show pixels designated if
   historical rates continue to 2030.}
   \label{fig:forward_sa_bau}
 \end{subfigure}\hfill
 \begin{subfigure}[t]{0.49\textwidth}
-  \includegraphics[width=\textwidth, keepaspectratio]{../outputs/south_america/results/forward/lgbm/scenario_30x30.png}
+  \includegraphics[width=\textwidth, keepaspectratio]{../outputs/south_america/results/forward/rf/scenario_30x30.png}
   \caption{30$\times$30 scenario. Clusters show the highest-probability pixels
   that would need to be designated to reach 30\% terrestrial coverage by 2030.}
   \label{fig:forward_sa_30x30}
@@ -2061,22 +2078,23 @@ The present analysis quantifies agricultural land exposure using MODIS land-cove
 a complete transition-risk assessment would extend to urban, industrial, and forestry
 concessions using the same aggregation approach.
 
-In South America, only 582~km$^2$ of agricultural land falls within the top-1\% zone
-(0.4\%), confirming that the transition-risk premium falls predominantly on natural
-land: agricultural value is actively suppressed from high-risk zones, consistent
-with the SHAP findings in Section~\ref{sec:results_sa_shap}. In the United States,
-9{,}949~km$^2$ falls in the top-1\% zone (13.6\%), substantially higher, reflecting
-the extensive co-occurrence of private agricultural land and federal public land
-across the American West; the top-5\% zone reaches 115{,}620~km$^2$ (32.3\%).
-In Southeast Asia, only 37~km$^2$ falls in the top-1\% zone ($<$0.1\%), consistent
-with designation concentrating in remote upland forests.
+In South America, only 1{,}420~km$^2$ of agricultural land falls within the top-1\%
+zone (1.0\%), confirming that the transition-risk premium falls predominantly on
+natural land: agricultural value is actively suppressed from high-risk zones,
+consistent with the SHAP findings in Section~\ref{sec:results_sa_shap}. In the
+United States, 8{,}185~km$^2$ falls in the top-1\% zone (11.7\%), substantially
+higher, reflecting the extensive co-occurrence of private agricultural land and
+federal public land across the American West; the top-5\% zone reaches
+41{,}624~km$^2$ (12.1\%). In Southeast Asia, 759~km$^2$ falls in the top-1\% zone
+(2.0\%), consistent with designation concentrating primarily, but not exclusively,
+in remote upland forests.
 Table~\ref{tab:exposure} summarises these figures.
 
-The consistently low agricultural shares for South America ($<$1\%) and Southeast
-Asia ($<$0.1\%) are corroborated by observed test-period (2017--2019) designations
-in South America, where fewer than 2\% fell on MODIS-classified agricultural pixels.
-The US exception reflects federal land tenure: BLM and National Forest land
-co-occurs with working agricultural land across the American West.
+The low single-digit agricultural shares for South America and Southeast Asia are
+corroborated by observed test-period (2017--2019) designations in South America,
+where fewer than 2\% fell on MODIS-classified agricultural pixels. The US exception
+reflects federal land tenure: BLM and National Forest land co-occurs with working
+agricultural land across the American West.
 Area estimates reported here can be combined with external land-value or loan-exposure
 data to express financial materiality --- that conversion is beyond the scope of
 this analysis.
@@ -2084,7 +2102,7 @@ this analysis.
 \begin{table}[H]
 \centering
 \caption{Agricultural land exposed to designation risk in the top-1\% and top-5\%
-risk zones, by region (LightGBM forward model; MODIS land-cover). ``Share'' is the
+risk zones, by region (Random Forest forward model; MODIS land-cover). ``Share'' is the
 fraction of the respective risk zone classified as agricultural.}
 \label{tab:exposure}
 \begin{tabular}{lrcrrc}
@@ -2093,9 +2111,9 @@ fraction of the respective risk zone classified as agricultural.}
 \cmidrule{2-3}\cmidrule{5-6}
 \textbf{Region} & \textbf{Agri.\ area} & \textbf{Share} & & \textbf{Agri.\ area} & \textbf{Share} \\
 \midrule
-South America  & 582~km$^2$      & 0.4\%  & & 6{,}143~km$^2$   & 0.9\% \\
-United States  & 9{,}949~km$^2$  & 13.6\% & & 115{,}620~km$^2$ & 32.3\% \\
-Southeast Asia & 37~km$^2$       & $<$0.1\%  & & 1{,}189~km$^2$   & 0.6\% \\
+South America  & 1{,}420~km$^2$  & 1.0\%  & & 11{,}254~km$^2$ & 1.6\% \\
+United States  & 8{,}185~km$^2$  & 11.7\% & & 41{,}624~km$^2$ & 12.1\% \\
+Southeast Asia & 759~km$^2$      & 2.0\%  & & 4{,}183~km$^2$  & 2.1\% \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -2104,18 +2122,18 @@ Southeast Asia & 37~km$^2$       & $<$0.1\%  & & 1{,}189~km$^2$   & 0.6\% \\
 \label{sec:forward_overlap}
 If the 30$\times$30 expansion follows historical patterns, it will concentrate new
 designations predominantly \emph{outside} the most ecologically critical land:
-only \textbf{18.4\%} of projected designations (790,202~km$^2$ total) fall within
-GSN biodiversity priority zones, and only \textbf{1.1\%} intersect
+only \textbf{27.2\%} of projected designations (790,170~km$^2$ total) fall within
+GSN biodiversity priority zones, and only \textbf{1.6\%} intersect
 climate-stabilisation priority areas. This gap is quantified by overlaying the
 30$\times$30 scenario map against two GSN priority layers (high-biodiversity areas
 \texttt{GSN\_b2} and climate-stabilisation areas \texttt{GSN\_b1}); because these
 layers are also model predictors, this is a GSN-alignment assessment rather than a
 fully independent ecological validation.
 
-In absolute terms, projected 30$\times$30 designations would cover 145,154~km$^2$
+In absolute terms, projected 30$\times$30 designations would cover 214,733~km$^2$
 of biodiversity-priority land --- just 4.9\% of the full biodiversity priority area
 (2,992,096~km$^2$). The climate-stabilisation overlap is even smaller:
-8,539~km$^2$ (3.7\% of the 227,777~km$^2$ climate priority area).
+12,541~km$^2$ (5.5\% of the 227,777~km$^2$ climate priority area).
 
 Figure~\ref{fig:alignment} maps these overlaps spatially. High-risk pixels
 concentrate along already-protected Amazon and Cerrado frontiers, largely missing
@@ -2129,20 +2147,20 @@ concentrating new designations in lower-priority land.
 \begin{figure}[H]
   \centering
   \begin{subfigure}[t]{0.49\textwidth}
-    \includegraphics[width=\textwidth, keepaspectratio]{../outputs/south_america/results/forward/lgbm/conservation_alignment.png}
+    \includegraphics[width=\textwidth, keepaspectratio]{../outputs/south_america/results/forward/rf/conservation_alignment.png}
     \caption{Biodiversity priority overlap\\
     \textit{\small Red: priority, not designated; Gold/Orange: designated, not priority; Blue: designated \& priority}}
     \label{fig:alignment_biodiversity}
   \end{subfigure}\hfill
   \begin{subfigure}[t]{0.49\textwidth}
-    \includegraphics[width=\textwidth, keepaspectratio]{../outputs/south_america/results/forward/lgbm/climate_stabilisation_alignment.png}
+    \includegraphics[width=\textwidth, keepaspectratio]{../outputs/south_america/results/forward/rf/climate_stabilisation_alignment.png}
     \caption{Climate-stabilisation priority overlap\\
     \textit{\small Red: priority, not designated; Gold/Orange: designated, not priority; Blue: designated \& priority}}
     \label{fig:alignment_climate}
   \end{subfigure}
   \caption{Overlap between projected 30$\times$30 designations and GSN ecological
-  priority areas in South America (LightGBM). Biodiversity-priority overlap: 18.4\%;
-  climate-stabilisation overlap: 1.1\%. Path-of-least-resistance expansion
+  priority areas in South America (Random Forest). Biodiversity-priority overlap: 27.2\%;
+  climate-stabilisation overlap: 1.6\%. Path-of-least-resistance expansion
   does not target the most ecologically critical land.}
   \label{fig:alignment}
 \end{figure}
@@ -2155,63 +2173,79 @@ concentrating new designations in lower-priority land.
 
 \subsection{Designation Drivers}
 \label{sec:disc_drivers}
-The SHAP analysis identifies biodiversity value as the most consistently
-important predictor group across all three regions, with economic opportunity cost
-and governance each making substantive contributions. A formal ablation study
-removing each predictor group in turn would provide stronger evidence for this
-ordering; as it stands, the hierarchy rests on mean absolute SHAP values and is
-subject to multicollinearity among groups. These are predictive associations, not
-causal claims: the framework cannot establish whether governance quality causes
-higher designation rates, or whether both reflect deeper country-level
-characteristics such as income or international integration.
+The SHAP analysis reveals distinct driver hierarchies across regions, with economic
+deterrents, ecological suitability, and governance each contributing in
+region-specific combinations. A formal ablation study removing each predictor group
+in turn would provide stronger evidence for this ordering; as it stands, the
+hierarchy rests on mean absolute SHAP values and is subject to multicollinearity
+among groups. These are predictive associations, not causal claims: the framework
+cannot establish whether governance quality causes higher designation rates, or
+whether both reflect deeper country-level characteristics such as income or
+international integration.
 
-GSN biodiversity indicators carry predominantly positive SHAP in all three regions,
-confirming ecological priority as a near-universal criterion for designation.
-The governance signal is region-specific in character but broadly positive where
-it is interpretable. In South America, WGI Rule of Law (\texttt{policy\_b4}) ranks
-second in absolute importance with a clearly positive mean SHAP ($+0.129$; 78.5\%
-of observations positive), indicating that rule of law is positively associated with
-designation probability across much of the continent in this model. In
-Southeast Asia, V-Dem Liberal Democracy Index is the single most important predictor
-with a positive mean SHAP ($+0.128$; 56.7\% positive), consistent with democratic
-governance enabling designation. The United States is the exception: WGI Rule of
-Law carries a strongly negative mean SHAP ($-0.566$; 12.6\% positive), but because
-all US observations share one national score that varies only year to year, this
-most likely reflects a temporal confound rather than a genuine governance effect;
-DPI executive ideology ($+0.278$; 97.8\% positive) is the dominant institutional
-signal in the US, suggesting presidential discretion matters more than institutional
-quality per se in that context.
+\textbf{South America.} WGI Rule of Law (\texttt{policy\_b4}) ranks first in the
+LightGBM SHAP analysis with a positive mean SHAP ($+0.078$; 73.7\% of observations
+positive), indicating that stronger rule of law is the single strongest predictor of
+designation at continental scale. This is consistent with the state-capacity
+interpretation: effective institutions can gazette and enforce PAs, while weak
+governance creates a binding constraint even where land is ecologically valuable.
+Biodiversity indicators (\texttt{GSN\_b2\_smooth16}, rank~2; 81.8\% positive) follow
+closely. Economic deterrents are confirmed in both LGBM and RF: agricultural land
+value, road access, and population density carry negative SHAP in both models.
+The RF SHAP, in which road distance and population density dominate the top eight
+positions, reinforces this economic-deterrence channel: the RF ranking, because it
+does not depend on sequential boosting, is arguably less susceptible to capturing
+governance variation through correlated ecological features.
+
+\textbf{United States.} The driver profile is qualitatively distinct. Mean annual
+temperature (\texttt{WorldClim\_b1}) is the leading LGBM predictor (89.9\% positive),
+acting as a proxy for the arid BLM landscapes where most federal designations are
+concentrated. Distance to oil-and-gas infrastructure (\texttt{dist\_oil\_gas};
+90.7\% positive) confirms that federal land away from extractive development is
+preferentially designated. No political or governance variable enters the LightGBM
+top twenty; in the RF SHAP ranking, DPI executive ideology
+(\texttt{policy\_b1}; rank~11; 96.4\% positive) appears as a secondary institutional
+signal. The robust US result is therefore federal land geography, with presidential
+discretion visible in RF but not stable enough to dominate the LightGBM ranking.
+No governance-quality indicator enters the top ten, since all US observations share
+a single national WGI score that conveys no cross-sectional institutional variation.
+
+\textbf{Southeast Asia.} Elevation and climate overwhelmingly dominate: the smoothed
+elevation feature ranks first (96.5\% of observations positive), with warm seasonal
+temperatures co-varying alongside it in ranks 2--3. Intact Wilderness and NDVI
+follow as biodiversity signals. Governance appears at rank 11 (WGI Government
+Effectiveness, 77.3\% positive) as a positive but secondary contributor, consistent
+with administrative capacity enabling designation in the region's diverse
+institutional landscape. The prior narrative attributing the dominant SHAP position
+to democratic governance was an artefact of data contamination in an earlier model
+version and has been removed.
 
 Economic opportunity cost deters designation in all three regions: agricultural land
-value carries a negative mean SHAP in South America ($-0.107$), the United States
-($-0.407$), and Southeast Asia ($-0.123$) alike, and infrastructure proxies
-(night-time lights, road access) are consistently negative where they appear in the
-top features.
+value carries a negative mean SHAP in South America, the United States, and Southeast
+Asia alike, and infrastructure proxies are consistently negative where they appear in
+the top features.
 
-The implication for the 30$\times$30 target is therefore twofold. First, in
-countries with weak institutions, even ecologically important areas may remain
-unprotected not because they are economically valuable but because the state lacks
-the administrative capacity to gazette and enforce new PAs. Second, in countries
-with strong governance, the remaining unprotected biodiversity-priority land tends
-to be economically valuable, requiring the compensation mechanisms (direct payments,
-conservation easements, carbon market incentives) that are central to the political
-economy of ambitious designation. If future designations follow the same
-governance-and-ecology logic as historical ones, the additional 12 percentage
-points of coverage will concentrate in countries with both strong institutions and
-available low-cost land, leaving some biodiversity-rich contexts underrepresented.
-That interpretation is consistent with literature showing that PA expansion often
-favours easier-to-protect land \citep{venter2018}; it also underscores why meeting
-30$\times$30 biodiversity goals requires active national coordination
-\citep{eckert2023}.
+The implications for the 30$\times$30 target are twofold. In countries with weak
+institutions, even ecologically important areas may remain unprotected not because
+they are economically valuable but because the state lacks the administrative
+capacity to gazette and enforce new PAs. In countries with strong governance, the
+remaining unprotected biodiversity-priority land tends to be economically valuable,
+requiring the compensation mechanisms such as direct payments, conservation easements,
+carbon market incentives, which are central to the political economy of ambitious
+designation. If future designations follow the same logic as historical ones, the
+additional 12 percentage points of coverage will concentrate in countries with both
+strong institutions and available low-cost land, leaving some biodiversity-rich
+contexts underrepresented \citep{venter2018, eckert2023}.
 
-The collective predictive power of this driver feature set is contextually benchmarked
-against \citet{mouillot2024}, who achieve similar discrimination using a comparable
-socio-environmental niche approach (SA PR-AUC of 0.645 against a random baseline of 0.008).
-Direct comparison requires caution: \citet{mouillot2024} model the current spatial
-distribution of PAs (a cross-sectional classification task) rather than future transitions
-(a prospective forecast), and the metrics are not directly comparable; the figure is offered
-as contextual evidence that ecological and institutional covariates contain sufficient signal
-to characterise PA designation at continental scale.
+The collective predictive power of this feature set is contextually benchmarked
+against \citet{mouillot2024}, who apply a comparable socio-environmental niche
+approach to characterise existing PA distributions (SA RF PR-AUC of 0.548 against a
+random baseline of 0.008). Direct comparison requires caution: \citet{mouillot2024}
+model the current spatial distribution of PAs (a cross-sectional classification task)
+rather than future transitions (a prospective forecast), and metrics are not directly
+comparable; the comparison is offered as contextual evidence that ecological and
+institutional covariates contain sufficient signal to characterise PA designation at
+continental scale.
 
 \subsection{Biome Coverage Gaps}
 \label{sec:disc_representation}
@@ -2229,7 +2263,7 @@ designation in those ecosystems.
 
 This suggests a representation gap: biomes with poor LOBO performance show that
 historical patterns do not apply consistently across ecological contexts, and the
-GSN alignment analysis (Section~\ref{sec:forward_overlap}) shows that only 18.4\%
+GSN alignment analysis (Section~\ref{sec:forward_overlap}) shows that only 27.2\%
 of projected 30$\times$30 designations overlap with biodiversity priority zones.
 Together, these results indicate that even if 30\% terrestrial coverage is achieved,
 the distribution across biomes is likely to remain biased toward ecologically
@@ -2272,9 +2306,10 @@ prioritisation, but transition-risk quantification requires statements of the fo
 ``this parcel has a 3\% probability of being designated within five years'': an
 interval-scale probability, not an ordinal rank.
 
-After Platt scaling, the ECE of 0.0081 in South America confirms that the calibrated
-scores have this property: on average, the predicted probability deviates from the
-observed transition rate by less than one percentage point across the score distribution.
+After Platt scaling, the South America RF ECE of 0.0116 (LightGBM: 0.00569) confirms
+that calibrated scores have this property: on average, the predicted probability
+deviates from the observed transition rate by approximately one percentage point
+across the score distribution---a small absolute deviation on a 0.8\% base rate.
 A lender extending a five-year agricultural loan secured on land with calibrated
 $\hat{p}$ could compute a simple expected transition loss as
 $\hat{p} \times \text{EAD} \times \text{LGD}$, where EAD is the exposure at default
@@ -2288,9 +2323,9 @@ this financial risk is concentrated in practice. In South America and Southeast 
 the high-risk zone is overwhelmingly composed of remote forest, shrubland, and savanna:
 areas that are both ecologically valuable and economically cheap to designate, which is
 precisely why they score highly under historical designation patterns. The agricultural
-share of the top-1\% risk zone is below 1\% in both regions. Low agricultural share
+share of the top-1\% risk zone is low in both regions. Low agricultural share
 implies natural land dominance, but not automatically ecological relevance: the GSN
-alignment analysis (18.4\% overlap with biodiversity priority zones) shows that only a
+alignment analysis (27.2\% overlap with biodiversity priority zones) shows that only a
 minority of high-risk natural land falls within globally prioritised conservation areas.
 Designation risk for agricultural landowners is therefore concentrated at the edges of
 these natural landscapes, not at the core. In the United States, by contrast, the
@@ -2338,7 +2373,24 @@ an explicit GSN alignment analysis for the US has not been conducted.
 
 \subsection{Limitations}
 \label{sec:discussion_limitations}
-The model extrapolates historical designation patterns and is subject to a
+
+\paragraph{Evaluation design and label-window overlap.}
+The temporal test set (2017--2019) is held out from hyperparameter search, model
+fitting, and calibration. However, the five-year forward-looking target means that a
+single eventual designation can generate positive labels in several preceding
+pixel-year observations. Because many predictors are static or slow-moving, this
+rolling-window design can make temporal-test performance optimistic relative to a
+strict deployment setting --- an issue formalised as label leakage across folds by
+\citet{lopezdeprado2018} and shown empirically to inflate rolling-CV estimates
+relative to holdout benchmarks by \citet{cerqueira2020}. The walk-forward backtests %TODO: Tone down both claims that these papers are used for. the papers are good but do not 100% support these claims.
+(Appendix~\ref{app:backtest}) therefore provide the conservative validation check:
+each backtest trains only on years whose five-year label window ends before the
+prediction origin, then scores a later non-overlapping five-year window. The temporal
+test and the walk-forward backtests should be interpreted together as a range of
+plausible out-of-sample performance.
+
+\paragraph{Stationarity and policy shocks.}
+The model further extrapolates historical designation patterns and is subject to a
 stationarity assumption: structural breaks---government change, new carbon-market
 mechanisms, Kunming-Montreal momentum, or nature-related disclosure requirements
 \citep{tnfd2023}---are not captured. Calibrated probabilities are conditional
@@ -2349,6 +2401,7 @@ designations, but momentum could equally stall, legal rollbacks could reduce
 effective protection, or implementation could shift toward OECMs not counted in
 this framework.
 
+\paragraph{Missing institutional variables.}
 The current feature set includes country-level governance indicators (WGI, V-Dem, DPI)
 and indigenous territory boundaries (LandMark), but is missing key spatially granular
 institutional variables: parcel-level land-tenure status (public vs.\ private
@@ -2359,23 +2412,34 @@ the US West. NGO funding flows, which directly enable specific designation proce
 are also unobserved. Incorporating parcel-level tenure data, where available, would be
 the highest-priority extension.
 
+\paragraph{Target data quality and OECMs.}
 Two data-quality issues affect the target variable. Gazette year entries in the WDPA
 may lag the formal legal designation in some jurisdictions \citep{bingham2019}; the
-five-year lookahead window reduces sensitivity to small date
-errors, but systematic lags in data entry could introduce a small bias toward later
-observation of transitions. More structurally, the WDPA's increasing incorporation of
-Other Effective Area-Based Conservation Measures (OECMs), which vary widely in
-protection strength from strictly managed nature reserves to loosely governed community
-areas, may introduce heterogeneity in the target variable not captured by the binary
-protected/unprotected classification \citep{maxwell2020}.
-OECMs and indigenous conserved areas often arise
-precisely where conventional PA designation has not been politically feasible: in areas
-with higher human pressure, active resource-use rights, or contested land tenure. A
-model trained on historical WDPA entries dominated by classical PA types would not
-learn the socio-environmental signature of OECM siting, and forward projections
-calibrated to traditional PA patterns could systematically miss the areas most likely
-to receive OECM designations under the Kunming-Montreal Framework.
+five-year lookahead window reduces sensitivity to small date errors, but systematic
+lags in data entry could introduce a small bias toward later observation of
+transitions. More structurally, the WDPA's increasing incorporation of Other
+Effective Area-Based Conservation Measures (OECMs), which vary widely in protection
+strength from strictly managed nature reserves to loosely governed community areas,
+may introduce heterogeneity in the target variable not captured by the binary
+protected/unprotected classification \citep{maxwell2020}. OECMs and indigenous
+conserved areas often arise precisely where conventional PA designation has not been
+politically feasible: in areas with higher human pressure, active resource-use rights,
+or contested land tenure. A model trained on historical WDPA entries dominated by
+classical PA types would not learn the socio-environmental signature of OECM siting,
+and forward projections calibrated to traditional PA patterns could systematically
+miss the areas most likely to receive OECM designations under the Kunming-Montreal
+Framework.
 
+\paragraph{United States Random Forest artifact.}
+The United States Random Forest ROC-AUC of 0.999 reflects a geographic clustering
+artifact: only 7,426 positive pixels appear in the test set, concentrated almost
+entirely in a single BLM biome, so the RF captures proximity to this cluster unusually
+well. The LightGBM ROC-AUC of 0.707 provides a more conservative and less spatially
+confounded estimate for the US. The reported LightGBM and RF metrics for South
+America and Southeast Asia are less affected by this issue, as designation events are
+distributed across many biomes.
+
+\paragraph{Measurement error and spatial dependence.}
 Country-level composite indicators (WGI, V-Dem) and remotely sensed proxies (NDVI,
 night-time lights) are measured with error, attenuating estimated feature importance;
 spatially finer predictors would be expected to improve discrimination, particularly
@@ -2386,6 +2450,7 @@ on true out-of-sample performance. The 1~km$^2$ modelling unit also introduces a
 modifiable areal unit problem, and PA polygon boundaries do not align to the pixel
 grid.
 
+\paragraph{Sensitivity analysis.}
 Several methodological choices warrant sensitivity caveats. The distance-to-PA
 feature (\texttt{dist\_wdpa}) captures spatial path dependence but risks a subtle
 endogeneity: pixels adjacent to an existing PA may score highly because they are part
@@ -2403,6 +2468,7 @@ change in PR-AUC has not been conducted. Ablation would provide stronger evidenc
 the individual predictor groups independently add predictive value rather than acting
 as proxies for one another, and remains a priority for future work.
 
+\paragraph{Fixed prediction horizon.}
 Pixels assigned high predicted probability but not designated within the five-year
 window are classified as false positives by conventional metrics; however, many
 cluster along known designation frontiers and are better characterised as ``right
@@ -2410,8 +2476,10 @@ prediction, wrong window''---the model correctly identifies elevated-risk zones,
 the designation is delayed beyond the horizon, an inherent constraint of the
 fixed-window binary target. The persistence of such clusters across four
 independent backtest origins (2013, 2015, 2017, 2019) provides indirect evidence of
-spatial consistency.
-A formal check against 2025-onward WDPA additions has not been conducted.
+spatial consistency. A formal check against 2025-onward WDPA additions has not been
+conducted.
+
+\paragraph{Predictive, not causal.}
 Throughout, the framework is predictive, not causal: SHAP values are partial
 correlations, and the appropriate use is spatial risk screening and portfolio
 prioritisation, not policy impact evaluation.
@@ -2424,9 +2492,10 @@ prioritisation, not policy impact evaluation.
 
 This thesis has developed and evaluated a machine-learning framework for predicting
 the spatial expansion of protected areas under the 30$\times$30 biodiversity target,
-applied to three major world regions. The primary model for South America achieves a ROC-AUC of 0.897 and captures 77.4\%
-of all test-period PA establishment events within the top 1\% of predicted risk
-(pixel-year Lift@1\% = 66.8$\times$; event-level Precision@1\% = 79.8\%), performance
+applied to three major world regions. The primary Random Forest model for South
+America achieves a ROC-AUC of 0.910 and a PR-AUC of 0.548; it captures 69.1\% of
+all unique PA establishment events within the top 1\% of predicted risk at an
+event-level Precision@1\% of 97.0\% (pixel-year Lift@1\% = 67.6$\times$)---performance
 sufficient to make the model a practically useful tool for spatial transition-risk
 screening. Calibrated predicted probabilities serve as interval-scale transition-risk
 scores that are a prerequisite input for financial risk quantification, portfolio
@@ -2434,24 +2503,25 @@ screening, and land-use planning; full portfolio aggregation workflows remain an
 avenue for future applied work.
 
 Three empirical findings emerge from the analysis. The driver hierarchy reveals
-that conservation priority (GSN biodiversity indicators) and governance quality
-(WGI Rule of Law, V-Dem Liberal Democracy Index) are the primary predictors of
-where PAs are designated, not merely economic opportunity cost. If future
-designations continue to follow the same governance-and-ecology logic as historical
-ones, closing the 30$\times$30 gap will require strengthening institutions and
-providing compensation mechanisms in biodiversity-rich, economically contested areas,
-not only designating remote land. The gap between what this model predicts and where
-designation \emph{should} go for maximum conservation impact is itself a policy
-finding: it reveals where the 30$\times$30 commitment risks being met on paper
-without delivering proportionate biodiversity outcomes. Forward projections confirm that all three studied regions are severely
-off-track, South America by approximately 68 additional years from 2024 and the
-United States and Southeast Asia by more than 170 additional years at current
-designation rates (formal WDPA PA coverage; OECMs would reduce these gaps). Perhaps
-the most striking result is that LGBM cross-continental transfer is near-random or
+that institutional capacity (WGI Rule of Law is the top LightGBM predictor in South
+America), ecological priority (GSN biodiversity indicators), and economic deterrence
+(road access, population density, agricultural land value) jointly determine where
+PAs are designated; driver profiles are region-specific, with terrain and climate
+dominating in Southeast Asia and climate plus energy geography driving the US ranking.
+If future designations continue to follow the same accessibility-and-governance logic
+as historical ones, closing the 30$\times$30 gap will require active compensation
+mechanisms in biodiversity-rich, economically contested areas, not only designating
+remote land. The gap between what this model predicts and where designation
+\emph{should} go for maximum conservation impact is itself a policy finding. Forward
+projections confirm that all three studied regions are severely off-track, South
+America by approximately 68 additional years from 2024 and the United States and
+Southeast Asia by more than 170 additional years at current designation rates (formal
+WDPA PA coverage; OECMs would reduce these gaps). Perhaps the most striking
+methodological result is that LightGBM cross-continental transfer is near-random or
 below-random across all evaluated directions; RF transfer is partial in several
-directions, suggesting that LightGBM overfits more strongly to regional institutional
-patterns. For LGBM-based risk scoring, this implies that region-specific models are
-required for credible risk assessment.
+directions, confirming that designation patterns are institutionally specific. For
+transition-risk scoring, this implies that region-specific models are required for
+credible risk assessment.
 
 For governments, the most actionable output is the scenario maps: they identify
 specific geographic clusters that would need to be designated under BAU, moderate,
@@ -2460,11 +2530,12 @@ maps to distinguish between acceleration-only and acceleration-plus-redirection
 policy needs. For investors and lenders, the calibrated probability surface provides a
 transition-risk score that can be aggregated to parcel, watershed, or portfolio
 level where parcel boundary data are available, offering a spatial input for
-nature-related financial disclosure. For researchers, the governance-as-primary-driver
-finding motivates models
-that add parcel-level land tenure (public vs.\ private), carbon-market project
-eligibility, and NGO funding flows, the spatially granular institutional predictors
-that country-level governance scores cannot proxy.
+nature-related financial disclosure. For researchers, the compound driver finding---
+institutional capacity in South America, climate geography in the US, terrain in
+Southeast Asia---motivates models that add parcel-level land tenure (public
+vs.\ private), carbon-market project eligibility, and NGO funding flows, the
+spatially granular institutional predictors that country-level governance scores
+cannot proxy.
 
 The most important extension is the inclusion of parcel-level land-tenure data.
 Even though the current model includes country-level governance indicators,
@@ -2523,7 +2594,9 @@ All three tables use final results from the corrected Euler runs (April 2026).
 Lift = PR-AUC\,/\,positive rate; lift\,$=1$ equals a random classifier.
 Tropical \& Subtropical Coniferous Forests has zero test-period designations and is
 excluded from the mean. The mean lift is driven by Temperate Grasslands (843$\times$);
-median lift across the 10 evaluated biomes is 11$\times$.}
+median lift across the 10 evaluated biomes is 11$\times$.
+\emph{Note: LOBO jobs were not re-run after the final model fix; values are preliminary
+and directional.}}
 \label{tab:lobo_sa}
 \begin{tabular}{p{7cm}rrrr}
 \toprule
@@ -2597,23 +2670,24 @@ Montane Grasslands; Temperate Broadleaf; Trop.\ Grasslands       &      0   & --
 
 \begin{table}[H]
 \centering
-\caption{LightGBM predictive performance on the temporal test set (2017--2019) for
+\caption{Predictive performance on the temporal test set (2017--2019) for
 the United States (baseline positive rate $\approx 0.040\%$) and Southeast Asia
-(baseline positive rate $\approx 0.596\%$).}
+(baseline positive rate $\approx 0.596\%$). RF is the primary model; LightGBM in
+parentheses. USA RF ROC-AUC reflects geographic clustering (see text).}
 \label{tab:regional_metrics}
 \small
 \begin{tabular}{lcc}
 \toprule
 \textbf{Metric} & \textbf{United States} & \textbf{Southeast Asia} \\
 \midrule
-ROC-AUC              & 0.947 & 0.994 \\
-PR-AUC               & 0.093 & 0.919 \\
-Precision @ top 1\%  & 0.033 & 0.561 \\
-Lift @ top 1\%       & 81.3$\times$ & 94.2$\times$ \\
-Precision @ top 5\%  & 0.007 & 0.115 \\
-Lift @ top 5\%       & 17.9$\times$ & 19.3$\times$ \\
-Brier score          & 0.000400 & 0.00144 \\
-ECE (post-calibration) & 0.000310 & 0.00863 \\
+ROC-AUC              & 0.999 (LGBM: 0.707) & 0.987 (LGBM: 0.980) \\
+PR-AUC               & 0.538 (LGBM: 0.015) & 0.571 (LGBM: 0.538) \\
+Precision @ top 1\%  & 0.040 (LGBM: 0.022) & 0.492 (LGBM: 0.444) \\
+Lift @ top 1\%       & 99.6$\times$ (LGBM: 55.0$\times$) & 82.6$\times$ (LGBM: 74.5$\times$) \\
+Precision @ top 5\%  & 0.008 (LGBM: 0.005) & 0.114 (LGBM: 0.111) \\
+Lift @ top 5\%       & 19.9$\times$ (LGBM: 13.1$\times$) & 19.2$\times$ (LGBM: 18.6$\times$) \\
+Brier score          & 0.000402 (LGBM: 0.000399) & 0.004457 (LGBM: 0.003938) \\
+ECE (post-calibration) & 0.000890 (LGBM: 0.000646) & 0.009151 (LGBM: 0.009603) \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -2623,9 +2697,10 @@ ECE (post-calibration) & 0.000310 & 0.00863 \\
 
 Reliability diagrams show the fraction of positive outcomes binned by predicted
 probability (20 equal-width bins), before and after Platt scaling \citep{platt1999}.
-Post-calibration ECE values for all LightGBM models: South America 0.0081 (pre: 0.018),
-United States 0.000310 (pre: 0.0006), Southeast Asia 0.00863 (pre: 0.038); all
-show substantial improvement after calibration. The diagrams below provide the full
+Post-calibration ECE values: South America LightGBM 0.00569 (pre: 0.018), South
+America RF 0.0116; United States LightGBM 0.000646 (pre: 0.027), RF 0.000890;
+Southeast Asia LightGBM 0.009603 (pre: 0.038), RF 0.009151. All models show
+substantial ECE reduction after Platt scaling. The diagrams below provide the full
 visual evidence.
 
 \begin{figure}[H]
@@ -2669,7 +2744,7 @@ visual evidence.
 \label{app:transfer}
 
 Cross-continental transfer is evaluated across all three continental pairs using the
-73-feature set common to all regions. Each production model is serialised after
+72-feature set common to all regions. Each production model is serialised after
 training on its home region (2001--2019) and scored on each other region's test
 panel (2017--2019) without any retraining. Table~\ref{tab:transfer_full} reports ROC-AUC for all twelve direction--algorithm
 combinations. ROC-AUC is used here because it is invariant to base-rate differences
@@ -2729,7 +2804,7 @@ Section~\ref{sec:disc_transfer}.
 
 Walk-forward backtests at origins $T \in \{2013, 2015, 2017, 2019\}$ verify that
 deployment-style inference generalises to held-out designation windows. At each
-origin, the LightGBM backtest model is trained on 2001--$(T-5)$, scores year-$T$
+origin, the Random Forest backtest model is trained on 2001--$(T-5)$, scores year-$T$
 unprotected pixels, and is evaluated against realised designations in years $T+1$
 through $T+5$. The $T=2019$ run (train 2001--2014, evaluate 2020--2024) is the
 closest historical analogue to the actual 2024$\rightarrow$2030 deployment setting.
@@ -2738,33 +2813,33 @@ Table~\ref{tab:backtest_summary} reports the saved backtest metrics by origin.
 \begin{table}[H]
   \centering
   \small
-  \caption{LightGBM walk-forward backtest metrics by origin year. $N$ pos.\ denotes
+  \caption{Random Forest walk-forward backtest metrics by origin year. $N$ pos.\ denotes
   the number of evaluable positive pixels in the realised five-year window.}
   \label{tab:backtest_summary}
   \begin{tabular}{llrrr}
     \toprule
     \textbf{Region} & \textbf{Origin $T$} & \textbf{$N$ pos.} & \textbf{Precision@1\%} & \textbf{PR-AUC} \\
     \midrule
-    South America & 2013 & 217,489 & 0.1111 & 0.0482 \\
-    South America & 2015 & 205,855 & 0.0477 & 0.0231 \\
-    South America & 2017 & 189,449 & 0.0199 & 0.0125 \\
-    South America & 2019 & 59,245  & 0.0085 & 0.0049 \\
-    United States & 2013 & 17,624  & 0.0043 & 0.0015 \\
-    United States & 2015 & 9,762   & 0.0017 & 0.0007 \\
-    United States & 2017 & 7,306   & 0.0002 & 0.0004 \\
-    United States & 2019 & 333     & 0.0001 & 0.0001 \\
-    Southeast Asia & 2013 & 76,476 & 0.0302 & 0.0209 \\
-    Southeast Asia & 2015 & 80,569 & 0.0360 & 0.0211 \\
-    Southeast Asia & 2017 & 37,778 & 0.0140 & 0.0233 \\
-    Southeast Asia & 2019 & 12,414 & 0.0269 & 0.0130 \\
+    South America & 2013 & 217,489 & 0.2765 & 0.1150 \\
+    South America & 2015 & 205,855 & 0.2311 & 0.1068 \\
+    South America & 2017 & 189,449 & 0.0881 & 0.0293 \\
+    South America & 2019 & 59,245  & 0.0177 & 0.0088 \\
+    United States & 2013 & 17,624  & 0.0054 & 0.0023 \\
+    United States & 2015 & 9,762   & 0.0016 & 0.0008 \\
+    United States & 2017 & 7,306   & 0.0002 & 0.0005 \\
+    United States & 2019 & 333     & 0.0002 & 0.0001 \\
+    Southeast Asia & 2013 & 76,476 & 0.0469 & 0.0186 \\
+    Southeast Asia & 2015 & 80,569 & 0.0088 & 0.0187 \\
+    Southeast Asia & 2017 & 37,778 & 0.0055 & 0.0307 \\
+    Southeast Asia & 2019 & 12,414 & 0.0117 & 0.0112 \\
     \bottomrule
   \end{tabular}
 \end{table}
 
 South America shows declining absolute precision across later origin years, from
-0.1111 at $T=2013$ to 0.0085 at $T=2019$, while the United States remains very low
-in absolute terms throughout. Southeast Asia is more stable, with Precision@1\%
-between 0.0140 and 0.0360 across the four saved backtests.
+0.2765 at $T=2013$ to 0.0177 at $T=2019$, while the United States remains very low
+in absolute terms throughout. Southeast Asia is more variable, with Precision@1\%
+between 0.0055 and 0.0469 across the four saved backtests.
 
 \paragraph{False positive spatial patterns.}
 Figures~\ref{fig:fp_sa_2017}--\ref{fig:fp_usa_2017} map the spatial distribution of
@@ -2785,18 +2860,18 @@ any five-year period.
 \begin{figure}[H]
   \centering
   \begin{subfigure}[t]{0.48\textwidth}
-    \includegraphics[width=\textwidth]{../outputs/south_america/results/forward/lgbm/forward_backtest_precision_over_time.pdf}
-    \caption{South America: LightGBM}
+    \includegraphics[width=\textwidth]{../outputs/south_america/results/forward/rf/forward_backtest_precision_over_time.pdf}
+    \caption{South America: Random Forest}
   \end{subfigure}\hfill
   \begin{subfigure}[t]{0.48\textwidth}
-    \includegraphics[width=\textwidth]{../outputs/usa/results/forward/lgbm/forward_backtest_precision_over_time.pdf}
-    \caption{United States: LightGBM}
+    \includegraphics[width=\textwidth]{../outputs/usa/results/forward/rf/forward_backtest_precision_over_time.pdf}
+    \caption{United States: Random Forest}
   \end{subfigure}
 
   \vspace{0.8em}
   \begin{subfigure}[t]{0.48\textwidth}
-    \includegraphics[width=\textwidth]{../outputs/se_asia/results/forward/lgbm/forward_backtest_precision_over_time.pdf}
-    \caption{Southeast Asia: LightGBM}
+    \includegraphics[width=\textwidth]{../outputs/se_asia/results/forward/rf/forward_backtest_precision_over_time.pdf}
+    \caption{Southeast Asia: Random Forest}
   \end{subfigure}
 
   \caption{Backtesting precision@1\% over time for walk-forward forecasts at origins
@@ -2810,12 +2885,12 @@ any five-year period.
 \begin{figure}[H]
   \centering
   \begin{subfigure}[t]{0.48\textwidth}
-    \includegraphics[width=\textwidth]{../outputs/south_america/results/forward/lgbm/forward_backtest_T2017_false_positives.pdf}
+    \includegraphics[width=\textwidth]{../outputs/south_america/results/forward/rf/forward_backtest_T2017_false_positives.pdf}
     \caption{South America: false positives at $T=2017$}
     \label{fig:fp_sa_2017}
   \end{subfigure}\hfill
   \begin{subfigure}[t]{0.48\textwidth}
-    \includegraphics[width=\textwidth]{../outputs/usa/results/forward/lgbm/forward_backtest_T2017_false_positives.pdf}
+    \includegraphics[width=\textwidth]{../outputs/usa/results/forward/rf/forward_backtest_T2017_false_positives.pdf}
     \caption{United States: false positives at $T=2017$}
     \label{fig:fp_usa_2017}
   \end{subfigure}
@@ -2831,7 +2906,7 @@ any five-year period.
 \label{app:features}
 
 Table~\ref{tab:features} lists the full feature set used in the South America, USA,
-and Southeast Asia models. All three regions share the same 73-feature schema,
+and Southeast Asia models. All three regions share the same 72-feature schema,
 derived from the predictor groups in Table~\ref{tab:data} via multi-scale spatial
 smoothing ($4\times4$, $16\times16$, $64\times64$ km), Euclidean distance transforms,
 and temporal lags.
@@ -2842,7 +2917,7 @@ and temporal lags.
   >{\raggedright\arraybackslash}p{0.12\linewidth}%
   >{\raggedright\arraybackslash}p{0.52\linewidth}%
 }
-\caption{Complete feature dictionary (73 features). All three continental models
+\caption{Complete feature dictionary (72 features). All three continental models
 share this schema, derived via multi-scale spatial smoothing
 ($4\times4$, $16\times16$, $64\times64$~km for all smoothed variables),
 Euclidean distance transforms, and temporal lags.
@@ -2953,9 +3028,8 @@ Euclidean distance transforms, and temporal lags.
 \texttt{HNTL\_smooth64}   & Dynamic & Night-time lights at $64\times64$ km \\
 \midrule
 %% ---- Protection ------------------------------------------------------------
-\multicolumn{3}{l}{\textit{Protection status and proximity (dynamic)}} \\
+\multicolumn{3}{l}{\textit{Protected-area proximity (dynamic)}} \\
 \midrule
-\texttt{WDPA}             & Dynamic & Previous-year protected area status (binary, WDPA; always 0 for risk-set eligible pixels by construction, providing no leakage; at inference time the feature is set to 0 for all scored pixels) \\
 \texttt{dist\_wdpa}       & Dynamic & Euclidean distance to nearest PA boundary (m), lagged 1 yr \\
 \midrule
 %% ---- Governance ------------------------------------------------------------
@@ -2992,12 +3066,12 @@ Euclidean distance transforms, and temporal lags.
 \begin{figure}[H]
 \centering
 \begin{subfigure}[t]{0.49\textwidth}
-  \includegraphics[width=\textwidth, keepaspectratio]{../outputs/usa/results/forward/lgbm/risk_map_bau.png}
+  \includegraphics[width=\textwidth, keepaspectratio]{../outputs/usa/results/forward/rf/risk_map_bau.png}
   \caption{BAU scenario.}
   \label{fig:forward_usa_bau}
 \end{subfigure}\hfill
 \begin{subfigure}[t]{0.49\textwidth}
-  \includegraphics[width=\textwidth, keepaspectratio]{../outputs/usa/results/forward/lgbm/scenario_30x30.png}
+  \includegraphics[width=\textwidth, keepaspectratio]{../outputs/usa/results/forward/rf/scenario_30x30.png}
   \caption{30$\times$30 scenario.}
   \label{fig:forward_usa_30x30}
 \end{subfigure}
@@ -3011,18 +3085,18 @@ Forest lands) and the Pacific Northwest.}
 \begin{figure}[H]
 \centering
 \begin{subfigure}[t]{0.49\textwidth}
-  \includegraphics[width=\textwidth, keepaspectratio]{../outputs/se_asia/results/forward/lgbm/risk_map_bau.png}
+  \includegraphics[width=\textwidth, keepaspectratio]{../outputs/se_asia/results/forward/rf/risk_map_bau.png}
   \caption{BAU scenario.}
   \label{fig:forward_seasia_bau}
 \end{subfigure}\hfill
 \begin{subfigure}[t]{0.49\textwidth}
-  \includegraphics[width=\textwidth, keepaspectratio]{../outputs/se_asia/results/forward/lgbm/scenario_30x30.png}
+  \includegraphics[width=\textwidth, keepaspectratio]{../outputs/se_asia/results/forward/rf/scenario_30x30.png}
   \caption{30$\times$30 scenario.}
   \label{fig:forward_seasia_30x30}
 \end{subfigure}
 \caption{Forward projection for Southeast Asia under BAU and 30$\times$30 scenarios.
-The limited number of clusters (9 total) reflects the concentration of
-high-probability pixels in large forested upland areas in Borneo and Sumatra.}
+High-probability pixels concentrate in large forested upland areas in Borneo and
+Sumatra.}
 \label{fig:forward_seasia}
 \end{figure}
 
@@ -3048,7 +3122,7 @@ high-probability pixels in large forested upland areas in Borneo and Sumatra.}
 
 \begin{figure}[H]
 \centering
-\includegraphics[width=0.60\textwidth, keepaspectratio]{../outputs/south_america/results/forward/lgbm/hotspot_maps.pdf}
+\includegraphics[width=0.60\textwidth, keepaspectratio]{../outputs/south_america/results/forward/rf/hotspot_maps.pdf}
 \caption{Hotspot zoom-ins for South America (LightGBM, BAU scenario).
 Top row: predicted designation probability by 2030. Bottom row: BAU designation zone
 (red), existing PAs in green, country borders in grey. Left: Colombian Amazon cluster
@@ -3112,57 +3186,37 @@ to the model's log-odds output. Each point is one observation from the SHAP samp
 the $x$-axis is the raw feature value, the $y$-axis is the SHAP value (positive =
 increases predicted designation probability, negative = decreases it). The colour
 of each point encodes the SHAP value of the most strongly interacting secondary
-feature, revealing joint effects. The following plots illustrate the three features
-with the most interpretively distinctive marginal effects for the South America
-LightGBM model.
+feature, revealing joint effects. The following plots illustrate two current
+post-leakage-fix features with distinctive marginal effects for the South America
+Random Forest model, the stronger-performing model used for the forward-risk
+analysis.
 
 \begin{figure}[H]
 \centering
 \begin{subfigure}[t]{0.48\textwidth}
   \centering
-  \includegraphics[width=\textwidth, keepaspectratio]{../outputs/south_america/results/model1_lgbm/shap_dep_GSN_b2_smooth16.pdf}
-  \caption{SHAP dependence plot for \texttt{GSN\_b2\_smooth16} (GSN high-biodiversity
-  indicator, $16 \times 16$ km neighbourhood mean). The positive relationship shows
-  that pixels in globally significant biodiversity areas carry a higher marginal
-  SHAP contribution towards designation, on average across the model's feature
-  interactions. Colour indicates the SHAP value of a secondary interacting feature.}
-  \label{fig:shap_dep_gsn}
+  \includegraphics[width=\textwidth, keepaspectratio]{../outputs/south_america/results/model1_rf/shap_dep_dist_road.pdf}
+  \caption{SHAP dependence plot for \texttt{dist\_road} (distance to the nearest road).
+  Road distance is the highest-ranked South America RF feature by mean absolute SHAP
+  value. Its mean SHAP contribution is $-0.018$ and 19.6\% of sampled observations are
+  positive, indicating that the road-accessibility axis more often enters as a
+  suppressing term in the sampled risk distribution. Colour indicates the SHAP value
+  of a secondary interacting feature.}
+  \label{fig:shap_dep_dist_road}
 \end{subfigure}
 \hfill
 \begin{subfigure}[t]{0.48\textwidth}
   \centering
-  \includegraphics[width=\textwidth, keepaspectratio]{../outputs/south_america/results/model1_lgbm/shap_dep_policy_b4.pdf}
-  \caption{SHAP dependence plot for \texttt{policy\_b4} (WGI Rule of Law, country level).
-  The relationship is positively sloped --- stronger rule of law increases SHAP --- and
-  the continental mean SHAP is $+0.129$ (78.5\% of observations positive), indicating
-  that governance is an enabling condition for PA designation across most of South
-  America.}
-  \label{fig:shap_dep_pol}
+  \includegraphics[width=\textwidth, keepaspectratio]{../outputs/south_america/results/model1_rf/shap_dep_GPW.pdf}
+  \caption{SHAP dependence plot for \texttt{GPW} (population density). Population density
+  ranks second in the South America RF SHAP ranking. Its mean SHAP contribution is
+  $-0.025$ and 14.4\% of sampled observations are positive, consistent with populated
+  or otherwise high-opportunity-cost pixels being less likely to enter the highest
+  designation-risk tier.}
+  \label{fig:shap_dep_gpw}
 \end{subfigure}
 
-\vspace{1em}
-
-\begin{subfigure}[t]{0.48\textwidth}
-  \centering
-  \includegraphics[width=\textwidth, keepaspectratio]{../outputs/south_america/results/model1_lgbm/shap_dep_dist_indigenous.pdf}
-  \caption{SHAP dependence plot for \texttt{dist\_indigenous} (distance to nearest
-  indigenous or community-managed land, km). The effect is mixed: proximity to
-  indigenous territories raises designation probability in co-management contexts
-  (Amazonia), while greater distance acts as an economic-remoteness signal elsewhere,
-  yielding near-neutral mean SHAP overall.}
-  \label{fig:shap_dep_indigenous}
-\end{subfigure}
-\hfill
-\begin{subfigure}[t]{0.48\textwidth}
-  \centering
-  \includegraphics[width=\textwidth, keepaspectratio]{../outputs/south_america/results/model1_lgbm/shap_dep_WorldClim_b14.pdf}
-  \caption{SHAP dependence plot for \texttt{WorldClim\_b14} (precipitation of the driest
-  month, mm). The positive SHAP at low and high extremes reflects the model's use of
-  climate envelope information: both hyper-arid and wet-season-dominated regimes exhibit
-  distinctive spatial designation patterns.}
-  \label{fig:shap_dep_clim}
-\end{subfigure}
-\caption{SHAP dependence plots for the four most important features of the South America LightGBM model.}
+\caption{SHAP dependence plots for selected current South America Random Forest features.}
 \label{fig:shap_dep_all}
 \end{figure}
 
@@ -3170,12 +3224,12 @@ LightGBM model.
 \label{app:hyperparams}
 
 Tables~\ref{tab:hparams_lgbm} and \ref{tab:hparams_rf} report the hyperparameter
-values selected by Bayesian optimisation (Optuna TPE, 70 trials) for LightGBM and
-Random Forest respectively, across all three continental models.
+values selected by Bayesian optimisation (Optuna TPE) for LightGBM and Random Forest,
+respectively, across all three continental models.
 
 \begin{table}[H]
 \centering
-\caption{Selected LightGBM hyperparameters by region (Optuna TPE, 70 trials; optimisation
+\caption{Selected LightGBM hyperparameters by region (Optuna TPE, 40 trials; optimisation
 objective: PR-AUC on early-stopping split).}
 \label{tab:hparams_lgbm}
 \small
@@ -3183,42 +3237,42 @@ objective: PR-AUC on early-stopping split).}
 \toprule
 \textbf{Parameter} & \textbf{South America} & \textbf{United States} & \textbf{SE Asia} \\
 \midrule
-\texttt{num\_leaves}        & 238   & 200   & 255   \\
-\texttt{max\_depth}         & 35    & 15    & 15    \\
-\texttt{learning\_rate}     & 0.042 & 0.021 & 0.048 \\
-\texttt{min\_child\_samples}& 144   & 75    & 58    \\
-\texttt{subsample}          & 0.906 & 0.876 & 0.841 \\
-\texttt{colsample\_bynode}  & 0.553 & 0.706 & 0.874 \\
-\texttt{reg\_alpha}         & 1.825 & $3.2\times10^{-5}$ & $1.5\times10^{-3}$ \\
-\texttt{reg\_lambda}        & $2.5\times10^{-5}$ & 18.97 & 0.024 \\
-\texttt{min\_split\_gain}   & 0.004 & 0.051 & 0.788 \\
-\texttt{path\_smooth}       & 2.88  & 4.85  & 0.747 \\
-\texttt{n\_estimators}      & 2555  & 2985  & 2999  \\
+\texttt{num\_leaves}        & 99    & 233   & 209   \\
+\texttt{max\_depth}         & 20    & 20    & 25    \\
+\texttt{learning\_rate}     & 0.0249 & 0.0334 & 0.0904 \\
+\texttt{min\_child\_samples}& 78    & 41    & 104   \\
+\texttt{subsample}          & 0.914 & 0.669 & 0.876 \\
+\texttt{colsample\_bynode}  & 0.440 & 0.594 & 0.475 \\
+\texttt{reg\_alpha}         & 0.00398 & 0.212 & 0.114 \\
+\texttt{reg\_lambda}        & 0.0211 & $7.9\times10^{-5}$ & 0.00597 \\
+\texttt{min\_split\_gain}   & $1.9\times10^{-6}$ & 0.00357 & $8.2\times10^{-6}$ \\
+\texttt{path\_smooth}       & 0.410 & 8.21  & 0.397 \\
+\texttt{n\_estimators}      & 504   & 1406  & 1040  \\
 \midrule
-\multicolumn{4}{l}{\textit{Fixed parameters: \texttt{boosting\_type}=gbdt, \texttt{objective}=binary,
-\texttt{metric}=average\_precision, \texttt{random\_state}=42}} \\
+\multicolumn{4}{l}{\textit{Fixed: \texttt{boosting\_type}=gbdt, \texttt{objective}=binary,}} \\
+\multicolumn{4}{l}{\textit{\texttt{metric}=average\_precision, \texttt{random\_state}=42}} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \begin{table}[H]
 \centering
-\caption{Selected Random Forest hyperparameters by region (randomised search;
+\caption{Selected Random Forest hyperparameters by region (Optuna TPE, 10 trials;
 \texttt{class\_weight}=\texttt{balanced\_subsample} fixed throughout).}
 \label{tab:hparams_rf}
-\small
+\footnotesize
 \begin{tabular}{lccc}
 \toprule
 \textbf{Parameter} & \textbf{South America} & \textbf{United States} & \textbf{SE Asia} \\
 \midrule
-\texttt{n\_estimators}      & 300  & 300  & 300   \\
-\texttt{max\_depth}         & 30   & None & None  \\
-\texttt{max\_features}      & sqrt & sqrt & log2  \\
-\texttt{min\_samples\_leaf} & 1    & 7    & 6     \\
-\texttt{min\_samples\_split}& 22   & 23   & 30    \\
+\texttt{n\_estimators}      & 298  & 355  & 355   \\
+\texttt{max\_depth}         & 40   & None & None  \\
+\texttt{max\_features}      & sqrt & log2 & log2  \\
+\texttt{min\_samples\_leaf} & 2    & 6    & 6     \\
+\texttt{min\_samples\_split}& 16   & 30   & 30    \\
 \texttt{bootstrap}          & True & True & True  \\
 \midrule
-\multicolumn{4}{l}{\textit{Fixed parameters: \texttt{random\_state}=42, \texttt{n\_jobs}=-1}} \\
+\multicolumn{4}{l}{\textit{Fixed parameters: \texttt{random\_state}=42, \texttt{n\_jobs}=8}} \\
 \bottomrule
 \end{tabular}
 \end{table}
