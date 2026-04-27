@@ -32,7 +32,8 @@ Produces four figures from LOBO (Layer 1) and biome-stratified (Layer 2) results
       Requires spatial_CV_2 to be run after the 2026-04 update that adds
       mean_pred_prob to biome_metrics output.
 
-Data sources (latest file found by mtime, auto-detected; $SCRATCH checked first when set):
+Data sources (newest ``*_YYYYMMDD_HHMMSS.csv`` by embedded timestamp, not mtime;
+  $SCRATCH checked first when set):
   LOBO summary:   outputs/{region}/results/spatial_cv/{model_type}/lobo_summary_*.csv
   Layer 2:        outputs/{region}/results/spatial_generalisation/biome_metrics_*.csv
   Biome shapefile: data/shared/GlobalSafetyNet/terrestrial_ecoregions/Terrestrial_ecoregions.shp
@@ -45,6 +46,7 @@ Run after spatial_CV_1_aggregate (LOBO) and spatial_CV_2 (Layer 2).
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -226,6 +228,28 @@ def _find_latest(directory: Path, pattern: str) -> Optional[Path]:
     return matches[0] if matches else None
 
 
+def _find_latest_versioned_csv(directory: Path, stem: str) -> Optional[Path]:
+    """Return newest ``{stem}_YYYYMMDD_HHMMSS.csv`` by suffix timestamp (not mtime).
+
+    Prefer this over :func:`_find_latest` for pipeline outputs so a freshly touched
+    older file does not override a newer run. Files matching ``{stem}_*.csv`` but
+    not the timestamp pattern are only used if no versioned name exists (then
+    mtime tie-break via :func:`_find_latest`).
+    """
+    if not directory.exists():
+        return None
+    pat = re.compile(rf"^{re.escape(stem)}_(\d{{8}})_(\d{{6}})\.csv$", re.IGNORECASE)
+    versioned: list[tuple[tuple[str, str], Path]] = []
+    for p in directory.glob(f"{stem}_*.csv"):
+        m = pat.match(p.name)
+        if m:
+            versioned.append(((m.group(1), m.group(2)), p))
+    if versioned:
+        versioned.sort(key=lambda t: t[0], reverse=True)
+        return versioned[0][1]
+    return _find_latest(directory, f"{stem}_*.csv")
+
+
 def load_lobo_results(region: str, model_type: str = "lgbm") -> Optional[pd.DataFrame]:
     """Load the latest LOBO summary CSV, keeping only valid per-biome rows.
 
@@ -244,7 +268,7 @@ def load_lobo_results(region: str, model_type: str = "lgbm") -> Optional[pd.Data
 
     csv_path = None
     for d in search_dirs:
-        p = _find_latest(d, "lobo_summary_*.csv")
+        p = _find_latest_versioned_csv(d, "lobo_summary")
         if p:
             csv_path = p
             break
@@ -288,7 +312,7 @@ def load_layer2_results(region: str, model_label: str = "LGBM") -> Optional[pd.D
 
     csv_path = None
     for d in search_dirs:
-        p = _find_latest(d, "biome_metrics_*.csv")
+        p = _find_latest_versioned_csv(d, "biome_metrics")
         if p:
             csv_path = p
             break

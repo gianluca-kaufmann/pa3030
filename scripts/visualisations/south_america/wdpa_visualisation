@@ -384,10 +384,9 @@ def create_pa_coverage_chart(all_data):
         "forward" / "pathway" / "pathway_summary.json"
     )
 
-    # IMPORTANT: For visual continuity in the figure, always anchor the scenario
-    # projections to the *plotted* historical value at 2024 (from WDPA rasters).
-    # The forward-pipeline pathway JSON may compute coverage using slightly
-    # different masks/denominators, which can introduce a visible "jump".
+    # Align the plotted historical series with the equal-area 2024 coverage
+    # baseline used in the thesis text and pathway tables. The annual raster series
+    # provides the trend; the pathway summary provides the area-corrected level.
     cov_2024 = all_data.get(2024, all_data[years[-1]])["protected_percentage"]
 
     bau_rate_pct_yr   = 0.061    # % per year (from region_milestone)
@@ -410,8 +409,14 @@ def create_pa_coverage_chart(all_data):
 
         bau_rate_pct_yr = float(milestone.get("bau_annual_rate_pct_yr", bau_rate_pct_yr))
         moderate_target = _as_pct(pj.get("moderate_target_pct", moderate_target), moderate_target)
-        # NOTE: Do not override cov_2024 from JSON; we intentionally anchor to
-        # the WDPA-raster-derived 2024 point used in the historical series.
+        area_cov_2024 = _as_pct(
+            pj.get("coverage_pct_2024", milestone.get("current_pct_2024", cov_2024)),
+            cov_2024,
+        )
+        if cov_2024 > 0:
+            scale = area_cov_2024 / cov_2024
+            percentages = [p * scale for p in percentages]
+            cov_2024 = area_cov_2024
 
     def _linear(start, end, years_list):
         n = len(years_list) - 1
@@ -475,6 +480,180 @@ def create_pa_coverage_chart(all_data):
     print(f'   Saved: {output_file.name}')
     plt.close()
 
+    # Return scenario parameters so the dual chart can reuse them
+    return {
+        'years': years,
+        'percentages': percentages,
+        'cov_2024': cov_2024,
+        'bau_rate_pct_yr': bau_rate_pct_yr,
+        'moderate_target': moderate_target,
+        'target_30x30': target_30x30,
+        'proj_years': proj_years,
+        'bau_proj': bau_proj,
+        'mod_proj': mod_proj,
+        't30_proj': t30_proj,
+    }
+
+
+def create_pa_coverage_dual_chart(all_data):
+    """Two-panel figure: cumulative PA coverage (left) + annual new designation rate (right).
+
+    Saved as sa_pa_coverage_dual.pdf for the thesis Figure 6 (§5.5.1).
+    The left panel is identical to create_pa_coverage_chart; the right panel shows
+    annual change in coverage (percentage points / yr) derived from successive WDPA
+    rasters, revealing the rapid-designation phase (2000–2013), plateau, and post-2018
+    contraction.
+    """
+    import json
+
+    if all_data is None or len(all_data) < 2:
+        return
+
+    print("Creating dual-panel PA coverage chart...")
+
+    # ── Historical series ──────────────────────────────────────────────────────
+    years = sorted(all_data.keys())
+    percentages = [all_data[year]['protected_percentage'] for year in years]
+
+    # ── Scenario parameters (reuse logic from single-panel version) ────────────
+    pathway_json = (
+        PROJECT_ROOT / "outputs" / "south_america" / "results" /
+        "forward" / "pathway" / "pathway_summary.json"
+    )
+    cov_2024 = all_data.get(2024, all_data[years[-1]])["protected_percentage"]
+    bau_rate_pct_yr = 0.061
+    moderate_target = 27.7831
+    target_30x30    = 30.0
+    proj_years      = list(range(2024, 2031))
+    total_land_km2   = None
+
+    if pathway_json.exists():
+        with open(pathway_json) as fh:
+            pj = json.load(fh)
+        milestone = pj.get("region_milestone", [{}])[0]
+
+        def _as_pct(value, fallback):
+            try:
+                v = float(value)
+            except Exception:
+                v = float(fallback)
+            return v * 100.0 if v <= 1.0 else v
+
+        bau_rate_pct_yr = float(milestone.get("bau_annual_rate_pct_yr", bau_rate_pct_yr))
+        moderate_target = _as_pct(pj.get("moderate_target_pct", moderate_target), moderate_target)
+        area_cov_2024 = _as_pct(
+            pj.get("coverage_pct_2024", milestone.get("current_pct_2024", cov_2024)),
+            cov_2024,
+        )
+        if cov_2024 > 0:
+            scale = area_cov_2024 / cov_2024
+            percentages = [p * scale for p in percentages]
+            cov_2024 = area_cov_2024
+        try:
+            total_land_km2 = float(pj.get("total_land_km2"))
+        except Exception:
+            total_land_km2 = None
+
+    def _linear(start, end, years_list):
+        n = len(years_list) - 1
+        return [start + (end - start) * i / n for i in range(len(years_list))]
+
+    bau_end  = cov_2024 + bau_rate_pct_yr * (2030 - 2024)
+    bau_proj = _linear(cov_2024, bau_end, proj_years)
+    mod_proj = _linear(cov_2024, moderate_target, proj_years)
+    t30_proj = _linear(cov_2024, target_30x30, proj_years)
+
+    # ── Annual new designation rate (pp / yr) ─────────────────────────────────
+    # Computed as the year-on-year change in cumulative coverage percentage.
+    # We need total land area to convert pp to km².
+    total_pixels = None
+    first_year = years[0]
+    wdpa_file = PROJECT_ROOT / "data" / "south_america" / "ready" / "WDPA" / f"WDPA_SA_1km_{first_year}.tif"
+    if wdpa_file.exists():
+        import rasterio as _rio
+        with _rio.open(wdpa_file) as src:
+            data = src.read(1)
+            total_pixels = int(np.sum(~np.isnan(data)))
+
+    annual_years = years[1:]            # 2001–2024
+    annual_delta_pp = [percentages[i] - percentages[i - 1] for i in range(1, len(years))]
+
+    if total_land_km2 is not None:
+        annual_km2 = [d / 100.0 * total_land_km2 for d in annual_delta_pp]
+        right_ylabel = 'New designations (km²/yr)'
+        right_values = annual_km2
+        right_fmt    = lambda v: f'{v / 1000:.0f}k'
+    elif total_pixels is not None:
+        # Fallback only: approximate 1 pixel ≈ 1 km².
+        annual_km2 = [d / 100.0 * total_pixels for d in annual_delta_pp]
+        right_ylabel = 'New designations (km²/yr)'
+        right_values = annual_km2
+        right_fmt    = lambda v: f'{v / 1000:.0f}k'
+    else:
+        right_ylabel = 'New designations (pp/yr)'
+        right_values = annual_delta_pp
+        right_fmt    = lambda v: f'{v:.3f}'
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+    fig, (ax_left, ax_right) = plt.subplots(1, 2, figsize=(13, 4.2))
+
+    # ── Left panel: cumulative coverage ───────────────────────────────────────
+    ax_left.plot(years, percentages,
+                 color=PROTECTED_COLOR, linewidth=2.2, marker='o',
+                 markersize=3.5, markerfacecolor='white', markeredgewidth=1.5,
+                 zorder=4, label='Historical (WDPA)')
+    ax_left.axvline(2024, color='#888888', linewidth=0.8, linestyle=':', zorder=2)
+    ax_left.text(2024.1, 1.5, 'Projection\n2025–2030', fontsize=7.5,
+                 color='#888888', va='bottom')
+    ax_left.plot(proj_years, t30_proj, color='#CC2222', linewidth=1.8,
+                 linestyle='--', zorder=3, label='30×30 scenario')
+    ax_left.plot(proj_years, mod_proj, color='#E08214', linewidth=1.8,
+                 linestyle='--', zorder=3, label='Moderate scenario')
+    ax_left.plot(proj_years, bau_proj, color='#5E8FA2', linewidth=1.6,
+                 linestyle='--', zorder=3, label='BAU scenario')
+    ax_left.axhline(30, color='#CC2222', linewidth=0.7, linestyle=':',
+                    alpha=0.5, zorder=2)
+    ax_left.text(2029.5, 30.2, '30%', fontsize=7.5, color='#CC2222',
+                 ha='right', va='bottom')
+    ax_left.set_xlim(years[0] - 0.5, 2030.5)
+    ax_left.set_ylim(0, 32)
+    ax_left.set_xlabel('Year', fontsize=11)
+    ax_left.set_ylabel('Protected area (% of land)', fontsize=11)
+    ax_left.set_xticks([2000, 2005, 2010, 2015, 2020, 2024, 2027, 2030])
+    ax_left.grid(True, alpha=0.2, linestyle='--', linewidth=0.5)
+    ax_left.legend(fontsize=8.5, framealpha=0.88, loc='upper left')
+    ax_left.tick_params(labelsize=9.5)
+    ax_left.annotate(f'{percentages[0]:.1f}%', (years[0], percentages[0]),
+                     textcoords='offset points', xytext=(4, 8),
+                     fontsize=8, color=PROTECTED_COLOR, fontweight='bold')
+    ax_left.annotate(f'{percentages[-1]:.1f}%', (years[-1], percentages[-1]),
+                     textcoords='offset points', xytext=(-32, 7),
+                     fontsize=8, color=PROTECTED_COLOR, fontweight='bold')
+    ax_left.set_title('(a) Cumulative PA coverage', fontsize=10.5, fontweight='bold', pad=6)
+
+    # ── Right panel: annual new designation rate ───────────────────────────────
+    bar_colors = ['#CC2222' if v < 0 else PROTECTED_COLOR for v in right_values]
+    ax_right.bar(annual_years, right_values, color=bar_colors, alpha=0.78,
+                 width=0.8, zorder=3)
+    ax_right.axhline(0, color='black', linewidth=0.6, zorder=4)
+    # Mark Bolsonaro period (2019–2022)
+    ax_right.axvspan(2018.5, 2022.5, color='#E08214', alpha=0.12, zorder=1,
+                     label='2019–2022 (policy shock)')
+    ax_right.legend(fontsize=8, framealpha=0.85, loc='upper right')
+    ax_right.set_xlabel('Year', fontsize=11)
+    ax_right.set_ylabel(right_ylabel, fontsize=11)
+    ax_right.set_xticks([2001, 2005, 2010, 2015, 2019, 2024])
+    ax_right.grid(True, axis='y', alpha=0.2, linestyle='--', linewidth=0.5)
+    ax_right.tick_params(labelsize=9.5)
+    ax_right.set_title('(b) Annual new designations', fontsize=10.5, fontweight='bold', pad=6)
+
+    plt.tight_layout()
+
+    output_file = output_dir / 'sa_pa_coverage_dual.pdf'
+    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+    print(f'   Saved: {output_file.name}')
+    plt.close()
+
 
 def main():
     """Main visualization function"""
@@ -497,8 +676,11 @@ def main():
     # 2. Temporal comparison
     create_temporal_comparison(all_data)
 
-    # 2b. Single-panel coverage chart (thesis supplementary figure)
+    # 2b. Single-panel coverage chart (kept for reference)
     create_pa_coverage_chart(all_data)
+
+    # 2c. Dual-panel chart: cumulative + annual rate (thesis Figure 6)
+    create_pa_coverage_dual_chart(all_data)
 
     # 3. Change analysis
     create_change_analysis(all_data)
@@ -531,7 +713,8 @@ def main():
     for year in sorted(all_data.keys()):
         print(f"   - wdpa_coverage_sa_{year}.png")
     print("   - wdpa_temporal_comparison.png")
-    print("   - sa_pa_coverage_pct.pdf  (single-panel thesis figure)")
+    print("   - sa_pa_coverage_pct.pdf  (single-panel, kept for reference)")
+    print("   - sa_pa_coverage_dual.pdf (dual-panel thesis Figure 6)")
     print("   - wdpa_change_analysis.png")
     print("   - wdpa_summary_statistics.png")
     
