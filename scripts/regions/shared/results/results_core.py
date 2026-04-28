@@ -3077,8 +3077,8 @@ def create_biome_breakdown(
     enabling named ecoregion labels and biome-level aggregation.
 
     Outputs:
-        ecoregion_breakdown.csv  — per-ecoregion metrics (ECO_NAME, BIOME_NAME, ROC-AUC, P@1%)
-        biome_breakdown.pdf      — biome-level bar chart (grouped by BIOME_NAME)
+        ecoregion_breakdown.csv  — per-ecoregion metrics (ECO_NAME, BIOME_NAME, ROC-AUC, PR-AUC, P@1%)
+        biome_breakdown.pdf      — biome-level bar chart (grouped by BIOME_NAME, sorted by PR-AUC)
         ecoregion_breakdown.pdf  — top-20 ecoregions bar chart (only if shapefile available)
 
     Args:
@@ -3090,7 +3090,7 @@ def create_biome_breakdown(
     """
     import rasterio
     import rasterio.transform
-    from sklearn.metrics import roc_auc_score
+    from sklearn.metrics import roc_auc_score, average_precision_score
     from shapely.geometry import Point
 
     print("\n" + "=" * 70)
@@ -3248,6 +3248,10 @@ def create_biome_breakdown(
             roc_auc = roc_auc_score(grp_true, grp_proba)
         except Exception:
             roc_auc = float('nan')
+        try:
+            pr_auc = average_precision_score(grp_true, grp_proba)
+        except Exception:
+            pr_auc = float('nan')
         n_top   = max(1, int(n_rows * 0.01))
         top_idx = np.argpartition(grp_proba, -n_top)[-n_top:]
         p_at_1pct = float(grp_true[top_idx].mean())
@@ -3259,6 +3263,7 @@ def create_biome_breakdown(
             'n_observed_PAs': n_pos,
             'prevalence_pct': round(prevalence * 100, 4),
             'ROC_AUC':        round(roc_auc, 4),
+            'PR_AUC':         round(pr_auc, 4),
             'Precision_at_1pct': round(p_at_1pct, 4),
             'Lift_at_1pct':   round(p_at_1pct / prevalence, 2) if prevalence > 0 else 0.0,
         })
@@ -3267,7 +3272,7 @@ def create_biome_breakdown(
         print("  No biomes with sufficient data for aggregation. Skipping biome chart.")
         return
 
-    biome_df = pd.DataFrame(biome_records).sort_values('ROC_AUC', ascending=True)
+    biome_df = pd.DataFrame(biome_records).sort_values('PR_AUC', ascending=True)
 
     biome_csv = output_dir / 'biome_breakdown.csv'
     biome_df.to_csv(biome_csv, index=False)
@@ -3295,25 +3300,23 @@ def create_biome_breakdown(
     }
 
     labels     = [SHORT_BIOME.get(b, b[:30]) for b in biome_df['BIOME_NAME']]
-    roc_vals   = biome_df['ROC_AUC'].tolist()
+    pr_vals    = biome_df['PR_AUC'].tolist()
     lift_vals  = biome_df['Lift_at_1pct'].tolist()
     n_vals     = biome_df['n_pixel_years'].tolist()
     y_pos = np.arange(len(labels))
 
     fig, axes = plt.subplots(1, 2, figsize=(14, max(4, len(biome_df) * 0.55)))
 
-    # ROC-AUC panel
+    # PR-AUC panel (primary metric; random baseline = biome positive rate, varies per biome)
     ax1 = axes[0]
-    bars1 = ax1.barh(y_pos, roc_vals, color='#4A90D9', alpha=0.85)
+    bars1 = ax1.barh(y_pos, pr_vals, color='#4A90D9', alpha=0.85)
     ax1.set_yticks(y_pos)
     ax1.set_yticklabels(labels, fontsize=FONTSIZE_STATS)
-    ax1.set_xlabel('ROC-AUC', fontsize=FONTSIZE_LABEL)
-    ax1.set_title('ROC-AUC by Biome', fontsize=FONTSIZE_TITLE, fontweight='bold')
-    ax1.axvline(x=0.5, color='red', linestyle='--', linewidth=1, alpha=0.7, label='Random (0.5)')
+    ax1.set_xlabel('PR-AUC', fontsize=FONTSIZE_LABEL)
+    ax1.set_title('PR-AUC by Biome', fontsize=FONTSIZE_TITLE, fontweight='bold')
     ax1.set_xlim(0, 1)
-    ax1.legend(fontsize=FONTSIZE_LEGEND)
     ax1.grid(True, axis='x', alpha=0.3)
-    for bar, val, n in zip(bars1, roc_vals, n_vals):
+    for bar, val, n in zip(bars1, pr_vals, n_vals):
         ax1.text(min(val + 0.01, 0.97), bar.get_y() + bar.get_height() / 2,
                 f'{val:.3f}  (n={n:,})', va='center', ha='left', fontsize=FONTSIZE_STATS)
 
