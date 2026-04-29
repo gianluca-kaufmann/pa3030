@@ -28,9 +28,9 @@ PROFILE = {
         ],
         "hotspot_max_regions": 2,
         # Indices into cluster_hotspot_boxes.json to select for display.
-        # C1 (index 0): COL Forest — highest-ranked, most BAU pixels.
-        # C5 (index 4): CHL Bare/Other — different biome type, Andean foothills context.
-        "hotspot_region_indices": [0, 4],
+        # C1 (index 0): COL — highest-ranked, most BAU pixels.
+        # C7 (index 6): CHL Bare/Other — central Chilean cluster in the Andean foothills.
+        "hotspot_region_indices": [0, 6],
         "wdpa_2024_filename": "WDPA_SA_1km_2024.tif",
         "wdpa_2019_filename": "WDPA_SA_1km_2019.tif",
         # Forward-only display: calibrated scores are massed at low p; raise lower
