@@ -2666,6 +2666,7 @@ def compute_shap_analysis(
         "GPW_b1":                  "Population Density",
         "GPW_smooth16":            "Population Density (16 km)",
         "GPW_smooth64":            "Population Density (64 km)",
+        "landcover":               "Land Cover (MODIS)",
         "landcover_b1":            "Land Cover (MODIS)",
         "deforestation_b1":        "Annual Deforestation",
         "wildfire_b1":             "Wildfire Occurrence",
