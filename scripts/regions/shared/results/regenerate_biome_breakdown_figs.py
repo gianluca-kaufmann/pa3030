@@ -90,6 +90,8 @@ for region, model_dir, region_label, model_type in REGIONS:
     ax1.set_yticklabels(labels, fontsize=FONTSIZE_STATS)
     ax1.set_xlabel('PR-AUC', fontsize=FONTSIZE_LABEL)
     ax1.set_title('PR-AUC by Biome', fontsize=FONTSIZE_TITLE, fontweight='bold')
+    ax1.text(0.01, 1.01, '(a)', transform=ax1.transAxes,
+             fontsize=11, fontweight='bold', va='bottom', ha='left')
     ax1.set_xlim(0, 1)
     ax1.grid(True, axis='x', alpha=0.3)
     for bar, val, n in zip(bars1, pr_vals, n_vals):
@@ -103,6 +105,8 @@ for region, model_dir, region_label, model_type in REGIONS:
     ax2.set_yticklabels(labels, fontsize=FONTSIZE_STATS)
     ax2.set_xlabel('Lift@1% (×)', fontsize=FONTSIZE_LABEL)
     ax2.set_title('Lift@1% by Biome', fontsize=FONTSIZE_TITLE, fontweight='bold')
+    ax2.text(0.01, 1.01, '(b)', transform=ax2.transAxes,
+             fontsize=11, fontweight='bold', va='bottom', ha='left')
     ax2.axvline(x=1, color='red', linestyle='--', linewidth=1, alpha=0.7, label='Random (1×)')
     lift_max = max(lift_vals) if lift_vals else 1
     ax2.set_xlim(0, lift_max * 1.3)
@@ -113,8 +117,6 @@ for region, model_dir, region_label, model_type in REGIONS:
                  bar.get_y() + bar.get_height() / 2,
                  f'{val:.1f}×', va='center', ha='left', fontsize=FONTSIZE_STATS)
 
-    plt.suptitle(f'{region_label} ({model_type}) Performance by Biome (GSN Terrestrial Ecoregions)',
-                 fontsize=FONTSIZE_TITLE, fontweight='bold', y=1.01)
     plt.tight_layout()
 
     out_path = csv_path.parent / 'biome_breakdown.pdf'

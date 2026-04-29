@@ -576,11 +576,6 @@ def plot_lobo_vs_indistribution(
     axes[-1].legend(handles=handles, loc="lower right", fontsize=8.5,
                     framealpha=0.92, edgecolor="lightgray")
 
-    fig.suptitle(
-        "Spatial Generalisation: LOBO vs. In-Distribution Performance\n"
-        r"Leave-One-Biome-Out CV — Test set 2017–2019 (primary metric: PR-AUC)",
-        fontsize=11, y=1.01,
-    )
     fig.tight_layout()
     fig.savefig(output_path, dpi=FIGURE_DPI, bbox_inches="tight")
     plt.close(fig)

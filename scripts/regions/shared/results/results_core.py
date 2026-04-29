@@ -591,11 +591,6 @@ def create_hotspot_maps(
     if n == 1:
         axes = axes.reshape(2, 1)
 
-    fig.suptitle(
-        f"Hotspot Zoom-ins — {REGION_LABEL} ({model_type.upper()})\n"
-        "Top row: P(protection) probability | Bottom row: top-1% risk zone",
-        fontsize=12,
-    )
 
     for col_idx, (label, x0, x1, y0, y1) in enumerate(HOTSPOT_REGIONS):
         in_box = (x_all >= x0) & (x_all <= x1) & (y_all >= y0) & (y_all <= y1)
@@ -840,7 +835,7 @@ def create_pr_curve(df: pd.DataFrame, metrics_data: Dict[str, Any], output_dir: 
     
     ax.set_xlabel('Recall', fontsize=FONTSIZE_LABEL)
     ax.set_ylabel('Precision', fontsize=FONTSIZE_LABEL)
-    ax.set_title(f'{MODEL_LABEL} ({model_type.upper()}) Precision-Recall Curve', fontsize=FONTSIZE_TITLE, fontweight='bold')
+    ax.set_title('')
     ax.legend(loc='lower left', fontsize=PR_CURVE_LEGEND_FONTSIZE)
     ax.grid(True, alpha=0.3)
     ax.set_xlim([0, 1])
@@ -880,7 +875,7 @@ def create_roc_curve(df: pd.DataFrame, output_dir: Path, model_type: str) -> Non
     ax.plot([0, 1], [0, 1], 'r--', linewidth=2, label='Random guess (AUC = 0.5)')
     ax.set_xlabel('False Positive Rate', fontsize=FONTSIZE_LABEL)
     ax.set_ylabel('True Positive Rate', fontsize=FONTSIZE_LABEL)
-    ax.set_title(f'{MODEL_LABEL} ({model_type.upper()}) ROC Curve',
+    ax.set_title('',
                  fontsize=FONTSIZE_TITLE, fontweight='bold')
     ax.legend(loc='lower right', fontsize=FONTSIZE_LEGEND)
     ax.grid(True, alpha=0.3)
@@ -946,7 +941,7 @@ def create_cumulative_gains_chart(df: pd.DataFrame, output_dir: Path, model_type
     ax.plot([0, 100], [0, 100], 'k--', linewidth=1.5, label='Random guess')
     ax.set_xlabel('% of Area Searched', fontsize=FONTSIZE_LABEL)
     ax.set_ylabel('% of PAs Captured', fontsize=FONTSIZE_LABEL)
-    ax.set_title(f'{MODEL_LABEL} ({model_type.upper()}) Cumulative Gains (Search Efficiency)', fontsize=FONTSIZE_TITLE, fontweight='bold')
+    ax.set_title('')
     ax.legend(loc='lower right', fontsize=PR_CURVE_LEGEND_FONTSIZE)
     ax.grid(True, alpha=0.3)
     ax.set_xlim([0, 100])
@@ -1013,9 +1008,7 @@ def create_calibration_curve(df: pd.DataFrame, output_dir: Path, model_type: str
 
     ax.set_xlabel('Mean Predicted Probability', fontsize=FONTSIZE_LABEL)
     ax.set_ylabel('Fraction of Positives', fontsize=FONTSIZE_LABEL)
-    ax.set_title(f'{MODEL_LABEL} ({model_type.upper()}) Calibration Reliability Diagram '
-                 f'(Uniform Bins, n={n_bins})',
-                 fontsize=FONTSIZE_TITLE, fontweight='bold')
+    ax.set_title('')
     ax.legend(loc='best', fontsize=FONTSIZE_LEGEND)
     ax.grid(True, alpha=0.3)
     ax.set_xlim([0, 1])
@@ -3336,8 +3329,6 @@ def create_biome_breakdown(
         ax2.text(min(val + lift_max * 0.01, lift_max * 1.25), bar.get_y() + bar.get_height() / 2,
                 f'{val:.1f}×', va='center', ha='left', fontsize=FONTSIZE_STATS)
 
-    plt.suptitle(f'{MODEL_LABEL} ({model_type.upper()}) Performance by Biome (GSN Terrestrial Ecoregions)',
-                fontsize=FONTSIZE_TITLE, fontweight='bold', y=1.01)
     plt.tight_layout()
 
     pdf_path = output_dir / 'biome_breakdown.pdf'
@@ -3662,10 +3653,10 @@ def create_model_comparison_landscape(
         _Line2D([], [], marker="s", color="0.3", linestyle="None",
                 markersize=6, label="RF"),
     ]
-    leg3 = ax.legend(handles=patch_handles, fontsize=7.5, loc="lower right",
+    leg3 = ax.legend(handles=patch_handles, fontsize=7.5, loc="upper left",
                      title="Region", title_fontsize=8, framealpha=0.85)
     ax.add_artist(leg3)
-    ax.legend(handles=algo_handles2, fontsize=7.5, loc="lower left",
+    ax.legend(handles=algo_handles2, fontsize=7.5, loc="center left",
               title="Algorithm", title_fontsize=8, framealpha=0.85)
 
     out_path = output_dir / "model_comparison_landscape.pdf"
