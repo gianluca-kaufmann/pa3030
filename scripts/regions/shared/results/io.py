@@ -146,7 +146,7 @@ def check_calibration_status(parquet_path: Path, available_columns: list) -> Non
         print(f"{'!'*70}")
         print(f"  File: {parquet_path.name}")
         print(f"  No calibration metadata found (no 'y_pred_proba_uncalibrated'/'y_pred_proba_calibrated' columns)")
-        print(f"  For calibrated results, use: {MODEL_ID}_lgbm_scored_calibrated_*.parquet (LGBM) or {MODEL_ID}_rf_win5_scored_calibrated_*.parquet (RF)")
+        print(f"  For calibrated results, use: {MODEL_ID}_lgbm_scored_calibrated_*.parquet (LGBM) or {MODEL_ID}_rf_scored_calibrated_*.parquet (RF)")
         print(f"{'!'*70}\n")
 
 def load_scored_parquet(parquet_path: Path, test_years: Optional[Sequence[int]] = None) -> pd.DataFrame:
@@ -622,7 +622,7 @@ def find_latest_file(pattern: str, search_dir: Path, split_version: str = 'main'
     Training scripts save to the root directory, not split-specific subdirectories.
     For metrics files, uses the correct pattern based on model type:
     - LGBM: model1_lgbm_metrics_*.json
-    - RF: model1_rf_win5_metrics_*.json
+    - RF: model1_rf_metrics_*.json (post-W1; legacy: model1_rf_win5_metrics_*.json)
     
     Args:
         pattern: Glob pattern to match (may be overridden for metrics files)
@@ -638,13 +638,13 @@ def find_latest_file(pattern: str, search_dir: Path, split_version: str = 'main'
         if model_type == 'lgbm':
             pattern = f"{MODEL_ID}_lgbm_metrics_*.json"
         elif model_type == 'rf':
-            pattern = f"{MODEL_ID}_rf_win5_metrics_*.json"
+            pattern = f"{MODEL_ID}_rf_metrics_*.json"
     # For scored parquet files, use the correct pattern based on model type
     elif 'scored' in pattern and model_type:
         if model_type == 'lgbm':
             pattern = f"{MODEL_ID}_lgbm_scored_*.parquet"
         elif model_type == 'rf':
-            pattern = f"{MODEL_ID}_rf_win5_scored_*.parquet"
+            pattern = f"{MODEL_ID}_rf_scored_*.parquet"
     
     # Training scripts save to root directory, not split-specific subdirectory
     if not search_dir.exists():

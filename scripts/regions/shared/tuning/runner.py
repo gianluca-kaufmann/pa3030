@@ -50,9 +50,10 @@ from .search_spaces import (
     get_rf_fixed_params,
     get_rf_randomized_space,
 )
+from scripts.regions.shared.training.feature_guard import check_feature_denylist
 
 
-TARGET_COL = "transition_01_win5"
+TARGET_COL = "transition_01"
 YEAR_COL = "year"
 PR_AUC_SCORER = make_scorer(average_precision_score, response_method="predict_proba")
 
@@ -92,6 +93,7 @@ class RuntimeConfig:
     total_row_budget_rf_paper: int
     min_pos_per_year_after_budget: int
     rf_add_missing_indicators: bool
+    allow_legacy_train_win5: bool
     n_jobs: int
 
 
@@ -151,7 +153,7 @@ def _init_wandb_tuning(cfg: RuntimeConfig, optimizer_used: str) -> Any | None:
             config={
                 "region": cfg.region,
                 "model": cfg.model,
-                "task": "transition_01_win5_hyperparameter_tuning",
+                "task": "transition_01_hyperparameter_tuning",
                 "target_column": TARGET_COL,
                 "random_state": cfg.random_state,
                 "tuning_mode": cfg.tuning_mode,
@@ -258,6 +260,7 @@ def load_runtime_config(region: str, model: str, script_dir: Path, output_dir: P
         total_row_budget_rf_paper=int(os.environ.get("TOTAL_ROW_BUDGET_RF_PAPER", "500000")),
         min_pos_per_year_after_budget=int(os.environ.get("MIN_POS_PER_YEAR_AFTER_BUDGET", "25")),
         rf_add_missing_indicators=os.environ.get("RF_ADD_MISSING_INDICATORS", "1") == "1",
+        allow_legacy_train_win5=os.environ.get("TUNING_ALLOW_LEGACY_TRAIN_WIN5", "0") == "1",
         n_jobs=n_jobs,
     )
 
@@ -488,6 +491,7 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
             region=region,
             scratch_root=scratch_root,
             split_version=cfg.tuning_split_version,
+            allow_legacy_train_win5=cfg.allow_legacy_train_win5,
         )
 
         df, feature_cols, data_summary, year_stats, wdpa_diag, budget_diag = prepare_tuning_dataset(
@@ -505,6 +509,7 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
             min_pos_per_year_after_budget=cfg.min_pos_per_year_after_budget,
             max_pos_per_year=max_pos_per_year,
         )
+        check_feature_denylist(feature_cols, context=f"{region}/{model}/tuning")
         _report_memory_usage("after data sampling")
 
         split_cfg = SplitConfig(

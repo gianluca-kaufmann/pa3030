@@ -507,5 +507,76 @@ class TestGridReconstruction:
         assert np.isnan(grid[1, 1])
 
 
+class TestFeatureGuard:
+    """Verify the shared feature-leakage guard at scripts/regions/shared/training/feature_guard.py."""
+
+    def _import(self):
+        from scripts.regions.shared.training.feature_guard import (  # noqa: WPS433
+            FORBIDDEN_COLS,
+            FORBIDDEN_PATTERNS,
+            FeatureLeakageError,
+            check_feature_denylist,
+        )
+        return FORBIDDEN_COLS, FORBIDDEN_PATTERNS, FeatureLeakageError, check_feature_denylist
+
+    def test_clean_list_passes(self):
+        _, _, _, check = self._import()
+        check(["elevation_b1", "GSN_b3", "dist_road", "pa_momentum_pixels_lag1"], context="unit/clean")
+
+    def test_raw_wdpa_raises(self):
+        _, _, FeatureLeakageError, check = self._import()
+        with pytest.raises(FeatureLeakageError) as exc:
+            check(["elevation_b1", "WDPA"], context="unit/wdpa")
+        assert "WDPA" in str(exc.value)
+
+    def test_target_columns_raise(self):
+        _, _, FeatureLeakageError, check = self._import()
+        for col in ("transition_01", "transition_01_win5", "first_transition_year"):
+            with pytest.raises(FeatureLeakageError):
+                check([col, "elevation_b1"], context="unit/target")
+
+    def test_pattern_match_raises(self):
+        _, _, FeatureLeakageError, check = self._import()
+        # Not in exact list, but matches WDPA prefix pattern.
+        with pytest.raises(FeatureLeakageError) as exc:
+            check(["wdpa_buffered_5km"], context="unit/pattern")
+        msg = str(exc.value)
+        assert "pattern denylist" in msg
+        assert "wdpa_buffered_5km" in msg
+
+    def test_error_message_includes_context_and_offenders(self):
+        _, _, FeatureLeakageError, check = self._import()
+        with pytest.raises(FeatureLeakageError) as exc:
+            check(["row", "col", "elevation_b1"], context="my/specific/site")
+        msg = str(exc.value)
+        assert "my/specific/site" in msg
+        assert "row" in msg
+        assert "col" in msg
+
+    def test_year_blocked_by_default(self):
+        _, _, FeatureLeakageError, check = self._import()
+        with pytest.raises(FeatureLeakageError):
+            check(["elevation_b1", "year"], context="unit/year")
+
+    def test_country_helpers_blocked(self):
+        _, _, FeatureLeakageError, check = self._import()
+        for col in ("country_id", "country_iso3"):
+            with pytest.raises(FeatureLeakageError):
+                check([col, "elevation_b1"], context="unit/country")
+
+    def test_pa_momentum_features_pass(self):
+        """The W3 momentum features must be allowed — they're regular features, not labels."""
+        _, _, _, check = self._import()
+        check(
+            ["pa_momentum_pixels_lag1", "pa_momentum_pixels_lag2", "pa_momentum_pixels_lag3"],
+            context="unit/momentum",
+        )
+
+    def test_explicit_override_allows_year(self):
+        _, _, _, check = self._import()
+        from scripts.regions.shared.training.feature_guard import FORBIDDEN_COLS  # noqa: WPS433
+        check(["elevation_b1", "year"], context="unit/override", forbidden=FORBIDDEN_COLS - {"year"})
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

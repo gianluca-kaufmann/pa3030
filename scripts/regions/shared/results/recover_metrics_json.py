@@ -56,7 +56,7 @@ def find_latest_calibrated_parquet(ml_models_dir: Path, model_id: str, model_typ
     if model_type == "lgbm":
         pattern = f"{model_id}_lgbm_scored_calibrated_*.parquet"
     else:
-        pattern = f"{model_id}_rf_win5_scored_calibrated_*.parquet"
+        pattern = f"{model_id}_rf_scored_calibrated_*.parquet"
     candidates = sorted(main_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
     if not candidates:
         raise FileNotFoundError(
@@ -155,7 +155,7 @@ def main() -> None:
     if model_type == "lgbm":
         out_name = f"{model_id}_lgbm_metrics_{source_ts}.json"
     else:
-        out_name = f"{model_id}_rf_win5_metrics_{source_ts}.json"
+        out_name = f"{model_id}_rf_metrics_{source_ts}.json"
     out_path = ml_models_dir / out_name
     with open(out_path, "w") as f:
         json.dump(metrics, f, indent=2)

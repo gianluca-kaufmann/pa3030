@@ -1,4 +1,7 @@
 #!/bin/bash
+# LEGACY (pre-W1, 5-year-window pipeline): Sanity check of the win5 parquet.
+# Kept for reproducing thesis-era diagnostics; not part of the paper-current
+# hazard pipeline. Only runs against legacy *_win5.parquet files.
 #SBATCH --job-name=check_win5_sanity
 #SBATCH --partition=normal.24h
 #SBATCH --time=04:00:00

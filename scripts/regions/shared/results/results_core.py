@@ -1427,7 +1427,7 @@ def create_risk_map(
         output_dir: Directory where figures will be written.
         model_type: Model name (rf, lgbm, brf).
         metrics_data: Optional metrics/metadata dictionary.
-        test_parquet_path: Path to original test parquet (e.g. *test_win5.parquet*).
+        test_parquet_path: Path to original test parquet (e.g. *test.parquet*).
         test_years: Explicit list of test years. If not provided, they will be
             derived from `test_parquet_path` (and, if needed, from metadata)
             using `derive_test_years`.
@@ -2170,7 +2170,7 @@ def create_probability_map(
         metrics_data: Optional metrics/metadata dictionary.
         test_years: Explicit list of test years. If not provided, years will be
             derived dynamically from parquet/metadata using `derive_test_years`.
-        test_parquet_path: Optional path to original test parquet (e.g. *test_win5.parquet*),
+        test_parquet_path: Optional path to original test parquet (e.g. *test.parquet*),
             used when deriving `test_years` if they are not passed explicitly.
     """
     print("\n" + "=" * 70)
@@ -2483,9 +2483,9 @@ def compute_shap_analysis(
     """Compute SHAP analysis and generate visualizations.
     
     Data source priority:
-    1. train_win5.parquet (train set)
-    2. earlystop_win5.parquet (validation set)
-    3. test_win5.parquet (only if allow_test_shap=True)
+    1. train.parquet (train set)
+    2. earlystop.parquet (validation set)
+    3. test.parquet (only if allow_test_shap=True)
     
     Args:
         model_path: Path to trained model pickle file
@@ -3683,13 +3683,13 @@ def main() -> None:
         '--metrics_json',
         type=str,
         default=None,
-        help=f'Path to {MODEL_ID}_lgbm_metrics_*.json (LGBM) or {MODEL_ID}_rf_win5_metrics_*.json (RF) file (default: auto-discover latest in outputs/{REGION_SLUG}/results/ml_models/)'
+        help=f'Path to {MODEL_ID}_lgbm_metrics_*.json (LGBM) or {MODEL_ID}_rf_metrics_*.json (RF) file (default: auto-discover latest in outputs/{REGION_SLUG}/results/ml_models/)'
     )
     parser.add_argument(
         '--scored_parquet',
         type=str,
         default=None,
-        help=f'Path to {MODEL_ID}_lgbm_scored_*.parquet (LGBM) or {MODEL_ID}_rf_win5_scored_*.parquet (RF) file (default: auto-discover latest in outputs/{REGION_SLUG}/results/ml_models/)'
+        help=f'Path to {MODEL_ID}_lgbm_scored_*.parquet (LGBM) or {MODEL_ID}_rf_scored_*.parquet (RF) file (default: auto-discover latest in outputs/{REGION_SLUG}/results/ml_models/)'
     )
     parser.add_argument(
         '--model_type',
@@ -3714,7 +3714,7 @@ def main() -> None:
         '--test_parquet',
         type=str,
         default=None,
-        help='Path to original test_win5.parquet file (for loading WDPA_b1 data). If not provided, will try to auto-discover.'
+        help='Path to original test.parquet file (for loading WDPA_b1 data). If not provided, will try to auto-discover.'
     )
     parser.add_argument(
         '--future_parquet',
@@ -3854,14 +3854,14 @@ def main() -> None:
         for search_dir in ml_models_candidates:
             if not search_dir.exists():
                 continue
-            found = find_latest_file(f"{MODEL_ID}_{args.model_type}_win5_metrics_*.json", search_dir, args.split_version, args.model_type)
+            found = find_latest_file(f"{MODEL_ID}_{args.model_type}_metrics_*.json", search_dir, args.split_version, args.model_type)
             if found is not None:
                 metrics_path = found
                 print(f"  Found: {metrics_path}")
                 break
         
         if metrics_path is None:
-            expected_pattern = f"{MODEL_ID}_lgbm_metrics_*.json" if args.model_type == 'lgbm' else f"{MODEL_ID}_rf_win5_metrics_*.json"
+            expected_pattern = f"{MODEL_ID}_lgbm_metrics_*.json" if args.model_type == 'lgbm' else f"{MODEL_ID}_rf_metrics_*.json"
             print(f"ERROR: Could not find {expected_pattern} in any of the following directories:")
             for cand in ml_models_candidates:
                 print(f"  - {cand}")
@@ -3925,8 +3925,8 @@ def main() -> None:
                 search_dirs_scored_rf.append(base / args.split_version)
                 search_dirs_scored_rf.append(base)
 
-            calibrated_pattern_rf = f"{MODEL_ID}_rf_win5_scored_calibrated_*.parquet"
-            raw_pattern_rf = f"{MODEL_ID}_rf_win5_scored_*.parquet"
+            calibrated_pattern_rf = f"{MODEL_ID}_rf_scored_calibrated_*.parquet"
+            raw_pattern_rf = f"{MODEL_ID}_rf_scored_*.parquet"
 
             calibrated_path_rf = find_latest_file_in_dirs(calibrated_pattern_rf, search_dirs_scored_rf)
             raw_path_rf = find_latest_file_in_dirs(raw_pattern_rf, search_dirs_scored_rf, exclude_substr="calibrated")
@@ -3957,9 +3957,9 @@ def main() -> None:
         test_parquet_path = Path(args.test_parquet).resolve()
         print(f"Using provided test parquet: {test_parquet_path}")
     else:
-        print("Auto-discovering test_win5.parquet using $SCRATCH-first path resolution...")
+        print("Auto-discovering test.parquet using $SCRATCH-first path resolution...")
         try:
-            test_parquet_path = resolve_parquet_file("test_win5.parquet", args.split_version)
+            test_parquet_path = resolve_parquet_file("test.parquet", args.split_version)
             print(f"  ✓ Resolved path: {test_parquet_path}")
         except FileNotFoundError as e:
             print(f"  ✗ {e}")
@@ -4246,8 +4246,8 @@ def main() -> None:
             print(f"\nAuto-discovering trained model file for SHAP analysis ({MODEL_LABEL} only)...")
             # Only model-specific patterns: never use *model*.pkl so we never pick modelC_lgbm_*.pkl
             model_patterns = [
-                f"{MODEL_ID}_{args.model_type}_win5_*.pkl",
-                f"{MODEL_ID}_{args.model_type}_win5_*.joblib",
+                f"{MODEL_ID}_{args.model_type}_*.pkl",
+                f"{MODEL_ID}_{args.model_type}_*.joblib",
                 f"{MODEL_ID}_{args.model_type}_*.pkl",
                 f"{MODEL_ID}_{args.model_type}_*.joblib",
             ]
@@ -4324,16 +4324,16 @@ def main() -> None:
     if not args.skip_shap and model_path is not None:
         print("\nAuto-discovering data sources for SHAP analysis...")
         
-        # Try to find earlystop_win5.parquet
+        # Try to find earlystop.parquet
         earlystop_candidates = []
         if scratch_root is not None:
             earlystop_candidates.extend([
-                scratch_root / f"outputs/{REGION_SLUG}/results/{args.split_version}/earlystop_win5.parquet",
-                scratch_root / f"data/{REGION_SLUG}/ml/{args.split_version}/earlystop_win5.parquet"
+                scratch_root / f"outputs/{REGION_SLUG}/results/{args.split_version}/earlystop.parquet",
+                scratch_root / f"data/{REGION_SLUG}/ml/{args.split_version}/earlystop.parquet"
             ])
         earlystop_candidates.extend([
-            repo_root / f"outputs/{REGION_SLUG}/results/{args.split_version}/earlystop_win5.parquet",
-            repo_root / f"data/{REGION_SLUG}/ml/{args.split_version}/earlystop_win5.parquet"
+            repo_root / f"outputs/{REGION_SLUG}/results/{args.split_version}/earlystop.parquet",
+            repo_root / f"data/{REGION_SLUG}/ml/{args.split_version}/earlystop.parquet"
         ])
         
         for cand in earlystop_candidates:
@@ -4342,16 +4342,16 @@ def main() -> None:
                 print(f"  Found earlystop: {cand}")
                 break
         
-        # Try to find train_win5.parquet
+        # Try to find train.parquet
         train_candidates = []
         if scratch_root is not None:
             train_candidates.extend([
-                scratch_root / f"outputs/{REGION_SLUG}/results/{args.split_version}/train_win5.parquet",
-                scratch_root / f"data/{REGION_SLUG}/ml/{args.split_version}/train_win5.parquet"
+                scratch_root / f"outputs/{REGION_SLUG}/results/{args.split_version}/train.parquet",
+                scratch_root / f"data/{REGION_SLUG}/ml/{args.split_version}/train.parquet"
             ])
         train_candidates.extend([
-            repo_root / f"outputs/{REGION_SLUG}/results/{args.split_version}/train_win5.parquet",
-            repo_root / f"data/{REGION_SLUG}/ml/{args.split_version}/train_win5.parquet"
+            repo_root / f"outputs/{REGION_SLUG}/results/{args.split_version}/train.parquet",
+            repo_root / f"data/{REGION_SLUG}/ml/{args.split_version}/train.parquet"
         ])
         
         for cand in train_candidates:

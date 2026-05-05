@@ -76,7 +76,7 @@ from scripts.regions.shared.training.utils import (
 # Shared constants  (identical for both regions and all layers)
 # =============================================================================
 RANDOM_STATE     = 42
-TARGET_COL       = "transition_01_win5"
+TARGET_COL       = "transition_01"  # Annual hazard target
 LOOKAHEAD_YEARS  = 5
 WDPA_LAST_YEAR   = 2024
 LAST_LABEL_YEAR  = WDPA_LAST_YEAR - LOOKAHEAD_YEARS   # 2019
@@ -191,7 +191,7 @@ def resolve_trained_model(region: str, model_id: str, model_type: str) -> Path:
 
     File naming conventions (from the training scripts):
         LGBM: data/{region}/ml/models/{model_id}_lgbm_{timestamp}.pkl
-        RF:   data/{region}/ml/models/{model_id}_rf_win5_{timestamp}.joblib
+        RF:   data/{region}/ml/models/{model_id}_rf_{timestamp}.joblib
 
     Checks $SCRATCH first, then repo_root.  Raises FileNotFoundError if none found.
     """
@@ -201,7 +201,7 @@ def resolve_trained_model(region: str, model_id: str, model_type: str) -> Path:
     if model_type == "lgbm":
         pattern = f"{model_id}_lgbm_*.pkl"
     else:
-        pattern = f"{model_id}_rf_win5_*.joblib"
+        pattern = f"{model_id}_rf_*.joblib"
 
     search_dirs: list[Path] = []
     if scratch:
@@ -1233,7 +1233,7 @@ def find_scored_file(
     if algorithm == "lgbm":
         pattern = f"{model_id}_lgbm_scored_*.parquet"
     else:
-        pattern = f"{model_id}_rf_win5_scored_*.parquet"
+        pattern = f"{model_id}_rf_scored_*.parquet"
     files = list(output_dir.glob(pattern))
     files.extend(output_dir.glob(f"main/{pattern}"))
     return max(files, key=lambda p: p.stat().st_mtime) if files else None
@@ -1372,7 +1372,7 @@ def _compute_biome_feature_importance(
         # Generic "Column_N" names → resolve from parquet schema
         if feature_cols and feature_cols[0].startswith("Column_") and feature_cols[0][7:].isdigit():
             try:
-                tp = resolve_parquet(region, "test_win5.parquet")
+                tp = resolve_parquet(region, "test.parquet")
                 feature_cols = get_feature_cols(tp)
                 print(f"  Resolved {len(feature_cols)} feature names from parquet schema")
             except FileNotFoundError:
@@ -1390,7 +1390,7 @@ def _compute_biome_feature_importance(
             feature_cols = list(model.feature_names_in_)
         else:
             try:
-                tp = resolve_parquet(region, "test_win5.parquet")
+                tp = resolve_parquet(region, "test.parquet")
                 feature_cols = get_feature_cols(tp)
             except FileNotFoundError:
                 print("  Cannot resolve feature names — skipping")
@@ -1401,7 +1401,7 @@ def _compute_biome_feature_importance(
 
     # ── Find test parquet ─────────────────────────────────────────────────────
     try:
-        test_path = resolve_parquet(region, "test_win5.parquet")
+        test_path = resolve_parquet(region, "test.parquet")
     except FileNotFoundError as e:
         print(f"  Test parquet not found: {e}")
         del model; gc.collect()
@@ -1559,7 +1559,7 @@ def _run_transfer_direction(
         # Replace with parquet-derived names from the target region (same feature set,
         # same positional order) so that batch.select(feature_cols) works correctly.
         if feature_cols and feature_cols[0].startswith("Column_") and feature_cols[0][7:].isdigit():
-            tgt_parquet_cols = get_feature_cols(resolve_parquet(target_region, "train_win5.parquet"))
+            tgt_parquet_cols = get_feature_cols(resolve_parquet(target_region, "train.parquet"))
             if len(tgt_parquet_cols) == len(feature_cols):
                 feature_cols = tgt_parquet_cols
                 print(f"  NOTE: Replaced generic Column_N names with "
@@ -1587,8 +1587,8 @@ def _run_transfer_direction(
             # Fallback: infer feature order from both parquet schemas and verify
             # they share the same feature names, then use source column order
             # (the order the RF model was trained on) so predictions are correct.
-            src_train = resolve_parquet(source_region, "train_win5.parquet")
-            tgt_train = resolve_parquet(target_region, "train_win5.parquet")
+            src_train = resolve_parquet(source_region, "train.parquet")
+            tgt_train = resolve_parquet(target_region, "train.parquet")
             src_cols = get_feature_cols(src_train)
             tgt_cols = get_feature_cols(tgt_train)
             if set(src_cols) != set(tgt_cols):
@@ -1614,7 +1614,7 @@ def _run_transfer_direction(
         print(f"  {k}: {v}")
 
     # ── Score target region ──────────────────────────────────────────────────
-    tgt_test = resolve_parquet(target_region, "test_win5.parquet")
+    tgt_test = resolve_parquet(target_region, "test.parquet")
     test_result = score_region_test(
         tgt_test, predict_fn, feature_cols, output_dir, timestamp, label,
     )
@@ -1711,9 +1711,9 @@ def run_lobo_main(region: str, model_id: str) -> None:
         print(f"Test years:       {TEST_START}-{TEST_END}")
         print(f"Output dir:       {output_dir}")
 
-        train_path     = resolve_parquet(region, "train_win5.parquet")
-        earlystop_path = resolve_parquet(region, "earlystop_win5.parquet")
-        test_path      = resolve_parquet(region, "test_win5.parquet")
+        train_path     = resolve_parquet(region, "train.parquet")
+        earlystop_path = resolve_parquet(region, "earlystop.parquet")
+        test_path      = resolve_parquet(region, "test.parquet")
         print(f"\nTrain:     {train_path}")
         print(f"Earlystop: {earlystop_path}")
         print(f"Test:      {test_path}")
@@ -2340,7 +2340,7 @@ def run_transfer_main(
         ))
         region_cols: dict[str, list[str]] = {}
         for reg in unique_regions:
-            train_path = resolve_parquet(reg, "train_win5.parquet")
+            train_path = resolve_parquet(reg, "train.parquet")
             region_cols[reg] = get_feature_cols(train_path)
             print(f"{reg} features: {len(region_cols[reg])}")
         ref_set = set(region_cols[unique_regions[0]])

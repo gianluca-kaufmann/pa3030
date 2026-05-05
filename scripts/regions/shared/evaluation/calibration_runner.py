@@ -73,7 +73,7 @@ def _find_latest_scored_file(
     Training scripts save scored files to the root ml_models directory (not split-specific).
 
     LGBM: <model_id>_lgbm_scored_*.parquet
-    RF:   <model_id>_rf_win5_scored_*.parquet
+    RF:   <model_id>_rf_scored_*.parquet
     """
     candidate_roots = _candidate_metrics_roots(config)
     existing_roots = [d for d in candidate_roots if d.exists()]
@@ -90,7 +90,7 @@ def _find_latest_scored_file(
         if config.algorithm == "lgbm":
             pattern = f"{config.model_id}_lgbm_scored_*.parquet"
         elif config.algorithm == "rf":
-            pattern = f"{config.model_id}_rf_win5_scored_*.parquet"
+            pattern = f"{config.model_id}_rf_scored_*.parquet"
         else:
             raise ValueError(f"Unknown algorithm: {config.algorithm}")
 
@@ -141,7 +141,7 @@ def _search_cv_files(
             if not d.exists():
                 continue
             # Preferred pattern with win5
-            temporal = list(d.glob(f"{config.model_id}_lgbm_win5_temporal_cv_predictions_*.parquet"))
+            temporal = list(d.glob(f"{config.model_id}_lgbm_temporal_cv_predictions_*.parquet"))
             temporal_cv_files.extend(temporal)
             # Backwards-compatible pattern without win5
             temporal_alt = list(d.glob(f"{config.model_id}_lgbm_temporal_cv_predictions_*.parquet"))
@@ -157,14 +157,14 @@ def _search_cv_files(
             raise FileNotFoundError(
                 "ERROR: --require-temporal-cv flag is set, but no temporal CV predictions file found.\n"
                 "Temporal CV predictions are required for calibration.\n"
-                f"Expected pattern: {config.model_id}_lgbm_win5_temporal_cv_predictions_*.parquet\n"
+                f"Expected pattern: {config.model_id}_lgbm_temporal_cv_predictions_*.parquet\n"
                 f"Searched in:\n{searched}"
             )
 
         for d in search_dirs:
             if not d.exists():
                 continue
-            files = list(d.glob(f"{config.model_id}_lgbm_win5_cv_predictions_*.parquet"))
+            files = list(d.glob(f"{config.model_id}_lgbm_cv_predictions_*.parquet"))
             other_cv_files.extend(files)
             generic = list(d.glob("*cv_predictions*.parquet"))
             generic = [p for p in generic if p.name.startswith(f"{config.model_id}_lgbm_")]
@@ -176,7 +176,7 @@ def _search_cv_files(
         searched = "\n".join(str(d) for d in search_dirs)
         raise FileNotFoundError(
             "CV predictions file not found for calibration.\n"
-            f"Expected temporal CV pattern: {config.model_id}_lgbm_win5_temporal_cv_predictions_*.parquet\n"
+            f"Expected temporal CV pattern: {config.model_id}_lgbm_temporal_cv_predictions_*.parquet\n"
             f"Searched in:\n{searched}"
         )
 
@@ -186,7 +186,7 @@ def _search_cv_files(
         for d in search_dirs:
             if not d.exists():
                 continue
-            files = list(d.glob(f"{config.model_id}_rf_win5_earlystop_scored_*.parquet"))
+            files = list(d.glob(f"{config.model_id}_rf_earlystop_scored_*.parquet"))
             earlystop_files.extend(files)
 
         if earlystop_files:
@@ -195,7 +195,7 @@ def _search_cv_files(
         searched = "\n".join(str(d) for d in search_dirs)
         raise FileNotFoundError(
             "Earlystop predictions file not found for RF calibration.\n"
-            f"Expected pattern: {config.model_id}_rf_win5_earlystop_scored_*.parquet\n"
+            f"Expected pattern: {config.model_id}_rf_earlystop_scored_*.parquet\n"
             f"Searched in:\n{searched}"
         )
 
@@ -373,7 +373,7 @@ def run_calibration(
             expected_pattern = (
                 f"{config.model_id}_lgbm_scored_*.parquet"
                 if config.algorithm == "lgbm"
-                else f"{config.model_id}_rf_win5_scored_*.parquet"
+                else f"{config.model_id}_rf_scored_*.parquet"
             )
             print(f"Expected pattern: {expected_pattern}")
             raise
@@ -766,7 +766,7 @@ def run_calibration(
     else:
         calibrated_test_path = (
             split_output_dir
-            / f"{config.model_id}_rf_win5_scored_calibrated_{calibration_method}_{timestamp}.parquet"
+            / f"{config.model_id}_rf_scored_calibrated_{calibration_method}_{timestamp}.parquet"
         )
 
     test_df_minimal.to_parquet(calibrated_test_path, index=False)
@@ -775,7 +775,7 @@ def run_calibration(
     # Reliability JSON
     reliability_plot_path = (
         split_output_dir
-        / f"{config.model_id}_{config.algorithm}_win5_reliability_plot_{calibration_method}_{timestamp}.json"
+        / f"{config.model_id}_{config.algorithm}_reliability_plot_{calibration_method}_{timestamp}.json"
     )
     reliability_plot_data: Dict[str, Any] = {
         "metadata": {
@@ -822,7 +822,7 @@ def run_calibration(
     # Calibration metadata JSON
     calibration_metadata_path = (
         split_output_dir
-        / f"{config.model_id}_{config.algorithm}_win5_calibration_{calibration_method}_{timestamp}.json"
+        / f"{config.model_id}_{config.algorithm}_calibration_{calibration_method}_{timestamp}.json"
     )
     calibration_metadata: Dict[str, Any] = {
         "metadata": {
@@ -883,7 +883,7 @@ def run_calibration(
     # Brier/ECE summary text
     brier_summary_path = (
         split_output_dir
-        / f"{config.model_id}_{config.algorithm}_win5_brier_summary_{calibration_method}_{timestamp}.txt"
+        / f"{config.model_id}_{config.algorithm}_brier_summary_{calibration_method}_{timestamp}.txt"
     )
     save_brier_score_summary(
         brier_summary_path,

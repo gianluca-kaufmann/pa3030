@@ -190,12 +190,14 @@ def resolve_train_parquet(
     region: str,
     scratch_root: Path | None = None,
     split_version: str = "main",
+    allow_legacy_train_win5: bool = False,
 ) -> Path:
     """
-    Locate the tuning train parquet across split-aware and legacy layouts.
+    Locate the tuning train parquet across split-aware layouts.
 
     Search order prioritizes SCRATCH over repo root and requested split over
-    fallback splits for robustness.
+    fallback splits for robustness. The legacy train_win5.parquet name is only
+    considered when allow_legacy_train_win5 is explicitly enabled.
     """
     split = split_version.strip() or "main"
     split_candidates: List[str] = []
@@ -207,10 +209,9 @@ def resolve_train_parquet(
         f"outputs/{region}/results",
         f"data/{region}/ml",
     ]
-    filenames = [
-        "train_win5.parquet",
-        "train.parquet",
-    ]
+    filenames = ["train.parquet"]
+    if allow_legacy_train_win5:
+        filenames.append("train_win5.parquet")
 
     roots: List[Path] = []
     if scratch_root is not None:
@@ -229,8 +230,14 @@ def resolve_train_parquet(
         if cand.exists():
             return cand
 
+    legacy_hint = (
+        " Set TUNING_ALLOW_LEGACY_TRAIN_WIN5=1 to permit train_win5.parquet."
+        if not allow_legacy_train_win5
+        else ""
+    )
     raise FileNotFoundError(
-        f"Train parquet not found for region={region}, split={split}. Checked: {candidates}"
+        f"train.parquet not found for region={region}, split={split}. "
+        f"Checked: {candidates}.{legacy_hint}"
     )
 
 

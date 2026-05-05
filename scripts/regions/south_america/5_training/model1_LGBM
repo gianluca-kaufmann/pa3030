@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""LGBM Transition Model for Continent Dataset (5-Year Lookahead Prediction)
-Train LightGBM on pre-split parquet files. Final model trained on train+earlystop,
-using average best_iteration from CV folds (no early stopping), evaluated on test.
-Target: transition_01_win5 (1 if transition occurs within next 5 years, else 0)
+"""LGBM Transition Model for Continent Dataset (Annual Hazard Prediction)
+Train LightGBM on pre-split parquet files. Final model trained on train ∪ earlystop
+(disjoint year windows by construction; no duplicate rows), using average
+best_iteration from CV folds (no early stopping), evaluated on test.
+Target: transition_01 (1 if pixel transitions in this year, else 0).
 
 Features:
 - Temporal Cross-Validation: 3 folds with different train/earlystop year splits
 - Final Model: Uses average best_iteration from CV folds (no early stopping)
 - Time-based Sample Weighting: Later training years get higher weights
   (Year 2000: weight 0.5, Year MAX: weight 1.0, linear interpolation in between)
-- Right-Censoring Protection: Earlystop and test data filtered to LAST_LABEL_YEAR
-  (LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS) to avoid evaluating on
-  labels that don't have complete 5-year lookahead information
+- No right-censoring: under the annual hazard target, transition_01 in year T is
+  observable as soon as WDPA_b1 for year T is in the panel, so labels are not
+  truncated.
 """
 
 from __future__ import annotations
@@ -67,32 +68,37 @@ from scripts.regions.shared.training.utils import (  # noqa: E402
     compute_year_weights,
     check_year_overlap,
 )
+from scripts.regions.shared.training.feature_guard import check_feature_denylist  # noqa: E402
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 # Configuration
 RANDOM_STATE = 42
+# Both transition_01 and transition_01_win5 are kept in EXCLUDE_COLS defensively:
+# the active target (transition_01) must be filtered out of features, and the
+# legacy column would also be a label leak if it ever appeared in the panel.
 EXCLUDE_COLS = {'transition_01', 'transition_01_win5', 'WDPA_b1', 'WDPA_prev', 'WDPA', 'x', 'y', 'row', 'col', 'year'}
-TARGET_COL = "transition_01_win5"  # 5-year lookahead target
-LOOKAHEAD_YEARS = 5  # Number of years ahead for prediction
-WDPA_LAST_YEAR = 2024  # Last year with WDPA data
-LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS  # Last year we can reliably label (2019)
-TRAIN_YEARS = (2001, 2016)   # Train: 2001-2016 (excludes 2000 — stock PAs, not true transitions)
-EARLYSTOP_YEARS = (2014, min(2016, LAST_LABEL_YEAR))     # Earlystop: 2014-2016 (matches modelC main split)
+TARGET_COL = "transition_01"  # Annual hazard target
+WDPA_LAST_YEAR = 2024  # Last year with WDPA data observed in the panel
+TRAIN_YEARS = (2001, 2013)   # Train: pure window, disjoint from EARLYSTOP
+EARLYSTOP_YEARS = (2014, 2016)   # Earlystop: held-out for early stopping; OOF by construction
 TEST_START = 2017
 TEST_END = 2019
-TEST_YEARS = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))    # Test: 2017-2019 (matches modelC main split)
+TEST_YEARS = (TEST_START, TEST_END)   # Test: paper-current evaluation window (ROADMAP §W1)
 FIXED_PARAMS = {'random_state': RANDOM_STATE, 'boosting_type': 'gbdt', 'objective': 'binary', 'verbose': -1}
 
 # Batch size for data loading (can be overridden via BATCH_SIZE env var)
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "200000"))
 
-# Temporal Cross-Validation Folds
-# Matches modelC CV folds exactly (scale-up only)
+# Temporal Cross-Validation Folds (within the training pool TRAIN ∪ EARLYSTOP = 2001-2016).
+# The CV loader reads from both train.parquet and earlystop.parquet and filters by year;
+# folds therefore freely span either file. CV is used to determine an average best
+# num_boost_round across folds; the final model is then refit on the full pool with
+# that fixed num_boost_round (no early stopping).
 CV_FOLDS = [
-    ((2001, 2008), (2009, min(2011, LAST_LABEL_YEAR))),  # Fold 1: Train 2001-2008 → Earlystop 2009-2011
-    ((2001, 2011), (2012, min(2013, LAST_LABEL_YEAR))),  # Fold 2: Train 2001-2011 → Earlystop 2012-2013
-    ((2001, 2013), (2014, min(2016, LAST_LABEL_YEAR))),  # Fold 3: Train 2001-2013 → Earlystop 2014-2016
+    ((2001, 2008), (2009, 2010)),  # Fold 1: Train 2001-2008 → Earlystop 2009-2010
+    ((2001, 2010), (2011, 2013)),  # Fold 2: Train 2001-2010 → Earlystop 2011-2013
+    ((2001, 2013), (2014, 2016)),  # Fold 3: Train 2001-2013 → Earlystop 2014-2016
 ]
 
 # Utility Functions
@@ -668,7 +674,7 @@ def train_single_cv_fold(
     print(f"{'='*70}")
     
     # Check for year overlap
-    earlystop_year_range = (earlystop_years[0], min(earlystop_years[1], LAST_LABEL_YEAR))
+    earlystop_year_range = (earlystop_years[0], earlystop_years[1])
     if check_year_overlap(train_years, earlystop_year_range, f"Fold {fold_idx+1} Earlystop"):
         # Skip this fold if overlap detected
         return {
@@ -685,13 +691,13 @@ def train_single_cv_fold(
     )
     n_train_samples = len(X_train)
     
-    # Load earlystop data (filter to LAST_LABEL_YEAR to avoid right-censored labels)
+    # Load earlystop data (annual hazard target, no right-censoring needed)
     X_earlystop, y_earlystop, earlystop_years_array, earlystop_pos, earlystop_neg, earlystop_years_list = load_numpy_arrays_from_multiple_files(
         earlystop_paths, feature_cols, target_col, f"Fold {fold_idx+1} Earlystop", year_range=earlystop_year_range
     )
     n_earlystop_samples = len(X_earlystop)
-    
-    print(f"\nFold {fold_idx+1}: Train {n_train_samples:,} samples, Earlystop {n_earlystop_samples:,} samples (earlystop years {earlystop_year_range[0]}-{earlystop_year_range[1]}, capped at LAST_LABEL_YEAR={LAST_LABEL_YEAR})")
+
+    print(f"\nFold {fold_idx+1}: Train {n_train_samples:,} samples, Earlystop {n_earlystop_samples:,} samples (earlystop years {earlystop_year_range[0]}-{earlystop_year_range[1]})")
     print(f"  NOTE: Earlystop used ONLY for early stopping, NOT for metric reporting.")
     
     # Compute sample weights for training data (time-based weighting)
@@ -1217,8 +1223,8 @@ def phase2_testing(
     report_memory_usage("start of Phase 2")
     
     # Check for year overlap between training and test
-    final_train_years = (TRAIN_YEARS[0], EARLYSTOP_YEARS[1])  # Full training period: 2001-2016
-    test_year_range = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))
+    final_train_years = (TRAIN_YEARS[0], EARLYSTOP_YEARS[1])  # Full training pool: 2001-2016
+    test_year_range = (TEST_START, TEST_END)
     
     if check_year_overlap(final_train_years, test_year_range, "Test"):
         print("\n" + "="*70)
@@ -1235,7 +1241,7 @@ def phase2_testing(
     batch_size = BATCH_SIZE
     
     print(f"Processing test in batches of {batch_size:,}...")
-    print(f"Test year range: {test_year_range[0]}-{test_year_range[1]} (capped at LAST_LABEL_YEAR={LAST_LABEL_YEAR})")
+    print(f"Test year range: {test_year_range[0]}-{test_year_range[1]} (annual hazard target; no right-censoring)")
     
     # Pass 1: Count rows (pre-allocate arrays to avoid concatenation memory spike)
     print(f"  Pass 1: Counting test rows (year_range={test_year_range})...")
@@ -1317,8 +1323,7 @@ def phase2_testing(
             
             # Apply risk-set filtering: WDPA_prev == 0
             risk_mask = (wdpa_prev_array == 0)
-            # Filter by year range to exclude right-censored labels
-            # year_range=(TEST_START, min(TEST_END, LAST_LABEL_YEAR))
+            # Filter by year range
             year_mask = (year_array >= test_year_range[0]) & (year_array <= test_year_range[1])
             final_mask = valid_mask & year_mask & risk_mask
             if not final_mask.any():
@@ -1431,11 +1436,10 @@ def phase2_testing(
     metrics = {
         "metadata": {
             "timestamp": timestamp, 
-            "model": "LightGBM", 
-            "task": "transition_01_win5_prediction",
+            "model": "LightGBM",
+            "task": "transition_01_prediction",
             "target_column": TARGET_COL,
-            "lookahead_years": 5,
-            "random_state": RANDOM_STATE, 
+            "random_state": RANDOM_STATE,
             "n_features": len(feature_cols), 
             "features": feature_cols,
             "test_probabilities": "uncalibrated",
@@ -1514,9 +1518,9 @@ def phase2_testing(
 def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True, num_boost_round: Optional[int] = None, eval_only: bool = False) -> None:
     start_time = time.time()
     repo_root = get_repo_root()
-    train_path = resolve_parquet_file("train_win5.parquet")
-    earlystop_path = resolve_parquet_file("earlystop_win5.parquet")
-    test_path = resolve_parquet_file("test_win5.parquet")
+    train_path = resolve_parquet_file("train.parquet")
+    earlystop_path = resolve_parquet_file("earlystop.parquet")
+    test_path = resolve_parquet_file("test.parquet")
     params_path = resolve_best_params_json()
     
     # Load parameters before wandb.init() so we can log them
@@ -1571,9 +1575,8 @@ def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True, 
             name=f"model1_lgbm_{timestamp}",
             config={
                 "model": "LightGBM", 
-                "task": "transition_01_win5_prediction", 
+                "task": "transition_01_prediction",
                 "target_column": TARGET_COL,
-                "lookahead_years": 5,
                 "random_state": RANDOM_STATE,
                 "use_time_weights": use_time_weights,
                 "temporal_split": {
@@ -1591,15 +1594,14 @@ def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True, 
     else:
         print("W&B not available (module not installed)")
     
-    print("="*70 + "\nLGBM TRANSITION MODEL (CONTINENT DATASET - 5-YEAR LOOKAHEAD)\n" + "="*70)
+    print("="*70 + "\nLGBM TRANSITION MODEL (CONTINENT DATASET - ANNUAL HAZARD)\n" + "="*70)
     print(f"Train: {train_path}\nEarlystop: {earlystop_path}\nTest: {test_path}\nParams: {params_path if params_path else 'Using default manual hyperparameters (lgbm_best_params.json not found)'}\nOutput: {output_dir}")
     print(f"\nConfiguration:")
     print(f"  CV Mode: {cv_mode}")
     print(f"  Use Time Weights: {use_time_weights}")
     print(f"  WDPA_LAST_YEAR: {WDPA_LAST_YEAR}")
-    print(f"  LOOKAHEAD_YEARS: {LOOKAHEAD_YEARS}")
-    print(f"  LAST_LABEL_YEAR: {LAST_LABEL_YEAR} (WDPA_LAST_YEAR - LOOKAHEAD_YEARS)")
-    print(f"  Earlystop/Test data filtered to years <= {LAST_LABEL_YEAR} to avoid right-censored labels")
+    print(f"  Target: {TARGET_COL} (annual hazard; no right-censoring)")
+    print(f"  Train years (disjoint): TRAIN={TRAIN_YEARS}, EARLYSTOP={EARLYSTOP_YEARS}, TEST={TEST_YEARS}")
     
     all_cols_train = pq.ParquetFile(train_path).schema_arrow.names
     all_cols_test = pq.ParquetFile(test_path).schema_arrow.names
@@ -1613,6 +1615,7 @@ def main(timestamp: str, cv_mode: str = "fold3", use_time_weights: bool = True, 
     ]
     # Exclude target and coordinates from features (year is excluded)
     feature_cols = [c for c in numeric_cols if c not in EXCLUDE_COLS]
+    check_feature_denylist(feature_cols, context="south_america/lgbm/training")
     required_cols = [target_col, 'year', 'row', 'col']
     optional_cols = [col for col in ['x', 'y'] if col in all_cols_train]
     keep_cols_train = feature_cols + required_cols + optional_cols

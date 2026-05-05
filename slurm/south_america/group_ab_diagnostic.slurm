@@ -13,7 +13,9 @@
 # Group A/B leakage diagnostic — South America
 #
 # Splits test positives by designation-year cohort to quantify soft label
-# leakage.  Reads scored parquets + test_win5.parquet; no GPU required.
+# leakage.  LEGACY: reads pre-W1 scored parquets + test_win5.parquet; no GPU required.
+# This diagnostic is intentionally bound to the legacy 5-year window — it analyses
+# label overlap that the W1 hazard refactor eliminates by construction.
 # Peak memory: ~1.2 GB.  Runs for LGBM and RF sequentially (~5 min each).
 #
 # Usage:

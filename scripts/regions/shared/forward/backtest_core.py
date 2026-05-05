@@ -1,37 +1,31 @@
 #!/usr/bin/env python3
-"""Stage 0c: Pseudo-forecast backtesting.
+"""Stage 0c: Pseudo-forecast backtesting (annual hazard framing).
 
 Validates the forward prediction methodology by simulating the full pipeline at
 four historical origin years: T = 2013, 2015, 2017, 2019.
 
 For each origin year T:
-  1. Train a historical deployment model on 2001–(T−5) with locked hyperparams.
-     (Training cutoff = T − LOOKAHEAD_YEARS, mirroring the real deployment:
-     the last training year always has a complete 5-year lookahead window.)
+  1. Train a historical deployment model on 2001–T using the annual hazard
+     target ``transition_01``. Under hazard framing there is no right-censoring,
+     so the training cutoff is simply T (mirroring the real deployment, which
+     trains through WDPA_LAST_YEAR).
   2. Score year-T feature rows for WDPA_prev==0 AND WDPA==0 pixels from
-     merged_panel_final.parquet.
-  3. Reconstruct 5-year window actuals from the WDPA column (years T+1–T+5)
-     — NOT from transition_01_win5 (which may be absent or unreliable).
-  4. Evaluate: Precision@1/5/10%, Lift@1/5/10%, Forecast Capture Rate.
+     merged_panel_final.parquet — model output is annual hazard h.
+  3. Aggregate to a 5-year cumulative risk under the static-covariate
+     assumption: 1 − (1 − h)^HAZARD_HORIZON_YEARS.
+  4. Reconstruct 5-year window actuals from the WDPA column (years T+1–T+5).
+  5. Evaluate cumulative_5yr against the 5-year ground truth: Precision@1/5/10%,
+     Lift@1/5/10%, Forecast Capture Rate, ROC-AUC, PR-AUC.
 
 Origin years and their evaluation windows:
-  T=2013: train 2001–2008, score 2013, eval 2014–2018  (clean 5-yr window)
-  T=2015: train 2001–2010, score 2015, eval 2016–2020  (clean 5-yr window)
-  T=2017: train 2001–2012, score 2017, eval 2018–2022  (clean 5-yr window)
-  T=2019: train 2001–2014, score 2019, eval 2020–2024  (clean 5-yr window)
+  T=2013: train 2001–2013, score 2013, eval 2014–2018  (clean 5-yr window)
+  T=2015: train 2001–2015, score 2015, eval 2016–2020  (clean 5-yr window)
+  T=2017: train 2001–2017, score 2017, eval 2018–2022  (clean 5-yr window)
+  T=2019: train 2001–2019, score 2019, eval 2020–2024  (clean 5-yr window)
 
-Methodological alignment with the real deployment (5-year gap in both cases):
-  Real forward:    train 2001–2019, score 2024, predict 2025–2029  (gap: 5 yrs)
-  Backtest T=2019: train 2001–2014, score 2019, eval    2020–2024  (gap: 5 yrs)
-
-The multi-origin design lets the aggregate plot show precision-over-time,
-demonstrating that model skill is stable across different historical windows.
-
-Note on LAST_LABEL_YEAR vs WDPA_LAST_YEAR:
-  LAST_LABEL_YEAR=2019 is a *training* right-censoring boundary — it prevents
-  model training from using labels whose 5-year lookahead window extends beyond
-  the available WDPA data. It does NOT limit what can be evaluated in the
-  backtest. For evaluation, the correct bound is WDPA_LAST_YEAR=2024.
+Note: keeping the 5-year evaluation window is intentional so backtest numbers
+remain interpretable against the pre-W1 thesis numbers. An annual-hazard-only
+backtest is left as a TODO (ROADMAP open question 2).
 
 Model-type support:
   lgbm  — trains lgb.Booster with locked hyperparams; temporal weighting applied.
@@ -91,6 +85,7 @@ from scripts.regions.shared.training.utils import (  # noqa: E402
     get_repo_root as _get_repo_root,
     report_memory_usage,
 )
+from scripts.regions.shared.training.feature_guard import check_feature_denylist  # noqa: E402
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 RANDOM_STATE = 42
@@ -98,10 +93,12 @@ EXCLUDE_COLS = {
     "transition_01", "transition_01_win5", "WDPA_b1", "WDPA_prev", "WDPA",
     "x", "y", "row", "col", "year",
 }
-TARGET_COL = "transition_01_win5"
+TARGET_COL = "transition_01"  # Annual hazard target
 WDPA_LAST_YEAR = 2024
-LOOKAHEAD_YEARS = 5
-LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS  # 2019
+# Ground-truth evaluation window length (kept at 5 years so backtest numbers
+# remain comparable to pre-W1 thesis figures). Under the annual hazard framing
+# this is no longer a *training* constraint — only a label aggregation.
+HAZARD_HORIZON_YEARS = 5
 
 
 # ── False-positive map (same visual language as forward/results_core maps) ────
@@ -308,7 +305,7 @@ def resolve_panel(data_subdir: str, filename: str = "merged_panel_final.parquet"
 
 def resolve_split_parquets(data_subdir: str) -> List[Path]:
     """Resolve split parquet files (train + earlystop + test) for training."""
-    filenames = ["train_win5.parquet", "earlystop_win5.parquet", "test_win5.parquet"]
+    filenames = ["train.parquet", "earlystop.parquet", "test.parquet"]
     repo_root = get_repo_root()
     scratch = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
     paths = []
@@ -803,8 +800,8 @@ def load_inference_rows_and_wdpa(
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
     """Load year-T pixels (WDPA_prev==0, WDPA==0) + WDPA values for T+1…T+5."""
     T = origin_year
-    window_years = list(range(T + 1, T + LOOKAHEAD_YEARS + 1))
-    is_evaluable_flag = (T + LOOKAHEAD_YEARS) <= WDPA_LAST_YEAR
+    window_years = list(range(T + 1, T + HAZARD_HORIZON_YEARS + 1))
+    is_evaluable_flag = (T + HAZARD_HORIZON_YEARS) <= WDPA_LAST_YEAR
 
     cols_inf = feature_cols + ["year", "WDPA_prev", "WDPA", "row", "col"]
     schema_cols = set(pq.ParquetFile(panel_path).schema_arrow.names)
@@ -878,8 +875,8 @@ def load_inference_rows_and_wdpa(
     evaluable = np.ones(n_inf, dtype=bool) if is_evaluable_flag else np.zeros(n_inf, dtype=bool)
     if not is_evaluable_flag:
         evaluable_years = len(years_to_check)
-        print(f"  NOTE: T={T} has only {evaluable_years}/{LOOKAHEAD_YEARS} years observable "
-              f"(T+5={T+LOOKAHEAD_YEARS} > WDPA_LAST_YEAR={WDPA_LAST_YEAR})")
+        print(f"  NOTE: T={T} has only {evaluable_years}/{HAZARD_HORIZON_YEARS} years observable "
+              f"(T+5={T+HAZARD_HORIZON_YEARS} > WDPA_LAST_YEAR={WDPA_LAST_YEAR})")
         evaluable[:] = (evaluable_years > 0)
 
     row_col = np.stack([rows_arr, cols_arr], axis=1)
@@ -1071,12 +1068,12 @@ def run_single_origin(
 ) -> Dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     T = origin_year
-    train_range = (2001, T - LOOKAHEAD_YEARS)  # mirrors deployment: train ends at T-5
-    clean_window = (T + LOOKAHEAD_YEARS) <= WDPA_LAST_YEAR
+    train_range = (2001, T)  # annual hazard: train through T (no right-censoring)
+    clean_window = (T + HAZARD_HORIZON_YEARS) <= WDPA_LAST_YEAR
 
     print("\n" + "=" * 70)
     print(f"BACKTEST [{model_type.upper()}]: origin year T={T}  "
-          f"(train 2001–{T-LOOKAHEAD_YEARS}, eval {T+1}–{min(T+5, WDPA_LAST_YEAR)})")
+          f"(train 2001–{T}, eval {T+1}–{min(T+HAZARD_HORIZON_YEARS, WDPA_LAST_YEAR)})")
     print(f"  Clean 5-year window: {clean_window}")
     print("=" * 70)
     report_memory_usage(f"start T={T}")
@@ -1123,13 +1120,19 @@ def run_single_origin(
             }
         )
 
-    # ── Predict ───────────────────────────────────────────────────────────────
-    print(f"\nScoring {len(X_inf):,} pixels…")
+    # ── Predict (annual hazard) + aggregate to 5-year cumulative ──────────────
+    # Under the annual hazard target, the model output is h: P(transition in
+    # year T+1 | features-of-T). For comparison against the 5-year ground-truth
+    # window [T+1, T+5] reconstructed from raw WDPA, we aggregate under the
+    # static-covariate assumption: P(any designation in [T+1, T+5]) = 1 - (1-h)^5.
+    print(f"\nScoring {len(X_inf):,} pixels (annual hazard, then 5-yr cumulative)…")
     if model_type == "lgbm":
         n_est_inf = int(lgbm_params.get("n_estimators", N_ESTIMATORS_LOCKED_LGBM))
-        y_proba = model.predict(X_inf, num_iteration=n_est_inf).astype(np.float32)
+        h_annual = model.predict(X_inf, num_iteration=n_est_inf).astype(np.float32)
     else:  # rf
-        y_proba = model.predict_proba(X_inf)[:, 1].astype(np.float32)
+        h_annual = model.predict_proba(X_inf)[:, 1].astype(np.float32)
+    y_proba = (1.0 - np.power(1.0 - h_annual, HAZARD_HORIZON_YEARS)).astype(np.float32)
+    del h_annual
 
     del model, X_inf
     gc.collect()
@@ -1148,7 +1151,7 @@ def run_single_origin(
 
     if evaluable.sum() > 0 and label_5yr[evaluable].sum() > 0:
         window_label = (
-            f"T={T}, window [{T+1}–{min(T+LOOKAHEAD_YEARS, LAST_LABEL_YEAR)}]"
+            f"T={T}, window [{T+1}–{min(T+HAZARD_HORIZON_YEARS, WDPA_LAST_YEAR)}]"
             + ("" if clean_window else " (PARTIAL)")
         )
         metrics = compute_backtest_metrics(label_5yr[evaluable], y_proba[evaluable], window_label)

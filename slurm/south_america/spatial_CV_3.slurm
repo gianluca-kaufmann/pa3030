@@ -23,10 +23,10 @@
 #
 # Prerequisites:
 #   1. SA step-5 training done:  data/south_america/ml/models/model1_lgbm_*.pkl
-#                                data/south_america/ml/models/model1_rf_win5_*.joblib
+#                                data/south_america/ml/models/model1_rf_*.joblib
 #   2. USA step-5 training done: data/usa/ml/models/model2_lgbm_*.pkl
-#                                data/usa/ml/models/model2_rf_win5_*.joblib
-#   3. Test parquets:            data/{region}/ml/main/test_win5.parquet
+#                                data/usa/ml/models/model2_rf_*.joblib
+#   3. Test parquets:            data/{region}/ml/main/test.parquet
 #
 # Output:
 #   outputs/south_america/results/spatial_cv/transfer/

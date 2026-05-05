@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Random Forest Transition Model (5-Year Lookahead Prediction)
+"""Random Forest Transition Model (Annual Hazard Prediction)
 Train RandomForestClassifier on pre-split parquet files using two deliberate passes.
-Target: transition_01_win5 (1 if transition occurs within next 5 years, else 0)
+Target: transition_01 (annual hazard; 1 if pixel transitions in this year, else 0).
 
 Split configuration:
 - 'main': Train 2001-2013, Earlystop 2014-2016, Test 2017-2019
@@ -27,13 +27,9 @@ Two-pass design rationale:
   of training signal (2014-2016) from the final evaluation model — an unacceptable
   cost for a temporal trend model where recent years carry the most signal.
 
-  NOTE: train_win5.parquet already spans 2001-2016 (per model2_splits), so the final
-  model is loaded from train_path only (no duplication from earlystop_path).
-
 Features:
-- Right-Censoring Protection: Earlystop and test data filtered to LAST_LABEL_YEAR
-  (LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS) to avoid evaluating on
-  labels that don't have complete 5-year lookahead information
+- No right-censoring: under the annual hazard target, transition_01 in year T is
+  observable as soon as WDPA_b1 for year T is in the panel.
 - Imbalance Handling: Uses class_weight="balanced_subsample" by default
 """
 
@@ -72,30 +68,30 @@ from scripts.regions.shared.training.utils import (  # noqa: E402
     compute_metrics,
     check_year_overlap,
 )
+from scripts.regions.shared.training.feature_guard import check_feature_denylist  # noqa: E402
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Configuration
 RANDOM_STATE = 42
+# Both transition columns kept defensively; see model1_LGBM for rationale.
 EXCLUDE_COLS = {'transition_01', 'transition_01_win5', 'WDPA_b1', 'WDPA_prev', 'WDPA', 'x', 'y', 'row', 'col', 'year'}
-TARGET_COL = "transition_01_win5"  # 5-year lookahead target
-LOOKAHEAD_YEARS = 5  # Number of years ahead for prediction
-WDPA_LAST_YEAR = 2024  # Last year with WDPA data
-LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS  # Last year we can reliably label (2019)
+TARGET_COL = "transition_01"  # Annual hazard target
+WDPA_LAST_YEAR = 2024  # Last year with WDPA data observed in the panel
 
-# Split configuration - matches modelC main split exactly (scale-up only)
-#
-# TRAIN_ONLY_YEARS: the pure training window used for the *intermediate* model whose
-#   predictions on the earlystop set are OOF by construction (model never saw 2014-2016).
-#   This is the calibration source consumed by calibrate_1.
-# TRAIN_YEARS: the full labelled window (train + earlystop) used for the *final* model.
-#   train_win5.parquet already spans 2001-2016, so only train_path is needed — no risk
-#   of double-counting rows from earlystop_path.
-TRAIN_ONLY_YEARS = (2001, 2013)  # Intermediate model: pure train period → OOF earlystop predictions
-TRAIN_YEARS = (2001, 2016)       # Final model: full labelled period (train + earlystop)
-EARLYSTOP_YEARS = (2014, min(2016, LAST_LABEL_YEAR))     # Earlystop: 2014-2016 (matches modelC main split)
+# Disjoint paper-current split windows.
+# TRAIN_YEARS: pure training window used by the intermediate (Pass 1) model;
+#   its predictions on EARLYSTOP_YEARS are OOF by construction (disjoint years).
+# EARLYSTOP_YEARS: held-out window for the calibration source.
+# FINAL_TRAIN_YEARS: union of TRAIN and EARLYSTOP for the final (Pass 2) model.
+#   The two source files are disjoint so the union has no duplicates.
+TRAIN_YEARS = (2001, 2013)
+EARLYSTOP_YEARS = (2014, 2016)
+FINAL_TRAIN_YEARS = (TRAIN_YEARS[0], EARLYSTOP_YEARS[1])  # 2001-2016
 TEST_START = 2017
 TEST_END = 2019
-TEST_YEARS = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))    # Test: 2017-2019 (matches modelC main split)
+TEST_YEARS = (TEST_START, TEST_END)
+# Backwards-compat alias for downstream variables that still reference TRAIN_ONLY_YEARS.
+TRAIN_ONLY_YEARS = TRAIN_YEARS
 
 # Batch size for data loading (can be overridden via BATCH_SIZE env var)
 # Reduced default for OOM safety with large datasets
@@ -864,7 +860,7 @@ def phase1_training(
       produce genuinely OOF predictions consumed by calibrate_1.
 
     Step 2 — Final model (TRAIN_YEARS = 2001-2016):
-      Trained on all labelled data before the test window (train_win5.parquet already
+      Trained on all labelled data before the test window (train.parquet ∪ earlystop.parquet
       spans 2001-2016; earlystop_path is NOT loaded here to avoid double-counting).
       Scores the test set in phase2_testing.
 
@@ -926,8 +922,7 @@ def phase1_training(
     
     # Score earlystop set with intermediate model (OOM-proof batch processing)
     print(f"\nScoring earlystop set ({EARLYSTOP_YEARS[0]}-{EARLYSTOP_YEARS[1]}) — OOF by construction...")
-    print(f"  Year range capped at LAST_LABEL_YEAR={LAST_LABEL_YEAR}")
-    earlystop_year_range = (EARLYSTOP_YEARS[0], min(EARLYSTOP_YEARS[1], LAST_LABEL_YEAR))
+    earlystop_year_range = (EARLYSTOP_YEARS[0], EARLYSTOP_YEARS[1])
     
     # Pass 1: Count earlystop rows to track progress
     print(f"  Pass 1: Counting earlystop rows...")
@@ -969,7 +964,7 @@ def phase1_training(
     
     # Pass 2: Process batches and generate predictions (OOM-proof)
     print(f"  Pass 2: Generating predictions in batches...")
-    earlystop_scored_path = output_dir / f"model2_rf_win5_earlystop_scored_{timestamp}.parquet"
+    earlystop_scored_path = output_dir / f"model2_rf_earlystop_scored_{timestamp}.parquet"
     parquet_file = pq.ParquetFile(earlystop_path)
     writer = None
     idx_offset = 0
@@ -1072,17 +1067,16 @@ def phase1_training(
     # Step 2: Final model — trained on full labelled window 2001-2016
     # ------------------------------------------------------------------
     print("\n" + "-"*70)
-    print("STEP 2: FINAL MODEL ON FULL LABELLED WINDOW (2001-2016)")
+    print(f"STEP 2: FINAL MODEL ON FULL LABELLED WINDOW ({FINAL_TRAIN_YEARS[0]}-{FINAL_TRAIN_YEARS[1]})")
     print("-"*70)
-    print(f"Training final model on {TRAIN_YEARS[0]}-{TRAIN_YEARS[1]}...")
-    print(f"  Loading from train_path only: train_win5.parquet already spans 2001-2016.")
-    print(f"  earlystop_path is NOT loaded here — it is a subset of train and would duplicate rows.")
+    print(f"Training final model on {FINAL_TRAIN_YEARS[0]}-{FINAL_TRAIN_YEARS[1]}...")
+    print(f"  Loading from train.parquet ∪ earlystop.parquet (disjoint year ranges; no duplicate rows).")
     report_memory_usage("before final model loading")
 
-    print(f"\nLoading full training data ({TRAIN_YEARS[0]}-{TRAIN_YEARS[1]})...")
-    X_train_full, y_train_full, train_years_array_full, train_pos_full, train_neg_full, train_years_full = load_numpy_arrays_two_pass(
-        train_path, feature_cols, target_col, "full_train",
-        year_range=TRAIN_YEARS,
+    print(f"\nLoading full training data ({FINAL_TRAIN_YEARS[0]}-{FINAL_TRAIN_YEARS[1]})...")
+    X_train_full, y_train_full, train_years_array_full, train_pos_full, train_neg_full, train_years_full = load_numpy_arrays_from_multiple_files(
+        [train_path, earlystop_path], feature_cols, target_col, "full_train",
+        year_range=FINAL_TRAIN_YEARS,
         max_neg_samples=MAX_NEG_TRAIN if MAX_NEG_TRAIN > 0 else 0
     )
     n_train_full = len(y_train_full)
@@ -1139,7 +1133,7 @@ def phase1_training(
 
     del X_train_full, y_train_full, train_years_array_full; gc.collect()
 
-    model_path = model_dir / f"model2_rf_win5_{timestamp}.joblib"
+    model_path = model_dir / f"model2_rf_{timestamp}.joblib"
     joblib.dump(rf_model, model_path)
     print(f"Final model saved: {model_path}")
     del rf_model; gc.collect()
@@ -1173,8 +1167,8 @@ def phase2_testing(
     report_memory_usage("start of Phase 2")
     
     # Check for year overlap between training and test
-    final_train_years = TRAIN_YEARS  # Full labelled training window (2001-2016)
-    test_year_range = (TEST_START, min(TEST_END, LAST_LABEL_YEAR))
+    final_train_years = FINAL_TRAIN_YEARS  # Full labelled training window (2001-2016)
+    test_year_range = (TEST_START, TEST_END)
     
     if check_year_overlap(final_train_years, test_year_range, "Test"):
         print("\n" + "="*70)
@@ -1190,7 +1184,7 @@ def phase2_testing(
     batch_size = BATCH_SIZE
     
     print(f"Processing test in batches of {batch_size:,}...")
-    print(f"Test year range: {test_year_range[0]}-{test_year_range[1]} (capped at LAST_LABEL_YEAR={LAST_LABEL_YEAR})")
+    print(f"Test year range: {test_year_range[0]}-{test_year_range[1]} (annual hazard target; no right-censoring)")
     
     # Pass 1: Count rows (pre-allocate arrays to avoid concatenation memory spike)
     print(f"  Pass 1: Counting test rows (year_range={test_year_range})...")
@@ -1236,7 +1230,7 @@ def phase2_testing(
     # Pass 2: Process batches and fill pre-allocated arrays
     print(f"  Pass 2: Processing test batches (year_range={test_year_range})...")
     parquet_file = pq.ParquetFile(test_path)
-    scored_path = output_dir / f"model2_rf_win5_scored_{timestamp}.parquet"
+    scored_path = output_dir / f"model2_rf_scored_{timestamp}.parquet"
     writer = None
     test_pos = test_neg = batch_num = idx_offset = 0
     _score_milestone = -1
@@ -1262,8 +1256,7 @@ def phase2_testing(
             year_array = batch_table['year'].to_numpy(zero_copy_only=False)
             wdpa_prev_array = batch_table['WDPA_prev'].to_numpy(zero_copy_only=False)
             
-            # Filter by year range to exclude right-censored labels
-            # year_range=(TEST_START, min(TEST_END, LAST_LABEL_YEAR))
+            # Filter by test year range
             year_mask = (year_array >= test_year_range[0]) & (year_array <= test_year_range[1])
             # Apply risk-set filter: WDPA_prev == 0 (exclude already protected pixels)
             risk_set_mask = (wdpa_prev_array == 0)
@@ -1384,9 +1377,8 @@ def phase2_testing(
         "metadata": {
             "timestamp": timestamp, 
             "model": "RandomForest", 
-            "task": "transition_01_win5_prediction",
+            "task": "transition_01_prediction",
             "target_column": TARGET_COL,
-            "lookahead_years": 5,
             "random_state": RANDOM_STATE, 
             "n_features": len(feature_cols), 
             "features": feature_cols,
@@ -1423,7 +1415,7 @@ def phase2_testing(
         }
     }
     metrics = convert_numpy_types(metrics)
-    metrics_path = output_dir / f"model2_rf_win5_metrics_{timestamp}.json"
+    metrics_path = output_dir / f"model2_rf_metrics_{timestamp}.json"
     with open(metrics_path, 'w') as f:
         json.dump(metrics, f, indent=2)
     print(f"\nMetrics saved: {metrics_path}")
@@ -1454,9 +1446,9 @@ def main(timestamp: str, eval_only: bool = False) -> None:
     repo_root = get_repo_root()
     
     # Use correct filenames from preprocessing script (main split)
-    train_path = resolve_parquet_file("train_win5.parquet")
-    earlystop_path = resolve_parquet_file("earlystop_win5.parquet")
-    test_path = resolve_parquet_file("test_win5.parquet")
+    train_path = resolve_parquet_file("train.parquet")
+    earlystop_path = resolve_parquet_file("earlystop.parquet")
+    test_path = resolve_parquet_file("test.parquet")
     params_path = resolve_best_params_json()
     
     # Load parameters before wandb.init() so we can log them
@@ -1475,17 +1467,17 @@ def main(timestamp: str, eval_only: bool = False) -> None:
     model_dir.mkdir(parents=True, exist_ok=True)
 
     if eval_only:
-        json_files = sorted(output_dir.glob("model2_rf_win5_metrics_*.json"))
+        json_files = sorted(output_dir.glob("model2_rf_metrics_*.json"))
         if not json_files:
-            raise FileNotFoundError(f"No model2_rf_win5_metrics_*.json found in {output_dir}")
+            raise FileNotFoundError(f"No model2_rf_metrics_*.json found in {output_dir}")
         with open(json_files[-1]) as f:
             prev = json.load(f)
         prev_ts = prev["metadata"]["timestamp"]
-        model_path = model_dir / f"model2_rf_win5_{prev_ts}.joblib"
+        model_path = model_dir / f"model2_rf_{prev_ts}.joblib"
         if not model_path.exists():
-            cands = sorted(model_dir.glob("model2_rf_win5_*.joblib"))
+            cands = sorted(model_dir.glob("model2_rf_*.joblib"))
             if not cands:
-                raise FileNotFoundError(f"No model2_rf_win5_*.joblib found in {model_dir}")
+                raise FileNotFoundError(f"No model2_rf_*.joblib found in {model_dir}")
             model_path = cands[-1]
         feature_cols = prev["metadata"]["features"]
         all_cols_test = pq.ParquetFile(test_path).schema_arrow.names
@@ -1507,12 +1499,11 @@ def main(timestamp: str, eval_only: bool = False) -> None:
             wandb.init(
             project="ml-training-model2", 
             entity=os.environ.get("WANDB_ENTITY"), 
-            name=f"model2_rf_win5_{timestamp}",
+            name=f"model2_rf_{timestamp}",
             config={
                 "model": "RandomForest", 
-                "task": "transition_01_win5_prediction", 
+                "task": "transition_01_prediction",
                 "target_column": TARGET_COL,
-                "lookahead_years": 5,
                 "random_state": RANDOM_STATE,
                 "temporal_split": {
                     "train_years": list(TRAIN_YEARS), 
@@ -1529,13 +1520,12 @@ def main(timestamp: str, eval_only: bool = False) -> None:
     else:
         print("W&B not available (module not installed)")
     
-    print("="*70 + "\nRANDOM FOREST TRANSITION MODEL (5-YEAR LOOKAHEAD)\n" + "="*70)
+    print("="*70 + "\nRANDOM FOREST TRANSITION MODEL (ANNUAL HAZARD)\n" + "="*70)
     print(f"Train: {train_path}\nEarlystop: {earlystop_path}\nTest: {test_path}\nParams: {params_path if params_path else 'Using default manual hyperparameters (rf_best_params.json not found)'}\nOutput: {output_dir}")
     print(f"\nConfiguration:")
     print(f"  WDPA_LAST_YEAR: {WDPA_LAST_YEAR}")
-    print(f"  LOOKAHEAD_YEARS: {LOOKAHEAD_YEARS}")
-    print(f"  LAST_LABEL_YEAR: {LAST_LABEL_YEAR} (WDPA_LAST_YEAR - LOOKAHEAD_YEARS)")
-    print(f"  Earlystop/Test data filtered to years <= {LAST_LABEL_YEAR} to avoid right-censored labels")
+    print(f"  Target: {TARGET_COL} (annual hazard; no right-censoring)")
+    print(f"  Train years (disjoint): TRAIN={TRAIN_YEARS}, EARLYSTOP={EARLYSTOP_YEARS}, TEST={TEST_YEARS}")
     print(f"  BATCH_SIZE: {BATCH_SIZE:,} (smaller batch = less memory per iteration)")
     if MAX_NEG_TRAIN > 0:
         print(f"  MAX_NEG_TRAIN: {MAX_NEG_TRAIN:,} (negative samples will be downsampled to this cap)")
@@ -1578,6 +1568,7 @@ def main(timestamp: str, eval_only: bool = False) -> None:
     ]
     # Exclude target and coordinates from features (year is excluded)
     feature_cols = [c for c in numeric_cols if c not in EXCLUDE_COLS]
+    check_feature_denylist(feature_cols, context="usa/rf/training")
     required_cols = [target_col, 'year', 'row', 'col']
     optional_cols = [col for col in ['x', 'y'] if col in all_cols_train]
     keep_cols_train = feature_cols + required_cols + optional_cols
@@ -1610,7 +1601,7 @@ if __name__ == "__main__":
     output_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = output_dir / f"model2_rf_win5_{timestamp}.txt"
+    output_file = output_dir / f"model2_rf_{timestamp}.txt"
 
     tee = Tee(output_file)
     sys.stdout = tee
@@ -1621,4 +1612,3 @@ if __name__ == "__main__":
         sys.stdout = tee.stdout
         tee.close()
         print(f"\nOutput saved to: {output_file}")
-

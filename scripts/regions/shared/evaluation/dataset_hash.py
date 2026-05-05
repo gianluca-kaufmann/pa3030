@@ -86,8 +86,8 @@ def compute_dataset_hash(
     config: ModelEvalConfig,
     split_version: str = "main",
     num_sample_row_groups: int = 3,
-    train_filename: str = "train_win5.parquet",
-    test_filename: str = "test_win5.parquet",
+    train_filename: str = "train.parquet",
+    test_filename: str = "test.parquet",
 ) -> str:
     """
     Compute a content-stable dataset hash for the train/test panels used in

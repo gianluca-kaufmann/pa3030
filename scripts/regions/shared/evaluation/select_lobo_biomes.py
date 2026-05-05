@@ -185,7 +185,7 @@ def main() -> None:
         print(f"\nRequested {args.n_biomes} ≥ available {n_biomes} — using all biomes.")
         indices = list(range(n_biomes))
     else:
-        train_path = resolve_parquet(args.region, "train_win5.parquet")
+        train_path = resolve_parquet(args.region, "train.parquet")
         schema = pq.ParquetFile(train_path).schema_arrow
         feature_cols = [
             name for name, field in zip(schema.names, schema)

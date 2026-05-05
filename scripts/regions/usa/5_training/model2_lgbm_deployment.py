@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Stage 0b: Deployment Model Training (2001-2019) — USA Model 2 LightGBM.
+"""Stage 0b: Deployment Model Training (annual hazard, 2001-2024) — USA Model 2 LightGBM.
 
-Trains LightGBM on ALL non-censored labeled years (2001-2019) using the
+Trains LightGBM on ALL labeled years (2001-2024) under the annual hazard target using the
 hyperparameters and n_estimators locked in lgbm_best_params.json.  No CV,
 no test split — the full labeled window is used for training.
 
@@ -13,16 +13,16 @@ Key differences from model2_LGBM (evaluation model):
 
 Deployment calibration split:
   Fits Platt + isotonic calibrators using an auxiliary model trained on
-  2001-2016 that scores 2017-2019 held-out pixels.
+  2001-2016 that scores AUX_CALIB_YEARS held-out pixels.
 
 Outputs:
   data/usa/ml/models/model2_lgbm_deployment_{timestamp}.pkl
       (resolve_ml_models_dir — $SCRATCH/data/.../ml/models on Euler when SCRATCH is set)
       Pickle dict:
         {
-          'model':      lgb.Booster  (deployment model, 2001-2019),
-          'platt':      LogisticRegression fitted on aux-model 2017-2019 scores,
-          'isotonic':   IsotonicRegression fitted on aux-model 2017-2019 scores,
+          'model':      lgb.Booster  (deployment model, 2001-2024 annual hazard),
+          'platt':      LogisticRegression fitted on aux-model 2022-2024 scores,
+          'isotonic':   IsotonicRegression fitted on aux-model 2022-2024 scores,
           'feature_cols': list[str],
           'timestamp':  str,
           'metadata':   dict,
@@ -61,6 +61,7 @@ del _repo_root
 # ─────────────────────────────────────────────────────────────────────────────
 
 from scripts.regions.shared.forward.config import resolve_forward_dir, resolve_ml_models_dir  # noqa: E402
+from scripts.regions.shared.training.feature_guard import check_feature_denylist  # noqa: E402
 from scripts.regions.shared.training.utils import (  # noqa: E402
     WandbRunLogger,
     Tee,
@@ -78,14 +79,12 @@ EXCLUDE_COLS = {
     "transition_01", "transition_01_win5", "WDPA_b1", "WDPA_prev", "WDPA",
     "x", "y", "row", "col", "year",
 }
-TARGET_COL = "transition_01_win5"
-WDPA_LAST_YEAR = 2024
-LOOKAHEAD_YEARS = 5
-LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS  # 2019
+TARGET_COL = "transition_01"  # Annual hazard target
+WDPA_LAST_YEAR = 2024  # Last year with WDPA data observed in the panel
 
-DEPLOY_TRAIN_YEARS = (2001, 2019)
-AUX_TRAIN_YEARS   = (2001, 2016)
-AUX_CALIB_YEARS   = (2017, 2019)
+DEPLOY_TRAIN_YEARS = (2001, WDPA_LAST_YEAR)   # full deployment training window (annual hazard)
+AUX_TRAIN_YEARS   = (2001, 2021)              # auxiliary model for calibration
+AUX_CALIB_YEARS   = (2022, WDPA_LAST_YEAR)    # calibration held-out set
 
 FIXED_PARAMS = {
     "random_state": RANDOM_STATE,
@@ -774,14 +773,17 @@ def main() -> None:
     wb.log({"deployment/stage": "start"})
 
     print("=" * 70)
-    print("MODEL 2 LGBM — DEPLOYMENT MODEL (2001-2019)")
+    print(f"MODEL 2 LGBM — DEPLOYMENT MODEL (annual hazard, {DEPLOY_TRAIN_YEARS[0]}-{DEPLOY_TRAIN_YEARS[1]})")
     print("=" * 70)
 
     # ── Paths ─────────────────────────────────────────────────────────────────
-    train_path     = resolve_parquet("train_win5.parquet")
-    earlystop_path = resolve_parquet("earlystop_win5.parquet")
-    test_path      = resolve_parquet("test_win5.parquet")
-    all_paths      = [train_path, earlystop_path, test_path]
+    # Under annual hazard, deployment training spans the full WDPA window
+    # (2001-WDPA_LAST_YEAR). The eval-pipeline split files only cover 2001-2019,
+    # so we read from merged_panel_final.parquet directly. train.parquet still
+    # provides the schema reference (feature column list).
+    train_path           = resolve_parquet("train.parquet")
+    merged_panel_path    = resolve_parquet("merged_panel_final.parquet")
+    all_paths            = [merged_panel_path]
     params_path    = resolve_best_params_json()
 
     model_dir  = resolve_ml_models_dir(repo_root, "usa")
@@ -789,9 +791,8 @@ def main() -> None:
     model_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"  train:     {train_path}")
-    print(f"  earlystop: {earlystop_path}")
-    print(f"  test:      {test_path}")
+    print(f"  schema reference: {train_path}")
+    print(f"  data source:      {merged_panel_path}")
     print(f"  params:    {params_path or '(default guardrails)'}")
 
     # ── Hyperparameters ───────────────────────────────────────────────────────
@@ -806,12 +807,13 @@ def main() -> None:
         if pa.types.is_integer(field.type) or pa.types.is_floating(field.type)
     ]
     feature_cols = [c for c in all_numeric if c not in EXCLUDE_COLS]
+    check_feature_denylist(feature_cols, context="usa/lgbm/deployment")
     wb.log({"deployment/n_features": float(len(feature_cols)), "deployment/stage": "features_ready"})
     print(f"\n  Feature columns: {len(feature_cols)}")
 
-    # ── Step 1: Train deployment model on 2001-2019 ───────────────────────────
+    # ── Step 1: Train deployment model on full hazard window ─────────────────
     print("\n" + "=" * 70)
-    print("STEP 1: TRAINING DEPLOYMENT MODEL (2001-2019)")
+    print(f"STEP 1: TRAINING DEPLOYMENT MODEL ({DEPLOY_TRAIN_YEARS[0]}-{DEPLOY_TRAIN_YEARS[1]})")
     print("=" * 70)
     report_memory_usage("before loading deployment training labels")
 
@@ -889,7 +891,7 @@ def main() -> None:
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    print(f"  Model:           LightGBM deployment (2001-2019)")
+    print(f"  Model:           LightGBM deployment ({DEPLOY_TRAIN_YEARS[0]}-{DEPLOY_TRAIN_YEARS[1]})")
     print(f"  Features:        {len(feature_cols)}")
     print(f"  Train samples:   {dep_neg + dep_pos:,} ({dep_pos:,} pos / {dep_neg:,} neg)")
     print(f"  num_boost_round: {num_boost_round}")

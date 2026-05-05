@@ -72,7 +72,7 @@ class ModelEvalConfig:
 
     @property
     def model_prefix(self) -> str:
-        # Filenames are typically e.g. "model1_lgbm_..." or "model2_rf_win5_..."
+        # Filenames are typically e.g. "model1_lgbm_..." or "model2_rf_..."
         return f"{self.model_id}_{self.algorithm}"
 
     @staticmethod

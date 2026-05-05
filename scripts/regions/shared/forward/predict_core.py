@@ -1,14 +1,26 @@
 #!/usr/bin/env python3
-"""Stage 2: Calibrated forward inference on 2024 features.
+"""Stage 2: Calibrated forward inference on 2024 features (annual hazard model).
 
 Loads the deployment model artifact ({model_prefix}_{model_type}_deployment_*.pkl)
 plus its Platt / isotonic calibrators and runs batched inference on the 2024
 feature set produced by features_core.py.
 
+The deployment model predicts an **annual hazard** h: P(transition_01 = 1 | features).
+Under the static-covariate assumption (2024 features held fixed across the
+2025-2029 forecast horizon), the 5-year cumulative risk is::
+
+    P(any designation in 2025-2029) = 1 - (1 - h)^5
+
 Output:
     outputs/{region}/results/forward/{model_type}/forward_scored_2024.parquet
-    (repo or $SCRATCH/outputs/... when SCRATCH is set — see resolve_forward_dir)
-    Columns: row, col, x, y, y_pred_proba_raw, y_pred_proba_calibrated
+    Columns: row, col, x, y,
+             y_pred_proba_annual_hazard_raw,
+             y_pred_proba_annual_hazard,
+             y_pred_proba_5yr_cumulative
+
+Downstream consumers (scenario maps, top-K coverage, BAU / 30x30 trajectories,
+per-country tables, false-positive maps over 5-year ground truth) MUST read
+``y_pred_proba_5yr_cumulative``. Hazard-native diagnostics use the annual columns.
 
 Model-type support:
   lgbm  — finds {model_prefix}_lgbm_deployment_*.pkl,
@@ -50,6 +62,11 @@ from scripts.regions.shared.training.utils import (  # noqa: E402
     get_repo_root as _get_repo_root,
     report_memory_usage,
 )
+from scripts.regions.shared.training.feature_guard import check_feature_denylist  # noqa: E402
+
+# Hazard horizon for the static-covariate 5-year cumulative aggregation
+# (2025-2029 inclusive when the 2024 feature snapshot is the reference).
+HAZARD_HORIZON_YEARS = 5
 
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "500_000"))
 
@@ -160,6 +177,7 @@ def run_inference(
 
     model         = artifact["model"]
     feature_cols  = artifact["feature_cols"]
+    check_feature_denylist(feature_cols, context="forward/predict_core")
     meta          = artifact.get("metadata", {})
     num_boost_round = int(meta.get("num_boost_round", 2555)) if model_type == "lgbm" else 0
     print(f"  Model trained on years: {meta.get('train_years')}")
@@ -216,13 +234,17 @@ def run_inference(
             raw_proba = _predict_batch(model, model_type, X_batch, num_boost_round)
             cal_proba = calibrate(artifact, raw_proba)
 
-            # Build output table
+            # Build output table.
+            # Annual hazard h is the calibrated single-year probability of designation.
+            # 5-year cumulative risk under static covariates: 1 - (1 - h)^HAZARD_HORIZON_YEARS.
+            cum_5yr = 1.0 - np.power(1.0 - cal_proba, HAZARD_HORIZON_YEARS)
             out_dict: dict[str, pa.Array] = {}
             for c in meta_cols + coord_cols:
                 arr = batch.column(c).to_numpy(zero_copy_only=False)
                 out_dict[c] = pa.array(arr, type=pa.int32() if c in meta_cols else pa.float32())
-            out_dict["y_pred_proba_raw"]        = pa.array(raw_proba, type=pa.float32())
-            out_dict["y_pred_proba_calibrated"] = pa.array(cal_proba, type=pa.float32())
+            out_dict["y_pred_proba_annual_hazard_raw"] = pa.array(raw_proba, type=pa.float32())
+            out_dict["y_pred_proba_annual_hazard"]     = pa.array(cal_proba, type=pa.float32())
+            out_dict["y_pred_proba_5yr_cumulative"]    = pa.array(cum_5yr.astype(np.float32), type=pa.float32())
 
             out_table = pa.table(out_dict)
             if writer is None:
@@ -254,16 +276,26 @@ def run_inference(
 
     print(f"\nWritten: {n_written:,} rows → {out_path}")
 
-    # Quick stats on calibrated scores
-    print("\nSampling calibrated probability statistics…")
-    stats_sample = pq.read_table(out_path, columns=["y_pred_proba_calibrated"])
-    proba_arr = stats_sample.column("y_pred_proba_calibrated").to_numpy(zero_copy_only=False)
-    print(f"  min:    {proba_arr.min():.6f}")
-    print(f"  p50:    {np.median(proba_arr):.6f}")
-    print(f"  p95:    {np.percentile(proba_arr, 95):.6f}")
-    print(f"  p99:    {np.percentile(proba_arr, 99):.6f}")
-    print(f"  max:    {proba_arr.max():.6f}")
-    del proba_arr, stats_sample
+    # Quick stats on forward-relevant calibrated scores.
+    print("\nSampling 5-year cumulative probability statistics…")
+    stats_sample = pq.read_table(
+        out_path,
+        columns=["y_pred_proba_5yr_cumulative", "y_pred_proba_annual_hazard"],
+    )
+    cum_arr = stats_sample.column("y_pred_proba_5yr_cumulative").to_numpy(zero_copy_only=False)
+    hazard_arr = stats_sample.column("y_pred_proba_annual_hazard").to_numpy(zero_copy_only=False)
+    print(f"  min:    {cum_arr.min():.6f}")
+    print(f"  p50:    {np.median(cum_arr):.6f}")
+    print(f"  p95:    {np.percentile(cum_arr, 95):.6f}")
+    print(f"  p99:    {np.percentile(cum_arr, 99):.6f}")
+    print(f"  max:    {cum_arr.max():.6f}")
+    print("\nSampling annual hazard probability statistics…")
+    print(f"  min:    {hazard_arr.min():.6f}")
+    print(f"  p50:    {np.median(hazard_arr):.6f}")
+    print(f"  p95:    {np.percentile(hazard_arr, 95):.6f}")
+    print(f"  p99:    {np.percentile(hazard_arr, 99):.6f}")
+    print(f"  max:    {hazard_arr.max():.6f}")
+    del cum_arr, hazard_arr, stats_sample
 
     return out_path
 
@@ -302,8 +334,9 @@ def main() -> None:
     features_path  = resolve_features_parquet(repo_root, OUTPUTS_SUBDIR)
     out = run_inference(features_path, artifact_path, output_dir, model_type, wb=wb)
     print(f"\nDone. Output: {out}")
-    _stats = pq.read_table(out, columns=["y_pred_proba_calibrated"])
-    _arr = _stats.column("y_pred_proba_calibrated").to_numpy(zero_copy_only=False)
+    _stats = pq.read_table(out, columns=["y_pred_proba_5yr_cumulative", "y_pred_proba_annual_hazard"])
+    _arr = _stats.column("y_pred_proba_5yr_cumulative").to_numpy(zero_copy_only=False)
+    _hazard_arr = _stats.column("y_pred_proba_annual_hazard").to_numpy(zero_copy_only=False)
     wb.log(
         {
             "inference/n_pixels": int(len(_arr)),
@@ -313,10 +346,16 @@ def main() -> None:
             "inference/prob_p99": float(np.percentile(_arr, 99)),
             "inference/prob_max": float(_arr.max()),
             "inference/prob_mean": float(_arr.mean()),
+            "inference/annual_hazard_min": float(_hazard_arr.min()),
+            "inference/annual_hazard_p50": float(np.median(_hazard_arr)),
+            "inference/annual_hazard_p95": float(np.percentile(_hazard_arr, 95)),
+            "inference/annual_hazard_p99": float(np.percentile(_hazard_arr, 99)),
+            "inference/annual_hazard_max": float(_hazard_arr.max()),
+            "inference/annual_hazard_mean": float(_hazard_arr.mean()),
             "inference/stage": "done",
         }
     )
-    del _arr, _stats
+    del _arr, _hazard_arr, _stats
     wb.finish()
 
 

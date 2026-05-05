@@ -33,8 +33,8 @@ def _find_latest_metrics_file(
         pattern = f"{config.model_id}_lgbm_metrics_*.json"
         ts_re = re.compile(rf"{re.escape(config.model_id)}_lgbm_metrics_(\d{{8}}_\d{{6}})\.json")
     elif model_type == "rf":
-        pattern = f"{config.model_id}_rf_win5_metrics_*.json"
-        ts_re = re.compile(rf"{re.escape(config.model_id)}_rf_win5_metrics_(\d{{8}}_\d{{6}})\.json")
+        pattern = f"{config.model_id}_rf_metrics_*.json"
+        ts_re = re.compile(rf"{re.escape(config.model_id)}_rf_metrics_(\d{{8}}_\d{{6}})\.json")
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 
@@ -208,7 +208,7 @@ def run_benchmark(
     benchmark_output_dir.mkdir(parents=True, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    benchmark_path = benchmark_output_dir / f"{config.model_id}_{model_type}_win5_benchmark_{timestamp}.json"
+    benchmark_path = benchmark_output_dir / f"{config.model_id}_{model_type}_benchmark_{timestamp}.json"
 
     with benchmark_path.open("w") as f:
         json.dump(benchmark_dict, f, indent=2)

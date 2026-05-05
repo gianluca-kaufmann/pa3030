@@ -59,6 +59,7 @@ from typing import Tuple
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 import wandb
 from scipy.ndimage import distance_transform_edt, uniform_filter
@@ -66,6 +67,75 @@ from scipy.ndimage import distance_transform_edt, uniform_filter
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 warnings.filterwarnings('ignore')
+
+# ── W3: country PA momentum (lagged annual designation counts) ────────────────
+# Region key for country raster lookup; overridden in USA / SE Asia copies.
+W3_REGION = "usa"
+W3_LAG_YEARS = (1, 2, 3)
+
+
+def _load_country_raster(region: str, repo_root: Path, scratch_root: Path | None) -> np.ndarray:
+    """Locate and load country_iso3.tif produced by 2_preprocessing/policy_preprocessing.
+
+    Returns a uint8 numpy array indexed as raster[row, col] -> country_id (0 = no country).
+    """
+    import rasterio
+
+    candidates: list[Path] = []
+    if scratch_root is not None:
+        candidates.append(scratch_root / f"data/{region}/ready/policy/country_iso3.tif")
+    candidates.append(repo_root / f"data/{region}/ready/policy/country_iso3.tif")
+    candidates.append(repo_root / "data/shared/country_iso3.tif")
+    for p in candidates:
+        if p.exists():
+            logger.info(f"  W3 country raster: {p}")
+            with rasterio.open(p) as ds:
+                return ds.read(1)
+    raise FileNotFoundError(
+        "country_iso3.tif not found — W3 country PA momentum requires the "
+        "policy_preprocessing output. Searched:\n  " + "\n  ".join(str(c) for c in candidates)
+    )
+
+
+def _country_ids_for_rows(df: pd.DataFrame, country_raster: np.ndarray) -> np.ndarray:
+    """Look up country_id per pixel via raster[(row, col)] indexing. uint8."""
+    rows = df["row"].to_numpy(dtype=np.int64)
+    cols = df["col"].to_numpy(dtype=np.int64)
+    h, w = country_raster.shape
+    valid = (rows >= 0) & (rows < h) & (cols >= 0) & (cols < w)
+    out = np.zeros(len(df), dtype=np.uint8)
+    out[valid] = country_raster[rows[valid], cols[valid]].astype(np.uint8)
+    return out
+
+
+def _build_country_pa_momentum_table(temp_files: list[Path], country_raster: np.ndarray) -> pd.DataFrame:
+    """Aggregate transition_01 by (country_id, year) across all per-year temp files,
+    then compute pa_momentum_pixels_lag{1,2,3} within country (lag values use only
+    strictly earlier years — leak-free by construction).
+
+    Memory profile: reads only (row, col, year, transition_01) per file; the
+    aggregated table is at most ``n_countries x n_years`` rows.
+    """
+    parts: list[pd.DataFrame] = []
+    for fp in temp_files:
+        df = pq.read_table(fp, columns=["row", "col", "year", "transition_01"]).to_pandas()
+        df["country_id"] = _country_ids_for_rows(df, country_raster)
+        agg = (
+            df.groupby(["country_id", "year"], as_index=False)["transition_01"].sum()
+              .rename(columns={"transition_01": "pa_momentum_pixels"})
+        )
+        parts.append(agg)
+        del df
+    cy = pd.concat(parts, ignore_index=True)
+    cy = cy.groupby(["country_id", "year"], as_index=False)["pa_momentum_pixels"].sum()
+    cy = cy.sort_values(["country_id", "year"]).reset_index(drop=True)
+    for k in W3_LAG_YEARS:
+        cy[f"pa_momentum_pixels_lag{k}"] = (
+            cy.groupby("country_id")["pa_momentum_pixels"].shift(k)
+        )
+    cols = ["country_id", "year"] + [f"pa_momentum_pixels_lag{k}" for k in W3_LAG_YEARS]
+    return cy[cols]
+# ──────────────────────────────────────────────────────────────────────────────
 
 DISTANCE_DECAY_SCALE = 10000
 SMOOTH_VARIABLES = ['NDVI_b1', 'GPW_b1', 'HNTL_b1', 'deforestation_b1', 
@@ -903,29 +973,44 @@ def main() -> None:
     del static_lookup, smooth_lookup
     gc.collect()
     
-    # Combine all years using streaming
+    # ── W3: country PA momentum aggregation (single pre-pass across temp files) ─
     logger.info("\n" + "="*80)
-    logger.info(f"Combining {len(temp_files)} files (streaming)...")
-    
+    logger.info("W3: computing country PA momentum (lagged annual designation counts)...")
+    country_raster = _load_country_raster(W3_REGION, repo_root, scratch_root)
+    momentum_table = _build_country_pa_momentum_table(temp_files, country_raster)
+    logger.info(
+        f"  W3 momentum table: {len(momentum_table):,} (country, year) rows, "
+        f"{momentum_table['country_id'].nunique()} countries, "
+        f"{momentum_table['year'].nunique()} years"
+    )
+
+    # Combine all years using streaming, attaching the W3 lag features per row.
+    logger.info("\n" + "="*80)
+    logger.info(f"Combining {len(temp_files)} files (streaming + W3 merge)...")
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     writer = None
     total_rows_written = 0
     concat_start = time.time()
-    
+
     for i, temp_file in enumerate(temp_files):
         logger.info(f"  [{i+1}/{len(temp_files)}] {temp_file.name}...")
-        table = pq.read_table(temp_file)
+        df = pq.read_table(temp_file).to_pandas()
+        df["country_id"] = _country_ids_for_rows(df, country_raster)
+        df = df.merge(momentum_table, on=["country_id", "year"], how="left")
+        df = df.drop(columns=["country_id"])
+        table = pa.Table.from_pandas(df, preserve_index=False)
         total_rows_written += len(table)
-        
+
         if writer is None:
             logger.info(f"  Initializing output ({len(table.column_names)} columns)...")
             writer = pq.ParquetWriter(output_path, table.schema, compression='snappy')
-        
+
         writer.write_table(table)
-        del table
+        del df, table
         gc.collect()
-        
+
         wandb.log({"concatenation_progress": (i + 1) / len(temp_files)})
     
     if writer is None:
@@ -972,4 +1057,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

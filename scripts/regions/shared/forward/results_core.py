@@ -161,8 +161,12 @@ def _safe_savefig(
         return False
 
 # ── Column names ──────────────────────────────────────────────────────────────
-PROBA_COL = "y_pred_proba_calibrated"
-RAW_COL   = "y_pred_proba_raw"
+# Forward outputs use unambiguous unit-tagged columns (predict_core writes all
+# three). Anything that ranks pixels for 5-year cumulative coverage / scenarios
+# uses PROBA_COL. ANNUAL_HAZARD_COL is exposed for hazard-native diagnostics.
+PROBA_COL          = "y_pred_proba_5yr_cumulative"   # 1 - (1 - h)^5
+ANNUAL_HAZARD_COL  = "y_pred_proba_annual_hazard"    # calibrated single-year hazard
+RAW_COL            = "y_pred_proba_annual_hazard_raw"  # uncalibrated single-year hazard
 
 # GSN: regional merge stacks `ready/GSN/gsn_*_mask_1km.tif` alphabetically → band order
 # is climate stabilisation (b1), high biodiversity (b2), … — see gsn_preprocessing /
@@ -461,12 +465,15 @@ def create_eval_vs_deployment_scatter(
 
     # ── Load and intersect ────────────────────────────────────────────────────
     print("  Loading eval calibrated predictions …")
+    # Eval scored parquet still uses the generic "y_pred_proba_calibrated" column
+    # (output of the regular training pipeline). Forward parquet uses the unit-
+    # tagged 5-year cumulative column.
     eval_df = pq.read_table(eval_path, columns=["row", "col", "y_pred_proba_calibrated"]).to_pandas()
     eval_df = eval_df.rename(columns={"y_pred_proba_calibrated": "eval_prob"})
 
     print("  Loading deployment forward scores …")
-    deploy_df = pq.read_table(deploy_path, columns=["row", "col", "y_pred_proba_calibrated"]).to_pandas()
-    deploy_df = deploy_df.rename(columns={"y_pred_proba_calibrated": "deploy_prob"})
+    deploy_df = pq.read_table(deploy_path, columns=["row", "col", PROBA_COL]).to_pandas()
+    deploy_df = deploy_df.rename(columns={PROBA_COL: "deploy_prob"})
 
     merged = eval_df.merge(deploy_df, on=["row", "col"], how="inner")
     del eval_df, deploy_df
