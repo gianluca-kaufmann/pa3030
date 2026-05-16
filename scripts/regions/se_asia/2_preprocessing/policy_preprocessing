@@ -165,16 +165,60 @@ def apply_dpi_executive_forward_fill(policy: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
-DATA_DIR = PROJECT_ROOT / "data"
+_SCRATCH = os.environ.get("SCRATCH")
+# On Euler, all large/raw data live in $SCRATCH. Prefer that automatically so
+# scripts don't rely on home-directory storage.
+DATA_DIR = (Path(_SCRATCH) / "data") if _SCRATCH else (PROJECT_ROOT / "data")
 READY_DIR = DATA_DIR / "se_asia" / "ready"
 
 # Input paths (global raw data in shared/)
-# WGI: accept both the original name with "(1)" and the plain download name
-_wgi_candidates = [
-    DATA_DIR / "shared" / "WGI" / "wgidataset_with_sourcedata-2025 (1).xlsx",
-    DATA_DIR / "shared" / "WGI" / "wgidataset_with_sourcedata-2025.xlsx",
-]
-WGI_PATH = next((p for p in _wgi_candidates if p.exists()), _wgi_candidates[0])
+def resolve_wgi_path() -> Path:
+    """Resolve the WGI Excel path in a cluster-friendly way.
+
+    On Euler, the downloaded filename often differs (e.g. no " (1)" suffix, or a
+    slightly different naming convention). Support:
+    - Explicit override via env var `PA3030_WGI_PATH` (absolute or relative to repo)
+    - Auto-detection of any `*.xlsx` file in `data/shared/WGI/`
+    """
+
+    env = os.environ.get("PA3030_WGI_PATH")
+    if env:
+        p = Path(env)
+        if not p.is_absolute():
+            p = PROJECT_ROOT / p
+        if p.exists():
+            return p
+        raise FileNotFoundError(
+            "WGI file not found at `PA3030_WGI_PATH`.\n"
+            f"  PA3030_WGI_PATH={env}\n"
+            f"  Resolved path: {p}"
+        )
+
+    wgi_dir = DATA_DIR / "shared" / "WGI"
+    if wgi_dir.exists():
+        files = sorted(
+            [p for p in wgi_dir.glob("*.xlsx") if p.is_file()],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if files:
+            # Prefer the canonical WGI download naming if present, otherwise use newest.
+            preferred = [
+                p
+                for p in files
+                if re.search(r"wgidataset_with_sourcedata", p.name, flags=re.I)
+            ]
+            return preferred[0] if preferred else files[0]
+
+    raise FileNotFoundError(
+        "Cannot find WGI Excel file.\n"
+        f"  Looked for `*.xlsx` in: {wgi_dir}\n"
+        "  Fix: upload the WGI Excel file to that folder on Euler, or set\n"
+        "       `PA3030_WGI_PATH` to the file location."
+    )
+
+
+WGI_PATH = resolve_wgi_path()
 
 VDEM_PATH = DATA_DIR / "shared" / "VDem" / "V-Dem-CY-Core-v15.csv"
 
