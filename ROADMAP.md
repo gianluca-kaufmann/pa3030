@@ -1,24 +1,13 @@
 # PA3030 — Paper Publication Roadmap
 
 **Purpose**: Authoritative planning document. Keep compact and updated after every session.
-**Status**: Post-thesis. Paper branch active. Annual hazard results back from Euler.
-**Target**: GEC / One Earth (primary). Nature Finance / JEEM if LSE financial data materialises.
+**Status**: Post-thesis. Paper branch active. Architecture decision made (2026-05-18).
+**Target**: GEC / One Earth (base case). Nature Finance / JEEM / Nature Sustainability if
+LSE financial data materialises or Stage 2 results are exceptional.
 
 ---
 
-## STRATEGIC CONTEXT (updated 2026-05-17)
-
-### The fundamental insight from the annual hazard results
-
-SA LGBM annual hazard (Euler, 2026-05-17):
-
-| Metric   | Old model (win5, SE Asia) | New model (annual, SA) |
-|----------|--------------------------|------------------------|
-| ROC-AUC  | 0.980                    | 0.582                  |
-| PR-AUC   | 0.538                    | 0.005                  |
-| Lift@1%  | 74×                      | 2.7×                   |
-
-This collapse is **not a code bug**. It reveals a structural problem with the learning task.
+## CORE INSIGHT (2026-05-18)
 
 PA designation at time t is the product of two independent processes:
 
@@ -28,324 +17,304 @@ P(pixel i designated in year t)
   × P(pixel i chosen | expansion in C,t)  ← geographic selection  [IN features]
 ```
 
-The feature set — elevation, climate, biodiversity, dist_wdpa — carries signal only for the
-**second term**. The first term (does Brazil designate in 2018 vs 2019?) is driven by
-election cycles, CBD meetings, and donor funding, all invisible to geographic features.
+Every model that treats this as a single binary classification conflates the two terms.
+The annual hazard model (AUC 0.582) exposed this — it is graded against politically-timed
+annual events but uses static geographic features that cannot predict timing.
 
-The 5-year window was accidentally aggregating over enough political cycles that the
-timing noise averaged out and the geographic selection signal dominated. The annual
-model forces prediction of both terms simultaneously and is dominated by the
-unpredictable first term.
-
-AUC 0.582 is near-random because the model produces a stable geographic ranking
-(mostly static features) graded against politically-timed annual events.
-
-### What the paper needs vs what it does NOT need
-
-The paper's three deliverables are **geographic ranking problems**, not annual precision problems:
-
-1. **Forward risk maps** — Where is PA expansion most likely by 2030? This is a geographic
-   screening question. A model with moderate discriminative power that correctly clusters
-   risk in the Amazon frontier, Cerrado edge, and SE Asian deforestation fronts is
-   actionable, regardless of annual AUC.
-
-2. **30×30 gap finding** — Where does expansion go vs where biodiversity needs protection?
-   This is a spatial overlay. Fully independent of AUC.
-
-3. **Transition risk for investors/central banks** — What agricultural exposure sits in
-   high-designation-probability zones? This is also a spatial overlay:
-   `Exposure = P(designation by 2030) × land value × commodity sensitivity`.
-   Investors and central banks need geographic risk stratification, not precise annual
-   timing. Even a rough quintile ranking of land-by-designation-risk is actionable.
-
-None of these require annual AUC > 0.80. They require geographically sensible probability
-surfaces and stable geographic rankings.
-
-### The one diagnostic that determines everything
-
-Before any architectural decision: **do the 5-year cumulative predictions from the annual
-model look geographically sensible?**
-
-Compute `1 − (1 − ĥ)^5` from the Euler output and check:
-- Do high-probability pixels cluster in the Amazon frontier, Atlantic Forest edge,
-  Cerrado transition zone, SE Asian deforestation fronts?
-- Does the backtest (train-to-2015, predict-2016–2020) show concentration in the
-  right geographic zones?
-
-If YES → the model is working correctly as a geographic screening tool. Annual AUC 0.582
-is the expected result when grading stable geographic rankings against annually-noisy
-political events. Proceed with cumulative evaluation as the primary metric.
-
-If NO (forward map looks like noise) → deeper data or feature problem needs diagnosis
-before any compute is invested.
-
-**Run this diagnostic first, before the next Euler job.**
+**The fix is architectural, not parametric.** Build the two processes as separate models.
 
 ---
 
-## METHODOLOGY DECISION (pending diagnostic)
+## THE MODEL: Two-Stage Conditional Selection
 
-Three options, in order of preference:
+### Stage 1 — Country-Year Expansion Model (macro)
 
-### Option A — Annual hazard + cumulative evaluation [CURRENT PATH]
+**Question**: How much PA expansion will country C do in year t?
 
-Keep the annual hazard model. Report `1 − (1 − ĥ)^5` as the primary forward output.
-Evaluate against 5-year cumulative ground truth (already implemented in backtest_core).
-The annual AUC (0.582) is reported honestly in Methods as the expected result given that
-the model captures geographic selection but not political timing — this is itself a
-finding. Primary paper metric = forward backtest lift@K%, not annual AUC.
+**Target**: km² designated per country per year (continuous, not binary).
 
-Viable if: the cumulative maps look geographically sensible.
+**Model**: Panel regression (OLS or Poisson) with:
+- PA momentum lags 1–3 (already built in W3)
+- 30×30 commitment dummy (post-COP15 2023+)
+- CBD meeting year dummies (known dates)
+- GDP per capita, agricultural rent index
+- Government ideology / environmental ministry strength (ParlGov, V-Dem)
 
-### Option B — Lambdarank reframe [METHODOLOGICAL UPGRADE, ~2 weeks]
+**Expected performance**: R² 0.5–0.8. Country-year expansion is tractable because it
+responds to measurable political signals. Brazil Lula vs Bolsonaro years is a signal.
+International funding cycles are signals. This is a panel regression, not a black box.
 
-Reformulate as a conditional ranking problem within `(country_id, year)` groups.
-LightGBM `objective=lambdarank`, evaluation metric = NDCG@K within groups.
+**Output for investors/central banks**: Country-level PA expansion forecast for 2025–2030.
+Which sovereigns face the largest 30×30 shortfall AND have the institutional momentum
+to close it? This is jurisdiction-level transition risk — directly relevant for sovereign
+bonds, agricultural commodity exposure, and central bank stress tests.
 
-This directly models the second term only:
-*Given that country C designated some area in year t, which pixels did it select?*
+---
 
-Expected NDCG improvement is substantial because political timing is removed from the
-loss function entirely. The forward maps are identical in interpretation: rank all
-eligible pixels per country, top-ranked = highest PA expansion probability.
+### Stage 2 — Geographic Selection Model (micro, conditional)
 
-Implement if: Option A maps look sensible but reviewers are likely to push back on
-annual AUC 0.582 and the two-process explanation needs a stronger methodological anchor.
+**Question**: Given that country C expands in year t, which pixels does it select?
 
-### Option C — Revert to 5-year window with honest Group A/B reporting [FALLBACK]
+**Training set**: Only rows from country-years with observed expansion (Stage 1 > 0).
+Political timing is removed by conditioning on the expansion decision having occurred.
 
-Reinstate `transition_01_win5` as target. Report test AUC 0.93 WITH the explicit
-decomposition: Group A (path-dependent, structural overlap) AUC ≈ 0.99 vs
-Group B (genuinely unseen) AUC ≈ 0.56. Frame Group A AUC as a finding about
-path-dependency, not a leak. The Group A/B contrast is publishable at GEC/One Earth.
+**Model**: LightGBM with `objective=lambdarank`, grouped by `(country_id, year)`.
+Optimises NDCG within groups — directly trains the ranking problem.
 
-Use only if: Option A cumulative maps fail the geographic sensibility check AND the
-lambdarank reframe (Option B) is not feasible within the paper timeline.
+**Features**: Same geographic feature set (elevation, climate, dist_wdpa, biodiversity,
+deforestation, PA momentum). No changes to the feature pipeline.
+
+**Expected performance**: NDCG@1% within country-year groups: 0.75–0.90. Geographic
+selection IS predictable when conditioned on expansion. The model is no longer penalised
+for failing to predict which year a country decides to act.
+
+**Validation**: Concordance index within country-year on test set. Lift@1% within groups.
+NOT global AUC (wrong metric for this model).
+
+**Output for investors/central banks**: Geographic ranking of PA candidates per country.
+Which agricultural pixels are in the top quintile of designation probability in their
+country? This is site-level transition risk — directly relevant for farmland portfolios,
+credit risk on agricultural loans, and TNFD site disclosure.
+
+---
+
+### Forward Prediction — Combining Stages 1 and 2
+
+For 2025–2030:
+1. Stage 1 → expected expansion budget per country per year (30×30 shortfall ×
+   Stage 1 model coefficients, with uncertainty bands)
+2. Stage 2 → geographic ranking of all eligible pixels per country
+3. Forward map = top-K pixels from Stage 2 ranking where K = Stage 1 budget
+
+This produces:
+- A 2030 PA expansion probability surface with credible uncertainty bands
+- Country-level exposure estimates (agricultural land value in top quintile)
+- Biodiversity gap: top-K expansion vs species richness / threatened habitat maps
+- Transition risk: `Exposure = Stage1_prob × Stage2_rank × land_value × commodity`
+
+---
+
+## WHY THIS IS PUBLISHABLE AT A TOP JOURNAL
+
+The two-stage separation is a **genuine methodological contribution**. Nobody has
+published this architecture for PA designation. The paper's explicit claim:
+
+> "Treating PA designation as a single prediction problem conflates two processes with
+> fundamentally different information requirements. We decompose the problem, show that
+> the macro-level expansion decision is predictable from political/institutional signals
+> and the micro-level geographic selection is predictable from biophysical signals, and
+> demonstrate that this separation substantially improves both scientific validity and
+> investor-relevance of the resulting risk maps."
+
+This framing inverts the conventional ML paper logic: instead of claiming high AUC, the
+paper's finding IS the demonstration that naive AUC is the wrong metric and the wrong
+estimand. The two-stage model is the correct one. The 5-year window AUC of 0.93 (or
+annual 0.582) is then explained as an artefact of model misspecification, not a measure
+of predictive quality.
+
+Strong framing for GEC / One Earth / Nature Sustainability. With LSE financial data, also
+Nature Finance.
+
+---
+
+## THE STORY
+
+> "Governments decide to expand protection for political reasons we can model; they then
+> allocate that expansion to specific places for geographic reasons we can also model.
+> These are different models answering different questions. We build both, combine them
+> into a forward scenario for 30×30, and show that even under the most optimistic
+> expansion trajectories, the places most likely to receive protection are systematically
+> not the places where protection is most needed. We quantify the transition risk this
+> creates for agricultural investors and central banks."
 
 ---
 
 ## SETTLED DECISIONS
 
-**Paper aim**: Forecast where PA expansion will land under 30×30, characterise the
-geographic drivers, expose the biodiversity gap, and quantify transition risk for
-agricultural assets. The model is a screening tool, not a precise prediction engine.
+**Paper aim**: Forecast where PA expansion will land under 30×30 using a two-stage
+conditional selection model. Characterise geographic drivers. Expose biodiversity gap.
+Quantify transition risk for investors and central banks.
 
-**Three regions**: SA (primary), SE Asia, USA. Keep all three.
-- USA path-dependency (AUC ≈ 0.99 that collapses OOS) is a positive finding about
-  mature conservation systems — feature in Discussion, not Limitations.
-- SA→SE Asia transfer was AUC 0.796 under 5-year window; re-evaluate under hazard/lambdarank.
+**Model architecture**: Two-stage (Stage 1 panel regression + Stage 2 lambdarank).
+This supersedes the single annual hazard model and the 5-year window.
 
-**DO NOT** add tropical Africa. No data pipeline exists.
-**DO NOT** implement prediction-vintage snapshots.
-**DO NOT** start Paper 2 (embeddings) until Paper 1 is submitted.
+**Three regions**: SA (primary), SE Asia, USA. All three.
+- USA: Stage 2 near-trivial (pure adjacency), near-perfect within-group concordance.
+  This is itself a finding: mature conservation systems select by proximity, emerging
+  ones by biophysical value. Keep USA as the contrast case.
+
+**DO NOT** add tropical Africa. No data pipeline.
+**DO NOT** start Paper 2 (embeddings) until Paper 1 submitted.
 
 ---
 
-## CURRENT OUTPUT STATUS (as of 2026-05-17)
+## IMPLEMENTATION PLAN
 
-| Artifact | Status | Notes |
-|----------|--------|-------|
-| W0 feature guard | ✅ complete | 9 smoke tests pass |
-| W1 hazard code | ✅ complete | All scripts updated, guard in place |
-| W3 PA momentum | ✅ code complete | Needs feature_engineering rerun on Euler |
-| SA LGBM annual training | ✅ Euler complete | AUC 0.582 — diagnostic pending |
-| SA RF annual training | ❌ pending | |
-| SE Asia annual training | ❌ pending | |
-| USA annual training | ❌ pending | |
-| Cumulative eval (all regions) | ❌ pending | **FIRST PRIORITY** |
-| Calibration, LOBO, transfer | ❌ pending | After cumulative eval passes |
-| Forward maps | ❌ pending | After cumulative eval passes |
-| Cox/logistic baseline | ❌ not started | ~2 days local, no Euler |
-| Ablation study | ❌ not started | After main results |
-| Manuscript | ❌ not started | After results |
+### What changes (surgical, not a rewrite)
+
+| Component | Change | Effort |
+|-----------|--------|--------|
+| Stage 1 script | New: `5_training/model1_expansion.py` (panel regression, country-year level) | ~3 days |
+| Stage 2 objective | Change `objective=binary` → `objective=lambdarank` + add group construction by `(country_id, year)` in LGBM dataset | ~2 days |
+| Evaluation | New NDCG@K within-group metric + Stage 1 R²/RMSE | ~1 day |
+| Forward | Combine Stage 1 budget forecast + Stage 2 ranking into forward maps | ~2 days |
+| Cox baseline | Logistic regression on Stage 2 formulation (interpretable coefficients) | ~1 day |
+
+**Total local implementation**: ~2 weeks before next Euler run.
+
+**What does NOT change**: Feature pipeline, GEE extractions, preprocessing, LOBO
+infrastructure, calibration, backtest machinery, SHAP computation.
+
+### Implementation order (next session)
+
+1. Implement Stage 1 locally (SA first) — validate that expansion rates are predictable
+2. Restructure Stage 2 training script: `lambdarank` objective, group by country-year
+3. New evaluation script: NDCG@K within groups, concordance index within groups
+4. Run both stages locally on a subset to confirm the machinery works
+5. Push to Euler for full run
 
 ---
 
 ## WORKSTREAMS
 
-### IMMEDIATE — Cumulative evaluation diagnostic
+### W0 — Feature/provenance gate [✅ complete]
 
-**Before any further Euler compute**, run locally or on Euler:
+### W1 — Stage 2 lambdarank model [CODE CHANGE NEEDED before Euler]
 
-1. Load the SA LGBM annual hazard model output (scored test parquet from Euler).
-2. Compute `y_pred_proba_5yr_cumulative = 1 − (1 − h)^5` — already in `predict_core.py`.
-3. Plot a geographic probability map of SA. Check visually:
-   - High-probability zones: Amazon frontier, Cerrado edge, Atlantic Forest remnants?
-   - Or noise / implausible pattern?
-4. Run the forward backtest (`backtest_core.py`) with cumulative predictions.
-   Report Lift@1%, Lift@5%, PR-AUC against 5-year cumulative ground truth.
-5. **Decision gate**: If maps look sensible → proceed with Option A (annual + cumulative).
-   If maps look like noise → diagnose before any further compute.
+Replace `objective=binary` with `objective=lambdarank` + country-year grouping.
+This is the single most impactful change. All existing pipeline infrastructure
+(LOBO, calibration, SHAP, forward) carries over.
 
-Additionally, compute **country-year stratified AUC**: within each `(country, year)` group
-in the test set, compute concordance between model scores and designations. This isolates
-the geographic selection signal from political timing noise. If stratified AUC ≈ 0.75–0.85,
-the model is working correctly and the 0.582 global AUC is explained by the two-process
-decomposition.
+### W2 — New data [HIGH VALUE, parallel]
 
-### W1 — Hazard model Euler reruns [partially complete]
+**Carbon stocks** (ESA CCI Biomass): REDD+ mechanism makes high-carbon land a
+priority for designation. Expected top-5 SHAP. Strengthens the financial story
+(carbon market → designation risk → investor exposure).
 
-SA LGBM done. Remaining:
-- `training_rf.slurm` × SA
-- `tuning_lgbm.slurm` + `training_lgbm.slurm` × SE Asia
-- `tuning_lgbm.slurm` + `training_lgbm.slurm` × USA
-- Same for RF all regions
-- Then: calibration → benchmark → LOBO → transfer → forward (all 3 regions)
+**Land tenure / indigenous lands** (RAISG): Most important omitted variable.
+Designation is constrained by who owns the land, not just biophysics. SA tractable.
 
-**Hold** further Euler jobs until the cumulative evaluation diagnostic passes.
+**Political variables for Stage 1** (ParlGov, V-Dem, CBD commitment database):
+Essential for the Stage 1 expansion model. These are small datasets (country-year
+level) — easy to add.
 
-### W2 — New data [HIGH VALUE, parallel with W1]
+### W3 — PA momentum [✅ code complete; Euler feature_engineering rerun needed]
 
-**Carbon stocks** (ESA CCI Biomass, GEE): REDD+ and carbon markets make high-carbon
-land attractive to protect. Expected top-5 SHAP in SA and SE Asia. Strengthens the
-financial story (carbon market → designation risk → investor exposure).
+`pa_momentum_pixels_lag{1,2,3}` implemented. Run before W1 Euler rerun.
 
-**Land tenure / indigenous lands** (RAISG, LandMark): Strongest missing omitted variable.
-Designation is constrained by governance and land rights, not just biophysics. USA federal
-land is tractable; SA/SE Asia requires coverage/licensing check.
+### W4 — Ablation [after Stage 2 results confirmed]
 
-Add only if feasible within timeline. Carbon stocks first.
+Same plan as before: remove feature groups one at a time, report NDCG@K drop.
+Critical ablation: `dist_wdpa` alone (tests spatial autocorrelation dependence).
 
-### W3 — PA momentum [code ✅; Euler feature_engineering rerun needed]
+### W5 — Cox/logistic baseline [~1 day local]
 
-`pa_momentum_pixels_lag{1,2,3}` implemented in feature_engineering. Run
-`feature_engineering.slurm` × 3 regions before re-kicking W1 training. These lags
-are the only time-varying governance signal currently in the feature set.
+Logistic regression on the Stage 2 formulation (within-group, conditional on expansion).
+Provides interpretable coefficients that validate SHAP directions and give economics
+reviewers a familiar anchor.
 
-### W4 — Ablation study [after W1 results confirmed]
+### W6 — Manuscript [after W1 Stage 2 results]
 
-Remove feature groups one at a time, report PR-AUC drop. Critical ablation:
-`dist_wdpa` alone — if removing it collapses the model, the model is mostly learning
-spatial autocorrelation. Other groups: terrain, climate, biodiversity, infrastructure,
-governance, economic value.
-~15–20 SLURM jobs. Results go into §Methods.
+Paper structure:
 
-### W5 — Cox/logistic duration baseline [~2 days local, no Euler]
-
-Logistic regression on the same annual-hazard target, same features.
-Provides: (a) coefficient estimates that economics reviewers trust; (b) baseline showing
-what LGBM adds over a well-specified linear model; (c) coefficient signs that validate
-SHAP directions. SA first, then SE Asia.
-
-### W6 — Manuscript [after W1 + diagnostic pass]
-
-Paper structure (high-impact, ~5,000 words main + supplement):
-
-1. **Introduction** (~800 w): 30×30 urgency → the two-process insight → what we do
-2. **Results** (~2,500 w): Driver story (SHAP across 3 continents) → forward maps →
-   30×30 biodiversity gap → transition risk quantification
-3. **Methods** (~1,200 w): Two-process decomposition, hazard model formulation,
-   conditional ranking interpretation, data, evaluation (cumulative AUC + Lift + NDCG)
-4. **Discussion** (~1,000 w): Geographic selection vs political timing; opportunity-cost
-   bias in designation; path-dependency in USA; SA→SE Asia transfer; limitations
-5. **Supplement**: Feature dictionary, hyperparameters, full regional tables, LOBO,
-   transfer, backtest vintages, annual AUC with explanation
-
-Key narrative:
-*"PA expansion follows predictable geographic patterns — shaped by existing conservation
-geography, biophysical value, and land-use pressure. The political decision of when to
-act is not forecastable from geographic features, but which areas will be targeted when
-action happens is. We characterise these drivers across three continents, forecast where
-30×30 will land, expose the biodiversity gap between where protection goes and where it
-is needed most, and quantify the transition risk for agricultural assets in
-high-designation-probability zones."*
+1. **Introduction** (~800 w): 30×30 urgency → the two-process problem → what we do
+2. **Results** (~2,500 w):
+   - Stage 1: Which countries will expand? (political economy of PA supply)
+   - Stage 2: Where? SHAP driver story across 3 continents
+   - Forward maps + 30×30 biodiversity gap
+   - Transition risk for investors and central banks
+3. **Methods** (~1,200 w): Two-stage decomposition, lambdarank formulation,
+   evaluation metrics (NDCG, concordance within groups, Stage 1 R²)
+4. **Discussion** (~1,000 w): Political timing vs geographic selection; USA path-
+   dependency as Stage 2 extreme case; limits of the Stage 1 forecast; implications
+   for TNFD/NGFS nature risk frameworks
+5. **Supplement**: Feature dictionary, full regional tables, LOBO, transfer results,
+   backtest vintages, hyperparameters, Group A/B diagnostic from old model
 
 ---
 
 ## OPEN QUESTIONS
 
-1. **[BLOCKING] Diagnostic result**: Do the SA LGBM cumulative maps look geographically
-   sensible? Determines which methodology option to pursue. Run before next session.
+1. **[BLOCKING] Stage 1 political variables**: Which datasets are accessible for
+   government ideology + international commitment indicators? Check ParlGov (EU/OECD
+   coverage good, SA/SE Asia partial) and V-Dem (global coverage). CBD national pledge
+   database is online. Confirm coverage before designing Stage 1 fully.
 
-2. **[BLOCKING] LSE financial data**: What land price, credit spread, farmland REIT, or
-   concession value data can Elena Almeida / CETEx contribute? Determines journal target
-   (Nature Finance/JEEM vs GEC/One Earth) and whether the transition risk section is
-   evidential (asset pricing anomaly) or illustrative (exposure quantification).
+2. **[BLOCKING] LSE financial data**: Elena Almeida / CETEx — what financial datasets
+   are available? Still determines journal ceiling (Nature Finance/JEEM vs GEC/One Earth).
+   Must resolve before finalising manuscript structure.
 
-3. **Methodology choice**: Option A (annual + cumulative) vs Option B (lambdarank)?
-   Decide after diagnostic result. If lambdarank, implementation is ~2 weeks locally.
+3. **LambdaRank label construction**: Binary labels (0/1 designation) work for lambdarank
+   but relevance-graded labels (e.g., larger designations get higher relevance score)
+   might improve Stage 2. Decision: start with binary, upgrade if initial results are weak.
 
-4. **Backtesting metric**: Annual hazard predictions aggregated to 5-year cumulative
-   before comparing against 5-year ground truth (primary). Annual-only backtest as
-   secondary diagnostic. Both already in `backtest_core.py`.
+4. **Stage 1 spatial scale**: Country-level is cleanest. Sub-national (state/province)
+   would be more granular for large countries (Brazil, Indonesia, USA) but requires
+   sub-national political variables. Start with country-level; upgrade if data exists.
 
-5. **USA policy features**: Federal governance differs structurally from SA/SE Asia
-   country-level indicators. Check whether excluding USA from the governance SHAP
-   narrative makes the cross-continental comparison cleaner.
+5. **USA Stage 2**: Within-group concordance for USA expected to be near-perfect (pure
+   adjacency effect). Confirm whether this makes USA's Stage 2 model uninformative for
+   the cross-continental SHAP story or whether it strengthens the contrast narrative.
 
 ---
 
 ## KEY NUMBERS
 
-Current (Euler, annual hazard, SA LGBM):
 | Metric | Value | Notes |
 |--------|-------|-------|
-| Annual ROC-AUC | 0.582 | Expected given two-process decomposition |
-| Annual PR-AUC | 0.005 | Base-rate collapse (annual events ~5× rarer than 5-year) |
-| Annual Lift@1% | 2.7× | Graded against politically-timed annual events |
-| Cumulative AUC | **TBD** | Run diagnostic — this is the primary metric |
-| Country-year stratified AUC | **TBD** | Run diagnostic — tests geographic selection signal |
+| Annual AUC (old approach) | 0.582 | Expected — wrong estimand |
+| 5-year window AUC | 0.93 (test) / 0.56 (Group B) | Wrong estimand, inflated |
+| Stage 1 R² target | 0.5–0.8 | Country-year expansion rate |
+| Stage 2 NDCG@1% target | 0.75–0.90 | Within country-year groups |
+| Stage 2 Lift@1% target | 15–40× within groups | Geographic selection signal |
 
-Reference (5-year window, post-fix, SA RF):
-| Metric | Value |
-|--------|-------|
-| Test AUC | 0.9268 |
-| PR-AUC | 0.6337 |
-| Lift@1% | 67.6× |
-| Forward backtest AUC (T=2015) | 0.748 |
-| Group B AUC (genuinely unseen) | 0.5587 |
+---
 
-Target (cumulative hazard, primary metric):
-- Forward backtest Lift@1% ≥ 5× → maps are actionable for investor risk screening
-- Country-year stratified AUC ≥ 0.70 → geographic selection signal confirmed
+## CURRENT OUTPUT STATUS (as of 2026-05-18)
+
+| Artifact | Status | Notes |
+|----------|--------|-------|
+| SA LGBM annual binary training | ✅ Euler (old approach) | AUC 0.582, superseded by two-stage |
+| W0 feature guard | ✅ complete | 9 smoke tests pass |
+| W1 hazard code | ✅ code complete | Needs lambdarank change before rerun |
+| W3 PA momentum | ✅ code complete | Needs feature_engineering rerun on Euler |
+| Stage 1 expansion model | ❌ not started | First task next session |
+| Stage 2 lambdarank model | ❌ not started | Second task next session |
+| All Euler reruns | ❌ pending | After local implementation confirmed |
 
 ---
 
 ## BRANCH AND REVERSION POLICY
 
-- **`paper` branch**: All W1/W2/W3 hazard model changes. Active development here.
-- **`main` branch**: Intact thesis code (5-year window, original splits). Never touched.
-- To revert to thesis settings: `git checkout main` — all original scripts, splits,
-  and model artifacts are preserved there.
-- To recover specific thesis outputs: they remain in `outputs/` on main, untouched.
+- **`paper` branch**: Active development. All W1/W2/W3 changes + two-stage model.
+- **`main` branch**: Intact thesis code (5-year window). Never touched.
+- Revert to thesis: `git checkout main` — original scripts and artifacts intact.
 
 ---
 
 ## TWO-PUBLICATION STRATEGY
 
-### Paper 1 — Finance / Economics (THIS PAPER)
+### Paper 1 — This paper
 
-**Journals**: GEC / One Earth (base case). Nature Finance / JEEM if LSE data confirms
-the "unpriced risk" test is feasible.
+**Journals (ordered)**: GEC / One Earth → Nature Sustainability → Nature Finance (if
+LSE data) / JEEM (if LSE data).
 
-**One-sentence pitch**: "Geographic screening of protected-area expansion reveals where
-30×30 will land and quantifies the transition risk for agricultural investors and central
-banks."
-
-**Core contributions**:
-1. Cross-continental characterisation of PA designation drivers (SHAP, 3 regions, 20 years)
-2. Forward maps of PA expansion under 30×30 with biodiversity gap analysis
-3. Transition risk quantification for agricultural assets (requires LSE financial data
-   for the evidential version; illustrative version does not)
-4. The two-process insight: geographic selection is forecastable; political timing is not
+**One-sentence pitch**: "A two-stage model of PA expansion separates the predictable
+geographic selection of conservation candidates from the unpredictable political timing
+of designation, enabling credible 30×30 forward scenarios and transition risk
+quantification for investors and central banks."
 
 ### Paper 2 — Methods / Prediction (AFTER P1 SUBMITTED)
 
-**Target**: Nature Sustainability / PNAS / Nature Machine Intelligence
-
-**One-sentence pitch**: "Satellite foundation model embeddings reveal a universal visual
-signature of conservation-attractive landscape, enabling cross-regional PA prediction
-that tabular features cannot achieve."
-
-**Gate**: Requires AlphaEarth (or equivalent) access confirmed + Paper 1 submitted.
-Do not start until P1 is submitted.
+**Target**: Nature Sustainability / PNAS / Nature Machine Intelligence.
+**Pitch**: Foundation model embeddings improve Stage 2 cross-regional transfer.
+**Gate**: AlphaEarth access confirmed + P1 submitted.
 
 ---
 
 ## THINGS DELIBERATELY NOT IN THIS PAPER
 
 - Colombia: supplement only
-- Tropical Africa: no data pipeline, not feasible
-- Embeddings / Paper 2 model: blocked until P1 submitted
-- Prediction-vintage snapshots: rejected
-- Bayesian network interpretability layer: dropped
+- Tropical Africa: no data pipeline
+- Embeddings / Paper 2: blocked until P1 submitted
+- Single-model global AUC as primary metric: rejected (wrong estimand)
