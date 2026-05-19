@@ -2,14 +2,39 @@
 
 **Purpose**: Authoritative planning document. Keep compact and updated after every session.
 **Status**: Post-thesis. Paper branch active. Architecture decision made (2026-05-18).
-**Target**: GEC / One Earth (base case). Nature Finance / JEEM / Nature Sustainability if
-LSE financial data materialises or Stage 2 results are exceptional.
+**Target**: GEC / One Earth (base case). Nature Sustainability if Stage 1 R² ≥ 0.55 and Stage 2 NDCG@1% ≥ 0.80.
 
 ---
 
-## CORE INSIGHT (2026-05-18)
+## JUSTIFICATION FOR THE METHODOLOGICAL PIVOT
 
-PA designation at time t is the product of two independent processes:
+This section documents why the thesis model is inadequate and why the two-stage architecture
+is the scientifically correct replacement. Use this when presenting to supervisors.
+
+### Why the thesis model is wrong (not just weak)
+
+The thesis model achieved test AUC = 0.93 (SA) and 0.986 (SE Asia). These numbers are
+artefacts of model misspecification, confirmed by the Group A/B leakage diagnostic
+(run 2026-04-25):
+
+| Pixel group | Definition | SA RF AUC | Interpretation |
+|-------------|-----------|-----------|----------------|
+| Group A | Designated 2018–2019 (label overlap with training features) | 0.9994 | Memorised — features include post-designation state |
+| Ambiguous | Designated 2020–2022 (partial overlap) | 0.8623 | Upper bound on honest short-horizon performance |
+| Group B | Designated 2023–2024 (genuinely unseen) | 0.5587 | Near-random — true OOS performance |
+
+The high AUC is driven almost entirely by Group A pixels whose features already reflect
+their protected status. The model learned a tautology: protected-looking pixels get
+protected. Group B (the only genuinely unseen pixels) performs at AUC = 0.56 —
+barely above random.
+
+The annual hazard model (AUC = 0.582) made the deeper problem explicit: static geographic
+features cannot predict the *year* a country decides to expand. The model was graded
+against politically-timed annual events it had no information to anticipate.
+
+### The root cause: model misspecification, not data quality
+
+PA designation is the product of two independent processes:
 
 ```
 P(pixel i designated in year t)
@@ -17,11 +42,27 @@ P(pixel i designated in year t)
   × P(pixel i chosen | expansion in C,t)  ← geographic selection  [IN features]
 ```
 
-Every model that treats this as a single binary classification conflates the two terms.
-The annual hazard model (AUC 0.582) exposed this — it is graded against politically-timed
-annual events but uses static geographic features that cannot predict timing.
+A single binary classifier conflates both terms. It is trained to predict the
+*joint* event but only has features relevant to the second term. No amount of
+feature engineering or hyperparameter tuning can fix this — it is a structural
+specification error.
 
-**The fix is architectural, not parametric.** Build the two processes as separate models.
+**The fix is architectural, not parametric.**
+
+### Why the two-stage model is the correct specification
+
+- Stage 1 estimates the first term: how much expansion will country C do in year t?
+  This is modelled with political/institutional variables (V-Dem, WGI, GDP, CBD) that
+  are genuinely informative about political timing.
+- Stage 2 estimates the second term: given expansion, which pixels are selected?
+  This is a ranking problem within country-year groups, using geographic features
+  that are genuinely informative about geographic selection.
+- Conditioning Stage 2 on the expansion event having occurred removes the political
+  noise that drove the old model's poor performance.
+
+The methodological contribution is the decomposition itself. The paper's explicit claim
+is that treating PA designation as a single prediction problem is wrong, and we prove
+this empirically (Group A/B diagnostic) before presenting the correct model.
 
 ---
 
@@ -31,23 +72,31 @@ annual events but uses static geographic features that cannot predict timing.
 
 **Question**: How much PA expansion will country C do in year t?
 
-**Target**: km² designated per country per year (continuous, not binary).
+**Target**: km² designated per country per year (continuous).
 
-**Model**: Panel regression (OLS or Poisson) with:
+**Model**: Panel regression (Poisson or negative binomial — NOT OLS; expansion data
+has many country-years at zero and occasional large spikes) with:
 - PA momentum lags 1–3 (already built in W3)
 - 30×30 commitment dummy (post-COP15 2023+)
 - CBD meeting year dummies (known dates)
-- GDP per capita, agricultural rent index
-- Government ideology / environmental ministry strength (ParlGov, V-Dem)
+- GDP per capita, agricultural land % (WB WDI)
+- Democracy index (V-Dem v16: `v2x_polyarchy`, annual, 1900–2025)
+- Government effectiveness (WB WGI: `GOV_WGI_GE.EST`, annual, 1996–2024)
+- Note: ParlGov DROPPED — EU/OECD only, no coverage for SA or SE Asia
 
-**Expected performance**: R² 0.5–0.8. Country-year expansion is tractable because it
-responds to measurable political signals. Brazil Lula vs Bolsonaro years is a signal.
-International funding cycles are signals. This is a panel regression, not a black box.
+**Honest performance expectation**: R² 0.40–0.65. Country-year PA expansion is
+partially tractable from political signals, but lumpy international funding cycles
+and individual political events create irreducible noise. The autoregressive baseline
+(PA momentum lags alone) must be computed first; V-Dem + WGI are valuable only if
+they improve substantially on that baseline. If Stage 1 R² < 0.40, forward scenario
+uncertainty bands become too wide to claim investor-relevance — Stage 1 is then
+reframed as illustrative macro context rather than a forecasting model. Stage 2
+results stand independently either way (see below).
 
-**Output for investors/central banks**: Country-level PA expansion forecast for 2025–2030.
-Which sovereigns face the largest 30×30 shortfall AND have the institutional momentum
-to close it? This is jurisdiction-level transition risk — directly relevant for sovereign
-bonds, agricultural commodity exposure, and central bank stress tests.
+**Output for investors/central banks**: Country-level PA expansion likelihood for
+2025–2030. Which sovereigns face the largest 30×30 shortfall AND have the
+institutional capacity to close it? Jurisdiction-level transition risk: directly
+relevant for sovereign bond exposure and central bank stress tests.
 
 ---
 
@@ -56,76 +105,138 @@ bonds, agricultural commodity exposure, and central bank stress tests.
 **Question**: Given that country C expands in year t, which pixels does it select?
 
 **Training set**: Only rows from country-years with observed expansion (Stage 1 > 0).
-Political timing is removed by conditioning on the expansion decision having occurred.
+Political timing noise is removed by conditioning on the expansion event.
 
-**Model**: LightGBM with `objective=lambdarank`, grouped by `(country_id, year)`.
+**Model**: LightGBM `objective=lambdarank`, grouped by `(country_id, year)`.
 Optimises NDCG within groups — directly trains the ranking problem.
 
-**Features**: Same geographic feature set (elevation, climate, dist_wdpa, biodiversity,
-deforestation, PA momentum). No changes to the feature pipeline.
+**Features**: Existing geographic feature set (elevation, climate, dist_wdpa,
+biodiversity, deforestation, PA momentum). No changes to feature pipeline.
 
-**Expected performance**: NDCG@1% within country-year groups: 0.75–0.90. Geographic
-selection IS predictable when conditioned on expansion. The model is no longer penalised
-for failing to predict which year a country decides to act.
+**Honest performance expectation**: NDCG@1% within country-year groups: 0.72–0.88.
+Geographic selection IS predictable when conditioned on expansion. The model is no
+longer penalised for failing to predict which year a country acts.
 
-**Validation**: Concordance index within country-year on test set. Lift@1% within groups.
-NOT global AUC (wrong metric for this model).
+**Critical baseline**: The `dist_wdpa`-only model must be computed as the naïve
+baseline (W4 ablation, run early). If Stage 2 NDCG@1% cannot beat this baseline
+by ≥ 5 percentage points, the 60-feature pipeline adds nothing beyond spatial
+autocorrelation — that would be a finding in itself, but a much narrower paper.
 
-**Output for investors/central banks**: Geographic ranking of PA candidates per country.
-Which agricultural pixels are in the top quintile of designation probability in their
-country? This is site-level transition risk — directly relevant for farmland portfolios,
-credit risk on agricultural loans, and TNFD site disclosure.
+**Validation**: NDCG@K within country-year groups, concordance index within groups,
+Lift@1% within groups. NOT global AUC (wrong metric for a conditional ranking model).
+
+**Stage 2 is the primary empirical contribution of the paper.** It stands alone
+regardless of Stage 1 performance. The SHAP driver story (which geographic factors
+drive selection across 3 continents), the biodiversity gap (top-K expansion vs
+priority habitat maps), and the USA adjacency contrast are all Stage 2 outputs.
+
+**Output for investors/central banks**: Site-level transition risk. Which agricultural
+pixels are in the top quintile of designation probability in their country? Directly
+relevant for farmland portfolios, agricultural credit risk, and TNFD site disclosure.
 
 ---
 
 ### Forward Prediction — Combining Stages 1 and 2
 
 For 2025–2030:
-1. Stage 1 → expected expansion budget per country per year (30×30 shortfall ×
-   Stage 1 model coefficients, with uncertainty bands)
-2. Stage 2 → geographic ranking of all eligible pixels per country
-3. Forward map = top-K pixels from Stage 2 ranking where K = Stage 1 budget
+1. Stage 1 → expected expansion budget per country (30×30 shortfall × Stage 1
+   coefficients, with bootstrapped uncertainty bands). Three scenarios: BAU,
+   moderate (midpoint), 30×30-compliant.
+2. Stage 2 → geographic ranking of all eligible pixels per country.
+3. Forward map = top-K pixels from Stage 2 ranking where K = Stage 1 budget.
+
+**Spatial aggregation**: Top-K individual pixels produce scattered 1km² patches.
+Run a hexagonal binning or kernel density step before producing map figures to show
+spatial concentration of high-probability pixels. Acknowledge explicitly in Methods
+that this is a pixel-level likelihood surface, not a contiguous PA boundary proposal.
+Show empirically that high-probability pixels cluster geographically (if they do) —
+this validates the map without requiring contiguity.
 
 This produces:
-- A 2030 PA expansion probability surface with credible uncertainty bands
-- Country-level exposure estimates (agricultural land value in top quintile)
+- 2030 PA expansion probability surface with scenario uncertainty bands
+- Country-level shortfall + capacity table (sovereign bond / stress test input)
 - Biodiversity gap: top-K expansion vs species richness / threatened habitat maps
-- Transition risk: `Exposure = Stage1_prob × Stage2_rank × land_value × commodity`
+- Transition risk formula: `Exposure = Stage1_prob × Stage2_rank × land_value`
 
 ---
 
 ## WHY THIS IS PUBLISHABLE AT A TOP JOURNAL
 
-The two-stage separation is a **genuine methodological contribution**. Nobody has
-published this architecture for PA designation. The paper's explicit claim:
+The two-stage decomposition is a **genuine methodological contribution**. No prior
+PA prediction paper has built this architecture. The paper's argument:
 
-> "Treating PA designation as a single prediction problem conflates two processes with
-> fundamentally different information requirements. We decompose the problem, show that
-> the macro-level expansion decision is predictable from political/institutional signals
-> and the micro-level geographic selection is predictable from biophysical signals, and
-> demonstrate that this separation substantially improves both scientific validity and
-> investor-relevance of the resulting risk maps."
+> "Treating PA designation as a single prediction problem conflates two processes
+> with fundamentally different information requirements. We prove this empirically
+> using a Group A/B leakage diagnostic, decompose the problem into its constituent
+> parts, and show that the micro-level geographic selection process is strongly
+> predictable once political timing noise is removed. We use the resulting model to
+> produce credible 30×30 forward scenarios and to quantify the gap between where
+> protection will go and where it is most needed."
 
-This framing inverts the conventional ML paper logic: instead of claiming high AUC, the
-paper's finding IS the demonstration that naive AUC is the wrong metric and the wrong
-estimand. The two-stage model is the correct one. The 5-year window AUC of 0.93 (or
-annual 0.582) is then explained as an artefact of model misspecification, not a measure
-of predictive quality.
+This framing inverts conventional ML paper logic: the finding IS the demonstration
+that naive AUC is the wrong metric and wrong estimand. The 0.93 AUC and the 0.582
+AUC are both explained as model misspecification artefacts, not measures of
+predictive quality. The two-stage model is the correct specification.
 
-Strong framing for GEC / One Earth / Nature Sustainability. With LSE financial data, also
-Nature Finance.
+**Why GEC / One Earth**: policy-facing, quantitative methods accepted, biodiversity
+gap + transition risk narrative is precisely on-scope. 30×30 is the defining
+conservation policy of the decade.
+
+**Why Nature Sustainability is reachable**: if Stage 1 R² ≥ 0.55 and Stage 2
+NDCG@1% ≥ 0.80, the combined forward scenario is credible enough for their
+standards. The three-continent scope and TNFD/NGFS relevance are consistent with
+their recent published work.
 
 ---
 
-## THE STORY
+## THE STORY (one paragraph for co-authors and supervisors)
 
-> "Governments decide to expand protection for political reasons we can model; they then
-> allocate that expansion to specific places for geographic reasons we can also model.
-> These are different models answering different questions. We build both, combine them
-> into a forward scenario for 30×30, and show that even under the most optimistic
-> expansion trajectories, the places most likely to receive protection are systematically
-> not the places where protection is most needed. We quantify the transition risk this
-> creates for agricultural investors and central banks."
+> "Governments decide to expand protection for political reasons we can partially
+> model; they then allocate that expansion to specific places for geographic reasons
+> we can model well. These are structurally different problems requiring different
+> models. We prove the misspecification of the conventional single-model approach
+> using a leakage diagnostic, then build both stages separately. The combined model
+> produces 30×30 forward scenarios and shows that even under optimistic expansion
+> trajectories, the places most likely to receive protection are systematically not
+> the places where protection is most needed. We quantify the agricultural transition
+> risk this creates."
+
+---
+
+## PRE-FLIGHT CHECKS (blocking — complete before writing Stage 1 or Stage 2 code)
+
+These two checks take ≤ 1 day and determine whether the design requires adjustment
+before implementation begins. Do not skip them.
+
+### Check A — Within-group sample sizes (Stage 2 viability)
+
+Query the existing parquet panels and count, per `(country_id, year)`, the number
+of positive transitions. Report: distribution of group sizes, number of groups with
+≥ 5 positives, ≥ 10 positives, median group size. LambdaRank requires multiple
+positives per group to learn meaningful rankings.
+
+**Decision rule**:
+- Median group positives ≥ 5 across all regions → proceed as designed (annual groups)
+- Median group positives 2–4 → aggregate to 2–3 year windows before grouping
+- Median group positives < 2 → Stage 2 group definition needs rethinking; escalate
+
+Script: `scripts/regions/shared/stage2_group_size_check.py` (to be written, ~30 lines).
+
+### Check B — Stage 1 autoregressive baseline
+
+Before building the full political panel model, fit a simple Poisson regression with
+PA momentum lags 1–3 only (no political variables). Report pseudo-R² and RMSE.
+This is the baseline Stage 1 must beat; it also calibrates R² expectations.
+
+**Decision rule**:
+- Momentum-only pseudo-R² ≥ 0.50 → adding V-Dem + WGI can push total to 0.55–0.65;
+  Stage 1 is a credible macro model
+- Momentum-only pseudo-R² 0.30–0.50 → Stage 1 framed as illustrative context,
+  not a forecast; paper lead stays on Stage 2
+- Momentum-only pseudo-R² < 0.30 → Stage 1 expansion is dominated by noise;
+  drop Stage 1 from main results, include as supplement or Discussion
+
+Script: `scripts/regions/south_america/5_training/stage1_ar_baseline.py` (~50 lines).
 
 ---
 
@@ -136,12 +247,40 @@ conditional selection model. Characterise geographic drivers. Expose biodiversit
 Quantify transition risk for investors and central banks.
 
 **Model architecture**: Two-stage (Stage 1 panel regression + Stage 2 lambdarank).
-This supersedes the single annual hazard model and the 5-year window.
+Supersedes single annual hazard model and 5-year window. Neither can be reverted to
+as a primary model — they are shown to be misspecified.
+
+**Stage 2 is primary, Stage 1 is context**: The paper's empirical spine is Stage 2.
+Stage 1 provides the macro expansion budget needed for the forward map. If Stage 1
+performs poorly, the paper narrows to "here is where protection will go, conditional
+on a country choosing to act" — still publishable. Do not gate the whole paper on
+Stage 1 performance.
 
 **Three regions**: SA (primary), SE Asia, USA. All three.
-- USA: Stage 2 near-trivial (pure adjacency), near-perfect within-group concordance.
-  This is itself a finding: mature conservation systems select by proximity, emerging
-  ones by biophysical value. Keep USA as the contrast case.
+- USA: near-perfect within-group concordance expected (pure adjacency effect). This
+  IS a finding: mature conservation systems select by proximity, emerging ones by
+  biophysical value. USA is the contrast case, not a validation failure.
+
+**COP15 structural break**: Training runs to 2019; 30×30 commitment post-2022.
+Stage 1 is extrapolating to a qualitatively different political regime. The COP15
+dummy partially addresses this but does not resolve it. Address explicitly in Methods
+as a design limitation, not an afterthought. Frame it as: "Stage 1 estimates the
+pre-30×30 expansion rate; the COP15 dummy scales the forecast upward under the
+assumption that the commitment is partially binding. We present sensitivity scenarios."
+
+**Literature positioning**: Stage 1 must add something existing political ecology /
+PA supply papers do not already do. Confirmed targets for literature check before
+submission: Joppa & Pfaff (2009), Baldi et al. (2010), Nolte et al. (2010),
+and recent country-year PA supply models. Stage 1 covariates (V-Dem + WGI at
+country-year) are not used in prior PA prediction papers — this is the gap.
+
+**LambdaRank labels**: Binary (0/1 designation). Standard for NDCG with binary
+relevance. Upgrade to graded relevance (larger designations = higher score) only
+if initial NDCG@1% < 0.70.
+
+**Stage 1 spatial scale**: Country-level. Sub-national only if Check A reveals
+that country-year groups are too sparse and aggregating to 3-year windows is
+insufficient — then state-level grouping for Brazil/Indonesia/USA may help.
 
 **DO NOT** add tropical Africa. No data pipeline.
 **DO NOT** start Paper 2 (embeddings) until Paper 1 submitted.
@@ -154,24 +293,45 @@ This supersedes the single annual hazard model and the 5-year window.
 
 | Component | Change | Effort |
 |-----------|--------|--------|
-| Stage 1 script | New: `5_training/model1_expansion.py` (panel regression, country-year level) | ~3 days |
-| Stage 2 objective | Change `objective=binary` → `objective=lambdarank` + add group construction by `(country_id, year)` in LGBM dataset | ~2 days |
-| Evaluation | New NDCG@K within-group metric + Stage 1 R²/RMSE | ~1 day |
-| Forward | Combine Stage 1 budget forecast + Stage 2 ranking into forward maps | ~2 days |
-| Cox baseline | Logistic regression on Stage 2 formulation (interpretable coefficients) | ~1 day |
+| Pre-flight Check A | Group size diagnostic script | ~0.5 days |
+| Pre-flight Check B | Stage 1 AR baseline script | ~0.5 days |
+| Stage 1 script | New: `5_training/model1_expansion.py` (Poisson panel regression) | ~3 days |
+| Stage 2 objective | `objective=binary` → `objective=lambdarank` + country-year grouping | ~2 days |
+| Stage 2 calibration | Platt/isotonic on lambdarank scores before transition risk formula | ~0.5 days |
+| Evaluation | NDCG@K within groups, concordance index, Stage 1 pseudo-R²/RMSE | ~1 day |
+| Naïve baseline (W4 early) | `dist_wdpa`-only lambdarank (required reference point) | ~0.5 days |
+| Forward | Stage 1 budget × Stage 2 ranking → forward maps + hex-binned figures | ~2 days |
+| Logistic baseline (W5) | Logistic regression on Stage 2 formulation (interpretable coefficients) | ~1 day |
 
 **Total local implementation**: ~2 weeks before next Euler run.
 
 **What does NOT change**: Feature pipeline, GEE extractions, preprocessing, LOBO
-infrastructure, calibration, backtest machinery, SHAP computation.
+infrastructure, calibration, backtest machinery, SHAP computation, existing splits.
 
-### Implementation order (next session)
+### Implementation order
 
-1. Implement Stage 1 locally (SA first) — validate that expansion rates are predictable
-2. Restructure Stage 2 training script: `lambdarank` objective, group by country-year
-3. New evaluation script: NDCG@K within groups, concordance index within groups
-4. Run both stages locally on a subset to confirm the machinery works
-5. Push to Euler for full run
+0. ~~**Verify Stage 1 political data coverage**~~ **[DONE 2026-05-19]**
+   V-Dem v16 + WB WGI confirmed for all three regions. ParlGov dropped.
+   See `outputs/data_checks/stage1_political_coverage.json`.
+
+0a. **[BLOCKING] Pre-flight Check A** — within-group sample sizes. Must run before
+    Stage 2 design is locked.
+
+0b. **[BLOCKING] Pre-flight Check B** — Stage 1 AR baseline (momentum lags only).
+    Sets realistic R² expectations before building full political model.
+
+1. Implement Stage 1 locally (SA first) — full political panel model
+
+2. Restructure Stage 2: `lambdarank` objective, group by `(country_id, year)`
+
+3. **Run naïve `dist_wdpa`-only baseline immediately** (before full Stage 2 run).
+   This is the benchmark Stage 2 must beat. Do not wait for W4.
+
+4. New evaluation script: NDCG@K within groups, concordance index within groups
+
+5. Run both stages locally on a subset to confirm machinery works end-to-end
+
+6. Push to Euler for full run across all three regions
 
 ---
 
@@ -182,79 +342,99 @@ infrastructure, calibration, backtest machinery, SHAP computation.
 ### W1 — Stage 2 lambdarank model [CODE CHANGE NEEDED before Euler]
 
 Replace `objective=binary` with `objective=lambdarank` + country-year grouping.
-This is the single most impactful change. All existing pipeline infrastructure
-(LOBO, calibration, SHAP, forward) carries over.
+Single most impactful change. LOBO, calibration, SHAP, forward all carry over.
 
-### W2 — New data [HIGH VALUE, parallel]
+### W2 — New data [HIGH VALUE, parallel with W1]
 
 **Carbon stocks** (ESA CCI Biomass): REDD+ mechanism makes high-carbon land a
-priority for designation. Expected top-5 SHAP. Strengthens the financial story
-(carbon market → designation risk → investor exposure).
+priority for designation. Expected top-5 SHAP. Directly strengthens the financial
+story (carbon market → designation incentive → investor transition exposure).
+Do SA first; SE Asia second.
 
-**Land tenure / indigenous lands** (RAISG): Most important omitted variable.
-Designation is constrained by who owns the land, not just biophysics. SA tractable.
+**Land tenure / indigenous lands** (RAISG): Biggest omitted variable for SA.
+Designation is constrained by land ownership, not just biophysics. Public and
+indigenous lands are the path of least political resistance. SA tractable via RAISG.
 
-**Political variables for Stage 1** (ParlGov, V-Dem, CBD commitment database):
-Essential for the Stage 1 expansion model. These are small datasets (country-year
-level) — easy to add.
+**Political variables** (V-Dem v16, WB WGI, WDI): Already confirmed. Download and
+format as country-year panel for Stage 1 script. Small datasets, low effort.
 
 ### W3 — PA momentum [✅ code complete; Euler feature_engineering rerun needed]
 
 `pa_momentum_pixels_lag{1,2,3}` implemented. Run before W1 Euler rerun.
 
-### W4 — Ablation [after Stage 2 results confirmed]
+### W4 — Ablation [run naïve baseline early; full ablation after Stage 2 confirmed]
 
-Same plan as before: remove feature groups one at a time, report NDCG@K drop.
-Critical ablation: `dist_wdpa` alone (tests spatial autocorrelation dependence).
+**Naïve baseline (run immediately)**: `dist_wdpa`-only lambdarank model. This is
+the critical reference point. Stage 2 must beat it by ≥ 5pp NDCG@1% to claim the
+full feature set adds meaningful signal beyond spatial autocorrelation.
 
-### W5 — Cox/logistic baseline [~1 day local]
+**Full ablation** (after Stage 2 results confirmed): Remove feature groups one at a
+time (climate, biodiversity, deforestation, PA momentum, terrain). Report NDCG@K
+drop per group. Generates the feature importance table for Methods section.
 
-Logistic regression on the Stage 2 formulation (within-group, conditional on expansion).
-Provides interpretable coefficients that validate SHAP directions and give economics
-reviewers a familiar anchor.
+### W5 — Logistic baseline [~1 day local, after W1]
 
-### W6 — Manuscript [after W1 Stage 2 results]
+Logistic regression on Stage 2 formulation (within-group, conditional on expansion).
+Interpretable coefficients anchor the SHAP directions for economics reviewers and
+satisfy the "show us a simple model first" reviewer request.
 
-Paper structure:
+### W6 — Manuscript [after W1 Stage 2 results, with Stage 1 in whatever state it is]
 
-1. **Introduction** (~800 w): 30×30 urgency → the two-process problem → what we do
+**Paper structure**:
+
+1. **Introduction** (~800 w): 30×30 urgency → the two-process misspecification
+   problem (with Group A/B diagnostic as evidence) → what we do
 2. **Results** (~2,500 w):
-   - Stage 1: Which countries will expand? (political economy of PA supply)
-   - Stage 2: Where? SHAP driver story across 3 continents
-   - Forward maps + 30×30 biodiversity gap
-   - Transition risk for investors and central banks
-3. **Methods** (~1,200 w): Two-stage decomposition, lambdarank formulation,
-   evaluation metrics (NDCG, concordance within groups, Stage 1 R²)
-4. **Discussion** (~1,000 w): Political timing vs geographic selection; USA path-
-   dependency as Stage 2 extreme case; limits of the Stage 1 forecast; implications
-   for TNFD/NGFS nature risk frameworks
-5. **Supplement**: Feature dictionary, full regional tables, LOBO, transfer results,
-   backtest vintages, hyperparameters, Group A/B diagnostic from old model
+   - Stage 2: Where will expansion go? SHAP driver story across 3 continents.
+     USA adjacency contrast. Biodiversity gap.
+   - Stage 1: Which countries will expand? (political economy of PA supply —
+     or: macro context, depending on Check B outcome)
+   - Forward maps + 30×30 scenarios (BAU / moderate / compliant)
+   - Transition risk exposure estimates for investors
+3. **Methods** (~1,200 w): Group A/B diagnostic. Two-stage decomposition.
+   LambdaRank formulation. NDCG within groups. Stage 1 Poisson panel.
+   COP15 structural break handling. Forward spatial aggregation.
+4. **Discussion** (~1,000 w): Political timing vs geographic selection; USA
+   path-dependency as Stage 2 extreme case; COP15 extrapolation limits;
+   TNFD/NGFS implications; what a prescriptive model would look like vs this
+   descriptive model.
+5. **Supplement**: Feature dictionary, full regional tables, LOBO, cross-continental
+   transfer, backtest vintages, hyperparameters, Group A/B full diagnostic,
+   `dist_wdpa`-only baseline comparison.
+
+**Note on paper structure**: Stage 2 leads Results, not Stage 1. This protects the
+paper against the scenario where Stage 1 performs modestly — the lead finding is
+still strong regardless.
 
 ---
 
 ## OPEN QUESTIONS
 
-1. **[BLOCKING] Stage 1 political variables**: Which datasets are accessible for
-   government ideology + international commitment indicators? Check ParlGov (EU/OECD
-   coverage good, SA/SE Asia partial) and V-Dem (global coverage). CBD national pledge
-   database is online. Confirm coverage before designing Stage 1 fully.
+1. **[RESOLVED 2026-05-19] Stage 1 political data coverage**: V-Dem v16 +
+   WB WGI confirmed for all three regions. ParlGov dropped (EU/OECD only).
+   See `outputs/data_checks/stage1_political_coverage.json`.
 
-2. **[BLOCKING] LSE financial data**: Elena Almeida / CETEx — what financial datasets
-   are available? Still determines journal ceiling (Nature Finance/JEEM vs GEC/One Earth).
-   Must resolve before finalising manuscript structure.
+2. **[RESOLVED] LSE financial data**: Dropped. Journal target fixed at GEC / One Earth.
 
-3. **LambdaRank label construction**: Binary labels (0/1 designation) work for lambdarank
-   but relevance-graded labels (e.g., larger designations get higher relevance score)
-   might improve Stage 2. Decision: start with binary, upgrade if initial results are weak.
+3. **[BLOCKING — Pre-flight Check A] Within-group sample sizes**: How many
+   country-year groups have ≥ 5 positive transitions? Determines whether annual
+   grouping is viable or whether 2–3 year aggregation is needed for SE Asia.
 
-4. **Stage 1 spatial scale**: Country-level is cleanest. Sub-national (state/province)
-   would be more granular for large countries (Brazil, Indonesia, USA) but requires
-   sub-national political variables. Start with country-level; upgrade if data exists.
+4. **[BLOCKING — Pre-flight Check B] Stage 1 AR baseline R²**: Momentum-only
+   pseudo-R² sets realistic expectations before the full political model is built.
 
-5. **USA Stage 2**: Within-group concordance for USA expected to be near-perfect (pure
-   adjacency effect). Confirm whether this makes USA's Stage 2 model uninformative for
-   the cross-continental SHAP story or whether it strengthens the contrast narrative.
+5. **USA Stage 2**: Near-perfect concordance expected (adjacency). Confirm in
+   local run. If concordance > 0.95, USA Stage 2 is the contrast case; if lower
+   than expected, investigate what other features matter in the USA context.
+
+6. **Graded relevance for LambdaRank**: Start with binary labels. Upgrade to
+   area-weighted relevance (larger designations = higher score) only if initial
+   NDCG@1% < 0.70 after first Euler run.
+
+7. **Sub-national Stage 1**: Country-level is the default. If Check A reveals
+   group sparsity requiring 2–3 year aggregation AND Check B shows low AR R²,
+   investigate whether state-level grouping for Brazil/Indonesia/USA improves
+   Stage 1 fit. This is a fallback, not the plan.
 
 ---
 
@@ -262,24 +442,31 @@ Paper structure:
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| Annual AUC (old approach) | 0.582 | Expected — wrong estimand |
-| 5-year window AUC | 0.93 (test) / 0.56 (Group B) | Wrong estimand, inflated |
-| Stage 1 R² target | 0.5–0.8 | Country-year expansion rate |
-| Stage 2 NDCG@1% target | 0.75–0.90 | Within country-year groups |
-| Stage 2 Lift@1% target | 15–40× within groups | Geographic selection signal |
+| Thesis 5-year AUC (Group A) | 0.9994 | Leakage — memorised |
+| Thesis 5-year AUC (Group B) | 0.5587 | Genuinely unseen — near-random |
+| Annual AUC (old approach) | 0.582 | Correct outcome for a misspecified model |
+| Stage 1 R² target (honest) | 0.40–0.65 | Depends on Check B AR baseline |
+| Stage 2 NDCG@1% target | 0.72–0.88 | Within country-year groups |
+| Stage 2 naïve baseline | TBD (dist_wdpa only) | Must beat by ≥ 5pp |
+| Stage 2 Lift@1% target | 10–35× within groups | Geographic selection signal |
 
 ---
 
-## CURRENT OUTPUT STATUS (as of 2026-05-18)
+## CURRENT OUTPUT STATUS (as of 2026-05-19)
 
 | Artifact | Status | Notes |
 |----------|--------|-------|
-| SA LGBM annual binary training | ✅ Euler (old approach) | AUC 0.582, superseded by two-stage |
+| SA LGBM annual binary | ✅ Euler | AUC 0.582 — misspecified, superseded |
+| Group A/B leakage diagnostic | ✅ complete | SA Group B AUC 0.5587 confirmed |
 | W0 feature guard | ✅ complete | 9 smoke tests pass |
 | W1 hazard code | ✅ code complete | Needs lambdarank change before rerun |
 | W3 PA momentum | ✅ code complete | Needs feature_engineering rerun on Euler |
-| Stage 1 expansion model | ❌ not started | First task next session |
-| Stage 2 lambdarank model | ❌ not started | Second task next session |
+| Stage 1 political data coverage | ✅ complete | V-Dem + WGI confirmed |
+| **Pre-flight Check A** (group sizes) | ❌ not started | Run before Stage 2 design locked |
+| **Pre-flight Check B** (AR baseline) | ❌ not started | Run before Stage 1 coding begins |
+| Stage 1 expansion model | ❌ not started | After Check B |
+| Stage 2 lambdarank model | ❌ not started | After Check A |
+| dist_wdpa naïve baseline | ❌ not started | Run before full Stage 2 Euler run |
 | All Euler reruns | ❌ pending | After local implementation confirmed |
 
 ---
@@ -296,15 +483,14 @@ Paper structure:
 
 ### Paper 1 — This paper
 
-**Journals (ordered)**: GEC / One Earth → Nature Sustainability → Nature Finance (if
-LSE data) / JEEM (if LSE data).
+**Journals (ordered)**: GEC / One Earth → Nature Sustainability → JEEM.
 
-**One-sentence pitch**: "A two-stage model of PA expansion separates the predictable
-geographic selection of conservation candidates from the unpredictable political timing
-of designation, enabling credible 30×30 forward scenarios and transition risk
-quantification for investors and central banks."
+**One-sentence pitch**: "A two-stage model of protected area designation separates
+the predictable geographic selection of conservation candidates from the politically-
+timed expansion decision, enabling credible 30×30 forward scenarios and transition
+risk quantification for agricultural investors and central banks."
 
-### Paper 2 — Methods / Prediction (AFTER P1 SUBMITTED)
+### Paper 2 — Methods / Embeddings (AFTER P1 SUBMITTED)
 
 **Target**: Nature Sustainability / PNAS / Nature Machine Intelligence.
 **Pitch**: Foundation model embeddings improve Stage 2 cross-regional transfer.
@@ -317,4 +503,6 @@ quantification for investors and central banks."
 - Colombia: supplement only
 - Tropical Africa: no data pipeline
 - Embeddings / Paper 2: blocked until P1 submitted
-- Single-model global AUC as primary metric: rejected (wrong estimand)
+- Single-model global AUC as primary metric: rejected (wrong estimand, proven empirically)
+- Graded LambdaRank labels: fallback only if binary NDCG@1% < 0.70
+- Sub-national Stage 1: fallback only if country-level Check B baseline is very weak
