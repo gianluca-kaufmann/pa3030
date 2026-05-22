@@ -58,7 +58,7 @@ def attach_political_covariates(cy: pd.DataFrame) -> pd.DataFrame:
     cy["cbd_meeting_year"] = cy["year"].isin(CBD_MEETING_YEARS).astype(int)
 
     shared = _ROOT / "data" / "shared"
-    vdem = _load_csv(shared / "vdem_v16.csv", ["iso3", "year", "v2x_polyarchy"])
+    vdem = _load_csv(shared / "vdem_v15.csv", ["iso3", "year", "v2x_polyarchy"])
     if vdem is not None:
         cy = cy.merge(vdem[["iso3", "year", "v2x_polyarchy"]], on=["iso3", "year"], how="left")
 

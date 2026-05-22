@@ -58,18 +58,23 @@ def country_ids_for_rows(df: pd.DataFrame, country_raster: np.ndarray) -> np.nda
 
 
 def resolve_panel_path(region: str) -> Path:
-    """Locate merged_panel_final.parquet for *region* (SCRATCH first)."""
+    """Locate merged_panel_final.parquet for *region* (SCRATCH first).
+
+    On Euler panels live at $SCRATCH/data/{region}/ml/; locally they may
+    also appear under outputs/{region}/results/ (legacy location).
+    """
     root = repo_root()
     scratch = scratch_root()
-    rel = f"outputs/{region}/results/merged_panel_final.parquet"
+    candidates: list[Path] = []
     if scratch is not None:
-        candidate = scratch / rel
+        candidates.append(scratch / f"data/{region}/ml/merged_panel_final.parquet")
+        candidates.append(scratch / f"outputs/{region}/results/merged_panel_final.parquet")
+    candidates.append(root / f"outputs/{region}/results/merged_panel_final.parquet")
+    candidates.append(root / f"data/{region}/ml/merged_panel_final.parquet")
+    for candidate in candidates:
         if candidate.exists():
             return candidate
-    candidate = root / rel
-    if candidate.exists():
-        return candidate
     raise FileNotFoundError(
-        f"merged_panel_final.parquet not found for region={region!r}. "
-        f"Searched: {scratch / rel if scratch else '(no SCRATCH)'}, {candidate}"
+        f"merged_panel_final.parquet not found for region={region!r}. Searched:\n  "
+        + "\n  ".join(str(c) for c in candidates)
     )

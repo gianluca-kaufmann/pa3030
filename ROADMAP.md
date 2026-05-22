@@ -80,7 +80,7 @@ has many country-years at zero and occasional large spikes) with:
 - 30×30 commitment dummy (post-COP15 2023+)
 - CBD meeting year dummies (known dates)
 - GDP per capita, agricultural land % (WB WDI)
-- Democracy index (V-Dem v16: `v2x_polyarchy`, annual, 1900–2025)
+- Democracy index (V-Dem v15: `v2x_polyarchy`, annual, 1789–2024; v16 not downloaded but identical for 2001–2019 training window)
 - Government effectiveness (WB WGI: `GOV_WGI_GE.EST`, annual, 1996–2024)
 - Note: ParlGov DROPPED — EU/OECD only, no coverage for SA or SE Asia
 
@@ -310,8 +310,8 @@ infrastructure, calibration, backtest machinery, SHAP computation, existing spli
 
 ### Implementation order
 
-0. ~~**Verify Stage 1 political data coverage**~~ **[DONE 2026-05-19]**
-   V-Dem v16 + WB WGI confirmed for all three regions. ParlGov dropped.
+0. ~~**Verify Stage 1 political data coverage**~~ **[DONE 2026-05-22]**
+   V-Dem v15 + WB WGI + WB WDI downloaded. ParlGov dropped. V-Dem corrected to v15.
    See `outputs/data_checks/stage1_political_coverage.json`.
 
 0a. **[BLOCKING] Pre-flight Check A** — within-group sample sizes. Must run before
@@ -355,8 +355,9 @@ Do SA first; SE Asia second.
 Designation is constrained by land ownership, not just biophysics. Public and
 indigenous lands are the path of least political resistance. SA tractable via RAISG.
 
-**Political variables** (V-Dem v16, WB WGI, WDI): Already confirmed. Download and
-format as country-year panel for Stage 1 script. Small datasets, low effort.
+**Political variables** (V-Dem v15, WB WGI, WDI): Downloaded and formatted 2026-05-22.
+`data/shared/vdem_v15.csv`, `data/shared/wgi.csv`, `data/shared/wdi.csv` ready.
+Note: V-Dem v15 used (v16 not on cluster; identical for 2001–2019 window). BRN not in V-Dem v15 — null in panel.
 
 ### W3 — PA momentum [✅ code complete; Euler feature_engineering rerun needed]
 
@@ -410,9 +411,10 @@ still strong regardless.
 
 ## OPEN QUESTIONS
 
-1. **[RESOLVED 2026-05-19] Stage 1 political data coverage**: V-Dem v16 +
-   WB WGI confirmed for all three regions. ParlGov dropped (EU/OECD only).
-   See `outputs/data_checks/stage1_political_coverage.json`.
+1. **[RESOLVED 2026-05-22] Stage 1 political data coverage**: V-Dem v15 + WB WGI +
+   WB WDI downloaded and formatted. ParlGov dropped (EU/OECD only). V-Dem corrected
+   from v16 to v15 (identical for 2001–2019 window). BRN missing from V-Dem (null
+   in panel, acceptable). See `outputs/data_checks/stage1_political_coverage.json`.
 
 2. **[RESOLVED] LSE financial data**: Dropped. Journal target fixed at GEC / One Earth.
 
