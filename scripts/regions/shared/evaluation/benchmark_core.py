@@ -221,8 +221,129 @@ def run_benchmark(
     )
 
 
+def _find_latest_stage2_metrics_file(
+    config: ModelEvalConfig,
+    split_version: str = "main",
+) -> Path:
+    pattern = f"{config.model_id}_lgbm_stage2_metrics_*.json"
+    ts_re = re.compile(
+        rf"{re.escape(config.model_id)}_lgbm_stage2_metrics_(\d{{8}}_\d{{6}})\.json"
+    )
+    repo_metrics_root = config.repo_root / f"outputs/{config.region}/results/ml_models"
+    candidates = [
+        config.metrics_root / split_version,
+        config.metrics_root,
+        repo_metrics_root / split_version,
+        repo_metrics_root,
+    ]
+    search_dirs: list[Path] = []
+    seen: set[Path] = set()
+    for cand in candidates:
+        resolved = cand.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        search_dirs.append(cand)
+
+    def key(path: Path):
+        m = ts_re.match(path.name)
+        if m:
+            try:
+                dt = datetime.strptime(m.group(1), "%Y%m%d_%H%M%S")
+                return (dt, 0.0)
+            except ValueError:
+                pass
+        return (datetime.fromtimestamp(0), path.stat().st_mtime)
+
+    for output_dir in search_dirs:
+        if not output_dir.exists():
+            continue
+        files = list(output_dir.glob(pattern))
+        if files:
+            return max(files, key=key)
+    searched = ", ".join(str(p) for p in search_dirs)
+    raise FileNotFoundError(
+        f"No Stage 2 metrics files found matching {pattern}. Searched: {searched}"
+    )
+
+
+def _create_stage2_benchmark_json(
+    metrics_data: Dict[str, Any],
+    dataset_hash: str,
+    source_metrics_filename: str,
+) -> Dict[str, Any]:
+    metadata = metrics_data.get("metadata", {})
+    test_perf = metrics_data.get("test_performance", {})
+    model_params = metrics_data.get("model_parameters", {})
+    temporal_split = metrics_data.get("temporal_split", {})
+
+    benchmark = {
+        "schema_version": "1.0.0",
+        "benchmark_metadata": {
+            "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "source_metrics_file": source_metrics_filename,
+            "model": metadata.get("model", "LightGBM_LambdaRank"),
+            "task": metadata.get("task", "stage2_geographic_selection"),
+            "target_column": metadata.get("target_column", "transition_01"),
+            "variant": metadata.get("variant", "full"),
+        },
+        "dataset": {"hash": dataset_hash, "temporal_split": temporal_split},
+        "model_config": {
+            "n_features": metadata.get("n_features", 0),
+            "features": metadata.get("features", []),
+            "hyperparameters": model_params,
+            "group_cols": metadata.get("group_cols", ["country_id", "year"]),
+        },
+        "evaluative_metrics": {"test_performance": test_perf},
+        "performance_summary": {
+            "test_ndcg_at_1pct": test_perf.get("ndcg_at_1pct"),
+            "test_ndcg_at_5pct": test_perf.get("ndcg_at_5pct"),
+            "test_concordance_within_groups": test_perf.get(
+                "concordance_index_within_groups"
+            ),
+            "test_lift_at_1pct_within_groups": test_perf.get("lift_at_1pct_within_groups"),
+        },
+    }
+    return benchmark
+
+
+def run_stage2_benchmark(
+    config: ModelEvalConfig,
+    split_version: str = "main",
+) -> BenchmarkResult:
+    """Benchmark wrapper for Stage 2 LambdaRank metrics JSON."""
+    metrics_path = _find_latest_stage2_metrics_file(config, split_version=split_version)
+    metrics_data = _load_metrics_file(metrics_path)
+    dataset_hash = compute_dataset_hash(config, split_version=split_version)
+    benchmark_dict = _create_stage2_benchmark_json(
+        metrics_data=metrics_data,
+        dataset_hash=dataset_hash,
+        source_metrics_filename=metrics_path.name,
+    )
+    metrics_parent = metrics_path.parent
+    if metrics_parent.name == split_version:
+        metrics_root_used = metrics_parent.parent
+    else:
+        metrics_root_used = metrics_parent
+    benchmark_output_dir = metrics_root_used / split_version
+    benchmark_output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    benchmark_path = (
+        benchmark_output_dir / f"{config.model_id}_lgbm_stage2_benchmark_{timestamp}.json"
+    )
+    with benchmark_path.open("w") as f:
+        json.dump(benchmark_dict, f, indent=2)
+    return BenchmarkResult(
+        benchmark=benchmark_dict,
+        metrics_path=metrics_path,
+        benchmark_path=benchmark_path,
+        dataset_hash=dataset_hash,
+    )
+
+
 __all__ = [
     "BenchmarkResult",
     "run_benchmark",
+    "run_stage2_benchmark",
 ]
 

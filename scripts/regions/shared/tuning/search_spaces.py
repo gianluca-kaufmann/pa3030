@@ -160,3 +160,23 @@ def compute_auto_scale_pos_weight(y: np.ndarray) -> float:
     pos = float((y > 0).sum())
     neg = float((y == 0).sum())
     return float(neg / max(pos, 1.0))
+
+
+def get_lgbm_stage2_fixed_params(random_state: int, n_jobs: int) -> Dict:
+    """Fixed LightGBM params for Stage 2 LambdaRank tuning/training."""
+    return {
+        "random_state": random_state,
+        "n_jobs": n_jobs,
+        "boosting_type": "gbdt",
+        "objective": "lambdarank",
+        "metric": "ndcg",
+        "verbose": -1,
+        "lambdarank_truncation_level": 5,
+    }
+
+
+def get_lgbm_stage2_optuna_bounds(mode: str) -> Dict:
+    """Optuna bounds for Stage 2 (no scale_pos_weight)."""
+    base = get_lgbm_optuna_bounds(mode, auto_scale_pos_weight=1.0)
+    base["lambdarank_truncation_level"] = (2, 10)
+    return base

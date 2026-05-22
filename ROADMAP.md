@@ -2,7 +2,7 @@
 
 **Purpose**: Authoritative planning document. Keep compact and updated after every session.
 **Status**: Post-thesis. Paper branch active. Architecture decision made (2026-05-18).
-**Target**: GEC / One Earth (base case). Nature Sustainability if Stage 1 R² ≥ 0.55 and Stage 2 NDCG@1% ≥ 0.80.
+**Target**: Nature/Science if Stage 1 R² ≥ 0.55 and Stage 2 NDCG@1% ≥ 0.80.
 
 ---
 
@@ -462,12 +462,15 @@ still strong regardless.
 | W1 hazard code | ✅ code complete | Needs lambdarank change before rerun |
 | W3 PA momentum | ✅ code complete | Needs feature_engineering rerun on Euler |
 | Stage 1 political data coverage | ✅ complete | V-Dem + WGI confirmed |
-| **Pre-flight Check A** (group sizes) | ❌ not started | Run before Stage 2 design locked |
-| **Pre-flight Check B** (AR baseline) | ❌ not started | Run before Stage 1 coding begins |
-| Stage 1 expansion model | ❌ not started | After Check B |
-| Stage 2 lambdarank model | ❌ not started | After Check A |
-| dist_wdpa naïve baseline | ❌ not started | Run before full Stage 2 Euler run |
-| All Euler reruns | ❌ pending | After local implementation confirmed |
+| **Pre-flight Check A** (group sizes) | ✅ code ready | `scripts/regions/shared/stage2_group_size_check.py` — run on Euler panels |
+| **Pre-flight Check B** (AR baseline) | ✅ code ready | `scripts/regions/south_america/5_training/stage1_ar_baseline.py` |
+| Stage 1 expansion model | ✅ code ready | `stage1_data_builder.py`, `model1_expansion.py` — needs political CSVs + panel |
+| Stage 2 lambdarank model | ✅ code ready | `model{1,2,3}_LGBM_stage2` + `shared/training/stage2_lgbm_core.py` |
+| dist_wdpa naïve baseline | ✅ code ready | `model1_LGBM_stage2_naive` |
+| `country_id` in panels | ✅ code ready | feature_engineering keeps column; **Euler FE rerun required** |
+| Stage 2 tuning / SLURM | ✅ code ready | `tuning_lgbm_stage2.slurm` × 3 regions |
+| Two-stage forward predict | ✅ code ready | `two_stage_predict_core.py`; set `PA3030_FORWARD_TWO_STAGE=1` |
+| All Euler reruns | ❌ pending | FE rerun + Stage 2 train/tune after Checks A/B pass |
 
 ---
 

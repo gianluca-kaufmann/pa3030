@@ -301,6 +301,14 @@ def run_inference(
 
 
 def main() -> None:
+    if os.environ.get("PA3030_FORWARD_TWO_STAGE", "").strip().lower() in {"1", "true", "yes"}:
+        from scripts.regions.shared.forward.two_stage_predict_core import (  # noqa: WPS433
+            run_two_stage_inference,
+        )
+
+        run_two_stage_inference()
+        return
+
     # Re-import config after runner.py reload
     from scripts.regions.shared.forward.config import (  # noqa: F401
         DATA_SUBDIR,

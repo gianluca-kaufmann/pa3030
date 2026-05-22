@@ -578,5 +578,31 @@ class TestFeatureGuard:
         check(["elevation_b1", "year"], context="unit/override", forbidden=FORBIDDEN_COLS - {"year"})
 
 
+class TestStage2Metrics:
+    """Stage 2 within-group NDCG / concordance metrics."""
+
+    def test_ndcg_perfect_ranking(self):
+        from scripts.regions.shared.evaluation.stage2_metrics import (
+            compute_stage2_metrics,
+        )
+
+        y = np.array([0, 0, 1, 0, 1, 0], dtype=np.float64)
+        scores = np.array([0.1, 0.2, 0.9, 0.3, 0.8, 0.4], dtype=np.float64)
+        groups = np.array([3, 3], dtype=np.int32)
+        m = compute_stage2_metrics(y, scores, groups)
+        assert m["ndcg_at_1pct"] >= 0.99
+
+    def test_concordance_perfect(self):
+        from scripts.regions.shared.evaluation.stage2_metrics import (
+            concordance_within_groups,
+        )
+
+        y = np.array([0, 1, 0, 1], dtype=np.float64)
+        scores = np.array([0.1, 0.9, 0.2, 0.8], dtype=np.float64)
+        groups = np.array([2, 2], dtype=np.int32)
+        c = concordance_within_groups(y, scores, groups)
+        assert c == pytest.approx(1.0)
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
