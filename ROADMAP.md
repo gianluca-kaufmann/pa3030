@@ -205,38 +205,58 @@ their recent published work.
 
 ## PRE-FLIGHT CHECKS (blocking — complete before writing Stage 1 or Stage 2 code)
 
-These two checks take ≤ 1 day and determine whether the design requires adjustment
-before implementation begins. Do not skip them.
+~~These two checks take ≤ 1 day and determine whether the design requires adjustment
+before implementation begins. Do not skip them.~~
 
-### Check A — Within-group sample sizes (Stage 2 viability)
+**[BOTH CHECKS COMPLETE 2026-05-22]** — all three regions cleared. Stage 2 annual
+grouping confirmed viable. Stage 1 is illustrative macro context (not primary forecast).
+See `outputs/data_checks/stage2_group_sizes.json` and `stage1_ar_baseline.json`.
 
-Query the existing parquet panels and count, per `(country_id, year)`, the number
-of positive transitions. Report: distribution of group sizes, number of groups with
-≥ 5 positives, ≥ 10 positives, median group size. LambdaRank requires multiple
-positives per group to learn meaningful rankings.
+### Check A — Within-group sample sizes (Stage 2 viability) ✅ DONE
 
-**Decision rule**:
-- Median group positives ≥ 5 across all regions → proceed as designed (annual groups)
-- Median group positives 2–4 → aggregate to 2–3 year windows before grouping
-- Median group positives < 2 → Stage 2 group definition needs rethinking; escalate
+**Results (2026-05-22)**:
 
-Script: `scripts/regions/shared/stage2_group_size_check.py` (to be written, ~30 lines).
+| Region | Expansion groups | Median positives | ≥5 positives | ≥10 positives | Decision |
+|--------|-----------------|-----------------|--------------|---------------|---------|
+| South America | 222 / 325 total | 774 | 217 | 211 | ✅ proceed_annual_groups |
+| USA | 24 / 25 total | 2,709 | 24 | 24 | ✅ proceed_annual_groups |
+| SE Asia | 136 / 275 total | 476 | 131 | 130 | ✅ proceed_annual_groups |
 
-### Check B — Stage 1 autoregressive baseline
+Median group positives are 476–2,709 across regions — far above the ≥ 5 threshold.
+Stage 2 LambdaRank with `(country_id, year)` annual groups is confirmed viable.
+No aggregation to multi-year windows needed.
 
-Before building the full political panel model, fit a simple Poisson regression with
-PA momentum lags 1–3 only (no political variables). Report pseudo-R² and RMSE.
-This is the baseline Stage 1 must beat; it also calibrates R² expectations.
+Script: `scripts/regions/shared/stage2_group_size_check.py`.
 
-**Decision rule**:
-- Momentum-only pseudo-R² ≥ 0.50 → adding V-Dem + WGI can push total to 0.55–0.65;
-  Stage 1 is a credible macro model
-- Momentum-only pseudo-R² 0.30–0.50 → Stage 1 framed as illustrative context,
-  not a forecast; paper lead stays on Stage 2
-- Momentum-only pseudo-R² < 0.30 → Stage 1 expansion is dominated by noise;
-  drop Stage 1 from main results, include as supplement or Discussion
+### Check B — Stage 1 autoregressive baseline ✅ DONE
 
-Script: `scripts/regions/south_america/5_training/stage1_ar_baseline.py` (~50 lines).
+**Results (2026-05-22)** — South America, train 2001–2013, 169 country-years, 13 countries:
+
+| Metric | Value |
+|--------|-------|
+| Momentum-only D² (deviance R²) | **0.415** |
+| RMSE | 33,942 pixels |
+| Mean expansion | 10,573 pixels/country-year |
+| lag1 coefficient (std.) | +0.261 |
+| lag2 coefficient (std.) | +0.231 |
+| lag3 coefficient (std.) | +0.252 |
+| **Decision** | **illustrative_context** |
+
+D² = 0.415 falls in the 0.30–0.50 band: **Stage 1 is illustrative macro context,
+not a standalone forecast.** Paper lead stays on Stage 2. Adding V-Dem + WGI + WDI
+may push D² above 0.50 — run the full political model to find out.
+
+Note: metric is D² (deviance-based), not McFadden pseudo-R². McFadden formula is
+incorrect for Poisson with large counts (LL > 0 inverts the sign convention).
+
+Script: `scripts/regions/south_america/5_training/stage1_ar_baseline.py`.
+
+**Bugs fixed during Check B run (2026-05-22)**:
+1. `stage1_panel.py`: momentum lags used `transform("sum")` (all-time total, constant
+   within country) instead of `shift(lag)` on annual expansion — lags were degenerate.
+2. `stage1_ar_baseline.py`: pixel counts up to 346k caused Poisson log-link overflow
+   without feature scaling → added `StandardScaler` before fitting.
+3. `stage1_ar_baseline.py`: replaced broken McFadden formula with `model.score()` (D²).
 
 ---
 
@@ -314,11 +334,11 @@ infrastructure, calibration, backtest machinery, SHAP computation, existing spli
    V-Dem v15 + WB WGI + WB WDI downloaded. ParlGov dropped. V-Dem corrected to v15.
    See `outputs/data_checks/stage1_political_coverage.json`.
 
-0a. **[BLOCKING] Pre-flight Check A** — within-group sample sizes. Must run before
-    Stage 2 design is locked.
+0a. ~~**[BLOCKING] Pre-flight Check A**~~ **[DONE 2026-05-22]** — annual groups viable
+    across all 3 regions (SA median 774, USA 2,709, SE Asia 476 positives/group).
 
-0b. **[BLOCKING] Pre-flight Check B** — Stage 1 AR baseline (momentum lags only).
-    Sets realistic R² expectations before building full political model.
+0b. ~~**[BLOCKING] Pre-flight Check B**~~ **[DONE 2026-05-22]** — momentum-only D² = 0.415.
+    Stage 1 = illustrative context. Full political model next.
 
 1. Implement Stage 1 locally (SA first) — full political panel model
 
@@ -418,12 +438,11 @@ still strong regardless.
 
 2. **[RESOLVED] LSE financial data**: Dropped. Journal target fixed at GEC / One Earth.
 
-3. **[BLOCKING — Pre-flight Check A] Within-group sample sizes**: How many
-   country-year groups have ≥ 5 positive transitions? Determines whether annual
-   grouping is viable or whether 2–3 year aggregation is needed for SE Asia.
+3. **[RESOLVED 2026-05-22] Within-group sample sizes**: All three regions pass
+   annual grouping threshold. SA median 774, USA 2,709, SE Asia 476 positives/group.
 
-4. **[BLOCKING — Pre-flight Check B] Stage 1 AR baseline R²**: Momentum-only
-   pseudo-R² sets realistic expectations before the full political model is built.
+4. **[RESOLVED 2026-05-22] Stage 1 AR baseline D²**: Momentum-only D² = 0.415
+   → illustrative context zone. Full political model (V-Dem + WGI + WDI) is next.
 
 5. **USA Stage 2**: Near-perfect concordance expected (adjacency). Confirm in
    local run. If concordance > 0.95, USA Stage 2 is the contrast case; if lower
@@ -447,7 +466,8 @@ still strong regardless.
 | Thesis 5-year AUC (Group A) | 0.9994 | Leakage — memorised |
 | Thesis 5-year AUC (Group B) | 0.5587 | Genuinely unseen — near-random |
 | Annual AUC (old approach) | 0.582 | Correct outcome for a misspecified model |
-| Stage 1 R² target (honest) | 0.40–0.65 | Depends on Check B AR baseline |
+| Stage 1 momentum-only D² (Check B) | 0.415 | Illustrative context zone (0.30–0.50) |
+| Stage 1 R² target (honest) | 0.40–0.65 | Depends on full political model |
 | Stage 2 NDCG@1% target | 0.72–0.88 | Within country-year groups |
 | Stage 2 naïve baseline | TBD (dist_wdpa only) | Must beat by ≥ 5pp |
 | Stage 2 Lift@1% target | 10–35× within groups | Geographic selection signal |
@@ -464,8 +484,8 @@ still strong regardless.
 | W1 hazard code | ✅ code complete | Needs lambdarank change before rerun |
 | W3 PA momentum | ✅ code complete | Needs feature_engineering rerun on Euler |
 | Stage 1 political data coverage | ✅ complete | V-Dem + WGI confirmed |
-| **Pre-flight Check A** (group sizes) | ✅ code ready | `scripts/regions/shared/stage2_group_size_check.py` — run on Euler panels |
-| **Pre-flight Check B** (AR baseline) | ✅ code ready | `scripts/regions/south_america/5_training/stage1_ar_baseline.py` |
+| **Pre-flight Check A** (group sizes) | ✅ complete | SA 774, USA 2709, SEA 476 median positives — annual groups confirmed |
+| **Pre-flight Check B** (AR baseline) | ✅ complete | Momentum-only D² = 0.415 — illustrative context |
 | Stage 1 expansion model | ✅ code ready | `stage1_data_builder.py`, `model1_expansion.py` — needs political CSVs + panel |
 | Stage 2 lambdarank model | ✅ code ready | `model{1,2,3}_LGBM_stage2` + `shared/training/stage2_lgbm_core.py` |
 | dist_wdpa naïve baseline | ✅ code ready | `model1_LGBM_stage2_naive` |

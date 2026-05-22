@@ -56,10 +56,9 @@ def build_country_year_panel(
         for k, v in accum.items()
     ]
     cy = pd.DataFrame(rows).sort_values(["country_id", "year"]).reset_index(drop=True)
-    cy["pa_momentum_pixels"] = cy.groupby("country_id")["pa_expansion_pixels"].transform("sum")
     for lag in LAG_YEARS:
         cy[f"pa_momentum_pixels_lag{lag}"] = (
-            cy.groupby("country_id")["pa_momentum_pixels"]
+            cy.groupby("country_id")["pa_expansion_pixels"]
             .shift(lag)
             .fillna(0)
             .astype(np.float64)

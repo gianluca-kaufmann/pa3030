@@ -4,7 +4,11 @@
 Fits a Poisson GLM: pa_expansion_pixels ~ lag1 + lag2 + lag3 at country-year level.
 Momentum lags are computed directly from panel aggregates (no feature_engineering rerun).
 
-ROADMAP decision rule (pseudo-R² on expansion counts):
+Metric: D² (deviance-based pseudo-R²) via sklearn model.score().
+McFadden pseudo-R² is NOT used: it assumes LL ≤ 0 (logistic), but Poisson LL on
+large counts is positive, which inverts the sign convention.
+
+ROADMAP decision rule (D² on expansion counts):
   - >= 0.50  -> full political model likely credible
   - 0.30-0.50 -> Stage 1 illustrative context; paper lead stays on Stage 2
   - < 0.30   -> Stage 1 dominated by noise; supplement or Discussion only
@@ -29,6 +33,7 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import PoissonRegressor
 from sklearn.metrics import mean_squared_error
+from sklearn.preprocessing import StandardScaler
 
 # Bootstrap repo root
 def _repo_root() -> Path:
@@ -59,40 +64,30 @@ def _decision_rule(pseudo_r2: float) -> str:
     return "supplement_or_discussion_only"
 
 
-def _poisson_log_likelihood(y: np.ndarray, mu: np.ndarray) -> float:
-    mu = np.clip(mu, 1e-9, None)
-    y = np.asarray(y, dtype=np.float64)
-    return float(np.sum(y * np.log(mu) - mu))
-
-
-def _mcfadden_pseudo_r2(y: np.ndarray, mu: np.ndarray, mu_null: np.ndarray) -> float:
-    ll = _poisson_log_likelihood(y, mu)
-    ll0 = _poisson_log_likelihood(y, mu_null)
-    if ll0 == 0:
-        return float("nan")
-    return 1.0 - ll / ll0
-
-
 def fit_ar_baseline(cy: pd.DataFrame) -> dict:
     """Poisson regression with momentum lags only."""
     feature_cols = [f"pa_momentum_pixels_lag{lag}" for lag in (1, 2, 3)]
     cy = cy.dropna(subset=feature_cols)
-    X = cy[feature_cols].to_numpy(dtype=np.float64)
+    X_raw = cy[feature_cols].to_numpy(dtype=np.float64)
     y = cy["pa_expansion_pixels"].to_numpy(dtype=np.float64)
+
+    # Pixel counts reach ~350k; without scaling exp() overflows in the Poisson log-link
+    scaler = StandardScaler()
+    X = scaler.fit_transform(X_raw)
 
     model = PoissonRegressor(alpha=0.0, max_iter=500)
     model.fit(X, y)
-    mu = np.clip(model.predict(X), 1e-9, None)
-    mu_null = np.full_like(y, y.mean())
 
-    pseudo_r2 = _mcfadden_pseudo_r2(y, mu, mu_null)
+    # D² (deviance-based pseudo-R²): correct for Poisson; sklearn model.score() returns this
+    pseudo_r2 = float(model.score(X, y))
+    mu = np.clip(model.predict(X), 1e-9, None)
     rmse = float(np.sqrt(mean_squared_error(y, mu)))
 
     return {
         "n_country_years": int(len(cy)),
         "n_countries": int(cy["country_id"].nunique()),
         "year_range": [int(cy["year"].min()), int(cy["year"].max())],
-        "pseudo_r2_mcfadden": pseudo_r2,
+        "pseudo_r2_d2": pseudo_r2,
         "rmse": rmse,
         "mean_expansion_pixels": float(y.mean()),
         "coefficients": {
@@ -123,7 +118,7 @@ def main() -> None:
     result["panel_path"] = str(panel_path)
     result["train_years"] = list(TRAIN_YEARS)
 
-    print(f"McFadden pseudo-R²: {result['pseudo_r2_mcfadden']:.4f}")
+    print(f"D² (deviance pseudo-R²): {result['pseudo_r2_d2']:.4f}")
     print(f"RMSE: {result['rmse']:.4f}")
     print(f"DECISION: {result['decision_rule']}")
     print("Coefficients:", result["coefficients"])
