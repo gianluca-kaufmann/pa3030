@@ -22,3 +22,7 @@ echo "Starting model1_LGBM_stage2..."
 srun --cpu-bind=cores --distribution=block:block python -u \
   scripts/regions/south_america/5_training/model1_LGBM_stage2
 echo "Done."
+
+echo "Starting naive baseline (dist_wdpa only)..."
+python -u scripts/regions/south_america/5_training/model1_LGBM_stage2_naive
+echo "Naive baseline done."

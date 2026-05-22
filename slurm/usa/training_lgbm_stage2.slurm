@@ -16,3 +16,7 @@ source "$HOME/venvs/master_thesis/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
 python -u scripts/regions/usa/5_training/model2_LGBM_stage2
+
+echo "Starting naive baseline (dist_wdpa only)..."
+python -u scripts/regions/usa/5_training/model2_LGBM_stage2_naive
+echo "Naive baseline done."

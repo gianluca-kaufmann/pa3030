@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import PoissonRegressor
 from sklearn.metrics import mean_squared_error
+from sklearn.preprocessing import StandardScaler
 
 _ROOT = Path(__file__).resolve().parents[4]
 if str(_ROOT) not in sys.path:
@@ -30,13 +31,6 @@ POLITICAL_COLS = [
 ]
 
 
-def _mcfadden_pseudo_r2(y: np.ndarray, mu: np.ndarray, mu_null: np.ndarray) -> float:
-    eps = 1e-9
-    ll = np.sum(y * np.log(mu + eps) - mu)
-    ll0 = np.sum(y * np.log(mu_null + eps) - mu_null)
-    return 1.0 - ll / ll0 if ll0 != 0 else float("nan")
-
-
 def main() -> None:
     if not PANEL_PATH.exists():
         raise FileNotFoundError(
@@ -48,21 +42,25 @@ def main() -> None:
     feature_cols = [c for c in LAG_COLS + POLITICAL_COLS if c in cy.columns]
     cy[feature_cols] = cy[feature_cols].fillna(0)
 
-    X = cy[feature_cols].to_numpy(dtype=np.float64)
+    X_raw = cy[feature_cols].to_numpy(dtype=np.float64)
     y = cy["pa_expansion_pixels"].to_numpy(dtype=np.float64)
+
+    # Scale to prevent log-link overflow on large pixel counts (up to ~350k)
+    scaler = StandardScaler()
+    X = scaler.fit_transform(X_raw)
 
     model = PoissonRegressor(alpha=0.0, max_iter=1000)
     model.fit(X, y)
+    # D² (deviance-based pseudo-R²): correct for Poisson; model.score() returns this
+    pseudo_r2 = float(model.score(X, y))
     mu = np.clip(model.predict(X), 1e-9, None)
-    mu_null = np.full_like(y, y.mean())
-    pseudo_r2 = _mcfadden_pseudo_r2(y, mu, mu_null)
     rmse = float(np.sqrt(mean_squared_error(y, mu)))
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     result = {
         "region": "south_america",
         "model": "poisson_glm",
-        "pseudo_r2_mcfadden": pseudo_r2,
+        "pseudo_r2_d2": pseudo_r2,
         "rmse": rmse,
         "n_country_years": int(len(cy)),
         "feature_cols": feature_cols,
@@ -71,7 +69,7 @@ def main() -> None:
     }
     out_path = OUT_DIR / "model1_expansion_coefficients.json"
     out_path.write_text(json.dumps(result, indent=2))
-    print(f"Stage 1 Poisson GLM pseudo-R²: {pseudo_r2:.4f}, RMSE: {rmse:.4f}")
+    print(f"Stage 1 Poisson GLM D²: {pseudo_r2:.4f}, RMSE: {rmse:.4f}")
     print(f"Saved: {out_path}")
 
 
