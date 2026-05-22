@@ -1,15 +1,15 @@
 ================================================================================
 MERGED PANEL DATASET VALIDATION REPORT
 ================================================================================
-Report generated: 2026-02-27 13:43:21
+Report generated: 2026-05-16 23:26:11
 Source file: merged_panel_final.parquet
-Data computed: 2026-02-27 13:38:53
+Data computed: 2026-05-16 23:25:50
 ================================================================================
 
 1. DATASET DIMENSIONS
 --------------------------------------------------------------------------------
 Total rows: 413,722,039
-Total columns: 80
+Total columns: 82
 Number of row groups: 409
 
 2. COLUMN INFORMATION
@@ -48,7 +48,6 @@ WorldClim_b16                                      FLOAT
 WorldClim_b17                                      FLOAT                         
 WorldClim_b18                                      FLOAT                         
 WorldClim_b19                                      FLOAT                         
-WDPA                                               FLOAT                         
 deforestation_b1                                   FLOAT                         
 deforestation_b2                                   FLOAT                         
 deforestation_b3                                   FLOAT                         
@@ -96,8 +95,11 @@ GSN_b4_smooth64                                    FLOAT
 GSN_b5_smooth16                                    FLOAT                         
 GSN_b5_smooth64                                    FLOAT                         
 transition_01                                      INT32                         
+pa_momentum_pixels_lag1                            DOUBLE                        
+pa_momentum_pixels_lag2                            DOUBLE                        
+pa_momentum_pixels_lag3                            DOUBLE                        
 
-Numeric columns: 80
+Numeric columns: 82
 
 3. UNIQUE VALUES / STRUCTURE
 --------------------------------------------------------------------------------
@@ -136,6 +138,11 @@ Year       Count                Percentage
 2023       15,722,960           3.80%          
 2024       15,714,838           3.80%          
 
+Note: This is a risk-set panel — rows per year decreases as pixels become
+  protected. The large drop from year 1 to year 2 reflects pre-existing WDPA
+  pixels (year 1 sets WDPA_prev=0 for all; year 2 excludes pixels with WDPA=1
+  in year 1). Subsequent annual attrition reflects new designations each year.
+
 5. UNIQUENESS / BALANCE CHECK
 --------------------------------------------------------------------------------
 Unique pixels: 20,785,671
@@ -144,8 +151,12 @@ Expected rows (pixels × years): 519,641,775
 Actual rows: 413,722,039
 Balanced across years: Yes
 
-⚠ WARNING: Row count mismatch!
-  → 105,919,736 fewer rows than expected (missing data)
+[INFO] Risk-set panel: actual rows < first-year cohort × years.
+  'Unique pixels' equals the year-2000 cohort (all land pixels, since
+  WDPA_prev is forced to 0 for the first year). Pixels leave the panel
+  once designated as protected, so later years are smaller by design.
+  The 105,919,736 'missing' rows are
+  pixels that became protected in prior years — not a data error.
 
 6. MISSING VALUES ANALYSIS
 --------------------------------------------------------------------------------
@@ -183,7 +194,6 @@ WorldClim_b16                                      119,962              0.57%
 WorldClim_b17                                      119,962              0.57%          
 WorldClim_b18                                      119,962              0.57%          
 WorldClim_b19                                      119,962              0.57%          
-WDPA                                               119,962              0.57%          
 deforestation_b1                                   119,962              0.57%          
 deforestation_b2                                   119,962              0.57%          
 deforestation_b3                                   119,962              0.57%          
@@ -191,14 +201,14 @@ GPW                                                119,962              0.57%
 HNTL                                               120,041              0.57%          
 landcover                                          152                  0.00%          
 NDVI                                               119,962              0.57%          
-policy_b1                                          6,644,245            31.70%         
-policy_b2                                          90,283               0.43%          
-policy_b3                                          1,137,592            5.43%          
-policy_b4                                          1,137,592            5.43%          
+policy_b1                                          0                    0.00%           [exact]
+policy_b2                                          0                    0.00%           [exact]
+policy_b3                                          0                    0.00%           [exact]
+policy_b4                                          0                    0.00%           [exact]
 wildfire_b1                                        119,962              0.57%          
 wildfire_b2                                        119,962              0.57%          
 WDPA_prev                                          0                    0.00%          
-economic_value_lag1                                1,300,106            6.20%          
+economic_value_lag1                                20,785,671           5.02%           [exact]
 dist_wdpa                                          0                    0.00%          
 dist_road                                          0                    0.00%          
 dist_oil_gas                                       0                    0.00%          
@@ -231,9 +241,27 @@ GSN_b4_smooth64                                    32                   0.00%
 GSN_b5_smooth16                                    111                  0.00%          
 GSN_b5_smooth64                                    32                   0.00%          
 transition_01                                      0                    0.00%          
+pa_momentum_pixels_lag1                            1,048,576            5.00%          
+pa_momentum_pixels_lag2                            2,097,152            10.01%         
+pa_momentum_pixels_lag3                            3,145,728            15.01%         
 
-Summary: 68 columns have missing values
-Note: Missing value statistics are based on sampled row groups.
+Summary: 66 columns have missing values
+Note: Missing value statistics are based on sampled row groups,
+      except columns marked [exact] which use all row groups.
+
+Known missingness patterns (by design):
+  WDPA_prev        : always 0 in the final panel — risk-set filter invariant
+                     (confirms only unprotected pixels are retained). Expected.
+  economic_value_lag1: NaN for the first panel year (no prior-year lag exists
+                     by design). ~1/n_years fraction of rows affected.
+  policy_b1 (dpi_exec_ideology): was often NaN when DPI `ifs` codes were not
+                     mapped to ISO3; re-run policy preprocessing if needed.
+                     After IFS fix + DPI carry-forward, remaining NaNs are mostly
+                     years before first DPI observation or unmapped execrlc labels.
+  policy_b2 (vdem_ldi): small residual gaps — e.g. territories without a V-Dem
+                     series, or edges of the ffill/bfill grid.
+  policy_b3, policy_b4 (wgi_ge, wgi_rl): WGI is ffill/bfill in policy preprocessing;
+                     residual NaNs usually mean no WGI value for that economy-year.
 
 7. NUMERIC COLUMN STATISTICS
 --------------------------------------------------------------------------------
@@ -253,16 +281,27 @@ GSN_b4                                   0.000000           1.000000           0
 GSN_b5                                   0.000000           2.520000           1.333149          
 powerplants_b2                           0.000000           10.000000          0.000560          
 WorldClim_b1                             -139.210007        292.000000         209.773505        
+  [NOTE] WorldClim bio01 (Annual Mean Temp). Stored in x10 units after
+         pipeline unscaling; divide by 10 for degrees Celsius.
 WorldClim_b2                             -99.471970         303.000000         233.925856        
+  [NOTE] WorldClim bio02 (Mean Diurnal Range). x10 units; divide by 10 for C.
 WorldClim_b3                             -181.293137        285.000000         182.862977        
+  [NOTE] WorldClim bio03 (Isothermality). x10 units.
 WorldClim_b4                             0.000000           11195.200195       1510.117021       
 WorldClim_b5                             0.000000           1284.643677        226.810414        
+  [NOTE] WorldClim bio05 (Max Temp Warmest Month). x10 units; divide by 10 for C.
 WorldClim_b6                             0.000000           740.205811         43.057671         
+  [NOTE] WorldClim bio06 (Min Temp Coldest Month). x10 units; divide by 10 for C.
 WorldClim_b7                             0.000000           228.000000         55.103927         
+  [NOTE] WorldClim bio07 (Temp Annual Range). x10 units; divide by 10 for C.
 WorldClim_b8                             0.000000           3680.579346        618.444220        
+  [NOTE] WorldClim bio08 (Mean Temp Wettest Quarter). x10 units; /10 for C.
 WorldClim_b9                             0.000000           2460.059814        155.258790        
+  [NOTE] WorldClim bio09 (Mean Temp Driest Quarter). x10 units; /10 for C.
 WorldClim_b10                            0.000000           2681.802490        326.805465        
+  [NOTE] WorldClim bio10 (Mean Temp Warmest Quarter). x10 units; /10 for C.
 WorldClim_b11                            0.000000           3114.066650        365.440074        
+  [NOTE] WorldClim bio11 (Mean Temp Coldest Quarter). x10 units; /10 for C.
 WorldClim_b12                            0.000000           211.000000         114.615932        
 WorldClim_b13                            0.000000           95.043678          67.772928         
 WorldClim_b14                            0.000000           6392.553711        2014.711586       
@@ -271,7 +310,6 @@ WorldClim_b16                            -248.261765        239.000000         1
 WorldClim_b17                            0.000000           343.000000         178.561894        
 WorldClim_b18                            -173.261765        292.000000         216.721757        
 WorldClim_b19                            -109.149040        299.568268         199.087685        
-WDPA                                     0.000000           1.000000           0.024084          
 deforestation_b1                         0.000000           100.000000         14.895240         
 deforestation_b2                         0.000000           1.000000           0.016627          
 deforestation_b3                         0.000000           1.000000           0.255704          
@@ -279,14 +317,19 @@ GPW                                      0.000000           44132.015625       2
 HNTL                                     0.000000           63.000000          1.781570          
 landcover                                0.000000           17.000000          7.397877          
 NDVI                                     -1933.000000       9184.000000        5769.756923       
-policy_b1                                -1.000000          1.000000           -0.480836         
-policy_b2                                0.064000           0.847000           0.601073          
-policy_b3                                -1.595954          1.518681           -0.100484         
-policy_b4                                -2.306469          1.297171           -0.379555         
+  [NOTE] Raw MODIS x10000 scale. Divide by 10000 for standard NDVI (-1 to 1).
+         Negative values over water/snow are physically valid.
+policy_b1                                -1.000000          1.000000           -0.279900         
+policy_b2                                0.064000           0.847000           0.601417          
+policy_b3                                -1.595954          1.664408           -0.105621         
+policy_b4                                -2.306469          1.354000           -0.387241         
 wildfire_b1                              0.000000           1153.000000        5.240465          
 wildfire_b2                              0.000000           1.000000           0.024232          
 WDPA_prev                                0.000000           0.000000           0.000000          
+  [NOTE] Always 0 (risk-set invariant — all rows are unprotected pixels).
 dist_wdpa                                1000.000000        5455516.474175     262427.877198     
+  [NOTE] min=1000 m is expected: 1 km grid + risk-set filter => nearest
+         protected pixel is at least 1 grid cell away = 1000 m.
 dist_road                                0.000000           4008092.938044     14410.544741      
 dist_oil_gas                             0.000000           4026286.129922     103192.394049     
 dist_powerplant                          0.000000           4029404.422492     129502.032211     
@@ -298,7 +341,9 @@ elevation_b2_smooth4                     0.000000           40.406570          1
 elevation_b2_smooth16                    0.000000           33.267056          2.008614          
 elevation_b2_smooth64                    0.012867           21.928740          2.046510          
 NDVI_smooth16                            -1608.978516       8812.105469        5762.274969       
+  [NOTE] Spatially smoothed NDVI, still in raw MODIS x10000 scale.
 NDVI_smooth64                            -365.015350        8694.577148        5758.254499       
+  [NOTE] Spatially smoothed NDVI, still in raw MODIS x10000 scale.
 GPW_smooth16                             -0.000000          18218.537109       22.881604         
 GPW_smooth64                             0.000000           7340.271973        21.852044         
 HNTL_smooth16                            0.000000           63.000000          1.773067          
@@ -318,9 +363,12 @@ GSN_b4_smooth64                          0.000000           0.372781           0
 GSN_b5_smooth16                          0.000000           2.512500           1.334175          
 GSN_b5_smooth64                          0.000000           2.480000           1.334702          
 transition_01                            0.000000           1.000000           0.023946          
-economic_value_lag1                      107.680870         13253.970703       918.109039        
+economic_value_lag1                      0.000000           18635.154297       244.447867        
+pa_momentum_pixels_lag1                  0.000000           1229841.000000     55048.381358      
+pa_momentum_pixels_lag2                  0.000000           1229841.000000     83691.945507      
+pa_momentum_pixels_lag3                  0.000000           1229841.000000     56578.849809      
 
-Total numeric columns: 80
+Total numeric columns: 82
 
 8. STATIC VARIABLES (Constant Across Years)
 --------------------------------------------------------------------------------

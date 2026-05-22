@@ -75,6 +75,7 @@ def resolve_parquet_file(region: str, filename: str) -> Path:
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
     candidates: list[Path] = []
     if scratch_root is not None:
+        candidates.append(scratch_root / f"data/{region}/ml/main/{filename}")
         candidates.append(scratch_root / f"outputs/{region}/results/main/{filename}")
         candidates.append(scratch_root / f"outputs/{region}/results/{filename}")
     candidates.append(repo_root / f"outputs/{region}/results/main/{filename}")
