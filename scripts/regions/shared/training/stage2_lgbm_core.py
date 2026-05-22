@@ -142,8 +142,14 @@ def load_stage2_arrays(
     feature_cols: List[str],
     expansion_groups: set[tuple[int, int]],
     year_range: Optional[Tuple[int, int]],
+    neg_ratio: Optional[int] = None,
+    rng_seed: int = 42,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Load X, y, years, country_id, group_sizes for expansion country-years only."""
+    """Load X, y, years, country_id, group_sizes for expansion country-years only.
+
+    neg_ratio: if set, subsample negatives to neg_ratio * n_positives per group.
+               Useful for tuning to avoid OOM on large regions.
+    """
     schema_names = pq.ParquetFile(panel_path).schema_arrow.names
     has_country = "country_id" in schema_names
     raster = None if has_country else load_country_raster(region)
@@ -153,6 +159,7 @@ def load_stage2_arrays(
         essential.append("country_id")
     essential = list(dict.fromkeys(essential))
 
+    rng = np.random.default_rng(rng_seed) if neg_ratio is not None else None
     frames: list[pd.DataFrame] = []
     pf = pq.ParquetFile(panel_path)
     for batch in pf.iter_batches(columns=essential, batch_size=BATCH_SIZE):
@@ -170,6 +177,15 @@ def load_stage2_arrays(
         df = df[np.array([k in expansion_groups for k in keys], dtype=bool)]
         if df.empty:
             continue
+        if neg_ratio is not None:
+            pos_mask = (df[TARGET_COL] > 0).to_numpy()
+            neg_idx = np.where(~pos_mask)[0]
+            pos_idx = np.where(pos_mask)[0]
+            n_keep = min(len(neg_idx), len(pos_idx) * neg_ratio)
+            if n_keep < len(neg_idx):
+                sampled_neg = rng.choice(neg_idx, size=n_keep, replace=False)
+                keep = np.sort(np.concatenate([pos_idx, sampled_neg]))
+                df = df.iloc[keep]
         frames.append(df[["country_id", "year", TARGET_COL] + feature_cols])
 
     if not frames:
@@ -177,6 +193,7 @@ def load_stage2_arrays(
 
     data = pd.concat(frames, ignore_index=True)
     data = data.sort_values(["country_id", "year"]).reset_index(drop=True)
+
     X = data[feature_cols].to_numpy(dtype=np.float32)
     y = (data[TARGET_COL] > 0).astype(np.int8).to_numpy()
     years = data["year"].to_numpy(dtype=np.int32)
