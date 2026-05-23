@@ -54,6 +54,7 @@ FIXED_PARAMS = {
     "metric": "ndcg",
     "verbose": -1,
     "lambdarank_truncation_level": 100,
+    "max_query_size": 2_000_000,
 }
 
 
