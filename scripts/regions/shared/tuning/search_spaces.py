@@ -172,7 +172,6 @@ def get_lgbm_stage2_fixed_params(random_state: int, n_jobs: int) -> Dict:
         "metric": "ndcg",
         "verbose": -1,
         "lambdarank_truncation_level": 100,
-        "max_query_size": 2_000_000,
     }
 
 

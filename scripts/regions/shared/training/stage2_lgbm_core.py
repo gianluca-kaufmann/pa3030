@@ -54,8 +54,25 @@ FIXED_PARAMS = {
     "metric": "ndcg",
     "verbose": -1,
     "lambdarank_truncation_level": 100,
-    "max_query_size": 2_000_000,
 }
+
+# LightGBM 4.6 hardcodes a 10 000-row per-query limit in C++.
+# We split any group that exceeds this before building lgb.Dataset.
+_LGB_MAX_QUERY = 9_000
+
+
+def _split_large_groups(group_sizes: np.ndarray) -> np.ndarray:
+    """Split any group larger than _LGB_MAX_QUERY into equal-ish sub-groups."""
+    out: list[int] = []
+    for s in group_sizes:
+        s = int(s)
+        if s <= _LGB_MAX_QUERY:
+            out.append(s)
+        else:
+            n = (s + _LGB_MAX_QUERY - 1) // _LGB_MAX_QUERY
+            base, rem = divmod(s, n)
+            out.extend([base + 1] * rem + [base] * (n - rem))
+    return np.array(out, dtype=np.int32)
 
 
 @dataclass
@@ -366,8 +383,8 @@ def train_lambdarank(
     weights: Optional[np.ndarray],
     num_boost_round: int,
 ) -> lgb.Booster:
-    train_set = lgb.Dataset(X_train, label=y_train, group=group_train, weight=weights)
-    val_set = lgb.Dataset(X_val, label=y_val, group=group_val, reference=train_set)
+    train_set = lgb.Dataset(X_train, label=y_train, group=_split_large_groups(group_train), weight=weights)
+    val_set = lgb.Dataset(X_val, label=y_val, group=_split_large_groups(group_val), reference=train_set)
     return lgb.train(
         params,
         train_set,

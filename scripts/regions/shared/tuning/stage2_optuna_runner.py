@@ -13,6 +13,7 @@ import numpy as np
 import optuna
 
 from scripts.regions.shared.evaluation.stage2_metrics import ndcg_at_k_within_groups
+from scripts.regions.shared.training.stage2_lgbm_core import _split_large_groups
 from scripts.regions.shared.tuning.search_spaces import get_lgbm_stage2_optuna_bounds
 
 
@@ -101,8 +102,8 @@ def optimize_lgbm_stage2_optuna(
         for fold_idx, (train_idx, val_idx) in enumerate(folds, start=1):
             X_tr, y_tr, g_tr = _sort_subset(X, y, country_id, years, train_idx)
             X_va, y_va, g_va = _sort_subset(X, y, country_id, years, val_idx)
-            dtrain = lgb.Dataset(X_tr, label=y_tr, group=g_tr)
-            dval = lgb.Dataset(X_va, label=y_va, group=g_va, reference=dtrain)
+            dtrain = lgb.Dataset(X_tr, label=y_tr, group=_split_large_groups(g_tr))
+            dval = lgb.Dataset(X_va, label=y_va, group=_split_large_groups(g_va), reference=dtrain)
             booster = lgb.train(
                 train_params,
                 dtrain,
