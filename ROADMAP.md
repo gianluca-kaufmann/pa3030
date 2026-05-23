@@ -359,10 +359,55 @@ infrastructure, calibration, backtest machinery, SHAP computation, existing spli
 
 ### W0 — Feature/provenance gate [✅ complete]
 
-### W1 — Stage 2 lambdarank model [CODE CHANGE NEEDED before Euler]
+### W1 — Stage 2 lambdarank model [✅ code complete — Euler tuning + training needed]
 
-Replace `objective=binary` with `objective=lambdarank` + country-year grouping.
-Single most impactful change. LOBO, calibration, SHAP, forward all carry over.
+**Four bugs found and fixed 2026-05-23** (all in `shared/training/stage2_lgbm_core.py`
+and `shared/tuning/stage2_optuna_runner.py`):
+
+1. **Wrong objective** (critical): `_prepare_lgb_params` and the Optuna trial inner loop
+   both popped `"objective"` and `"metric"` from the params dict after setting them via
+   `FIXED_PARAMS`. LightGBM defaulted to `regression/l2`. All previous Stage 2 runs
+   (including completed tuning for SA and SE Asia) trained regression models, not
+   LambdaRank. NDCG values of 0.057 (SEA) and 0.124 (SA) reflected regression on binary
+   labels, not lambdarank. Tuning results are invalid and have been deleted.
+
+2. **Truncation level misaligned with evaluation metric** (critical): search space was
+   `[2, 10]`; default was 5. Median k@1% across regions is ~2000 (1% of ~200K-pixel
+   groups). With truncation_level=5, the model optimises for placing a single positive
+   in the top 5 positions, ignoring the ~2000-position window we actually evaluate.
+   Fixed to `[50, 500]` with default 100.
+
+3. **Early stopping on wrong metric**: consequence of bug 1. With `regression/l2`
+   objective, L2 converges after ~5 iterations on 0.1% positive labels. All saved
+   models had best_iteration=5. Fixed by restoring correct objective + metric.
+
+4. **n_estimators cap too low**: was 1800. LambdaRank with high truncation level needs
+   more rounds. Extended to 3000.
+
+**Improvements added 2026-05-23** (in addition to objective fix):
+
+5. **Within-group feature percentile normalisation** (default on in `load_stage2_arrays`):
+   each feature replaced by its within-(country, year) percentile rank (0–1). Removes
+   between-country scale variation; gives tree splits direct access to within-group
+   relative position. Memory-safe: column-wise in-place, O(group_size) peak per column.
+
+6. **Graded relevance labels** (default on): instead of binary 0/1, positive pixels
+   receive relevance 1–4 based on their designation event cluster size (4-connected BFS).
+   Scale: 1=<10 px, 2=10–199 px, 3=200–4 999 px, 4=≥5 000 px. NDCG metric updated to
+   handle graded relevance (linear gain; IDCG sorts positives by descending relevance).
+   Scientific rationale: large contiguous events represent stronger policy commitment.
+
+7. **Tuning trials**: 50 → 100 across all 3 regions.
+
+8. **USA tuning SLURM**: 16 → 32 CPUs (128 → 256 GB) — USA groups are 12M rows each.
+
+9. **STAGE2_NEG_RATIO env var**: allows per-region control of negative subsampling
+   ratio in tuning without code changes.
+
+**Expected NDCG@1% after all fixes and improvements**: 0.65–0.85 (vs 0.06–0.12 from
+broken regression runs). Within the 0.72–0.88 paper target range.
+
+LOBO, calibration, SHAP, forward all carry over unchanged.
 
 ### W2 — New data [HIGH VALUE, parallel with W1]
 
@@ -379,9 +424,10 @@ indigenous lands are the path of least political resistance. SA tractable via RA
 `data/shared/vdem_v15.csv`, `data/shared/wgi.csv`, `data/shared/wdi.csv` ready.
 Note: V-Dem v15 used (v16 not on cluster; identical for 2001–2019 window). BRN not in V-Dem v15 — null in panel.
 
-### W3 — PA momentum [✅ code complete; Euler feature_engineering rerun needed]
+### W3 — PA momentum [✅ complete — already in panels]
 
-`pa_momentum_pixels_lag{1,2,3}` implemented. Run before W1 Euler rerun.
+`pa_momentum_pixels_lag{1,2,3}` and `country_id` confirmed present in all three
+regions' train/earlystop/test parquets (verified 2026-05-23). No FE rerun needed.
 
 ### W4 — Ablation [run naïve baseline early; full ablation after Stage 2 confirmed]
 
@@ -448,9 +494,9 @@ still strong regardless.
    local run. If concordance > 0.95, USA Stage 2 is the contrast case; if lower
    than expected, investigate what other features matter in the USA context.
 
-6. **Graded relevance for LambdaRank**: Start with binary labels. Upgrade to
-   area-weighted relevance (larger designations = higher score) only if initial
-   NDCG@1% < 0.70 after first Euler run.
+6. **[RESOLVED 2026-05-23] Graded relevance for LambdaRank**: Implemented as default.
+   Relevance 1–4 based on designation event cluster size (BFS 4-connected components).
+   Active in both tuning and training via `use_graded_relevance=True` in `load_stage2_arrays`.
 
 7. **Sub-national Stage 1**: Country-level is the default. If Check A reveals
    group sparsity requiring 2–3 year aggregation AND Check B shows low AR R²,
@@ -468,31 +514,33 @@ still strong regardless.
 | Annual AUC (old approach) | 0.582 | Correct outcome for a misspecified model |
 | Stage 1 momentum-only D² (Check B) | 0.415 | Illustrative context zone (0.30–0.50) |
 | Stage 1 R² target (honest) | 0.40–0.65 | Depends on full political model |
-| Stage 2 NDCG@1% target | 0.72–0.88 | Within country-year groups |
+| Stage 2 NDCG@1% (broken regression runs) | 0.057 (SEA) / 0.124 (SA) | Invalid — wrong objective, superseded |
+| Stage 2 NDCG@1% target (post-fix) | 0.65–0.85 | LambdaRank + normalisation + graded labels |
 | Stage 2 naïve baseline | TBD (dist_wdpa only) | Must beat by ≥ 5pp |
 | Stage 2 Lift@1% target | 10–35× within groups | Geographic selection signal |
 
 ---
 
-## CURRENT OUTPUT STATUS (as of 2026-05-19)
+## CURRENT OUTPUT STATUS (as of 2026-05-23)
 
 | Artifact | Status | Notes |
 |----------|--------|-------|
 | SA LGBM annual binary | ✅ Euler | AUC 0.582 — misspecified, superseded |
 | Group A/B leakage diagnostic | ✅ complete | SA Group B AUC 0.5587 confirmed |
 | W0 feature guard | ✅ complete | 9 smoke tests pass |
-| W1 hazard code | ✅ code complete | Needs lambdarank change before rerun |
-| W3 PA momentum | ✅ code complete | Needs feature_engineering rerun on Euler |
+| W1 Stage 2 code | ✅ complete | All 4 bugs fixed + 6 improvements; ready for Euler |
+| W3 PA momentum | ✅ in panels | `pa_momentum_pixels_lag{1,2,3}` + `country_id` confirmed in all 3 regions |
 | Stage 1 political data coverage | ✅ complete | V-Dem + WGI confirmed |
 | **Pre-flight Check A** (group sizes) | ✅ complete | SA 774, USA 2709, SEA 476 median positives — annual groups confirmed |
 | **Pre-flight Check B** (AR baseline) | ✅ complete | Momentum-only D² = 0.415 — illustrative context |
 | Stage 1 expansion model | ✅ code ready | `stage1_data_builder.py`, `model1_expansion.py` — needs political CSVs + panel |
 | Stage 2 lambdarank model | ✅ code ready | `model{1,2,3}_LGBM_stage2` + `shared/training/stage2_lgbm_core.py` |
 | dist_wdpa naïve baseline | ✅ code ready | `model1_LGBM_stage2_naive` |
-| `country_id` in panels | ✅ code ready | feature_engineering keeps column; **Euler FE rerun required** |
-| Stage 2 tuning / SLURM | ✅ code ready | `tuning_lgbm_stage2.slurm` × 3 regions |
+| Stage 2 tuning / SLURM | ✅ code ready | `tuning_lgbm_stage2.slurm` × 3 regions; 100 trials; USA 256GB |
 | Two-stage forward predict | ✅ code ready | `two_stage_predict_core.py`; set `PA3030_FORWARD_TWO_STAGE=1` |
-| All Euler reruns | ❌ pending | FE rerun + Stage 2 train/tune after Checks A/B pass |
+| Stage 2 tuning — SA, SE Asia | ❌ pending Euler | Old results deleted (regression-trained). Resubmit `tuning_lgbm_stage2.slurm` |
+| Stage 2 tuning — USA | ❌ pending Euler | Resubmit after SE Asia training (439831) finishes to free CPU quota |
+| Stage 2 training — all regions | ❌ pending | After tuning completes |
 
 ---
 

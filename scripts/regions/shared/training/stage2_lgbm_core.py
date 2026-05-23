@@ -53,7 +53,7 @@ FIXED_PARAMS = {
     "objective": "lambdarank",
     "metric": "ndcg",
     "verbose": -1,
-    "lambdarank_truncation_level": 5,
+    "lambdarank_truncation_level": 100,
 }
 
 
@@ -136,6 +136,119 @@ def _expansion_groups_from_batches(
     return set(pos_by_group.keys())
 
 
+def _compute_event_size_labels(
+    rows: np.ndarray,
+    cols: np.ndarray,
+    pos_mask: np.ndarray,
+) -> np.ndarray:
+    """Graded relevance (1–4) for one group based on designation event cluster size.
+
+    Uses 4-connected BFS over positive pixels. Negatives receive label 0.
+    Relevance scale:
+      1 = isolated pixel or event < 10 px
+      2 = event 10–199 px
+      3 = event 200–4 999 px
+      4 = event ≥ 5 000 px
+
+    Scientific rationale: large contiguous designations represent greater policy
+    commitment and conservation value than isolated pixels, providing a stronger
+    gradient signal for LambdaRank training.
+    """
+    n = len(rows)
+    labels = np.zeros(n, dtype=np.int8)
+    pos_idx = np.where(pos_mask)[0]
+    if len(pos_idx) == 0:
+        return labels
+
+    pos_lookup: dict[tuple[int, int], int] = {
+        (int(rows[i]), int(cols[i])): i for i in pos_idx
+    }
+    assigned = np.full(n, -1, dtype=np.int32)
+    comp_members: list[list[int]] = []
+
+    for start in pos_idx:
+        if assigned[start] != -1:
+            continue
+        comp_id = len(comp_members)
+        members: list[int] = []
+        queue = [start]
+        assigned[start] = comp_id
+        head = 0
+        while head < len(queue):
+            i = queue[head]
+            head += 1
+            members.append(i)
+            r, c = int(rows[i]), int(cols[i])
+            for dr, dc in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+                j = pos_lookup.get((r + dr, c + dc))
+                if j is not None and assigned[j] == -1:
+                    assigned[j] = comp_id
+                    queue.append(j)
+        comp_members.append(members)
+
+    for members in comp_members:
+        size = len(members)
+        rel = 4 if size >= 5000 else 3 if size >= 200 else 2 if size >= 10 else 1
+        for i in members:
+            labels[i] = rel
+
+    return labels
+
+
+def _apply_graded_relevance(
+    data: pd.DataFrame,
+    group_sizes: np.ndarray,
+    target_col: str,
+) -> np.ndarray:
+    """Compute graded relevance labels for the full sorted DataFrame."""
+    y = np.zeros(len(data), dtype=np.int8)
+    rows_arr = data["row"].to_numpy(dtype=np.int32)
+    cols_arr = data["col"].to_numpy(dtype=np.int32)
+    target_arr = data[target_col].to_numpy()
+    offset = 0
+    for size in group_sizes:
+        end = offset + int(size)
+        pos_mask = target_arr[offset:end] > 0
+        if pos_mask.any():
+            y[offset:end] = _compute_event_size_labels(
+                rows_arr[offset:end], cols_arr[offset:end], pos_mask
+            )
+        offset = end
+    return y
+
+
+def _rank_normalize_within_groups(X: np.ndarray, group_sizes: np.ndarray) -> np.ndarray:
+    """Replace each feature with its within-group percentile rank (0–1), in-place.
+
+    LambdaRank learns to rank within query groups. Absolute feature values carry
+    between-country variation that is orthogonal to the within-country selection
+    task. Normalizing to within-group percentile ranks gives the tree splits
+    direct access to relative position information and improves cross-country
+    generalization.
+
+    Column-wise processing keeps peak memory to O(group_size) per column
+    rather than O(group_size × n_features), making it safe for USA-scale groups
+    (~12M rows per country-year).
+    """
+    offset = 0
+    for size in group_sizes:
+        end = offset + int(size)
+        n = int(size)
+        if n <= 1:
+            X[offset:end] = 0.5
+            offset = end
+            continue
+        denom = float(n - 1)
+        arange = np.arange(n, dtype=np.float32)
+        for col in range(X.shape[1]):
+            order = np.argsort(X[offset:end, col])  # int64, ~8n bytes
+            ranks = np.empty(n, dtype=np.float32)
+            ranks[order] = arange
+            X[offset:end, col] = ranks / denom
+        offset = end
+    return X
+
+
 def load_stage2_arrays(
     panel_path: Path,
     region: str,
@@ -144,11 +257,19 @@ def load_stage2_arrays(
     year_range: Optional[Tuple[int, int]],
     neg_ratio: Optional[int] = None,
     rng_seed: int = 42,
+    normalize_within_groups: bool = True,
+    use_graded_relevance: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Load X, y, years, country_id, group_sizes for expansion country-years only.
 
     neg_ratio: if set, subsample negatives to neg_ratio * n_positives per group.
                Useful for tuning to avoid OOM on large regions.
+    normalize_within_groups: replace each feature with its within-group percentile
+               rank (0–1). Aligns feature representation with the within-group
+               ranking task and removes between-country scale variation.
+    use_graded_relevance: assign relevance 1–4 based on designation event cluster
+               size instead of binary 0/1. Large contiguous events get higher
+               relevance, providing richer gradient signal for LambdaRank.
     """
     schema_names = pq.ParquetFile(panel_path).schema_arrow.names
     has_country = "country_id" in schema_names
@@ -186,7 +307,8 @@ def load_stage2_arrays(
                 sampled_neg = rng.choice(neg_idx, size=n_keep, replace=False)
                 keep = np.sort(np.concatenate([pos_idx, sampled_neg]))
                 df = df.iloc[keep]
-        frames.append(df[["country_id", "year", TARGET_COL] + feature_cols])
+        coord_cols = ["row", "col"] if use_graded_relevance else []
+        frames.append(df[["country_id", "year", TARGET_COL] + coord_cols + feature_cols])
 
     if not frames:
         raise ValueError(f"No Stage 2 samples after expansion filter: {panel_path}")
@@ -195,10 +317,19 @@ def load_stage2_arrays(
     data = data.sort_values(["country_id", "year"]).reset_index(drop=True)
 
     X = data[feature_cols].to_numpy(dtype=np.float32)
-    y = (data[TARGET_COL] > 0).astype(np.int8).to_numpy()
+    group_sizes = data.groupby(["country_id", "year"], sort=False).size().to_numpy(dtype=np.int32)
+
+    if use_graded_relevance:
+        y = _apply_graded_relevance(data, group_sizes, TARGET_COL)
+    else:
+        y = (data[TARGET_COL] > 0).astype(np.int8).to_numpy()
+
     years = data["year"].to_numpy(dtype=np.int32)
     country_ids = data["country_id"].to_numpy(dtype=np.int32)
-    group_sizes = data.groupby(["country_id", "year"], sort=False).size().to_numpy(dtype=np.int32)
+
+    if normalize_within_groups:
+        X = _rank_normalize_within_groups(X, group_sizes)
+
     return X, y, years, country_ids, group_sizes
 
 
@@ -211,10 +342,11 @@ def _prepare_lgb_params(best_params: Dict[str, Any], num_threads: int) -> Dict[s
         "n_estimators",
         "num_boost_round",
         "n_jobs",
-        "objective",
-        "metric",
     ):
         params.pop(key, None)
+    # Enforce fixed objective/metric — best_params must not override these
+    params["objective"] = FIXED_PARAMS["objective"]
+    params["metric"] = FIXED_PARAMS["metric"]
     params["random_state"] = params.get("random_state", 42)
     params["num_threads"] = num_threads
     if "lambdarank_truncation_level" not in params:

@@ -58,11 +58,12 @@ def run_stage2_tuning(
         train_path, region, (2001, 2016)
     ) | _expansion_groups_from_batches(earlystop_path, region, (2001, 2016))
 
+    neg_ratio = int(os.environ.get("STAGE2_NEG_RATIO", "100"))
     X_tr, y_tr, years_tr, cid_tr, _ = load_stage2_arrays(
-        train_path, region, feature_cols, expansion_groups, (2001, 2013), neg_ratio=100
+        train_path, region, feature_cols, expansion_groups, (2001, 2013), neg_ratio=neg_ratio
     )
     X_es, y_es, years_es, cid_es, _ = load_stage2_arrays(
-        earlystop_path, region, feature_cols, expansion_groups, (2014, 2016), neg_ratio=100
+        earlystop_path, region, feature_cols, expansion_groups, (2014, 2016), neg_ratio=neg_ratio
     )
     X = np.vstack([X_tr, X_es])
     y = np.concatenate([y_tr, y_es])

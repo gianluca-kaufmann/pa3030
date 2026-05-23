@@ -22,7 +22,12 @@ def ndcg_at_k_within_groups(
     group_sizes: np.ndarray,
     k_pct: float,
 ) -> float:
-    """Macro-averaged NDCG@k_pct within each group (binary relevance)."""
+    """Macro-averaged NDCG@k_pct within each group (binary or graded relevance).
+
+    Supports graded relevance labels (e.g., 1–4 from designation event size).
+    DCG uses linear gain (rel / log2(rank+2)); IDCG is computed from the ideal
+    ranking of the positive items sorted by descending relevance.
+    """
     scores: list[float] = []
     offset = 0
     for size in group_sizes:
@@ -32,17 +37,17 @@ def ndcg_at_k_within_groups(
         yt = y_true[offset:end]
         ys = y_score[offset:end]
         offset = end
-        n_pos = int((yt > 0).sum())
-        if n_pos == 0:
+        pos_rels = yt[yt > 0]
+        if len(pos_rels) == 0:
             continue
         k = max(1, int(np.ceil(size * k_pct / 100.0)))
+        # DCG: top-k by predicted score
         order = np.argsort(-ys)
         yt_sorted = yt[order[:k]]
-        dcg = 0.0
-        for i, rel in enumerate(yt_sorted):
-            if rel > 0:
-                dcg += 1.0 / np.log2(i + 2)
-        ideal = sum(1.0 / np.log2(i + 2) for i in range(min(n_pos, k)))
+        dcg = sum(float(r) / np.log2(i + 2) for i, r in enumerate(yt_sorted) if r > 0)
+        # IDCG: ideal ordering — highest relevance first
+        ideal_rels = np.sort(pos_rels)[::-1][:k]
+        ideal = sum(float(r) / np.log2(i + 2) for i, r in enumerate(ideal_rels))
         if ideal > 0:
             scores.append(dcg / ideal)
     return float(np.mean(scores)) if scores else 0.0

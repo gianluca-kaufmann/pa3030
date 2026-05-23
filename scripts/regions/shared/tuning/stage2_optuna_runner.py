@@ -91,8 +91,11 @@ def optimize_lgbm_stage2_optuna(
             "n_estimators": trial.suggest_int("n_estimators", bounds["n_estimators"][0], bounds["n_estimators"][1]),
         }
         train_params = {**fixed_params, **params}
-        for key in ("objective", "metric", "scale_pos_weight", "is_unbalance"):
+        for key in ("scale_pos_weight", "is_unbalance", "n_estimators", "n_jobs"):
             train_params.pop(key, None)
+        # Enforce fixed objective/metric — trial params must not override these
+        train_params["objective"] = fixed_params.get("objective", "lambdarank")
+        train_params["metric"] = fixed_params.get("metric", "ndcg")
 
         fold_scores: List[float] = []
         for fold_idx, (train_idx, val_idx) in enumerate(folds, start=1):

@@ -171,12 +171,19 @@ def get_lgbm_stage2_fixed_params(random_state: int, n_jobs: int) -> Dict:
         "objective": "lambdarank",
         "metric": "ndcg",
         "verbose": -1,
-        "lambdarank_truncation_level": 5,
+        "lambdarank_truncation_level": 100,
     }
 
 
 def get_lgbm_stage2_optuna_bounds(mode: str) -> Dict:
-    """Optuna bounds for Stage 2 (no scale_pos_weight)."""
+    """Optuna bounds for Stage 2 (no scale_pos_weight).
+
+    lambdarank_truncation_level: median k@1% across groups is ~2000 for SA/SEA.
+    Training with truncation_level << k@1% starves positives outside the top-K
+    of any gradient signal. Range [50, 500] covers 25th–90th percentile of
+    group-level k@1% values and is computationally feasible.
+    """
     base = get_lgbm_optuna_bounds(mode, auto_scale_pos_weight=1.0)
-    base["lambdarank_truncation_level"] = (2, 10)
+    base["lambdarank_truncation_level"] = (50, 500)
+    base["n_estimators"] = (200, 3000)
     return base
