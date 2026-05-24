@@ -1,10 +1,23 @@
 # PA3030 - Protected Area Designation Prediction
 
+> **PAPER BRANCH — ARCHITECTURE HAS CHANGED**: Active development is on the `paper`
+> branch, which uses a **two-stage conditional selection model**. ROADMAP.md is the
+> authoritative source for current design. Key changes vs. thesis:
+> - Stage 1: country-year Poisson panel regression (D² metric)
+> - Stage 2: LightGBM LambdaRank grouped by `(country_id, year)` (NDCG@1% within groups)
+> - Target variable is NOT `transition_01_win5` — see ROADMAP.md
+> - Old single-model AUC results (0.93, 0.986) are proven leakage artefacts
+> The sections below describe the thesis pipeline (`main` branch), which is superseded.
+
 ## Overview
 
-PA3030 is a large-scale, reproducible machine learning pipeline that predicts the probability of a given 1 km x 1 km pixel becoming newly designated as a protected area within a 5-year window. 
+PA3030 is a large-scale, reproducible machine learning pipeline that predicts
+protected area designation under the 30×30 biodiversity target using a two-stage
+conditional selection model: (1) country-year expansion modelling and (2) pixel-level
+geographic selection ranking.
 
-The core question: **"Given historical patterns of protected-area establishment, which locations are most likely to be designated as protected areas in the future?"**
+The core question: **"Which pixels will be designated as protected areas under 30×30,
+and which countries will drive that expansion?"**
 
 ## Policy Context: The 30x30 Target
 
@@ -110,7 +123,7 @@ Shared utilities (scripts/regions/shared/):
 
 - **Spatial resolution:** ~1 km x 1 km (EPSG:3857)
 - **Temporal coverage:** 2000-2024 (annual)
-- **Target variable:** `transition_01_win5` (binary, 5-year lookahead)
+- **Target variable:** Stage 2: graded NDCG@1% within `(country_id, year)` expansion groups (LambdaRank); Stage 1: country-year PA expansion area (Poisson). `transition_01_win5` is superseded on `paper` branch.
 - **Class imbalance:** ~0.3-0.5% positive (extreme)
 - **Features (~60):** elevation, slope, climate normals, biodiversity importance, population density, night-time lights, NDVI, deforestation, wildfire, land-cover, distance to infrastructure, spatial smoothing
 
@@ -124,6 +137,10 @@ Shared utilities (scripts/regions/shared/):
 - **Reproducibility:** Fixed random seeds (42), environment-agnostic paths via `get_repo_root()`
 
 ## Model Evaluation (What "Testing" Means)
+
+> **Paper branch primary metric**: NDCG@1% within country-year expansion groups
+> (Stage 2 LambdaRank). Stage 1 uses D² (deviance R²). The AUC/PR-AUC metrics
+> below apply to the thesis pipeline (`main` branch) and are superseded on `paper`.
 
 This project has no software unit tests. "Testing" refers to model evaluation — checking
 how well predictions match reality on held-out future data.

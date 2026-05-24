@@ -294,9 +294,10 @@ submission: Joppa & Pfaff (2009), Baldi et al. (2010), Nolte et al. (2010),
 and recent country-year PA supply models. Stage 1 covariates (V-Dem + WGI at
 country-year) are not used in prior PA prediction papers — this is the gap.
 
-**LambdaRank labels**: Binary (0/1 designation). Standard for NDCG with binary
-relevance. Upgrade to graded relevance (larger designations = higher score) only
-if initial NDCG@1% < 0.70.
+**LambdaRank labels**: Graded relevance (1–4, based on designation event cluster
+size via BFS). Active as default in both tuning and training (see W1 improvements).
+Binary was the original plan; graded is now the default. NDCG performance targets
+(0.65–0.85) are for graded NDCG — not directly comparable to binary NDCG targets.
 
 **Stage 1 spatial scale**: Country-level. Sub-national only if Check A reveals
 that country-year groups are too sparse and aggregating to 3-year windows is
@@ -503,6 +504,28 @@ still strong regardless.
    investigate whether state-level grouping for Brazil/Indonesia/USA improves
    Stage 1 fit. This is a fallback, not the plan.
 
+8. **[OPEN] Stage 1 D² is in-sample**: `model1_expansion.py` calls `model.score(X, y)`
+   on the same data used for fitting — no train/test split exists. The reported
+   D²=0.612 (SA) is optimistic. Add OOS evaluation on held-out test years (2014–2019)
+   before citing this number in the paper. Script fix: split to train≤2013, test 2014-2019.
+
+9. **[OPEN] `target_30x30` coefficient = 0.0**: The COP15 post-2022 dummy has zero
+   variation in training years (2001–2013), so the Poisson model learned coefficient=0.
+   Forward scenarios setting this to 1 have no effect on Stage 1 predictions.
+   Fix options: (a) use a continuous post-commitment ratchet variable, or (b) frame
+   the 30×30 scenario as an exogenous budget override applied after Stage 1 prediction
+   (Stage 2 handles geographic ranking regardless).
+
+10. **[OPEN] USA and SE Asia Stage 1 not run**: Only SA `model1_expansion.py` has been
+    executed. USA (`model2_expansion.py`) and SE Asia (`model3_expansion.py`) Stage 1
+    have not been run. Execute before producing three-region comparison table.
+
+11. **[OPEN] Tuning NDCG not representative of test NDCG**: Stage 2 tuning uses
+    `STAGE2_NEG_RATIO=20` (subsampled negatives), making within-tuning group sizes
+    ~21× smaller than full-data test groups. Tuning NDCG values (SA best≈0.19,
+    SEA best≈0.13) are not comparable to final test NDCG. Do not cite tuning NDCG
+    as a performance claim — report only the post-training test set NDCG.
+
 ---
 
 ## KEY NUMBERS
@@ -533,13 +556,15 @@ still strong regardless.
 | Stage 1 political data coverage | ✅ complete | V-Dem + WGI confirmed |
 | **Pre-flight Check A** (group sizes) | ✅ complete | SA 774, USA 2709, SEA 476 median positives — annual groups confirmed |
 | **Pre-flight Check B** (AR baseline) | ✅ complete | Momentum-only D² = 0.415 — illustrative context |
-| Stage 1 expansion model | ✅ code ready | `stage1_data_builder.py`, `model1_expansion.py` — needs political CSVs + panel |
+| Stage 1 expansion model (SA) | ⚠️ ran with bug | D²=0.612 IN-SAMPLE (`model.score(X,y)` on training data); OOS eval not done — see Open Issue 8 |
+| Stage 1 expansion model (USA, SEA) | ❌ not run | Scripts exist; run after SA OOS bug is fixed |
 | Stage 2 lambdarank model | ✅ code ready | `model{1,2,3}_LGBM_stage2` + `shared/training/stage2_lgbm_core.py` |
-| dist_wdpa naïve baseline | ✅ code ready | `model1_LGBM_stage2_naive` |
+| dist_wdpa naïve baseline | ✅ code ready | `model1_LGBM_stage2_naive`; not yet run on Euler |
 | Stage 2 tuning / SLURM | ✅ code ready | `tuning_lgbm_stage2.slurm` × 3 regions; 100 trials; USA 256GB |
 | Two-stage forward predict | ✅ code ready | `two_stage_predict_core.py`; set `PA3030_FORWARD_TWO_STAGE=1` |
-| Stage 2 tuning — SA, SE Asia | ❌ pending Euler | Old results deleted (regression-trained). Resubmit `tuning_lgbm_stage2.slurm` |
-| Stage 2 tuning — USA | ❌ pending Euler | Resubmit after SE Asia training (439831) finishes to free CPU quota |
+| Stage 2 tuning — SA | 🔄 running Euler | ~trial 48/100; best NDCG≈0.1858 (tuning metric — not comparable to test NDCG) |
+| Stage 2 tuning — SE Asia | ✅ complete | Best NDCG≈0.1261 (tuning metric; graded labels; params saved) |
+| Stage 2 tuning — USA | ❌ pending Euler | Submit after SE Asia training completes to stay within CPU quota |
 | Stage 2 training — all regions | ❌ pending | After tuning completes |
 
 ---
@@ -577,5 +602,5 @@ risk quantification for agricultural investors and central banks."
 - Tropical Africa: no data pipeline
 - Embeddings / Paper 2: blocked until P1 submitted
 - Single-model global AUC as primary metric: rejected (wrong estimand, proven empirically)
-- Graded LambdaRank labels: fallback only if binary NDCG@1% < 0.70
+- Binary LambdaRank labels: superseded. Graded (1–4 by cluster size) is now the default.
 - Sub-national Stage 1: fallback only if country-level Check B baseline is very weak

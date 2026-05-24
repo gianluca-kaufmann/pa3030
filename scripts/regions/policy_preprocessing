@@ -1,0 +1,636 @@
+#!/usr/bin/env python3
+"""
+Policy Variables Preprocessing
+==============================
+
+Objective:
+    Convert raw institutional / political datasets (WGI, V-Dem, DPI) into
+    per-variable per-year rasters aligned to the backbone grid.  Each pixel
+    receives the policy value of the country it belongs to.  This makes
+    policy data consistent with all other preprocessed features — the merge
+    script can discover and stack them like any other yearly raster.
+
+Source data (global, in ``data/shared/``):
+    - WGI:  ``WGI/wgidataset_with_sourcedata-2025 (1).xlsx`` (sheets ``ge``, ``rl``)
+    - V-Dem: ``VDem/V-Dem-CY-Core-v15.csv``  (column ``v2x_libdem``)
+    - DPI:   ``DPI/DPI2020.csv``  (column ``execrlc``)
+
+Region-specific inputs:
+    - Backbone raster: ``data/usa/ready/backbone/backbone.tif``
+    - Natural Earth admin-0 boundaries (downloaded or built-in)
+
+Outputs (in ``data/usa/ready/policy/``):
+    Per-variable per-year rasters (float32, backbone-aligned):
+    - ``wgi_ge_YYYY.tif``            : WGI Government Effectiveness (~-2.5 to +2.5)
+    - ``wgi_rl_YYYY.tif``            : WGI Rule of Law (~-2.5 to +2.5)
+    - ``vdem_ldi_YYYY.tif``          : V-Dem Liberal Democracy Index (0–1)
+    - ``dpi_exec_ideology_YYYY.tif`` : DPI Executive ideology (-1=Left, 0=Center, +1=Right)
+
+    Auxiliary files:
+    - ``country_iso3.tif``           : uint8 country-ID raster (for debugging)
+    - ``country_iso3_mapping.json``  : JSON {id: iso3} mapping
+
+Country coverage:
+    USA
+
+Notes:
+    - DPI data ends in 2020; later years have NaN for dpi_exec_ideology.
+    - Rasters contain the actual (un-lagged) values for each year.
+      Any lag (e.g., t-1) should be applied downstream (feature engineering).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import warnings
+from pathlib import Path
+
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.features import rasterize
+from scipy.ndimage import distance_transform_edt
+
+warnings.filterwarnings("ignore")
+
+# DPI ``ifs`` may be ISO3 strings or ISO-3166 numeric codes (same for all regions).
+ISO3166_NUMERIC_TO_ALPHA3: dict[int, str] = {
+    96: "BRN",
+    116: "KHM",
+    360: "IDN",
+    418: "LAO",
+    458: "MYS",
+    104: "MMR",
+    608: "PHL",
+    702: "SGP",
+    764: "THA",
+    626: "TLS",
+    704: "VNM",
+    32: "ARG",
+    68: "BOL",
+    76: "BRA",
+    152: "CHL",
+    170: "COL",
+    218: "ECU",
+    250: "FRA",
+    328: "GUY",
+    600: "PRY",
+    604: "PER",
+    740: "SUR",
+    858: "URY",
+    862: "VEN",
+    840: "USA",
+}
+
+
+def normalize_dpi_ifs_to_iso3(ifs: pd.Series) -> pd.Series:
+    """Map DPI ``ifs`` to ISO3 (alpha or numeric). Unrecognized → NaN."""
+    out: list = []
+    unmapped_numeric: set[int] = set()
+    for v in ifs:
+        if pd.isna(v):
+            out.append(np.nan)
+            continue
+        if isinstance(v, str):
+            s = v.strip()
+            if len(s) == 3 and s.isalpha():
+                out.append(s.upper())
+                continue
+            try:
+                num = int(float(s))
+            except ValueError:
+                out.append(np.nan)
+                continue
+        else:
+            try:
+                num = int(v)
+            except (TypeError, ValueError):
+                out.append(np.nan)
+                continue
+        iso = ISO3166_NUMERIC_TO_ALPHA3.get(num)
+        if iso is None:
+            unmapped_numeric.add(num)
+            out.append(np.nan)
+        else:
+            out.append(iso)
+    if unmapped_numeric:
+        sample = sorted(unmapped_numeric)[:15]
+        print(
+            f"  Warning: DPI `ifs` numeric codes without ISO3 mapping (dropped): "
+            f"{sample}{'...' if len(unmapped_numeric) > 15 else ''}"
+        )
+    return pd.Series(out, index=ifs.index, dtype=object)
+
+
+def dpi_execrlc_to_ideology(execrlc: pd.Series) -> pd.Series:
+    """Map DPI ``execrlc`` to {-1, 0, 1} or NaN."""
+    ideology_map = {"Left": -1.0, "Center": 0.0, "Right": 1.0}
+    result = np.full(len(execrlc), np.nan, dtype=np.float64)
+    for i, raw in enumerate(execrlc):
+        if pd.isna(raw):
+            continue
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            if raw in (-1, 0, 1):
+                result[i] = float(raw)
+            continue
+        s = str(raw).strip()
+        if s in ideology_map:
+            result[i] = ideology_map[s]
+            continue
+        try:
+            n = float(s)
+            if n in (-1.0, 0.0, 1.0):
+                result[i] = n
+        except ValueError:
+            pass
+    return pd.Series(result, index=execrlc.index, dtype="float64")
+
+
+def apply_dpi_executive_forward_fill(policy: pd.DataFrame) -> None:
+    """Forward-fill ``dpi_exec_ideology`` within each ``iso3`` (sticky institutions after last DPI year)."""
+    if "dpi_exec_ideology" not in policy.columns or "iso3" not in policy.columns:
+        return
+    policy["dpi_exec_ideology"] = (
+        policy.groupby("iso3", sort=False)["dpi_exec_ideology"]
+        .transform(lambda s: s.ffill())
+    )
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
+DATA_DIR = PROJECT_ROOT / "data"
+READY_DIR = DATA_DIR / "usa" / "ready"
+
+# Input paths (global raw data in shared/)
+def resolve_wgi_path() -> Path:
+    """Resolve the WGI Excel path in a cluster-friendly way.
+
+    On Euler, the downloaded filename often differs (e.g. no " (1)" suffix, or a
+    slightly different naming convention). Support:
+    - Explicit override via env var `PA3030_WGI_PATH` (absolute or relative to repo)
+    - Auto-detection of any `*.xlsx` file in `data/shared/WGI/`
+    """
+
+    env = os.environ.get("PA3030_WGI_PATH")
+    if env:
+        p = Path(env)
+        if not p.is_absolute():
+            p = PROJECT_ROOT / p
+        if p.exists():
+            return p
+        raise FileNotFoundError(
+            "WGI file not found at `PA3030_WGI_PATH`.\n"
+            f"  PA3030_WGI_PATH={env}\n"
+            f"  Resolved path: {p}"
+        )
+
+    wgi_dir = DATA_DIR / "shared" / "WGI"
+    if wgi_dir.exists():
+        files = sorted(
+            [p for p in wgi_dir.glob("*.xlsx") if p.is_file()],
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if files:
+            # Prefer the canonical WGI download naming if present, otherwise use newest.
+            preferred = [
+                p
+                for p in files
+                if re.search(r"wgidataset_with_sourcedata", p.name, flags=re.I)
+            ]
+            return preferred[0] if preferred else files[0]
+
+    raise FileNotFoundError(
+        "Cannot find WGI Excel file.\n"
+        f"  Looked for `*.xlsx` in: {wgi_dir}\n"
+        "  Fix: upload the WGI Excel file to that folder on Euler, or set\n"
+        "       `PA3030_WGI_PATH` to the file location."
+    )
+
+
+WGI_PATH = resolve_wgi_path()
+
+VDEM_PATH = DATA_DIR / "shared" / "VDem" / "V-Dem-CY-Core-v15.csv"
+
+# DPI: accept both CSV (original) and XLSX (alternative download format)
+_dpi_candidates = [
+    DATA_DIR / "shared" / "DPI" / "DPI2020.csv",
+    DATA_DIR / "shared" / "DPI" / "DPI2020.xlsx",
+]
+DPI_PATH = next((p for p in _dpi_candidates if p.exists()), _dpi_candidates[0])
+BACKBONE_PATH = READY_DIR / "backbone" / "backbone.tif"
+
+# Output directory
+OUTPUT_DIR = READY_DIR / "policy"
+
+# Policy variable definitions
+POLICY_VARIABLES = [
+    "wgi_ge",
+    "wgi_rl",
+    "vdem_ldi",
+    "dpi_exec_ideology",
+]
+
+# USA territory
+USA_TERRITORIES = ["USA"]
+USA_POLICY_ISO3 = ["USA"]
+
+USA_COUNTRY_ID = {1: "USA"}
+USA_ISO3_TO_ID = {v: k for k, v in USA_COUNTRY_ID.items()}
+
+# Year range for output rasters.
+YEAR_MIN = 2000
+YEAR_MAX = 2024
+
+# Natural Earth 10m admin-0 map-units shapefile URL
+NE_10M_URL = (
+    "https://naciscdn.org/naturalearth/10m/cultural/"
+    "ne_10m_admin_0_map_units.zip"
+)
+
+# Backbone CRS equivalent
+BACKBONE_CRS_EPSG = "EPSG:3857"
+
+
+# ---------------------------------------------------------------------------
+# Policy table construction (internal — not saved as output)
+# ---------------------------------------------------------------------------
+
+def load_wgi() -> pd.DataFrame:
+    """Read WGI Government Effectiveness (ge) and Rule of Law (rl) sheets."""
+    print("Loading WGI data...")
+
+    # The WGI Excel column for the governance estimate can change name across
+    # file versions.  Try the canonical name first, then fall back to the first
+    # column whose name contains "estimate" (case-insensitive).
+    ESTIMATE_COL_CANONICAL = "Governance estimate (approx. -2.5 to +2.5)"
+
+    def _find_estimate_col(df: pd.DataFrame, sheet: str) -> str:
+        if ESTIMATE_COL_CANONICAL in df.columns:
+            return ESTIMATE_COL_CANONICAL
+        candidates = [c for c in df.columns if "estimate" in c.lower()]
+        if candidates:
+            print(f"  Warning: WGI sheet '{sheet}' — canonical column not found; "
+                  f"using '{candidates[0]}' instead.")
+            return candidates[0]
+        raise KeyError(
+            f"Cannot find governance estimate column in WGI sheet '{sheet}'. "
+            f"Available columns: {list(df.columns)}"
+        )
+
+    dfs = []
+    for sheet, col_name in [("ge", "wgi_ge"), ("rl", "wgi_rl")]:
+        df_raw = pd.read_excel(WGI_PATH, sheet_name=sheet)
+        estimate_col = _find_estimate_col(df_raw, sheet)
+        df = df_raw[["Economy (code)", "Year", estimate_col]].copy()
+        df = df.rename(columns={
+            "Economy (code)": "iso3",
+            "Year": "year",
+            estimate_col: col_name,
+        })
+        df = df[df["iso3"].isin(USA_POLICY_ISO3)].copy()
+        dfs.append(df)
+
+    merged = dfs[0].merge(dfs[1], on=["iso3", "year"], how="outer")
+    merged = merged.sort_values(["iso3", "year"]).reset_index(drop=True)
+    print(f"  WGI: {len(merged)} rows, "
+          f"years {merged['year'].min()}-{merged['year'].max()}, "
+          f"{merged['iso3'].nunique()} countries")
+    return merged
+
+
+def load_vdem() -> pd.DataFrame:
+    """Read V-Dem Liberal Democracy Index (v2x_libdem)."""
+    print("Loading V-Dem data...")
+    df = pd.read_csv(VDEM_PATH, usecols=["country_text_id", "year", "v2x_libdem"])
+    df = df.rename(columns={"country_text_id": "iso3", "v2x_libdem": "vdem_ldi"})
+    df = df[df["iso3"].isin(USA_POLICY_ISO3)].copy()
+    df = df.sort_values(["iso3", "year"]).reset_index(drop=True)
+    print(f"  V-Dem: {len(df)} rows, "
+          f"years {df['year'].min()}-{df['year'].max()}, "
+          f"{df['iso3'].nunique()} countries")
+    return df
+
+
+def load_dpi() -> pd.DataFrame:
+    """Read DPI Chief Executive Party ideology (execrlc).
+
+    Accepts both CSV (original download) and XLSX (alternative download format).
+    When read from XLSX, the year column comes as datetime64 and is converted to int.
+
+    The ``ifs`` column may contain ISO3 strings or ISO-3166 numeric codes; both are
+    normalized before filtering to the regional country list.
+    """
+    print("Loading DPI data...")
+    suffix = DPI_PATH.suffix.lower()
+    if suffix == ".csv":
+        df = pd.read_csv(DPI_PATH, usecols=["ifs", "year", "execrlc"], encoding="latin-1")
+    else:
+        df = pd.read_excel(DPI_PATH, usecols=["ifs", "year", "execrlc"])
+        # Excel stores the year column as datetime; extract the integer year
+        if pd.api.types.is_datetime64_any_dtype(df["year"]):
+            df["year"] = df["year"].dt.year
+    df["year"] = pd.to_numeric(df["year"], errors="coerce").dropna().astype(int)
+    df["iso3"] = normalize_dpi_ifs_to_iso3(df["ifs"])
+    df = df.drop(columns=["ifs"])
+    df = df[df["iso3"].isin(USA_POLICY_ISO3)].copy()
+    df["dpi_exec_ideology"] = dpi_execrlc_to_ideology(df["execrlc"])
+    df = df.drop(columns=["execrlc"])
+    df = df.sort_values(["iso3", "year"]).reset_index(drop=True)
+    print(f"  DPI: {len(df)} rows, "
+          f"years {df['year'].min()}-{df['year'].max()}, "
+          f"{df['iso3'].nunique()} countries")
+    return df
+
+
+def build_policy_table() -> pd.DataFrame:
+    """Merge WGI, V-Dem, and DPI into a single (iso3, year) table."""
+    print("\nBuilding policy table...")
+    wgi = load_wgi()
+    vdem = load_vdem()
+    dpi = load_dpi()
+
+    policy = wgi.merge(vdem, on=["iso3", "year"], how="outer")
+    policy = policy.merge(dpi, on=["iso3", "year"], how="outer")
+
+    policy = policy[policy["iso3"].isin(USA_POLICY_ISO3)].copy()
+    policy["year"] = policy["year"].astype(int)
+    for col in POLICY_VARIABLES:
+        if col in policy.columns:
+            policy[col] = policy[col].astype("float32")
+
+    # Expand to a complete (iso3, year) grid for YEAR_MIN..YEAR_MAX so that
+    # biennial WGI gaps (e.g. 2001 is absent from WGI) are filled by carry-forward
+    # from the most recent available value. DPI is separately forward-filled so
+    # 2021+ keeps the last observed executive-ideology value.
+    all_iso3 = sorted(policy["iso3"].unique())
+    full_idx = pd.MultiIndex.from_product(
+        [all_iso3, list(range(YEAR_MIN, YEAR_MAX + 1))],
+        names=["iso3", "year"],
+    )
+    policy = (
+        policy
+        .set_index(["iso3", "year"])
+        .reindex(full_idx)
+        .reset_index()
+    )
+    # Forward/back-fill WGI and V-Dem (biennial gaps, edges).
+    wgi_vdem_cols = [c for c in ["wgi_ge", "wgi_rl", "vdem_ldi"] if c in policy.columns]
+    if wgi_vdem_cols:
+        policy[wgi_vdem_cols] = (
+            policy.groupby("iso3")[wgi_vdem_cols]
+            .transform(lambda s: s.ffill().bfill())
+        )
+
+    apply_dpi_executive_forward_fill(policy)
+
+    policy = policy.sort_values(["iso3", "year"]).reset_index(drop=True)
+
+    print(f"\nPolicy table: {len(policy)} rows, "
+          f"{policy['iso3'].nunique()} countries, "
+          f"years {policy['year'].min()}-{policy['year'].max()}")
+    for col in POLICY_VARIABLES:
+        n_miss = policy[col].isna().sum()
+        print(f"  {col}: {n_miss} missing ({100 * n_miss / len(policy):.1f}%)")
+
+    # Per-year coverage diagnostic — helps pinpoint data gaps
+    print("\n  Per-year missingness (wgi_ge) — years with any NaN indicate WGI gaps:")
+    wgi_by_year = policy.groupby("year")["wgi_ge"].apply(lambda s: s.isna().mean())
+    for yr, pct in wgi_by_year.items():
+        if yr >= YEAR_MIN and pct > 0:
+            print(f"    {yr}: {pct * 100:.0f}% missing")
+
+    return policy
+
+
+# ---------------------------------------------------------------------------
+# Country-code raster
+# ---------------------------------------------------------------------------
+
+def load_natural_earth() -> gpd.GeoDataFrame:
+    """Load Natural Earth 10m admin-0 countries, filtered to USA."""
+    print("\nLoading Natural Earth 10m admin-0 shapefile...")
+    try:
+        gdf = gpd.read_file(NE_10M_URL)
+        print(f"  Downloaded 10m shapefile: {len(gdf)} features")
+    except Exception as e:
+        print(f"  Failed to download 10m shapefile: {e}")
+        print("  Falling back to geopandas built-in naturalearth_lowres...")
+        gdf = gpd.read_file(gpd.datasets.get_path("naturalearth_lowres"))
+        print(f"  Loaded low-res shapefile: {len(gdf)} features")
+
+    # IMPORTANT: Use ADM0_A3 (country-level) before GU_A3 (map-unit level).
+    # In ne_10m_admin_0_map_units, GU_A3 uses sub-national codes ("US1", "USG",
+    # "HWI", etc.) while ADM0_A3 always uses the 3-letter country code ("USA").
+    # Checking GU_A3 first caused the USA filter to return empty, producing
+    # all-NaN policy rasters.
+    iso3_col = None
+    for candidate in ["ADM0_A3", "ISO_A3", "GU_A3", "iso_a3"]:
+        if candidate in gdf.columns:
+            iso3_col = candidate
+            break
+    if iso3_col is None:
+        raise ValueError(f"Cannot find ISO3 column. Available: {list(gdf.columns)}")
+    print(f"  Using ISO3 column: {iso3_col}")
+
+    gdf_usa = gdf[gdf[iso3_col].isin(USA_TERRITORIES)].copy()
+    if gdf_usa.empty:
+        raise ValueError(
+            f"No features found for USA_TERRITORIES={USA_TERRITORIES} "
+            f"in column '{iso3_col}'.\n"
+            f"  Unique values (sample): {sorted(gdf[iso3_col].unique())[:20]}\n"
+            f"  Try a different ISO3 column or update USA_TERRITORIES."
+        )
+    gdf_usa = gdf_usa[[iso3_col, "geometry"]].rename(columns={iso3_col: "iso3"})
+    print(f"  USA territories found: {sorted(gdf_usa['iso3'].unique())}")
+
+    return gdf_usa
+
+
+def create_country_raster(gdf_usa: gpd.GeoDataFrame) -> tuple[np.ndarray, dict]:
+    """Rasterize USA country polygon onto the backbone grid."""
+    print("\nCreating country-code raster...")
+
+    if not BACKBONE_PATH.exists():
+        raise FileNotFoundError(
+            f"Backbone raster not found: {BACKBONE_PATH}. "
+            "Run backbone_preprocessing first."
+        )
+
+    with rasterio.open(BACKBONE_PATH) as src:
+        profile = src.profile.copy()
+        backbone_transform = src.transform
+        backbone_shape = (src.height, src.width)
+        backbone_data = src.read(1)
+
+    print(f"  Backbone: {backbone_shape}")
+
+    if gdf_usa.crs is None:
+        gdf_usa = gdf_usa.set_crs("EPSG:4326")
+    gdf_proj = gdf_usa.to_crs(BACKBONE_CRS_EPSG)
+    print(f"  Reprojected {len(gdf_proj)} country polygons to {BACKBONE_CRS_EPSG}")
+
+    territory_to_id = {v: k for k, v in USA_COUNTRY_ID.items()}
+    shapes = []
+    for _, row in gdf_proj.iterrows():
+        cid = territory_to_id.get(row["iso3"])
+        if cid is not None:
+            shapes.append((row.geometry, cid))
+    if not shapes:
+        raise ValueError("No valid country geometries to rasterize.")
+
+    country_raster = rasterize(
+        shapes, out_shape=backbone_shape, transform=backbone_transform,
+        fill=0, dtype=np.uint8, all_touched=True,
+    )
+    country_raster[backbone_data == 0] = 0
+
+    total_land = int((backbone_data == 1).sum())
+    assigned = int((country_raster > 0).sum())
+    unassigned = total_land - assigned
+    print(f"  Land pixels: {total_land:,}")
+    print(f"  Assigned to country: {assigned:,} ({100 * assigned / total_land:.1f}%)")
+    if unassigned > 0:
+        print(f"  Unassigned: {unassigned:,} ({100 * unassigned / total_land:.1f}%)")
+        print(f"  Applying nearest-neighbour fill to {unassigned:,} unassigned land pixels...")
+        # Land pixels with country_id=0 arise from sub-pixel polygon boundary gaps.
+        # Fill each such pixel with the country_id of its nearest assigned neighbour
+        # so that no land pixel is silently excluded from policy rasters.
+        need_fill = (backbone_data == 1) & (country_raster == 0)
+        assigned_mask = (country_raster > 0)
+        _, nearest_idx = distance_transform_edt(~assigned_mask, return_indices=True)
+        country_raster[need_fill] = country_raster[
+            nearest_idx[0][need_fill],
+            nearest_idx[1][need_fill],
+        ]
+        assigned_after = int((country_raster > 0).sum())
+        print(f"  After fill: {assigned_after:,} land pixels assigned "
+              f"({100 * assigned_after / total_land:.1f}%)")
+
+    for cid, iso3 in sorted(USA_COUNTRY_ID.items()):
+        n = int((country_raster == cid).sum())
+        if n > 0:
+            print(f"    {iso3} (id={cid:2d}): {n:>10,} pixels")
+
+    return country_raster, profile
+
+
+def save_country_raster(country_raster: np.ndarray, profile: dict) -> None:
+    """Write the country-code raster and JSON mapping as auxiliary files."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    raster_path = OUTPUT_DIR / "country_iso3.tif"
+    out_profile = profile.copy()
+    out_profile.update(dtype="uint8", nodata=0, compress="lzw", count=1)
+    with rasterio.open(raster_path, "w", **out_profile) as dst:
+        dst.write(country_raster, 1)
+    print(f"  Saved auxiliary country raster: {raster_path}")
+
+    mapping_path = OUTPUT_DIR / "country_iso3_mapping.json"
+    mapping_dict = {str(k): v for k, v in USA_COUNTRY_ID.items()}
+    with open(mapping_path, "w") as f:
+        json.dump(mapping_dict, f, indent=2)
+    print(f"  Saved auxiliary country mapping: {mapping_path}")
+
+
+# ---------------------------------------------------------------------------
+# Rasterize policy variables
+# ---------------------------------------------------------------------------
+
+def rasterize_policy_variables(
+    policy_table: pd.DataFrame,
+    country_raster: np.ndarray,
+    profile: dict,
+) -> None:
+    """Create per-variable per-year TIF rasters.
+
+    For each variable and each year in [YEAR_MIN, YEAR_MAX], every pixel
+    receives the value of the variable for that pixel's country.  Pixels
+    with no country (country_raster == 0) or missing data are set to NaN.
+    """
+    print("\nRasterizing policy variables...")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    id_to_iso3 = USA_COUNTRY_ID
+
+    out_profile = profile.copy()
+    out_profile.update(
+        dtype="float32", nodata=np.nan, compress="lzw",
+        count=1, tiled=True, blockxsize=512, blockysize=512,
+    )
+
+    total_files = 0
+    years = list(range(YEAR_MIN, YEAR_MAX + 1))
+
+    for var in POLICY_VARIABLES:
+        print(f"\n  Variable: {var}")
+        files_written = 0
+
+        for year in years:
+            raster = np.full(country_raster.shape, np.nan, dtype=np.float32)
+
+            for cid, iso3 in id_to_iso3.items():
+                mask = country_raster == cid
+                if not mask.any():
+                    continue
+
+                row = policy_table[
+                    (policy_table["iso3"] == iso3) & (policy_table["year"] == year)
+                ]
+                if not row.empty and var in row.columns:
+                    val = row.iloc[0][var]
+                    if pd.notna(val):
+                        raster[mask] = float(val)
+
+            out_path = OUTPUT_DIR / f"{var}_{year}.tif"
+            with rasterio.open(out_path, "w", **out_profile) as dst:
+                dst.write(raster, 1)
+            files_written += 1
+            total_files += 1
+
+        valid_years = policy_table[policy_table[var].notna()]["year"]
+        yr_range = f"{int(valid_years.min())}-{int(valid_years.max())}" if len(valid_years) > 0 else "none"
+        print(f"    {files_written} rasters written ({YEAR_MIN}-{YEAR_MAX}), "
+              f"data available for {yr_range}")
+
+    print(f"\nTotal: {total_files} policy rasters written to {OUTPUT_DIR}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    print("Policy Variables Preprocessing — USA")
+    print("=" * 60)
+    print(f"Input:  {DATA_DIR / 'shared'} (WGI, VDem, DPI)")
+    print(f"Output: {OUTPUT_DIR}")
+    print()
+
+    # Step 1: Build policy lookup table (internal, not saved)
+    policy = build_policy_table()
+
+    # Step 2: Create country raster (for pixel -> country mapping)
+    gdf_usa = load_natural_earth()
+    country_raster, profile = create_country_raster(gdf_usa)
+
+    # Step 3: Save auxiliary files (country raster + mapping)
+    save_country_raster(country_raster, profile)
+
+    # Step 4: Rasterize all policy variables
+    rasterize_policy_variables(policy, country_raster, profile)
+
+    print("\n" + "=" * 60)
+    print("Policy preprocessing complete.")
+    print(f"Upload {OUTPUT_DIR.name}/ to Euler:")
+    print(f"  $SCRATCH/data/usa/ready/policy/")
+
+
+if __name__ == "__main__":
+    main()
