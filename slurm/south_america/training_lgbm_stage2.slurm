@@ -18,6 +18,11 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
+# To test higher truncation level after initial training (recommended experiment):
+# uncomment the export below, change the job name, and resubmit.
+# Rationale: tuning searched [50,500] but test k@1% is ~2000; 1500 covers that window.
+# export STAGE2_TRUNCATION_LEVEL=1500
+
 echo "Starting model1_LGBM_stage2..."
 srun --cpu-bind=cores --distribution=block:block python -u \
   scripts/regions/south_america/5_training/model1_LGBM_stage2

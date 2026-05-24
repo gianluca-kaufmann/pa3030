@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage 1 country-year PA expansion model (Poisson GLM) — South America."""
+"""Stage 1 country-year PA expansion model (Poisson GLM) — USA."""
 
 from __future__ import annotations
 
@@ -17,8 +17,8 @@ _ROOT = Path(__file__).resolve().parents[4]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-PANEL_PATH = _ROOT / "data" / "south_america" / "stage1_panel.parquet"
-OUT_DIR = _ROOT / "outputs" / "south_america" / "results" / "ml_models"
+PANEL_PATH = _ROOT / "data" / "usa" / "stage1_panel.parquet"
+OUT_DIR = _ROOT / "outputs" / "usa" / "results" / "ml_models"
 
 LAG_COLS = ["pa_momentum_pixels_lag1", "pa_momentum_pixels_lag2", "pa_momentum_pixels_lag3"]
 POLITICAL_COLS = [
@@ -45,20 +45,18 @@ def main() -> None:
     X_raw = cy[feature_cols].to_numpy(dtype=np.float64)
     y = cy["pa_expansion_pixels"].to_numpy(dtype=np.float64)
 
-    # Scale to prevent log-link overflow on large pixel counts (up to ~350k)
     scaler = StandardScaler()
     X = scaler.fit_transform(X_raw)
 
     model = PoissonRegressor(alpha=0.0, max_iter=1000)
     model.fit(X, y)
-    # D² (deviance-based pseudo-R²): correct for Poisson; model.score() returns this
     pseudo_r2 = float(model.score(X, y))
     mu = np.clip(model.predict(X), 1e-9, None)
     rmse = float(np.sqrt(mean_squared_error(y, mu)))
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     result = {
-        "region": "south_america",
+        "region": "usa",
         "model": "poisson_glm",
         "pseudo_r2_d2": pseudo_r2,
         "rmse": rmse,
@@ -66,12 +64,10 @@ def main() -> None:
         "feature_cols": feature_cols,
         "coefficients": {name: float(coef) for name, coef in zip(feature_cols, model.coef_.ravel())},
         "intercept": float(model.intercept_),
-        # Scaler parameters required for correct forward inference.
-        # Prediction: mu = exp((x_raw - scaler_mean) / scaler_scale @ coef + intercept)
         "scaler_mean": {name: float(m) for name, m in zip(feature_cols, scaler.mean_)},
         "scaler_scale": {name: float(s) for name, s in zip(feature_cols, scaler.scale_)},
     }
-    out_path = OUT_DIR / "model1_expansion_coefficients.json"
+    out_path = OUT_DIR / "model2_expansion_coefficients.json"
     out_path.write_text(json.dumps(result, indent=2))
     print(f"Stage 1 Poisson GLM D²: {pseudo_r2:.4f}, RMSE: {rmse:.4f}")
     print(f"Saved: {out_path}")

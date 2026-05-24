@@ -368,7 +368,12 @@ def _prepare_lgb_params(best_params: Dict[str, Any], num_threads: int) -> Dict[s
     params["random_state"] = params.get("random_state", 42)
     params["num_threads"] = num_threads
     if "lambdarank_truncation_level" not in params:
-        params["lambdarank_truncation_level"] = 5
+        params["lambdarank_truncation_level"] = FIXED_PARAMS["lambdarank_truncation_level"]
+    # STAGE2_TRUNCATION_LEVEL env var overrides tuned value for post-tuning experiments.
+    # Set to ~1500 to cover test k@1% (~2000 for SA/SEA full-data groups).
+    override = os.environ.get("STAGE2_TRUNCATION_LEVEL")
+    if override:
+        params["lambdarank_truncation_level"] = int(override)
     return params
 
 

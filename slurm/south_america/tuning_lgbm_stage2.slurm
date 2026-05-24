@@ -15,5 +15,5 @@ module load stack/2024-06 gcc/12.2.0 python_cuda/3.11.6 eth_proxy
 source "$HOME/venvs/master_thesis/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
-export STAGE2_NEG_RATIO=20
+export STAGE2_NEG_RATIO=100
 python -u scripts/regions/south_america/4_tuning/model1_tuning_lgbm_stage2

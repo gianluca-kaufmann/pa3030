@@ -58,7 +58,11 @@ def concordance_within_groups(
     y_score: np.ndarray,
     group_sizes: np.ndarray,
 ) -> float:
-    """Macro-averaged pairwise concordance among (positive, negative) pairs per group."""
+    """Macro-averaged pairwise concordance among (positive, negative) pairs per group.
+
+    Uses searchsorted on sorted negatives: O(n_neg log n_neg + n_pos log n_neg)
+    instead of O(n_pos * n_neg) nested loops — safe for USA-scale groups.
+    """
     concordances: list[float] = []
     offset = 0
     for size in group_sizes:
@@ -72,17 +76,13 @@ def concordance_within_groups(
         neg_idx = np.where(yt == 0)[0]
         if len(pos_idx) == 0 or len(neg_idx) == 0:
             continue
-        pairs = 0
-        concordant = 0
-        for pi in pos_idx:
-            for ni in neg_idx:
-                pairs += 1
-                if ys[pi] > ys[ni]:
-                    concordant += 1
-                elif ys[pi] == ys[ni]:
-                    concordant += 0.5
-        if pairs > 0:
-            concordances.append(concordant / pairs)
+        pos_scores = ys[pos_idx]
+        sorted_negs = np.sort(ys[neg_idx])
+        n_concordant = np.searchsorted(sorted_negs, pos_scores, side="left")
+        n_tied = np.searchsorted(sorted_negs, pos_scores, side="right") - n_concordant
+        concordant = float(n_concordant.sum()) + 0.5 * float(n_tied.sum())
+        total_pairs = float(len(pos_scores) * len(sorted_negs))
+        concordances.append(concordant / total_pairs)
     return float(np.mean(concordances)) if concordances else 0.0
 
 

@@ -15,6 +15,10 @@ module load stack/2024-06 gcc/12.2.0 python_cuda/3.11.6 eth_proxy
 source "$HOME/venvs/master_thesis/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
+# To test higher truncation level after initial training (recommended experiment):
+# uncomment the export below, change the job name, and resubmit.
+# export STAGE2_TRUNCATION_LEVEL=1500
+
 python -u scripts/regions/usa/5_training/model2_LGBM_stage2
 
 echo "Starting naive baseline (dist_wdpa only)..."
