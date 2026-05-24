@@ -270,6 +270,43 @@ def _rank_normalize_within_groups(X: np.ndarray, group_sizes: np.ndarray) -> np.
     return X
 
 
+def _shuffle_within_groups(
+    X: np.ndarray,
+    y: np.ndarray,
+    group_sizes: np.ndarray,
+    rng: np.random.Generator,
+) -> None:
+    """Randomly shuffle rows within each group in-place (X column-wise, y directly).
+
+    Must be called AFTER rank normalisation so that relative rank values are
+    preserved, but BEFORE sub-window splitting in lgb.Dataset.  The result is that
+    each consecutive 9K sub-window is a random sample of the full country-year
+    rather than a spatially-contiguous patch.
+
+    Why this matters: panels are spatially sorted (row, col order), so consecutive
+    9K windows contain pixels from the same geographic neighbourhood.  LambdaRank
+    gradient signals then compare only locally-similar pixels, teaching the model
+    "is this pixel better than its 9K spatial neighbours?" — not the test task of
+    "is this pixel better than ALL 500K pixels in the country-year?"  With random
+    sub-windows, gradients compare pixels drawn from the full feature distribution,
+    aligning training with the test evaluation scale.
+
+    country_id and year are constant within every group, so they need not be shuffled.
+    X is shuffled column-wise to keep peak memory O(n × 4B) per column rather than
+    O(n × n_features × 4B), which is critical for large country-years (USA ~50M rows).
+    """
+    offset = 0
+    for size in group_sizes:
+        n = int(size)
+        if n > 1:
+            perm = rng.permutation(n)
+            sl = slice(offset, offset + n)
+            y[sl] = y[sl][perm]
+            for col_idx in range(X.shape[1]):
+                X[sl, col_idx] = X[sl, col_idx][perm]
+        offset += n
+
+
 def load_stage2_arrays(
     panel_path: Path,
     region: str,
@@ -302,7 +339,18 @@ def load_stage2_arrays(
     essential = list(dict.fromkeys(essential))
 
     rng = np.random.default_rng(rng_seed) if neg_ratio is not None else None
-    frames: list[pd.DataFrame] = []
+
+    # Keep metadata (5 small columns) and feature arrays (float32) separate during
+    # streaming to avoid the 2× peak from pd.concat on a DataFrame that includes all
+    # 75 feature columns (~190 GB peak for SA at 203M rows with float32 features).
+    # With separation: meta concat is ~4 GB; feature concat peaks at ~2×60 GB = 120 GB.
+    meta_cols = ["country_id", "year", TARGET_COL]
+    if use_graded_relevance:
+        meta_cols += ["row", "col"]
+
+    meta_frames: list[pd.DataFrame] = []
+    feat_arrays: list[np.ndarray] = []
+
     pf = pq.ParquetFile(panel_path)
     for batch in pf.iter_batches(columns=essential, batch_size=BATCH_SIZE):
         df = batch.to_pandas()
@@ -328,16 +376,30 @@ def load_stage2_arrays(
                 sampled_neg = rng.choice(neg_idx, size=n_keep, replace=False)
                 keep = np.sort(np.concatenate([pos_idx, sampled_neg]))
                 df = df.iloc[keep]
-        coord_cols = ["row", "col"] if use_graded_relevance else []
-        frames.append(df[["country_id", "year", TARGET_COL] + coord_cols + feature_cols])
+        meta_frames.append(df[meta_cols].copy())
+        feat_arrays.append(df[feature_cols].to_numpy(dtype=np.float32))
+        del df
 
-    if not frames:
+    if not feat_arrays:
         raise ValueError(f"No Stage 2 samples after expansion filter: {panel_path}")
 
-    data = pd.concat(frames, ignore_index=True)
-    data = data.sort_values(["country_id", "year"]).reset_index(drop=True)
+    # Metadata concat: cheap (~4 GB for SA's 203M rows × 5 cols × 4B).
+    data = pd.concat(meta_frames, ignore_index=True)
+    del meta_frames
+    gc.collect()
 
-    X = data[feature_cols].to_numpy(dtype=np.float32)
+    # Sort order for (country_id, year): lexsort uses last key as primary.
+    order = np.lexsort((data["year"].to_numpy(), data["country_id"].to_numpy()))
+    data = data.iloc[order].reset_index(drop=True)
+
+    # Feature concat then sort: peak = 2 × n_rows × n_features × 4B (~120 GB for SA).
+    X_unsorted = np.concatenate(feat_arrays, axis=0)
+    del feat_arrays
+    gc.collect()
+    X = X_unsorted[order]
+    del X_unsorted, order
+    gc.collect()
+
     group_sizes = data.groupby(["country_id", "year"], sort=False).size().to_numpy(dtype=np.int32)
 
     if use_graded_relevance:
@@ -347,9 +409,18 @@ def load_stage2_arrays(
 
     years = data["year"].to_numpy(dtype=np.int32)
     country_ids = data["country_id"].to_numpy(dtype=np.int32)
+    del data
+    gc.collect()
 
     if normalize_within_groups:
         X = _rank_normalize_within_groups(X, group_sizes)
+
+    # Shuffle rows within each group so that consecutive 9K sub-windows (created
+    # by _split_large_groups in lgb.Dataset) are random samples of the full
+    # country-year rather than spatially-contiguous patches.  Uses a fixed seed
+    # offset from rng_seed so it is independent of neg_ratio sampling but still
+    # fully reproducible.  See _shuffle_within_groups docstring for the rationale.
+    _shuffle_within_groups(X, y, group_sizes, np.random.default_rng(rng_seed + 1337))
 
     return X, y, years, country_ids, group_sizes
 
@@ -473,7 +544,7 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
     print(f"  {len(expansion_groups):,} expansion country-years ({time.time()-t0:.1f}s)")
 
     print("Loading train pool...")
-    X_tr, y_tr, _, _, g_tr = load_stage2_arrays(
+    X_tr, y_tr, years_tr, _, g_tr = load_stage2_arrays(
         train_path, cfg.region, feature_cols, expansion_groups, cfg.train_years
     )
     X_es, y_es, _, _, g_es = load_stage2_arrays(
@@ -489,8 +560,8 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
         g_es,
         lgb_params,
         compute_year_weights(
-            np.full(len(y_tr), cfg.train_years[1], dtype=np.int32),
-            min_year=2001,
+            years_tr,
+            min_year=cfg.train_years[0],
             max_year=cfg.train_years[1],
         ),
         num_boost_round,

@@ -94,6 +94,27 @@ Fixed: replaced with O(n log n) `searchsorted` implementation.
 **Bug F5 — Fallback truncation level was 5 (minor)**
 Fixed to use `FIXED_PARAMS` default (100).
 
+Additional bugs and improvements applied 2026-05-25:
+
+**Improvement I1 — Random within-group shuffle before sub-window splitting (major, structural)**
+Training panels are spatially sorted (row, col order), so LightGBM's consecutive 9K sub-windows
+contained spatially homogeneous patches. LambdaRank gradients compared only locally-similar pixels,
+teaching "rank vs 9K neighbours" rather than "rank vs all 500K country-year pixels".
+Fix: `_shuffle_within_groups` called in `load_stage2_arrays` after rank normalisation (and before
+lgb.Dataset construction). Each 9K window is now a random sample of the full country-year
+distribution, aligning training gradients with the test evaluation task. Column-wise X shuffle
+keeps peak memory O(n × 4B) per column, safe for USA-scale groups (~50M rows/country-year).
+Applied to both training and tuning (tuning also calls `load_stage2_arrays`).
+
+**Bug F9 — Stage 2 temporal weighting always uniform (important)**
+`run_stage2_training` passed `np.full(len(y_tr), cfg.train_years[1])` (constant year 2013) to
+`compute_year_weights`, making all weights 1.0. The actual `years_tr` were discarded with `_`.
+Fixed: capture `years_tr` and pass it to `compute_year_weights(years_tr, min_year=..., max_year=...)`.
+Samples from 2001 now receive weight 0.5; samples from 2013 receive weight 1.0, focusing gradient
+on patterns most relevant to the 2017–2019 test period.
+
+**Memory fix applied 2026-05-25** (see W1 section above for full description).
+
 Additional bugs found and fixed 2026-05-24 (second pass):
 
 **Bug F6 — eval_at not set → early stopping monitored NDCG@1 (single position) (important)**
@@ -138,13 +159,26 @@ re-tune after if results disappoint).
 
 ### W0 — Feature / provenance gate ✅ complete
 
-### W1 — Stage 2 LambdaRank ✅ code complete; training in progress
+### W1 — Stage 2 LambdaRank ✅ code complete; SA training pending re-run
 
 All bugs fixed (original 4 from 2026-05-23 + F1–F8 from 2026-05-24). Code is clean.
 
-SEA first run (truncation=285, without eval_at fix): NDCG@1%=0.106, lift@1%≈8.7× binary.
-Both SA and SEA training SLURMs now use `STAGE2_TRUNCATION_LEVEL=3000` and `eval_at=[90]`.
-SEA re-run and SA first run are queued (see WHAT TO DO NEXT).
+**Memory fix applied 2026-05-25**: `load_stage2_arrays` in `stage2_lgbm_core.py` now separates
+metadata (5 cols, ~4 GB) from feature arrays (float32 numpy) during batch streaming. This cuts
+peak memory from ~190 GB (old: pd.concat of full DataFrames) to ~120 GB (new: 2× feature array
+during np.concatenate and sort). SA training previously OOM-killed at 128 GB; this fix should allow
+it to run within 128 GB.
+
+**SEA tuning–training inconsistency found 2026-05-25**: SEA tuning ran 2026-05-23 (before Bug F6
+fix), using default `eval_at=[1,2,3,4,5]`, and found `n_estimators=1397`. Full training uses
+`eval_at=[90]` (from FIXED_PARAMS post-F6), which peaked at iteration 52 and fired early stopping.
+Result: SEA re-run (565173) trained only 52 trees → NDCG@1%=0.1125, well below the ~0.20+ that
+1397 trees might achieve. SA tuning ran after Bug F6 fix with `eval_at=[90]`, finding n_estimators=955;
+SA training will be consistent. SEA must be re-tuned before re-training.
+
+SEA re-run (565173): NDCG@1%=0.1125, lift@1%=10.1×, concordance=0.789 (52 trees only — under-trained).
+SA training (565170): OOM-killed. SA naive baseline: NDCG@1%=0.023, lift@1%=2.7×.
+SA full model: not yet run.
 
 ### W2 — New data [HIGH VALUE, parallel with W1]
 
@@ -211,11 +245,12 @@ Submit USA tuning after SE Asia training completes (CPU quota). USA tuning SLURM
 | Annual hazard model AUC | 0.582 | Misspecified — superseded |
 | Stage 1 momentum-only D² (in-sample) | 0.415 | Illustrative context zone |
 | Stage 1 full political model D² (in-sample) | 0.612 | In-sample only — OOS needed |
-| Stage 2 tuning NDCG (SA, neg_ratio=100) | 0.186 | CV metric on training data |
-| Stage 2 tuning NDCG (SEA, neg_ratio=100) | 0.126 | CV metric on training data |
+| Stage 2 tuning NDCG (SA, neg_ratio=100) | 0.186 | CV metric on training data; eval_at=[90] ✓ |
+| Stage 2 tuning NDCG (SEA, neg_ratio=100) | 0.126 | CV metric — pre-F6 fix, eval_at=[1-5]; re-tune needed |
 | Stage 2 SEA test NDCG@1% (first run, trunc=285) | 0.106 | Binary lift ≈ 8.7× |
+| Stage 2 SEA test NDCG@1% (re-run, trunc=3000, eval_at=[90]) | 0.1125 | Lift=10.1×, concordance=0.789 — **52 trees only** |
 | Stage 2 naïve baseline SEA (dist_wdpa only) | 0.014 NDCG / ≈1.5× lift | Beaten by ≥9 pp ✓ |
-| Stage 2 naïve baseline SA (dist_wdpa only) | 0.016 NDCG | Full model not yet run |
+| Stage 2 naïve baseline SA (dist_wdpa only) | 0.023 NDCG / 2.7× lift | Full model OOM-killed; resubmit pending |
 | Stage 2 NDCG@1% target (test, corrected) | 0.15–0.35 | SE Asia; see derivation in Stage 2 section |
 | Stage 2 Lift@1% target (binary) | 10–25× | Primary paper metric |
 
@@ -236,10 +271,12 @@ Submit USA tuning after SE Asia training completes (CPU quota). USA tuning SLURM
 | Stage 2 tuning — SEA | ✅ complete | 100 trials, best NDCG=0.126, trunc=285 |
 | Stage 2 tuning — USA | ❌ pending | Submit now (SEA training done); range now [50,3000] |
 | Stage 2 training — SEA (first run) | ✅ done | NDCG=0.106, lift≈8.7×; trunc=285, no eval_at fix |
-| Stage 2 training — SA | 🔄 job 565170 (running) | First run; trunc=3000 + eval_at fix |
-| Stage 2 training — SEA (re-run trunc=3000) | 🔄 job 565173 → after SA | eval_at fix; replaces first run |
-| Stage 2 tuning — USA | 🔄 job 565180 → after SEA | Range [50,3000], eval_at fix |
-| Stage 2 training — USA | 🔄 job 565711 → after USA tune | trunc=3000 + eval_at fix |
+| Stage 2 training — SA | 🔄 job 567921 RUNNING | Memory fix + shuffle (I1) + F9 weighting fix applied |
+| Stage 2 training — SEA (re-run trunc=3000) | ✅ done (job 565173) | NDCG=0.1125, lift=10.1× — under-trained (52 trees); re-tune queued |
+| Stage 2 tuning — SEA (re-run with eval_at=[90]) | 🔄 job 567952 PENDING | Shuffle + F9 fix; starts after SA frees memory quota |
+| Stage 2 training — SEA (final) | 🔄 job 567979 → afterok:567952 | Will use new n_estimators from re-tune |
+| Stage 2 tuning — USA | 🔄 job 568012 → afterok:567979 | Range [50,3000], all fixes applied |
+| Stage 2 training — USA | 🔄 job 568045 → afterok:568012 | trunc=3000 + all fixes |
 | Naïve baseline SEA | ✅ done | NDCG=0.014, lift≈1.5× binary (full model beats by 9 pp) |
 | Naïve baseline SA | ✅ done | NDCG=0.016 |
 | Two-stage forward predict | ✅ code fixed | Bugs F1+F2 resolved 2026-05-24 |
@@ -248,30 +285,29 @@ Submit USA tuning after SE Asia training completes (CPU quota). USA tuning SLURM
 
 ## WHAT TO DO NEXT (ordered)
 
-**Jobs are fully queued — nothing to submit right now.**
+**Active job chain (all submitted 2026-05-25):**
+- 567921: SA training — RUNNING
+- 567952: SEA tuning — PENDING (QOSMaxMemoryPerUser; starts after SA)
+- 567979: SEA training — PENDING (afterok:567952)
+- 568012: USA tuning — PENDING (afterok:567979)
+- 568045: USA training — PENDING (afterok:568012)
 
-Chain (all jobs submitted, each depends on the previous):
-  565170 SA training → 565173 SEA re-run → 565180 USA tuning → 565711 USA training
+1. **After SA training (567921) finishes**: check `lift_at_1pct_within_groups` (target >10×) and
+   confirm full model beats naive by ≥ 5 pp NDCG@1%.
 
-1. **Wait for SA training (565170)** to produce
-   `outputs/south_america/results/ml_models/model1_lgbm_stage2_metrics_*.json`.
-   Check: `lift_at_1pct_within_groups` (target: >10×) and that full model beats naive
-   by ≥ 5 pp NDCG@1% (SEA confirmed at +9 pp).
+2. **After SEA training (567979) finishes**: confirm NDCG@1% improved over 0.1125 (52-tree result).
 
-2. **After SA and SEA re-run finish**, compare the two SEA runs:
-   - First run (trunc=285, no eval_at): NDCG=0.106, lift≈8.7×
-   - Re-run (trunc=3000, eval_at fix): check for improvement
-   Use the better run as the reported model.
-
-3. **After USA training finishes**, check for the USA "near-perfect concordance" finding
+3. **After USA training (568045) finishes**, check for the USA "near-perfect concordance" finding
    (adjacency effect — described in SETTLED DECISIONS).
 
-4. **Run Stage 1 OOS evaluation** locally: modify `model1_expansion.py` to split train ≤ 2013 /
+4. **After SA and SEA final training**: compare metrics, confirm both beat naive by ≥ 5 pp.
+
+5. **Run Stage 1 OOS evaluation** locally: modify `model1_expansion.py` to split train ≤ 2013 /
    test 2014–2019 before citing D² in the paper. (Open Issue A.)
 
-5. **Run `model2/3_expansion.py`** for USA and SEA Stage 1. (Open Issue D.)
+6. **Run `model2/3_expansion.py`** for USA and SEA Stage 1. (Open Issue D.)
 
-6. **Full ablation (W4)** after all three regions have final training results.
+7. **Full ablation (W4)** after all three regions have final training results.
 
 ---
 
