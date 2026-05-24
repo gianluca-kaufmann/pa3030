@@ -116,12 +116,17 @@ def lift_at_k_within_groups(
     group_sizes: np.ndarray,
     k_pct: float,
 ) -> float:
-    """Macro-averaged lift@k_pct within groups."""
-    baseline = float(y_true.mean()) if len(y_true) else 0.0
+    """Macro-averaged lift@k_pct within groups.
+
+    Uses the binary positive rate (fraction of pixels with any transition) as
+    the baseline, not the mean of graded relevance labels. This ensures lift is
+    interpretable as "times better than random selection of transition pixels".
+    """
+    binary_baseline = float((y_true > 0).mean()) if len(y_true) else 0.0
     prec = precision_at_k_within_groups(y_true, y_score, group_sizes, k_pct)
-    if baseline <= 0:
+    if binary_baseline <= 0:
         return 0.0
-    return prec / baseline
+    return prec / binary_baseline
 
 
 def compute_stage2_metrics(
@@ -155,7 +160,7 @@ def compute_stage2_metrics(
         "lift_at_10pct_within_groups": lift_at_k_within_groups(
             y_true, y_score, group_sizes, 10.0
         ),
-        "baseline_rate": float(y_true.mean()) if len(y_true) else 0.0,
+        "baseline_rate": float((y_true > 0).mean()) if len(y_true) else 0.0,
         "n_groups": int(len(group_sizes)),
         "n_samples": int(len(y_true)),
     }

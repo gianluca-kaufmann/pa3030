@@ -48,17 +48,20 @@ STAGE2_EXCLUDE_COLS = frozenset({
     "country_iso3",
 })
 
+# LightGBM 4.6 hardcodes a 10 000-row per-query limit in C++.
+# We split any group that exceeds this before building lgb.Dataset.
+_LGB_MAX_QUERY = 9_000
+
 FIXED_PARAMS = {
     "boosting_type": "gbdt",
     "objective": "lambdarank",
     "metric": "ndcg",
     "verbose": -1,
     "lambdarank_truncation_level": 100,
+    # Early stopping monitors ndcg@k@1% of the split sub-groups (_LGB_MAX_QUERY rows).
+    # Default eval_at=[1,2,3,4,5] uses only the single top position — too noisy.
+    "eval_at": [max(1, _LGB_MAX_QUERY // 100)],  # = [90] for _LGB_MAX_QUERY=9000
 }
-
-# LightGBM 4.6 hardcodes a 10 000-row per-query limit in C++.
-# We split any group that exceeds this before building lgb.Dataset.
-_LGB_MAX_QUERY = 9_000
 
 
 def _split_large_groups(group_sizes: np.ndarray) -> np.ndarray:

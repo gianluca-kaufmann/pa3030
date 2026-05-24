@@ -18,10 +18,10 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
-# To test higher truncation level after initial training (recommended experiment):
-# uncomment the export below, change the job name, and resubmit.
-# Rationale: tuning searched [50,500] but test k@1% is ~2000; 1500 covers that window.
-# export STAGE2_TRUNCATION_LEVEL=1500
+# SA tuning found truncation=499 (ceiling of old [50,500] range), confirming higher
+# is better. 3000 covers ~33% of each 9000-row split sub-group and gives gradient
+# to high-relevance (rel=4) pixels buried beyond position 499 in each sub-group.
+export STAGE2_TRUNCATION_LEVEL=3000
 
 echo "Starting model1_LGBM_stage2..."
 srun --cpu-bind=cores --distribution=block:block python -u \

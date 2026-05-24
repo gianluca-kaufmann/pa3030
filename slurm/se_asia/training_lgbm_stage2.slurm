@@ -15,9 +15,10 @@ module load stack/2024-06 gcc/12.2.0 python_cuda/3.11.6 eth_proxy
 source "$HOME/venvs/master_thesis/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
-# To test higher truncation level after initial training (recommended experiment):
-# uncomment the export below, change the job name, and resubmit.
-# export STAGE2_TRUNCATION_LEVEL=1500
+# Truncation override: SA tuning hit the [50,500] ceiling (best=499); wider search
+# confirms higher is better. 3000 covers ~33% of each 9000-row split sub-group and
+# gives gradient signal to high-relevance (rel=4) pixels buried beyond position 500.
+export STAGE2_TRUNCATION_LEVEL=3000
 
 python -u scripts/regions/se_asia/5_training/model3_LGBM_stage2
 
