@@ -18,12 +18,8 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
-# SA tuning found truncation=499 (ceiling of old [50,500] range), confirming higher
-# is better. 3000 covers ~33% of each 9000-row split sub-group and gives gradient
-# to high-relevance (rel=4) pixels buried beyond position 499 in each sub-group.
-# Remove this override once SA is re-tuned with the [50,3000] range.
-export STAGE2_TRUNCATION_LEVEL=3000
-# Match tuning neg_ratio so hyperparameters are valid for the training class-balance regime.
+# STAGE2_TRUNCATION_LEVEL intentionally absent — use the value from best_params.json
+# found by the [50,3000] re-tune.  Override removed 2026-05-25.
 export STAGE2_NEG_RATIO=100
 
 echo "Starting model1_LGBM_stage2..."

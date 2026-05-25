@@ -39,7 +39,7 @@ A single classifier conflates both terms. The Group A/B diagnostic proves this e
 | Stage 2 tuning NDCG — SA | 0.186 | CV on training data |
 | Stage 2 test NDCG@1% — SA | **0.028** | Lift=6.0×; naive lift=0.747× (< 1) — see below |
 | Stage 2 naive baseline — SA | NDCG=0.016 / lift=0.747× | dist_wdpa ANTI-predictive in test period |
-| Stage 2 test NDCG@1% — SEA (52 trees, under-trained) | 0.1125 | Re-tuning running (job 567952) |
+| Stage 2 test NDCG@1% — SEA (re-tuned, eval_at=[90]) | **0.091** | Lift@1%=12.7×; naive lift=2.7× — beats SA significantly |
 | Stage 2 naive baseline — SEA | 0.014 / ~1.5× lift | Full model beats by ~9 pp |
 | NDCG@1% target (corrected) | 0.15–0.35 | SEA/SA; see derivation below |
 | Lift@1% target | 10–25× | Primary paper metric |
@@ -48,9 +48,13 @@ A single classifier conflates both terms. The Group A/B diagnostic proves this e
 
 **SA underperformance — two compounding causes**:
 1. **Frontier exhaustion (structural)**: Annual designations collapsed 2001–2009 (150–320K km²/yr) → 2010+ (~20–60K km²/yr) — *before* Bolsonaro. Large easy Amazon blocks were designated first; 2017–2019 pixels are smaller and qualitatively different from training-era positives. Fixed by: `country_pa_cumsum_lag1_pixels` saturation feature (re-run panel merge on Euler) + accept as paper finding.
-2. **Bolsonaro structural break (political)**: 2019 Brazil collapses further. Confirm via Issue C year/country breakdown.
+2. **Bolsonaro structural break hypothesis — FALSIFIED (Issue C)**: 2019 is actually the best test year (Lift=9.64×). 2017 drives the shortfall. Issue D (9K sub-window mismatch) is now the primary suspect.
 
 **Naive baseline finding**: Within expansion groups, `dist_wdpa`-only model achieves lift@1%=0.747 < 1.0 — proximity to existing PAs is ANTI-predictive for 2017–2019. Test-period designations are new areas, not extensions. **Paper finding: two-stage model provides genuine added value over naive heuristic.**
+
+**USA LambdaRank chain cancelled (2026-05-25)**: Jobs 568012/568045 (USA Stage 2 tune/train) cancelled to prioritise SA FE re-run (Issues H+I) and W8 binary. USA Stage 2 will be re-submitted after SA results confirm the approach.
+
+**STAGE2_TRUNCATION_LEVEL override removed (2026-05-25)**: `training_lgbm_stage2.slurm` no longer overrides truncation to 3000. The SA re-tune with [50,3000] will find the true optimum, which will then be read from `best_params.json` by the chained training job.
 
 **Three tuning/training inconsistencies fixed (2026-05-25)**:
 1. `neg_ratio` mismatch: training now reads `STAGE2_NEG_RATIO` env var (same as tuning); SLURM training scripts updated with `STAGE2_NEG_RATIO=100`.
@@ -83,13 +87,22 @@ A single classifier conflates both terms. The Group A/B diagnostic proves this e
 | Stage 2 tuning — SA | ✅ 100 trials, NDCG=0.186, trunc=3000 |
 | Stage 2 training — SA | ✅ Job 567921. NDCG=0.028, lift=6.0× (see diagnosis above) |
 | Stage 2 naive baseline — SA | ✅ NDCG=0.017, lift=2.7× |
-| Stage 2 tuning — SEA (re-run, eval_at=[90]) | 🔄 Job 567952 running |
-| Stage 2 training — SEA (final) | 🔄 Job 567979 (afterok:567952) |
-| Stage 2 tuning — USA | 🔄 Job 568012 (afterok:567979) |
-| Stage 2 training — USA | 🔄 Job 568045 (afterok:568012) |
+| Stage 2 tuning — SEA (re-run, eval_at=[90]) | ✅ Job 567952 done. NDCG=0.091, Lift=12.7× |
+| Stage 2 training — SEA (final) | ✅ Job 567979 done |
+| Stage 2 tuning — USA | ❌ Job 568012 cancelled (deprioritised) |
+| Stage 2 training — USA | ❌ Job 568045 cancelled (deprioritised) |
+| Issue C: SA year/country breakdown | 🔄 Job 628878 running |
+| Stage 1 SA (data builder + Poisson expansion) | 🔄 Job 628893 queued |
+| Stage 1 USA (data builder + Poisson expansion) | 🔄 Job 628895 queued |
+| Stage 1 SEA (data builder + Poisson expansion) | 🔄 Job 628897 queued |
+| W8: SA binary Stage 2 tune | 🔄 Job 628923 queued |
+| W8: SA binary Stage 2 train | 🔄 Job 628926 (afterok:628923) |
+| SA feature engineering (Issues H+I: saturation + trend features) | 🔄 Job 628941 queued |
+| SA LambdaRank Stage 2 re-tune (corrected [50,3000] range) | 🔄 Job 628943 (afterok:628941) |
+| SA LambdaRank Stage 2 retrain (uses re-tuned best_params.json) | 🔄 Job 628945 (afterok:628943) |
 | Forward prediction pipeline | ✅ Bugs F1+F2 fixed; probability output is uncalibrated (Issue G) |
 
-**Do not modify Stage 2 architecture until job chain 567952→568045 completes.**
+**Active chains**: 628923→628926 (W8 binary SA) | 628941→628943→628945 (SA FE → re-tune → retrain). Do not modify Stage 2 architecture or SA panel parquets while these run.
 
 ---
 
@@ -107,8 +120,8 @@ OOS split (train 2001–2016, test 2017–2024) + v2x_corr/v2cseeorgs/gov_wgi_rl
 **B — `target_30x30` coefficient = 0**
 No variation in 2001–2013 training window. Fix: apply 30×30 scenario as exogenous budget multiplier post-prediction, not through the model coefficient.
 
-**C — SA underperformance not yet diagnosed by year/country** ← script written; run on Euler
-Script: `scripts/regions/south_america/6_evaluation/stage2_year_country_breakdown.py`. Run on Euler where scored parquet lives. NOTE: existing SA scored parquet lacks country_id (fixed in `stage2_lgbm_core.py` going forward). Year breakdown is available; country breakdown requires re-run with new code. If 2019 Brazil drives the shortfall → Bolsonaro structural break confirmed (paper finding). If uniform → Issue D.
+**C — SA year breakdown ✅ (job 628878, 2026-05-25)**
+Result: 2017 Lift=1.47× | 2018 Lift=7.90× | 2019 Lift=9.64× (best!). **Bolsonaro hypothesis falsified** — 2019 is strongest. The 2017 collapse (baseline_rate=0.0017, half of 2018/2019) drags the 3-year average to Lift=6×. Likely cause: fewer designations in 2017 make NDCG highly sensitive to misclassification of rare events. **Implication: Issue D (9K sub-window mismatch) is now primary unexplained residual; W8 binary is the key test.** Country breakdown unavailable (scored parquet lacks country_id; re-run with new code will include it).
 
 **D — LambdaRank 9K sub-window vs. full-group evaluation mismatch**
 Training optimises ranking within 9K-row sub-windows; evaluation is over full country-year groups (up to 1.2M rows). Addressed by W8 (binary LightGBM Stage 2). Decision pending cross-region metric comparison after chain completes.
@@ -204,15 +217,15 @@ Script exists: `model1_logistic_stage2.py`. Run for SA. Interpretable coefficien
 
 ## Next Actions (Ordered)
 
-1. **Euler — ~5 min**: Run `stage2_year_country_breakdown.py` against existing SA scored parquet → confirms whether 2019 Brazil drives shortfall (Issue C).
-2. **Euler — ~4 h**: Re-run `feature_engineering` for SA (`sbatch slurm/south_america/feature_engineering.slurm`). Rebuilds panel parquet with `country_pa_cumsum_lag1_pixels` **and** new trend features (`NDVI_b1_trend5`, `deforestation_b1_trend5`, `HNTL_b1_trend5`). Then re-tune + retrain SA Stage 2 LambdaRank (fixes Issues H + I together).
-3. **Euler — after job chain 567952→568045 completes**: Compare cross-region metrics; decide W8 priority; confirm SEA improved over 0.1125.
-4. **Euler — W8 SA**: `sbatch slurm/south_america/tuning_lgbm_stage2_binary.slurm` → `sbatch training_lgbm_stage2_binary.slurm`. Compare binary vs. LambdaRank Lift@1%.
-5. **Euler — Stage 1 SA** (~10 min): `python scripts/regions/south_america/5_training/stage1_data_builder.py` → `python model1_expansion.py`. Gives OOS D² + all W2 political feature coefficients (election cycle, REDD+, v2x_corr, v2cseeorgs, gov_wgi_rl_est).
-6. **Euler — Stage 1 USA + SE Asia**: Same sequence with `stage1_data_builder.py` + `model2/3_expansion.py`. All scripts ready.
-7. **REDD+ final verification** (before paper submission, not blocking): Open each `# TO VERIFY` URL in `build_redd_plus.py` (FCPF and UN-REDD country pages) and confirm the enrollment year. Election cycle is fully verified via V-Dem v15 — no manual check needed.
-8. **Next data sprint**: GEE export for ESA CCI Biomass (carbon stocks) and RAISG indigenous territory area fraction. SA first.
-9. **W5**: Run logistic Stage 2 baseline for SA on Euler (needs rebuilt panel from step 2).
+1. ✅ **Issue C** — Done. 2019 is the BEST year (Lift=9.64×); 2017 is the worst (1.47×). Bolsonaro hypothesis falsified. Issue D (9K sub-window) is now primary suspect for SA underperformance.
+2. ✅ **Issues H+I** — SA FE job 628941 queued → re-tune 628943 → retrain 628945. Will rebuild panel with `country_pa_cumsum_lag1_pixels` + trend features then find optimal truncation in [50,3000].
+3. ✅ **W8 SA binary** — Jobs 628923 → 628926 queued. Compare binary Lift@1% vs LambdaRank 6.0× once done.
+4. ✅ **Stage 1 SA/USA/SEA** — Jobs 628893/895/897 queued. Will give OOS D² + full political coefficients.
+5. **Cross-region comparison** (after jobs complete): SEA Lift=12.7× vs SA Lift=6.0×. If SA uniquely underperforms after H+I re-train → Bolsonaro structural break (paper finding). Then re-queue USA Stage 2.
+6. **REDD+ final verification** (before paper submission, not blocking): Open each `# TO VERIFY` URL in `build_redd_plus.py` (FCPF and UN-REDD country pages) and confirm the enrollment year. Election cycle is fully verified via V-Dem v15 — no manual check needed.
+7. **Next data sprint**: GEE export for ESA CCI Biomass (carbon stocks) and RAISG indigenous territory area fraction. SA first.
+8. **W5**: Run logistic Stage 2 baseline for SA on Euler (needs rebuilt panel from SA FE, job 628941).
+9. **USA Stage 2 LambdaRank**: Re-submit once SA binary and SA LambdaRank re-train results are in hand.
 10. **Issue F**: Audit WDPA label quality (estimate % non-Designated in positives); decide whether GEE re-export is warranted.
 11. **W7**: Start manuscript after Stage 1 OOS + SA SHAP confirmed + cross-region metrics in hand.
 
@@ -226,7 +239,7 @@ Script exists: `model1_logistic_stage2.py`. Run for SA. Interpretable coefficien
 - **Graded relevance 1–4**: BFS cluster size. Binary labels superseded.
 - **Within-group normalisation**: on for training and inference.
 - **COP15 structural break**: Stage 1 extrapolates pre-30×30 patterns. 30×30 scenario = exogenous budget override (Issue B).
-- **SA 2019 underperformance**: Bolsonaro structural break hypothesis — confirm via Issue C before re-architecting.
+- **SA 2019 underperformance**: Bolsonaro hypothesis **falsified** (Issue C). 2019 is best year; 2017 is worst. Issue D (9K sub-window) is primary suspect. W8 binary result will confirm or rule out.
 - **Journals**: GEC / One Earth → Nature Sustainability → JEEM.
 - **DO NOT** add tropical Africa. **DO NOT** start Paper 2 until Paper 1 submitted.
 
