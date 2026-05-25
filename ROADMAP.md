@@ -177,8 +177,8 @@ Result: SEA re-run (565173) trained only 52 trees → NDCG@1%=0.1125, well below
 SA training will be consistent. SEA must be re-tuned before re-training.
 
 SEA re-run (565173): NDCG@1%=0.1125, lift@1%=10.1×, concordance=0.789 (52 trees only — under-trained).
-SA training (565170): OOM-killed. SA naive baseline: NDCG@1%=0.023, lift@1%=2.7×.
-SA full model: not yet run.
+SA training (567921): ✅ DONE. NDCG@1%=0.028, lift@1%=6.0×, concordance=0.643. Beats naive (0.017) by only 1.1 pp — below 5 pp target. Large train/test gap vs CV NDCG=0.186 warrants investigation.
+SA naive baseline: NDCG@1%=0.017, lift@1%=2.7×.
 
 ### W2 — New data [HIGH VALUE, parallel with W1]
 
@@ -249,8 +249,9 @@ Submit USA tuning after SE Asia training completes (CPU quota). USA tuning SLURM
 | Stage 2 tuning NDCG (SEA, neg_ratio=100) | 0.126 | CV metric — pre-F6 fix, eval_at=[1-5]; re-tune needed |
 | Stage 2 SEA test NDCG@1% (first run, trunc=285) | 0.106 | Binary lift ≈ 8.7× |
 | Stage 2 SEA test NDCG@1% (re-run, trunc=3000, eval_at=[90]) | 0.1125 | Lift=10.1×, concordance=0.789 — **52 trees only** |
-| Stage 2 naïve baseline SEA (dist_wdpa only) | 0.014 NDCG / ≈1.5× lift | Beaten by ≥9 pp ✓ |
-| Stage 2 naïve baseline SA (dist_wdpa only) | 0.023 NDCG / 2.7× lift | Full model OOM-killed; resubmit pending |
+| Stage 2 naïve baseline SEA (dist_wdpa only) | 0.015 NDCG / 2.9× lift | Beaten by ≥9 pp ✓ |
+| Stage 2 naïve baseline SA (dist_wdpa only) | 0.017 NDCG / 2.7× lift | Full model beats by only 1.1 pp — below 5 pp target |
+| Stage 2 SA test NDCG@1% (final, all fixes) | **0.028** | Lift=6.0×, concordance=0.643 — below 10× target; large train/test gap vs CV NDCG=0.186 |
 | Stage 2 NDCG@1% target (test, corrected) | 0.15–0.35 | SE Asia; see derivation in Stage 2 section |
 | Stage 2 Lift@1% target (binary) | 10–25× | Primary paper metric |
 
@@ -271,36 +272,40 @@ Submit USA tuning after SE Asia training completes (CPU quota). USA tuning SLURM
 | Stage 2 tuning — SEA | ✅ complete | 100 trials, best NDCG=0.126, trunc=285 |
 | Stage 2 tuning — USA | ❌ pending | Submit now (SEA training done); range now [50,3000] |
 | Stage 2 training — SEA (first run) | ✅ done | NDCG=0.106, lift≈8.7×; trunc=285, no eval_at fix |
-| Stage 2 training — SA | 🔄 job 567921 RUNNING | Memory fix + shuffle (I1) + F9 weighting fix applied |
+| Stage 2 training — SA | ✅ done (job 567921) | NDCG=0.028, lift=6.0×, concordance=0.643 — below target; beats naive by 1.1 pp only |
 | Stage 2 training — SEA (re-run trunc=3000) | ✅ done (job 565173) | NDCG=0.1125, lift=10.1× — under-trained (52 trees); re-tune queued |
-| Stage 2 tuning — SEA (re-run with eval_at=[90]) | 🔄 job 567952 PENDING | Shuffle + F9 fix; starts after SA frees memory quota |
+| Stage 2 tuning — SEA (re-run with eval_at=[90]) | 🔄 job 567952 RUNNING | 6h26m of 24h; shuffle + F9 fix applied |
 | Stage 2 training — SEA (final) | 🔄 job 567979 → afterok:567952 | Will use new n_estimators from re-tune |
 | Stage 2 tuning — USA | 🔄 job 568012 → afterok:567979 | Range [50,3000], all fixes applied |
 | Stage 2 training — USA | 🔄 job 568045 → afterok:568012 | trunc=3000 + all fixes |
 | Naïve baseline SEA | ✅ done | NDCG=0.014, lift≈1.5× binary (full model beats by 9 pp) |
-| Naïve baseline SA | ✅ done | NDCG=0.016 |
+| Naïve baseline SA | ✅ done | NDCG=0.017, lift=2.7× |
 | Two-stage forward predict | ✅ code fixed | Bugs F1+F2 resolved 2026-05-24 |
 
 ---
 
 ## WHAT TO DO NEXT (ordered)
 
-**Active job chain (all submitted 2026-05-25):**
-- 567921: SA training — RUNNING
-- 567952: SEA tuning — PENDING (QOSMaxMemoryPerUser; starts after SA)
+**Active job chain (submitted 2026-05-25):**
+- 567921: SA training — ✅ DONE (NDCG=0.028, lift=6.0×)
+- 567952: SEA tuning — RUNNING (6h26m of 24h)
 - 567979: SEA training — PENDING (afterok:567952)
 - 568012: USA tuning — PENDING (afterok:567979)
 - 568045: USA training — PENDING (afterok:568012)
 
-1. **After SA training (567921) finishes**: check `lift_at_1pct_within_groups` (target >10×) and
-   confirm full model beats naive by ≥ 5 pp NDCG@1%.
+1. **Investigate SA underperformance**: lift=6× vs 10× target; beats naive by only 1.1 pp NDCG.
+   CV NDCG=0.186 → test=0.028 is a large drop. Candidates: test-period distribution shift (2017–2019
+   has more large PA events?), group size imbalance (26 groups, some very large), or grouping noise.
+   Defer ablation until SEA/USA results are in — if SA is a systematic outlier, structural cause
+   is more likely than a tuning issue.
 
 2. **After SEA training (567979) finishes**: confirm NDCG@1% improved over 0.1125 (52-tree result).
 
-3. **After USA training (568045) finishes**, check for the USA "near-perfect concordance" finding
+3. **After USA training (568045) finishes**: check for the USA "near-perfect concordance" finding
    (adjacency effect — described in SETTLED DECISIONS).
 
-4. **After SA and SEA final training**: compare metrics, confirm both beat naive by ≥ 5 pp.
+4. **After all three regions**: compare metrics table, confirm SEA and USA beat naive by ≥ 5 pp.
+   If SA remains the outlier, investigate group structure differences.
 
 5. **Run Stage 1 OOS evaluation** locally: modify `model1_expansion.py` to split train ≤ 2013 /
    test 2014–2019 before citing D² in the paper. (Open Issue A.)
