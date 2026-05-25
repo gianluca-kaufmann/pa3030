@@ -13,7 +13,7 @@
 # Layer 2 spatial CV — biome-stratified metrics — South East Asia
 #
 # Loads model3 scored parquets, assigns WWF biome labels via GSN raster,
-# and computes per-biome metrics on the test years (2017-2019).
+# and computes per-biome metrics on the test years (2017-2024).
 # Requires the full training pipeline (step 5) to have run first.
 #
 # Usage:

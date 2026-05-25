@@ -13,7 +13,7 @@ the gap between likely designations and biodiversity conservation priorities.
 
 ## Key Results
 
-All results are out-of-sample on the 2017–2019 test period. Random Forest is the primary
+All results are out-of-sample on the 2017–2024 test period. Random Forest is the primary
 model; LightGBM confirms the directional findings. (The United States is a special case:
 apparent performance is strongly affected by geographic concentration of designations and
 should be read mainly as a spatial ranking signal rather than calibrated absolute risk.)

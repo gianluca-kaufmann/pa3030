@@ -688,8 +688,8 @@ def fit_deployment_calibrators(
 ) -> Tuple[LogisticRegression, IsotonicRegression]:
     """Fit Platt + isotonic calibrators using the deployment calibration split.
 
-    Trains an auxiliary model on AUX_TRAIN_YEARS (2001–2016) with the same
-    locked hyperparameters, scores AUX_CALIB_YEARS (2017–2019) held-out
+    Trains an auxiliary model on AUX_TRAIN_YEARS (2001–2021) with the same
+    locked hyperparameters, scores AUX_CALIB_YEARS (2022–2024) held-out
     pixels, then fits calibrators on those out-of-sample predictions.
 
     Methodological note: the calibrators are fitted on an *auxiliary* model's

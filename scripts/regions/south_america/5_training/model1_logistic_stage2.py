@@ -41,9 +41,9 @@ def main() -> None:
     X_tr, y_tr, _, _, g_tr = load_stage2_arrays(
         train_path, region, feature_cols, expansion, (2001, 2013)
     )
-    test_exp = _expansion_groups_from_batches(test_path, region, (2017, 2019))
+    test_exp = _expansion_groups_from_batches(test_path, region, (2017, 2024))
     X_te, y_te, _, _, g_te = load_stage2_arrays(
-        test_path, region, feature_cols, test_exp, (2017, 2019)
+        test_path, region, feature_cols, test_exp, (2017, 2024)
     )
 
     clf = LogisticRegression(max_iter=500, class_weight="balanced", n_jobs=-1)

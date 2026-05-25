@@ -133,7 +133,19 @@ def _build_country_pa_momentum_table(temp_files: list[Path], country_raster: np.
         cy[f"pa_momentum_pixels_lag{k}"] = (
             cy.groupby("country_id")["pa_momentum_pixels"].shift(k)
         )
-    cols = ["country_id", "year"] + [f"pa_momentum_pixels_lag{k}" for k in W3_LAG_YEARS]
+    # Cumulative PA stock at time t-1: total pixels designated in this country
+    # before year t.  Captures frontier exhaustion — as this grows, the "easy"
+    # land has been taken and annual designation speed declines structurally.
+    # cumsum() then shift(1) gives strictly past information (leak-free).
+    cy["country_pa_cumsum_lag1_pixels"] = (
+        cy.groupby("country_id")["pa_momentum_pixels"]
+        .transform(lambda x: x.cumsum().shift(1).fillna(0))
+    )
+    cols = (
+        ["country_id", "year"]
+        + [f"pa_momentum_pixels_lag{k}" for k in W3_LAG_YEARS]
+        + ["country_pa_cumsum_lag1_pixels"]
+    )
     return cy[cols]
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -165,6 +177,91 @@ SENTINEL_RULES: dict[str, tuple[float, float]] = {
     'WorldClim_':  (-340.0, -320.0),    # -32768 ÷ 100 ≈ -327.68; legit temps > -300 (×10)
     'powerplants_': (-340.0, -320.0),   # same Int16 overflow pattern
 }
+
+TREND_VARIABLES: list[str] = ["NDVI_b1", "deforestation_b1", "HNTL_b1"]
+TREND_WINDOW: int = 5  # 5-year rolling OLS slope
+
+
+def _ols_slope_vectorized(Y: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """Vectorized OLS slope for each row of Y, handling NaN.
+
+    Args:
+        Y: shape (n_pixels, n) — time-series values, may contain NaN
+        x: shape (n,)          — time index [0, 1, ..., n-1], same for all rows
+    Returns:
+        slopes: shape (n_pixels,) — OLS slope; NaN where < 2 valid observations
+    """
+    valid   = ~np.isnan(Y)
+    n_valid = valid.sum(axis=1).astype(np.float32)
+    Y_z     = np.where(valid, Y, 0.0)
+    X_mat   = np.broadcast_to(x, Y.shape).astype(np.float32)
+
+    sum_x  = (X_mat * valid).sum(axis=1)
+    sum_y  = Y_z.sum(axis=1)
+    sum_xy = (X_mat * Y_z).sum(axis=1)
+    sum_x2 = (X_mat * X_mat * valid).sum(axis=1)
+
+    denom = n_valid * sum_x2 - sum_x * sum_x
+    numer = n_valid * sum_xy - sum_x * sum_y
+    return np.where(
+        (n_valid >= 2) & (np.abs(denom) > 1e-12),
+        numer / np.where(np.abs(denom) > 1e-12, denom, 1.0),
+        np.nan,
+    ).astype(np.float32)
+
+
+def compute_trend_features(
+    input_path: Path,
+    year: int,
+    avail_trend_vars: list[str],
+    window: int = TREND_WINDOW,
+) -> pd.DataFrame | None:
+    """Compute per-pixel OLS trend slope over a rolling window.
+
+    For year t with window=5, uses observations from [max(2000, t-4), ..., t].
+    Output columns: {var}_trend5 for each var in avail_trend_vars.
+    Returns None if avail_trend_vars is empty.
+    """
+    if not avail_trend_vars:
+        return None
+
+    start_year = max(year - window + 1, 2000)
+    load_years = list(range(start_year, year + 1))
+    n = len(load_years)
+    trend_col_names = [f"{v}_trend5" for v in avail_trend_vars]
+
+    df_curr = pd.read_parquet(
+        input_path, columns=["row", "col"],
+        filters=[("year", "==", year)],
+    )
+    if n < 2:
+        for col in trend_col_names:
+            df_curr[col] = np.float32(np.nan)
+        return df_curr[["row", "col"] + trend_col_names]
+
+    # Merge each historical year's values onto the current-year pixel footprint.
+    lookup = df_curr[["row", "col"]].copy()
+    del df_curr
+    for i, yr in enumerate(load_years):
+        df_yr = pd.read_parquet(
+            input_path,
+            columns=["row", "col"] + avail_trend_vars,
+            filters=[("year", "==", yr)],
+        )
+        df_yr = df_yr.rename(columns={v: f"{v}__y{i}" for v in avail_trend_vars})
+        lookup = lookup.merge(df_yr, on=["row", "col"], how="left")
+        del df_yr
+        gc.collect()
+
+    x = np.arange(n, dtype=np.float32)
+    for var in avail_trend_vars:
+        year_cols = [f"{var}__y{i}" for i in range(n)]
+        Y = lookup[year_cols].to_numpy(dtype=np.float32)
+        lookup[f"{var}_trend5"] = _ols_slope_vectorized(Y, x)
+        lookup.drop(columns=year_cols, inplace=True)
+        gc.collect()
+
+    return lookup[["row", "col"] + trend_col_names]
 
 
 def clean_sentinel_values(df: pd.DataFrame) -> pd.DataFrame:
@@ -425,6 +522,7 @@ def process_year(
     smooth_time_vars: list[str] | None = None,
     wdpa_col: str = 'WDPA_b1',
     economic_value_col: str | None = None,
+    trend_vars: list[str] | None = None,
 ) -> tuple[Path | None, dict]:
     """Process a single year and return temp file path + metrics."""
     start_time = time.time()
@@ -489,7 +587,16 @@ def process_year(
     df_year = merge_static_distances(df_year, static_lookup, distance_mapping)
     df_year = merge_static_smooth(df_year, smooth_lookup)
     df_year = compute_all_smooth_features(df_year, smooth_time_vars)
-    
+
+    # Trend features: 5-year OLS slope for NDVI, deforestation, nightlights
+    if trend_vars:
+        logger.info(f"  Computing 5-year trend features for {trend_vars}...")
+        trend_df = compute_trend_features(input_path, year, trend_vars)
+        if trend_df is not None:
+            df_year = df_year.merge(trend_df, on=['row', 'col'], how='left')
+            del trend_df
+            gc.collect()
+
     # Step 3: Apply Risk Set filter (keep only WDPA_prev == 0)
     df_year = df_year[df_year['WDPA_prev'] == 0].copy()
     n_rows_filtered = len(df_year)
@@ -714,6 +821,8 @@ def main() -> None:
             "static_distance_mapping": STATIC_DISTANCE_MAPPING,
             "static_smooth_variables": STATIC_SMOOTH_VARIABLES,
             "static_smooth_sizes": STATIC_SMOOTH_SIZES,
+            "trend_variables": TREND_VARIABLES,
+            "trend_window": TREND_WINDOW,
         }
     )
     
@@ -835,6 +944,25 @@ def main() -> None:
     if resolved_smooth_time_vars != list(SMOOTH_VARIABLES):
         logger.info(f"  Resolved SMOOTH_VARIABLES: {resolved_smooth_time_vars}")
 
+    # --- Resolve TREND_VARIABLES against actual schema ---
+    resolved_trend_vars: list[str] = []
+    for var in TREND_VARIABLES:
+        if var in available_cols:
+            resolved_trend_vars.append(var)
+        elif var.endswith('_b1'):
+            base_name = var[:-3]
+            if base_name in available_cols:
+                logger.info(f"  Trend variable '{var}' not found; using '{base_name}' instead")
+                resolved_trend_vars.append(base_name)
+            else:
+                logger.warning(f"  Trend variable '{var}' not found in schema — skipping 5yr trend")
+        else:
+            logger.warning(f"  Trend variable '{var}' not found in schema — skipping 5yr trend")
+    if resolved_trend_vars:
+        logger.info(f"  Trend variables (5-year OLS slope): {resolved_trend_vars}")
+    else:
+        logger.warning("  No trend variables available — trend features will be skipped")
+
     # Resolve economic value column for lagged feature creation (and dropping contemporaneous value)
     economic_value_col: str | None = None
     for candidate in ['economic_value_b1', 'economic_value']:
@@ -934,6 +1062,7 @@ def main() -> None:
                 smooth_time_vars=resolved_smooth_time_vars,
                 wdpa_col=wdpa_col,
                 economic_value_col=economic_value_col,
+                trend_vars=resolved_trend_vars,
             )
             if temp_file is not None:
                 temp_files.append(temp_file)

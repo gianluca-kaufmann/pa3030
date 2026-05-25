@@ -196,39 +196,38 @@ class TestRiskSetFiltering:
 
 
 # ---------------------------------------------------------------------------
-# Test 4: Right-censoring (complete 5-year lookahead)
+# Test 4: Label year validity (annual hazard target — no lookahead required)
 # ---------------------------------------------------------------------------
 
 class TestRightCensoring:
-    """Verify labels only exist for years with complete 5-year lookahead windows."""
+    """Verify label year boundaries for the annual hazard target (transition_01).
+
+    transition_01 in year t records whether a pixel was newly designated in year t.
+    It requires only WDPA_b1[t], which is observed for all years up to WDPA_LAST_YEAR.
+    There is no 5-year lookahead constraint (that applied to the superseded win5 target).
+    LAST_LABEL_YEAR therefore equals WDPA_LAST_YEAR.
+    """
 
     WDPA_LAST_YEAR = 2024
-    LOOKAHEAD_YEARS = 5
-    LAST_LABEL_YEAR = WDPA_LAST_YEAR - LOOKAHEAD_YEARS  # 2019
+    LAST_LABEL_YEAR = WDPA_LAST_YEAR  # annual hazard: no lookahead required
 
-    def test_last_label_year_computation(self):
-        """LAST_LABEL_YEAR should be WDPA_LAST_YEAR - LOOKAHEAD_YEARS."""
-        assert self.LAST_LABEL_YEAR == 2019
+    def test_last_label_year_equals_wdpa_last_year(self):
+        """Annual hazard needs no lookahead — labels are valid through WDPA_LAST_YEAR."""
+        assert self.LAST_LABEL_YEAR == self.WDPA_LAST_YEAR == 2024
 
-    def test_year_2019_has_complete_window(self):
-        """Year 2019 needs data through 2024 (2019+5). WDPA goes to 2024 → complete."""
-        assert 2019 + self.LOOKAHEAD_YEARS <= self.WDPA_LAST_YEAR
-
-    def test_year_2020_has_incomplete_window(self):
-        """Year 2020 needs data through 2025, but WDPA only goes to 2024 → incomplete."""
-        assert 2020 + self.LOOKAHEAD_YEARS > self.WDPA_LAST_YEAR
+    def test_year_2024_is_valid(self):
+        """Year 2024 is the last WDPA year — transition_01 label is valid there."""
+        assert 2024 <= self.LAST_LABEL_YEAR
 
     def test_no_labels_after_last_label_year(self):
         """No test/eval data should include years > LAST_LABEL_YEAR."""
-        years = [2015, 2016, 2017, 2018, 2019, 2020, 2021]
+        years = [2020, 2021, 2022, 2023, 2024, 2025, 2026]
         valid_years = [y for y in years if y <= self.LAST_LABEL_YEAR]
-        assert max(valid_years) == 2019
-        assert 2020 not in valid_years
-        assert 2021 not in valid_years
+        assert max(valid_years) == 2024
+        assert 2025 not in valid_years
 
-    def test_split_configs_respect_censoring(self):
-        """All CV fold boundaries should respect LAST_LABEL_YEAR."""
-        # Mirrors modelC_LGBM:75-99
+    def test_split_configs_respect_label_year(self):
+        """All CV fold earlystop ends must not exceed LAST_LABEL_YEAR."""
         cv_folds_main = [
             ((2000, 2008), (2009, min(2011, self.LAST_LABEL_YEAR))),
             ((2000, 2011), (2012, min(2013, self.LAST_LABEL_YEAR))),
@@ -252,7 +251,7 @@ class TestTemporalSplits:
         """Train years must come before earlystop, which must come before test."""
         train_years = (2000, 2013)
         earlystop_years = (2014, 2016)
-        test_years = (2017, 2019)
+        test_years = (2017, 2024)
 
         assert train_years[1] < earlystop_years[0], "Train must end before earlystop starts"
         assert earlystop_years[1] < test_years[0], "Earlystop must end before test starts"
@@ -261,7 +260,7 @@ class TestTemporalSplits:
         """Robustness split should also have strict temporal ordering."""
         train_years = (2000, 2012)
         earlystop_years = (2013, 2015)
-        test_years = (2016, 2019)
+        test_years = (2016, 2024)
 
         assert train_years[1] < earlystop_years[0]
         assert earlystop_years[1] < test_years[0]
@@ -270,7 +269,7 @@ class TestTemporalSplits:
         """No year should appear in more than one split."""
         train = set(range(2000, 2014))
         earlystop = set(range(2014, 2017))
-        test = set(range(2017, 2020))
+        test = set(range(2017, 2025))
 
         assert train.isdisjoint(earlystop), "Train and earlystop must not overlap"
         assert train.isdisjoint(test), "Train and test must not overlap"

@@ -18,7 +18,10 @@ export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 # Truncation override: SA tuning hit the [50,500] ceiling (best=499); wider search
 # confirms higher is better. 3000 covers ~33% of each 9000-row split sub-group and
 # gives gradient signal to high-relevance (rel=4) pixels buried beyond position 500.
+# Remove once SEA is re-tuned and best_params.json contains the true optimum.
 export STAGE2_TRUNCATION_LEVEL=3000
+# Match tuning neg_ratio so hyperparameters are valid for the training class-balance regime.
+export STAGE2_NEG_RATIO=100
 
 python -u scripts/regions/se_asia/5_training/model3_LGBM_stage2
 

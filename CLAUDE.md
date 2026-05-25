@@ -129,7 +129,7 @@ Shared utilities (scripts/regions/shared/):
 
 ## Key Design Decisions
 
-- **Right-censoring protection:** `LAST_LABEL_YEAR = 2019` ensures complete 5-year lookahead for all labels
+- **Right-censoring protection:** `LAST_LABEL_YEAR = 2024` — annual hazard target needs no lookahead; all WDPA-covered years are valid labels
 - **Risk-set filtering:** Only unprotected pixels (`WDPA_prev == 0`) are eligible for transition
 - **Temporal weighting:** Recent years weighted higher than earlier years
 - **Class imbalance:** Handled via `scale_pos_weight = n_neg / n_pos`
@@ -146,9 +146,9 @@ This project has no software unit tests. "Testing" refers to model evaluation �
 how well predictions match reality on held-out future data.
 
 ### Temporal Splits
-- **Train (2000-2013):** Learn historical protection patterns
-- **Early-stop (2014-2016):** Prevent overfitting (not used for evaluation)
-- **Test (2017-2019):** Evaluate predictions against what actually happened
+- **Stage 1 Train (2001–2016):** Poisson GLM learns country-year expansion patterns
+- **Stage 2 Train (2001–2013) / Early-stop (2014–2016):** LambdaRank learns pixel ranking
+- **Test (2017–2024):** Evaluate predictions against what actually happened
 
 ### Metrics Computed
 - **ROC-AUC:** Overall ranking quality (0.92 on Colombia)
@@ -252,8 +252,7 @@ Features that could improve predictive power but are not currently included:
    `shared/` to reduce duplication and bug risk.
 7. **Highlight calibration in paper** — Many ML papers skip calibration.
    The reliability diagrams and Platt/isotonic correction are a strength.
-8. **Explain right-censoring design** — The `LAST_LABEL_YEAR = 2019` constraint
-   is methodologically rigorous. Make this prominent in the methods section.
+8. **Explain right-censoring design** — The `LAST_LABEL_YEAR = 2024` constraint (annual hazard, no lookahead required) extends the test period to 2024. Make this prominent in the methods section.
 
 ### Medium-High Priority (Paper Differentiation)
 9. **Bayesian network interpretability layer** — Train a BN on the top 10-15 features

@@ -192,3 +192,14 @@ def get_lgbm_stage2_optuna_bounds(mode: str) -> Dict:
     base["lambdarank_truncation_level"] = (50, 3000)
     base["n_estimators"] = (200, 3000)
     return base
+
+
+def get_lgbm_stage2_binary_optuna_bounds(mode: str) -> Dict:
+    """Optuna bounds for W8 binary LightGBM Stage 2.
+
+    No lambdarank_truncation_level (binary objective has no sub-window constraint).
+    scale_pos_weight is computed from data per fold, not tuned here.
+    """
+    base = get_lgbm_optuna_bounds(mode, auto_scale_pos_weight=1.0)
+    base["n_estimators"] = (200, 3000)
+    return base

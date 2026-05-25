@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Build country-year panel for Stage 1 expansion model (South America).
+"""Build country-year panel for Stage 1 expansion model (USA).
 
-Merges PA expansion counts with political covariates (V-Dem, WGI, WDI, CBD dummies).
+Merges PA expansion counts with political covariates (V-Dem, WGI, WDI, election cycle, REDD+).
 CSV paths are optional; missing files log a warning and leave columns null.
 
 Output:
-    data/south_america/stage1_panel.parquet
+    data/usa/stage1_panel.parquet
 """
 
 from __future__ import annotations
@@ -25,16 +25,12 @@ from scripts.regions.shared.country_raster import resolve_panel_path
 from scripts.regions.shared.stage1_panel import build_country_year_panel, compute_years_to_next_election
 
 TRAIN_YEARS = (2001, 2013)
-PANEL_YEARS = (2001, 2024)  # covers train + early-stop + test
+PANEL_YEARS = (2001, 2024)
 
-REGION = "south_america"
-OUT_PATH = _ROOT / "data" / "south_america" / "stage1_panel.parquet"
+REGION = "usa"
+OUT_PATH = _ROOT / "data" / "usa" / "stage1_panel.parquet"
 
-# ISO3 -> country_id mapping from policy preprocessing (must match raster codes)
-ISO3_TO_ID = {
-    "ARG": 1, "BOL": 2, "BRA": 3, "CHL": 4, "COL": 5, "ECU": 6,
-    "GUY": 7, "PRY": 8, "PER": 9, "SUR": 10, "URY": 11, "VEN": 12,
-}
+ISO3_TO_ID = {"USA": 1}
 ID_TO_ISO3 = {v: k for k, v in ISO3_TO_ID.items()}
 
 CBD_MEETING_YEARS = {1994, 2002, 2010, 2018, 2022}
@@ -44,7 +40,7 @@ def _load_csv(path: Path, required_cols: list[str]) -> pd.DataFrame | None:
     if not path.exists():
         print(f"  WARN: missing {path}")
         return None
-    df = pd.read_csv(path)
+    df = pd.read_csv(path, comment="#")
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         print(f"  WARN: {path} missing columns {missing}")
@@ -72,9 +68,6 @@ def attach_political_covariates(cy: pd.DataFrame) -> pd.DataFrame:
 
     wdi = _load_csv(shared / "wdi.csv", ["iso3", "year", "gdp_per_capita", "agricultural_land_pct"])
     if wdi is not None:
-        # gdp_growth_lag1: year-on-year % change in GDP/capita, lagged 1 year.
-        # Uses WDI data back to 1990, so 2001+ values are all well-defined.
-        # Lag-1 avoids using same-year GDP growth in forward prediction.
         wdi = wdi.sort_values(["iso3", "year"])
         wdi["gdp_growth_lag1"] = (
             wdi.groupby("iso3")["gdp_per_capita"].pct_change().shift(1)
@@ -114,7 +107,7 @@ def main() -> None:
         "columns": list(cy.columns),
         "output": str(OUT_PATH),
     }
-    meta_path = _ROOT / "outputs" / "data_checks" / "stage1_panel_build.json"
+    meta_path = _ROOT / "outputs" / "data_checks" / "stage1_panel_usa_build.json"
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(json.dumps(meta, indent=2))
     print(f"Wrote {OUT_PATH} ({len(cy)} country-years)")

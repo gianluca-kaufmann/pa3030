@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-Quantify train/test leakage in the SA pa3030 main split.
+Quantify train/test leakage specific to the legacy win5 target (transition_01_win5).
 
-Main split (from scripts/regions/south_america/5_training/model1_splits):
-  TRAIN years [2001, 2016], TEST years [2017, 2019], 5-year lookahead.
+NOTE: This script analyses leakage arising from the 5-year lookahead window of the
+superseded win5 target. The current model uses the annual hazard target (transition_01),
+which has no lookahead and therefore no equivalent leakage. This script is retained
+for reference only and should not be run against the current split files.
 
+Original win5 split: TRAIN [2001, 2016], TEST [2017, 2019], 5-year lookahead.
 A test-positive pixel "leaks" if first_transition_year is in [2018, 2021] —
 that pixel then also carries a positive label somewhere in TRAIN.
 

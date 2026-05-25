@@ -15,9 +15,11 @@ module load stack/2024-06 gcc/12.2.0 python_cuda/3.11.6 eth_proxy
 source "$HOME/venvs/master_thesis/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
-# To test higher truncation level after initial training (recommended experiment):
-# uncomment the export below, change the job name, and resubmit.
-# export STAGE2_TRUNCATION_LEVEL=1500
+# SA tuning confirmed higher truncation is better (best=499 hit old ceiling).
+# 3000 covers ~33% of each 9000-row split sub-group. Remove once USA is re-tuned.
+export STAGE2_TRUNCATION_LEVEL=3000
+# Match tuning neg_ratio so hyperparameters are valid for the training class-balance regime.
+export STAGE2_NEG_RATIO=100
 
 python -u scripts/regions/usa/5_training/model2_LGBM_stage2
 

@@ -421,7 +421,7 @@ def main() -> None:
 
     # ── Paths ─────────────────────────────────────────────────────────────────
     # Under annual hazard, deployment training spans the full WDPA window
-    # (2001-WDPA_LAST_YEAR). The eval-pipeline split files only cover 2001-2019,
+    # (2001-WDPA_LAST_YEAR). The eval-pipeline split files cover 2001-2024,
     # so we read from merged_panel_final.parquet directly. train.parquet still
     # provides the schema reference (feature column list).
     train_path           = resolve_parquet("train.parquet")

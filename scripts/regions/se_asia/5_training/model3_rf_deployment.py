@@ -368,8 +368,8 @@ def fit_deployment_calibrators(
 ) -> Tuple[LogisticRegression, IsotonicRegression]:
     """Fit Platt + isotonic calibrators using the deployment calibration split.
 
-    Trains an auxiliary RF on AUX_TRAIN_YEARS (2001–2016) with the same
-    locked hyperparameters, scores AUX_CALIB_YEARS (2017–2019) held-out
+    Trains an auxiliary RF on AUX_TRAIN_YEARS (2001–2021) with the same
+    locked hyperparameters, scores AUX_CALIB_YEARS (2022–2024) held-out
     pixels, then fits calibrators on those out-of-sample predictions.
     """
     print("\n" + "=" * 70)
@@ -449,7 +449,7 @@ def main() -> None:
 
     # ── Paths ─────────────────────────────────────────────────────────────────
     # Under annual hazard, deployment training spans the full WDPA window
-    # (2001-WDPA_LAST_YEAR). The eval-pipeline split files only cover 2001-2019,
+    # (2001-WDPA_LAST_YEAR). The eval-pipeline split files cover 2001-2024,
     # so we read from merged_panel_final.parquet directly. train.parquet still
     # provides the schema reference (feature column list).
     train_path           = resolve_parquet("train.parquet")

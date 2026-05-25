@@ -146,7 +146,7 @@ def main() -> None:
             "test_negatives": int((y_true == 0).sum()),
         },
         "temporal_split": {
-            "test_years": [2017, 2019],
+            "test_years": [2017, 2024],
         },
         "test_performance": test_metrics,
     }

@@ -258,7 +258,7 @@ def derive_test_years(metrics_data: Optional[Dict[str, Any]] = None,
     Priority:
     1. Read unique years from the `year` column of `test_parquet_path`
     2. Use `metadata.test_year_range` or `metadata.test_years` from metrics
-    3. Fallback to [2018, 2019] **only** if the test parquet is missing or unusable
+    3. Fallback to [2023, 2024] **only** if the test parquet is missing or unusable
     
     Args:
         metrics_data: Parsed metrics JSON (may contain `metadata` field)
@@ -266,7 +266,7 @@ def derive_test_years(metrics_data: Optional[Dict[str, Any]] = None,
         test_parquet_path: Path to original test parquet (preferred source of test years)
     
     Returns:
-        List of test years (e.g., [2018, 2019])
+        List of test years (e.g., [2017, 2018, 2019, 2020, 2021, 2022, 2023, 2024])
     """
     # ------------------------------------------------------------------
     # 1) Prefer deriving years directly from the original test parquet
@@ -321,12 +321,12 @@ def derive_test_years(metrics_data: Optional[Dict[str, Any]] = None,
     #    No WARNING printed to keep logs thesis-clean.
     # ------------------------------------------------------------------
     if parquet_unusable:
-        return [2018, 2019]
-    
+        return [2023, 2024]
+
     # In the extremely unlikely case that the parquet exists and is readable
     # but provided no usable years and no metadata is available, still return
     # a sensible default without emitting warnings.
-    return [2018, 2019]
+    return [2023, 2024]
 
 def load_future_pa_establishments(future_parquet_path: Optional[Path], future_years: list) -> Optional[pd.DataFrame]:
     """Load future PA establishments (e.g., 2020-2024) from validation/future parquet for temporal validation.

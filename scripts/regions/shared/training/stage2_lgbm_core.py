@@ -63,6 +63,15 @@ FIXED_PARAMS = {
     "eval_at": [max(1, _LGB_MAX_QUERY // 100)],  # = [90] for _LGB_MAX_QUERY=9000
 }
 
+# Binary LightGBM (W8): no sub-window constraint, uses scale_pos_weight for imbalance.
+# metric=average_precision (PR-AUC) is more informative than AUC under extreme imbalance.
+BINARY_FIXED_PARAMS = {
+    "boosting_type": "gbdt",
+    "objective": "binary",
+    "metric": "average_precision",
+    "verbose": -1,
+}
+
 
 def _split_large_groups(group_sizes: np.ndarray) -> np.ndarray:
     """Split any group larger than _LGB_MAX_QUERY into equal-ish sub-groups."""
@@ -84,7 +93,7 @@ class Stage2Config:
     model_prefix: str  # model1, model2, model3
     train_years: Tuple[int, int] = (2001, 2013)
     earlystop_years: Tuple[int, int] = (2014, 2016)
-    test_years: Tuple[int, int] = (2017, 2019)
+    test_years: Tuple[int, int] = (2017, 2024)
     random_state: int = 42
     feature_subset: Optional[List[str]] = None  # e.g. ["dist_wdpa"] for naive baseline
     ablation_drop: Optional[str] = None  # drop feature group by name prefix
@@ -109,14 +118,15 @@ def resolve_parquet_file(region: str, filename: str) -> Path:
 
 def resolve_best_params_json(cfg: Stage2Config) -> Optional[Path]:
     script_dir = get_repo_root() / "scripts" / "regions" / cfg.region / "5_training"
+    suffix = "_binary" if cfg.variant == "binary" else ""
     candidates = [
-        script_dir / f"{cfg.model_prefix}_stage2_lgbm_best_params.json",
+        script_dir / f"{cfg.model_prefix}_stage2_lgbm{suffix}_best_params.json",
         script_dir / "lgbm_best_params.json",
         script_dir / f"{cfg.model_prefix}_lgbm_best_params.json",
     ]
     scratch = os.environ.get("SCRATCH")
     if scratch:
-        candidates.insert(0, Path(scratch) / f"scripts/regions/{cfg.region}/5_training/{cfg.model_prefix}_stage2_lgbm_best_params.json")
+        candidates.insert(0, Path(scratch) / f"scripts/regions/{cfg.region}/5_training/{cfg.model_prefix}_stage2_lgbm{suffix}_best_params.json")
     for cand in candidates:
         if cand.exists():
             return cand
@@ -425,6 +435,13 @@ def load_stage2_arrays(
     return X, y, years, country_ids, group_sizes
 
 
+def _compute_scale_pos_weight(y: np.ndarray) -> float:
+    """Compute scale_pos_weight = n_neg / n_pos from binary labels."""
+    n_pos = int((y > 0).sum())
+    n_neg = len(y) - n_pos
+    return float(n_neg) / float(max(n_pos, 1))
+
+
 def _prepare_lgb_params(best_params: Dict[str, Any], num_threads: int) -> Dict[str, Any]:
     params = {**FIXED_PARAMS, **best_params}
     for key in (
@@ -464,6 +481,30 @@ def train_lambdarank(
 ) -> lgb.Booster:
     train_set = lgb.Dataset(X_train, label=y_train, group=_split_large_groups(group_train), weight=weights)
     val_set = lgb.Dataset(X_val, label=y_val, group=_split_large_groups(group_val), reference=train_set)
+    return lgb.train(
+        params,
+        train_set,
+        num_boost_round=num_boost_round,
+        valid_sets=[val_set],
+        valid_names=["earlystop"],
+        callbacks=[lgb.early_stopping(100), lgb.log_evaluation(50)],
+    )
+
+
+def train_binary_lgbm(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    params: Dict[str, Any],
+    weights: Optional[np.ndarray],
+    num_boost_round: int,
+) -> lgb.Booster:
+    """Train binary LightGBM for W8 Stage 2 — no 9K sub-window constraint."""
+    y_tr_bin = (y_train > 0).astype(np.int8)
+    y_va_bin = (y_val > 0).astype(np.int8)
+    train_set = lgb.Dataset(X_train, label=y_tr_bin, weight=weights)
+    val_set = lgb.Dataset(X_val, label=y_va_bin, reference=train_set)
     return lgb.train(
         params,
         train_set,
@@ -532,8 +573,13 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
         print("  Using default Stage 2 hyperparameters (no stage2 best params JSON found)")
 
     num_threads = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 4))
-    lgb_params = _prepare_lgb_params(best_params, num_threads)
     num_boost_round = int(best_params.get("n_estimators", best_params.get("num_boost_round", 2000)))
+
+    # Negative-subsampling ratio: binary uses scale_pos_weight instead; LambdaRank must
+    # match the tuning ratio (STAGE2_NEG_RATIO=100 in all tuning SLURMs) so hyperparameters
+    # are valid for the class-balance regime the final model actually trains in.
+    _nr_env = os.environ.get("STAGE2_NEG_RATIO", "100")
+    neg_ratio: Optional[int] = (int(_nr_env) if int(_nr_env) > 0 else None) if cfg.variant != "binary" else None
 
     train_pool_years = (cfg.train_years[0], cfg.earlystop_years[1])
     print(f"Building expansion group index ({train_pool_years})...")
@@ -543,43 +589,68 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
     ) | _expansion_groups_from_batches(earlystop_path, cfg.region, train_pool_years)
     print(f"  {len(expansion_groups):,} expansion country-years ({time.time()-t0:.1f}s)")
 
-    print("Loading train pool...")
+    print(f"Loading train pool (variant={cfg.variant}, neg_ratio={neg_ratio})...")
     X_tr, y_tr, years_tr, _, g_tr = load_stage2_arrays(
-        train_path, cfg.region, feature_cols, expansion_groups, cfg.train_years
+        train_path, cfg.region, feature_cols, expansion_groups, cfg.train_years,
+        neg_ratio=neg_ratio,
     )
     X_es, y_es, _, _, g_es = load_stage2_arrays(
-        earlystop_path, cfg.region, feature_cols, expansion_groups, cfg.earlystop_years
+        earlystop_path, cfg.region, feature_cols, expansion_groups, cfg.earlystop_years,
+        neg_ratio=neg_ratio,
     )
-    print(f"Fitting LambdaRank: train {len(y_tr):,} rows / earlystop {len(y_es):,} rows...")
-    model = train_lambdarank(
-        X_tr,
-        y_tr,
-        g_tr,
-        X_es,
-        y_es,
-        g_es,
-        lgb_params,
-        compute_year_weights(
-            years_tr,
-            min_year=cfg.train_years[0],
-            max_year=cfg.train_years[1],
-        ),
-        num_boost_round,
+
+    year_weights = compute_year_weights(
+        years_tr, min_year=cfg.train_years[0], max_year=cfg.train_years[1]
     )
+
+    lgb_params: Dict[str, Any] = {}
+    binary_params: Dict[str, Any] = {}
+
+    if cfg.variant == "binary":
+        # W8: binary LightGBM — no 9K sub-window, scale_pos_weight for imbalance.
+        # Hyperparameters are stripped/rebuilt to avoid LambdaRank-only keys.
+        scale_pos_weight = _compute_scale_pos_weight(y_tr)
+        binary_params = {**BINARY_FIXED_PARAMS}
+        for key in (
+            "num_leaves", "max_depth", "learning_rate", "min_child_samples",
+            "subsample", "colsample_bynode", "colsample_bytree",
+            "reg_alpha", "reg_lambda", "min_split_gain", "path_smooth",
+        ):
+            if key in best_params:
+                binary_params[key] = best_params[key]
+        binary_params["scale_pos_weight"] = scale_pos_weight
+        binary_params["random_state"] = best_params.get("random_state", 42)
+        binary_params["num_threads"] = num_threads
+        print(
+            f"Fitting Binary LightGBM: train {len(y_tr):,} rows / earlystop {len(y_es):,} rows"
+            f" | scale_pos_weight={scale_pos_weight:.1f}"
+        )
+        model = train_binary_lgbm(
+            X_tr, y_tr, X_es, y_es, binary_params, year_weights, num_boost_round
+        )
+    else:
+        lgb_params = _prepare_lgb_params(best_params, num_threads)
+        print(f"Fitting LambdaRank: train {len(y_tr):,} rows / earlystop {len(y_es):,} rows...")
+        model = train_lambdarank(
+            X_tr, y_tr, g_tr, X_es, y_es, g_es, lgb_params, year_weights, num_boost_round
+        )
+
     del X_tr, y_tr, g_tr, X_es, y_es, g_es
     gc.collect()
 
     tag = f"{cfg.model_prefix}_lgbm_stage2"
     if cfg.variant == "naive":
         tag += "_naive"
+    elif cfg.variant == "binary":
+        tag += "_binary"
     model_path = model_dir / f"{tag}_{timestamp}.pkl"
     with open(model_path, "wb") as f:
         pickle.dump({"model": model, "feature_cols": feature_cols, "config": cfg}, f)
     print(f"Model saved: {model_path}")
 
     test_expansion = _expansion_groups_from_batches(test_path, cfg.region, cfg.test_years)
-    print("Loading test set...")
-    X_te, y_te, years_te, _, g_te = load_stage2_arrays(
+    print("Loading test set (no neg_ratio — full evaluation)...")
+    X_te, y_te, years_te, country_ids_te, g_te = load_stage2_arrays(
         test_path, cfg.region, feature_cols, test_expansion, cfg.test_years
     )
     scores = model.predict(X_te, num_iteration=model.best_iteration or None).astype(np.float64)
@@ -587,16 +658,22 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
     print(f"Test NDCG@1%: {test_metrics['ndcg_at_1pct']:.4f}")
     print(f"Test concordance: {test_metrics['concordance_index_within_groups']:.4f}")
 
-    scored = pd.DataFrame({"y_true": y_te, "y_pred_score": scores, "year": years_te})
+    scored = pd.DataFrame({
+        "y_true": y_te,
+        "y_pred_score": scores,
+        "year": years_te,
+        "country_id": country_ids_te,
+    })
     pq.write_table(
         pa.Table.from_pandas(scored, preserve_index=False),
         out_dir / f"{tag}_scored_{timestamp}.parquet",
     )
 
+    saved_params = binary_params if cfg.variant == "binary" else lgb_params
     metrics = {
         "metadata": {
             "timestamp": timestamp,
-            "model": "LightGBM_LambdaRank",
+            "model": "LightGBM_Binary" if cfg.variant == "binary" else "LightGBM_LambdaRank",
             "task": "stage2_geographic_selection",
             "target_column": TARGET_COL,
             "variant": cfg.variant,
@@ -604,6 +681,7 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
             "n_features": len(feature_cols),
             "features": feature_cols,
             "group_cols": list(GROUP_COLS),
+            "neg_ratio": neg_ratio,
         },
         "temporal_split": {
             "train_years": list(cfg.train_years),
@@ -611,7 +689,7 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
             "test_years": list(cfg.test_years),
         },
         "test_performance": test_metrics,
-        "model_parameters": lgb_params,
+        "model_parameters": saved_params,
         "n_expansion_groups_train_pool": len(expansion_groups),
     }
     metrics_path = out_dir / f"{tag}_metrics_{timestamp}.json"

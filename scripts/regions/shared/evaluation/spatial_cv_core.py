@@ -77,13 +77,12 @@ from scripts.regions.shared.training.utils import (
 # =============================================================================
 RANDOM_STATE     = 42
 TARGET_COL       = "transition_01"  # Annual hazard target
-LOOKAHEAD_YEARS  = 5
 WDPA_LAST_YEAR   = 2024
-LAST_LABEL_YEAR  = WDPA_LAST_YEAR - LOOKAHEAD_YEARS   # 2019
+LAST_LABEL_YEAR  = WDPA_LAST_YEAR   # 2024 — annual hazard needs no lookahead
 TRAIN_YEARS      = (2001, 2016)
 EARLYSTOP_YEARS  = (2014, 2016)
 TEST_START       = 2017
-TEST_END         = min(2019, LAST_LABEL_YEAR)
+TEST_END         = LAST_LABEL_YEAR  # 2024
 EXCLUDE_COLS     = {
     'transition_01', 'transition_01_win5', 'WDPA_b1', 'WDPA_prev', 'WDPA',
     'x', 'y', 'row', 'col', 'year',

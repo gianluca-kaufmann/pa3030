@@ -21,7 +21,10 @@ export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 # SA tuning found truncation=499 (ceiling of old [50,500] range), confirming higher
 # is better. 3000 covers ~33% of each 9000-row split sub-group and gives gradient
 # to high-relevance (rel=4) pixels buried beyond position 499 in each sub-group.
+# Remove this override once SA is re-tuned with the [50,3000] range.
 export STAGE2_TRUNCATION_LEVEL=3000
+# Match tuning neg_ratio so hyperparameters are valid for the training class-balance regime.
+export STAGE2_NEG_RATIO=100
 
 echo "Starting model1_LGBM_stage2..."
 srun --cpu-bind=cores --distribution=block:block python -u \

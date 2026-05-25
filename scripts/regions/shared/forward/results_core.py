@@ -479,7 +479,7 @@ def create_eval_vs_deployment_scatter(
     del eval_df, deploy_df
     gc.collect()
 
-    print(f"  Pixels in both test-period (2017–2019) and 2024 unprotected: {len(merged):,}")
+    print(f"  Pixels in both test-period (2017–2024) and 2024 unprotected: {len(merged):,}")
     if len(merged) < 1_000:
         print("  Too few matching pixels — skipping scatter")
         return

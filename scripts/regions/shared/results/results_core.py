@@ -1472,7 +1472,7 @@ def create_risk_map(
     # Extract time period for labels
     if test_years is None or len(test_years) == 0:
         test_years = derive_test_years(metrics_data, None, test_parquet_path)
-    time_period = f"{min(test_years)}-{max(test_years)}" if test_years else "2018-2019"
+    time_period = f"{min(test_years)}-{max(test_years)}" if test_years else "2017-2024"
     
     # Step 1: Load WDPA data to identify ACTUAL establishments during test period
     # CRITICAL: Prioritize actual test-period establishments over y_true (which is 5-year lookahead)
