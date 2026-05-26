@@ -1,0 +1,263 @@
+
+Loaded params from /cluster/home/gikaufmann/master_thesis/scripts/regions/se_asia/5_training/lgbm_best_params.json
+Best CV score: 0.4765
+W&B connected
+======================================================================
+LGBM TRANSITION MODEL (CONTINENT DATASET - 5-YEAR LOOKAHEAD)
+======================================================================
+Train: /cluster/scratch/gikaufmann/data/se_asia/ml/main/train_win5.parquet
+Earlystop: /cluster/scratch/gikaufmann/data/se_asia/ml/main/earlystop_win5.parquet
+Test: /cluster/scratch/gikaufmann/data/se_asia/ml/main/test_win5.parquet
+Params: /cluster/home/gikaufmann/master_thesis/scripts/regions/se_asia/5_training/lgbm_best_params.json
+Output: /cluster/home/gikaufmann/master_thesis/outputs/se_asia/results/ml_models
+
+Configuration:
+  CV Mode: fold3
+  Use Time Weights: True
+  WDPA_LAST_YEAR: 2024
+  LOOKAHEAD_YEARS: 5
+  LAST_LABEL_YEAR: 2019 (WDPA_LAST_YEAR - LOOKAHEAD_YEARS)
+  Earlystop/Test data filtered to years <= 2019 to avoid right-censored labels
+Selected 72 features, loading 78 cols from train, 78 from test
+Target column: transition_01_win5
+
+======================================================================
+PHASE 1: TRAINING WITH TEMPORAL CROSS-VALIDATION
+======================================================================
+  [Memory start of Phase 1] RSS: 0.27 GB
+
+======================================================================
+STEP A: TEMPORAL CROSS-VALIDATION
+======================================================================
+CV Mode: fold3
+  Running only fold 3
+
+======================================================================
+CV FOLD 3/3
+Train: 2001-2013 → Earlystop: 2014-2016
+======================================================================
+
+Loading from 2 files (years 2001-2013) (two-pass NumPy loader)...
+  Pass 1: Counting rows...
+  Found 55,790,479 samples
+  Pass 2: Pre-allocating arrays (55,790,479 samples, 72 features)...
+  0% — 200,000/55,790,479 rows
+  [Memory   0%] RSS: 0.91 GB
+  25% — 14,000,000/55,790,479 rows
+  [Memory   25%] RSS: 4.68 GB
+  50% — 28,000,000/55,790,479 rows
+  [Memory   50%] RSS: 8.50 GB
+  75% — 42,000,000/55,790,479 rows
+  [Memory   75%] RSS: 12.32 GB
+  100% — 55,790,479/55,790,479 rows
+  [Memory   100%] RSS: 16.08 GB
+  Loaded 55,790,479 rows in 29.0s (15.22 GB)
+  55,109,826 neg, 680,653 pos, ratio 1:81.0, years 2001-2013
+
+Loading from 2 files (years 2014-2016) (two-pass NumPy loader)...
+  Pass 1: Counting rows...
+  Found 25,328,100 samples
+  Pass 2: Pre-allocating arrays (25,328,100 samples, 72 features)...
+  0% — 56,510/25,328,100 rows
+  [Memory   0%] RSS: 16.12 GB
+  25% — 6,409,683/25,328,100 rows
+  [Memory   25%] RSS: 17.85 GB
+  50% — 12,664,050/25,328,100 rows
+  [Memory   50%] RSS: 19.56 GB
+  75% — 19,064,050/25,328,100 rows
+  [Memory   75%] RSS: 21.30 GB
+  100% — 25,328,100/25,328,100 rows
+  [Memory   100%] RSS: 23.00 GB
+  Loaded 25,328,100 rows in 13.2s (6.91 GB)
+  24,890,470 neg, 437,630 pos, ratio 1:56.9, years 2014-2016
+
+Fold 3: Train 55,790,479 samples, Earlystop 25,328,100 samples (earlystop years 2014-2016, capped at LAST_LABEL_YEAR=2019)
+  NOTE: Earlystop used ONLY for early stopping, NOT for metric reporting.
+  Training sample weights: min=0.500, max=1.000, mean=0.749
+  Computed scale_pos_weight from training data: 80.966110 = 55,109,826 / 680,653
+  Creating datasets...
+  Training...
+Training until validation scores don't improve for 500 rounds
+[100]	earlystop's average_precision: 0.14205
+[200]	earlystop's average_precision: 0.175782
+[300]	earlystop's average_precision: 0.196463
+[400]	earlystop's average_precision: 0.211929
+[500]	earlystop's average_precision: 0.218722
+[600]	earlystop's average_precision: 0.22659
+[700]	earlystop's average_precision: 0.236298
+[800]	earlystop's average_precision: 0.242239
+[900]	earlystop's average_precision: 0.252029
+[1000]	earlystop's average_precision: 0.257613
+Did not meet early stopping. Best iteration is:
+[1033]	earlystop's average_precision: 0.260253
+  Generating OOF predictions on earlystop set (25,328,100 samples)...
+
+  DIAGNOSTIC ONLY (not used for model selection / early stopping):
+    PR-AUC: 0.2603
+    ROC-AUC: 0.8683
+    Base rate: 0.0173
+    Precision@1%: 0.4104
+  [Memory after fold 3 predictions] RSS: 2.54 GB
+
+Saving temporal CV OOF predictions (1 folds)...
+  Temporal CV OOF predictions saved: model3_lgbm_temporal_cv_predictions_20260423_223156.parquet
+  Total samples: 25,328,100
+  Folds: [2]
+
+CV Diagnostics (aggregated across 1 non-skipped folds):
+  PR-AUC: 0.2603 ± 0.0000
+  ROC-AUC: 0.8683 ± 0.0000
+
+Fold3 early-stopping best_iteration: 1033 (logged only)
+  Not used to set chosen_iteration — Optuna n_estimators used instead for consistency with deployment/LOBO.
+  Chosen iteration (Optuna n_estimators from JSON): 1040
+
+======================================================================
+TEMPORAL CV RESULTS (Aggregated)
+======================================================================
+CV Mode: fold3
+Chosen iteration (for final model): 1040
+======================================================================
+
+======================================================================
+STEP B: FINAL MODEL TRAINING
+======================================================================
+Training final model on full dataset: 2001-2016
+  [Memory before final model training] RSS: 1.84 GB
+
+Loading full training data (2001-2016)...
+
+Loading from 2 files (years 2001-2016) (two-pass NumPy loader)...
+  Pass 1: Counting rows...
+  Found 81,118,579 samples
+  Pass 2: Pre-allocating arrays (81,118,579 samples, 72 features)...
+  0% — 200,000/81,118,579 rows
+  [Memory   0%] RSS: 2.16 GB
+  25% — 20,400,000/81,118,579 rows
+  [Memory   25%] RSS: 7.68 GB
+  50% — 40,600,000/81,118,579 rows
+  [Memory   50%] RSS: 13.19 GB
+  75% — 61,000,000/81,118,579 rows
+  [Memory   75%] RSS: 18.76 GB
+  100% — 81,118,579/81,118,579 rows
+  [Memory   100%] RSS: 24.25 GB
+  Loaded 81,118,579 rows in 36.4s (22.14 GB)
+  80,000,296 neg, 1,118,283 pos, ratio 1:71.5, years 2001-2016
+  [Memory after loading final data] RSS: 24.25 GB
+
+Final model training: train (2001-2016): 81,118,579 rows
+Final training: no earlystop/val; num_boost_round fixed from CV to avoid leakage.
+  Training sample weights: min=0.500, max=1.000, mean=0.782
+
+Imbalance: Computed scale_pos_weight from training data: 71.538507 = 80,000,296 / 1,118,283
+
+Training final model on 81,118,579 samples...
+  [Memory before final training] RSS: 24.55 GB
+
+Final model parameters:
+  boosting_type: gbdt
+  colsample_bynode: 0.47480145943556706
+  colsample_bytree: 0.7
+  is_unbalance: False
+  learning_rate: 0.0903693510040815
+  max_depth: 25
+  metric: average_precision
+  min_child_samples: 104
+  min_split_gain: 8.231099873383114e-06
+  num_leaves: 209
+  num_threads: 32
+  objective: binary
+  path_smooth: 0.3974407719485138
+  random_state: 42
+  reg_alpha: 0.11392708850930655
+  reg_lambda: 0.005972490975083891
+  scale_pos_weight: 71.53850680015702
+  subsample: 0.8757653524281445
+  subsample_freq: 1
+  verbose: -1
+  Creating dataset...
+  [Memory after train dataset creation] RSS: 24.25 GB
+  Starting training with num_boost_round=1040 (fixed from CV, no validation set/early stopping)...
+  Progress will be logged every 100 iterations via LightGBM callback.
+
+Training done in 655.4s. Used 1040 iterations (chosen based on CV)
+Final model saved: /cluster/home/gikaufmann/master_thesis/data/se_asia/ml/models/model3_lgbm_20260423_223156.pkl
+Phase 1 completed.
+
+======================================================================
+PHASE 2: TESTING
+======================================================================
+  [Memory start of Phase 2] RSS: 2.52 GB
+
+Loading model from /cluster/home/gikaufmann/master_thesis/data/se_asia/ml/models/model3_lgbm_20260423_223156.pkl
+  [Memory after loading model] RSS: 2.52 GB
+Processing test in batches of 200,000...
+Test year range: 2017-2019 (capped at LAST_LABEL_YEAR=2019)
+  Pass 1: Counting test rows (year_range=(2017, 2019))...
+  Found 12,503,260 test samples (filtered to year_range=2017-2019)
+  Pre-allocating arrays for 12,503,260 samples...
+  [Memory after pre-allocation] RSS: 2.52 GB
+  Using 1040 iterations for predictions (chosen from CV)
+  Pass 2: Processing test batches (year_range=(2017, 2019))...
+Writing to /cluster/home/gikaufmann/master_thesis/outputs/se_asia/results/ml_models/model3_lgbm_scored_20260423_223156.parquet
+  1% — 200,000/12,503,260 rows
+  [Memory   1%] RSS: 2.52 GB
+  25% — 3,200,000/12,503,260 rows
+  [Memory   25%] RSS: 2.59 GB
+  51% — 6,400,000/12,503,260 rows
+  [Memory   51%] RSS: 2.60 GB
+  75% — 9,400,000/12,503,260 rows
+  [Memory   75%] RSS: 2.61 GB
+  100% — 12,503,260/12,503,260 rows
+  [Memory   100%] RSS: 2.63 GB
+Completed 63 batches in 28.8s, 12,503,260 rows
+  [Memory after all predictions] RSS: 2.63 GB
+
+Test set: 12,428,756 neg, 74,504 pos, ratio 1:166.8, years 2017-2019
+
+Test metrics: ROC-AUC 0.9802, PR-AUC 0.5380
+  P@1%: 0.4437 (55,471/125,032), lift 74.45x
+  P@5%: 0.1108 (69,245/625,163), lift 18.59x
+  P@10%: 0.0568 (71,046/1,250,326), lift 9.54x
+
+Top 20 features:
+                  feature  importance
+                dist_wdpa        7620
+          dist_powerplant        7316
+             dist_oil_gas        6573
+                      GPW        6448
+          GSN_b4_smooth64        5756
+          GSN_b2_smooth64        5675
+deforestation_b1_smooth64        5646
+    elevation_b1_smooth64        5626
+    elevation_b2_smooth64        5371
+                policy_b3        5130
+          dist_indigenous        5042
+    elevation_b2_smooth16        5009
+          GSN_b2_smooth16        4811
+             GPW_smooth64        4799
+                policy_b4        4790
+             GPW_smooth16        4727
+          GSN_b5_smooth64        4705
+    elevation_b1_smooth16        4662
+                policy_b2        4312
+     elevation_b2_smooth4        4250
+
+Metrics saved: /cluster/home/gikaufmann/master_thesis/outputs/se_asia/results/ml_models/model3_lgbm_metrics_20260423_223156.json
+
+======================================================================
+SUMMARY
+======================================================================
+Model: LightGBM, 72 features
+
+Temporal Cross-Validation (CV Mode: fold3):
+  Folds run: 1
+  Final num_boost_round (chosen): 1040
+  Fold3 best_iteration: 1033
+
+Test (2017-2019, 12,503,260 samples, 0.596% pos): ROC-AUC 0.9802, PR-AUC 0.5380
+  P@1%: 0.4437 (74.5x), P@5%: 0.1108 (18.6x), P@10%: 0.0568 (9.5x)
+
+Timings: train 655.4s, pred 28.8s, total 2282.9s (38.0m)
+======================================================================
+Done.

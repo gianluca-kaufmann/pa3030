@@ -91,31 +91,37 @@ A single classifier conflates both terms. The Group A/B diagnostic proves this e
 | Stage 2 training — SEA (final) | ✅ Job 567979 done |
 | Stage 2 tuning — USA | ❌ Job 568012 cancelled (deprioritised) |
 | Stage 2 training — USA | ❌ Job 568045 cancelled (deprioritised) |
-| Issue C: SA year/country breakdown | 🔄 Job 628878 running |
-| Stage 1 SA (data builder + Poisson expansion) | 🔄 Job 628893 queued |
-| Stage 1 USA (data builder + Poisson expansion) | 🔄 Job 628895 queued |
-| Stage 1 SEA (data builder + Poisson expansion) | 🔄 Job 628897 queued |
-| W8: SA binary Stage 2 tune | 🔄 Job 628923 queued |
-| W8: SA binary Stage 2 train | 🔄 Job 628926 (afterok:628923) |
-| SA feature engineering (Issues H+I: saturation + trend features) | 🔄 Job 628941 queued |
-| SA LambdaRank Stage 2 re-tune (corrected [50,3000] range) | 🔄 Job 628943 (afterok:628941) |
-| SA LambdaRank Stage 2 retrain (uses re-tuned best_params.json) | 🔄 Job 628945 (afterok:628943) |
+| Issue C: SA year/country breakdown | ✅ Job 628878 done. 2017=1.47× | 2018=7.90× | 2019=9.64× |
+| Stage 1 SA (full political model, re-run) | ✅ Jobs 628893+631668 done. D²_train=0.761, D²_test=−0.096 (improved from −0.623; see Issue A) |
+| Stage 1 SEA (full political model, re-run) | ✅ Jobs 628897+631670 done. D²_train=0.305, D²_test=+0.103 (positive; simpler model gave 0.249 — see Issue J) |
+| Stage 1 USA (full political model, re-run) | ❌ Jobs 628895+631669 done but D²_test=OVERFLOW (see Issue K — model underdetermined, fix required) |
+| W8: SA binary Stage 2 tune | 🔄 Job 689625 running (30 trials, trunc N/A, n_est ≤1500) |
+| W8: SA binary Stage 2 train | 🔄 Job 689627 (afterok:689625) |
+| SA feature engineering (Issues H+I: saturation + trend features) | ✅ Job 628941 done. Panel rebuilt 2026-05-26 01:09 (57 GB) |
+| SA LambdaRank Stage 2 re-tune ([50,1000] range, 30 trials) | 🔄 Job 689639 pending (QOSMaxMemoryPerUser, afterok binary tune) |
+| SA LambdaRank Stage 2 retrain | 🔄 Job 689640 (afterok:689639) |
+| USA feature engineering (Issue H: saturation + trend features) | ❌ Not yet run — panel is pre-feature-engineering (May 22) |
+| SE Asia feature engineering (Issue H: saturation + trend features) | ❌ Not yet run — panel is pre-feature-engineering (May 22) |
 | Forward prediction pipeline | ✅ Bugs F1+F2 fixed; probability output is uncalibrated (Issue G) |
 
-**Active chains**: 628923→628926 (W8 binary SA) | 628941→628943→628945 (SA FE → re-tune → retrain). Do not modify Stage 2 architecture or SA panel parquets while these run.
+**Active chains**: 689625→689627 (W8 binary SA tune→retrain) | 689639→689640 (SA LambdaRank tune→retrain, pending). Do not modify SA panel parquets while these run.
 
 ---
 
 ## Open Issues
 
-**H — Panel merge re-run required for saturation feature** ← code done; Euler re-run pending
-`country_pa_cumsum_lag1_pixels` added to `_build_country_pa_momentum_table` in all three region `feature_engineering` scripts. Re-run `feature_engineering` on Euler to rebuild the panel parquets, then re-train Stage 2. This is the single highest-expected-value new feature.
+**H — Panel merge re-run required for saturation + trend features** ← SA ✅ done; USA + SE Asia pending
+`country_pa_cumsum_lag1_pixels` (saturation) + `NDVI_b1_trend5` / `deforestation_b1_trend5` / `HNTL_b1_trend5` (trend) added to all three `feature_engineering` scripts. SA panel rebuilt 2026-05-26 (61 GB); SA re-tune+retrain chain running. USA (`merged_panel_final.parquet` from 2026-05-22, 46 GB) and SE Asia (from 2026-05-22, 18 GB) still need `feature_engineering` re-runs on Euler, then Stage 2 re-tune+retrain for each.
 
-**I — SA Stage 2 re-tune with corrected range required**
-Best tuned `lambdarank_truncation_level=499` hit the old [50,500] ceiling. Current training overrides to 3000 via `STAGE2_TRUNCATION_LEVEL`. Re-run SA Stage 2 tuning (`tuning_lgbm_stage2.slurm`) after job chain completes to find the true optimum in [50,3000] and then **remove** the override from the training SLURM.
+**I — SA Stage 2 re-tune with corrected range ✅ submitted**
+Old ceiling was 500 (best trial hit 499). New search space: `lambdarank_truncation_level` ∈ [50, 1000], `n_estimators` ∈ [200, 1500], 30 trials. Jobs 689639→689640 queued.
 
-**A — Stage 1 D² is in-sample** ← code complete; re-run on Euler to get numbers
-OOS split (train 2001–2016, test 2017–2024) + v2x_corr/v2cseeorgs/gov_wgi_rl_est + election_cycle + redd_plus all in code. Requires `stage1_data_builder.py` rebuild then `model1_expansion.py` on Euler. Data files: `data/shared/election_cycle.csv` (V-Dem-derived) and `redd_plus.csv` (FCPF/UN-REDD sourced) ready; REDD+ TO VERIFY entries need final check before paper submission.
+**A — Stage 1 D² ✅ OOS numbers in hand (2026-05-26)**
+Results with full political model (v2x_polyarchy, v2x_corr, v2cseeorgs, gov_wgi_ge_est, gov_wgi_rl_est, gdp_growth_lag1, redd_plus_enrolled, pa_cumsum_lag1_pixels):
+- SA: D²_train=0.761, D²_test=**−0.096** (improved from −0.623 with simpler model). Still slightly negative — structural SA break (frontier exhaustion) remains the primary cause; v2x_polyarchy (β=3.04) is the strongest predictor.
+- SE Asia: D²_train=0.305, D²_test=**+0.103** (positive; beats null). Full model slightly underperforms simpler model on test (0.249→0.103) — see Issue J.
+- USA: D²_test=**OVERFLOW** — see Issue K. Do not use USA Stage 1 coefficients.
+REDD+ TO VERIFY entries still need final check against cited FCPF/UN-REDD pages before paper submission.
 
 **B — `target_30x30` coefficient = 0**
 No variation in 2001–2013 training window. Fix: apply 30×30 scenario as exogenous budget multiplier post-prediction, not through the model coefficient.
@@ -131,6 +137,12 @@ Job 568012/568045 queued (afterok chain). No action needed until they complete.
 
 **F — WDPA label quality: no STATUS or IUCN filter** ← important methodological gap
 `1_extraction/WDPA_export` paints ALL WDPA polygons (no `STATUS == 'Designated'` filter, no IUCN category filter). This may include "Proposed" and "Inscribed" areas in the positive labels — potential leakage if those areas are known-pending designations. Fix requires adding `WDPA.filter(ee.Filter.eq('STATUS', 'Designated'))` and optionally `IUCN_CAT` filter to the GEE export, then re-running preprocessing for all regions. **Assess impact first**: estimate what fraction of positive labels come from non-Designated polygons before deciding whether to re-export.
+
+**J — SE Asia Stage 1 overfits with full political model**
+Full model (16 features, 176 obs) gives D²_test=0.103 vs simpler model's 0.249. The additional political variables (WGI, V-Dem, REDD+) hurt OOS performance in SE Asia — likely multicollinearity (gov_wgi_ge_est=+2.66 vs gov_wgi_rl_est=−2.13, v2cseeorgs=−1.70). Fix options: (1) feature selection / L1 penalty; (2) drop redundant WGI columns and keep only one governance index; (3) report both models and note the tradeoff. Decision needed before paper submission.
+
+**K — USA Stage 1 completely underdetermined: numerical overflow**
+1 country × 16 training years = 16 obs, 16 features → 1:1 obs/feature ratio. Ridge alpha=0.1 is far too weak: coefficients explode (pa_cumsum β=3.94, agricultural_land β=−3.88), D²_test=−1.18×10¹⁴¹. Fix: reduce to 2–3 features only (e.g. `pa_momentum_lag1` + `pa_cumsum_lag1_pixels`) and/or set alpha ≥ 10. Alternatively treat USA Stage 1 as a trend-extrapolation only and report it as such in the paper. This must be fixed before USA forward predictions are credible.
 
 **G — Forward "probability" is not calibrated**
 `y_pred_proba_5yr_cumulative` in `two_stage_predict_core.py` is min-max normalised LambdaRank score — not a statistical probability. Cannot be interpreted as P(designated). For investor/risk framing this is misleading. Fix: W8 binary LightGBM produces proper probabilities; apply Platt scaling calibration on top. Until then, label this output as "designation risk index", not "probability."

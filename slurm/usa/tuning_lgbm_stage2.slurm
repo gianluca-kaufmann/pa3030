@@ -16,4 +16,5 @@ source "$HOME/venvs/master_thesis/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
 export STAGE2_NEG_RATIO=100
+export STAGE2_TUNING_TRIALS=30
 python -u scripts/regions/usa/4_tuning/model2_tuning_lgbm_stage2

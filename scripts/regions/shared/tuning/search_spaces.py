@@ -185,12 +185,14 @@ def get_lgbm_stage2_optuna_bounds(mode: str) -> Dict:
     (LGB_MAX_QUERY=9 000). k@1% per split sub-group = 90. The truncation level
     controls how many positions in each sub-group receive gradient signal; higher
     values help push rare high-relevance (rel=4) pixels out of positions >T.
-    SA tuning hit the previous ceiling of 500 (best trial: 499), so the range
-    is widened to 3 000. Upper limit is bounded by sub-group size (9 000).
+    SA tuning hit the previous ceiling of 500 (best trial: 499), so we search
+    above 500. Ceiling is 1 000 — runtime scales ~O(K^1.5), so trunc=3 000 would
+    make each trial 20× slower than trunc=500 with negligible NDCG gain (empirical:
+    trunc 410→639→2506 gave NDCG 0.088→0.095→0.097, only +0.002 for 6× more trunc).
     """
     base = get_lgbm_optuna_bounds(mode, auto_scale_pos_weight=1.0)
-    base["lambdarank_truncation_level"] = (50, 3000)
-    base["n_estimators"] = (200, 3000)
+    base["lambdarank_truncation_level"] = (50, 1000)
+    base["n_estimators"] = (200, 1500)
     return base
 
 
@@ -199,7 +201,9 @@ def get_lgbm_stage2_binary_optuna_bounds(mode: str) -> Dict:
 
     No lambdarank_truncation_level (binary objective has no sub-window constraint).
     scale_pos_weight is computed from data per fold, not tuned here.
+    n_estimators capped at 1500: binary trains on the full dataset (neg_ratio=None),
+    so high tree counts are expensive; early stopping at patience=100 handles the rest.
     """
     base = get_lgbm_optuna_bounds(mode, auto_scale_pos_weight=1.0)
-    base["n_estimators"] = (200, 3000)
+    base["n_estimators"] = (200, 1500)
     return base
