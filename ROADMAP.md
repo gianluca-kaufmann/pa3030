@@ -90,8 +90,8 @@ A single classifier conflates both terms. The Group A/B diagnostic proves this e
 | Stage 2 tuning — SA | ✅ 100 trials, NDCG=0.186, trunc=3000 |
 | Stage 2 training — SA | ✅ Job 567921. NDCG=0.028, lift=6.0× (see diagnosis above) |
 | Stage 2 naive baseline — SA | ✅ NDCG=0.017, lift=2.7× |
-| Stage 2 tuning — SEA (re-run, eval_at=[90]) | ✅ Job 567952 done. NDCG=0.091, Lift=12.7× |
-| Stage 2 training — SEA (final) | ✅ Job 567979 done |
+| Stage 2 tuning — SEA (re-run, eval_at=[90]) | ✅ Job 567952 done. NDCG=0.091, Lift=12.7× — **pre-H+I panel; not final** |
+| Stage 2 training — SEA (final) | ✅ Job 567979 done — **pre-H+I panel; SEA FE re-run still pending** |
 | Stage 2 tuning — USA | ❌ Job 568012 cancelled (deprioritised) |
 | Stage 2 training — USA | ❌ Job 568045 cancelled (deprioritised) |
 | Issue C: SA year/country breakdown | ✅ Job 628878 done. 2017=1.47× | 2018=7.90× | 2019=9.64× |
@@ -209,7 +209,9 @@ No variation in 2001–2013 training window. Fix: apply 30×30 scenario as exoge
 Result: 2017 Lift=1.47× | 2018 Lift=7.90× | 2019 Lift=9.64× (best!). **Bolsonaro hypothesis falsified** — 2019 is strongest. The 2017 collapse (baseline_rate=0.0017, half of 2018/2019) drags the 3-year average to Lift=6×. Likely cause: fewer designations in 2017 make NDCG highly sensitive to misclassification of rare events. **Implication: Issue D (9K sub-window mismatch) is now primary unexplained residual; W8 binary is the key test.** Country breakdown unavailable (scored parquet lacks country_id; re-run with new code will include it).
 
 **D — LambdaRank 9K sub-window vs. full-group evaluation mismatch**
-Training optimises ranking within 9K-row sub-windows; evaluation is over full country-year groups (up to 1.2M rows). Addressed by W8 (binary LightGBM Stage 2). Decision pending cross-region metric comparison after chain completes.
+Training optimises ranking within 9K-row sub-windows; evaluation is over full country-year groups (up to 1.2M rows). SA median group = 413K rows → ~45 sub-windows per group (not 188 — that figure used the mean, which Brazil inflates). Concordance=0.64 confirms the model IS learning to rank; the problem is tail discrimination at the top-1% cutoff. Two complementary fixes under investigation:
+1. **W8 binary** (currently running): no 9K ceiling, scale_pos_weight handles imbalance. Primary diagnostic — if SA binary Lift@1% >> 6×, the 9K mismatch is confirmed as the dominant bottleneck.
+2. **W9 ecoregion groups** (conditional on W8 result): change training groups from `(country_id, year)` → `(country_id, year, ecoregion_id)`. Ecoregion groups are typically 1K–50K pixels → no sub-window splitting. Scientifically motivated (designation decisions are hierarchical: which biome first, then which pixel). **Critical caveat**: training on within-biome ranking and evaluating on within-country ranking creates a train/eval distribution mismatch — the model never sees cross-biome comparisons during gradient updates. This is a genuine experimental risk, not just a reporting caveat. Requires empirical validation. Infrastructure exists: `gsn_terrestrial_ecoregions_mask_1km.tif` is already loaded in `spatial_cv_core.py:load_biome_raster_and_mapping()`. Pursue only if W8 result confirms 9K as the bottleneck and suggests LambdaRank is worth fixing rather than replacing.
 
 **E — USA Stage 2 timing**
 Job 568012/568045 queued (afterok chain). No action needed until they complete.
@@ -304,22 +306,49 @@ Script exists: `model1_logistic_stage2.py`. Run for SA. Interpretable coefficien
 
 **Decision rule**: if binary Lift@1% > LambdaRank Lift@1% on SA test set → switch primary. Either way, binary produces calibrated forward probabilities (resolves Issue G).
 
+### W9 — Stage 2 Structural Improvements [conditional on W8 result]
+
+Three improvements to investigate after W8 binary result is in hand. Priority order is fixed by the W8 outcome.
+
+**W9a — Ecoregion-stratified training groups** (see Issue D for full description and caveats)
+- Change training groups from `(country_id, year)` → `(country_id, year, ecoregion_id)`
+- Keep evaluation groups at `(country_id, year)` — unchanged
+- Apply within-group rank normalisation at `(country_id, year)` level *before* splitting into ecoregion sub-groups, so cross-biome feature comparability is preserved
+- **Gate**: pursue only if W8 binary SA Lift@1% > LambdaRank 6× AND W8 binary is not clearly dominant; if binary is dominant, switch primary and skip W9a
+- Implementation: ~2 days. Add `ecoregion_id` column via raster lookup in `load_stage2_arrays()` (optional flag); change `group_sizes` computation for training path only
+
+**W9b — Curriculum hard negative mining** (~1 day, after any re-trained model exists)
+- Phase 1: score all training pixels with the current model
+- Phase 2: retrain with a mix of (a) all positives + (b) top-scored negatives ("hard") + (c) random negatives, ramping the hard-negative fraction from 0% → 50% over training epochs
+- **Do NOT use pure hard negatives** (no curriculum ramp): pure hard mining causes the model to memorise current failure cases rather than learn a generalizable ranking — curriculum is the robust IR recommendation
+- Expected gain: 10–20% NDCG improvement (speculative; no experiment yet)
+- Implement as `neg_sampling="curriculum"` option in `load_stage2_arrays()`
+
+**W9c — Stage 1 predicted expansion as Stage 2 feature** (~1 hour to wire, but requires care)
+- Add `stage1_predicted_expansion` (country-year level) as a pixel-level feature in Stage 2 — same value for every pixel in a group
+- Rationale: countries under high expansion pressure may select different pixel types (faster, lower-quality) than countries at normal pace; bridging Stage 1 → Stage 2 is architecturally principled
+- **Leakage caveat**: Stage 1 trains on 2001–2016, which overlaps the Stage 2 early-stop window (2014–2016). Using Stage 1 in-sample predictions for those years would leak. Fix: generate rolling/walk-forward Stage 1 predictions (train on years ≤t−1, predict year t) for the Stage 2 training window before adding this feature
+- Low priority — implement only if W9a and W9b are done and NDCG remains below target
+
 ---
 
 ## Next Actions (Ordered)
 
 1. ✅ **Issue C** — Done. 2019 is the BEST year (Lift=9.64×); 2017 is the worst (1.47×). Bolsonaro hypothesis falsified. Issue D (9K sub-window) is now primary suspect for SA underperformance.
-2. ✅ **Issues H+I** — SA FE job 628941 queued → re-tune 628943 → retrain 628945. Will rebuild panel with `country_pa_cumsum_lag1_pixels` + trend features then find optimal truncation in [50,3000].
-3. ✅ **W8 SA binary** — Jobs 628923 → 628926 queued. Compare binary Lift@1% vs LambdaRank 6.0× once done.
-4. ✅ **Stage 1 SA/USA/SEA** — Jobs 628893/895/897 queued. Will give OOS D² + full political coefficients.
-5. **Cross-region comparison** (after jobs complete): SEA Lift=12.7× vs SA Lift=6.0×. If SA uniquely underperforms after H+I re-train → Bolsonaro structural break (paper finding). Then re-queue USA Stage 2.
-6. **REDD+ final verification** (before paper submission, not blocking): Open each `# TO VERIFY` URL in `build_redd_plus.py` (FCPF and UN-REDD country pages) and confirm the enrollment year. Election cycle is fully verified via V-Dem v15 — no manual check needed.
-7. ✅ **WDPA lag correction done**: `WDPA_May2026_Public_csv.csv` processed; all three panels patched with correct 2001 lag initialization. SA D²_test(8yr) +0.031, Chow break non-significant. No TRAIN_YEARS change needed.
-8. **Next data sprint**: GEE export for ESA CCI Biomass (carbon stocks) and RAISG indigenous territory area fraction. SA first.
-8. **W5**: Run logistic Stage 2 baseline for SA on Euler (needs rebuilt panel from SA FE, job 628941).
-9. **USA Stage 2 LambdaRank**: Re-submit once SA binary and SA LambdaRank re-train results are in hand.
-10. **Issue F**: Audit WDPA label quality (estimate % non-Designated in positives); decide whether GEE re-export is warranted.
-11. **W7**: Start manuscript after Stage 1 OOS + SA SHAP confirmed + cross-region metrics in hand.
+2. ✅ **Issues H+I** — SA FE job 628941 done. SA panel rebuilt with `country_pa_cumsum_lag1_pixels` + trend features. SA re-tune (689639) + retrain (689640) pending.
+3. ✅ **W8 SA binary** — Jobs 689625→689627 running. Compare binary Lift@1% vs LambdaRank 6.0× once done.
+4. ✅ **Stage 1 SA/USA/SEA** — Finalised locally 2026-05-26. SA D²_test(8yr)=+0.356; SEA D²_test(8yr)=+0.109; USA trend-only D²_test=−3.14 (path-dependency finding).
+5. **W8 + SA LambdaRank re-train decision** (after jobs 689627 and 689640 complete): Compare binary Lift@1% vs LambdaRank Lift@1% on SA test set. If binary >> LambdaRank → binary becomes primary (W8 wins); if similar → LambdaRank primary with ecoregion investigation (W9a). Record numbers here and update Settled Decisions.
+6. **SEA + USA feature engineering re-runs** (after SA chains complete; Issue H): SA panel is updated; SEA and USA panels are still pre-saturation-feature (2026-05-22). Submit `feature_engineering` jobs for both regions, then chain Stage 2 re-tune+retrain. SEA 0.091/12.7× result is NOT final — treat as a lower bound.
+7. **USA Stage 2 LambdaRank** (after SEA FE re-run confirms approach): Re-submit tune+train chain.
+8. **W9a ecoregion-stratified training** (conditional — see Issue D gate): implement only if W8 confirms 9K bottleneck AND binary does not clearly dominate. ~2 days.
+9. **W4 ablation + W5 logistic baseline** (after SA re-train result is in hand; both use rebuilt SA panel):
+   - W4: run `stage2_ablation.py` for SA. Critical test: does removing `pa_momentum` collapse to naive NDCG?
+   - W5: run `model1_logistic_stage2.py` for SA. Required for methods comparison table and economics reviewers.
+10. **Issue F — WDPA label quality audit**: count what fraction of positive labels come from non-Designated polygons. Estimate impact before deciding on GEE re-export. Must appear in methods section of any top-tier submission regardless of outcome.
+11. **REDD+ final verification** (before paper submission, not blocking): Open each `# TO VERIFY` URL in `build_redd_plus.py` and confirm enrollment year against FCPF/UN-REDD pages.
+12. **Next data sprint**: GEE export for ESA CCI Biomass (carbon stocks) and RAISG indigenous territory area fraction. SA first. Run in parallel with steps 6–9.
+13. **W7 manuscript** (gate: SA re-train result confirmed + SEA FE re-run done + ablation run + Issue F quantified): Do not start W7 until these gates are met.
 
 ---
 
