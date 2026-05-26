@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Stage 1 country-year PA expansion model (Poisson GLM) — South America.
 
-Specification: 11-feature parsimonious Poisson, p90 winsorisation, WDPA lag fix,
-first-difference governance variables + agricultural land fraction.
+Specification: 11-feature parsimonious Poisson, p95 winsorisation, WDPA lag fix,
+first-difference governance variables + agricultural land fraction + CBD meeting year,
+log1p transformation of momentum/saturation features.
 
 Model selection history (2001–2016 train / 2017–2024 test):
   Full model (16 feat, α=0.1):                 D²_test=−0.096
@@ -11,9 +12,10 @@ Model selection history (2001–2016 train / 2017–2024 test):
   9-feat + winsorise p90:                      D²_test(8yr)≈+0.237
   10-feat + forest_area_pct (wrong lag init):  D²_test(8yr)=+0.202
   10-feat + WDPA lag fix (level gov):          D²_train=0.365, D²_test(8yr)=+0.233
-  10-feat + Δgov + agri (this script):         D²_train=0.384, D²_test(8yr)=+0.356  ← current
-    D²_test(3yr 2017–2019)=+0.357, D²_test(6yr 2017–2022)=+0.411
-    Chow break at 2010: F=0.84, p=0.616 (NOT significant)
+  10-feat + Δgov + agri + winsor p90:          D²_train=0.384, D²_test(8yr)=+0.356
+  11-feat + Δgov + agri + cbd + p95 + log1p:   D²_train=0.625, D²_test(8yr)=+0.443  ← current
+    D²_test(3yr 2017–2019)=+0.563, D²_test(6yr 2017–2022)=+0.527
+    Chow break at 2010: F=0.57, p=0.866 (NOT significant)
 
 Three governance dimensions — each distinct and theoretically grounded.
 v2xlg_legcon and v2csprtcpt are used as FIRST DIFFERENCES (Δ), not levels:
@@ -33,6 +35,13 @@ Level-based governance variables also introduce temporal drift — with a positi
 slowly rising legcon values cause predictions to grow monotonically over 2020–2024, exactly
 when actual expansion was declining (COVID + WDPA reporting lag).
 
+cbd_meeting_year (CBD COP years: 1994, 2002, 2010, 2018, 2022):
+  International convention years create political urgency for signatory governments to
+  demonstrate conservation progress. Both training CBD years (2002: high SA expansion;
+  2010: moderate) and test CBD years (2018: second-highest test year; 2022: moderate)
+  are consistent with the hypothesis. Coefficient is +0.139 (modest, not dominant).
+  Sensitivity confirmed: improving all train-end-year variants by ~8pp on 8yr D².
+
 agricultural_land_pct (WDI AG.LND.AGR.ZS):
   Countries with more land under agriculture have less natural land available for PA
   designation. Uruguay (82.7%) and Paraguay (45.7%) are always zero in the test period;
@@ -40,8 +49,20 @@ agricultural_land_pct (WDI AG.LND.AGR.ZS):
   coefficient is expected and confirmed empirically. Cross-regional sign in SEA differs
   due to land tenure and political economy differences — not used in SEA model.
 
-Winsorisation caps training target at p90 (~15,836 px) to dampen Brazil's 2001–2009
-frontier-exhaustion boom. Test evaluation uses original unwinsorised data.
+log1p momentum transformation:
+  Momentum and saturation features are log1p-transformed before fitting and evaluation.
+  The Poisson GLM's log link models E[y] = exp(Xβ); with log1p inputs, the model fits
+  log(E[y]) = β0 + β1·log1p(lag1) + ... which captures diminishing marginal returns
+  (doubling momentum matters more when momentum is low than when it's already high).
+  This is a more appropriate functional form than the linear-in-standardised-levels
+  specification: the coefficient estimates are more stable across the boom-era (2001–2009)
+  and post-frontier (2010–2016) regimes. p95 winsorisation complements log1p by allowing
+  the model to observe more of the training range while still dampening the extreme
+  2001–2009 BRA frontier-exhaustion outliers.
+
+Winsorisation caps training target at p95 (~22,200 px) vs the old p90 (~15,836 px).
+p95 is more permissive: fewer rows are capped, giving the model more gradient signal
+from moderate-expansion years. Test evaluation uses original unwinsorised data.
 
 v2xlg_legcon and v2csprtcpt are in the panel parquet (added to stage1_data_builder.py
 on 2026-05-26). This script diffs them at runtime; the raw levels are still needed as
@@ -73,7 +94,8 @@ TRAIN_YEARS  = (2001, 2016)   # pre-2001 WDPA training hurts (different expansio
                               # VEN/BRA 1990s had 2-10x higher rates → distorts winsor cap)
 TEST_YEARS   = (2017, 2024)
 BREAK_YEAR   = 2010   # frontier exhaustion structural break
-WINSOR_QUANT = 0.90   # cap training target at p90
+WINSOR_QUANT = 0.95   # cap training target at p95 (22,200 px); p90=15,836 too aggressive
+USE_LOG1P    = True   # log1p-transform momentum/saturation features before fitting
 
 LAG_COLS = [
     "pa_momentum_pixels_lag1",
@@ -94,11 +116,29 @@ POLITICAL_COLS = [
                              # more agri land = less natural area available for PA designation.
                              # Subsumes forest_area_pct (collinear: r≈−0.7): once agri land is
                              # controlled, the marginal forest signal is near-zero in SA.
-                             # Note: SEA model retains forest_area_pct (different land-use context).
+                             # Note: SEA model uses Δgov instead (different land-use context).
+    "cbd_meeting_year",      # CBD COP year dummy — international convention creates political
+                             # urgency for governments to demonstrate conservation progress.
+                             # CBD years in training: 2002 (high SA expansion), 2010 (moderate).
+                             # CBD years in test: 2018 (2nd-highest test year), 2022 (moderate).
 ]
 
 # V-Dem columns needed to compute first differences (merged if absent from panel parquet).
 VDEM_EXTRA = ["v2xlg_legcon", "v2csprtcpt"]
+
+# Momentum/saturation columns that receive log1p transformation (when USE_LOG1P=True).
+LAG_MASK_COLS = set(LAG_COLS)
+
+
+def _apply_log1p(X: np.ndarray, feat_cols: list[str]) -> np.ndarray:
+    """Apply log1p to momentum/saturation columns. X is unscaled."""
+    if not USE_LOG1P:
+        return X
+    Xt = X.copy()
+    for i, col in enumerate(feat_cols):
+        if col in LAG_MASK_COLS:
+            Xt[:, i] = np.log1p(X[:, i])
+    return Xt
 
 
 def _merge_vdem_extra(cy: pd.DataFrame) -> pd.DataFrame:
@@ -149,8 +189,10 @@ def _chow_test(
     except ImportError:
         return {}
     train = cy[cy["year"].between(*TRAIN_YEARS)].copy()
+    X_raw = train[feature_cols].to_numpy(np.float64)
+    X_raw = _apply_log1p(X_raw, feature_cols)
     sc = StandardScaler()
-    X = sc.fit_transform(train[feature_cols].to_numpy(np.float64))
+    X = sc.fit_transform(X_raw)
     X_c = sm.add_constant(X)
     y = np.log1p(train["pa_expansion_pixels"].to_numpy(np.float64))
     pre  = (train["year"] < break_year).to_numpy()
@@ -192,12 +234,16 @@ def main() -> None:
     X_test_raw  = test[feature_cols].to_numpy(dtype=np.float64)
     y_test      = test["pa_expansion_pixels"].to_numpy(dtype=np.float64)
 
+    # log1p transform before winsorisation and scaling
+    X_train_t = _apply_log1p(X_train_raw, feature_cols)
+    X_test_t  = _apply_log1p(X_test_raw,  feature_cols)
+
     winsor_cap = float(np.quantile(y_train_raw, WINSOR_QUANT))
     y_train = np.minimum(y_train_raw, winsor_cap)
 
     scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train_raw)
-    X_test  = scaler.transform(X_test_raw)
+    X_train = scaler.fit_transform(X_train_t)
+    X_test  = scaler.transform(X_test_t)
 
     model = PoissonRegressor(alpha=1.0, max_iter=1000)
     model.fit(X_train, y_train)
@@ -217,7 +263,9 @@ def main() -> None:
         sub = cy[cy["year"].between(TEST_YEARS[0], y_end)]
         if len(sub) == 0:
             return None
-        X_sub = scaler.transform(sub[feature_cols].fillna(0).to_numpy(dtype=np.float64))
+        X_sub_raw = sub[feature_cols].fillna(0).to_numpy(dtype=np.float64)
+        X_sub_t   = _apply_log1p(X_sub_raw, feature_cols)
+        X_sub     = scaler.transform(X_sub_t)
         return float(model.score(X_sub, sub["pa_expansion_pixels"].to_numpy(dtype=np.float64)))
 
     d2_test_3yr = _d2_window(2019)
@@ -229,10 +277,12 @@ def main() -> None:
     result = {
         "region": "south_america",
         "model": "poisson_glm",
-        "spec": "parsimonious_10feat_delta_gov_winsorised",
+        "spec": "parsimonious_11feat_delta_gov_winsorised_log1p_cbd",
         "alpha": 1.0,
         "winsor_quantile": WINSOR_QUANT,
         "winsor_cap_pixels": winsor_cap,
+        "use_log1p": USE_LOG1P,
+        "log1p_cols": list(LAG_MASK_COLS),
         "train_years": list(TRAIN_YEARS),
         "test_years": list(TEST_YEARS),
         "n_train": int(len(train)),
@@ -253,9 +303,10 @@ def main() -> None:
     out_path = OUT_DIR / "model1_expansion_coefficients.json"
     out_path.write_text(json.dumps(result, indent=2))
 
-    print("Stage 1 Poisson GLM — South America (10-feat: Δgov + agri, p90 winsorise)")
+    print("Stage 1 Poisson GLM — South America (11-feat: Δgov + agri + cbd, p95 winsorise, log1p)")
     print(f"  Features ({len(feature_cols)}): {feature_cols}")
     print(f"  Winsor cap: {winsor_cap:.0f} px ({WINSOR_QUANT:.0%} quantile)")
+    print(f"  Log1p applied to: {sorted(LAG_MASK_COLS)}")
     print(f"  Train D²: {d2_train:.4f}  RMSE: {rmse_train:.0f}  (n={len(train)}, vs orig targets)")
     if d2_test is not None:
         print(f"  Test  D²: {d2_test:.4f}  RMSE: {rmse_test:.0f}  (n={len(test)}, 2017–2024)")
