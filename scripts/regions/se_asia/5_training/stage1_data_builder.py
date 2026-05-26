@@ -22,10 +22,24 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from scripts.regions.shared.country_raster import resolve_panel_path
-from scripts.regions.shared.stage1_panel import build_country_year_panel, compute_years_to_next_election
+from scripts.regions.shared.stage1_panel import (
+    build_country_year_panel,
+    compute_pre2001_expansion,
+    compute_years_to_next_election,
+    extend_panel_with_wdpa,
+)
 
 TRAIN_YEARS = (2001, 2013)
 PANEL_YEARS = (2001, 2024)
+
+_WDPA_DIR = _ROOT / "data" / "shared"
+WDPA_CSV_PATHS = [
+    _WDPA_DIR / "WDPA_May2026_Public_csv.csv",
+    _WDPA_DIR / "wdpa" / "WDPA_WDOECM_Public_0.csv",
+    _WDPA_DIR / "wdpa" / "WDPA_WDOECM_Public_1.csv",
+    _WDPA_DIR / "wdpa" / "WDPA_WDOECM_Public_2.csv",
+]
+PRE2001_YEAR_RANGE = (1990, 2000)
 
 REGION = "se_asia"
 OUT_PATH = _ROOT / "data" / "se_asia" / "stage1_panel.parquet"
@@ -59,10 +73,12 @@ def attach_political_covariates(cy: pd.DataFrame) -> pd.DataFrame:
     cy["cbd_meeting_year"] = cy["year"].isin(CBD_MEETING_YEARS).astype(int)
 
     shared = _ROOT / "data" / "shared"
-    vdem = _load_csv(shared / "vdem_v15.csv", ["iso3", "year", "v2x_polyarchy", "v2x_corr", "v2cseeorgs"])
+    _vdem_cols = ["iso3", "year", "v2x_polyarchy", "v2x_corr", "v2cseeorgs",
+                  "v2xlg_legcon", "v2csprtcpt"]
+    vdem = _load_csv(shared / "vdem_v15.csv", _vdem_cols)
     if vdem is not None:
         cy = cy.merge(
-            vdem[["iso3", "year", "v2x_polyarchy", "v2x_corr", "v2cseeorgs"]],
+            vdem[[c for c in _vdem_cols if c in vdem.columns]],
             on=["iso3", "year"], how="left",
         )
 
@@ -98,6 +114,18 @@ def main() -> None:
     panel_path = resolve_panel_path(REGION)
     print(f"Building Stage 1 panel from {panel_path}")
     cy = build_country_year_panel(panel_path, REGION, year_range=PANEL_YEARS)
+
+    wdpa_present = [p for p in WDPA_CSV_PATHS if p.exists()]
+    if wdpa_present:
+        print(f"  WDPA files found ({len(wdpa_present)}): extending panel to {PRE2001_YEAR_RANGE}")
+        wdpa_rows = compute_pre2001_expansion(wdpa_present, ISO3_TO_ID, PRE2001_YEAR_RANGE)
+        if not wdpa_rows.empty:
+            n_before = len(cy)
+            cy = extend_panel_with_wdpa(cy, wdpa_rows)
+            print(f"  Pre-2001 rows added: {len(cy) - n_before} ({n_before} → {len(cy)})")
+    else:
+        print(f"  WDPA CSV not found at {_WDPA_DIR} — skipping pre-2001 extension.")
+
     cy = attach_political_covariates(cy)
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     cy.to_parquet(OUT_PATH, index=False)
@@ -106,6 +134,7 @@ def main() -> None:
         "source_panel": str(panel_path),
         "train_years": list(TRAIN_YEARS),
         "panel_years": list(PANEL_YEARS),
+        "pre2001_extension": PRE2001_YEAR_RANGE if wdpa_present else None,
         "n_rows": len(cy),
         "n_countries": int(cy["country_id"].nunique()),
         "columns": list(cy.columns),

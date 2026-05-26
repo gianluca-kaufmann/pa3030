@@ -43,6 +43,7 @@ POLITICAL_COLS = [
     "gdp_per_capita",
     "gdp_growth_lag1",
     "agricultural_land_pct",
+    "forest_area_pct",    # forest area % of land (WDI AG.LND.FRST.ZS)
     "target_30x30",
     "cbd_meeting_year",
     "years_to_next_election",
@@ -61,7 +62,11 @@ def main() -> None:
         )
     cy = pd.read_parquet(PANEL_PATH)
 
-    feature_cols = [c for c in LAG_COLS + POLITICAL_COLS if c in cy.columns]
+    # USA: 1 country × 16 training years = 16 obs. With 16 features the model is
+    # underdetermined even at alpha=10 (numerical overflow, Issue K). Restrict to
+    # momentum/saturation features only — treated as time-series trend extrapolation
+    # in the paper, not cross-country political evidence.
+    feature_cols = [c for c in LAG_COLS if c in cy.columns]
     cy[feature_cols] = cy[feature_cols].fillna(0)
 
     train = cy[cy["year"].between(*TRAIN_YEARS)].copy()
@@ -76,7 +81,10 @@ def main() -> None:
     X_train = scaler.fit_transform(X_train_raw)
     X_test = scaler.transform(X_test_raw)
 
-    model = PoissonRegressor(alpha=0.1, max_iter=1000)
+    # alpha=10 (not 0.1): USA has 1 country × 16 training years = 16 obs for 16 features.
+    # Weak regularisation causes numerical overflow (Issue K). Interpret coefficients
+    # as trend extrapolation only, not cross-country political evidence.
+    model = PoissonRegressor(alpha=10.0, max_iter=1000)
     model.fit(X_train, y_train)
 
     d2_train = _d2(model, X_train, y_train)
@@ -94,7 +102,7 @@ def main() -> None:
     result = {
         "region": "usa",
         "model": "poisson_glm",
-        "alpha": 0.1,
+        "alpha": 10.0,
         "train_years": list(TRAIN_YEARS),
         "test_years": list(TEST_YEARS),
         "n_train": int(len(train)),
