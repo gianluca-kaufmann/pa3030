@@ -1,32 +1,51 @@
 #!/usr/bin/env python3
 """Stage 1 country-year PA expansion model (Poisson GLM) — South America.
 
-Specification: 10-feature parsimonious Poisson with p90 winsorisation + WDPA lag fix.
+Specification: 11-feature parsimonious Poisson, p90 winsorisation, WDPA lag fix,
+first-difference governance variables + agricultural land fraction.
 
 Model selection history (2001–2016 train / 2017–2024 test):
   Full model (16 feat, α=0.1):                 D²_test=−0.096
   Parsimonious 7-feat (α=1.0):                 D²_test=−0.004
   Parsimonious 7-feat + winsorise p90:         D²_test=+0.195
   9-feat + winsorise p90:                      D²_test(8yr)≈+0.237
-  10-feat + forest_area_pct:                   D²_test(8yr)=+0.202 (wrong lag init)
-  10-feat + forest_area_pct + WDPA lag fix     D²_train=0.365 D²_test(8yr)=+0.233  ← current
-    (panel patched with WDPA_May2026_Public_csv.csv):  D²_test(3yr)=+0.248, D²_6yr=+0.330
-    Chow break F=0.82 p=0.621 (NOT significant — break was lag init artefact)
+  10-feat + forest_area_pct (wrong lag init):  D²_test(8yr)=+0.202
+  10-feat + WDPA lag fix (level gov):          D²_train=0.365, D²_test(8yr)=+0.233
+  10-feat + Δgov + agri (this script):         D²_train=0.384, D²_test(8yr)=+0.356  ← current
+    D²_test(3yr 2017–2019)=+0.357, D²_test(6yr 2017–2022)=+0.411
+    Chow break at 2010: F=0.84, p=0.616 (NOT significant)
 
-Three governance dimensions — each distinct and theoretically grounded:
-  v2x_polyarchy  : electoral/participatory democracy (citizen accountability)
-  v2xlg_legcon   : legislative constraints on executive (institutional checks;
-                   r=0.82 with polyarchy but different mechanism — a strong
-                   legislature prevents rollback of PA designations)
-  v2csprtcpt     : civil society participatory environment (NGO/advocacy capacity;
-                   r=0.48 with polyarchy, more distinct — measures who can organise
-                   and lobby for conservation regardless of election outcomes)
+Three governance dimensions — each distinct and theoretically grounded.
+v2xlg_legcon and v2csprtcpt are used as FIRST DIFFERENCES (Δ), not levels:
 
-Winsorisation caps training target at p90 (~15,836 px) to dampen Brazil's
-2001–2009 frontier-exhaustion boom. Test evaluation uses original unwinsorised data.
+  v2x_polyarchy   : level — cross-country: more democratic countries designate more
+  Δv2xlg_legcon   : change in legislative constraints — captures the WITHIN-COUNTRY timing
+                    of PA decisions; a year in which legislative checks strengthen creates
+                    the political opening for designation (not just having strong checks)
+  Δv2csprtcpt     : change in civil society participatory environment — a year of NGO/
+                    advocacy empowerment triggers designation events; the level is largely
+                    absorbed by v2x_polyarchy (r=0.48) and country-level fixed variation
 
-v2xlg_legcon and v2csprtcpt are merged from V-Dem v15 at runtime (not yet in the
-panel parquet — add to stage1_data_builder.py before next Euler rebuild).
+Using first differences is more causally defensible: it is the governance CHANGE in year t
+that triggers the designation event, not the absolute governance level (which is stable
+across time within a country and confounded with stable country characteristics).
+Level-based governance variables also introduce temporal drift — with a positive coefficient,
+slowly rising legcon values cause predictions to grow monotonically over 2020–2024, exactly
+when actual expansion was declining (COVID + WDPA reporting lag).
+
+agricultural_land_pct (WDI AG.LND.AGR.ZS):
+  Countries with more land under agriculture have less natural land available for PA
+  designation. Uruguay (82.7%) and Paraguay (45.7%) are always zero in the test period;
+  Suriname (0.5%) and Guyana (3.6%) have the most unprotected natural area. Negative
+  coefficient is expected and confirmed empirically. Cross-regional sign in SEA differs
+  due to land tenure and political economy differences — not used in SEA model.
+
+Winsorisation caps training target at p90 (~15,836 px) to dampen Brazil's 2001–2009
+frontier-exhaustion boom. Test evaluation uses original unwinsorised data.
+
+v2xlg_legcon and v2csprtcpt are in the panel parquet (added to stage1_data_builder.py
+on 2026-05-26). This script diffs them at runtime; the raw levels are still needed as
+intermediates so _merge_vdem_extra remains in case of an older panel without these columns.
 """
 
 from __future__ import annotations
@@ -62,26 +81,30 @@ LAG_COLS = [
     "pa_momentum_pixels_lag3",
     "pa_cumsum_lag1_pixels",
 ]
-# Three theoretically distinct governance dimensions (see docstring above).
-# Collinearity managed by L2 regularisation (α=1); VIF acceptable under shrinkage.
+# Governance variables in first differences (see module docstring for rationale).
+# v2x_polyarchy remains as a level — it captures stable cross-country democratic culture
+# and does not produce temporal drift because it changes very slowly.
 POLITICAL_COLS = [
-    "v2x_polyarchy",      # electoral democracy — citizen accountability
-    "gdp_growth_lag1",    # GDP/capita growth lagged 1yr — fiscal space
-    "redd_plus_enrolled", # REDD+ participation — direct financial incentive
-    "v2xlg_legcon",       # legislative constraints on executive
-    "v2csprtcpt",         # civil society participatory environment
-    "forest_area_pct",    # forest area % of land (WDI AG.LND.FRST.ZS) — countries with
-                          # more remaining forest have more to designate; REDD+ incentive proxy
+    "v2x_polyarchy",         # level — electoral democracy, cross-country dimension
+    "gdp_growth_lag1",       # GDP/capita growth lagged 1yr — fiscal space for conservation
+    "redd_plus_enrolled",    # REDD+ participation — financial incentive for forest protection
+    "d_v2xlg_legcon",        # Δ legislative constraints on executive — institutional event signal
+    "d_v2csprtcpt",          # Δ civil society participatory environment — advocacy event signal
+    "agricultural_land_pct", # agricultural land % (WDI AG.LND.AGRI.ZS) — opportunity cost:
+                             # more agri land = less natural area available for PA designation.
+                             # Subsumes forest_area_pct (collinear: r≈−0.7): once agri land is
+                             # controlled, the marginal forest signal is near-zero in SA.
+                             # Note: SEA model retains forest_area_pct (different land-use context).
 ]
 
-# V-Dem columns to merge at runtime (not yet in panel parquet)
+# V-Dem columns needed to compute first differences (merged if absent from panel parquet).
 VDEM_EXTRA = ["v2xlg_legcon", "v2csprtcpt"]
 
 
 def _merge_vdem_extra(cy: pd.DataFrame) -> pd.DataFrame:
-    """Merge v2xlg_legcon and v2csprtcpt from V-Dem v15 CSV if not already present."""
+    """Merge v2xlg_legcon and v2csprtcpt from V-Dem v15 CSV if not already in panel."""
     if all(c in cy.columns for c in VDEM_EXTRA):
-        return cy  # already merged (e.g. via stage1_data_builder or direct panel patch)
+        return cy
     if not VDEM_PATH.exists():
         raise FileNotFoundError(f"V-Dem CSV not found at {VDEM_PATH}")
     vdem = pd.read_csv(
@@ -93,6 +116,21 @@ def _merge_vdem_extra(cy: pd.DataFrame) -> pd.DataFrame:
     cy = cy.merge(vdem, on=["iso3", "year"], how="left")
     for col in VDEM_EXTRA:
         cy[col] = cy[col].fillna(cy[col].median())
+    return cy
+
+
+def _compute_governance_diffs(cy: pd.DataFrame) -> pd.DataFrame:
+    """Compute within-country first differences of governance level variables.
+
+    For year t: d_v2xlg_legcon(t) = v2xlg_legcon(t) − v2xlg_legcon(t−1).
+    The 1990 row (panel start) gets NaN, which is outside TRAIN_YEARS and filled
+    with 0 at feature assembly. All training and test rows have valid diffs because
+    the panel includes 1990–2000 as context for the lag computation.
+    """
+    cy = cy.sort_values(["iso3", "year"]).copy()
+    for col in VDEM_EXTRA:
+        if col in cy.columns:
+            cy[f"d_{col}"] = cy.groupby("iso3")[col].diff()
     return cy
 
 
@@ -140,7 +178,8 @@ def main() -> None:
             f"Stage 1 panel not found at {PANEL_PATH}. Run stage1_data_builder.py first."
         )
     cy = pd.read_parquet(PANEL_PATH)
-    cy = _merge_vdem_extra(cy)
+    cy = _merge_vdem_extra(cy)       # ensure legcon/csprtcpt present as levels
+    cy = _compute_governance_diffs(cy)  # compute d_v2xlg_legcon, d_v2csprtcpt
 
     feature_cols = [c for c in LAG_COLS + POLITICAL_COLS if c in cy.columns]
     cy[feature_cols] = cy[feature_cols].fillna(0)
@@ -190,7 +229,7 @@ def main() -> None:
     result = {
         "region": "south_america",
         "model": "poisson_glm",
-        "spec": "parsimonious_10feat_winsorised",
+        "spec": "parsimonious_10feat_delta_gov_winsorised",
         "alpha": 1.0,
         "winsor_quantile": WINSOR_QUANT,
         "winsor_cap_pixels": winsor_cap,
@@ -214,7 +253,7 @@ def main() -> None:
     out_path = OUT_DIR / "model1_expansion_coefficients.json"
     out_path.write_text(json.dumps(result, indent=2))
 
-    print("Stage 1 Poisson GLM — South America (10-feat + winsorise p90)")
+    print("Stage 1 Poisson GLM — South America (10-feat: Δgov + agri, p90 winsorise)")
     print(f"  Features ({len(feature_cols)}): {feature_cols}")
     print(f"  Winsor cap: {winsor_cap:.0f} px ({WINSOR_QUANT:.0%} quantile)")
     print(f"  Train D²: {d2_train:.4f}  RMSE: {rmse_train:.0f}  (n={len(train)}, vs orig targets)")

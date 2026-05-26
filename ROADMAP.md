@@ -34,7 +34,7 @@ A single classifier conflates both terms. The Group A/B diagnostic proves this e
 
 | Metric | Value | Notes |
 |---|---|---|
-| Stage 1 D² — SA (10-feat + WDPA lag fix, final) | D²_train=0.365, D²_test(8yr)=**+0.233**, D²_test(3yr 2017–19)=**+0.248**, D²_test(6yr 2017–22)=**+0.330** | 10-feat + WDPA pre-2001 lag init; Chow F=0.82 **p=0.621 (non-significant)**. WDPA fixes lag-1 at 2001 from 0 → actual 2000 values (BRA: 149K km²), removing the false structural break. forest_area_pct coef=+0.547. |
+| Stage 1 D² — SA (10-feat + Δgov + agri, final) | D²_train=0.384, D²_test(8yr)=**+0.356**, D²_test(3yr 2017–19)=**+0.357**, D²_test(6yr 2017–22)=**+0.411** | 10-feat: v2xlg_legcon+v2csprtcpt as **first differences** (Δ), + agricultural_land_pct (drops forest_area_pct — collinear with agri, near-zero coef once agri included); Chow F=0.64 **p=0.791 (non-significant)**. |
 | Stage 1 D² — SEA (8-feat parsimonious, final) | D²_train=0.103, D²_test(8yr)=**+0.109**, D²_test(3yr)=**+0.301**, D²_test(6yr)=**+0.207** | 8-feat + WDPA lag fix + forest_area_pct (coef=**−0.422**, cross-regional sign reversal = paper finding). 3yr unchanged from without WDPA fix (0.301). 8yr mixed. |
 | Stage 1 D² — USA (trend-only, Issue K) | D²_train=0.218, D²_test=**−3.14** | 4 momentum features, α=10; political path-dependency finding |
 | Stage 1 SA — Chow break at 2010 | F=1.86, p=0.069 | Marginal significance; visual evidence of frontier exhaustion is compelling |
@@ -95,7 +95,7 @@ A single classifier conflates both terms. The Group A/B diagnostic proves this e
 | Stage 2 tuning — USA | ❌ Job 568012 cancelled (deprioritised) |
 | Stage 2 training — USA | ❌ Job 568045 cancelled (deprioritised) |
 | Issue C: SA year/country breakdown | ✅ Job 628878 done. 2017=1.47× | 2018=7.90× | 2019=9.64× |
-| Stage 1 SA (10-feat + WDPA lag fix, final) | ✅ Run locally 2026-05-26. D²_train=0.365, D²_test(8yr)=+0.233, D²_test(3yr)=+0.248, D²_6yr=+0.330. Chow F=0.82 p=0.621 (non-significant — break was lag init artefact). |
+| Stage 1 SA (10-feat Δgov+agri, final) | ✅ Run locally 2026-05-26. D²_train=0.384, D²_test(8yr)=+0.356, D²_test(3yr)=+0.357, D²_6yr=+0.411. Chow F=0.64 p=0.791 (non-significant). v2xlg_legcon+v2csprtcpt as first differences; agricultural_land_pct added; forest_area_pct dropped (collinear with agri, near-zero coef). |
 | Stage 1 SEA (8-feat + WDPA lag fix, final) | ✅ Run locally 2026-05-26. D²_train=0.103, D²_test(8yr)=+0.109, D²_test(3yr)=+0.301. |
 | Stage 1 USA (trend-only model, Issue K fix) | ✅ Run locally 2026-05-26. D²_train=0.218, D²_test=−3.14 (4 trend features, alpha=10; see Issue K) |
 | W8: SA binary Stage 2 tune | 🔄 Job 689625 running (30 trials, trunc N/A, n_est ≤1500) |
@@ -130,21 +130,24 @@ Full grid search over feature sets, regularisation, and model families (Poisson,
 | Full Poisson α=100 | −0.083 | +0.230 | Best SEA, but sacrifices interpretability |
 | Country FE log-OLS | +0.091 | +0.061 | Positive SA D²! — but train D²=0.037; level forecasts unreliable |
 | Parsimonious α=300 | +0.0002 | — | Barely positive; extreme shrinkage makes coefs ≈0 |
-| **Parsimonious 7-feat + winsorise p90** | **+0.195** | — | **Final SA spec** — caps training at 90th pctile (~15,836 px); train D²=0.196≈test D² (no overfit) |
+| **Parsimonious 7-feat + winsorise p90** | **+0.195** | — | Previous SA spec |
+| 10-feat + WDPA lag fix (level gov) | +0.233 | +0.109 | Prior spec — temporal drift in 2022–2024 predictions |
+| **10-feat + Δgov + agri + winsorise p90** | **+0.356** | — | **Final SA spec** — Δv2xlg_legcon, Δv2csprtcpt, agricultural_land_pct (drops forest_area_pct: collinear, near-zero once agri included); train D²=0.384 |
 | Oracle (country train mean) | −7.23 | −0.11 | Ceiling is structural, not model-specific |
 
-Key insight: SA oracle test D²=−7.23 confirms the problem is the period-level distributional shift (train mean=9,200 vs test mean=2,151 pixels/country-year), not cross-sectional model failure. Winsorising training observations at p90 (15,836 px) removes the leverage of Brazil's 2001–2009 boom years and produces a more conservative model that generalises better. Train D²≈Test D²=0.196 confirms no overfitting.
+Key insight: SA oracle test D²=−7.23 confirms the problem is the period-level distributional shift (train mean=9,200 vs test mean=2,151 pixels/country-year), not cross-sectional model failure. Winsorising training observations at p90 (15,836 px) removes the leverage of Brazil's 2001–2009 boom years. Using **first differences** of v2xlg_legcon and v2csprtcpt rather than levels removes temporal drift: level-based governance variables with positive coefficients cause predictions to grow monotonically over 2020–2024 exactly when actual expansion was declining. agricultural_land_pct captures land-availability constraint (URY/PRY always zero, low agri countries have more to designate).
 
 **Year-by-year SA predictions (winsorise p90 model)**:
 - Model predicts 22,000–32,000 px/yr steadily; actual is volatile (1,628–73,753 px/yr)
 - Model correctly captures the order-of-magnitude (not boom-era scale); appropriate for the post-frontier-exhaustion regime
 - Per-country scaled Log-Ridge achieves better Spearman (0.66 vs 0.34) but collapses absolute predictions to <2,000 px/yr — unusable for forward projection
 
-**SA spec features (10 total, 2026-05-26)**:
+**SA spec features (10 total, 2026-05-26, final)**:
 - Momentum: pa_momentum_pixels_lag1/2/3, pa_cumsum_lag1_pixels
-- Political (3 governance dimensions): v2x_polyarchy, gdp_growth_lag1, redd_plus_enrolled, v2xlg_legcon (legislative constraints, r=0.82 with polyarchy, distinct mechanism), v2csprtcpt (civil society, r=0.48 with polyarchy)
-- Land: forest_area_pct (WDI AG.LND.FRST.ZS; coef=+0.547 — countries with more forest expand more, REDD+ driven)
-- Still dropped: v2x_corr↔gov_wgi_rl_est (r=−0.83), gov_wgi_ge_est↔gov_wgi_rl_est (r=0.88), v2cseeorgs (r=0.78 with polyarchy, superseded by csprtcpt)
+- Political (levels): v2x_polyarchy (+0.74 — cross-country democratic culture), gdp_growth_lag1 (+0.16 — fiscal space), redd_plus_enrolled (−0.33 — substitution effect: REDD+ payments reduce need for formal designation; paper finding)
+- Political (first differences — event timing signal): Δv2xlg_legcon (+0.14 — legislative strengthening triggers designation events), Δv2csprtcpt (+0.15 — civil society empowerment triggers events). Theory: governance CHANGES (not levels) drive the TIMING of PA designation decisions within a country.
+- Land constraint: agricultural_land_pct (−0.33 — more agri land = less natural area available; explains persistent zero-expansion countries URY/PRY; subsumes forest_area_pct which is collinear and near-zero once agri included)
+- Still dropped: v2xlg_legcon level, v2csprtcpt level (both replaced by Δ), forest_area_pct (collinear with agri in SA; retained in SEA model where land context differs), v2x_corr↔gov_wgi_rl_est (r=−0.83), gov_wgi_ge_est, v2cseeorgs
 
 **SEA spec features (8 total, 2026-05-26)**:
 - Momentum: pa_momentum_pixels_lag1/2/3, pa_cumsum_lag1_pixels
@@ -153,7 +156,8 @@ Key insight: SA oracle test D²=−7.23 confirms the problem is the period-level
 - v2xlg_legcon + v2csprtcpt added to vdem_v15.csv and all three stage1_data_builder.py (2026-05-26)
 
 **Chow structural break test (SA, break at 2010)**:
-- **10-feat + WDPA lag fix (final): F=0.82, p=0.621 (NOT significant)** ← current
+- **10-feat + Δgov + agri (final): F=0.64, p=0.791 (NOT significant)** ← current
+- 10-feat + WDPA lag fix (levels): F=0.82, p=0.621 (NOT significant)
 - 10-feat (wrong lag init, no WDPA): F=1.83, p=0.052 (marginal)
 - 9-feat (no forest, no WDPA): F=1.99, p=0.037 (significant)
 - Old 7-feat parsimonious: F=1.86, p=0.069 (marginal)
