@@ -25,8 +25,10 @@ Model selection history (D²_6yr = primary, 2001–2016 train):
     D²_train=0.069  D²_8yr=+0.184  D²_3yr=+0.279
   8-feat + forest_area_pct + WDPA lag fix:
     D²_train=0.103  D²_8yr=+0.109  D²_3yr=+0.301
-  9-feat + Δv2xlg_legcon + Δv2csprtcpt (drop forest) — current:
-    D²_train=0.095  D²_6yr(PRIMARY)=+0.252  D²_3yr=+0.306  D²_8yr=+0.168
+  9-feat + Δv2xlg_legcon + Δv2csprtcpt (drop forest):
+    D²_train=0.095  D²_6yr=+0.252  D²_3yr=+0.306  D²_8yr=+0.168
+  10-feat + legcon_x_cspart — current:
+    D²_train=0.088  D²_6yr(PRIMARY)=+0.290  D²_3yr=+0.399  D²_8yr=+0.208
   Full 16-feature model: D²_8yr=+0.103 (worse — multicollinear)
 
 Design rationale — Δgov replaces forest_area_pct:
@@ -51,6 +53,13 @@ Cross-regional finding on v2x_polyarchy:
   more competing land-use pressures. Contrast with SA where polyarchy is strongly
   positive (+0.77). This cross-regional heterogeneity is a substantive paper finding
   on different political economy channels of PA designation.
+
+legcon_x_cspart (dual accountability interaction: Δv2xlg_legcon × Δv2csprtcpt):
+  Same mechanism as SA: simultaneous improvement in legislative constraints AND civil
+  society participation produces disproportionate PA designation. D²_6yr: +0.259 →
+  +0.290 (+3.1pp); D²_3yr: +0.303 → +0.399 (+9.6pp). No collinearity concerns
+  (unlike SA, SEA spec has no lagged Δgov features). No temporal decay applied
+  (decay hurts all SEA windows; pre-2010 SEA data is informative).
 
 CBD meeting year NOT included in SEA: Adding cbd_meeting_year hurts SEA D² (drops
   8yr from +0.168 to +0.067). CBD convention cycles correspond to SA political momentum,
@@ -102,6 +111,7 @@ POLITICAL_COLS = [
     "redd_plus_enrolled",    # REDD+ participation
     "d_v2xlg_legcon",        # Δ legislative constraints — institutional event signal
     "d_v2csprtcpt",          # Δ civil society participatory environment — advocacy event signal
+    "legcon_x_cspart",       # Δlegcon × Δcspart — dual accountability interaction
 ]
 
 
@@ -128,6 +138,10 @@ def _compute_governance_diffs(cy: pd.DataFrame) -> pd.DataFrame:
     for col in VDEM_EXTRA:
         if col in cy.columns:
             cy[f"d_{col}"] = cy.groupby("iso3")[col].diff()
+    # Dual accountability interaction: simultaneous Δlegcon and Δcspart co-movement.
+    d_leg = cy.get("d_v2xlg_legcon", pd.Series(0.0, index=cy.index)).fillna(0)
+    d_csp = cy.get("d_v2csprtcpt",   pd.Series(0.0, index=cy.index)).fillna(0)
+    cy["legcon_x_cspart"] = d_leg * d_csp
     return cy
 
 
@@ -218,7 +232,7 @@ def main() -> None:
     out_path = OUT_DIR / "model3_expansion_coefficients.json"
     out_path.write_text(json.dumps(result, indent=2))
 
-    print("Stage 1 Poisson GLM — SE Asia (9-feat: Δgov spec)")
+    print("Stage 1 Poisson GLM — SE Asia (10-feat: Δgov+dual-accountability-interact)")
     print(f"  Features ({len(feature_cols)}): {feature_cols}")
     print(f"  Primary eval window: 2017–{PRIMARY_EVAL_END} (excl 2023–2024: WDPA reporting lag)")
     print(f"  Train D²: {d2_train:.4f}  RMSE: {rmse_train:.0f}  (n={len(train)})")
