@@ -120,7 +120,7 @@ def compute_pre2001_expansion(
         wdpa_csv_paths = [wdpa_csv_paths]
 
     needed_cols = ["ISO3", "STATUS", "STATUS_YR", "GIS_AREA"]
-    optional_cols = ["REP_AREA"]
+    optional_cols = ["REP_AREA", "GIS_M_AREA", "REP_M_AREA"]
 
     parts: list[pd.DataFrame] = []
     for path in wdpa_csv_paths:
@@ -144,15 +144,14 @@ def compute_pre2001_expansion(
 
     raw = pd.concat(parts, ignore_index=True)
 
-    # Resolve area: prefer GIS_AREA; fall back to REP_AREA for point records.
-    if "REP_AREA" in raw.columns:
-        raw["area_km2"] = np.where(
-            raw["GIS_AREA"].fillna(0) > 0,
-            raw["GIS_AREA"].fillna(0),
-            raw["REP_AREA"].fillna(0),
-        )
-    else:
-        raw["area_km2"] = raw["GIS_AREA"].fillna(0)
+    # Resolve terrestrial area only: GIS_AREA - GIS_M_AREA (marine portion).
+    # This excludes purely marine PAs (e.g. Galápagos Marine Reserve, IDN marine KKs)
+    # so pre-2001 values are on the same terrestrial footing as the 2001+ pixel counts.
+    gis_marine = raw["GIS_M_AREA"].fillna(0) if "GIS_M_AREA" in raw.columns else 0
+    rep_marine = raw["REP_M_AREA"].fillna(0) if "REP_M_AREA" in raw.columns else 0
+    gis_terr = (raw["GIS_AREA"].fillna(0) - gis_marine).clip(lower=0)
+    rep_terr = (raw["REP_AREA"].fillna(0) - rep_marine).clip(lower=0) if "REP_AREA" in raw.columns else 0
+    raw["area_km2"] = np.where(gis_terr > 0, gis_terr, rep_terr)
 
     # Filter to designated PAs with known STATUS_YR and relevant countries/years.
     y_min, y_max = year_range
