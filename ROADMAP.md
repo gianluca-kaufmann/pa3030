@@ -105,7 +105,7 @@ A single classifier conflates both terms. The Group A/B diagnostic proves this e
 | SA LambdaRank Stage 2 retrain | 🔄 Job 689640 (afterok:689639) |
 | USA feature engineering (Issue H: saturation + trend features) | ❌ Not yet run — panel is pre-feature-engineering (May 22) |
 | SE Asia feature engineering (Issue H: saturation + trend features) | ❌ Blocked on scp of patched TIFs to Euler (done locally — see Issue L) |
-| SA WDPA GeoTIF patch (Issue L: 2023+2024 missing designations) | ✅ Patched locally 2026-05-27. +2,347 px (2023) +103 px (2024). Scp after 689640 completes, then rebuild SA panel + re-run Stage 1 + re-queue Stage 2. |
+| SA WDPA GeoTIF patch (Issue L: 2023+2024 missing designations) | ✅ Patched locally + scp to Euler done 2026-05-27. +2,347 px (2023) +103 px (2024). Next: SA FE re-run → stage1_data_builder → model1_expansion local → Stage 2 re-queue (after 689640 completes). |
 | SEA WDPA GeoTIF patch (Issue L) | ✅ Patched locally 2026-05-27. +1,127 px (2023) +188 px (2024). Scp to Euler ✅ done — SEA FE re-run now unblocked. |
 | Forward prediction pipeline | ✅ Bugs F1+F2 fixed; probability output is uncalibrated (Issue G) |
 
@@ -379,12 +379,7 @@ Three improvements to investigate after W8 binary result is in hand. Priority or
 4. ✅ **Stage 1 SA/USA/SEA** — UPDATED 2026-05-27 (marine fix). SA D²_7yr=+0.368 (PRIMARY, 2017–23), D²_8yr=+0.343; SEA D²_6yr=+0.259 (PRIMARY, 2017–22), D²_8yr=+0.178; USA D²_test=−3.14. These are terrestrial-only pre-2001 lag numbers (GIS_AREA−GIS_M_AREA). ⚠️ Will update again after Euler FE re-runs fix 2001+ pixel data.
 5. **W8 + SA LambdaRank re-train decision** (after jobs 689627 and 689640 complete): Compare binary Lift@1% vs LambdaRank Lift@1% on SA test set. If binary >> LambdaRank → binary becomes primary (W8 wins); if similar → LambdaRank primary with ecoregion investigation (W9a). Record numbers here and update Settled Decisions.
 6. ✅ **Issue L — WDPA GeoTIF patch for SEA** — done locally 2026-05-27. Scp to Euler ✅ done. SEA FE re-run now unblocked.
-   **Issue L — WDPA GeoTIF patch for SA** — done locally 2026-05-27. **Action needed**: scp AFTER 689640 completes (chain reads panel, not TIFs — no conflict). Then SA FE re-run → stage1_data_builder → model1_expansion local → Stage 2 re-tune+retrain.
-   ```
-   scp data/south_america/ready/WDPA/WDPA_SA_1km_2023.tif \
-       data/south_america/ready/WDPA/WDPA_SA_1km_2024.tif \
-       euler:$SCRATCH/data/south_america/ready/WDPA/
-   ```
+   **Issue L — WDPA GeoTIF patch for SA** — ✅ patched locally + scp to Euler done 2026-05-27. Next: SA FE re-run (after 689640 completes) → stage1_data_builder → model1_expansion local → Stage 2 re-tune+retrain.
 7. **Euler re-run sequence** (blocked until 689640 completes for SA):
    - **SEA** (TIFs on Euler ✅): submit SEA FE SLURM job → download SEA stage1_panel.parquet → re-run `model3_expansion.py` locally → re-queue SEA Stage 2 tune+retrain. SEA D²_6yr=+0.259 will update.
    - **SA** (after scp): re-run SA FE SLURM job → `stage1_data_builder.py` → download → `model1_expansion.py` locally → re-queue SA Stage 2 tune+retrain. SA D²_7yr=+0.368 will update.
