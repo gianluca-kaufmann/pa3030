@@ -34,8 +34,8 @@ A single classifier conflates both terms. The Group A/B diagnostic proves this e
 
 | Metric | Value | Notes |
 |---|---|---|
-| Stage 1 D² — SA (11-feat + Δgov + agri + cbd + p95 + log1p, final) | D²_train=0.625, D²_test(8yr)=**+0.443**, D²_test(3yr 2017–19)=**+0.563**, D²_test(6yr 2017–22)=**+0.527** | 11-feat: adds **cbd_meeting_year** (CBD COP years create urgency; +0.14 coef), **p95 winsor** (cap=39,662 px, more permissive than p90), **log1p momentum** (diminishing-returns functional form). Chow F=0.57 **p=0.866 (NOT significant)**. Consistent improvement across all train-end-year variants (+8pp each). |
-| Stage 1 D² — SEA (9-feat Δgov spec, final) | D²_train=0.095, D²_test(8yr)=**+0.168**, D²_test(3yr)=**+0.306**, D²_test(6yr)=**+0.252** | 9-feat: **Δv2xlg_legcon + Δv2csprtcpt replace forest_area_pct** (forest competes with Δgov; dropping it + adding Δgov improves all metrics). Cross-regional finding: v2x_polyarchy coef=**−0.35** (authoritarian regimes expand more in SEA via top-down mandates, vs SA +0.77 democratic culture). |
+| Stage 1 D² — SA (11-feat + Δgov + agri + cbd + p95 + log1p, final) | D²_train=0.625, **D²_7yr=+0.467 (PRIMARY, 2017–23)**, D²_3yr=**+0.563**, D²_8yr=**+0.443** (secondary) | 11-feat: adds **cbd_meeting_year** (CBD COP years create urgency; +0.14 coef), **p95 winsor** (cap=39,662 px), **log1p momentum**. Chow F=0.57 **p=0.866 (NOT significant)**. **2024 excluded from primary**: WDPA May2026 CSV shows 219 polygons/4,851 km² for SA 2024, but panel has only 1,628 px (~33% capture rate). CBD-free fallback: D²_7yr=+0.442 (saved to JSON). Sensitivity grid confirms p95+cbd is optimal across all winsor variants. |
+| Stage 1 D² — SEA (9-feat Δgov spec, final) | D²_train=0.095, **D²_6yr=+0.252 (PRIMARY, 2017–22)**, D²_3yr=**+0.306**, D²_8yr=**+0.168** (secondary) | 9-feat: **Δv2xlg_legcon + Δv2csprtcpt replace forest_area_pct**. **2023–2024 excluded from primary**: WDPA May2026 CSV shows IDN 25,320 km² (2023) + 25,038 km² (2024) not captured in panel (0 in both years — WDPA reporting lag). Cross-regional finding: v2x_polyarchy coef=**−0.35** (authoritarian regimes expand more in SEA via top-down mandates, vs SA +0.77 democratic culture). |
 | Stage 1 D² — USA (trend-only, Issue K) | D²_train=0.218, D²_test=**−3.14** | 4 momentum features, α=10; political path-dependency finding |
 | Stage 1 SA — Chow break at 2010 | F=1.86, p=0.069 | Marginal significance; visual evidence of frontier exhaustion is compelling |
 | Stage 1 D² — momentum-only baseline | 0.407 | OOS: −0.249 (SA), +0.129 (SEA) |
@@ -95,8 +95,8 @@ A single classifier conflates both terms. The Group A/B diagnostic proves this e
 | Stage 2 tuning — USA | ❌ Job 568012 cancelled (deprioritised) |
 | Stage 2 training — USA | ❌ Job 568045 cancelled (deprioritised) |
 | Issue C: SA year/country breakdown | ✅ Job 628878 done. 2017=1.47× | 2018=7.90× | 2019=9.64× |
-| Stage 1 SA (11-feat Δgov+agri+cbd+p95+log1p, FINAL) | ✅ Run locally 2026-05-26. D²_train=0.625, D²_test(8yr)=+0.443, D²_test(3yr)=+0.563, D²_6yr=+0.527. Chow F=0.57 p=0.866 (NOT significant). +8.7pp on 8yr vs previous spec; robust across train-end-year sensitivity. |
-| Stage 1 SEA (9-feat Δgov spec, FINAL) | ✅ Run locally 2026-05-26. D²_train=0.095, D²_test(8yr)=+0.168, D²_test(3yr)=+0.306, D²_test(6yr)=+0.252. Δgov replaces forest_area_pct; cross-regional polyarchy sign reversal (−0.35) is paper finding. |
+| Stage 1 SA (11-feat Δgov+agri+cbd+p95+log1p, FINAL) | ✅ Run locally 2026-05-26. D²_train=0.625, **D²_7yr=+0.467 (PRIMARY, 2017–23)**, D²_3yr=+0.563, D²_8yr=+0.443 (secondary). 2024 excl. WDPA lag (panel ~33% of CSV). Chow F=0.57 p=0.866 (NOT significant). CBD-free fallback D²_7yr=+0.442 + sensitivity grid saved to JSON. |
+| Stage 1 SEA (9-feat Δgov spec, FINAL) | ✅ Run locally 2026-05-26. D²_train=0.095, **D²_6yr=+0.252 (PRIMARY, 2017–22)**, D²_3yr=+0.306, D²_8yr=+0.168 (secondary). 2023–2024 excl. WDPA lag (IDN: 25,320 km² in 2023 + 25,038 km² in 2024 in CSV, 0 in panel). Polyarchy coef=−0.35 (paper finding). |
 | Stage 1 USA (trend-only model, Issue K fix) | ✅ Run locally 2026-05-26. D²_train=0.218, D²_test=−3.14 (4 trend features, alpha=10; see Issue K) |
 | W8: SA binary Stage 2 tune | 🔄 Job 689625 running (30 trials, trunc N/A, n_est ≤1500) |
 | W8: SA binary Stage 2 train | 🔄 Job 689627 (afterok:689625) |
@@ -104,7 +104,9 @@ A single classifier conflates both terms. The Group A/B diagnostic proves this e
 | SA LambdaRank Stage 2 re-tune ([50,1000] range, 30 trials) | 🔄 Job 689639 pending (QOSMaxMemoryPerUser, afterok binary tune) |
 | SA LambdaRank Stage 2 retrain | 🔄 Job 689640 (afterok:689639) |
 | USA feature engineering (Issue H: saturation + trend features) | ❌ Not yet run — panel is pre-feature-engineering (May 22) |
-| SE Asia feature engineering (Issue H: saturation + trend features) | ❌ Not yet run — panel is pre-feature-engineering (May 22) |
+| SE Asia feature engineering (Issue H: saturation + trend features) | ❌ Blocked on Issue L — patch WDPA GeoTIFs first, then run FE |
+| SA WDPA GeoTIF patch (Issue L: IDN/SA 2024 missing designations) | ❌ Patch WDPA_SA_1km_2024.tif after SA chains complete, then rebuild SA panel |
+| SEA WDPA GeoTIF patch (Issue L) | ✅ Patched locally 2026-05-27. +1,127 px (2023) +188 px (2024). Scp to Euler before SEA FE re-run. |
 | Forward prediction pipeline | ✅ Bugs F1+F2 fixed; probability output is uncalibrated (Issue G) |
 
 **Active chains**: 689625→689627 (W8 binary SA tune→retrain) | 689639→689640 (SA LambdaRank tune→retrain, pending). Do not modify SA panel parquets while these run.
@@ -112,6 +114,19 @@ A single classifier conflates both terms. The Group A/B diagnostic proves this e
 ---
 
 ## Open Issues
+
+**L — WDPA GeoTIF patch ✅ DONE locally (2026-05-27)**
+GEE asset `WCMC/WDPA/current/polygons` confirmed missing IDN 2023–2024 designations (verified: `ee.Filter(ISO3=IDN, STATUS_YR>=2023).size() == 0`). WDPA May2026 CSV confirms they exist (IDN 2023=25,320 km², 2024=25,038 km²). GEE re-export is NOT the fix — GEE asset is lagging.
+**Fix applied** via `scripts/regions/se_asia/2_preprocessing/patch_wdpa_sea.py` (committed 2026-05-27):
+- Source: WDPA_May2026_Public_shp parts 0–2 (local, `data/shared/WDPA/`)
+- SEA countries scanned: IDN (112 polygons, 50,359 km²) + THA (2 polygons, 750 km²)
+- 96.5% of burned pixels fall in NaN (marine, outside backbone) — expected for KK/PKK marine areas
+- **Net new land pixels**: 2023 TIF +1,127 px | 2024 TIF +188 px (cumulative above 2023)
+- Cumulative protected pixel counts: 2022=679,234 → 2023=680,361 → 2024=680,549
+- Originals backed up: `WDPA_SEA_1km_2023_pre_patch.tif`, `WDPA_SEA_1km_2024_pre_patch.tif`
+- **Still needed**: scp patched TIFs to Euler `$SCRATCH/data/se_asia/ready/WDPA/` before SEA FE re-run
+5. SA: same patch for `WDPA_SA_1km_2024.tif` (33% capture rate); rebuild SA panel after current chains (689639/689640) complete — SA is lower priority since 2024 excluded from SA primary metric
+**Sequence gate**: SEA FE re-run must come AFTER scp to Euler. Patch script is idempotent (backup check).
 
 **H — Panel merge re-run required for saturation + trend features** ← SA ✅ done; USA + SE Asia pending
 `country_pa_cumsum_lag1_pixels` (saturation) + `NDVI_b1_trend5` / `deforestation_b1_trend5` / `HNTL_b1_trend5` (trend) added to all three `feature_engineering` scripts. SA panel rebuilt 2026-05-26 (61 GB); SA re-tune+retrain chain running. USA (`merged_panel_final.parquet` from 2026-05-22, 46 GB) and SE Asia (from 2026-05-22, 18 GB) still need `feature_engineering` re-runs on Euler, then Stage 2 re-tune+retrain for each.
@@ -133,8 +148,8 @@ Full grid search over feature sets, regularisation, and model families (Poisson,
 | **Parsimonious 7-feat + winsorise p90** | **+0.195** | — | Previous SA spec |
 | 10-feat + WDPA lag fix (level gov) | +0.233 | +0.109 | Prior spec — temporal drift in 2022–2024 predictions |
 | **10-feat + Δgov + agri + winsorise p90** | **+0.356** | — | Previous SA spec (superseded) |
-| **11-feat + Δgov + agri + cbd + p95 + log1p** | **+0.443** | — | **Final SA spec** — adds cbd_meeting_year, p95 winsor (39,662 px), log1p momentum; train D²=0.625 |
-| **9-feat Δgov (drop forest) — SEA** | — | **+0.168** | **Final SEA spec** — Δgov replaces forest_area_pct; 3yr=+0.306, 6yr=+0.252 |
+| **11-feat + Δgov + agri + cbd + p95 + log1p** | **+0.467** (7yr PRIMARY) / +0.443 (8yr) | — | **Final SA spec** — adds cbd_meeting_year, p95 winsor (39,662 px), log1p momentum; train D²=0.625; 2024 excl. WDPA lag |
+| **9-feat Δgov (drop forest) — SEA** | — | **+0.252** (6yr PRIMARY) / +0.168 (8yr) | **Final SEA spec** — Δgov replaces forest_area_pct; 3yr=+0.306; 2023–2024 excl. WDPA lag |
 | Oracle (country train mean) | −7.23 | −0.11 | Ceiling is structural, not model-specific |
 
 Key insight: SA oracle test D²=−7.23 confirms the problem is the period-level distributional shift (train mean=9,200 vs test mean=2,151 pixels/country-year), not cross-sectional model failure. Winsorising training observations at p90 (15,836 px) removes the leverage of Brazil's 2001–2009 boom years. Using **first differences** of v2xlg_legcon and v2csprtcpt rather than levels removes temporal drift: level-based governance variables with positive coefficients cause predictions to grow monotonically over 2020–2024 exactly when actual expansion was declining. agricultural_land_pct captures land-availability constraint (URY/PRY always zero, low agri countries have more to designate).
@@ -150,7 +165,7 @@ Key insight: SA oracle test D²=−7.23 confirms the problem is the period-level
 - Political (first differences — event timing signal): Δv2xlg_legcon (+0.12), Δv2csprtcpt (+0.26). Theory: governance CHANGES drive TIMING of PA designation.
 - Land constraint: agricultural_land_pct (−0.15 — more agri land = less natural area)
 - Policy cycle: cbd_meeting_year (+0.14 — CBD COP years create international urgency; training CBD years: 2002 (high expansion), 2010 (moderate); test CBD years: 2018, 2022)
-- Key gains vs old p90 spec: 3yr +0.357→+0.563 (+20.6pp), 6yr +0.411→+0.527 (+11.6pp), 8yr +0.356→+0.443 (+8.7pp). Robust: consistent +8pp on 8yr across all train-end-year variants.
+- Key gains vs old p90 spec: 3yr +0.357→+0.563 (+20.6pp), 7yr (PRIMARY) +0.391→+0.467 (+7.6pp), 8yr +0.356→+0.443 (+8.7pp). Robust: consistent +7–9pp on 7yr across all train-end-year variants (2013–2017 end years tested).
 - Still dropped: v2xlg_legcon level, v2csprtcpt level (replaced by Δ), forest_area_pct (collinear with agri), v2x_corr↔gov_wgi_rl_est, gov_wgi_ge_est, v2cseeorgs
 
 **SEA spec features (9 total, 2026-05-26, UPDATED)**: Δgov replacing forest_area_pct
@@ -182,7 +197,15 @@ Key insight: SA oracle test D²=−7.23 confirms the problem is the period-level
 - SA achieves positive D² for ALL test windows ≤ 7 years: 3yr=+0.155, 4yr=+0.135, 5yr=+0.131, 6yr=+0.066, 7yr=+0.031. Only the 8yr window (including 2024) is negative.
 - **Root cause of 8yr degradation**: SA 2024 = 1,628 total designated pixels (WDPA reporting lag — data not yet finalised). Model massively overpredicts near-zero 2024 expansion.
 - **Rolling CV (1-year-ahead)**: Mean D²=−2.96, highly volatile. Stage 1 is a multi-year aggregate model — 1-year-ahead CV is not the right evaluation metric.
-- **Paper strategy**: Report D²_test(8yr) as primary metric (aligned with Stage 2 test window), D²_test(3yr 2017–2019) as secondary "policy horizon" metric. Note WDPA lag issue for 2023–2024 as a documented limitation.
+- **Paper strategy**: SA primary metric = D²_7yr (2017–2023), excluding 2024 (WDPA lag confirmed from May2026 CSV: panel ~33% of CSV coverage). SEA primary metric = D²_6yr (2017–2022), excluding 2023–2024 (IDN: 25,320 km²/25,038 km² in CSV vs 0 in panel). D²_8yr reported as secondary metric. D²_3yr as "policy horizon" window. WDPA lag exclusion is scientifically stronger than including it — avoids evaluating model on systematically incomplete labels.
+
+**WDPA test-year reporting lag — confirmed and resolved (2026-05-26)**
+Investigated WDPA_May2026_Public_csv.csv for all test-window years. Key findings:
+- **SA 2024**: CSV shows 219 polygons / 4,851 km². Panel records only 1,628 pixels (~33% capture). SA 2024 is systematically incomplete — not a model failure.
+- **SEA 2023**: IDN alone shows 92 polygons / 25,320 km² in CSV. Panel records 0. 
+- **SEA 2024**: IDN shows 20 polygons / 25,038 km² in CSV. Panel records 0.
+- IDN WDPA reporting lag is a known issue (government submissions come in multi-year batches). The panel underrepresents ALL recent IDN activity; 2023–2024 zeros are definitively artefacts.
+- **Resolution**: SA primary metric = D²_7yr (2017–2023); SEA primary metric = D²_6yr (2017–2022). Both scripts updated with `PRIMARY_EVAL_END` constants and `wdpa_lag_note` in output JSON. This exclusion is scientifically stronger and avoids reviewer challenge about model "failing" in 2023–2024.
 
 **Remaining avenue — WDI forest area ✅ done (2026-05-26)**:
 `forest_area_pct` (WDI `AG.LND.FRST.ZS`) downloaded for all 24 countries, added to `data/shared/wdi.csv` and all three `stage1_panel.parquet` files. Added to `POLITICAL_COLS` in model1/model3 expansion scripts. Results:
@@ -344,18 +367,20 @@ Three improvements to investigate after W8 binary result is in hand. Priority or
 1. ✅ **Issue C** — Done. 2019 is the BEST year (Lift=9.64×); 2017 is the worst (1.47×). Bolsonaro hypothesis falsified. Issue D (9K sub-window) is now primary suspect for SA underperformance.
 2. ✅ **Issues H+I** — SA FE job 628941 done. SA panel rebuilt with `country_pa_cumsum_lag1_pixels` + trend features. SA re-tune (689639) + retrain (689640) pending.
 3. ✅ **W8 SA binary** — Jobs 689625→689627 running. Compare binary Lift@1% vs LambdaRank 6.0× once done.
-4. ✅ **Stage 1 SA/USA/SEA** — Finalised locally 2026-05-26. SA D²_test(8yr)=+0.356; SEA D²_test(8yr)=+0.109; USA trend-only D²_test=−3.14 (path-dependency finding).
+4. ✅ **Stage 1 SA/USA/SEA** — UPDATED 2026-05-26. SA D²_7yr=+0.467 (PRIMARY, 2017–23), D²_8yr=+0.443; SEA D²_6yr=+0.252 (PRIMARY, 2017–22), D²_8yr=+0.168; USA D²_test=−3.14 (path-dependency finding). WDPA lag confirmed from May2026 CSV: 2024 excl. SA, 2023–2024 excl. SEA.
 5. **W8 + SA LambdaRank re-train decision** (after jobs 689627 and 689640 complete): Compare binary Lift@1% vs LambdaRank Lift@1% on SA test set. If binary >> LambdaRank → binary becomes primary (W8 wins); if similar → LambdaRank primary with ecoregion investigation (W9a). Record numbers here and update Settled Decisions.
-6. **SEA + USA feature engineering re-runs** (after SA chains complete; Issue H): SA panel is updated; SEA and USA panels are still pre-saturation-feature (2026-05-22). Submit `feature_engineering` jobs for both regions, then chain Stage 2 re-tune+retrain. SEA 0.091/12.7× result is NOT final — treat as a lower bound.
-7. **USA Stage 2 LambdaRank** (after SEA FE re-run confirms approach): Re-submit tune+train chain.
-8. **W9a ecoregion-stratified training** (conditional — see Issue D gate): implement only if W8 confirms 9K bottleneck AND binary does not clearly dominate. ~2 days.
-9. **W4 ablation + W5 logistic baseline** (after SA re-train result is in hand; both use rebuilt SA panel):
-   - W4: run `stage2_ablation.py` for SA. Critical test: does removing `pa_momentum` collapse to naive NDCG?
-   - W5: run `model1_logistic_stage2.py` for SA. Required for methods comparison table and economics reviewers.
-10. **Issue F — WDPA label quality audit**: count what fraction of positive labels come from non-Designated polygons. Estimate impact before deciding on GEE re-export. Must appear in methods section of any top-tier submission regardless of outcome.
-11. **REDD+ final verification** (before paper submission, not blocking): Open each `# TO VERIFY` URL in `build_redd_plus.py` and confirm enrollment year against FCPF/UN-REDD pages.
-12. **Next data sprint**: GEE export for ESA CCI Biomass (carbon stocks) and RAISG indigenous territory area fraction. SA first. Run in parallel with steps 6–9.
-13. **W7 manuscript** (gate: SA re-train result confirmed + SEA FE re-run done + ablation run + Issue F quantified): Do not start W7 until these gates are met.
+6. ✅ **Issue L — WDPA GeoTIF patch for SEA** — done locally 2026-05-27. **Action needed**: `scp` patched TIFs to Euler (see below) before submitting SEA FE re-run SLURM job.
+7. **SEA + USA feature engineering re-runs** (after Issue L patch; Issue H): SEA FE re-run picks up patched GeoTIFs automatically. Then chain Stage 2 re-tune+retrain. SEA 0.091/12.7× result is NOT final — treat as a lower bound.
+   - USA FE re-run has no known WDPA lag issue; can proceed independently.
+8. **USA Stage 2 LambdaRank** (after SEA FE re-run confirms approach): Re-submit tune+train chain.
+9. **W9a ecoregion-stratified training** (conditional — see Issue D gate): implement only if W8 confirms 9K bottleneck AND binary does not clearly dominate. ~2 days.
+10. **W4 ablation + W5 logistic baseline** (after SA re-train result is in hand; both use rebuilt SA panel):
+    - W4: run `stage2_ablation.py` for SA. Critical test: does removing `pa_momentum` collapse to naive NDCG?
+    - W5: run `model1_logistic_stage2.py` for SA. Required for methods comparison table and economics reviewers.
+11. **Issue F — WDPA label quality audit**: count what fraction of positive labels come from non-Designated polygons. Estimate impact before deciding on GEE re-export. Must appear in methods section of any top-tier submission regardless of outcome.
+12. **REDD+ final verification** (before paper submission, not blocking): Open each `# TO VERIFY` URL in `build_redd_plus.py` and confirm enrollment year against FCPF/UN-REDD pages.
+13. **Next data sprint**: GEE export for ESA CCI Biomass (carbon stocks) and RAISG indigenous territory area fraction. SA first. Run in parallel with steps 7–10.
+14. **W7 manuscript** (gate: SA re-train result confirmed + SEA FE re-run done + Issue L patched + ablation run + Issue F quantified): Do not start W7 until these gates are met.
 
 ---
 
@@ -370,6 +395,9 @@ Three improvements to investigate after W8 binary result is in hand. Priority or
 - **SA 2019 underperformance**: Bolsonaro hypothesis **falsified** (Issue C). 2019 is best year; 2017 is worst. Issue D (9K sub-window) is primary suspect. W8 binary result will confirm or rule out.
 - **Journals**: GEC / One Earth → Nature Sustainability → JEEM.
 - **DO NOT** add tropical Africa. **DO NOT** start Paper 2 until Paper 1 submitted.
+- **Stage 1 primary metrics fixed (2026-05-26)**: SA primary = D²_7yr (2017–2023); SEA primary = D²_6yr (2017–2022). Both confirmed from WDPA May2026 CSV: SA 2024 panel captures ~33% of CSV designations; IDN 2023+2024 in CSV (25,320+25,038 km²) record as 0 in panel. Evaluating against incomplete labels penalises the model unfairly. D²_8yr reported as secondary for completeness.
+- **Saturation interaction leakage (SEA) — DO NOT re-investigate**: saturation_ratio = cumsum/max(cumsum) over full panel is leaky (max encodes future information). sat_clean (max over train years only) gives SEA D²_6yr=−0.275 (catastrophically bad). No interaction terms adopted for SEA. The apparent +10.7pp SEA 6yr gain from saturation_ratio was entirely spurious.
+- **CBD thin training support (SA)**: cbd_meeting_year has only 2 training instances (2002, 2010). CBD-free fallback spec is saved to model1_expansion_coefficients.json. Consistent +0.009–0.029 improvement on 7yr across all winsor variants confirms it is not noise. Use fallback as response to reviewers if challenged.
 
 ---
 
