@@ -267,7 +267,19 @@ Full model (16 features, 176 obs) gives D²_test=0.103 vs simpler model's 0.249.
 `model2_expansion.py` now uses only LAG_COLS (4 momentum/saturation features, alpha=10). Results: D²_train=0.218, D²_test=−3.14. Negative test D² confirms the model overpredicts — it learned the Obama-era high-expansion pattern (2001–2016) but Trump era (2017–2024) saw a structural drop in designation rate. **Paper framing: USA Stage 1 is a time-series trend extrapolation, not cross-country political evidence. The negative OOS D² is itself a finding about political path-dependency in USA conservation.** Note: USA POLITICAL_COLS are excluded from the model output JSON; USA Stage 1 coefficients cannot be compared to SA/SE Asia political coefficients.
 
 **G — Forward "probability" is not calibrated**
-`y_pred_proba_5yr_cumulative` in `two_stage_predict_core.py` is min-max normalised LambdaRank score — not a statistical probability. Cannot be interpreted as P(designated). For investor/risk framing this is misleading. Fix: W8 binary LightGBM produces proper probabilities; apply Platt scaling calibration on top. Until then, label this output as "designation risk index", not "probability."
+`y_pred_proba_5yr_cumulative` in `two_stage_predict_core.py` is min-max normalised LambdaRank score — not a statistical probability. Cannot be interpreted as P(designated). For investor/risk framing this is indefensible. Fix: W8 binary LightGBM + Platt calibration produces P(designated | expansion); 5-year formula is 1−(1−p)^5. Until then, label as "designation risk index."
+
+**M — Stage 1 forward budget is single-year only**
+`_predict_country_budgets` in `two_stage_predict_core.py` predicts ONE year's expansion (latest panel year) and selects top-K pixels once. True 5-year transition risk requires accumulating Stage 1 budgets for 2025–2029 and combining with Stage 2 calibrated probabilities: P(designated by 2030) = 1 − ∏_{t=2025}^{2029}(1 − stage1_share_t × stage2_prob_i). Depends on W8 binary completing first (Issue G).
+
+**N — LambdaRank early stopping monitors the wrong metric**
+`FIXED_PARAMS["eval_at"] = [90]` monitors ndcg@90 within 9K sub-windows. Paper metric is ndcg@1% within full 413K-row groups. The model may stop at a sub-optimal iteration for the real objective. Optuna uses full-group ndcg@1% for trial scoring (via `ndcg_at_k_within_groups`) but at the sub-window-stopped iteration, so the two are correlated but not aligned. Binary avoids this entirely.
+
+**O — Binary scale_pos_weight must use true class ratio, not subsampled**
+When `neg_ratio=100`, `_compute_scale_pos_weight(y_tr)` returns ~100 (subsampled ratio). True positive rate is ~0.3–0.5% → true SPW ≈ 300–500. Using SPW=100 underweights positives, inflates predicted probabilities (~3×), and breaks calibration — critical for transition risk framing. Fix: pre-scan parquet for true n_pos/n_neg (read only `transition_01` + `WDPA_prev` columns) before loading with neg_ratio; pass true SPW as override to both tuning and training.
+
+**P — NDCG is an unfair W8 comparison metric**
+LambdaRank trains on graded relevance (1–4); binary trains on {0,1} labels. NDCG with graded labels systematically advantages LambdaRank. **Lift@1% is the correct W8 comparison metric** — it uses binary precision (fraction of top-1% that are any transition) and treats both models equally. W8 decision rule should be: binary Lift@1% vs LambdaRank Lift@1%, not NDCG.
 
 ---
 
@@ -345,7 +357,7 @@ Script exists: `model1_logistic_stage2.py`. Run for SA. Interpretable coefficien
 
 **SA run order**: (1) `sbatch tuning_lgbm_stage2_binary.slurm` → (2) `sbatch training_lgbm_stage2_binary.slurm`.
 
-**Decision rule**: if binary Lift@1% > LambdaRank Lift@1% on SA test set → switch primary. Either way, binary produces calibrated forward probabilities (resolves Issue G).
+**Decision rule**: binary Lift@1% vs LambdaRank Lift@1% on SA test set (see Issue P — NDCG is unfair comparison). Binary wins → switch primary, fix forward pipeline (Issues G+M+O). LambdaRank wins → keep LambdaRank primary, still use binary for calibrated forward probabilities.
 
 ### W9 — Stage 2 Structural Improvements [conditional on W8 result]
 
@@ -377,8 +389,13 @@ Three improvements to investigate after W8 binary result is in hand. Priority or
 
 1. ✅ **Issue C** — Done. 2019 is the BEST year (Lift=9.64×); 2017 is the worst (1.47×). Bolsonaro hypothesis falsified. Issue D (9K sub-window) is now primary suspect for SA underperformance.
 2. ✅ **Issues H+I** — SA FE job 628941 done. SA panel rebuilt with `country_pa_cumsum_lag1_pixels` + trend features. SA re-tune (689639) + retrain (689640) pending.
+<<<<<<< HEAD
 3. ✅ **W8 SA binary** — Jobs 689625→689627 running. Compare binary Lift@1% vs LambdaRank 6.0× once done.
 4. ✅ **Stage 1 SA/USA/SEA** — UPDATED 2026-05-27 (13-feat SA + 10-feat SEA). SA D²_7yr=**+0.399** (PRIMARY, 2017–23), D²_3yr=+0.428, D²_8yr=+0.377; SEA D²_6yr=**+0.290** (PRIMARY, 2017–22), D²_3yr=+0.399, D²_8yr=+0.208; USA D²_test=−3.14 (trend-only, finding about path-dependency). New SA/SEA features: d_v2xlg_legcon_lag1 + legcon_x_cspart + decay(0.6) for SA; legcon_x_cspart for SEA. ⚠️ Will update again after Euler FE re-runs fix 2001+ pixel data.
+=======
+3. ❌ **W8 SA binary** — Jobs 689625 OOM (128 GB, neg_ratio=None loads full parquet). 689627 cancelled. Needs resubmit: (a) pre-scan for true SPW (Issue O), (b) neg_ratio=100 for memory, (c) chain afterok:689640. Compare binary Lift@1% vs LambdaRank Lift@1% (Issue P — use Lift, not NDCG).
+4. ✅ **Stage 1 SA/USA/SEA** — UPDATED 2026-05-27 (marine fix). SA D²_7yr=+0.368 (PRIMARY, 2017–23), D²_8yr=+0.343; SEA D²_6yr=+0.259 (PRIMARY, 2017–22), D²_8yr=+0.178; USA D²_test=−3.14. These are terrestrial-only pre-2001 lag numbers (GIS_AREA−GIS_M_AREA). ⚠️ Will update again after Euler FE re-runs fix 2001+ pixel data.
+>>>>>>> aae46172f6749186025b34b8d5f03ebb39706537
 5. **W8 + SA LambdaRank re-train decision** (after jobs 689627 and 689640 complete): Compare binary Lift@1% vs LambdaRank Lift@1% on SA test set. If binary >> LambdaRank → binary becomes primary (W8 wins); if similar → LambdaRank primary with ecoregion investigation (W9a). Record numbers here and update Settled Decisions.
 6. ✅ **Issue L — WDPA GeoTIF patch for SEA** — done locally 2026-05-27. Scp to Euler ✅ done. SEA FE re-run now unblocked.
    **Issue L — WDPA GeoTIF patch for SA** — ✅ patched locally + scp to Euler done 2026-05-27. Next: SA FE re-run (after 689640 completes) → stage1_data_builder → model1_expansion local → Stage 2 re-tune+retrain.
