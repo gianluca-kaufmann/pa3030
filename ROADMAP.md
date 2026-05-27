@@ -104,9 +104,9 @@ A single classifier conflates both terms. The Group A/B diagnostic proves this e
 | SA LambdaRank Stage 2 re-tune ([50,1000] range, 30 trials) | 🔄 Job 689639 pending (QOSMaxMemoryPerUser, afterok binary tune) |
 | SA LambdaRank Stage 2 retrain | 🔄 Job 689640 (afterok:689639) |
 | USA feature engineering (Issue H: saturation + trend features) | ❌ Not yet run — panel is pre-feature-engineering (May 22) |
-| SE Asia feature engineering (Issue H: saturation + trend features) | ❌ Blocked on Issue L — patch WDPA GeoTIFs first, then run FE |
-| SA WDPA GeoTIF patch (Issue L: IDN/SA 2024 missing designations) | ❌ Patch WDPA_SA_1km_2024.tif after SA chains complete, then rebuild SA panel |
-| SEA WDPA GeoTIF patch (Issue L) | ✅ Patched locally 2026-05-27. +1,127 px (2023) +188 px (2024). Scp to Euler before SEA FE re-run. |
+| SE Asia feature engineering (Issue H: saturation + trend features) | ❌ Blocked on scp of patched TIFs to Euler (done locally — see Issue L) |
+| SA WDPA GeoTIF patch (Issue L: 2023+2024 missing designations) | ✅ Patched locally 2026-05-27. +2,347 px (2023) +103 px (2024). Scp after 689640 completes, then rebuild SA panel + re-run Stage 1 + re-queue Stage 2. |
+| SEA WDPA GeoTIF patch (Issue L) | ✅ Patched locally 2026-05-27. +1,127 px (2023) +188 px (2024). Scp to Euler ✅ done — SEA FE re-run now unblocked. |
 | Forward prediction pipeline | ✅ Bugs F1+F2 fixed; probability output is uncalibrated (Issue G) |
 
 **Active chains**: 689625→689627 (W8 binary SA tune→retrain) | 689639→689640 (SA LambdaRank tune→retrain, pending). Do not modify SA panel parquets while these run.
@@ -125,8 +125,9 @@ GEE asset `WCMC/WDPA/current/polygons` confirmed missing IDN 2023–2024 designa
 - Cumulative protected pixel counts: 2022=679,234 → 2023=680,361 → 2024=680,549
 - Originals backed up: `WDPA_SEA_1km_2023_pre_patch.tif`, `WDPA_SEA_1km_2024_pre_patch.tif`
 - **Still needed**: scp patched TIFs to Euler `$SCRATCH/data/se_asia/ready/WDPA/` before SEA FE re-run
-5. SA: same patch for `WDPA_SA_1km_2024.tif` (33% capture rate); rebuild SA panel after current chains (689639/689640) complete — SA is lower priority since 2024 excluded from SA primary metric
-**Sequence gate**: SEA FE re-run must come AFTER scp to Euler. Patch script is idempotent (backup check).
+5. SA 2023+2024: **✅ Patched locally 2026-05-27** via `scripts/regions/south_america/2_preprocessing/patch_wdpa_sa.py`. Net new pixels: +2,347 (2023), +103 more (2024). SA 2023 is in the primary metric period — affects Stage 1 country-year target and Stage 2 test labels. **Sequence**: scp AFTER 689640 completes (running chain reads panel parquet, not TIFs — no conflict); then SA FE re-run → stage1_data_builder → model1_expansion local → Stage 2 re-tune+retrain.
+**Stage 1 terrestrial note**: Stage 1 target `pa_expansion_pixels` is aggregated from `transition_01` in the backbone parquet (terrestrial only). Marine designations have zero effect on Stage 1. The GIS_AREA CSV is only used in `compute_pre2001_expansion` for pre-2001 lag initialization.
+**Sequence gate**: SEA FE re-run must come AFTER scp to Euler. Both patch scripts are idempotent (backup check prevents double-patching).
 
 **H — Panel merge re-run required for saturation + trend features** ← SA ✅ done; USA + SE Asia pending
 `country_pa_cumsum_lag1_pixels` (saturation) + `NDVI_b1_trend5` / `deforestation_b1_trend5` / `HNTL_b1_trend5` (trend) added to all three `feature_engineering` scripts. SA panel rebuilt 2026-05-26 (61 GB); SA re-tune+retrain chain running. USA (`merged_panel_final.parquet` from 2026-05-22, 46 GB) and SE Asia (from 2026-05-22, 18 GB) still need `feature_engineering` re-runs on Euler, then Stage 2 re-tune+retrain for each.
