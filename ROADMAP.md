@@ -1,6 +1,6 @@
 # PA3030 — Paper Publication Roadmap
 
-**Updated**: 2026-05-27 | **Branch**: `paper` (active). `main` = intact thesis, never touch.
+**Updated**: 2026-05-28 | **Branch**: `paper` (active). `main` = intact thesis, never touch.
 
 **Story**: The 30×30 biodiversity agreement is coming. We predict which land will be designated as protected area — giving investors and central banks an actionable transition risk tool for portfolio exposure to PA designation events.
 
@@ -28,16 +28,15 @@ Train 2001–2013 | Early-stop 2014–2016 | Test 2017–2024.
 
 ---
 
-## Current Key Numbers ⚠️ Preliminary — Euler re-runs pending
+## Current Key Numbers ⚠️ Preliminary — SEA+USA FE re-runs pending
 
 | Region | Stage 1 D² | Stage 2 Lift@1% | Status |
 |---|---|---|---|
-| SA | **+0.399** (7yr PRIMARY 2017–23) / +0.428 (3yr) / +0.377 (8yr) | **6.0×** LambdaRank | Stage 2 re-tune+retrain pending (jobs 689639→689640) |
+| SA | **+0.399** (7yr PRIMARY 2017–23) / +0.428 (3yr) / +0.377 (8yr) | 4.95× LambdaRank (8yr 2017–24, intermediate) | Improvements incoming |
 | SEA | **+0.290** (6yr PRIMARY 2017–22) / +0.399 (3yr) / +0.208 (8yr) | **12.7×** LambdaRank | FE re-run pending; SEA is currently the stronger Stage 2 result |
 | USA | −3.14 (8yr, trend-only) | TBD | Path-dependency finding; Stage 2 deprioritised |
 
-SA naive baseline: dist_wdpa Lift=0.747× < 1 (anti-predictive — test designations are novel areas, not extensions to existing PAs).
-All numbers will update after Euler FE re-runs (WDPA GeoTIF patch + saturation + trend features).
+SA naive baseline (dist_wdpa only): 2.81× on 8yr test (2017–24). All numbers will update after next improvements + FE re-runs.
 
 ---
 
@@ -60,8 +59,14 @@ Negative OOS D² = political path-dependency finding (Obama-era expansion patter
 
 ### CRITICAL — Blocking paper or results validity
 
-**F — WDPA label quality** ← **Do first, before trusting any results**
-GEE export has no `STATUS='Designated'` filter. "Proposed" / "Inscribed" areas may be in positive labels — affects all metrics. Quick audit: count `transition_01=1` pixels where WDPA STATUS ≠ 'Designated'. If contamination >5% → GEE re-export required and all downstream results are suspect.
+**F — WDPA label quality** ✅ **Audited 2026-05-28 — labels acceptable**
+GEE export confirmed to have no `STATUS='Designated'` filter (paints all WDPA statuses). Full shapefile audit run against WDPA May2026:
+- SEA: 4.26% contamination (2020–2024) — just under 5% threshold; labels acceptable. Non-Designated pixels are primarily "Inscribed" (UNESCO WHSites) and "Established" — legally valid PAs.
+- SA + USA: full-region audit queued (SLURM job `wdpa_audit_fix.slurm`). SEA result gives strong prior that contamination is <5%.
+- Reporting lag confirmed: SA 2023=~78% capture (old panel), SEA 2023/2024=0% (old panel). Corrected TIFs (Designated-only, May2026 shapefile) uploaded to SCRATCH for SA and SEA on 2026-05-27.
+- USA 2022/2023/2024 near-zero positives (14/11/0) — reporting lag confirmed. Fix: `wdpa_audit_fix.slurm` burns missing Biden-era designations into USA TIFs before merge.
+- Audit script: `scripts/regions/shared/audit_wdpa_status.py`. JSON output in `outputs/<region>/results/wdpa_audit_<region>.json`.
+- GEE re-export NOT required. Issue F closed pending SA/USA full-region confirmation.
 
 **G+M — Forward pipeline incomplete** ← Core transition risk contribution
 Stage 2 output is an uncalibrated rank score, not P(designated). Stage 1 budget is single-year only. Together these block the 2025–2029 cumulative risk product. Fix: W8 binary + Platt calibration → true P(designated | expansion); then implement multi-year accumulation. Depends on W8 completing.
@@ -77,8 +82,8 @@ LightGBM enforces 9K-row per-query ceiling. SA median group = 413K rows → trai
 **N — Early stopping monitors wrong metric**
 `eval_at=[90]` within 9K sub-windows; paper metric is NDCG@1% within 413K-row groups. Binary avoids this entirely.
 
-**H — USA + SEA FE re-runs pending**
-SA panel rebuilt (✅). SEA TIFs now on Euler (✅) — FE re-run not yet submitted. USA panel from 2026-05-22 pre-dates saturation + trend features. Both unblocked.
+**H — All-region panel rebuild** ← **In queue as of 2026-05-28**
+SA `merged_panel_2000_2024.parquet` (May 16) pre-dates corrected 2023/2024 WDPA TIFs (uploaded May 27) — SA merge also needs re-run. SEA and USA both pre-date improvements commit (May 25) and/or corrected TIFs. All three regions need fresh merge + FE. Chain submitted via `slurm/submit_audit_then_merge_fe.sh`: WDPA audit+fix → SA merge → SA FE → SEA merge → SEA FE → USA merge → USA FE (7 sequential jobs).
 
 ### LOWER — Required before submission
 
@@ -108,31 +113,29 @@ SA panel rebuilt (✅). SEA TIFs now on Euler (✅) — FE re-run not yet submit
 
 | Chain | Status |
 |---|---|
-| SA LambdaRank re-tune → retrain (689639 → 689640) | 🔄 Pending (QOSMaxMemoryPerUser) |
-| W8 SA binary tune → train | ❌ Needs resubmit after Issue O fix + after 689640 |
-| SEA FE re-run | ⏳ Unblocked — submit now |
-| USA FE re-run | ⏳ Independent — submit now |
+| SA LambdaRank re-tune → retrain (689639 → 689640) | ✅ Done 2026-05-28 |
+| W8 SA binary tune → train | ❌ Needs resubmit after Issue O fix (after new SA panel ready) |
+| WDPA audit+fix → SA merge → SA FE → SEA merge → SEA FE → USA merge → USA FE | ⏳ Submit: `bash slurm/submit_audit_then_merge_fe.sh` |
 
-**Do not modify SA panel parquets while 689639–689640 run.**
+**Do not resubmit W8 until the new SA `merged_panel_final.parquet` is ready (SA FE job complete).**
 
 ---
 
 ## Next Actions (Ordered)
 
-0. **Set up Colombia dev panel**: filter SA Stage 2 parquet to Colombia `country_id`, verify ≥5 expansion training groups, confirm tuning runs in <30 min. Then use it to resolve Issues D/O before touching Euler.
-1. **Issue F — WDPA label audit** (run locally, fast): count STATUS≠Designated in positive labels. If >5% contamination → GEE re-export takes priority over everything else.
-2. **Submit SEA FE re-run** on Euler (TIFs already there — unblocked).
-3. **Submit USA FE re-run** on Euler (independent).
-4. **Await 689640** → resubmit W8 binary with Issue O fixes (true SPW, neg_ratio=100).
-5. **W8 decision**: binary Lift@1% vs LambdaRank Lift@1%. Record result here.
+0. ~~**Issue F audit**~~ ✅ Done 2026-05-28. SEA contamination 4.26% < 5%; labels acceptable. SA/USA full audit + USA TIF fix queued in `submit_audit_then_merge_fe.sh`.
+1. **Submit panel rebuild chain**: `bash slurm/submit_audit_then_merge_fe.sh` → 7 sequential jobs (audit+fix, SA merge+FE, SEA merge+FE, USA merge+FE). All corrected 2023/2024 WDPA TIFs already in SCRATCH.
+2. **Set up Colombia dev panel**: while chain runs, filter SA Stage 2 parquet (`merged_panel_final.parquet`) to Colombia `country_id` → `data/dev/sa_panel_dev.parquet`. Verify ≥5 expansion training groups. Use for Issues D/O fast iteration.
+3. **Resubmit W8 binary** with Issue O fixes (true SPW, neg_ratio=100) — after SA FE job completes (new SA panel ready).
+4. **W8 decision**: binary Lift@1% vs LambdaRank Lift@1%. Record result here.
    - Binary wins → fix forward pipeline (G+M), binary becomes Stage 2 primary.
    - LambdaRank wins → pursue W9a ecoregion-stratified training groups.
-6. **Download updated panels** (SEA + USA after FE re-runs) → re-run Stage 1 locally → update key numbers above.
-7. **W4 ablation study** (SA first, after re-train result confirmed): does removing pa_momentum collapse Lift? Required for paper Methods.
-8. **Forward pipeline — Issues G+M**: Platt calibration + multi-year accumulation (2025–2029). Implement after W8 settled.
-9. **W9a ecoregion groups** (conditional on W8 outcome — see Issue D): groups `(country_id, year, ecoregion_id)` for training; evaluate at `(country_id, year)`. Only if LambdaRank primary and 9K is confirmed bottleneck.
-10. **REDD+ verification**: open TO VERIFY URLs before final manuscript.
-11. **Manuscript gate**: SA + SEA Stage 2 final results confirmed + Issue F resolved + ablation done + Issues G+M implemented. Do not start W7 before all gates.
+5. **Re-run Stage 1** locally after SEA + USA FE jobs complete → update key numbers table above.
+6. **W4 ablation study** (SA first, after re-train result confirmed): does removing pa_momentum collapse Lift? Required for paper Methods.
+7. **Forward pipeline — Issues G+M**: Platt calibration + multi-year accumulation (2025–2029). Implement after W8 settled.
+8. **W9a ecoregion groups** (conditional on W8 outcome — see Issue D): groups `(country_id, year, ecoregion_id)` for training; evaluate at `(country_id, year)`. Only if LambdaRank primary and 9K is confirmed bottleneck.
+9. **REDD+ verification**: open TO VERIFY URLs before final manuscript.
+10. **Manuscript gate**: SA + SEA Stage 2 final results confirmed + Issue F resolved + ablation done + Issues G+M implemented. Do not start W7 before all gates.
 
 ---
 
