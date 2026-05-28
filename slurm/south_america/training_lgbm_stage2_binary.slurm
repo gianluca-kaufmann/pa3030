@@ -18,9 +18,10 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
-# Binary variant: no LambdaRank sub-window constraint, scale_pos_weight handles imbalance.
-# neg_ratio is intentionally NOT set — binary uses the full true class balance with
-# scale_pos_weight = n_neg/n_pos computed from data.  Memory peak ~30GB for SA.
+# Binary variant: neg_ratio=100 for memory safety (Issue O fix). True SPW is
+# pre-scanned from the full data before subsampling so scale_pos_weight reflects
+# the real class imbalance (~300-500 for SA), not the subsampled ratio (~100).
+export STAGE2_NEG_RATIO=100
 
 echo "Starting model1_LGBM_stage2_binary..."
 srun --cpu-bind=cores --distribution=block:block python -u \

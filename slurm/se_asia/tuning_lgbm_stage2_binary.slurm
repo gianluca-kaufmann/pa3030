@@ -18,7 +18,9 @@ VENV_DIR="$HOME/venvs/master_thesis"
 source "$VENV_DIR/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
-# Binary variant: no neg_ratio (scale_pos_weight handles imbalance), no truncation level.
+# Binary variant: neg_ratio=100 for memory safety; true SPW pre-scanned from full data
+# (Issue O fix) so scale_pos_weight reflects real imbalance, not the subsampled ratio.
+export STAGE2_NEG_RATIO=100
 
 echo "Starting Stage 2 binary tuning (SE Asia)..."
 python -u scripts/regions/se_asia/5_training/model3_tune_stage2_binary

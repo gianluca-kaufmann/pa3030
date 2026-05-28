@@ -71,8 +71,8 @@ GEE export confirmed to have no `STATUS='Designated'` filter (paints all WDPA st
 **G+M — Forward pipeline incomplete** ← Core transition risk contribution
 Stage 2 output is an uncalibrated rank score, not P(designated). Stage 1 budget is single-year only. Together these block the 2025–2029 cumulative risk product. Fix: W8 binary + Platt calibration → true P(designated | expansion); then implement multi-year accumulation. Depends on W8 completing.
 
-**O — Binary scale_pos_weight bug** ← Blocking W8
-W8 binary job 689625 OOM'd: `neg_ratio=None` loaded full parquet; SPW computed on subsampled ratio (~100) instead of true ratio (~300–500), inflating positives. Fix: pre-scan parquet for true n_pos/n_neg before loading; use neg_ratio=100 for memory; pass true SPW as override to both tuning and training. Resubmit after 689640 completes.
+**O — Binary scale_pos_weight bug** ✅ **Fixed 2026-05-28**
+W8 binary job 689625 OOM'd: `neg_ratio=None` loaded full parquet; SPW computed on subsampled ratio (~100) instead of true ratio (~300–500). Fix applied: `_scan_true_class_counts()` pre-scans expansion groups before loading; binary now uses `STAGE2_NEG_RATIO=100` for memory; true SPW passed through to both tuning (`optimize_lgbm_stage2_binary_optuna(true_scale_pos_weight=...)`) and training (`scale_pos_weight = true_spw`). All 6 binary SLURM scripts updated with `export STAGE2_NEG_RATIO=100`. Resubmit W8 after new SA panel ready (SA FE job).
 
 ### HIGH — Affects Stage 2 quality
 
@@ -82,8 +82,8 @@ LightGBM enforces 9K-row per-query ceiling. SA median group = 413K rows → trai
 **N — Early stopping monitors wrong metric**
 `eval_at=[90]` within 9K sub-windows; paper metric is NDCG@1% within 413K-row groups. Binary avoids this entirely.
 
-**H — All-region panel rebuild** ← **In queue as of 2026-05-28**
-SA `merged_panel_2000_2024.parquet` (May 16) pre-dates corrected 2023/2024 WDPA TIFs (uploaded May 27) — SA merge also needs re-run. SEA and USA both pre-date improvements commit (May 25) and/or corrected TIFs. All three regions need fresh merge + FE. Chain submitted via `slurm/submit_audit_then_merge_fe.sh`: WDPA audit+fix → SA merge → SA FE → SEA merge → SEA FE → USA merge → USA FE (7 sequential jobs).
+**H — All-region panel rebuild** ← **Submit to Euler: `bash slurm/submit_audit_then_merge_fe.sh`**
+SA `merged_panel_2000_2024.parquet` (May 16) pre-dates corrected 2023/2024 WDPA TIFs (uploaded May 27) — SA merge also needs re-run. SEA and USA both pre-date improvements commit (May 25) and/or corrected TIFs. All three regions need fresh merge + FE. Chain: WDPA audit+fix → SA merge → SA FE → SEA merge → SEA FE → USA merge → USA FE (7 sequential jobs). Script is ready; run from Euler login node.
 
 ### LOWER — Required before submission
 
@@ -114,8 +114,8 @@ SA `merged_panel_2000_2024.parquet` (May 16) pre-dates corrected 2023/2024 WDPA 
 | Chain | Status |
 |---|---|
 | SA LambdaRank re-tune → retrain (689639 → 689640) | ✅ Done 2026-05-28 |
-| W8 SA binary tune → train | ❌ Needs resubmit after Issue O fix (after new SA panel ready) |
-| WDPA audit+fix → SA merge → SA FE → SEA merge → SEA FE → USA merge → USA FE | ⏳ Submit: `bash slurm/submit_audit_then_merge_fe.sh` |
+| W8 SA binary tune → train | ⏳ Issue O fixed; resubmit after SA FE completes (new panel ready) |
+| WDPA audit+fix → SA merge → SA FE → SEA merge → SEA FE → USA merge → USA FE | ⏳ Submit from Euler: `bash slurm/submit_audit_then_merge_fe.sh` |
 
 **Do not resubmit W8 until the new SA `merged_panel_final.parquet` is ready (SA FE job complete).**
 
@@ -123,10 +123,12 @@ SA `merged_panel_2000_2024.parquet` (May 16) pre-dates corrected 2023/2024 WDPA 
 
 ## Next Actions (Ordered)
 
-0. ~~**Issue F audit**~~ ✅ Done 2026-05-28. SEA contamination 4.26% < 5%; labels acceptable. SA/USA full audit + USA TIF fix queued in `submit_audit_then_merge_fe.sh`.
-1. **Submit panel rebuild chain**: `bash slurm/submit_audit_then_merge_fe.sh` → 7 sequential jobs (audit+fix, SA merge+FE, SEA merge+FE, USA merge+FE). All corrected 2023/2024 WDPA TIFs already in SCRATCH.
-2. **Set up Colombia dev panel**: while chain runs, filter SA Stage 2 parquet (`merged_panel_final.parquet`) to Colombia `country_id` → `data/dev/sa_panel_dev.parquet`. Verify ≥5 expansion training groups. Use for Issues D/O fast iteration.
-3. **Resubmit W8 binary** with Issue O fixes (true SPW, neg_ratio=100) — after SA FE job completes (new SA panel ready).
+0. ~~**Issue F audit**~~ ✅ Done 2026-05-28.
+0b. ~~**Issue O fix**~~ ✅ Done 2026-05-28. `_scan_true_class_counts()` added; binary neg_ratio=100 with true SPW override; 6 SLURM scripts updated.
+0c. ~~**Colombia dev panel script**~~ ✅ Done 2026-05-28. `scripts/regions/south_america/dev/create_colombia_panel.py` + `STAGE2_DATA_ROOT` env var in `resolve_parquet_file`.
+1. **Submit panel rebuild chain** (from Euler login node): `bash slurm/submit_audit_then_merge_fe.sh` → 7 sequential jobs. All corrected TIFs already in SCRATCH.
+2. **Create Colombia dev panel** (after SA FE completes): `python scripts/regions/south_america/dev/create_colombia_panel.py`. Verify ≥5 expansion training groups. Run W8 with `STAGE2_DATA_ROOT=data/dev/south_america/ml`.
+3. **Resubmit W8 binary** — after SA FE job completes (new SA panel ready). Issue O fix is in place.
 4. **W8 decision**: binary Lift@1% vs LambdaRank Lift@1%. Record result here.
    - Binary wins → fix forward pipeline (G+M), binary becomes Stage 2 primary.
    - LambdaRank wins → pursue W9a ecoregion-stratified training groups.

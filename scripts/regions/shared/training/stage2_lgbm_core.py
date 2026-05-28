@@ -104,6 +104,13 @@ def resolve_parquet_file(region: str, filename: str) -> Path:
     repo_root = get_repo_root()
     scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
     candidates: list[Path] = []
+    # STAGE2_DATA_ROOT: dev/Colombia panel override. Set to the directory that
+    # contains main/{filename} (e.g. data/dev/south_america/ml) to redirect
+    # Stage 2 scripts to a region-filtered dev subset without other code changes.
+    data_root = Path(os.environ["STAGE2_DATA_ROOT"]) if os.environ.get("STAGE2_DATA_ROOT") else None
+    if data_root is not None:
+        candidates.append(data_root / "main" / filename)
+        candidates.append(data_root / filename)
     if scratch_root is not None:
         candidates.append(scratch_root / f"data/{region}/ml/main/{filename}")
         candidates.append(scratch_root / f"outputs/{region}/results/main/{filename}")
@@ -442,6 +449,54 @@ def _compute_scale_pos_weight(y: np.ndarray) -> float:
     return float(n_neg) / float(max(n_pos, 1))
 
 
+def _scan_true_class_counts(
+    panel_path: Path,
+    region: str,
+    expansion_groups: set[tuple[int, int]],
+    year_range: Optional[Tuple[int, int]],
+) -> Tuple[int, int]:
+    """Count n_pos and n_neg in expansion groups by streaming minimal columns.
+
+    Returns (n_pos, n_neg) reflecting the full (non-subsampled) class balance.
+    Used by binary W8 to compute the true scale_pos_weight before neg_ratio
+    subsampling: subsampled y_tr gives SPW≈neg_ratio, but the true SPW from
+    the full data (~300–500 for SA) is what the model should use.
+    """
+    schema_names = pq.ParquetFile(panel_path).schema_arrow.names
+    has_country = "country_id" in schema_names
+    raster = None if has_country else load_country_raster(region)
+
+    cols = [TARGET_COL, "year", "WDPA_prev"]
+    if has_country:
+        cols.append("country_id")
+    else:
+        cols += ["row", "col"]
+
+    n_pos = 0
+    n_neg = 0
+    pf = pq.ParquetFile(panel_path)
+    for batch in pf.iter_batches(columns=cols, batch_size=BATCH_SIZE):
+        df = batch.to_pandas()
+        if df.empty:
+            continue
+        df = df[df[TARGET_COL].notna() & (df["WDPA_prev"] == 0)]
+        if year_range is not None:
+            df = df[(df["year"] >= year_range[0]) & (df["year"] <= year_range[1])]
+        if df.empty:
+            continue
+        if not has_country:
+            df["country_id"] = country_ids_for_rows(df, raster)
+        keys = list(zip(df["country_id"].astype(int), df["year"].astype(int)))
+        mask = np.array([k in expansion_groups for k in keys], dtype=bool)
+        df = df[mask]
+        if df.empty:
+            continue
+        n_pos += int((df[TARGET_COL] > 0).sum())
+        n_neg += int((df[TARGET_COL] == 0).sum())
+        del df
+    return n_pos, n_neg
+
+
 def _prepare_lgb_params(best_params: Dict[str, Any], num_threads: int) -> Dict[str, Any]:
     params = {**FIXED_PARAMS, **best_params}
     for key in (
@@ -575,11 +630,14 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
     num_threads = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 4))
     num_boost_round = int(best_params.get("n_estimators", best_params.get("num_boost_round", 2000)))
 
-    # Negative-subsampling ratio: binary uses scale_pos_weight instead; LambdaRank must
-    # match the tuning ratio (STAGE2_NEG_RATIO=100 in all tuning SLURMs) so hyperparameters
-    # are valid for the class-balance regime the final model actually trains in.
+    # Negative-subsampling ratio: both binary and LambdaRank use STAGE2_NEG_RATIO for
+    # memory efficiency. Binary uses scale_pos_weight to maintain the correct class-
+    # balance signal; the true SPW is computed via _scan_true_class_counts before
+    # subsampling so it reflects the full data ratio (~300–500 for SA), not the
+    # subsampled ratio (~100). LambdaRank must match the tuning ratio so hyperparameters
+    # are valid for the class-balance regime the final model trains in.
     _nr_env = os.environ.get("STAGE2_NEG_RATIO", "100")
-    neg_ratio: Optional[int] = (int(_nr_env) if int(_nr_env) > 0 else None) if cfg.variant != "binary" else None
+    neg_ratio: Optional[int] = int(_nr_env) if int(_nr_env) > 0 else None
 
     train_pool_years = (cfg.train_years[0], cfg.earlystop_years[1])
     print(f"Building expansion group index ({train_pool_years})...")
@@ -588,6 +646,22 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
         train_path, cfg.region, train_pool_years
     ) | _expansion_groups_from_batches(earlystop_path, cfg.region, train_pool_years)
     print(f"  {len(expansion_groups):,} expansion country-years ({time.time()-t0:.1f}s)")
+
+    # Binary W8: pre-scan train.parquet for true class counts before neg_ratio subsampling.
+    # The subsampled y_tr gives SPW≈neg_ratio; the true SPW from the full data is what
+    # the model should use to correctly weight positives against the full imbalance.
+    true_spw: Optional[float] = None
+    if cfg.variant == "binary":
+        print("Pre-scanning for true class counts (Issue O fix)...")
+        t_scan = time.time()
+        _n_pos, _n_neg = _scan_true_class_counts(
+            train_path, cfg.region, expansion_groups, cfg.train_years
+        )
+        true_spw = float(_n_neg) / float(max(_n_pos, 1))
+        print(
+            f"  True n_pos={_n_pos:,}, n_neg={_n_neg:,}, true_SPW={true_spw:.1f}"
+            f" (vs subsampled SPW≈{neg_ratio}) ({time.time()-t_scan:.1f}s)"
+        )
 
     print(f"Loading train pool (variant={cfg.variant}, neg_ratio={neg_ratio})...")
     X_tr, y_tr, years_tr, _, g_tr = load_stage2_arrays(
@@ -608,8 +682,9 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
 
     if cfg.variant == "binary":
         # W8: binary LightGBM — no 9K sub-window, scale_pos_weight for imbalance.
-        # Hyperparameters are stripped/rebuilt to avoid LambdaRank-only keys.
-        scale_pos_weight = _compute_scale_pos_weight(y_tr)
+        # Use the true SPW from the pre-scan (true n_neg/n_pos in full data), not
+        # _compute_scale_pos_weight(y_tr) which reflects the neg_ratio subsampling.
+        scale_pos_weight = true_spw if true_spw is not None else _compute_scale_pos_weight(y_tr)
         binary_params = {**BINARY_FIXED_PARAMS}
         for key in (
             "num_leaves", "max_depth", "learning_rate", "min_child_samples",

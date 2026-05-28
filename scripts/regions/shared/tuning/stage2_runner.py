@@ -15,6 +15,7 @@ from scripts.regions.shared.training.stage2_lgbm_core import (
     STAGE2_EXCLUDE_COLS,
     TARGET_COL,
     _expansion_groups_from_batches,
+    _scan_true_class_counts,
     load_stage2_arrays,
     resolve_parquet_file,
 )
@@ -62,11 +63,32 @@ def run_stage2_tuning(
         train_path, region, (2001, 2016)
     ) | _expansion_groups_from_batches(earlystop_path, region, (2001, 2016))
 
-    # Binary uses no neg_ratio (scale_pos_weight is the imbalance mechanism).
-    # LambdaRank uses the same neg_ratio as tuning so hyperparameters are valid
-    # for the class-balance regime the final model trains in.
+    # Both binary and LambdaRank use STAGE2_NEG_RATIO for memory-safe loading.
+    # Binary uses scale_pos_weight for class-balance signalling: the true SPW
+    # is pre-scanned from the full data so it reflects the real imbalance (~300–500
+    # for SA), not the subsampled ratio (~neg_ratio). LambdaRank must match the
+    # tuning neg_ratio so hyperparameters are valid for the training regime.
     _nr_env = os.environ.get("STAGE2_NEG_RATIO", "100")
-    neg_ratio: int | None = (int(_nr_env) if int(_nr_env) > 0 else None) if variant != "binary" else None
+    neg_ratio: int | None = int(_nr_env) if int(_nr_env) > 0 else None
+
+    # Issue O fix: pre-scan for true class balance before neg_ratio subsampling.
+    true_spw: float | None = None
+    if variant == "binary":
+        print("Pre-scanning train + earlystop for true class counts (Issue O fix)...")
+        _n_pos_tr, _n_neg_tr = _scan_true_class_counts(
+            train_path, region, expansion_groups, (2001, 2013)
+        )
+        _n_pos_es, _n_neg_es = _scan_true_class_counts(
+            earlystop_path, region, expansion_groups, (2014, 2016)
+        )
+        _n_pos_total = _n_pos_tr + _n_pos_es
+        _n_neg_total = _n_neg_tr + _n_neg_es
+        true_spw = float(_n_neg_total) / float(max(_n_pos_total, 1))
+        print(
+            f"  n_pos={_n_pos_total:,}, n_neg={_n_neg_total:,}, true_SPW={true_spw:.1f}"
+            f" (vs subsampled SPW≈{neg_ratio})"
+        )
+
     X_tr, y_tr, years_tr, cid_tr, _ = load_stage2_arrays(
         train_path, region, feature_cols, expansion_groups, (2001, 2013), neg_ratio=neg_ratio
     )
@@ -86,7 +108,8 @@ def run_stage2_tuning(
 
     if variant == "binary":
         best_params, best_score, records = optimize_lgbm_stage2_binary_optuna(
-            X, y, country_id, years, folds, mode, n_trials, 42
+            X, y, country_id, years, folds, mode, n_trials, 42,
+            true_scale_pos_weight=true_spw,
         )
         metric_name = "ndcg_at_1pct_within_groups (binary)"
         fixed: dict = {}
@@ -109,6 +132,7 @@ def run_stage2_tuning(
             "target_col": TARGET_COL,
             "feature_count": len(feature_cols),
             "neg_ratio": neg_ratio,
+            "true_scale_pos_weight": true_spw,
             "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
         },
         "tuning_records": records,

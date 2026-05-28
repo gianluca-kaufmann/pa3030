@@ -6,7 +6,7 @@ Year-based CV folds keep (country_id, year) groups intact within each fold.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import lightgbm as lgb
 import numpy as np
@@ -158,12 +158,15 @@ def optimize_lgbm_stage2_binary_optuna(
     mode: str,
     n_trials: int,
     random_state: int,
+    true_scale_pos_weight: Optional[float] = None,
 ) -> Tuple[Dict[str, Any], float, List[Dict[str, Any]]]:
     """Optuna HPO for W8 binary LightGBM Stage 2.
 
-    Trains with binary log-loss + scale_pos_weight (computed per fold from true
-    class balance — no neg_ratio subsampling).  Evaluates on NDCG@1% within groups
-    so the optimised metric matches the LambdaRank variant for direct comparison.
+    Trains with binary log-loss + scale_pos_weight.  When true_scale_pos_weight is
+    provided (Issue O fix), it is used directly for all folds instead of computing
+    SPW from the subsampled fold data (which reflects neg_ratio, not the full data
+    class imbalance).  Evaluates on NDCG@1% within groups so the optimised metric
+    matches the LambdaRank variant for direct comparison.
     Year weights are applied to training folds (matching final training behaviour).
     """
     bounds = get_lgbm_stage2_binary_optuna_bounds(mode)
@@ -197,7 +200,7 @@ def optimize_lgbm_stage2_binary_optuna(
             weights_tr = compute_year_weights(
                 yrs_tr, min_year=int(yrs_tr.min()), max_year=int(yrs_tr.max())
             )
-            spw = _compute_scale_pos_weight(y_tr)
+            spw = true_scale_pos_weight if true_scale_pos_weight is not None else _compute_scale_pos_weight(y_tr)
             fold_params = {**train_params, "scale_pos_weight": spw}
             y_tr_bin = (y_tr > 0).astype(np.int8)
             y_va_bin = (y_va > 0).astype(np.int8)
