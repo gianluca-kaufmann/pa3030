@@ -37,6 +37,7 @@ STAGE2_EXCLUDE_COLS = frozenset({
     "transition_01",
     "transition_01_win5",
     "WDPA_b1",
+    "WDPA_b2",  # pre_patch backup band — leakage; excluded alongside b1
     "WDPA_prev",
     "WDPA",
     "x",

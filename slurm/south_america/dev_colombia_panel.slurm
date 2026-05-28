@@ -8,6 +8,7 @@
 #SBATCH --output=/cluster/scratch/%u/logs/col_panel_%j.out
 #SBATCH --error=/cluster/scratch/%u/logs/col_panel_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
+set -euo pipefail
 
 mkdir -p "$SCRATCH/logs"
 
@@ -18,5 +19,5 @@ source "$HOME/venvs/master_thesis/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
 echo "Creating Colombia dev panel from SA Stage 2 splits..."
-python scripts/regions/south_america/dev/create_colombia_panel.py
+srun python scripts/regions/south_america/dev/create_colombia_panel.py --country-id 5
 echo "Colombia panel creation done."

@@ -130,8 +130,14 @@ LightGBM enforces 9K-row per-query ceiling. SA median group = 413K rows → trai
 | SA LambdaRank re-tune → retrain (689639 → 689640) | ✅ Done 2026-05-28 (ran on old panel — re-train on new panel pending after splits) |
 | WDPA audit (1076907) | ✅ Done 2026-05-28 13:07 — all 3 regions |
 | SA merge (1076908) → SA FE (1076910) | ✅ Done 2026-05-28 13:56 / 16:34 |
-| SEA merge (1076912) → SEA FE (1076913) → USA merge (1076915) → USA FE (1076916) | ⏳ In queue |
-| SA splits (1106055) → col_panel (1106062) → col_tune_lr (1106410) → col_train_lr (1106411) → col_tune_bin (1106412) → col_train_bin (1106413) → W8 tune (1106414) → W8 train (1106416) | ⏳ Submitted 2026-05-28 |
+| SEA merge (1076912) → SEA FE (1076913) → USA merge (1076915) → USA FE (1076916) | ✅ All done (SEA merge 5m, SEA FE 22m, USA merge 11m, USA FE 57m) |
+| SA splits (1106055) | ✅ Done (3m 53s) |
+| col_panel (1106062) | ❌ Failed silently — `country_iso3` absent + WDPA_b2 leakage bug |
+| col_tune_lr (1106410) → col_train_lr (1106411) | ❌ Failed — ran on full SA panel; WDPA_b2 blocked both |
+| col_panel (1122578) | ❌ Failed — `RecordBatch` passed to `write_table()` (needs `Table`); partial file written |
+| col_tune_lr (1122580) → col_train_lr (1122581) → col_tune_bin (1122582) → col_train_bin (1122583) | ❌ All failed — empty Colombia panel → no expansion samples |
+| W8 tune (1122585) → W8 train (1122586) | ❌ Cancelled 2026-05-29 — ran prematurely (silent Colombia failures released afterok dependency). Must wait for Colombia Issue D decision first. |
+| col_panel (1141209) → col_tune_lr (1141210) → col_train_lr (1141211) → col_tune_bin (1141212) → col_train_bin (1141213) | ⏳ In queue 2026-05-29 |
 
 ---
 

@@ -484,7 +484,7 @@ def run_tuning(region: str, model: str, script_dir: Path, output_dir: Path) -> D
         max_neg_per_year = cfg.max_neg_per_year_paper if cfg.tuning_mode == "paper" else cfg.max_neg_per_year_fast
         max_pos_per_year = cfg.max_pos_per_year_paper if cfg.tuning_mode == "paper" else cfg.max_pos_per_year_fast
         total_row_budget = _get_total_row_budget(cfg)
-        exclude_cols = {"transition_01", "transition_01_win5", "WDPA_b1", "WDPA_prev", "WDPA", "x", "y", "row", "col", YEAR_COL}
+        exclude_cols = {"transition_01", "transition_01_win5", "WDPA_b1", "WDPA_b2", "WDPA_prev", "WDPA", "x", "y", "row", "col", YEAR_COL}
         scratch_root = Path(os.environ["SCRATCH"]) if os.environ.get("SCRATCH") else None
         train_path = resolve_train_parquet(
             cfg.repo_root,

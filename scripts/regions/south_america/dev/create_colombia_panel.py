@@ -81,7 +81,7 @@ def _filter_to_country(
     total_rows = 0
 
     for batch in pf.iter_batches(batch_size=BATCH_SIZE):
-        tbl = batch.cast(schema)
+        tbl = pa.Table.from_batches([batch])  # RecordBatch → Table (write_table requires Table)
         if country_id_val is not None and has_cid:
             mask = pa.compute.equal(tbl.column("country_id"), country_id_val)
         elif has_iso3:
@@ -165,7 +165,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Create Colombia-only dev panel from SA splits")
     parser.add_argument("--country-iso3", default="COL", help="ISO3 country code (default: COL)")
-    parser.add_argument("--country-id", type=int, default=None, help="Integer country_id from the raster (overrides iso3 filter if country_iso3 column absent)")
+    parser.add_argument("--country-id", type=int, default=5, help="Integer country_id from the raster (default: 5=COL; overrides iso3 filter when country_iso3 column absent)")
     parser.add_argument("--check-only", action="store_true", help="Only report expansion groups; do not write files")
     args = parser.parse_args()
 
