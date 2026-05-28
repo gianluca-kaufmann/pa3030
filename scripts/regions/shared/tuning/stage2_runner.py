@@ -39,7 +39,12 @@ def run_stage2_tuning(
 ) -> Path:
     repo_root = get_repo_root()
     script_dir = repo_root / "scripts" / "regions" / region / "5_training"
-    out_dir = output_dir or script_dir
+    # STAGE2_OUTPUT_DIR: redirect best_params.json for dev/Colombia panel runs so
+    # Colombia tuning artefacts don't overwrite production SA best_params.
+    if env_out_dir := os.environ.get("STAGE2_OUTPUT_DIR"):
+        out_dir = Path(env_out_dir)
+    else:
+        out_dir = output_dir or script_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
     train_path = resolve_parquet_file(region, "train.parquet")

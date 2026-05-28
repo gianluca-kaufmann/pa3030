@@ -134,6 +134,10 @@ def resolve_best_params_json(cfg: Stage2Config) -> Optional[Path]:
     scratch = os.environ.get("SCRATCH")
     if scratch:
         candidates.insert(0, Path(scratch) / f"scripts/regions/{cfg.region}/5_training/{cfg.model_prefix}_stage2_lgbm{suffix}_best_params.json")
+    # STAGE2_OUTPUT_DIR: dev/Colombia panel override — check this first so Colombia
+    # training reads the Colombia-tuned best_params, not the production SA ones.
+    if env_out_dir := os.environ.get("STAGE2_OUTPUT_DIR"):
+        candidates.insert(0, Path(env_out_dir) / f"{cfg.model_prefix}_stage2_lgbm{suffix}_best_params.json")
     for cand in candidates:
         if cand.exists():
             return cand
