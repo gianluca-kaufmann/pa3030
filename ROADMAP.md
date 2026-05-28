@@ -131,9 +131,7 @@ LightGBM enforces 9K-row per-query ceiling. SA median group = 413K rows → trai
 | WDPA audit (1076907) | ✅ Done 2026-05-28 13:07 — all 3 regions |
 | SA merge (1076908) → SA FE (1076910) | ✅ Done 2026-05-28 13:56 / 16:34 |
 | SEA merge (1076912) → SEA FE (1076913) → USA merge (1076915) → USA FE (1076916) | ⏳ In queue |
-| SA splits (1106055) → col_panel (1106062) → col_tune_lr (1106063) → col_train_lr (1106065) | ⏳ Submitted 2026-05-28 |
-| SA splits (1106055) → col_panel (1106062) → col_tune_bin (1106064) → col_train_bin (1106066) | ⏳ Submitted 2026-05-28 (parallel with LambdaRank chain) |
-| SA splits (1106055) → W8 SA binary tune (1106067) → W8 SA binary train (1106071) | ⏳ Submitted 2026-05-28 (parallel with Colombia chains) |
+| SA splits (1106055) → col_panel (1106062) → col_tune_lr (1106410) → col_train_lr (1106411) → col_tune_bin (1106412) → col_train_bin (1106413) → W8 tune (1106414) → W8 train (1106416) | ⏳ Submitted 2026-05-28 |
 
 ---
 
