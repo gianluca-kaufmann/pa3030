@@ -80,8 +80,8 @@ W8 binary job 689625 OOM'd: `neg_ratio=None` loaded full parquet; SPW computed o
 **D — LambdaRank 9K sub-window mismatch**
 LightGBM enforces 9K-row per-query ceiling. SA median group = 413K rows → training optimises within 9K but evaluation is over full groups. CV=0.186 → test=0.028 gap is partly this. Binary (W8) has no ceiling. Decision rule: binary Lift@1% vs LambdaRank Lift@1% on SA test set. If binary wins → switch primary, activate Issues G+M fix. If LambdaRank wins → pursue W9a ecoregion groups.
 
-**N — Early stopping monitors wrong metric**
-`eval_at=[90]` within 9K sub-windows; paper metric is NDCG@1% within 413K-row groups. Binary avoids this entirely.
+**N — Early stopping monitors wrong metric** ✅ **Fixed 2026-05-29**
+`eval_at=[90]` within 9K sub-windows caused LambdaRank to stop at iter 2 (Colombia); binary AP stopping caused stop at iter 5. Fix: `_TrueNdcg1PctEarlyStop` custom callback in `stage2_lgbm_core.py` calls `model.predict(X_val)` every iteration and stops on true NDCG@1% within full groups (patience=100 for final training, patience=50 for Optuna folds). Applied to both LambdaRank and binary in training AND Optuna — both models now tune and stop on the actual paper metric. Colombia re-run submitted (jobs 1227274–1227280).
 
 **H — All-region panel rebuild** ⏳ **SA done; SEA+USA in queue**
 - ✅ SA merge completed 2026-05-28 13:56 → `merged_panel_2000_2024.parquet` (40 GB)
@@ -137,7 +137,8 @@ LightGBM enforces 9K-row per-query ceiling. SA median group = 413K rows → trai
 | col_panel (1122578) | ❌ Failed — `RecordBatch` passed to `write_table()` (needs `Table`); partial file written |
 | col_tune_lr (1122580) → col_train_lr (1122581) → col_tune_bin (1122582) → col_train_bin (1122583) | ❌ All failed — empty Colombia panel → no expansion samples |
 | W8 tune (1122585) → W8 train (1122586) | ❌ Cancelled 2026-05-29 — ran prematurely (silent Colombia failures released afterok dependency). Must wait for Colombia Issue D decision first. |
-| col_panel (1141209) → col_tune_lr (1141210) → col_train_lr (1141211) → col_tune_bin (1141212) → col_train_bin (1141213) | ⏳ In queue 2026-05-29 |
+| col_panel (1141209) → col_tune_lr (1141210) → col_train_lr (1141211) → col_tune_bin (1141212) → col_train_bin (1141213) | ✅ Done 2026-05-29 — but early stopping fired at iter 2 (LR) / iter 5 (bin); Issue N unresolved |
+| col_tune_lr (1227274) → col_train_lr (1227276) → col_tune_bin (1227278) → col_train_bin (1227280) | ⏳ In queue 2026-05-29 — Issue N fix applied: _TrueNdcg1PctEarlyStop replaces ndcg@90/AP stopping |
 
 ---
 

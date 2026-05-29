@@ -26,5 +26,5 @@ export STAGE2_TUNING_TRIALS=30
 mkdir -p "$STAGE2_OUTPUT_DIR"
 
 echo "Stage 2 binary tuning — Colombia dev panel (30 trials)..."
-python -u scripts/regions/south_america/5_training/model1_tune_stage2_binary
+srun python -u scripts/regions/south_america/5_training/model1_tune_stage2_binary
 echo "Colombia binary tuning done."

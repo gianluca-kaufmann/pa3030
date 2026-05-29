@@ -26,5 +26,5 @@ export STAGE2_TUNING_TRIALS=30
 mkdir -p "$STAGE2_OUTPUT_DIR"
 
 echo "Stage 2 LambdaRank tuning — Colombia dev panel (30 trials)..."
-python -u scripts/regions/south_america/4_tuning/model1_tuning_lgbm_stage2
+srun python -u scripts/regions/south_america/4_tuning/model1_tuning_lgbm_stage2
 echo "Colombia LambdaRank tuning done."

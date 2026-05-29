@@ -6,7 +6,7 @@ Year-based CV folds keep (country_id, year) groups intact within each fold.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import lightgbm as lgb
 import numpy as np
@@ -15,6 +15,7 @@ import optuna
 from scripts.regions.shared.evaluation.stage2_metrics import ndcg_at_k_within_groups
 from scripts.regions.shared.training.stage2_lgbm_core import (
     BINARY_FIXED_PARAMS,
+    _TrueNdcg1PctEarlyStop,
     _compute_scale_pos_weight,
     _split_large_groups,
 )
@@ -118,17 +119,14 @@ def optimize_lgbm_stage2_optuna(
                 yrs_tr, min_year=int(yrs_tr.min()), max_year=int(yrs_tr.max())
             )
             dtrain = lgb.Dataset(X_tr, label=y_tr, group=_split_large_groups(g_tr), weight=weights_tr)
-            dval = lgb.Dataset(X_va, label=y_va, group=_split_large_groups(g_va), reference=dtrain)
+            early_stop_cb = _TrueNdcg1PctEarlyStop(X_va, y_va, g_va, patience=50, verbose=False)
             booster = lgb.train(
                 train_params,
                 dtrain,
                 num_boost_round=params["n_estimators"],
-                valid_sets=[dval],
-                valid_names=["val"],
-                callbacks=[lgb.early_stopping(100, verbose=False)],
+                callbacks=[early_stop_cb],
             )
-            pred = booster.predict(X_va, num_iteration=booster.best_iteration or None)
-            score = ndcg_at_k_within_groups(y_va.astype(np.float64), pred, g_va, 1.0)
+            score = early_stop_cb.best_score
             fold_scores.append(score)
             trial.report(_mean(fold_scores), step=fold_idx)
             if trial.should_prune():
@@ -203,20 +201,17 @@ def optimize_lgbm_stage2_binary_optuna(
             spw = true_scale_pos_weight if true_scale_pos_weight is not None else _compute_scale_pos_weight(y_tr)
             fold_params = {**train_params, "scale_pos_weight": spw}
             y_tr_bin = (y_tr > 0).astype(np.int8)
-            y_va_bin = (y_va > 0).astype(np.int8)
             dtrain = lgb.Dataset(X_tr, label=y_tr_bin, weight=weights_tr)
-            dval = lgb.Dataset(X_va, label=y_va_bin, reference=dtrain)
+            # y_va (graded 0–4) is passed to the callback so NDCG@1% is computed on
+            # the same scale as the final test evaluation (not on binary 0/1).
+            early_stop_cb = _TrueNdcg1PctEarlyStop(X_va, y_va, g_va, patience=50, verbose=False)
             booster = lgb.train(
                 fold_params,
                 dtrain,
                 num_boost_round=params["n_estimators"],
-                valid_sets=[dval],
-                valid_names=["val"],
-                callbacks=[lgb.early_stopping(100, verbose=False)],
+                callbacks=[early_stop_cb],
             )
-            pred = booster.predict(X_va, num_iteration=booster.best_iteration or None)
-            # Evaluate as a ranking model (same metric as LambdaRank variant)
-            score = ndcg_at_k_within_groups(y_va.astype(np.float64), pred, g_va, 1.0)
+            score = early_stop_cb.best_score
             fold_scores.append(score)
             trial.report(_mean(fold_scores), step=fold_idx)
             if trial.should_prune():

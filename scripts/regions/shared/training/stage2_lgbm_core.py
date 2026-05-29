@@ -11,22 +11,26 @@ import json
 import os
 import pickle
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from lightgbm.callback import EarlyStopException as _LgbEarlyStopException
 
 from scripts.regions.shared.country_raster import (
     country_ids_for_rows,
     load_country_raster,
 )
-from scripts.regions.shared.evaluation.stage2_metrics import compute_stage2_metrics
+from scripts.regions.shared.evaluation.stage2_metrics import (
+    compute_stage2_metrics,
+    ndcg_at_k_within_groups,
+)
 from scripts.regions.shared.training.feature_guard import check_feature_denylist
 from scripts.regions.shared.training.utils import compute_year_weights, get_repo_root
 
@@ -59,19 +63,76 @@ FIXED_PARAMS = {
     "metric": "ndcg",
     "verbose": -1,
     "lambdarank_truncation_level": 100,
-    # Early stopping monitors ndcg@k@1% of the split sub-groups (_LGB_MAX_QUERY rows).
-    # Default eval_at=[1,2,3,4,5] uses only the single top position — too noisy.
+    # eval_at=[90] = k@1% of 9K sub-windows; logged for reference only.
+    # Early stopping is handled by _TrueNdcg1PctEarlyStop (true NDCG@1% on full groups).
     "eval_at": [max(1, _LGB_MAX_QUERY // 100)],  # = [90] for _LGB_MAX_QUERY=9000
 }
 
 # Binary LightGBM (W8): no sub-window constraint, uses scale_pos_weight for imbalance.
-# metric=average_precision (PR-AUC) is more informative than AUC under extreme imbalance.
+# metric=average_precision is logged for reference; early stopping uses _TrueNdcg1PctEarlyStop.
 BINARY_FIXED_PARAMS = {
     "boosting_type": "gbdt",
     "objective": "binary",
     "metric": "average_precision",
     "verbose": -1,
 }
+
+
+class _TrueNdcg1PctEarlyStop:
+    """Custom early-stopping callback using true NDCG@1% on full validation groups.
+
+    Replaces lgb's built-in stopping criteria for both LambdaRank (ndcg@90 on 9K
+    sub-windows — Issue N) and binary (average_precision). Both models now stop on
+    the same metric used for final evaluation, so best_iteration reflects the model
+    state with the highest real-world ranking quality.
+
+    Prediction is called at every iteration on the full unsplit X_val so that
+    NDCG@1% is computed over the complete (country_id, year) groups rather than
+    over the 9K sub-window fragments that LightGBM sees internally.
+    """
+
+    order = 30  # run after lgb.log_evaluation (order=20)
+    before_iteration = False
+
+    def __init__(
+        self,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
+        group_val: np.ndarray,
+        patience: int = 100,
+        verbose: bool = True,
+        log_interval: int = 50,
+    ) -> None:
+        self.X_val = X_val
+        self.y_val = y_val.astype(np.float64)
+        self.group_val = group_val
+        self.patience = patience
+        self.verbose = verbose
+        self.log_interval = log_interval
+        self.best_score: float = 0.0
+        self.best_iter: int = 0
+
+    def __call__(self, env: Any) -> None:
+        pred = env.model.predict(self.X_val)
+        score = ndcg_at_k_within_groups(self.y_val, pred, self.group_val, 1.0)
+        if score > self.best_score:
+            self.best_score = score
+            self.best_iter = env.iteration
+        if self.verbose and (env.iteration + 1) % self.log_interval == 0:
+            print(
+                f"[{env.iteration + 1}]  true ndcg@1%: {score:.6f}"
+                f"  best: {self.best_score:.6f} @ iter {self.best_iter + 1}"
+            )
+        if env.iteration - self.best_iter >= self.patience:
+            if self.verbose:
+                print(
+                    f"True NDCG@1% early stopping at iter {env.iteration + 1}."
+                    f" Best: iter {self.best_iter + 1} ({self.best_score:.6f})"
+                )
+            raise _LgbEarlyStopException(
+                self.best_iter,
+                [("val", "ndcg@1%", self.best_score, True)],
+            )
 
 
 def _split_large_groups(group_sizes: np.ndarray) -> np.ndarray:
@@ -538,16 +599,20 @@ def train_lambdarank(
     params: Dict[str, Any],
     weights: Optional[np.ndarray],
     num_boost_round: int,
+    patience: int = 100,
 ) -> lgb.Booster:
     train_set = lgb.Dataset(X_train, label=y_train, group=_split_large_groups(group_train), weight=weights)
+    # val_set passed for ndcg@90 diagnostic logs (log_evaluation); stopping uses the
+    # custom callback below which monitors true NDCG@1% on full unsplit groups.
     val_set = lgb.Dataset(X_val, label=y_val, group=_split_large_groups(group_val), reference=train_set)
+    early_stop_cb = _TrueNdcg1PctEarlyStop(X_val, y_val, group_val, patience=patience)
     return lgb.train(
         params,
         train_set,
         num_boost_round=num_boost_round,
         valid_sets=[val_set],
         valid_names=["earlystop"],
-        callbacks=[lgb.early_stopping(100), lgb.log_evaluation(50)],
+        callbacks=[lgb.log_evaluation(50), early_stop_cb],
     )
 
 
@@ -556,22 +621,32 @@ def train_binary_lgbm(
     y_train: np.ndarray,
     X_val: np.ndarray,
     y_val: np.ndarray,
+    group_val: np.ndarray,
     params: Dict[str, Any],
     weights: Optional[np.ndarray],
     num_boost_round: int,
+    patience: int = 100,
 ) -> lgb.Booster:
-    """Train binary LightGBM for W8 Stage 2 — no 9K sub-window constraint."""
+    """Train binary LightGBM for W8 Stage 2 — no 9K sub-window constraint.
+
+    y_val should carry graded relevance labels (0–4) so that the early-stopping
+    callback evaluates true NDCG@1% on the same scale as final test evaluation.
+    y_train is binarised internally for the binary log-loss objective.
+    """
     y_tr_bin = (y_train > 0).astype(np.int8)
     y_va_bin = (y_val > 0).astype(np.int8)
     train_set = lgb.Dataset(X_train, label=y_tr_bin, weight=weights)
+    # val_set passed for average_precision diagnostic logs; stopping uses the
+    # custom callback which monitors true NDCG@1% on full unsplit groups.
     val_set = lgb.Dataset(X_val, label=y_va_bin, reference=train_set)
+    early_stop_cb = _TrueNdcg1PctEarlyStop(X_val, y_val, group_val, patience=patience)
     return lgb.train(
         params,
         train_set,
         num_boost_round=num_boost_round,
         valid_sets=[val_set],
         valid_names=["earlystop"],
-        callbacks=[lgb.early_stopping(100), lgb.log_evaluation(50)],
+        callbacks=[lgb.log_evaluation(50), early_stop_cb],
     )
 
 
@@ -706,7 +781,7 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
             f" | scale_pos_weight={scale_pos_weight:.1f}"
         )
         model = train_binary_lgbm(
-            X_tr, y_tr, X_es, y_es, binary_params, year_weights, num_boost_round
+            X_tr, y_tr, X_es, y_es, g_es, binary_params, year_weights, num_boost_round
         )
     else:
         lgb_params = _prepare_lgb_params(best_params, num_threads)
