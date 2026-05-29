@@ -16,5 +16,11 @@ source "$HOME/venvs/master_thesis/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
 export STAGE2_NEG_RATIO=100
-export STAGE2_TUNING_TRIALS=30
-python -u scripts/regions/south_america/4_tuning/model1_tuning_lgbm_stage2
+export STAGE2_TUNING_TRIALS=100
+# W9a: ecoregion-stratified training groups (fixes 9K sub-window mismatch — Issue D)
+# Colombia dev panel: LambdaRank 5.99x (W9a) vs 2.99x (no eco) — decisive improvement
+export STAGE2_ECO_GROUPS=1
+
+echo "Stage 2 LambdaRank tuning — SA full panel (100 trials, W9a eco groups)..."
+srun python -u scripts/regions/south_america/4_tuning/model1_tuning_lgbm_stage2
+echo "SA LambdaRank tuning done."

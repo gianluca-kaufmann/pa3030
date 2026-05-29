@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Stage 1 country-year PA expansion model (Poisson GLM) — South America.
 
-Specification: 13-feature parsimonious Poisson, p95 winsorisation, WDPA lag fix,
-first-difference governance variables (contemporaneous + 1-year lag) +
-dual-accountability interaction + agricultural land fraction + CBD meeting year,
-log1p transformation of momentum/saturation features,
-temporal decay weights (pre-2010 training observations weighted 0.6).
+Specification: 12-feature parsimonious Poisson (CBD-free primary), p95 winsorisation,
+first-difference governance variables (contemporaneous + 1-year lag) + dual-accountability
+interaction + agricultural land fraction, log1p transformation of momentum/saturation
+features, temporal decay weights (pre-2010 training observations weighted 0.6).
 
 Primary evaluation metric: D²_7yr (2017–2023).
   2024 is excluded from the primary metric: WDPA reporting lag confirmed from the
@@ -14,59 +13,41 @@ Primary evaluation metric: D²_7yr (2017–2023).
   predictions against systematically incomplete labels penalises the model unfairly.
   D²_8yr is reported as a secondary metric for completeness.
 
+Primary spec is CBD-free (Issue V):
+  cbd_meeting_year fires on only 2 training instances (2002, 2010) — a coefficient from
+  2 instances is statistically indistinguishable from noise. CBD-inclusive spec is
+  retained as a robustness check. CBD-free spec is more defensible as primary because
+  it has no 2-instance coefficients.
+
 Model selection history (2001–2016 train / 2017–2023 primary test):
   Old (10-feat p90, no-log1p):                     D²_7yr=+0.391  D²_3yr=+0.357
   p90 + log1p:                                     D²_7yr=+0.378  D²_3yr=+0.350
   p90 + log1p + cbd:                               D²_7yr=+0.409  D²_3yr=+0.387
   p95 + log1p (no cbd):                            D²_7yr=+0.442  D²_3yr=+0.529
   p95 + log1p + cbd (11-feat):                     D²_7yr=+0.467  D²_3yr=+0.563
-  p95 + log1p + cbd (11-feat, marine fix):         D²_7yr=+0.368  D²_3yr=+0.403  ← previous
+  p95 + log1p + cbd (11-feat, marine fix):         D²_7yr=+0.368  D²_3yr=+0.403
   + d_legcon_lag1 + decay(0.6):                    D²_7yr=+0.380  D²_3yr=+0.415
   + legcon_x_cspart + decay(0.6):                  D²_7yr=+0.395  D²_3yr=+0.415
-  + d_legcon_lag1 + legcon_x_cspart + decay (this): D²_7yr=+0.399  D²_3yr=+0.428  ← primary
+  + d_legcon_lag1 + legcon_x_cspart + decay:
+    with CBD:    D²_7yr=+0.399  D²_3yr=+0.428  ← CBD robustness
+    without CBD: D²_7yr=+0.389  D²_3yr=+0.415  ← PRIMARY (Issue V)
   Chow break at 2010: F=0.57, p=0.866 (NOT significant)
 
 d_v2xlg_legcon_lag1 (1-year lag of legislative constraint change):
-  PA designation responds to governance changes from the PREVIOUS year, not just
-  the current year. Policy implementation takes 1–2 years: a legislative opening
-  in t-1 feeds PAs into the pipeline; they are designated in t. The negative
-  coefficient captures a "pipeline drainage" effect — governance-driven
-  designations in t-1 leave less pent-up demand in t. This is complementary to
-  the contemporaneous Δv2xlg_legcon signal. LOO: positive for 9/12 countries.
+  Policy implementation delay: a legislative opening in t-1 feeds PAs into the
+  pipeline; they are designated in t. The negative coefficient captures a "pipeline
+  drainage" effect — governance-driven designations in t-1 leave less pent-up demand.
+  LOO: positive for 9/12 countries.
 
 legcon_x_cspart (dual accountability interaction: Δv2xlg_legcon × Δv2csprtcpt):
-  PA designation requires BOTH a legislative opening (institutional capacity to
-  act) AND an active civil society (demand and monitoring). Simultaneous
-  improvement in both channels produces disproportionate designation activity —
-  the interaction captures this co-movement. 25/208 training instances are
-  non-zero (years with co-movement in both governance channels). LOO: positive
-  for 10/12 countries. Bootstrap: 89.5% stable (marginal; the 10.5% instability
-  reflects sensitivity of sparse interaction terms to training perturbation).
-  CBD-free fallback without legcon_x_cspart: D²_7yr≈+0.380.
+  PA designation requires BOTH a legislative opening AND an active civil society.
+  25/208 training instances are non-zero. LOO: positive for 10/12 countries.
+  Bootstrap: 89.5% stable.
 
 Temporal decay weights (pre-2010 = 0.6):
   SA expansion regime shifted ~2010: 2001–2009 saw massive frontier-block
-  designations (100–320K km²/yr) that are structurally different from the test
-  period. Down-weighting pre-2010 training observations to 0.6 reduces the
-  influence of the frontier-exhaustion era without discarding it. Chooses 0.6
-  (not 0.3 or 0.1) so the pre-2010 signal is retained but proportionally less
-  influential. Pairs naturally with the interaction feature.
-
-Governance first differences (v2xlg_legcon, v2csprtcpt):
-  Governance CHANGES, not levels, drive the TIMING of PA designation events.
-  Level-based governance variables introduce temporal drift; first differences are
-  more causally defensible and prevent monotonic over-prediction in 2020–2024.
-
-cbd_meeting_year (CBD COP years: 1994, 2002, 2010, 2018, 2022):
-  International convention years create political urgency for signatory governments.
-  Coefficient +0.12 (modest). CBD-free fallback spec is saved alongside main spec
-  for reviewer requests.
-
-log1p momentum transformation + p95 winsorisation:
-  log1p compresses the highly-skewed BRA 2001–2009 boom values so coefficients
-  generalise to the post-frontier test regime. p95 (cap≈39,662 px) is more
-  permissive than p90 (15,836 px): fewer rows are capped, preserving gradient
-  signal from moderate-expansion years.
+  designations (100–320K km²/yr). Down-weighting pre-2010 observations to 0.6
+  reduces their influence without discarding signal.
 """
 
 from __future__ import annotations
@@ -79,7 +60,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 from sklearn.linear_model import PoissonRegressor
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error, mean_poisson_deviance
 from sklearn.preprocessing import StandardScaler
 
 _ROOT = Path(__file__).resolve().parents[4]
@@ -90,18 +71,15 @@ PANEL_PATH  = _ROOT / "data" / "south_america" / "stage1_panel.parquet"
 VDEM_PATH   = _ROOT / "data" / "shared" / "VDem" / "V-Dem-CY-Core-v15.csv"
 OUT_DIR     = _ROOT / "outputs" / "south_america" / "results" / "ml_models"
 
-TRAIN_YEARS  = (2001, 2016)
-TEST_YEARS   = (2017, 2024)
-PRIMARY_EVAL_END = 2023   # exclude 2024: WDPA reporting lag (panel ~33% of CSV coverage)
-BREAK_YEAR   = 2010
-WINSOR_QUANT = 0.95
-USE_LOG1P    = True
+TRAIN_YEARS      = (2001, 2016)
+TEST_YEARS       = (2017, 2024)
+PRIMARY_EVAL_END = 2023   # exclude 2024: WDPA reporting lag (~33% panel capture)
+BREAK_YEAR       = 2010
+WINSOR_QUANT     = 0.95
+USE_LOG1P        = True
 
-# Temporal decay: downweight pre-2010 frontier-exhaustion training years.
-# Pre-2010 SA expansion (100–320K km²/yr frontier blocks) is structurally
-# different from the test period; 0.6 retains signal while reducing leverage.
 DECAY_BREAK_YEAR = 2010
-DECAY_WEIGHT_PRE = 0.6   # weight for year < DECAY_BREAK_YEAR
+DECAY_WEIGHT_PRE = 0.6
 
 LAG_COLS = [
     "pa_momentum_pixels_lag1",
@@ -109,6 +87,9 @@ LAG_COLS = [
     "pa_momentum_pixels_lag3",
     "pa_cumsum_lag1_pixels",
 ]
+
+# Primary spec: CBD-free 8 political features (Issue V).
+# cbd_meeting_year dropped — only 2 training instances (2002, 2010), not defensible.
 POLITICAL_COLS = [
     "v2x_polyarchy",
     "gdp_growth_lag1",
@@ -116,17 +97,19 @@ POLITICAL_COLS = [
     "d_v2xlg_legcon",
     "d_v2csprtcpt",
     "agricultural_land_pct",
-    "cbd_meeting_year",
-    # New in 13-feat spec (2026-05-27):
-    "d_v2xlg_legcon_lag1",   # 1-yr lag of Δlegislative constraints — implementation delay
-    "legcon_x_cspart",       # Δlegcon × Δcspart — dual accountability interaction
+    "d_v2xlg_legcon_lag1",
+    "legcon_x_cspart",
 ]
-POLITICAL_COLS_NO_CBD = [c for c in POLITICAL_COLS if c != "cbd_meeting_year"]
-# Fallback: no interaction term (for reviewer sensitivity check)
-POLITICAL_COLS_NO_INTERACT = [c for c in POLITICAL_COLS
-                               if c not in ("legcon_x_cspart",)]
+
+# Robustness checks
+POLITICAL_COLS_WITH_CBD = POLITICAL_COLS + ["cbd_meeting_year"]
+POLITICAL_COLS_NO_INTERACT = [c for c in POLITICAL_COLS if c != "legcon_x_cspart"]
 
 VDEM_EXTRA   = ["v2xlg_legcon", "v2csprtcpt"]
+# Level variables needed directly as features (not for diff computation).
+# Loaded alongside VDEM_EXTRA if absent from the panel (happens when vdem_v15.csv
+# is missing sub-index columns and the entire V-Dem merge was skipped in the builder).
+VDEM_LEVEL   = ["v2x_polyarchy"]
 LAG_MASK_COLS = set(LAG_COLS)
 
 
@@ -141,18 +124,19 @@ def _apply_log1p(X: np.ndarray, feat_cols: list[str]) -> np.ndarray:
 
 
 def _merge_vdem_extra(cy: pd.DataFrame) -> pd.DataFrame:
-    if all(c in cy.columns for c in VDEM_EXTRA):
+    needed = [c for c in VDEM_EXTRA + VDEM_LEVEL if c not in cy.columns]
+    if not needed:
         return cy
     if not VDEM_PATH.exists():
         raise FileNotFoundError(f"V-Dem CSV not found at {VDEM_PATH}")
     vdem = pd.read_csv(
         VDEM_PATH,
-        usecols=["country_text_id", "year"] + VDEM_EXTRA,
+        usecols=["country_text_id", "year"] + needed,
         low_memory=False,
     ).rename(columns={"country_text_id": "iso3"})
     cy["iso3"] = cy["iso3"].astype(str)
     cy = cy.merge(vdem, on=["iso3", "year"], how="left")
-    for col in VDEM_EXTRA:
+    for col in needed:
         cy[col] = cy[col].fillna(cy[col].median())
     return cy
 
@@ -162,10 +146,8 @@ def _compute_governance_diffs(cy: pd.DataFrame) -> pd.DataFrame:
     for col in VDEM_EXTRA:
         if col in cy.columns:
             cy[f"d_{col}"] = cy.groupby("iso3")[col].diff()
-    # 1-year lag of the legislative constraint change (policy implementation delay).
     if "d_v2xlg_legcon" in cy.columns:
         cy["d_v2xlg_legcon_lag1"] = cy.groupby("iso3")["d_v2xlg_legcon"].shift(1)
-    # Dual accountability interaction: simultaneous governance co-movement.
     d_leg = cy.get("d_v2xlg_legcon", pd.Series(0.0, index=cy.index)).fillna(0)
     d_csp = cy.get("d_v2csprtcpt",   pd.Series(0.0, index=cy.index)).fillna(0)
     cy["legcon_x_cspart"] = d_leg * d_csp
@@ -173,7 +155,6 @@ def _compute_governance_diffs(cy: pd.DataFrame) -> pd.DataFrame:
 
 
 def _make_decay_weights(train: pd.DataFrame) -> np.ndarray:
-    """Return per-observation sample weights: pre-2010 rows get DECAY_WEIGHT_PRE."""
     w = np.ones(len(train))
     w[train["year"].values < DECAY_BREAK_YEAR] = DECAY_WEIGHT_PRE
     return w
@@ -181,7 +162,6 @@ def _make_decay_weights(train: pd.DataFrame) -> np.ndarray:
 
 def _fit_model(cy: pd.DataFrame, feature_cols: list[str], winsor_q: float,
                use_decay: bool = True) -> tuple:
-    """Fit Poisson + return (model, scaler, winsor_cap)."""
     train = cy[cy["year"].between(*TRAIN_YEARS)].copy()
     X_raw = train[feature_cols].to_numpy(dtype=np.float64)
     y_raw = train["pa_expansion_pixels"].to_numpy(dtype=np.float64)
@@ -196,14 +176,200 @@ def _fit_model(cy: pd.DataFrame, feature_cols: list[str], winsor_q: float,
     return model, scaler, cap, y_raw, X_sc
 
 
-def _d2_window(cy: pd.DataFrame, model, scaler, feature_cols: list[str],
-               y_end: int) -> float | None:
+def _d2_window(cy: pd.DataFrame, model: PoissonRegressor, scaler: StandardScaler,
+               feature_cols: list[str], y_end: int) -> float | None:
     sub = cy[cy["year"].between(TEST_YEARS[0], y_end)]
     if len(sub) == 0:
         return None
     X_raw = sub[feature_cols].fillna(0).to_numpy(dtype=np.float64)
     X_sc  = scaler.transform(_apply_log1p(X_raw, feature_cols))
     return float(model.score(X_sc, sub["pa_expansion_pixels"].to_numpy(dtype=np.float64)))
+
+
+def _poisson_d2_from_preds(y_true: np.ndarray, mu: np.ndarray) -> float:
+    """Poisson D² = 1 - D(y, mu) / D(y, mean(y)). Works with any prediction source."""
+    eps = 1e-10
+    mu = np.clip(mu, eps, None)
+    y_bar = np.full_like(y_true, y_true.mean())
+    y_bar = np.clip(y_bar, eps, None)
+    try:
+        dev_model = float(mean_poisson_deviance(y_true, mu))
+        dev_null  = float(mean_poisson_deviance(y_true, y_bar))
+    except Exception:
+        return float("nan")
+    if dev_null < 1e-12:
+        return 1.0
+    return 1.0 - dev_model / dev_null
+
+
+def _jackknife_test_d2(cy: pd.DataFrame, model: PoissonRegressor, scaler: StandardScaler,
+                       feature_cols: list[str], test_end: int) -> dict:
+    """Leave-one-test-year-out jackknife CI for D² over TEST_YEARS[0]–test_end (Issue Q)."""
+    test_years = list(range(TEST_YEARS[0], test_end + 1))
+    loo_d2s: list[float] = []
+    for left_out in test_years:
+        sub = cy[
+            cy["year"].between(TEST_YEARS[0], test_end) & (cy["year"] != left_out)
+        ]
+        if len(sub) < 2:
+            continue
+        X = scaler.transform(_apply_log1p(
+            sub[feature_cols].fillna(0).to_numpy(dtype=np.float64), feature_cols
+        ))
+        y = sub["pa_expansion_pixels"].to_numpy(dtype=np.float64)
+        loo_d2s.append(float(model.score(X, y)))
+
+    if len(loo_d2s) < 2:
+        return {}
+
+    n = len(loo_d2s)
+    arr = np.array(loo_d2s)
+    mean_loo = float(arr.mean())
+    # Jackknife variance: (n-1)/n * sum((theta_{-i} - theta_bar)^2)
+    var_jk = (n - 1) / n * float(np.sum((arr - mean_loo) ** 2))
+    se_jk = float(np.sqrt(var_jk))
+    t_crit = float(stats.t.ppf(0.975, df=n - 1))
+    half = t_crit * se_jk
+
+    return {
+        "loo_d2_per_year": {
+            str(y): round(v, 4) for y, v in zip(test_years, loo_d2s)
+        },
+        "jackknife_mean_d2": round(mean_loo, 4),
+        "jackknife_se": round(se_jk, 4),
+        "ci_95_lower": round(mean_loo - half, 4),
+        "ci_95_upper": round(mean_loo + half, 4),
+        "n_folds": n,
+        "note": (
+            f"LOO jackknife over {TEST_YEARS[0]}–{test_end}. "
+            "D²_loo is the full test-set D² with one year dropped."
+        ),
+    }
+
+
+def _nb_robustness(cy: pd.DataFrame, feature_cols: list[str],
+                   winsor_q: float) -> dict:
+    """Negative Binomial GLM robustness (Issue R). Same features/split/winsor as primary.
+
+    Evaluates NB predictions using Poisson D² so the metric is directly comparable
+    to the Poisson GLM. NB allows Var = mu + alpha*mu² vs. Poisson Var = mu.
+    If NB D²_7yr ≈ Poisson D²_7yr, over-dispersion is not distorting results.
+    """
+    try:
+        import statsmodels.api as sm
+    except ImportError:
+        return {"skipped": "statsmodels not installed"}
+
+    train = cy[cy["year"].between(*TRAIN_YEARS)].copy()
+    X_raw = train[feature_cols].to_numpy(dtype=np.float64)
+    y_raw = train["pa_expansion_pixels"].to_numpy(dtype=np.float64)
+    X_t   = _apply_log1p(X_raw, feature_cols)
+    cap   = float(np.quantile(y_raw, winsor_q))
+    y_fit = np.minimum(y_raw, cap)
+
+    scaler = StandardScaler()
+    X_sc   = scaler.fit_transform(X_t)
+    # Prepend intercept column — consistent with test data below.
+    X_sc_c = np.column_stack([np.ones(len(X_sc)), X_sc])
+
+    try:
+        nb_res = sm.GLM(
+            y_fit, X_sc_c,
+            family=sm.families.NegativeBinomial(),
+        ).fit(disp=False)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+    out: dict = {
+        "note": (
+            "NB fitted without decay weights (Issue R robustness only — not production). "
+            "D² computed as Poisson D² applied to NB predictions for fair comparison."
+        ),
+    }
+    try:
+        # alpha (dispersion) — statsmodels NB stores it as scale attribute
+        out["nb_alpha_estimated"] = round(float(nb_res.scale), 6)
+    except Exception:
+        pass
+
+    for end_yr, key in [
+        (2019, "d2_3yr"),
+        (PRIMARY_EVAL_END, "d2_7yr_PRIMARY"),
+        (2024, "d2_8yr"),
+    ]:
+        sub = cy[cy["year"].between(TEST_YEARS[0], end_yr)]
+        if len(sub) == 0:
+            continue
+        X_sub = scaler.transform(
+            _apply_log1p(sub[feature_cols].fillna(0).to_numpy(dtype=np.float64), feature_cols)
+        )
+        X_sub_c = np.column_stack([np.ones(len(X_sub)), X_sub])
+        mu = np.clip(nb_res.predict(X_sub_c), 1e-9, None)
+        y_sub = sub["pa_expansion_pixels"].to_numpy(dtype=np.float64)
+        out[key] = round(_poisson_d2_from_preds(y_sub, mu), 4)
+
+    return out
+
+
+def _country_fe_sensitivity(cy: pd.DataFrame, feature_cols: list[str],
+                             winsor_q: float) -> dict:
+    """Poisson with country fixed effects (Issue U). Compare D²_7yr with and without FE.
+
+    SA has 12 countries — adding 11 dummies to 12 features gives 23 features on
+    ~192 training observations. If FE collapse OOS D², that justifies excluding them
+    (FE cannot generalise to new countries; cross-regional transfer requires no FE).
+    """
+    train = cy[cy["year"].between(*TRAIN_YEARS)].copy()
+
+    # Build country dummy matrix (drop one as reference; record which)
+    countries_sorted = sorted(train["iso3"].unique())
+    ref_country = countries_sorted[0]
+    dummy_cols = [f"fe_{c}" for c in countries_sorted[1:]]
+
+    def _make_fe(df: pd.DataFrame) -> np.ndarray:
+        fe = np.zeros((len(df), len(dummy_cols)), dtype=np.float64)
+        for j, c in enumerate(countries_sorted[1:]):
+            fe[:, j] = (df["iso3"].values == c).astype(np.float64)
+        return fe
+
+    X_raw = train[feature_cols].to_numpy(dtype=np.float64)
+    X_t   = _apply_log1p(X_raw, feature_cols)
+    y_raw = train["pa_expansion_pixels"].to_numpy(dtype=np.float64)
+    cap   = float(np.quantile(y_raw, winsor_q))
+    y_fit = np.minimum(y_raw, cap)
+
+    X_aug = np.hstack([X_t, _make_fe(train)])
+    scaler_fe = StandardScaler()
+    X_sc  = scaler_fe.fit_transform(X_aug)
+    sw    = _make_decay_weights(train)
+
+    model_fe = PoissonRegressor(alpha=1.0, max_iter=1000)
+    model_fe.fit(X_sc, y_fit, sample_weight=sw)
+
+    out: dict = {
+        "n_country_fe": len(dummy_cols),
+        "reference_country": ref_country,
+        "note": (
+            "Country FE sensitivity: 11 country dummies + 12 primary features. "
+            "If FE collapse OOS D², this justifies the no-FE primary spec "
+            "(FE cannot generalise to new countries in cross-region transfer)."
+        ),
+    }
+    for end_yr, key in [
+        (2019, "d2_3yr"),
+        (PRIMARY_EVAL_END, "d2_7yr_PRIMARY"),
+        (2024, "d2_8yr"),
+    ]:
+        sub = cy[cy["year"].between(TEST_YEARS[0], end_yr)]
+        if len(sub) == 0:
+            continue
+        X_sub_raw = sub[feature_cols].fillna(0).to_numpy(dtype=np.float64)
+        X_sub_aug = np.hstack([_apply_log1p(X_sub_raw, feature_cols), _make_fe(sub)])
+        X_sub_sc  = scaler_fe.transform(X_sub_aug)
+        y_sub = sub["pa_expansion_pixels"].to_numpy(dtype=np.float64)
+        out[key] = round(float(model_fe.score(X_sub_sc, y_sub)), 4)
+
+    return out
 
 
 def _chow_test(cy: pd.DataFrame, feature_cols: list[str], break_year: int) -> dict:
@@ -228,12 +394,11 @@ def _chow_test(cy: pd.DataFrame, feature_cols: list[str], break_year: int) -> di
 
 
 def _sensitivity_table(cy: pd.DataFrame) -> list[dict]:
-    """Run sensitivity grid (winsor × CBD × interact) and return rows for output JSON."""
     rows = []
     for q in [0.90, 0.95, 0.97]:
         for use_cbd in [False, True]:
             for use_interact in [False, True]:
-                base = POLITICAL_COLS if use_cbd else POLITICAL_COLS_NO_CBD
+                base = POLITICAL_COLS_WITH_CBD if use_cbd else POLITICAL_COLS
                 if not use_interact:
                     base = [c for c in base if c != "legcon_x_cspart"]
                 feat_cols = [c for c in LAG_COLS + base if c in cy.columns]
@@ -261,56 +426,67 @@ def main() -> None:
     cy = _merge_vdem_extra(cy)
     cy = _compute_governance_diffs(cy)
 
-    # ── Primary spec (with CBD) ───────────────────────────────────────────────
+    # ── PRIMARY spec: CBD-free 12-feat (Issue V) ──────────────────────────────
     feature_cols = [c for c in LAG_COLS + POLITICAL_COLS if c in cy.columns]
     cy[feature_cols] = cy[feature_cols].fillna(0)
 
     model, scaler, winsor_cap, y_train_raw, X_train = _fit_model(cy, feature_cols, WINSOR_QUANT)
 
-    d2_train = float(model.score(X_train, y_train_raw))
-    mu_train = np.clip(model.predict(X_train), 1e-9, None)
+    d2_train  = float(model.score(X_train, y_train_raw))
+    mu_train  = np.clip(model.predict(X_train), 1e-9, None)
     rmse_train = float(np.sqrt(mean_squared_error(y_train_raw, mu_train)))
 
     test = cy[cy["year"].between(*TEST_YEARS)].copy()
     X_test_raw = test[feature_cols].to_numpy(dtype=np.float64)
     X_test     = scaler.transform(_apply_log1p(X_test_raw, feature_cols))
     y_test     = test["pa_expansion_pixels"].to_numpy(dtype=np.float64)
-    d2_test_8yr  = float(model.score(X_test, y_test))
-    mu_test      = np.clip(model.predict(X_test), 1e-9, None)
-    rmse_test    = float(np.sqrt(mean_squared_error(y_test, mu_test)))
 
     d2_test_3yr  = _d2_window(cy, model, scaler, feature_cols, 2019)
     d2_test_6yr  = _d2_window(cy, model, scaler, feature_cols, 2022)
     d2_test_7yr  = _d2_window(cy, model, scaler, feature_cols, PRIMARY_EVAL_END)
+    d2_test_8yr  = float(model.score(X_test, y_test))
+    mu_test      = np.clip(model.predict(X_test), 1e-9, None)
+    rmse_test    = float(np.sqrt(mean_squared_error(y_test, mu_test)))
 
-    # ── CBD-free fallback spec ────────────────────────────────────────────────
-    feat_no_cbd = [c for c in LAG_COLS + POLITICAL_COLS_NO_CBD if c in cy.columns]
-    cy[feat_no_cbd] = cy[feat_no_cbd].fillna(0)
-    m_fb, sc_fb, _, y_tr_fb, X_tr_fb = _fit_model(cy, feat_no_cbd, WINSOR_QUANT)
-    fallback = {
-        "spec": "no_cbd_fallback",
-        "features": feat_no_cbd,
-        "d2_train": round(float(m_fb.score(X_tr_fb, y_tr_fb)), 4),
-        "d2_7yr":   round(_d2_window(cy, m_fb, sc_fb, feat_no_cbd, PRIMARY_EVAL_END) or 0, 4),
-        "d2_3yr":   round(_d2_window(cy, m_fb, sc_fb, feat_no_cbd, 2019) or 0, 4),
-        "d2_8yr":   round(_d2_window(cy, m_fb, sc_fb, feat_no_cbd, 2024) or 0, 4),
+    # ── Jackknife CI on primary 7yr test window (Issue Q) ────────────────────
+    jackknife_7yr = _jackknife_test_d2(cy, model, scaler, feature_cols, PRIMARY_EVAL_END)
+
+    # ── Negative Binomial robustness (Issue R) ───────────────────────────────
+    nb_robustness = _nb_robustness(cy, feature_cols, WINSOR_QUANT)
+
+    # ── Country FE sensitivity (Issue U) ────────────────────────────────────
+    country_fe = _country_fe_sensitivity(cy, feature_cols, WINSOR_QUANT)
+
+    # ── CBD robustness spec (Issue V complement) ─────────────────────────────
+    feat_cbd = [c for c in LAG_COLS + POLITICAL_COLS_WITH_CBD if c in cy.columns]
+    cy[feat_cbd] = cy[feat_cbd].fillna(0)
+    m_cbd, sc_cbd, _, y_tr_cbd, X_tr_cbd = _fit_model(cy, feat_cbd, WINSOR_QUANT)
+    cbd_robustness = {
+        "spec": "cbd_inclusive_robustness",
+        "features": feat_cbd,
+        "d2_train": round(float(m_cbd.score(X_tr_cbd, y_tr_cbd)), 4),
+        "d2_7yr":   round(_d2_window(cy, m_cbd, sc_cbd, feat_cbd, PRIMARY_EVAL_END) or 0, 4),
+        "d2_3yr":   round(_d2_window(cy, m_cbd, sc_cbd, feat_cbd, 2019) or 0, 4),
+        "d2_8yr":   round(_d2_window(cy, m_cbd, sc_cbd, feat_cbd, 2024) or 0, 4),
+        "note": "cbd_meeting_year included. 2 training instances (2002, 2010). Robustness only.",
         "coefficients": {n: round(float(c), 4)
-                         for n, c in zip(feat_no_cbd, m_fb.coef_.ravel())},
+                         for n, c in zip(feat_cbd, m_cbd.coef_.ravel())},
     }
-    # ── No-interaction fallback (for reviewer sensitivity check) ─────────────
-    feat_no_int = [c for c in LAG_COLS + POLITICAL_COLS_NO_INTERACT if c in cy.columns]
-    cy[feat_no_int] = cy[feat_no_int].fillna(0)
-    m_ni, sc_ni, _, y_tr_ni, X_tr_ni = _fit_model(cy, feat_no_int, WINSOR_QUANT)
-    fallback_no_interact = {
-        "spec": "no_interact_fallback",
-        "features": feat_no_int,
+
+    # ── No-interaction robustness ─────────────────────────────────────────────
+    feat_ni = [c for c in LAG_COLS + POLITICAL_COLS_NO_INTERACT if c in cy.columns]
+    cy[feat_ni] = cy[feat_ni].fillna(0)
+    m_ni, sc_ni, _, y_tr_ni, X_tr_ni = _fit_model(cy, feat_ni, WINSOR_QUANT)
+    no_interact_robustness = {
+        "spec": "no_interact_robustness",
+        "features": feat_ni,
         "d2_train": round(float(m_ni.score(X_tr_ni, y_tr_ni)), 4),
-        "d2_7yr":   round(_d2_window(cy, m_ni, sc_ni, feat_no_int, PRIMARY_EVAL_END) or 0, 4),
-        "d2_3yr":   round(_d2_window(cy, m_ni, sc_ni, feat_no_int, 2019) or 0, 4),
-        "d2_8yr":   round(_d2_window(cy, m_ni, sc_ni, feat_no_int, 2024) or 0, 4),
+        "d2_7yr":   round(_d2_window(cy, m_ni, sc_ni, feat_ni, PRIMARY_EVAL_END) or 0, 4),
+        "d2_3yr":   round(_d2_window(cy, m_ni, sc_ni, feat_ni, 2019) or 0, 4),
+        "d2_8yr":   round(_d2_window(cy, m_ni, sc_ni, feat_ni, 2024) or 0, 4),
         "note": "legcon_x_cspart dropped; d_v2xlg_legcon_lag1 retained. LOO: positive 9/12.",
         "coefficients": {n: round(float(c), 4)
-                         for n, c in zip(feat_no_int, m_ni.coef_.ravel())},
+                         for n, c in zip(feat_ni, m_ni.coef_.ravel())},
     }
 
     chow = _chow_test(cy, feature_cols, BREAK_YEAR)
@@ -320,7 +496,8 @@ def main() -> None:
     result = {
         "region": "south_america",
         "model": "poisson_glm",
-        "spec": "parsimonious_13feat_delta_gov_lag_interact_decay_winsorised_log1p_cbd",
+        "spec": "parsimonious_12feat_cbd_free_delta_gov_lag_interact_decay_winsorised_log1p",
+        "spec_note": "Primary spec is CBD-free (Issue V). cbd_meeting_year has 2 training instances.",
         "alpha": 1.0,
         "winsor_quantile": WINSOR_QUANT,
         "winsor_cap_pixels": winsor_cap,
@@ -337,7 +514,7 @@ def main() -> None:
             "D²_7yr (2017–2023) is the primary reported metric."
         ),
         "n_train": int(len(cy[cy["year"].between(*TRAIN_YEARS)])),
-        "n_test":  int(len(test)),
+        "n_test": int(len(test)),
         "pseudo_r2_d2_train": d2_train,
         "pseudo_r2_d2_test_3yr": d2_test_3yr,
         "pseudo_r2_d2_test_6yr": d2_test_6yr,
@@ -351,15 +528,19 @@ def main() -> None:
         "intercept": float(model.intercept_),
         "scaler_mean":  {n: float(m) for n, m in zip(feature_cols, scaler.mean_)},
         "scaler_scale": {n: float(s) for n, s in zip(feature_cols, scaler.scale_)},
-        "cbd_free_fallback": fallback,
-        "no_interact_fallback": fallback_no_interact,
+        "jackknife_ci_7yr": jackknife_7yr,
+        "nb_robustness": nb_robustness,
+        "country_fe_sensitivity": country_fe,
+        "cbd_robustness": cbd_robustness,
+        "no_interact_robustness": no_interact_robustness,
         "sensitivity_grid": sens,
         **chow,
     }
     out_path = OUT_DIR / "model1_expansion_coefficients.json"
     out_path.write_text(json.dumps(result, indent=2))
 
-    print("Stage 1 Poisson GLM — South America (13-feat: Δgov+lag+interact+agri+cbd, p95, log1p, decay)")
+    print("Stage 1 Poisson GLM — South America (12-feat CBD-free: Δgov+lag+interact+agri, p95, log1p, decay)")
+    print(f"  Spec: PRIMARY = CBD-free (Issue V). CBD-inclusive retained as robustness check.")
     print(f"  Features ({len(feature_cols)}): {feature_cols}")
     print(f"  Winsor cap: {winsor_cap:.0f} px (p{int(WINSOR_QUANT*100)})")
     print(f"  Decay weights: pre-{DECAY_BREAK_YEAR} = {DECAY_WEIGHT_PRE}")
@@ -367,11 +548,26 @@ def main() -> None:
     print(f"  Train D²: {d2_train:.4f}  RMSE: {rmse_train:.0f}  (n={result['n_train']})")
     print(f"  Test  D² (3yr 2017–2019): {d2_test_3yr:.4f}")
     print(f"  Test  D² (7yr 2017–2023): {d2_test_7yr:.4f}  ← PRIMARY")
-    print(f"  Test  D² (8yr 2017–2024): {d2_test_8yr:.4f}  ← secondary (incl. WDPA-lag 2024)")
+    print(f"  Test  D² (8yr 2017–2024): {d2_test_8yr:.4f}  ← secondary")
+    if jackknife_7yr:
+        jk = jackknife_7yr
+        print(f"  Jackknife 7yr CI: mean={jk['jackknife_mean_d2']:.4f} "
+              f"[{jk['ci_95_lower']:.4f}, {jk['ci_95_upper']:.4f}] "
+              f"(SE={jk['jackknife_se']:.4f})")
+        per_yr = jk.get("loo_d2_per_year", {})
+        print(f"  LOO D² per year: {per_yr}")
     if chow:
         print(f"  Chow break at {BREAK_YEAR}: F={chow['chow_f_stat']:.2f}  p={chow['chow_p_value']:.4f}")
-    print(f"  CBD-free fallback:  D²_7yr={fallback['d2_7yr']:.4f}  D²_3yr={fallback['d2_3yr']:.4f}")
-    print(f"  No-interact fallback: D²_7yr={fallback_no_interact['d2_7yr']:.4f}  D²_3yr={fallback_no_interact['d2_3yr']:.4f}")
+    print(f"  CBD robustness (with CBD): D²_7yr={cbd_robustness['d2_7yr']:.4f}  D²_3yr={cbd_robustness['d2_3yr']:.4f}")
+    print(f"  No-interact robustness:   D²_7yr={no_interact_robustness['d2_7yr']:.4f}  D²_3yr={no_interact_robustness['d2_3yr']:.4f}")
+    if "d2_7yr_PRIMARY" in nb_robustness:
+        print(f"  NB robustness (Issue R):  D²_7yr={nb_robustness['d2_7yr_PRIMARY']:.4f}  "
+              f"alpha={nb_robustness.get('nb_alpha_estimated', 'N/A')}")
+    else:
+        print(f"  NB robustness: {nb_robustness}")
+    if "d2_7yr_PRIMARY" in country_fe:
+        print(f"  Country FE sensitivity:   D²_7yr={country_fe['d2_7yr_PRIMARY']:.4f}  "
+              f"(vs primary {d2_test_7yr:.4f}; FE adds {country_fe['n_country_fe']} dummies)")
     print()
     print("  Sensitivity grid (winsor × CBD × interact, metric = D²_7yr):")
     print(f"  {'spec':<35} | train  |  3yr   |  7yr (primary) |  8yr")

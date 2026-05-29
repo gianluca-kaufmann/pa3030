@@ -21,6 +21,8 @@ export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 # STAGE2_TRUNCATION_LEVEL intentionally absent — use the value from best_params.json
 # found by the [50,3000] re-tune.  Override removed 2026-05-25.
 export STAGE2_NEG_RATIO=100
+# W9a: ecoregion-stratified training groups (fixes 9K sub-window mismatch — Issue D)
+export STAGE2_ECO_GROUPS=1
 
 echo "Starting model1_LGBM_stage2..."
 srun --cpu-bind=cores --distribution=block:block python -u \

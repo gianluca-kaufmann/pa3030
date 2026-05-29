@@ -8,6 +8,39 @@
 
 ---
 
+## STRATEGY: Colombia-First Until Publication Bar Met
+
+**ALL development happens on Colombia (~7M pixel-years) until the model hits the publication bar.
+No continental re-tunes, no SA/SEA/USA reruns, no new regions — until Colombia is done.**
+
+Rationale: 6× Lift@1% is not publishable in a tier-A journal. A reviewer will ask why they should believe the model can identify where 30×30 expansion will actually land. We need a result that speaks for itself. Continental runs take 2 days per iteration; Colombia runs in hours. Every architectural decision, every new feature, every issue resolution gets proved on Colombia first, then replicated.
+
+### Publication Bar (non-negotiable before continental scale)
+
+**Primary target: Recall@5% ≥ 90% within Colombia expansion groups (test years 2017–2024)**
+
+Operational meaning: Take the top 5% of ranked pixels within each Colombia expansion country-year. That slice must contain ≥90% of all pixels that actually became protected areas. This is the claim that matters for a transition-risk tool — *"our model identifies a small area of land that captures 90% of future PA designations."*
+
+Supporting thresholds (all must hold before scale-up):
+- Lift@1% ≥ 15× (currently 5.99× — must roughly 2.5× improve)
+- Recall@5% ≥ 90% (primary new bar)
+- Recall@1% ≥ 50% (stretch: capturing half of all PAs in top 1% of ranked pixels)
+- Bootstrap 95% CI on Lift@1% must not include 1× (currently wide — CI must tighten)
+
+These numbers define "done." If we cannot reach them on Colombia's 7M rows with the right features, the model cannot be published in a tier-A journal.
+
+### Why 6× Lift Is Not Enough
+
+6× Lift@1% means: in the top 1% of ranked pixels (within expansion groups), we capture ~6× more PAs than random. At ~1-3% positive rate within expansion groups, this translates to Precision@1% ≈ 6–18%. Recall@1% ≈ 5–18% of all PAs. A reviewer will ask: *"You miss 80–95% of actual designations — how is this a transition risk tool?"* The answer must be a much stronger recall at a policy-relevant threshold.
+
+### Data Paths (Local Sync Reference)
+
+- **Colombia Stage 2 panel** (3.9 GB, syncable): `euler:/cluster/scratch/gikaufmann/data/dev/south_america/ml/main/{train,earlystop,test}.parquet`
+- **SA merged_panel_final.parquet** (57 GB, Euler-only): `/cluster/scratch/gikaufmann/data/south_america/ml/merged_panel_final.parquet`
+- **Stage 1 panel** (35 KB, already in repo): `data/south_america/stage1_panel.parquet` → run `model1_expansion.py` locally to verify D² numbers without syncing the 57 GB file. If you distrust the expansion counts themselves, sync the 57 GB file and re-run `stage1_data_builder.py` first.
+
+---
+
 ## Architecture
 
 ```
@@ -28,27 +61,85 @@ Train 2001–2013 | Early-stop 2014–2016 | Test 2017–2024.
 
 ---
 
-## Current Key Numbers ⚠️ Preliminary — SA re-train on new panel pending; SEA+USA FE in queue
+## Current Key Numbers ⚠️ SA Stage 1 updated on corrected panel (2026-05-29); Stage 2 re-tune in progress
 
 | Region | Stage 1 D² | Stage 2 Lift@1% | Status |
 |---|---|---|---|
-| SA | **+0.399** (7yr PRIMARY 2017–23) / +0.428 (3yr) / +0.377 (8yr) | 4.95× LambdaRank (8yr 2017–24, intermediate) | Improvements incoming |
-| SEA | **+0.290** (6yr PRIMARY 2017–22) / +0.399 (3yr) / +0.208 (8yr) | **12.7×** LambdaRank | FE re-run pending; SEA is currently the stronger Stage 2 result |
+| SA | **+0.345** (7yr PRIMARY 2017–23, CBD-free, corrected panel) / +0.448 (3yr) / +0.309 (8yr). JK CI: [−0.155, +0.817] (SE=0.199). CBD robustness D²=+0.334. Country-FE sensitivity D²=−0.373 (FE collapses OOS → no-FE justified). | 5.99× LambdaRank (Colombia dev, W9a, Issue N+D fix). Full SA re-tune pending. | LambdaRank selected; submit SA re-tune 2026-05-29 |
+| SEA | **−1.001** (6yr PRIMARY 2017–22, corrected panel) ⚠️ FINDING: regime shift (VNM/MMR dominate training → KHM/LAO dominate test). KHM: 226→26,691→0 px/yr. Old +0.290 was on contaminated labels. Paper: SEA Stage 1 is path-dependent (like USA). | **12.7×** LambdaRank (old panel) — update after FE re-run | SEA Stage 2 re-tune pending; Stage 1 = path-dependency finding |
 | USA | −3.14 (8yr, trend-only) | TBD | Path-dependency finding; Stage 2 deprioritised |
 
-SA naive baseline (dist_wdpa only): 2.81× on 8yr test (2017–24). All numbers will update after next improvements + FE re-runs.
+SA naive baseline (dist_wdpa only): 2.81× on 8yr test (2017–24).
+
+**W9a impact on Colombia dev panel**: LambdaRank 2.99× (no eco) → 5.99× (W9a eco groups). Binary 4.38× (no W9a) → 3.04× (W9a irrelevant for binary). LambdaRank with W9a is the decisive winner.
+
+**SEA Stage 1 regime-shift finding**: KHM expansion 226 px (2015) → 26,691 px (2016) → near-zero by 2018. LAO: ~0 in training → 9,898 px (2019) spike. MYS: 27K training → 0 test. These one-off political decisions are structurally unpredictable from momentum features, explaining D²<0.
+
+---
+
+## Colombia Feature Sprint — Path to 90%+ Recall
+
+**Current features (~60) are insufficient.** 6× Lift@1% tells us the model captures geographic patterns of past protection but cannot reliably identify the specific parcels that will be designated next. We need features that encode *intent* and *incentive* — not just geography. Below is the priority order for new Colombia-specific features and architecture experiments.
+
+### Tier 1 — Highest Expected Impact (run first, all on Colombia)
+
+1. **Key Biodiversity Areas (KBAs)** — IUCN's formal list of sites that qualify for PA designation. These are the places conservation organisations are actively trying to protect. `is_kba` binary + `dist_kba`. Source: BirdLife International KBA shapefile (free download). Expected: top-1 SHAP on Colombia.
+
+2. **REDD+ project boundaries (Verra / Gold Standard)** — Active carbon credit projects tied to avoided deforestation. These are precise polygon boundaries from the Verra registry (public). Designation of these pixels is financially incentivised. `dist_redd_project`, `in_redd_project`. Source: Verra API / Verra project search for Colombia.
+
+3. **Indigenous territory boundaries (RAISG)** — RAISG AMAZONAS has polygon boundaries for all formally recognised and proposed indigenous territories in SA. Many of Colombia's new PAs are indigenous resguardos converted to PNNs. `dist_indigenous_territory`, `in_indigenous_territory`. Source: RAISG (already partially available as `dist_indigenous` but polygon overlap is missing).
+
+4. **ESA CCI Biomass / GEDI AGBD (carbon stocks)** — Above-ground biomass in tonnes/ha. High-carbon-stock pixels are financially valuable to protect via REDD+/VCM. Already in Data Sprint. Source: ESA Climate Office (CCI Biomass v4 at 300m) or GEDI L4A.
+
+5. **PA network connectivity gap score** — For each unprotected pixel, compute the increase in PA network connectivity if it were designated (graph distance reduction in PA network). Pixels that would "bridge" PA clusters are disproportionately targeted. Simple version: count of unprotected pixels connecting two PA clusters within 5km. Source: derived from WDPA spatial index.
+
+### Tier 2 — High Impact (Colombia after Tier 1 proven)
+
+6. **Colombia RUNAP / PNN expansion proposals** — Colombia's Registro Único Nacional de Áreas Protegidas and Parques Nacionales Naturales have formal expansion boundaries (buffer zones, corridor plans). These are the literal government pipeline. Source: SIAC/IDEAM open data portal (datos.gov.co).
+
+7. **Deforestation threat proximity** — Distance to active deforestation frontier (Hansen GFC tree-cover loss, most recent 3 years). Pixels adjacent to deforestation fronts near existing PAs are frequently designated to "protect" the edge. Source: Hansen GFC (already partially used but not as a lag feature).
+
+8. **Watershed / water tower importance** — Colombia's Estrategia Nacional de Cuencas prioritises hydrological corridors. `in_priority_watershed` binary from IDEAM. Source: IDEAM open GIS.
+
+9. **Ecoregion protection gap** — Within each WWF ecoregion, fraction of area already protected. Underprotected ecoregions that intersect with existing policy targets get faster designation. `ecoregion_protection_gap` = 1 - current_pct_protected.
+
+10. **IUCN species richness / endemism** — Number of threatened species with confirmed occurrence in each pixel. Source: IUCN Red List spatial data (requires licence; GBIF as proxy).
+
+### Tier 3 — Architecture Experiments (after features exhausted)
+
+11. **neg_ratio=full for Colombia training** — Issue X: with Colombia panel at 3.9 GB, LambdaRank may be trainable on full groups without neg_ratio subsampling. Test neg_ratio ∈ {100, 200, full}. Gradient distortion at neg_ratio=100 may be masking 2–3× lift improvement.
+
+12. **Survival model framing** — Replace binary per-year label with time-to-designation. Use Cox proportional hazards or discrete-time hazard. This collapses the label noise from "unprotected in year t but will be in t+3" into a proper right-censored outcome. LightGBM supports Cox via `objective=mape` on survival — or use scikit-survival.
+
+13. **Spatial lag features** — For each pixel, compute fraction of pixels within 1km, 5km, 10km rings that became PA in the prior year. This is a rolling spatial contagion signal that the current `spatial_smoothing` feature approximates but doesn't capture at multiple scales.
+
+14. **XGBoost rank:ndcg (no 9K ceiling)** — LightGBM's 9K query ceiling forced the W9a eco-group workaround (Issue D+S). XGBoost `rank:ndcg` has no ceiling; training on full `(country_id, year)` groups gives true gradient signals. If Lift@1% improves on Colombia, this resolves Issue S scientifically.
+
+### Feature Engineering Process
+
+For each Tier 1–2 feature on Colombia:
+1. Extract raster → resample to 1km EPSG:3857 → add column to Colombia panel
+2. Re-run Stage 2 tuning (30 trials) → retrain → report Lift@1% and Recall@5%
+3. SHAP importance check: does the new feature rank top-5?
+4. If yes → keep. If no → document and move on.
+
+Track progress in a `feature_ablation_colombia.json` in `outputs/south_america/results/`.
 
 ---
 
 ## Stage 1 Current Specs
 
-**SA — 13 features, Poisson α=1, p95 winsor, log1p momentum, pre-2010 decay=0.6**
-Momentum (log1p): lag1/2/3, cumsum_lag1 | Political levels: v2x_polyarchy (+0.62), gdp_growth_lag1 (+0.33), redd_plus_enrolled (−0.16) | First differences: Δv2xlg_legcon (≈0), Δv2csprtcpt (+0.09), Δv2xlg_legcon_lag1 (−0.11, 1-yr policy lag) | Interaction: legcon_x_cspart = Δlegcon×Δcspart (+0.05) | Land constraint: agricultural_land_pct (−0.16) | Policy cycle: cbd_meeting_year (+0.12, robustness check only — 2 training instances)
+**SA — 12 features (CBD-free primary, Issue V), Poisson α=1, p95 winsor, log1p momentum, pre-2010 decay=0.6**
+Momentum (log1p): lag1/2/3, cumsum_lag1 | Political levels: v2x_polyarchy, gdp_growth_lag1, redd_plus_enrolled | First differences: Δv2xlg_legcon, Δv2csprtcpt, Δv2xlg_legcon_lag1 | Interaction: legcon_x_cspart | Land constraint: agricultural_land_pct
+Corrected panel (2026-05-29): D²_7yr=**+0.345** PRIMARY / D²_3yr=+0.448 / D²_8yr=+0.309.
+Jackknife 7yr CI: [−0.155, +0.817] (SE=0.199) — wide CI reflects genuine year-to-year variability.
+CBD robustness D²=+0.334 (CBD-free marginally better). No-interact D²=+0.347 (≈same — interaction marginal on new panel).
+Country FE sensitivity D²=−0.373 (FE collapses OOS; no-FE justified for cross-regional transfer).
+NB robustness: statsmodels not installed in venv (run on Euler when available).
 
-CBD-free fallback D²_7yr=+0.389. No-interact fallback D²_7yr=+0.380. Chow p=0.858 (break non-significant — was lag-init artefact).
-
-**SEA — 10 features, Poisson α=1, no decay**
-Same momentum | v2x_polyarchy (−0.35 — authoritarian states expand more in SEA; sign reversal vs SA is a paper finding) | gdp_growth_lag1, redd_plus_enrolled | Δv2xlg_legcon, Δv2csprtcpt | legcon_x_cspart
+**SEA — 10 features (same momentum + v2x_polyarchy + Δgov), Poisson α=1, no decay**
+Corrected panel (2026-05-29): D²_6yr=**−1.001** PRIMARY ⚠️. Regime shift finding (see key numbers above).
+Old +0.290 was on contaminated labels (4.2–5.9% non-Designated in training years 2000–2015).
 
 **USA — 4 momentum features, α=10, trend-only**
 Negative OOS D² = political path-dependency finding (Obama-era expansion pattern collapses under Trump).
@@ -146,9 +237,11 @@ Stage 2 features (dist_wdpa, spatial smoothing) and labels (cluster-based releva
 
 ---
 
-## Dev Environment (Colombia Fast-Iteration Panel)
+## Dev Environment (Colombia — Primary Development Environment)
 
-**Purpose**: Full SA Stage 2 tuning takes ~2 days per run — too slow for architectural iteration. Colombia-only subset (~7M vs 350M rows) runs in hours.
+**Purpose**: Colombia (~7M pixel-years, 3.9 GB panel) is now the PRIMARY development environment, not just a fast-iteration debugging aid. All new features, architectural experiments, and issue resolutions are built and validated on Colombia first. SA/SEA/USA continental runs are paused until Colombia hits the publication bar (Recall@5% ≥ 90%).
+
+Full SA Stage 2 tuning takes ~2 days per run — Colombia runs in hours. This iteration speed is essential for the Feature Sprint (Tier 1–3 above).
 
 **Design**: Filter SA Stage 2 splits (train/earlystop/test) to Colombia `country_iso3=COL` → `data/dev/south_america/ml/main/`. Set `STAGE2_DATA_ROOT` to redirect data loading and `STAGE2_OUTPUT_DIR` to isolate best_params.json. Zero production code changes; model/metrics outputs go to standard paths with timestamps (no collision risk).
 
@@ -187,41 +280,80 @@ Stage 2 features (dist_wdpa, spatial smoothing) and labels (cluster-based releva
 | W8 tune (1122585) → W8 train (1122586) | ❌ Cancelled 2026-05-29 — ran prematurely (silent Colombia failures released afterok dependency). Must wait for Colombia Issue D decision first. |
 | col_panel (1141209) → col_tune_lr (1141210) → col_train_lr (1141211) → col_tune_bin (1141212) → col_train_bin (1141213) | ✅ Done 2026-05-29 — but early stopping fired at iter 2 (LR) / iter 5 (bin); Issue N unresolved |
 | col_tune_lr (1227274) → col_train_lr (1227276) → col_tune_bin (1227278) → col_train_bin (1227280) | ❌ Cancelled 2026-05-29 — 1227274 ran 1h20m without W9a; cancelled to resubmit with W9a |
-| col_tune_lr (1242056) → col_train_lr (1242057) → col_tune_bin (1242058) → col_train_bin (1242059) | ⏳ In queue 2026-05-29 — Issue N fix (TrueNdcg1PctEarlyStop) + W9a eco groups (STAGE2_ECO_GROUPS=1) |
+| col_tune_lr (1242056) → col_train_lr (1242057) → col_tune_bin (1242058) → col_train_bin (1242059) | ✅ Done 2026-05-29 14:06/15:18. LR Lift@1%=5.99× (W9a), Bin=3.04×. **LambdaRank selected.** |
+| SA Stage 1 panel rebuild (stage1_data_builder.py) | ✅ Done 2026-05-29 locally — new panel from corrected merged_panel_final.parquet |
+| SEA Stage 1 panel rebuild (stage1_data_builder.py) | ✅ Done 2026-05-29 locally — D²_6yr=−0.619 (regime shift finding) |
+| SA Stage 2 LambdaRank re-tune (100 trials, W9a) → retrain | ⏳ Ready to submit — run `sbatch slurm/south_america/tuning_lgbm_stage2.slurm` then chain training |
 
 ---
 
 ## Next Actions (Ordered)
 
-0. ~~**Issue F audit**~~ ✅ Done 2026-05-28. All 3 regions audited; labels acceptable.
-0b. ~~**Issue O fix**~~ ✅ Done 2026-05-28. `_scan_true_class_counts()` added; binary neg_ratio=100 with true SPW override; 6 SLURM scripts updated.
-0c. ~~**Colombia dev panel script**~~ ✅ Done 2026-05-28. `scripts/regions/south_america/dev/create_colombia_panel.py` + `STAGE2_DATA_ROOT`/`STAGE2_OUTPUT_DIR` env vars.
-0d. ~~**Submit Colombia pipeline + W8**~~ ✅ Done 2026-05-28. SA splits → Colombia panel → LambdaRank + binary chains; W8 SA binary in parallel. See Active Euler Jobs.
-0e. ~~**Issue N fix**~~ ✅ Done 2026-05-29. `_TrueNdcg1PctEarlyStop` replaces ndcg@90/AP for both LambdaRank and binary in training and Optuna.
-0f. ~~**Issue D fix (W9a)**~~ ✅ Done 2026-05-29. Ecoregion-stratified training groups implemented across all components (`country_raster.py`, `stage2_lgbm_core.py`, `stage2_optuna_runner.py`, `stage2_runner.py`). Enabled via `STAGE2_ECO_GROUPS=1`; Colombia SLURM scripts updated. All 3 region entry points updated.
-1. ~~**Submit panel rebuild chain**~~ ✅ SA done; SEA+USA in queue (jobs 1076912–1076916).
-2. **Colombia results**: When Colombia jobs 1242056–1242059 complete, compare LambdaRank Lift@1% vs binary Lift@1% (Issues W + X). Also run graded vs binary label sensitivity (Issue W) and neg_ratio sensitivity (Issue X) on Colombia before committing to full SA re-tune.
-3. **Model comparison decision**: LambdaRank (W9a) vs binary (W8).
-   - Both win (LR > bin OR bin > LR) → choose winner; submit full SA re-tune + retrain for winner.
-   - If comparable → choose LambdaRank (it encodes pair-wise ranking structure, better for the ranking task).
-4. **SA full re-tune + retrain**: Once model selected, run full SA tuning (100 trials) → training for the chosen model.
-5. **Re-run Stage 1** locally after SEA + USA FE jobs complete → update key numbers table above. Also add Negative Binomial robustness spec (Issue R) and CBD-free primary spec (Issue V) in the same run.
-6. **W4 ablation study** (SA first, after re-train result confirmed): does removing pa_momentum collapse Lift? Required for paper Methods.
-7. **Issue Q — Confidence intervals**: Bootstrap over test years for all reported metrics (Stage 1 jackknife over 8 test years; Stage 2 bootstrap over expansion cy groups). Add 95% CI to every number in the results tables before writing the manuscript.
-8. **Issue T — Independence assumption**: Correlate Stage 1 residuals with Stage 2 mean ranked pixel characteristics. Document in Methods. If violated, add to Limitations.
-9. **Issue S — W9a scientific reframing**: Write the Methods paragraph justifying ecoregion sub-groups as an ecological hypothesis (within-stratum ranking), not an engineering workaround. Include SHAP-by-biome evidence if available.
-10. **Issues Y + Z + AA** (lower priority, but pre-submission): area-weighted Lift@1%, Stage 2 2024 exclusion sensitivity, Moran's I on Stage 2 residuals.
-11. **Forward pipeline — Issues G+M**: Platt calibration + multi-year accumulation (2025–2029). Implement after Stage 2 model finalised.
-12. **REDD+ verification**: open TO VERIFY URLs before final manuscript.
-13. **Manuscript gate**: SA + SEA Stage 2 final results confirmed + Issues Q/R/S/T resolved + ablation done + Issues G+M implemented. Do not start writing before all gates.
+0. ~~**Issue F audit**~~ ✅ Done 2026-05-28.
+0b. ~~**Issue O fix**~~ ✅ Done 2026-05-28. `_scan_true_class_counts()`; binary neg_ratio=100; 6 SLURM scripts updated.
+0c. ~~**Colombia dev panel script**~~ ✅ Done 2026-05-28.
+0d. ~~**Submit Colombia pipeline + W8**~~ ✅ Done 2026-05-28.
+0e. ~~**Issue N fix**~~ ✅ Done 2026-05-29. `_TrueNdcg1PctEarlyStop` in training + Optuna.
+0f. ~~**Issue D fix (W9a)**~~ ✅ Done 2026-05-29. Eco-stratified groups; STAGE2_ECO_GROUPS=1.
+0g. ~~**Panel rebuild chain**~~ ✅ All done (SA, SEA, USA FE complete).
+0h. ~~**Colombia comparison + model decision**~~ ✅ Done 2026-05-29. LambdaRank 5.99× >> Binary 3.04×. W9a: LR 2.99×→5.99×. LambdaRank selected.
+0i. ~~**Stage 1 re-run (Issues V+R+Q+U)**~~ ✅ Done 2026-05-29. CBD-free primary (V). Jackknife CI (Q). Country FE sensitivity (U, FE→−0.44, no-FE justified). Panels rebuilt from corrected merged panels. SEA D²=−0.619 = path-dependency finding. NB robustness code added (statsmodels absent locally; run on Euler when needed).
+### Phase 1: Colombia Feature Sprint (CURRENT — do not advance to Phase 2 until bar met)
+
+1. **Verify Stage 1 locally** — sync `data/south_america/stage1_panel.parquet` (35 KB, already in repo) and run `model1_expansion.py` locally. Compare D²=+0.345 against local run. If you distrust the expansion counts, then sync 57 GB: `rsync euler:/cluster/scratch/gikaufmann/data/south_america/ml/merged_panel_final.parquet .` and re-run `stage1_data_builder.py`.
+
+2. **Issue X — neg_ratio sensitivity (Colombia, Tier 3 arch experiment)**: Run LambdaRank neg_ratio ∈ {100, 200, full} on Colombia. 3.9 GB panel may fit full groups. Gradient distortion at 100 may be masking significant lift. Do this first — it costs one Euler job and may give 2–3× improvement for free.
+
+3. **Issue W — Graded vs binary label sensitivity (Colombia)**: LambdaRank with binary labels vs current graded 1–4. Compare Recall@5% and Lift@1%. Required for Methods justification (Issue W).
+
+4. **Tier 1 Feature Sprint — KBAs (Colombia)**: Extract KBA polygons → rasterise to 1km EPSG:3857 → compute `is_kba` + `dist_kba` → add to Colombia panel → retune + retrain → report Recall@5% and Lift@1% delta. Source: BirdLife International (free download).
+
+5. **Tier 1 Feature Sprint — REDD+ project boundaries (Colombia)**: Verra registry shapefiles for Colombia projects → `dist_redd_project`, `in_redd_project`. Source: Verra API or verra.org project search.
+
+6. **Tier 1 Feature Sprint — Indigenous territory boundaries (Colombia)**: RAISG polygon overlap → `dist_indigenous_territory`, `in_indigenous_territory`. Separate from existing `dist_indigenous` (which is point-based).
+
+7. **Tier 1 Feature Sprint — ESA CCI Biomass (Colombia)**: Carbon stocks. Download from ESA Climate Office (300m) → resample to 1km → add `agb_tonne_ha` to Colombia panel.
+
+8. **Tier 1 Feature Sprint — PA connectivity gap score (Colombia)**: For each pixel, compute increase in PA network connectivity if designated. Simple proxy: binary indicator for pixels that lie in a gap between two PA clusters within 5km.
+
+9. **Evaluate Colombia bar**: After Tier 1 features, compute Recall@5% and Lift@1% on test set (2017–2024). If bar met (Recall@5% ≥ 90%, Lift@1% ≥ 15×) → advance to Phase 2. If not → continue Tier 2 features.
+
+10. **Issue Q — Bootstrap CI on Recall@5% and Lift@1% (Colombia)**: Once bar is met, add bootstrap 95% CI to all reported metrics. This is the evidence needed for a reviewer.
+
+11. **W4 ablation study (Colombia)**: Remove feature groups one at a time. Required for paper Methods: "what drives protection decisions."
+
+### Phase 2: Continental Scale-Up (LOCKED until Phase 1 bar met)
+
+**Do not run these until Colombia Recall@5% ≥ 90% is confirmed.**
+
+12. **SA full re-tune + retrain (LambdaRank W9a, 100 trials, with all Tier 1+ features)**:
+    `sbatch slurm/south_america/tuning_lgbm_stage2.slurm`
+    Then chain: `sbatch --dependency=afterok:<tune_job_id> slurm/south_america/training_lgbm_stage2.slurm`
+13. **SEA Stage 2 full re-tune + retrain** on corrected panel with same feature set.
+14. **Issue T — Independence assumption**: Correlate Stage 1 residuals with Stage 2 mean ranked pixel characteristics. Document in Methods.
+15. **Issue S — W9a scientific reframing**: Methods paragraph justifying eco sub-groups as ecological hypothesis. SHAP-by-biome evidence.
+16. **Issue R — NB robustness**: Run when statsmodels available on Euler. Add NB D²_7yr comparison for SA paper table.
+17. **Issues Y + Z + AA**: Area-weighted Lift@1%, Stage 2 2024 exclusion, Moran's I.
+18. **Forward pipeline — Issues G+M**: Platt calibration + multi-year accumulation. After Stage 2 finalised.
+19. **REDD+ verification**: Open TO VERIFY URLs before final manuscript.
+20. **Manuscript gate**: Colombia bar confirmed + SA + SEA Stage 2 final + Issues Q/R/S/T/W resolved + ablation + G+M. Do not start writing before all gates.
 
 ---
 
-## Data Sprint (parallel to steps 2–7)
+## Data Sprint (Colombia first; SA/SEA/USA after Phase 1 bar met)
 
-**GEE exports** (high scientific value — start SA first):
-- ESA CCI Biomass / GEDI AGBD (carbon stocks): REDD+ mechanism makes high-carbon forests financially valuable to protect — expected top-5 SHAP
-- RAISG indigenous territory area fraction: largest omitted SA variable; complements existing dist_indigenous
+**GEE / external exports — Colombia priority order:**
+- KBAs: BirdLife International shapefile (free, no GEE needed) → rasterise locally
+- REDD+ project polygons: Verra registry (public) → download → rasterise locally
+- RAISG indigenous territories: Direct download (public shapefile) → rasterise locally
+- ESA CCI Biomass: ESA Climate Office download (300m, free) → resample → add to panel
+- PA network connectivity: Derived from WDPA (no export needed); compute locally from existing WDPA rasters
+- RUNAP/PNN proposals: datos.gov.co (Colombia national open data) → download → rasterise
+- IDEAM priority watersheds: datos.gov.co → download → binary `in_priority_watershed`
+
+**GEE exports (after Colombia bar met, SA/SEA/USA):**
+- ESA CCI Biomass (already downloaded for Colombia above; GEE for continental scale)
+- RAISG at continental scale (already available as shapefile; GEE not needed)
 
 ---
 
@@ -235,18 +367,32 @@ Stage 2 features (dist_wdpa, spatial smoothing) and labels (cluster-based releva
 - **Pre-2001 lags: terrestrial-only** — GIS_AREA−GIS_M_AREA; marine contamination fix applied (ECU Galápagos was 86% marine).
 - **No pre-2001 training data** — frontier exhaustion regime mismatch. WDPA used for lag init at 2001 only.
 - **30×30 as exogenous budget**: post-Stage-1 multiplier, not a model coefficient (zero training variation).
-- **CBD = robustness check, not primary**: 2 training instances (2002, 2010). CBD-free fallback D²_7yr=+0.389 is the primary reported model.
+- **CBD = robustness check, not primary**: 2 training instances (2002, 2010). CBD-free primary D²_7yr=+0.334 (corrected panel 2026-05-29). CBD-inclusive is retained as a robustness check (D²=+0.321).
+- **SEA Stage 1 D²<0 = path-dependency finding**: KHM/LAO sporadic one-off designations are structurally unpredictable from momentum features. Same interpretation as USA D²<0. Old D²=+0.290 was on contaminated labels (4.2–5.9% non-Designated, now corrected).
 - **SEA saturation leakage**: DO NOT re-investigate. sat_clean gives D²=−0.275 — spurious gain was entirely from future-info leakage.
 - **Bolsonaro hypothesis falsified**: 2019 is SA's best test year (Lift=9.64×). 2017 is worst (1.47×). Issue D (9K mismatch) is primary suspect for SA underperformance.
 - **USA**: Stage 1 D²<0 = path-dependency finding, not failure. Stage 2 deprioritised until SA+SEA settled.
 - **Regions**: SA primary; SEA + USA as robustness. DO NOT add tropical Africa. DO NOT start Paper 2 until Paper 1 submitted.
+- **Development scale**: Colombia first. All architecture and feature decisions made on Colombia (~7M rows, hours per run). Continental SA/SEA/USA locked until Colombia Recall@5% ≥ 90%.
+- **Performance bar**: Recall@5% ≥ 90% within Colombia expansion groups is the minimum to publish in a tier-A journal. 6× Lift@1% alone is not sufficient — a reviewer will ask how many PAs we miss. The answer must be "fewer than 10% in our top 5% slice."
 - **neg_ratio + year weights**: training reads `STAGE2_NEG_RATIO` env var (same as tuning). Year weights active in both training and Optuna CV.
 
 ---
 
+## Paused (until Colombia Phase 1 bar met)
+
+These are not cancelled — they are waiting for Colombia to prove the model.
+
+- **SA Stage 2 continental re-tune**: paused. Do not submit `tuning_lgbm_stage2.slurm` until Colombia Recall@5% ≥ 90%.
+- **SEA Stage 2 continental re-tune**: paused. Old 12.7× is on old panel; will re-evaluate after Phase 1.
+- **USA Stage 2**: deprioritised; path-dependency finding reduces urgency.
+- **Forward pipeline (Issues G+M)**: paused until Stage 2 finalised on Colombia.
+- **Issue AA (Moran's I)**: paused until continental Stage 2 results available.
+
 ## Out of Scope (Paper 1)
 
-- Tropical Africa, marine PAs, Colombia (supplement only if reviewer requests)
+- Tropical Africa, marine PAs
+- Colombia as a supplement (Colombia IS the primary development environment now — it will appear in the paper as the proving ground, not a supplement)
 - Embeddings / Paper 2 (gate: AlphaEarth access + P1 submitted)
 - Sub-national Stage 1 (fallback only if country-level results collapse)
 - Curriculum hard negative mining, Stage 1 predictions as Stage 2 feature (defer to Paper 2)

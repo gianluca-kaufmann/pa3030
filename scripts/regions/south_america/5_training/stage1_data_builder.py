@@ -74,6 +74,23 @@ def _load_csv(path: Path, required_cols: list[str]) -> pd.DataFrame | None:
     return df
 
 
+def _load_csv_partial(path: Path, wanted_cols: list[str]) -> pd.DataFrame | None:
+    """Like _load_csv but loads whichever of wanted_cols are present (no fail on missing)."""
+    if not path.exists():
+        print(f"  WARN: missing {path}")
+        return None
+    df = pd.read_csv(path)
+    available = [c for c in wanted_cols if c in df.columns]
+    missing = [c for c in wanted_cols if c not in df.columns]
+    if missing:
+        print(f"  WARN: {path} missing columns {missing} — loading available: {available}")
+    if not available:
+        return None
+    id_cols = ["iso3", "year"]
+    keep = [c for c in id_cols if c in df.columns] + available
+    return df[keep]
+
+
 def attach_political_covariates(cy: pd.DataFrame) -> pd.DataFrame:
     cy = cy.copy()
     cy["iso3"] = cy["country_id"].map(ID_TO_ISO3)
@@ -81,14 +98,14 @@ def attach_political_covariates(cy: pd.DataFrame) -> pd.DataFrame:
     cy["cbd_meeting_year"] = cy["year"].isin(CBD_MEETING_YEARS).astype(int)
 
     shared = _ROOT / "data" / "shared"
-    _vdem_cols = ["iso3", "year", "v2x_polyarchy", "v2x_corr", "v2cseeorgs",
+    _vdem_cols = ["v2x_polyarchy", "v2x_corr", "v2cseeorgs",
                   "v2xlg_legcon", "v2csprtcpt"]
-    vdem = _load_csv(shared / "vdem_v15.csv", _vdem_cols)
+    # Use partial load: vdem_v15.csv may not have sub-index columns (v2xlg_legcon,
+    # v2csprtcpt); those are merged later from VDem/V-Dem-CY-Core-v15.csv in
+    # model1_expansion.py. Loading what's available avoids silently dropping v2x_polyarchy.
+    vdem = _load_csv_partial(shared / "vdem_v15.csv", _vdem_cols)
     if vdem is not None:
-        cy = cy.merge(
-            vdem[[c for c in _vdem_cols if c in vdem.columns]],
-            on=["iso3", "year"], how="left",
-        )
+        cy = cy.merge(vdem, on=["iso3", "year"], how="left")
 
     wgi = _load_csv(shared / "wgi.csv", ["iso3", "year", "gov_wgi_ge_est", "gov_wgi_rl_est"])
     if wgi is not None:
