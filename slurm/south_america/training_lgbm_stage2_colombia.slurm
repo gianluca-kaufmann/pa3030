@@ -21,8 +21,10 @@ export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 export STAGE2_DATA_ROOT="$HOME/master_thesis/data/dev/south_america/ml"
 export STAGE2_OUTPUT_DIR="$HOME/master_thesis/data/dev/south_america/ml/params/lambdarank"
 export STAGE2_NEG_RATIO=100
+# W9a: ecoregion-stratified training groups (fixes 9K sub-window mismatch)
+export STAGE2_ECO_GROUPS=1
 
-echo "Stage 2 LambdaRank training — Colombia dev panel..."
+echo "Stage 2 LambdaRank training — Colombia dev panel (W9a eco groups)..."
 srun --cpu-bind=cores --distribution=block:block python -u \
   scripts/regions/south_america/5_training/model1_LGBM_stage2
 echo "Colombia LambdaRank training done."

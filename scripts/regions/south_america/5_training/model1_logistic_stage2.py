@@ -38,18 +38,14 @@ def main() -> None:
     schema = pq.ParquetFile(train_path).schema_arrow
     feature_cols = [n for n in schema.names if n not in STAGE2_EXCLUDE_COLS and n not in ("row", "col")]
 
-    X_tr, y_tr, _, _, g_tr = load_stage2_arrays(
-        train_path, region, feature_cols, expansion, (2001, 2013)
-    )
+    arr_tr = load_stage2_arrays(train_path, region, feature_cols, expansion, (2001, 2013))
     test_exp = _expansion_groups_from_batches(test_path, region, (2017, 2024))
-    X_te, y_te, _, _, g_te = load_stage2_arrays(
-        test_path, region, feature_cols, test_exp, (2017, 2024)
-    )
+    arr_te = load_stage2_arrays(test_path, region, feature_cols, test_exp, (2017, 2024))
 
     clf = LogisticRegression(max_iter=500, class_weight="balanced", n_jobs=-1)
-    clf.fit(X_tr, y_tr)
-    scores = clf.predict_proba(X_te)[:, 1]
-    metrics = compute_stage2_metrics(y_te.astype(np.float64), scores, g_te)
+    clf.fit(arr_tr.X, arr_tr.y)
+    scores = clf.predict_proba(arr_te.X)[:, 1]
+    metrics = compute_stage2_metrics(arr_te.y.astype(np.float64), scores, arr_te.cy_group_sizes)
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -58,6 +54,8 @@ def main() -> None:
         "test_performance": metrics,
         "coefficients": {f: float(c) for f, c in zip(feature_cols, clf.coef_.ravel())},
         "intercept": float(clf.intercept_[0]),
+        "n_train": len(arr_tr.y),
+        "n_test": len(arr_te.y),
     }
     path = OUT_DIR / f"model1_logistic_stage2_metrics_{ts}.json"
     path.write_text(json.dumps(out, indent=2))

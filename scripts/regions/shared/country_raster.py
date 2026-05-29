@@ -57,6 +57,44 @@ def country_ids_for_rows(df: pd.DataFrame, country_raster: np.ndarray) -> np.nda
     return out
 
 
+def load_ecoregion_raster(region: str) -> np.ndarray:
+    """Load gsn_terrestrial_ecoregions_mask_1km.tif for *region* (int16: row,col -> eco_id).
+
+    Returns 0 for nodata pixels. SA values are multiples of 4 (63 ecoregions);
+    USA/SE Asia are 1-based uint8 stored as int16.
+    """
+    import rasterio
+
+    scratch = scratch_root()
+    root = repo_root()
+    candidates: list[Path] = []
+    if scratch is not None:
+        candidates.append(scratch / f"data/{region}/ready/GSN/gsn_terrestrial_ecoregions_mask_1km.tif")
+    candidates.append(root / f"data/{region}/ready/GSN/gsn_terrestrial_ecoregions_mask_1km.tif")
+    for path in candidates:
+        if path.exists():
+            with rasterio.open(path) as ds:
+                return ds.read(1).astype(np.int16)
+    raise FileNotFoundError(
+        "gsn_terrestrial_ecoregions_mask_1km.tif not found. Searched:\n  "
+        + "\n  ".join(str(c) for c in candidates)
+    )
+
+
+def ecoregion_ids_for_rows(df: pd.DataFrame, eco_raster: np.ndarray) -> np.ndarray:
+    """Look up ecoregion_id per pixel via raster[(row, col)] indexing.
+
+    Returns int16 array; 0 = nodata (out-of-bounds or raster zero).
+    """
+    rows = df["row"].to_numpy(dtype=np.int64)
+    cols = df["col"].to_numpy(dtype=np.int64)
+    h, w = eco_raster.shape
+    valid = (rows >= 0) & (rows < h) & (cols >= 0) & (cols < w)
+    out = np.zeros(len(df), dtype=np.int16)
+    out[valid] = eco_raster[rows[valid], cols[valid]]
+    return out
+
+
 def resolve_panel_path(region: str) -> Path:
     """Locate merged_panel_final.parquet for *region* (SCRATCH first).
 

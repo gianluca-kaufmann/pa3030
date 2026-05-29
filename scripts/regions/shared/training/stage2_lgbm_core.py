@@ -25,7 +25,9 @@ from lightgbm.callback import EarlyStopException as _LgbEarlyStopException
 
 from scripts.regions.shared.country_raster import (
     country_ids_for_rows,
+    ecoregion_ids_for_rows,
     load_country_raster,
+    load_ecoregion_raster,
 )
 from scripts.regions.shared.evaluation.stage2_metrics import (
     compute_stage2_metrics,
@@ -150,6 +152,25 @@ def _split_large_groups(group_sizes: np.ndarray) -> np.ndarray:
 
 
 @dataclass
+class Stage2Arrays:
+    """Loaded arrays for one Stage 2 split (train, earlystop, or test).
+
+    cy_group_sizes: (country_id, year) groups — always used for NDCG evaluation.
+    train_group_sizes: (country_id, year, eco_id) sub-groups when W9a eco grouping
+        is active, otherwise equal to cy_group_sizes.
+    eco_ids: eco_id per row (int16, 0=nodata) when W9a is active, else None.
+    """
+
+    X: np.ndarray
+    y: np.ndarray
+    years: np.ndarray
+    country_ids: np.ndarray
+    cy_group_sizes: np.ndarray
+    train_group_sizes: np.ndarray
+    eco_ids: Optional[np.ndarray] = None
+
+
+@dataclass
 class Stage2Config:
     region: str
     model_prefix: str  # model1, model2, model3
@@ -160,6 +181,7 @@ class Stage2Config:
     feature_subset: Optional[List[str]] = None  # e.g. ["dist_wdpa"] for naive baseline
     ablation_drop: Optional[str] = None  # drop feature group by name prefix
     variant: str = "full"  # "full" or "naive"
+    use_ecoregion_groups: bool = False  # W9a: train on (cy, eco_id) sub-groups
 
 
 def resolve_parquet_file(region: str, filename: str) -> Path:
@@ -400,8 +422,9 @@ def load_stage2_arrays(
     rng_seed: int = 42,
     normalize_within_groups: bool = True,
     use_graded_relevance: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Load X, y, years, country_id, group_sizes for expansion country-years only.
+    eco_raster: Optional[np.ndarray] = None,
+) -> "Stage2Arrays":
+    """Load arrays for expansion country-years only.
 
     neg_ratio: if set, subsample negatives to neg_ratio * n_positives per group.
                Useful for tuning to avoid OOM on large regions.
@@ -411,6 +434,11 @@ def load_stage2_arrays(
     use_graded_relevance: assign relevance 1–4 based on designation event cluster
                size instead of binary 0/1. Large contiguous events get higher
                relevance, providing richer gradient signal for LambdaRank.
+    eco_raster: when provided (W9a), sort within (country_id, year) groups by
+               ecoregion_id and return eco sub-groups as train_group_sizes. The
+               cy_group_sizes field always holds (country_id, year) groups for
+               NDCG evaluation. Eco lookup requires row/col (use_graded_relevance
+               must be True).
     """
     schema_names = pq.ParquetFile(panel_path).schema_arrow.names
     has_country = "country_id" in schema_names
@@ -483,29 +511,67 @@ def load_stage2_arrays(
     del X_unsorted, order
     gc.collect()
 
-    group_sizes = data.groupby(["country_id", "year"], sort=False).size().to_numpy(dtype=np.int32)
+    cy_group_sizes = data.groupby(["country_id", "year"], sort=False).size().to_numpy(dtype=np.int32)
 
     if use_graded_relevance:
-        y = _apply_graded_relevance(data, group_sizes, TARGET_COL)
+        y = _apply_graded_relevance(data, cy_group_sizes, TARGET_COL)
     else:
         y = (data[TARGET_COL] > 0).astype(np.int8).to_numpy()
 
     years = data["year"].to_numpy(dtype=np.int32)
     country_ids = data["country_id"].to_numpy(dtype=np.int32)
+
+    # W9a eco grouping: look up eco_id per row BEFORE deleting data (needs row/col).
+    # Eco groups must only be used when use_graded_relevance=True (row/col available).
+    if eco_raster is not None and use_graded_relevance:
+        eco_ids_arr: Optional[np.ndarray] = ecoregion_ids_for_rows(data, eco_raster)
+    else:
+        eco_ids_arr = None
+
     del data
     gc.collect()
 
     if normalize_within_groups:
-        X = _rank_normalize_within_groups(X, group_sizes)
+        X = _rank_normalize_within_groups(X, cy_group_sizes)
 
-    # Shuffle rows within each group so that consecutive 9K sub-windows (created
-    # by _split_large_groups in lgb.Dataset) are random samples of the full
-    # country-year rather than spatially-contiguous patches.  Uses a fixed seed
-    # offset from rng_seed so it is independent of neg_ratio sampling but still
-    # fully reproducible.  See _shuffle_within_groups docstring for the rationale.
-    _shuffle_within_groups(X, y, group_sizes, np.random.default_rng(rng_seed + 1337))
+    if eco_ids_arr is None:
+        # Shuffle rows within each cy group so consecutive 9K sub-windows are random
+        # samples of the full country-year rather than spatially-contiguous patches.
+        _shuffle_within_groups(X, y, cy_group_sizes, np.random.default_rng(rng_seed + 1337))
+        train_group_sizes = cy_group_sizes
+    else:
+        # W9a: sort within each cy group by eco_id to form eco sub-groups.
+        # Rank normalization (above) was done within cy — values remain valid after
+        # this intra-cy re-sort.  No cy shuffle needed: eco sub-groups are < 9K rows
+        # so LightGBM does not sub-window them further.
+        eco_order = np.lexsort(
+            (eco_ids_arr.astype(np.int64), years.astype(np.int64), country_ids.astype(np.int64))
+        )
+        X = X[eco_order]
+        y = y[eco_order]
+        years = years[eco_order]
+        country_ids = country_ids[eco_order]
+        eco_ids_arr = eco_ids_arr[eco_order]
 
-    return X, y, years, country_ids, group_sizes
+        # Eco group sizes from consecutive (country_id, year, eco_id) runs.
+        # Data is now sorted by (cy, eco_id), so runs are contiguous.
+        key = (
+            country_ids.astype(np.int64) * 1_000_000_000
+            + years.astype(np.int64) * 100_000
+            + (eco_ids_arr.astype(np.int64) + 32_768)  # shift int16 to avoid negatives
+        )
+        changes = np.concatenate([[True], key[1:] != key[:-1], [True]])
+        train_group_sizes = np.diff(np.where(changes)[0]).astype(np.int32)
+
+    return Stage2Arrays(
+        X=X,
+        y=y,
+        years=years,
+        country_ids=country_ids,
+        cy_group_sizes=cy_group_sizes,
+        train_group_sizes=train_group_sizes,
+        eco_ids=eco_ids_arr,
+    )
 
 
 def _compute_scale_pos_weight(y: np.ndarray) -> float:
@@ -743,18 +809,27 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
             f" (vs subsampled SPW≈{neg_ratio}) ({time.time()-t_scan:.1f}s)"
         )
 
-    print(f"Loading train pool (variant={cfg.variant}, neg_ratio={neg_ratio})...")
-    X_tr, y_tr, years_tr, _, g_tr = load_stage2_arrays(
+    # W9a: load ecoregion raster for LambdaRank training groups.
+    # Binary variant has no 9K sub-window constraint — eco groups not needed.
+    eco_raster: Optional[np.ndarray] = None
+    if cfg.use_ecoregion_groups and cfg.variant != "binary":
+        print("Loading ecoregion raster for W9a eco sub-groups...")
+        eco_raster = load_ecoregion_raster(cfg.region)
+
+    print(f"Loading train pool (variant={cfg.variant}, neg_ratio={neg_ratio}, eco_groups={eco_raster is not None})...")
+    arr_tr = load_stage2_arrays(
         train_path, cfg.region, feature_cols, expansion_groups, cfg.train_years,
         neg_ratio=neg_ratio,
+        eco_raster=eco_raster,
     )
-    X_es, y_es, _, _, g_es = load_stage2_arrays(
+    # Earlystop is evaluation-only — always use cy groups for NDCG callback.
+    arr_es = load_stage2_arrays(
         earlystop_path, cfg.region, feature_cols, expansion_groups, cfg.earlystop_years,
         neg_ratio=neg_ratio,
     )
 
     year_weights = compute_year_weights(
-        years_tr, min_year=cfg.train_years[0], max_year=cfg.train_years[1]
+        arr_tr.years, min_year=cfg.train_years[0], max_year=cfg.train_years[1]
     )
 
     lgb_params: Dict[str, Any] = {}
@@ -764,7 +839,7 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
         # W8: binary LightGBM — no 9K sub-window, scale_pos_weight for imbalance.
         # Use the true SPW from the pre-scan (true n_neg/n_pos in full data), not
         # _compute_scale_pos_weight(y_tr) which reflects the neg_ratio subsampling.
-        scale_pos_weight = true_spw if true_spw is not None else _compute_scale_pos_weight(y_tr)
+        scale_pos_weight = true_spw if true_spw is not None else _compute_scale_pos_weight(arr_tr.y)
         binary_params = {**BINARY_FIXED_PARAMS}
         for key in (
             "num_leaves", "max_depth", "learning_rate", "min_child_samples",
@@ -777,20 +852,27 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
         binary_params["random_state"] = best_params.get("random_state", 42)
         binary_params["num_threads"] = num_threads
         print(
-            f"Fitting Binary LightGBM: train {len(y_tr):,} rows / earlystop {len(y_es):,} rows"
+            f"Fitting Binary LightGBM: train {len(arr_tr.y):,} rows / earlystop {len(arr_es.y):,} rows"
             f" | scale_pos_weight={scale_pos_weight:.1f}"
         )
         model = train_binary_lgbm(
-            X_tr, y_tr, X_es, y_es, g_es, binary_params, year_weights, num_boost_round
+            arr_tr.X, arr_tr.y, arr_es.X, arr_es.y, arr_es.cy_group_sizes,
+            binary_params, year_weights, num_boost_round,
         )
     else:
         lgb_params = _prepare_lgb_params(best_params, num_threads)
-        print(f"Fitting LambdaRank: train {len(y_tr):,} rows / earlystop {len(y_es):,} rows...")
+        eco_info = "eco sub-groups" if eco_raster is not None else "cy groups"
+        print(
+            f"Fitting LambdaRank: train {len(arr_tr.y):,} rows / earlystop {len(arr_es.y):,} rows"
+            f" | training groups: {eco_info}"
+        )
         model = train_lambdarank(
-            X_tr, y_tr, g_tr, X_es, y_es, g_es, lgb_params, year_weights, num_boost_round
+            arr_tr.X, arr_tr.y, arr_tr.train_group_sizes,
+            arr_es.X, arr_es.y, arr_es.cy_group_sizes,
+            lgb_params, year_weights, num_boost_round,
         )
 
-    del X_tr, y_tr, g_tr, X_es, y_es, g_es
+    del arr_tr, arr_es
     gc.collect()
 
     tag = f"{cfg.model_prefix}_lgbm_stage2"
@@ -805,19 +887,19 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
 
     test_expansion = _expansion_groups_from_batches(test_path, cfg.region, cfg.test_years)
     print("Loading test set (no neg_ratio — full evaluation)...")
-    X_te, y_te, years_te, country_ids_te, g_te = load_stage2_arrays(
+    arr_te = load_stage2_arrays(
         test_path, cfg.region, feature_cols, test_expansion, cfg.test_years
     )
-    scores = model.predict(X_te, num_iteration=model.best_iteration or None).astype(np.float64)
-    test_metrics = compute_stage2_metrics(y_te.astype(np.float64), scores, g_te)
+    scores = model.predict(arr_te.X, num_iteration=model.best_iteration or None).astype(np.float64)
+    test_metrics = compute_stage2_metrics(arr_te.y.astype(np.float64), scores, arr_te.cy_group_sizes)
     print(f"Test NDCG@1%: {test_metrics['ndcg_at_1pct']:.4f}")
     print(f"Test concordance: {test_metrics['concordance_index_within_groups']:.4f}")
 
     scored = pd.DataFrame({
-        "y_true": y_te,
+        "y_true": arr_te.y,
         "y_pred_score": scores,
-        "year": years_te,
-        "country_id": country_ids_te,
+        "year": arr_te.years,
+        "country_id": arr_te.country_ids,
     })
     pq.write_table(
         pa.Table.from_pandas(scored, preserve_index=False),
@@ -837,6 +919,7 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
             "features": feature_cols,
             "group_cols": list(GROUP_COLS),
             "neg_ratio": neg_ratio,
+            "use_ecoregion_groups": cfg.use_ecoregion_groups,
         },
         "temporal_split": {
             "train_years": list(cfg.train_years),

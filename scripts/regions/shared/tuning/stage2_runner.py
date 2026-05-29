@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from scripts.regions.shared.training.feature_guard import check_feature_denylist
+from scripts.regions.shared.country_raster import load_ecoregion_raster
 from scripts.regions.shared.training.stage2_lgbm_core import (
     STAGE2_EXCLUDE_COLS,
     TARGET_COL,
@@ -36,6 +37,7 @@ def run_stage2_tuning(
     mode: str = "fast",
     output_dir: Path | None = None,
     variant: str = "lambdarank",
+    use_ecoregion_groups: bool = False,
 ) -> Path:
     repo_root = get_repo_root()
     script_dir = repo_root / "scripts" / "regions" / region / "5_training"
@@ -94,16 +96,30 @@ def run_stage2_tuning(
             f" (vs subsampled SPW≈{neg_ratio})"
         )
 
-    X_tr, y_tr, years_tr, cid_tr, _ = load_stage2_arrays(
-        train_path, region, feature_cols, expansion_groups, (2001, 2013), neg_ratio=neg_ratio
+    # W9a eco groups: load ecoregion raster for LambdaRank only.
+    # Binary has no 9K sub-window issue — eco grouping not needed.
+    eco_raster = None
+    if use_ecoregion_groups and variant != "binary":
+        print("Loading ecoregion raster for W9a tuning eco sub-groups...")
+        eco_raster = load_ecoregion_raster(region)
+
+    arr_tr = load_stage2_arrays(
+        train_path, region, feature_cols, expansion_groups, (2001, 2013),
+        neg_ratio=neg_ratio, eco_raster=eco_raster,
     )
-    X_es, y_es, years_es, cid_es, _ = load_stage2_arrays(
-        earlystop_path, region, feature_cols, expansion_groups, (2014, 2016), neg_ratio=neg_ratio
+    arr_es = load_stage2_arrays(
+        earlystop_path, region, feature_cols, expansion_groups, (2014, 2016),
+        neg_ratio=neg_ratio, eco_raster=eco_raster,
     )
-    X = np.vstack([X_tr, X_es])
-    y = np.concatenate([y_tr, y_es])
-    years = np.concatenate([years_tr, years_es])
-    country_id = np.concatenate([cid_tr, cid_es])
+    X = np.vstack([arr_tr.X, arr_es.X])
+    y = np.concatenate([arr_tr.y, arr_es.y])
+    years = np.concatenate([arr_tr.years, arr_es.years])
+    country_id = np.concatenate([arr_tr.country_ids, arr_es.country_ids])
+    eco_ids = (
+        np.concatenate([arr_tr.eco_ids, arr_es.eco_ids])
+        if arr_tr.eco_ids is not None
+        else None
+    )
 
     df_index = pd.DataFrame({"year": years, "country_id": country_id})
     cfg = SplitConfig(train_year_max=2014, val_year_min=2015, val_year_max=2017, strategy="rolling", rolling_folds=3)
@@ -121,7 +137,8 @@ def run_stage2_tuning(
     else:
         fixed = get_lgbm_stage2_fixed_params(42, n_jobs)
         best_params, best_score, records = optimize_lgbm_stage2_optuna(
-            X, y, country_id, years, folds, mode, fixed, n_trials, 42
+            X, y, country_id, years, folds, mode, fixed, n_trials, 42,
+            eco_ids=eco_ids,
         )
         metric_name = "ndcg_at_1pct_within_groups"
 
@@ -138,6 +155,7 @@ def run_stage2_tuning(
             "feature_count": len(feature_cols),
             "neg_ratio": neg_ratio,
             "true_scale_pos_weight": true_spw,
+            "use_ecoregion_groups": use_ecoregion_groups,
             "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
         },
         "tuning_records": records,

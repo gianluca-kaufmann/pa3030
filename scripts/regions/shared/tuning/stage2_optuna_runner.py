@@ -36,26 +36,57 @@ def _sort_subset(
     country_id: np.ndarray,
     years: np.ndarray,
     indices: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Extract fold rows and sort by (country_id, year) for LambdaRank groups.
+    eco_ids: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Extract fold rows, sort by (country_id, year), optionally form eco sub-groups.
 
-    Returns Xs, ys, group_sizes, sorted_years.  sorted_years is needed for
-    compute_year_weights so tuning and final training use the same weighting.
+    Returns (Xs, ys, cy_group_sizes, train_group_sizes, sorted_years).
+
+    cy_group_sizes: (country_id, year) groups — always used for NDCG evaluation.
+    train_group_sizes: (country_id, year, eco_id) sub-groups when eco_ids is
+        provided (W9a), otherwise equal to cy_group_sizes.
+    sorted_years: year per row after sorting; needed for compute_year_weights.
     """
+    import pandas as pd
+
     Xs = X[indices]
     ys = y[indices]
     cid = country_id[indices]
     yrs = years[indices]
-    order = np.lexsort((yrs, cid))
-    Xs = Xs[order]
-    ys = ys[order]
-    cid = cid[order]
-    yrs = yrs[order]
-    import pandas as pd
+
+    # Sort by (country_id, year) for cy groups and rank normalization alignment.
+    cy_order = np.lexsort((yrs, cid))
+    Xs = Xs[cy_order]
+    ys = ys[cy_order]
+    cid = cid[cy_order]
+    yrs = yrs[cy_order]
 
     gdf = pd.DataFrame({"country_id": cid, "year": yrs})
-    group_sizes = gdf.groupby(["country_id", "year"], sort=False).size().to_numpy(dtype=np.int32)
-    return Xs, ys, group_sizes, yrs
+    cy_group_sizes = gdf.groupby(["country_id", "year"], sort=False).size().to_numpy(dtype=np.int32)
+
+    if eco_ids is not None:
+        # W9a: sort within each cy group by eco_id to form eco sub-groups.
+        ecos = eco_ids[indices][cy_order]
+        eco_order = np.lexsort(
+            (ecos.astype(np.int64), yrs.astype(np.int64), cid.astype(np.int64))
+        )
+        Xs = Xs[eco_order]
+        ys = ys[eco_order]
+        cid = cid[eco_order]
+        yrs = yrs[eco_order]
+        ecos = ecos[eco_order]
+        # Eco group sizes from consecutive (cy, eco_id) runs.
+        key = (
+            cid.astype(np.int64) * 1_000_000_000
+            + yrs.astype(np.int64) * 100_000
+            + (ecos.astype(np.int64) + 32_768)
+        )
+        changes = np.concatenate([[True], key[1:] != key[:-1], [True]])
+        train_group_sizes = np.diff(np.where(changes)[0]).astype(np.int32)
+    else:
+        train_group_sizes = cy_group_sizes
+
+    return Xs, ys, cy_group_sizes, train_group_sizes, yrs
 
 
 def optimize_lgbm_stage2_optuna(
@@ -68,7 +99,15 @@ def optimize_lgbm_stage2_optuna(
     fixed_params: Dict[str, Any],
     n_trials: int,
     random_state: int,
+    eco_ids: Optional[np.ndarray] = None,
 ) -> Tuple[Dict[str, Any], float, List[Dict[str, Any]]]:
+    """Optuna HPO for Stage 2 LambdaRank.
+
+    eco_ids: when provided (W9a), each CV fold's training lgb.Dataset uses
+        (country_id, year, eco_id) sub-groups instead of full cy groups, resolving
+        the 9K per-query hard cap.  The NDCG@1% callback always evaluates on full
+        (country_id, year) groups for a fair comparison.
+    """
     bounds = get_lgbm_stage2_optuna_bounds(mode)
     sampler = optuna.samplers.TPESampler(seed=random_state)
     pruner = optuna.pruners.MedianPruner(n_startup_trials=max(10, n_trials // 10))
@@ -113,11 +152,13 @@ def optimize_lgbm_stage2_optuna(
 
         fold_scores: List[float] = []
         for fold_idx, (train_idx, val_idx) in enumerate(folds, start=1):
-            X_tr, y_tr, g_tr, yrs_tr = _sort_subset(X, y, country_id, years, train_idx)
-            X_va, y_va, g_va, _       = _sort_subset(X, y, country_id, years, val_idx)
+            X_tr, y_tr, _, g_tr, yrs_tr = _sort_subset(X, y, country_id, years, train_idx, eco_ids)
+            X_va, y_va, g_va, _, _      = _sort_subset(X, y, country_id, years, val_idx, eco_ids)
             weights_tr = compute_year_weights(
                 yrs_tr, min_year=int(yrs_tr.min()), max_year=int(yrs_tr.max())
             )
+            # g_tr = eco sub-groups for training (W9a), or cy groups if eco_ids=None.
+            # g_va = cy groups for NDCG@1% callback evaluation (always cy).
             dtrain = lgb.Dataset(X_tr, label=y_tr, group=_split_large_groups(g_tr), weight=weights_tr)
             early_stop_cb = _TrueNdcg1PctEarlyStop(X_va, y_va, g_va, patience=50, verbose=False)
             booster = lgb.train(
@@ -193,8 +234,9 @@ def optimize_lgbm_stage2_binary_optuna(
 
         fold_scores: List[float] = []
         for fold_idx, (train_idx, val_idx) in enumerate(folds, start=1):
-            X_tr, y_tr, g_tr, yrs_tr = _sort_subset(X, y, country_id, years, train_idx)
-            X_va, y_va, g_va, _       = _sort_subset(X, y, country_id, years, val_idx)
+            # Binary has no 9K sub-window constraint — eco_ids=None, use cy groups.
+            X_tr, y_tr, g_tr, _, yrs_tr = _sort_subset(X, y, country_id, years, train_idx)
+            X_va, y_va, g_va, _, _      = _sort_subset(X, y, country_id, years, val_idx)
             weights_tr = compute_year_weights(
                 yrs_tr, min_year=int(yrs_tr.min()), max_year=int(yrs_tr.max())
             )

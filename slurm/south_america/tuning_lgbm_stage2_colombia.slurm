@@ -22,9 +22,11 @@ export STAGE2_DATA_ROOT="$HOME/master_thesis/data/dev/south_america/ml"
 export STAGE2_OUTPUT_DIR="$HOME/master_thesis/data/dev/south_america/ml/params/lambdarank"
 export STAGE2_NEG_RATIO=100
 export STAGE2_TUNING_TRIALS=30
+# W9a: ecoregion-stratified training groups (fixes 9K sub-window mismatch)
+export STAGE2_ECO_GROUPS=1
 
 mkdir -p "$STAGE2_OUTPUT_DIR"
 
-echo "Stage 2 LambdaRank tuning — Colombia dev panel (30 trials)..."
+echo "Stage 2 LambdaRank tuning — Colombia dev panel (30 trials, W9a eco groups)..."
 srun python -u scripts/regions/south_america/4_tuning/model1_tuning_lgbm_stage2
 echo "Colombia LambdaRank tuning done."

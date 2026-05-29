@@ -1,6 +1,6 @@
 # PA3030 — Paper Publication Roadmap
 
-**Updated**: 2026-05-28 (evening) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
+**Updated**: 2026-05-29 | **Branch**: `paper` (active). `main` = intact thesis, never touch.
 
 **Story**: The 30×30 biodiversity agreement is coming. We predict which land will be designated as protected area — giving investors and central banks an actionable transition risk tool for portfolio exposure to PA designation events.
 
@@ -77,8 +77,8 @@ W8 binary job 689625 OOM'd: `neg_ratio=None` loaded full parquet; SPW computed o
 
 ### HIGH — Affects Stage 2 quality
 
-**D — LambdaRank 9K sub-window mismatch**
-LightGBM enforces 9K-row per-query ceiling. SA median group = 413K rows → training optimises within 9K but evaluation is over full groups. CV=0.186 → test=0.028 gap is partly this. Binary (W8) has no ceiling. Decision rule: binary Lift@1% vs LambdaRank Lift@1% on SA test set. If binary wins → switch primary, activate Issues G+M fix. If LambdaRank wins → pursue W9a ecoregion groups.
+**D — LambdaRank 9K sub-window mismatch** ✅ **Fixed 2026-05-29 (W9a implemented)**
+LightGBM enforces 9K-row per-query ceiling. SA median group = 413K rows → training optimised within 9K but evaluation is over full groups. Fix (W9a): training groups are now `(country_id, year, eco_id)` ecoregion sub-groups (Colombia estimate: ~2,680 rows/group, well below 9K); NDCG evaluation still uses full `(country_id, year)` groups via `_TrueNdcg1PctEarlyStop`. Eco rasters loaded from `$SCRATCH/data/{region}/ready/GSN/gsn_terrestrial_ecoregions_mask_1km.tif`. Rank normalisation and graded relevance are computed within full cy groups before eco sub-sort. Binary (W8) has no 9K ceiling — eco groups not used for binary. Enabled via `STAGE2_ECO_GROUPS=1` env var in Colombia SLURM scripts.
 
 **N — Early stopping monitors wrong metric** ✅ **Fixed 2026-05-29**
 `eval_at=[90]` within 9K sub-windows caused LambdaRank to stop at iter 2 (Colombia); binary AP stopping caused stop at iter 5. Fix: `_TrueNdcg1PctEarlyStop` custom callback in `stage2_lgbm_core.py` calls `model.predict(X_val)` every iteration and stops on true NDCG@1% within full groups (patience=100 for final training, patience=50 for Optuna folds). Applied to both LambdaRank and binary in training AND Optuna — both models now tune and stop on the actual paper metric. Colombia re-run submitted (jobs 1227274–1227280).
@@ -138,7 +138,8 @@ LightGBM enforces 9K-row per-query ceiling. SA median group = 413K rows → trai
 | col_tune_lr (1122580) → col_train_lr (1122581) → col_tune_bin (1122582) → col_train_bin (1122583) | ❌ All failed — empty Colombia panel → no expansion samples |
 | W8 tune (1122585) → W8 train (1122586) | ❌ Cancelled 2026-05-29 — ran prematurely (silent Colombia failures released afterok dependency). Must wait for Colombia Issue D decision first. |
 | col_panel (1141209) → col_tune_lr (1141210) → col_train_lr (1141211) → col_tune_bin (1141212) → col_train_bin (1141213) | ✅ Done 2026-05-29 — but early stopping fired at iter 2 (LR) / iter 5 (bin); Issue N unresolved |
-| col_tune_lr (1227274) → col_train_lr (1227276) → col_tune_bin (1227278) → col_train_bin (1227280) | ⏳ In queue 2026-05-29 — Issue N fix applied: _TrueNdcg1PctEarlyStop replaces ndcg@90/AP stopping |
+| col_tune_lr (1227274) → col_train_lr (1227276) → col_tune_bin (1227278) → col_train_bin (1227280) | ❌ Cancelled 2026-05-29 — 1227274 ran 1h20m without W9a; cancelled to resubmit with W9a |
+| col_tune_lr (1242056) → col_train_lr (1242057) → col_tune_bin (1242058) → col_train_bin (1242059) | ⏳ In queue 2026-05-29 — Issue N fix (TrueNdcg1PctEarlyStop) + W9a eco groups (STAGE2_ECO_GROUPS=1) |
 
 ---
 
@@ -148,15 +149,17 @@ LightGBM enforces 9K-row per-query ceiling. SA median group = 413K rows → trai
 0b. ~~**Issue O fix**~~ ✅ Done 2026-05-28. `_scan_true_class_counts()` added; binary neg_ratio=100 with true SPW override; 6 SLURM scripts updated.
 0c. ~~**Colombia dev panel script**~~ ✅ Done 2026-05-28. `scripts/regions/south_america/dev/create_colombia_panel.py` + `STAGE2_DATA_ROOT`/`STAGE2_OUTPUT_DIR` env vars.
 0d. ~~**Submit Colombia pipeline + W8**~~ ✅ Done 2026-05-28. SA splits → Colombia panel → LambdaRank + binary chains; W8 SA binary in parallel. See Active Euler Jobs.
+0e. ~~**Issue N fix**~~ ✅ Done 2026-05-29. `_TrueNdcg1PctEarlyStop` replaces ndcg@90/AP for both LambdaRank and binary in training and Optuna.
+0f. ~~**Issue D fix (W9a)**~~ ✅ Done 2026-05-29. Ecoregion-stratified training groups implemented across all components (`country_raster.py`, `stage2_lgbm_core.py`, `stage2_optuna_runner.py`, `stage2_runner.py`). Enabled via `STAGE2_ECO_GROUPS=1`; Colombia SLURM scripts updated. All 3 region entry points updated.
 1. ~~**Submit panel rebuild chain**~~ ✅ SA done; SEA+USA in queue (jobs 1076912–1076916).
-2. **Colombia results**: When Colombia LambdaRank + binary training complete, compare Lift@1% in SLURM logs. Record here. This is the Issue D decision point.
-3. **W8 decision**: When W8 SA binary training completes, compare binary Lift@1% vs LambdaRank Lift@1% on full SA test set. Record here.
-   - Binary wins → fix forward pipeline (G+M), binary becomes Stage 2 primary.
-   - LambdaRank wins → pursue W9a ecoregion-stratified training groups.
+2. **Colombia results**: When Colombia jobs 1242056–1242059 complete, compare LambdaRank Lift@1% vs binary Lift@1%. Both models now have all known issues fixed (Issue N + D for LambdaRank, Issue N + O for binary). Record numbers here — this is the model selection decision point.
+3. **Model comparison decision**: LambdaRank (W9a) vs binary (W8).
+   - Both win (LR > bin OR bin > LR) → choose winner; submit full SA re-tune + retrain for winner.
+   - If comparable → choose LambdaRank (it encodes pair-wise ranking structure, better for the ranking task).
+4. **SA full re-tune + retrain**: Once model selected, run full SA tuning (100 trials) → training for the chosen model.
 5. **Re-run Stage 1** locally after SEA + USA FE jobs complete → update key numbers table above.
 6. **W4 ablation study** (SA first, after re-train result confirmed): does removing pa_momentum collapse Lift? Required for paper Methods.
-7. **Forward pipeline — Issues G+M**: Platt calibration + multi-year accumulation (2025–2029). Implement after W8 settled.
-8. **W9a ecoregion groups** (conditional on W8 outcome — see Issue D): groups `(country_id, year, ecoregion_id)` for training; evaluate at `(country_id, year)`. Only if LambdaRank primary and 9K is confirmed bottleneck.
+7. **Forward pipeline — Issues G+M**: Platt calibration + multi-year accumulation (2025–2029). Implement after Stage 2 model finalised.
 9. **REDD+ verification**: open TO VERIFY URLs before final manuscript.
 10. **Manuscript gate**: SA + SEA Stage 2 final results confirmed + Issue F resolved + ablation done + Issues G+M implemented. Do not start W7 before all gates.
 
