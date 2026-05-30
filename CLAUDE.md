@@ -376,3 +376,25 @@ pytest tests/test_pipeline.py -v
 ├── environment.yml
 └── README.md
 ```
+
+
+---
+
+## Save-to-memory convention (added by central memory setup)
+
+When Chiara says **"save to memory"** at the end of a session, append today's summary to **`MEMORY.md`** in this folder (create it if it does not exist). Use this template:
+
+```
+## YYYY-MM-DD
+
+### Completed
+- bullet
+### Decisions
+- bullet
+### Lessons learned
+- bullet (use ⚠ prefix if it is a "watch out")
+### Open todos / next session
+- [ ] bullet
+```
+
+A 7pm scheduled task at `~/Files/Claude/` reads `MEMORY.md` files across all projects and pulls today's content into the central memory. Keep entries concise — one line per item.
