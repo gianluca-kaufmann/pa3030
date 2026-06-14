@@ -49,6 +49,6 @@ echo "PWD = $(pwd)"
   exit 1
 }
 # Run the script
-python "scripts/regions/south_america/5_training/model1_splits"
+srun python "scripts/regions/south_america/5_training/model1_splits"
 
 echo "model1_splits script finished."

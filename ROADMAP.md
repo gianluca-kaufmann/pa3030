@@ -1,6 +1,6 @@
 # PA3030 — Publication Roadmap
 
-**Updated**: 2026-06-09 | **Branch**: `paper` (active). `main` = intact thesis, never touch.
+**Updated**: 2026-06-14 | **Branch**: `paper` (active). `main` = intact thesis, never touch.
 
 **Story**: The 30×30 agreement forces countries to double protected area coverage by 2030. We predict which pixels will be designated — giving investors, central banks, and policymakers an actionable transition risk tool. Stage 1 predicts *when* countries will expand; Stage 2 predicts *which pixels* will be chosen. Stage 2 output is a **calibrated suitability score**: every pixel gets a value interpretable as annual designation probability.
 
@@ -103,9 +103,9 @@ Local retrain at 3–5M rows: seconds. 30-trial Optuna: ~5–10 min. Feature exp
 | ID | Issue | Action |
 |---|---|---|
 | ~~**CC**~~ | Stage 1 LASSO feature selection | ✅ Done 2026-06-14. See `outputs/south_america/results/stage1_lasso.json`. |
-| **BB** | XGBoost `rank:ndcg` vs LambdaRank W9a | Euler job: tune XGBoost on Colombia (30 trials, same features). If XGBoost ≥ 5.99× → switch (simpler, Issue S dissolved). |
-| **X** | neg_ratio sensitivity | LambdaRank neg_ratio ∈ {100, 200, full} on Colombia. Run parallel with BB. Best ratio used going forward. |
-| **MS** | Build SA mini-sample | Sample 3–5M rows from SA training panel on Euler (stratified by country/year, natural ratio). Sync to Desktop. Run validation gate. |
+| **BB** | XGBoost `rank:ndcg` vs LambdaRank W9a | ✅ Tuning done 2026-06-14: best NDCG@1% = 0.1302 (trial 21/30). Training submitted (job 3354097, `training_xgboost_stage2_colombia.slurm`). Await Lift@1% on test set; compare to LGBM best once neg_ratio (X) settled. |
+| **X** | neg_ratio sensitivity | neg_ratio=200 ✅ done: NDCG@1%=0.1275. neg_ratio=full 🔄 running (job 3340192, ~16:00 ETA). Lock best ratio after neg_full completes; then submit LGBM training for winner. |
+| **MS** | Build SA mini-sample | ✅ Built 2026-06-14: 4M rows, 712 MB, 169 (country,year) groups, pos_rate=0.82%. At `$SCRATCH/data/south_america/ml/mini_sample.parquet`. Pending: sync to Desktop + validation gate. |
 
 → After Phase 0: engine (XGBoost or LightGBM) + neg_ratio locked. Mini-sample validated. No further architecture changes in Phase 1.
 
@@ -156,15 +156,15 @@ Local retrain at 3–5M rows: seconds. 30-trial Optuna: ~5–10 min. Feature exp
 
 ## Next Actions (ordered)
 
-### Phase 0 — Engine + Mini-Sample (start now)
+### Phase 0 — Engine + Mini-Sample (in progress)
 
-1. **Issue CC** (local, ~10 min): LASSO Stage 1. Run on `data/south_america/stage1_panel.parquet`. Save to `outputs/south_america/results/stage1_lasso.json`. Re-run D²_7yr + JK CI on selected spec.
+1. ~~**Issue CC**~~ ✅ Done 2026-06-14.
 
-2. **Issue BB** (Euler, 6h): XGBoost `rank:ndcg` vs LambdaRank W9a on Colombia, 30 trials. Decision: XGBoost ≥ 5.99× → switch; else keep LambdaRank.
+2. **Issue BB** — XGBoost tuning ✅ done. Training running (job 3354097). Once Lift@1% on test is available: compare vs LGBM best → lock engine.
 
-3. **Issue X** (Euler, 6h, parallel with BB): neg_ratio ∈ {100, 200, full}. Lock best ratio.
+3. **Issue X** — neg200 ✅ done. neg_full 🔄 running (~16:00 ETA). Once complete: pick best neg_ratio → submit LGBM training for winner → compare Lift@1% with XGBoost → lock engine + neg_ratio together.
 
-4. **Issue MS** (Euler, then local): Build SA mini-sample (3–5M rows, natural ratio, stratified by country/year). Sync to Desktop. Run validation gate: same model on mini vs full SA test → confirm Lift@1% ranks correlate.
+4. **Issue MS** — mini-sample ✅ built. Next: sync to Desktop (`rsync euler:$SCRATCH/data/south_america/ml/mini_sample.parquet data/south_america/`) → run validation gate locally.
 
 → Outcome: engine locked + neg_ratio locked + mini-sample validated. Ready for Phase 1.
 
@@ -217,7 +217,8 @@ Local retrain at 3–5M rows: seconds. 30-trial Optuna: ~5–10 min. Feature exp
 - `tuning_lgbm_stage2_colombia.slurm` — LambdaRank 30 trials, 6h, 32 GB
 - `training_lgbm_stage2_colombia.slurm` — LambdaRank training, 3h, 32 GB
 - `tuning_lgbm_stage2_binary_colombia.slurm` — binary / GG comparison
-- `tuning_xgboost_stage2_colombia.slurm` — XGBoost rank:ndcg, Issue BB
+- `tuning_xgboost_stage2_colombia.slurm` — XGBoost rank:ndcg tuning, Issue BB
+- `training_xgboost_stage2_colombia.slurm` — XGBoost training + test eval, Issue BB
 - `tuning_lgbm_stage2_neg200_colombia.slurm` — LambdaRank neg_ratio=200, Issue X
 - `tuning_lgbm_stage2_neg_full_colombia.slurm` — LambdaRank neg_ratio=full, Issue X
 - `build_mini_sample.slurm` — SA mini-sample, Issue MS

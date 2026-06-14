@@ -20,9 +20,11 @@ import optuna
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+import xgboost as xgb
 
 from scripts.regions.shared.evaluation.stage2_metrics import ndcg_at_k_within_groups
 from scripts.regions.shared.training.feature_guard import check_feature_denylist
+from scripts.regions.shared.training.stage2_xgb_core import XGBNdcg1PctEarlyStopper
 from scripts.regions.shared.training.stage2_lgbm_core import (
     STAGE2_EXCLUDE_COLS,
     TARGET_COL,
@@ -57,52 +59,7 @@ def _sort_fold(
     return Xs, ys, sizes, yrs
 
 
-class _XGBNdcg1PctEarlyStopper:
-    """XGBoost callback: early-stop on true NDCG@1% within full (country_id, year) groups.
-
-    Mirrors _TrueNdcg1PctEarlyStop from stage2_lgbm_core so both models are
-    stopped and evaluated on the same metric.
-    """
-
-    def __init__(
-        self,
-        dval: Any,
-        y_val: np.ndarray,
-        group_val: np.ndarray,
-        patience: int = 50,
-        verbose: bool = True,
-        log_interval: int = 50,
-    ) -> None:
-        self.dval = dval
-        self.y_val = y_val.astype(np.float64)
-        self.group_val = group_val
-        self.patience = patience
-        self.verbose = verbose
-        self.log_interval = log_interval
-        self.best_score: float = 0.0
-        self.best_iter: int = 0
-
-    def __call__(self, env: Any) -> bool:
-        """Called via xgb.train callbacks list (old-style callable API)."""
-        epoch = env.iteration
-        pred = env.model.predict(self.dval)
-        score = ndcg_at_k_within_groups(self.y_val, pred, self.group_val, 1.0)
-        if score > self.best_score:
-            self.best_score = score
-            self.best_iter = epoch
-        if self.verbose and (epoch + 1) % self.log_interval == 0:
-            print(
-                f"[{epoch + 1}]  xgb ndcg@1%: {score:.6f}"
-                f"  best: {self.best_score:.6f} @ iter {self.best_iter + 1}"
-            )
-        if epoch - self.best_iter >= self.patience:
-            if self.verbose:
-                print(
-                    f"XGB early stop at iter {epoch + 1}."
-                    f" Best: iter {self.best_iter + 1} ({self.best_score:.6f})"
-                )
-            raise StopIteration()
-        return False
+_XGBNdcg1PctEarlyStopper = XGBNdcg1PctEarlyStopper  # alias for backward compat
 
 
 def _optimize_xgb_optuna(
@@ -116,8 +73,6 @@ def _optimize_xgb_optuna(
     n_jobs: int,
 ) -> Tuple[Dict[str, Any], float, List[Dict[str, Any]]]:
     """Optuna HPO for XGBoost rank:ndcg."""
-    import xgboost as xgb
-
     sampler = optuna.samplers.TPESampler(seed=random_state)
     pruner = optuna.pruners.MedianPruner(n_startup_trials=max(10, n_trials // 10))
     study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
@@ -153,8 +108,13 @@ def _optimize_xgb_optuna(
             weights_tr = compute_year_weights(
                 yrs_tr, min_year=int(yrs_tr.min()), max_year=int(yrs_tr.max())
             )
+            # rank:ndcg requires one weight per query group, not per row.
+            # All rows in a (country_id, year) group share the same year weight,
+            # so take the first row index of each group.
+            group_starts = np.concatenate([[0], np.cumsum(g_tr[:-1])])
+            group_weights_tr = weights_tr[group_starts]
 
-            dtrain = xgb.DMatrix(X_tr, label=y_tr, weight=weights_tr)
+            dtrain = xgb.DMatrix(X_tr, label=y_tr, weight=group_weights_tr)
             dtrain.set_group(g_tr.tolist())
 
             dval = xgb.DMatrix(X_va, label=y_va)
@@ -163,16 +123,13 @@ def _optimize_xgb_optuna(
             early_stopper = _XGBNdcg1PctEarlyStopper(
                 dval, y_va, g_va, patience=50, verbose=False
             )
-            try:
-                xgb.train(
-                    params,
-                    dtrain,
-                    num_boost_round=n_estimators,
-                    callbacks=[early_stopper],
-                    verbose_eval=False,
-                )
-            except StopIteration:
-                pass
+            xgb.train(
+                params,
+                dtrain,
+                num_boost_round=n_estimators,
+                callbacks=[early_stopper],
+                verbose_eval=False,
+            )
 
             fold_scores.append(early_stopper.best_score)
             trial.report(_mean(fold_scores), step=fold_idx)
