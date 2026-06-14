@@ -47,7 +47,7 @@ Momentum: lag1/2/3, cumsum_lag1 | Political: v2x_polyarchy, gdp_growth_lag1, red
 
 | Metric | Bar | Current | Notes |
 |---|---|---|---|
-| Recall@5% | ≥ 90% | Not yet measured | Primary bar — supervisors confirmed achievable |
+| Recall@5% | ≥ 90% | ~13% (Colombia dev, 8 test groups) | Primary bar — supervisors confirmed achievable |
 | Lift@1% | ≥ 15× | 5.99× | ~2.5× gap — feature problem, not tuning |
 | Lift@1% 95% CI | must exclude 1× | Not computed | Bootstrap after final model |
 
@@ -97,11 +97,12 @@ Local retrain at 3–5M rows: seconds. 30-trial Optuna: ~5–10 min. Feature exp
 | J | SEA Stage 1 parsimony | 10-feat parsimonious spec selected |
 | P | Comparison metric for W8 | Lift@1% used; LambdaRank selected over binary |
 | W | Graded vs binary labels | LambdaRank 5.99× >> Binary 3.04× — graded labels confirmed 2026-05-29 |
+| CC | Stage 1 LASSO feature selection | LOYO-CV alpha=100. 9-feat selected (D²_7yr=0.346): lag1, cumsum_lag1, polyarchy, gdp_lag1, redd, d_csprtcpt, agri_land, d_legcon_lag1, cbd. Zeroed: lag2, lag3, d_legcon, legcon_x_cspart. 9-feat marginally better than 12-feat (0.346 vs 0.345). CBD survival disregarded (2 training instances). Interaction term dropped by LASSO but retained in primary spec on theoretical grounds. |
 
 ### Open — Phase 0 (do before any feature work)
 | ID | Issue | Action |
 |---|---|---|
-| **CC** | Stage 1 LASSO feature selection | LASSO path (Poisson + L1) on `stage1_panel.parquet`, LOYO-CV alpha. Local, ~10 min. Save to `stage1_lasso.json`. |
+| ~~**CC**~~ | Stage 1 LASSO feature selection | ✅ Done 2026-06-14. See `outputs/south_america/results/stage1_lasso.json`. |
 | **BB** | XGBoost `rank:ndcg` vs LambdaRank W9a | Euler job: tune XGBoost on Colombia (30 trials, same features). If XGBoost ≥ 5.99× → switch (simpler, Issue S dissolved). |
 | **X** | neg_ratio sensitivity | LambdaRank neg_ratio ∈ {100, 200, full} on Colombia. Run parallel with BB. Best ratio used going forward. |
 | **MS** | Build SA mini-sample | Sample 3–5M rows from SA training panel on Euler (stratified by country/year, natural ratio). Sync to Desktop. Run validation gate. |
@@ -199,6 +200,7 @@ Local retrain at 3–5M rows: seconds. 30-trial Optuna: ~5–10 min. Feature exp
 | Dataset | Location |
 |---|---|
 | SA merged_panel_final.parquet (57 GB) | `euler:$SCRATCH/data/south_america/ml/merged_panel_final.parquet` |
+| SA Stage 2 splits (42 GB) | `euler:$SCRATCH/data/south_america/ml/main/{train,earlystop,test}.parquet` |
 | SA mini-sample (~200 MB) | `euler:$SCRATCH/data/south_america/ml/mini_sample.parquet` → sync to `data/south_america/mini_sample.parquet` |
 | Colombia Stage 2 panel (3.9 GB) | `euler:$SCRATCH/data/dev/south_america/ml/main/{train,earlystop,test}.parquet` |
 | Stage 1 panels (~35 KB each) | `data/{south_america,se_asia,usa}/stage1_panel.parquet` (in repo) |
@@ -215,8 +217,10 @@ Local retrain at 3–5M rows: seconds. 30-trial Optuna: ~5–10 min. Feature exp
 - `tuning_lgbm_stage2_colombia.slurm` — LambdaRank 30 trials, 6h, 32 GB
 - `training_lgbm_stage2_colombia.slurm` — LambdaRank training, 3h, 32 GB
 - `tuning_lgbm_stage2_binary_colombia.slurm` — binary / GG comparison
-- *(to create)* `tuning_xgboost_stage2_colombia.slurm` — XGBoost rank:ndcg, Issue BB
-- *(to create)* `build_mini_sample.slurm` — SA mini-sample, Issue MS
+- `tuning_xgboost_stage2_colombia.slurm` — XGBoost rank:ndcg, Issue BB
+- `tuning_lgbm_stage2_neg200_colombia.slurm` — LambdaRank neg_ratio=200, Issue X
+- `tuning_lgbm_stage2_neg_full_colombia.slurm` — LambdaRank neg_ratio=full, Issue X
+- `build_mini_sample.slurm` — SA mini-sample, Issue MS
 
 **Key env vars**: `STAGE2_DATA_ROOT`, `STAGE2_OUTPUT_DIR`, `STAGE2_ECO_GROUPS=1` (W9a), `STAGE2_NEG_RATIO` (100/200/full).
 
