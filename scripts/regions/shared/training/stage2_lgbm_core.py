@@ -180,7 +180,7 @@ class Stage2Config:
     random_state: int = 42
     feature_subset: Optional[List[str]] = None  # e.g. ["dist_wdpa"] for naive baseline
     ablation_drop: Optional[str] = None  # drop feature group by name prefix
-    variant: str = "full"  # "full" or "naive"
+    variant: str = "full"  # "full" produces no suffix; any other string appended to output tag
     use_ecoregion_groups: bool = False  # W9a: train on (cy, eco_id) sub-groups
 
 
@@ -876,10 +876,8 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
     gc.collect()
 
     tag = f"{cfg.model_prefix}_lgbm_stage2"
-    if cfg.variant == "naive":
-        tag += "_naive"
-    elif cfg.variant == "binary":
-        tag += "_binary"
+    if cfg.variant != "full":
+        tag += f"_{cfg.variant}"
     model_path = model_dir / f"{tag}_{timestamp}.pkl"
     with open(model_path, "wb") as f:
         pickle.dump({"model": model, "feature_cols": feature_cols, "config": cfg}, f)
