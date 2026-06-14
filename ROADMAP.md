@@ -103,9 +103,9 @@ Local retrain at 3–5M rows: seconds. 30-trial Optuna: ~5–10 min. Feature exp
 | ID | Issue | Action |
 |---|---|---|
 | ~~**CC**~~ | Stage 1 LASSO feature selection | ✅ Done 2026-06-14. See `outputs/south_america/results/stage1_lasso.json`. |
-| **BB** | XGBoost `rank:ndcg` vs LambdaRank W9a | ✅ Tuning done 2026-06-14: best NDCG@1% = 0.1302 (trial 21/30). Training submitted (job 3354097, `training_xgboost_stage2_colombia.slurm`). Await Lift@1% on test set; compare to LGBM best once neg_ratio (X) settled. |
-| **X** | neg_ratio sensitivity | neg_ratio=200 ✅ done: NDCG@1%=0.1275. neg_ratio=full 🔄 running (job 3340192, ~16:00 ETA). Lock best ratio after neg_full completes; then submit LGBM training for winner. |
-| **MS** | Build SA mini-sample | ✅ Built 2026-06-14: 4M rows, 712 MB, 169 (country,year) groups, pos_rate=0.82%. At `$SCRATCH/data/south_america/ml/mini_sample.parquet`. Pending: sync to Desktop + validation gate. |
+| **BB** | XGBoost `rank:ndcg` vs LambdaRank W9a | ⚠️ First training (job 3354097) invalid: early-stop set had only 3 Colombia expansion groups → NDCG noisy → stopped at iter 4 → reported Lift@1%=2.33× with 4 trees. Bug fixed in `stage2_xgb_core.py` (falls back to fixed-iter when <5 expansion groups). Retraining submitted job 3391479 with full 739 iterations. Await new Lift@1% to compare vs LambdaRank 5.99×. |
+| **X** | neg_ratio sensitivity | neg_ratio=200 ✅ NDCG@1%=0.1275. neg_ratio=full ✅ NDCG@1%=0.1061 (worst). Baseline neg_ratio=100 NDCG@1%=0.1070. Winner: neg_ratio=200 on tuning metric. Submit LGBM training with neg_ratio=200 after BB engine decision. |
+| **MS** | Build SA mini-sample | ✅ Built. Validation gate: first run (job 3356942) OOM killed (32 GB → not enough for full SA test). Fixed SLURM to 16×8G=128 GB. Resubmitted job 3391648. |
 
 → After Phase 0: engine (XGBoost or LightGBM) + neg_ratio locked. Mini-sample validated. No further architecture changes in Phase 1.
 
@@ -160,11 +160,11 @@ Local retrain at 3–5M rows: seconds. 30-trial Optuna: ~5–10 min. Feature exp
 
 1. ~~**Issue CC**~~ ✅ Done 2026-06-14.
 
-2. **Issue BB** — XGBoost tuning ✅ done. Training running (job 3354097). Once Lift@1% on test is available: compare vs LGBM best → lock engine.
+2. **Issue BB** — XGBoost tuning ✅. First training invalid (early-stop bug, 4 trees). Fixed + resubmitted (job 3391479, 739 trees). Once done: compare Lift@1% vs LambdaRank 5.99× → lock engine.
 
-3. **Issue X** — neg200 ✅ done. neg_full 🔄 running (~16:00 ETA). Once complete: pick best neg_ratio → submit LGBM training for winner → compare Lift@1% with XGBoost → lock engine + neg_ratio together.
+3. **Issue X** — All ratios done: neg_full=0.1061 (worst), baseline=0.1070, neg200=0.1275 (best). Once BB engine locked: submit LGBM training with neg_ratio=200 → confirm Lift@1% on test.
 
-4. **Issue MS** — mini-sample ✅ built. Next: sync to Desktop (`rsync euler:$SCRATCH/data/south_america/ml/mini_sample.parquet data/south_america/`) → run validation gate locally.
+4. **Issue MS** — mini-sample ✅ built. Validation gate resubmitted (job 3391648, 128 GB). Once done: check Lift@1% > 2.81× (naive baseline) → gate passes → sync to Desktop.
 
 → Outcome: engine locked + neg_ratio locked + mini-sample validated. Ready for Phase 1.
 

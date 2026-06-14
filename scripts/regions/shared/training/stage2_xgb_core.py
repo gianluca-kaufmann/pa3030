@@ -36,6 +36,8 @@ from scripts.regions.shared.training.stage2_lgbm_core import (
 )
 from scripts.regions.shared.training.utils import compute_year_weights, get_repo_root
 
+_MIN_GROUPS_FOR_EARLY_STOP = 5  # fewer groups → NDCG@1% is too noisy to guide stopping
+
 FIXED_PARAMS: Dict[str, Any] = {
     "objective": "rank:ndcg",
     "tree_method": "hist",
@@ -134,14 +136,30 @@ def train_xgb_rank(
 
     Returns (booster, best_iter). Use iteration_range=(0, best_iter+1) when
     predicting to limit inference to the best checkpoint.
+    Falls back to fixed-iteration training when the early-stop set has too few
+    expansion groups for NDCG@1% to be a stable signal.
     """
-    # XGBoost rank:ndcg requires one weight per query group, not per row.
-    # All rows in a (country_id, year) group share the same year weight.
     group_starts = np.concatenate([[0], np.cumsum(group_train[:-1])])
     group_weights = year_weights_train[group_starts]
 
     dtrain = xgb.DMatrix(X_train, label=y_train, weight=group_weights)
     dtrain.set_group(group_train.tolist())
+
+    # Count expansion groups (groups with ≥1 positive) in the early-stop set.
+    boundaries = np.concatenate([[0], np.cumsum(group_val)])
+    n_pos_groups = int(sum(
+        y_val[boundaries[i]:boundaries[i + 1]].sum() > 0
+        for i in range(len(group_val))
+    ))
+    if n_pos_groups < _MIN_GROUPS_FOR_EARLY_STOP:
+        # Too few groups — NDCG@1% is noisy. Train for exactly num_boost_round iterations.
+        print(
+            f"  [XGB] Early-stop set has only {n_pos_groups} expansion groups "
+            f"(< {_MIN_GROUPS_FOR_EARLY_STOP}) — skipping early stop, "
+            f"training {num_boost_round} fixed iterations."
+        )
+        booster = xgb.train(params, dtrain, num_boost_round=num_boost_round)
+        return booster, num_boost_round - 1
 
     dval = xgb.DMatrix(X_val, label=y_val)
     dval.set_group(group_val.tolist())
