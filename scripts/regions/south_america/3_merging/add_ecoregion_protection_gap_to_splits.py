@@ -1,0 +1,227 @@
+"""Add ecoregion protection gap columns to the full SA Stage 2 splits on Euler.
+
+The ecoregion protection gap is time-varying (protection fraction of the pixel's
+ecoregion at year t-1), so it cannot use the standard TIF-based add_feature_to_splits.py
+workflow.  This script:
+  1. Computes the (eco_id, year) → protection_ratio lookup from WDPA + GSN TIFs
+  2. Processes each split in batches, joining lookup by (ecoregion_id, year)
+  3. Adds eco_protection_ratio_lag1 and eco_protection_gap_lag1 to each split
+
+Run this INSTEAD OF the standard add_feature_to_splits.py step in phase1_euler_gate.sh
+when the feature tag is "eco_protection_gap".
+
+Usage (Euler):
+  python scripts/regions/south_america/3_merging/add_ecoregion_protection_gap_to_splits.py \\
+      [--inplace]
+
+Env vars:
+  SCRATCH           — Euler scratch path
+  STAGE2_DATA_ROOT  — override split directory
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import rasterio
+
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
+ECO_TIF = PROJECT_ROOT / "data/south_america/ready/GSN/gsn_terrestrial_ecoregions_mask_1km.tif"
+
+TARGET_30X30 = 0.30
+N_ECO = 138
+BATCH_SIZE = 500_000
+NEW_COLS = ["eco_protection_ratio_lag1", "eco_protection_gap_lag1"]
+
+
+def _resolve_splits_dir() -> Path:
+    data_root = os.environ.get("STAGE2_DATA_ROOT")
+    if data_root:
+        p = Path(data_root) / "main"
+        if p.exists():
+            return p
+        p = Path(data_root)
+        if p.exists():
+            return p
+    scratch = os.environ.get("SCRATCH")
+    if scratch:
+        return Path(scratch) / "data/south_america/ml/main"
+    raise RuntimeError("Cannot find splits directory. Set SCRATCH or STAGE2_DATA_ROOT.")
+
+
+def _resolve_wdpa_dir() -> Path:
+    scratch = os.environ.get("SCRATCH")
+    if scratch:
+        p = Path(scratch) / "data/south_america/ready/WDPA"
+        if p.exists():
+            return p
+    local = PROJECT_ROOT / "data/south_america/ready/WDPA"
+    if local.exists():
+        return local
+    raise RuntimeError("Cannot find WDPA TIF directory. Set SCRATCH.")
+
+
+def _build_lookup(wdpa_dir: Path) -> pd.DataFrame:
+    """Compute protection ratio per (ecoregion_id, panel_year) from TIFs."""
+    print("Loading GSN ecoregion TIF...")
+    with rasterio.open(ECO_TIF) as src:
+        eco_grid = src.read(1)   # uint8
+
+    h_wdpa_ref, w_wdpa_ref = 9047, 8975
+    h_int = min(eco_grid.shape[0], h_wdpa_ref)
+    w_int = min(eco_grid.shape[1], w_wdpa_ref)
+    eco_int = eco_grid[:h_int, :w_int]
+
+    eco_totals = np.bincount(eco_int.ravel().astype(np.int32), minlength=N_ECO).astype(np.float64)
+    eco_totals[0] = 0
+
+    rows: list[dict] = []
+    for wdpa_year in range(2000, 2024):
+        path = wdpa_dir / f"WDPA_SA_1km_{wdpa_year}.tif"
+        if not path.exists():
+            continue
+        with rasterio.open(path) as src:
+            wdpa = src.read(1).astype(np.float32)
+
+        wdpa_int = wdpa[:h_int, :w_int]
+        protected = np.where(np.isfinite(wdpa_int), wdpa_int > 0, False).astype(np.float32)
+
+        eco_protected = np.bincount(
+            eco_int.ravel().astype(np.int32),
+            weights=protected.ravel(),
+            minlength=N_ECO,
+        )
+        with np.errstate(invalid="ignore", divide="ignore"):
+            ratio = np.where(eco_totals > 0, eco_protected / eco_totals, np.nan).astype(np.float32)
+
+        panel_year = wdpa_year + 1
+        for eco_id in range(1, N_ECO):
+            r = float(ratio[eco_id])
+            if not np.isnan(r):
+                rows.append({
+                    "ecoregion_id": eco_id,
+                    "panel_year": panel_year,
+                    "eco_protection_ratio_lag1": r,
+                    "eco_protection_gap_lag1": max(0.0, TARGET_30X30 - r),
+                })
+        print(f"  WDPA {wdpa_year} → panel year {panel_year} done")
+
+    df = pd.DataFrame(rows)
+    df["ecoregion_id"] = df["ecoregion_id"].astype(np.int16)
+    df["panel_year"] = df["panel_year"].astype(np.int16)
+    df["eco_protection_ratio_lag1"] = df["eco_protection_ratio_lag1"].astype(np.float32)
+    df["eco_protection_gap_lag1"] = df["eco_protection_gap_lag1"].astype(np.float32)
+    return df
+
+
+def _load_eco_grid() -> np.ndarray:
+    with rasterio.open(ECO_TIF) as src:
+        return src.read(1)   # (9172, 8974) uint8
+
+
+def _augment_split(
+    in_path: Path,
+    out_path: Path,
+    lookup: pd.DataFrame,
+    eco_grid: np.ndarray,
+) -> None:
+    if not in_path.exists():
+        print(f"  SKIP (not found): {in_path.name}")
+        return
+
+    print(f"  {in_path.name}  ({in_path.stat().st_size / 1e9:.1f} GB)...")
+    pf = pq.ParquetFile(in_path)
+
+    existing_cols = pf.schema_arrow.names
+    drop_cols = [c for c in NEW_COLS if c in existing_cols]
+    if drop_cols:
+        print(f"    Replacing existing: {drop_cols}")
+
+    h_eco, w_eco = eco_grid.shape
+    writer = None
+    rows_processed = 0
+
+    for batch in pf.iter_batches(batch_size=BATCH_SIZE):
+        table = pa.Table.from_batches([batch])
+        if drop_cols:
+            table = table.select([c for c in table.column_names if c not in drop_cols])
+
+        rows_arr = table.column("row").to_numpy(zero_copy_only=False).astype(np.int64)
+        cols_arr = table.column("col").to_numpy(zero_copy_only=False).astype(np.int64)
+        years_arr = table.column("year").to_numpy(zero_copy_only=False).astype(np.int16)
+
+        valid = (rows_arr >= 0) & (rows_arr < h_eco) & (cols_arr >= 0) & (cols_arr < w_eco)
+        eco_ids = np.zeros(len(rows_arr), dtype=np.int16)
+        eco_ids[valid] = eco_grid[rows_arr[valid], cols_arr[valid]]
+
+        join_df = pd.DataFrame({
+            "ecoregion_id": eco_ids,
+            "panel_year": years_arr,
+        })
+        merged = join_df.merge(
+            lookup,
+            left_on=["ecoregion_id", "panel_year"],
+            right_on=["ecoregion_id", "panel_year"],
+            how="left",
+        )
+        ratio_vals = merged["eco_protection_ratio_lag1"].to_numpy(dtype=np.float32)
+        gap_vals = merged["eco_protection_gap_lag1"].to_numpy(dtype=np.float32)
+
+        table = table.append_column("eco_protection_ratio_lag1",
+                                    pa.array(ratio_vals, type=pa.float32()))
+        table = table.append_column("eco_protection_gap_lag1",
+                                    pa.array(gap_vals, type=pa.float32()))
+
+        if writer is None:
+            writer = pq.ParquetWriter(out_path, table.schema, compression="snappy")
+        writer.write_table(table)
+        rows_processed += len(table)
+
+    if writer is not None:
+        writer.close()
+        print(f"    {rows_processed:,} rows → {out_path.name}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Add ecoregion protection gap to full SA splits"
+    )
+    parser.add_argument("--inplace", action="store_true",
+                        help="Overwrite originals (default: write .augmented)")
+    args = parser.parse_args()
+
+    wdpa_dir = _resolve_wdpa_dir()
+    splits_dir = _resolve_splits_dir()
+
+    print(f"Splits: {splits_dir}")
+    print(f"WDPA:   {wdpa_dir}")
+
+    lookup = _build_lookup(wdpa_dir)
+    eco_grid = _load_eco_grid()
+
+    for split_name in ("train.parquet", "earlystop.parquet", "test.parquet"):
+        in_path = splits_dir / split_name
+        if args.inplace:
+            tmp_path = splits_dir / (split_name + ".tmp")
+            _augment_split(in_path, tmp_path, lookup, eco_grid)
+            if tmp_path.exists():
+                tmp_path.rename(in_path)
+                print(f"    Replaced: {in_path.name}")
+        else:
+            out_path = splits_dir / (split_name.replace(".parquet", "_augmented.parquet"))
+            _augment_split(in_path, out_path, lookup, eco_grid)
+
+    if not args.inplace:
+        print()
+        print("Written with _augmented.parquet suffix. Re-run with --inplace to overwrite.")
+
+
+if __name__ == "__main__":
+    main()

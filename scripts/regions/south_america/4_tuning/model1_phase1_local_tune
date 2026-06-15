@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""Phase 1 local hyperparameter tuning on the SA mini-sample.
+
+Runs 30-trial Optuna on data/south_america/mini_splits/ (train 2001-2010,
+val 2011-2013) for fast same-day feature experiments.  Typically completes in
+5-10 minutes locally.
+
+Usage:
+  python scripts/regions/south_america/4_tuning/model1_phase1_local_tune \\
+      --feature-tag kba [--n-trials 30]
+
+STAGE2_DATA_ROOT defaults to data/south_america/mini_splits if not set.
+STAGE2_ECO_GROUPS defaults to 1 (W9a eco sub-groups, same as production).
+
+Output:
+  outputs/south_america/results/phase1/<feature-tag>/best_params.json
+
+Next step:
+  python scripts/regions/south_america/5_training/model1_phase1_local_train \\
+      --feature-tag <feature-tag>
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[4]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from scripts.regions.shared.tuning.stage2_runner import run_stage2_tuning
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Phase 1 local LambdaRank tuning on SA mini-splits"
+    )
+    parser.add_argument(
+        "--feature-tag", default="baseline",
+        help="Label for this experiment: 'kba', 'redd', 'baseline', etc."
+    )
+    parser.add_argument("--n-trials", type=int, default=30)
+    args = parser.parse_args()
+
+    if not os.environ.get("STAGE2_DATA_ROOT"):
+        default_root = str(_ROOT / "data/south_america/mini_splits")
+        os.environ["STAGE2_DATA_ROOT"] = default_root
+        print(f"STAGE2_DATA_ROOT → {default_root}")
+
+    use_eco = bool(int(os.environ.get("STAGE2_ECO_GROUPS", "1")))
+    out_dir = _ROOT / "outputs/south_america/results/phase1" / args.feature_tag
+
+    print(f"=== Phase 1 local tuning  tag={args.feature_tag}  trials={args.n_trials} ===")
+    run_stage2_tuning(
+        "south_america",
+        "model1",
+        n_trials=args.n_trials,
+        variant="lambdarank",
+        use_ecoregion_groups=use_eco,
+        output_dir=out_dir,
+        # Mini-splits cover 2001-2010 (train) and 2011-2013 (earlystop).
+        # Production year ranges are 2001-2013 / 2014-2016; override for local use.
+        train_year_range=(2001, 2010),
+        earlystop_year_range=(2011, 2013),
+    )
+
+
+if __name__ == "__main__":
+    main()

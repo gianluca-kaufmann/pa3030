@@ -38,7 +38,15 @@ def run_stage2_tuning(
     output_dir: Path | None = None,
     variant: str = "lambdarank",
     use_ecoregion_groups: bool = False,
+    train_year_range: tuple[int, int] = (2001, 2013),
+    earlystop_year_range: tuple[int, int] = (2014, 2016),
 ) -> Path:
+    """Run Optuna hyperparameter tuning for Stage 2 LambdaRank.
+
+    train_year_range / earlystop_year_range: override the default temporal
+        boundaries when using non-standard splits (e.g. mini-sample where the
+        earlystop covers 2011-2013 instead of the production 2014-2016).
+    """
     repo_root = get_repo_root()
     script_dir = repo_root / "scripts" / "regions" / region / "5_training"
     # STAGE2_OUTPUT_DIR: redirect best_params.json for dev/Colombia panel runs so
@@ -66,9 +74,13 @@ def run_stage2_tuning(
             feature_cols.append(name)
     check_feature_denylist(feature_cols, context=f"{region}/stage2/tuning")
 
+    pool_range = (
+        min(train_year_range[0], earlystop_year_range[0]),
+        max(train_year_range[1], earlystop_year_range[1]),
+    )
     expansion_groups = _expansion_groups_from_batches(
-        train_path, region, (2001, 2016)
-    ) | _expansion_groups_from_batches(earlystop_path, region, (2001, 2016))
+        train_path, region, pool_range
+    ) | _expansion_groups_from_batches(earlystop_path, region, pool_range)
 
     # Both binary and LambdaRank use STAGE2_NEG_RATIO for memory-safe loading.
     # Binary uses scale_pos_weight for class-balance signalling: the true SPW
@@ -83,10 +95,10 @@ def run_stage2_tuning(
     if variant == "binary":
         print("Pre-scanning train + earlystop for true class counts (Issue O fix)...")
         _n_pos_tr, _n_neg_tr = _scan_true_class_counts(
-            train_path, region, expansion_groups, (2001, 2013)
+            train_path, region, expansion_groups, train_year_range
         )
         _n_pos_es, _n_neg_es = _scan_true_class_counts(
-            earlystop_path, region, expansion_groups, (2014, 2016)
+            earlystop_path, region, expansion_groups, earlystop_year_range
         )
         _n_pos_total = _n_pos_tr + _n_pos_es
         _n_neg_total = _n_neg_tr + _n_neg_es
@@ -104,11 +116,11 @@ def run_stage2_tuning(
         eco_raster = load_ecoregion_raster(region)
 
     arr_tr = load_stage2_arrays(
-        train_path, region, feature_cols, expansion_groups, (2001, 2013),
+        train_path, region, feature_cols, expansion_groups, train_year_range,
         neg_ratio=neg_ratio, eco_raster=eco_raster,
     )
     arr_es = load_stage2_arrays(
-        earlystop_path, region, feature_cols, expansion_groups, (2014, 2016),
+        earlystop_path, region, feature_cols, expansion_groups, earlystop_year_range,
         neg_ratio=neg_ratio, eco_raster=eco_raster,
     )
     X = np.vstack([arr_tr.X, arr_es.X])
@@ -122,8 +134,16 @@ def run_stage2_tuning(
     )
 
     df_index = pd.DataFrame({"year": years, "country_id": country_id})
-    cfg = SplitConfig(train_year_max=2014, val_year_min=2015, val_year_max=2017, strategy="rolling", rolling_folds=3)
-    folds, _ = build_splits(df_index, cfg)
+    # CV folds: val window = 2 years at the end of the combined range.
+    all_max = max(train_year_range[1], earlystop_year_range[1])
+    cv_cfg = SplitConfig(
+        train_year_max=all_max - 1,
+        val_year_min=all_max - 1,
+        val_year_max=all_max + 1,
+        strategy="rolling",
+        rolling_folds=3,
+    )
+    folds, _ = build_splits(df_index, cv_cfg)
 
     n_jobs = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 4))
 

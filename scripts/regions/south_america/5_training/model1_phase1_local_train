@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""Phase 1 local training + proxy evaluation on the SA mini-sample.
+
+Trains LambdaRank on mini_splits train (2001-2010), evaluates on mini_splits
+earlystop (2011-2013) as a local proxy metric, and appends results to the
+feature ablation log at outputs/south_america/results/feature_ablation_sa.json.
+
+Usage:
+  python scripts/regions/south_america/5_training/model1_phase1_local_train \\
+      --feature-tag kba [--notes "added is_kba + dist_kba_km"]
+
+Requires:
+  1. prepare_mini_splits.py already run  (creates mini_splits/main/train + earlystop)
+  2. model1_phase1_local_tune already run for this feature-tag
+     (creates outputs/south_america/results/phase1/<tag>/model1_stage2_lgbm_best_params.json)
+
+Euler gate: if proxy Lift@1% > current best → run phase1_euler_gate.slurm
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import os
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parents[4]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from scripts.regions.shared.country_raster import load_ecoregion_raster
+from scripts.regions.shared.evaluation.stage2_metrics import compute_stage2_metrics
+from scripts.regions.shared.training.feature_guard import check_feature_denylist
+from scripts.regions.shared.training.stage2_lgbm_core import (
+    FIXED_PARAMS,
+    STAGE2_EXCLUDE_COLS,
+    TARGET_COL,
+    _expansion_groups_from_batches,
+    _prepare_lgb_params,
+    load_stage2_arrays,
+    train_lambdarank,
+)
+from scripts.regions.shared.training.utils import compute_year_weights, get_repo_root
+
+ABLATION_LOG = _ROOT / "outputs/south_america/results/feature_ablation_sa.json"
+PHASE1_DIR = _ROOT / "outputs/south_america/results/phase1"
+
+# Mini-split year ranges (matches prepare_mini_splits.py)
+TRAIN_YEARS = (2001, 2010)
+ES_YEARS = (2011, 2013)
+
+
+def _load_ablation_log() -> dict:
+    if ABLATION_LOG.exists():
+        with open(ABLATION_LOG) as f:
+            return json.load(f)
+    return {"entries": []}
+
+
+def _save_ablation_log(data: dict) -> None:
+    ABLATION_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(ABLATION_LOG, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Phase 1 local training + proxy eval"
+    )
+    parser.add_argument("--feature-tag", default="baseline",
+                        help="Must match the tag used in model1_phase1_local_tune")
+    parser.add_argument("--notes", default="",
+                        help="Free-text description of what was changed (for ablation log)")
+    parser.add_argument("--params", default=None,
+                        help="Path to best_params JSON. Defaults to phase1/<feature-tag>/best_params.json. "
+                             "Pass --params outputs/.../phase1/baseline/model1_stage2_lgbm_best_params.json "
+                             "to skip per-feature retuning and use baseline hyperparameters.")
+    parser.add_argument("--save-model", action="store_true",
+                        help="Save trained booster to phase1/<feature-tag>/model1_stage2_lgbm_booster.txt")
+    args = parser.parse_args()
+
+    data_root = Path(
+        os.environ.get("STAGE2_DATA_ROOT", str(_ROOT / "data/south_america/mini_splits"))
+    )
+    train_path = data_root / "main/train.parquet"
+    es_path = data_root / "main/earlystop.parquet"
+    for p in (train_path, es_path):
+        if not p.exists():
+            sys.exit(
+                f"Not found: {p}\n"
+                "Run: python scripts/regions/south_america/3_merging/prepare_mini_splits.py"
+            )
+
+    if args.params:
+        params_path = Path(args.params)
+    else:
+        params_path = PHASE1_DIR / args.feature_tag / "model1_stage2_lgbm_best_params.json"
+    if not params_path.exists():
+        baseline_path = PHASE1_DIR / "baseline" / "model1_stage2_lgbm_best_params.json"
+        if baseline_path.exists():
+            print(f"No tune output for tag '{args.feature_tag}' — using baseline params.")
+            params_path = baseline_path
+        else:
+            sys.exit(
+                f"best_params not found: {params_path}\n"
+                f"Run: python scripts/regions/south_america/4_tuning/model1_phase1_local_tune "
+                f"--feature-tag {args.feature_tag}"
+            )
+
+    with open(params_path) as f:
+        raw = json.load(f)
+    best_params = raw.get("best_params", raw)
+    tune_val_score = raw.get("best_val_score", None)
+
+    # Discover feature columns from parquet schema
+    schema = pq.ParquetFile(train_path).schema_arrow
+    feature_cols = [
+        n for n, f in zip(schema.names, schema)
+        if (pa.types.is_integer(f.type) or pa.types.is_floating(f.type))
+        and n not in STAGE2_EXCLUDE_COLS
+    ]
+    check_feature_denylist(feature_cols, context=f"phase1/{args.feature_tag}")
+
+    # Expansion groups: cy pairs with ≥1 positive across both splits
+    expansion_groups = (
+        _expansion_groups_from_batches(train_path, "south_america", TRAIN_YEARS)
+        | _expansion_groups_from_batches(es_path, "south_america", ES_YEARS)
+    )
+    print(f"Expansion groups: {len(expansion_groups)}")
+    print(f"Feature columns:  {len(feature_cols)}")
+
+    use_eco = bool(int(os.environ.get("STAGE2_ECO_GROUPS", "1")))
+    eco_raster = load_ecoregion_raster("south_america") if use_eco else None
+
+    neg_ratio = int(os.environ.get("STAGE2_NEG_RATIO", "100"))
+
+    print("Loading train split...")
+    arr_tr = load_stage2_arrays(
+        train_path, "south_america", feature_cols, expansion_groups,
+        TRAIN_YEARS, neg_ratio=neg_ratio, eco_raster=eco_raster,
+    )
+    print("Loading earlystop split (proxy val)...")
+    arr_es = load_stage2_arrays(
+        es_path, "south_america", feature_cols, expansion_groups,
+        ES_YEARS, neg_ratio=None,   # no subsampling at eval time
+    )
+
+    num_threads = int(os.environ.get("OMP_NUM_THREADS", str(os.cpu_count() or 4)))
+    params = _prepare_lgb_params(best_params, num_threads)
+    num_boost_round = int(
+        best_params.get("n_estimators", best_params.get("num_boost_round", 1000))
+    )
+    year_weights = compute_year_weights(
+        arr_tr.years, min_year=TRAIN_YEARS[0], max_year=TRAIN_YEARS[1]
+    )
+
+    print(
+        f"\nTraining LambdaRank  n_estimators={num_boost_round}"
+        f"  eco_groups={eco_raster is not None}"
+    )
+    t0 = time.time()
+    model = train_lambdarank(
+        arr_tr.X, arr_tr.y, arr_tr.train_group_sizes,
+        arr_es.X, arr_es.y, arr_es.cy_group_sizes,
+        params, year_weights, num_boost_round,
+    )
+    elapsed = time.time() - t0
+
+    if args.save_model:
+        booster_path = PHASE1_DIR / args.feature_tag / "model1_stage2_lgbm_booster.txt"
+        booster_path.parent.mkdir(parents=True, exist_ok=True)
+        model.save_model(str(booster_path))
+        print(f"Booster saved → {booster_path}")
+
+    del arr_tr
+    gc.collect()
+
+    scores = model.predict(
+        arr_es.X, num_iteration=model.best_iteration or None
+    ).astype(np.float64)
+    proxy = compute_stage2_metrics(
+        arr_es.y.astype(np.float64), scores, arr_es.cy_group_sizes
+    )
+    n_groups = len(arr_es.cy_group_sizes)
+    del arr_es
+    gc.collect()
+
+    ndcg1 = proxy["ndcg_at_1pct"]
+    lift1 = proxy["lift_at_1pct_within_groups"]
+    lift5 = proxy["lift_at_5pct_within_groups"]
+    rec5 = proxy["recall_at_5pct_within_groups"]
+
+    print(f"\n{'='*55}")
+    print(f"  Proxy metrics  (mini earlystop, {n_groups} groups)")
+    print(f"{'='*55}")
+    print(f"  NDCG@1%:          {ndcg1:.4f}   (tune val: {tune_val_score:.4f})")
+    print(f"  Lift@1%:          {lift1:.2f}×   (bar: ≥15×)")
+    print(f"  Lift@5%:          {lift5:.2f}×")
+    print(f"  Recall@5%:        {rec5:.3f}   (bar: ≥0.90)")
+    print(f"  Training time:    {elapsed:.1f}s  best_iter={model.best_iteration}")
+    print(f"{'='*55}")
+
+    # Read previous best for comparison — use best-kept result, not last-logged.
+    # Recall@5% is the binding constraint; compare on that.
+    log = _load_ablation_log()
+    kept_entries = [
+        e for e in log.get("entries", [])
+        if e.get("proxy_metrics") and e.get("kept") is not False
+    ]
+    best_rec5 = max(
+        (e["proxy_metrics"].get("recall_at_5pct_within_groups", 0.0) for e in kept_entries),
+        default=0.0,
+    )
+    best_lift1 = max(
+        (e["proxy_metrics"].get("lift_at_1pct_within_groups", 0.0) for e in kept_entries),
+        default=0.0,
+    )
+    d_rec5 = rec5 - best_rec5
+    d_lift1 = lift1 - best_lift1
+    print(f"  vs best kept  Lift@1%: {best_lift1:.2f}×  Δ = {d_lift1:+.2f}×")
+    print(f"  vs best kept  Recall@5%: {best_rec5:.3f}  Δ = {d_rec5:+.3f}")
+    proxy_improved = d_rec5 > 0.005 or (d_rec5 >= 0 and d_lift1 > 0.5)
+    if proxy_improved:
+        print("  ✓ PROXY IMPROVED — consider Euler gate if Recall@5% gain ≥ 0.05")
+    else:
+        print("  ✗ No meaningful improvement on proxy — skip Euler gate")
+
+    entry = {
+        "feature_tag": args.feature_tag,
+        "notes": args.notes,
+        "timestamp": datetime.now().strftime("%Y%m%d_%H%M%S"),
+        "n_features": len(feature_cols),
+        "features": feature_cols,
+        "tune_val_ndcg": round(tune_val_score, 6) if tune_val_score is not None else None,
+        "proxy_metrics": {k: round(v, 6) for k, v in proxy.items()},
+        "best_iter": int(model.best_iteration or 0),
+        "train_seconds": round(elapsed, 1),
+        "proxy_improved": proxy_improved,
+        "euler_gate_submitted": False,
+        "full_sa_lift_at_1pct": None,
+        "full_sa_recall_at_5pct": None,
+        "kept": None,
+    }
+    log.setdefault("entries", []).append(entry)
+    _save_ablation_log(log)
+    print(f"\nLogged → {ABLATION_LOG}")
+
+
+if __name__ == "__main__":
+    main()

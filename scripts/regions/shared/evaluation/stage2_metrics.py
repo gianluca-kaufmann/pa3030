@@ -110,6 +110,35 @@ def precision_at_k_within_groups(
     return float(np.mean(precs)) if precs else 0.0
 
 
+def recall_at_k_within_groups(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    group_sizes: np.ndarray,
+    k_pct: float,
+) -> float:
+    """Macro-averaged recall@k_pct within groups (publication bar metric).
+
+    Recall@k% = (# positives in top k% slice) / (# total positives in group).
+    Publication bar: Recall@5% >= 90%.
+    """
+    recalls: list[float] = []
+    offset = 0
+    for size in group_sizes:
+        if size <= 0:
+            continue
+        end = offset + int(size)
+        yt = y_true[offset:end]
+        ys = y_score[offset:end]
+        offset = end
+        n_pos = int((yt > 0).sum())
+        if n_pos == 0:
+            continue
+        k = max(1, int(np.ceil(size * k_pct / 100.0)))
+        top = np.argsort(-ys)[:k]
+        recalls.append(float((yt[top] > 0).sum()) / n_pos)
+    return float(np.mean(recalls)) if recalls else 0.0
+
+
 def lift_at_k_within_groups(
     y_true: np.ndarray,
     y_score: np.ndarray,
@@ -158,6 +187,15 @@ def compute_stage2_metrics(
             y_true, y_score, group_sizes, 5.0
         ),
         "lift_at_10pct_within_groups": lift_at_k_within_groups(
+            y_true, y_score, group_sizes, 10.0
+        ),
+        "recall_at_1pct_within_groups": recall_at_k_within_groups(
+            y_true, y_score, group_sizes, 1.0
+        ),
+        "recall_at_5pct_within_groups": recall_at_k_within_groups(
+            y_true, y_score, group_sizes, 5.0
+        ),
+        "recall_at_10pct_within_groups": recall_at_k_within_groups(
             y_true, y_score, group_sizes, 10.0
         ),
         "baseline_rate": float((y_true > 0).mean()) if len(y_true) else 0.0,
