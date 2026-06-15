@@ -85,8 +85,8 @@ Model dominated by coarse landscape signals. `dist_wdpa` (#14) is already annual
 
 | Job | SLURM ID | Status | ETA | Output |
 |---|---|---|---|---|
-| Spatial post-processing | 3495807 | PENDING→RUNNING | ~1–1.5h | `outputs/south_america/results/spatial_postprocess_alpha_sweep.json` |
-| Full SA retuning (100 trials) | 3495808 | PENDING (afterok:3495807) | ~2–4 days | `scripts/regions/south_america/5_training/model1_stage2_lgbm_best_params.json` |
+| Spatial post-processing | 3495807 | RUNNING | ~1h | `outputs/south_america/results/spatial_postprocess_alpha_sweep.json` |
+| Full SA retuning (20 trials) | 3496845 | PENDING (afterok:3495807) | ~8–12h (overnight) | `scripts/regions/south_america/5_training/model1_stage2_lgbm_best_params.json` |
 
 Monitor:
 ```bash
@@ -108,7 +108,7 @@ tail $SCRATCH/logs/model1_tune_stage2_3495808.out
 | Priority | Action | Status | Rationale |
 |---|---|---|---|
 | 1 | **Spatial post-processing** | 🔄 Running — job 3495807, ETA ~1–1.5h | Alpha sweep on existing model; read `spatial_postprocess_alpha_sweep.json` when done |
-| 2 | **Full SA retuning (100 trials)** | 🔄 Queued — job 3495808, ETA ~2–4 days | 100 Optuna trials on full 42 GB SA splits; fixes hyperparameter mismatch |
+| 2 | **Full SA retuning (20 trials)** | 🔄 Queued — job 3496845, ETA ~8–12h | 20 Optuna trials on full 42 GB SA splits; fixes hyperparameter mismatch |
 | 3 | **Retrain + apply spatial PP** | ⬜ After tuning | Retrain with new params → apply best alpha → record full SA metrics |
 | 4 | `is_kba`, `dist_kba_km` | ⏸ Blocked — awaiting BirdLife shapefile | Strongest intent signal (IUCN "should be protected" list) |
 | 5 | `in_indigenous_poly`, `dist_indigenous_poly_km` | ⏸ Blocked — awaiting RAISG download | Resguardo → national park pathway |

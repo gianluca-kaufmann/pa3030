@@ -16,7 +16,7 @@ source "$HOME/venvs/master_thesis/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
 export STAGE2_NEG_RATIO=100
-export STAGE2_TUNING_TRIALS=100
+export STAGE2_TUNING_TRIALS=20
 # W9a: ecoregion-stratified training groups (fixes 9K sub-window mismatch — Issue D)
 # Colombia dev panel: LambdaRank 5.99x (W9a) vs 2.99x (no eco) — decisive improvement
 export STAGE2_ECO_GROUPS=1
