@@ -35,18 +35,27 @@ P(pixel i designated in year t)
 
 ## Current Situation
 
-Lift@1% bar is met on the proxy. Recall@5% is at 24.4% against a bar of 90%.
+**Euler baseline gate complete (2026-06-15).** Full SA results (61 groups, 107M rows, test 2017–2024):
 
-Five Phase 1 experiments run, none improved Recall@5% meaningfully:
-- `eco_protection_gap`: Recall 24.4%→23.4% — dropped (aggregate signal)
-- `dist_redd_km`: Recall 24.4%→13.9% — dropped (centroid proxy, 308km mean)
-- `ndcg5pct_earlystop`: Recall→29.1% but Lift@1% 15.34×→5.38×, best_iter=20 — reverted
-- `agb_tonne_ha`: Lift@1%→14.07× (below bar), Recall→19.3%, best_iter=5 — dropped
-- `pruned30` (drop bottom-30 SHAP features, 79→49 features): Lift@1%→**17.10×**, Recall→22.6% (−1.8pp). mini_sample currently at 49-feature state.
+| Metric | Proxy (22 groups) | Full SA (61 groups) | Bar |
+|---|---|---|---|
+| Lift@1% | 15.34× | **2.85×** | ≥ 15× |
+| Recall@5% | 24.4% | **14.0%** | ≥ 90% |
+
+Both bars are missed by a wide margin on full SA. The proxy was overoptimistic: its 22 groups are the largest designation events where the model happens to do well. Full SA includes all 61 expansion country-years in the test period, including smaller/harder events. Early stopping hit at iter 149 (vs 446), suggesting proxy-tuned params don't fully transfer.
+
+**Proxy is unreliable and overoptimistic.** Proxy Lift@1% (15.34×) is 5× higher than full SA (2.85×). Proxy Recall@5% (24.4%) is 1.7× higher than full SA (14.0%). Phase 1 feature experiments on the proxy were measuring noise, not signal.
+
+Five Phase 1 experiments run on proxy, all now moot against full SA:
+- `eco_protection_gap`: Proxy Recall 24.4%→23.4% — dropped
+- `dist_redd_km`: Proxy Recall 24.4%→13.9% — dropped
+- `ndcg5pct_earlystop`: Proxy Recall→29.1% but Lift@1% collapsed — reverted
+- `agb_tonne_ha`: Proxy Lift@1%→14.07× (below proxy bar) — dropped
+- `pruned30` (79→49 features): Proxy Lift@1%→17.10×, Recall→22.6%. mini_sample currently at 49-feature state.
 
 **Structural ceiling hypothesis**: PA designation creates contiguous polygons. A pixel-independent ranking model correctly identifies "core" pixels (remote, biodiverse) but the remaining pixels in the polygon look ordinary in isolation — no feature makes them special. This is an area-process problem. The fix is spatial neighbourhood propagation of scores after training (no retraining needed). See queue below.
 
-**Reliability problem**: The 22-group proxy retains only the largest designation events (small events lose all positives to 1% random sampling). Recall@5% on 22 groups is noisy — we may be chasing measurement error. Full SA evaluation (2000+ groups) needed before further feature experimentation.
+**Two problems now confirmed**: (1) Proxy is not representative — must redesign or abandon proxy-first workflow. (2) Absolute performance on full SA is far below bar on both metrics — spatial post-processing and/or retuning on full SA needed.
 
 **SHAP audit done (2026-06-15).** Top 15 features by mean |SHAP|:
 ```
@@ -72,22 +81,25 @@ Model dominated by coarse landscape signals. `dist_wdpa` (#14) is already annual
 
 ## Next Session — First Action
 
-**Submit the Euler baseline gate to get full SA Recall@5%.**
+**Both Euler jobs are running. Wait for results, then interpret.**
 
-Params already copied to training dir: `scripts/regions/south_america/5_training/model1_stage2_lgbm_best_params.json` (Phase 1 baseline, n_estimators=446, best_val_score=0.2506).
+| Job | SLURM ID | Status | ETA | Output |
+|---|---|---|---|---|
+| Spatial post-processing | 3495807 | PENDING→RUNNING | ~1–1.5h | `outputs/south_america/results/spatial_postprocess_alpha_sweep.json` |
+| Full SA retuning (100 trials) | 3495808 | PENDING (afterok:3495807) | ~2–4 days | `scripts/regions/south_america/5_training/model1_stage2_lgbm_best_params.json` |
 
+Monitor:
 ```bash
-# From Euler repo root — pull latest code first, then:
-bash slurm/south_america/phase1_euler_baseline_gate.sh
+squeue -u gikaufmann
+tail $SCRATCH/logs/spatial_postprocess_3495807.out
+tail $SCRATCH/logs/model1_tune_stage2_3495808.out
 ```
 
-This submits `training_lgbm_stage2_phase1.slurm` directly (no feature injection, no retuning). Uses full SA splits (42 GB, 2000+ groups). Takes ~2–4h.
+**When spatial PP finishes**: read `spatial_postprocess_alpha_sweep.json`. Look for the alpha where Recall@5% peaks without Lift@1% collapsing. That alpha is the post-processing parameter to use on top of all future models.
 
-Interpret result:
-- Full SA Recall@5% >> 24.4% → proxy is unreliable; redesign mini-sample (stratified by group size)
-- Full SA Recall@5% ~ 24.4% → gap is real; next priority is spatial post-processing (see queue)
+**When tuning finishes**: new `best_params.json` is in `scripts/regions/south_america/5_training/`. Submit `slurm/south_america/training_lgbm_stage2_phase1.slurm` to retrain with the new params, then apply the best alpha from the spatial sweep. Record full SA Lift@1% + Recall@5% in `feature_ablation_sa.json` (baseline entry, update `full_sa_*` fields).
 
-After job completes: record `full_sa_lift_at_1pct` + `full_sa_recall_at_5pct` in `feature_ablation_sa.json` (baseline entry).
+**Note on spatial PP script**: `scripts/regions/south_america/6_evaluation/spatial_postprocess_stage2.py` replicates the exact preprocessing of `load_stage2_arrays` — WDPA_prev==0 filter + within-group rank normalization — so scores are valid. An earlier broken version (missing these two steps) was cancelled.
 
 ---
 
@@ -95,22 +107,25 @@ After job completes: record `full_sa_lift_at_1pct` + `full_sa_recall_at_5pct` in
 
 | Priority | Action | Status | Rationale |
 |---|---|---|---|
-| 1 | **Euler baseline gate** | ⬜ Next — run `phase1_euler_baseline_gate.sh` on Euler | Get reliable Recall@5% on 2000+ groups |
-| 2 | **Spatial post-processing** | ⬜ After Euler result | Apply neighbourhood score propagation to model outputs — addresses area-process ceiling on Recall@5% without retraining |
-| 3 | `is_kba`, `dist_kba_km` | ⏸ Blocked — awaiting BirdLife shapefile | Strongest intent signal (IUCN "should be protected" list) |
-| 4 | `in_indigenous_poly`, `dist_indigenous_poly_km` | ⏸ Blocked — awaiting RAISG download | Resguardo → national park pathway |
+| 1 | **Spatial post-processing** | 🔄 Running — job 3495807, ETA ~1–1.5h | Alpha sweep on existing model; read `spatial_postprocess_alpha_sweep.json` when done |
+| 2 | **Full SA retuning (100 trials)** | 🔄 Queued — job 3495808, ETA ~2–4 days | 100 Optuna trials on full 42 GB SA splits; fixes hyperparameter mismatch |
+| 3 | **Retrain + apply spatial PP** | ⬜ After tuning | Retrain with new params → apply best alpha → record full SA metrics |
+| 4 | `is_kba`, `dist_kba_km` | ⏸ Blocked — awaiting BirdLife shapefile | Strongest intent signal (IUCN "should be protected" list) |
+| 5 | `in_indigenous_poly`, `dist_indigenous_poly_km` | ⏸ Blocked — awaiting RAISG download | Resguardo → national park pathway |
+| — | **Euler baseline gate** | ✅ Done 2026-06-15 | Full SA: Lift@1%=2.85×, Recall@5%=14.0%; proxy confirmed overoptimistic |
 | — | SHAP audit | ✅ Done 2026-06-15 | See plots + findings above |
 | — | `dist_wdpa` construction | ✅ Checked 2026-06-15 | Already annual. Low rank is genuine. |
 | — | `agb_tonne_ha` | ✗ Dropped — best_iter=5 | AGB TIF still at `data/south_america/ready/AGB/agb_sa.tif` |
-| — | `pruned30` (49 features) | ⏸ Parked — Lift improves, Recall regresses | mini_sample currently at 49-feature state; revisit after Euler |
+| — | `pruned30` (49 features) | ⏸ Parked — proxy Lift improves, Recall regresses | mini_sample currently at 49-feature state; revisit after full SA retuning |
 
 **KBA download**: https://www.keybiodiversityareas.org/kba-data/request → `data/shared/KBA/`
 
-**Spatial post-processing design** (implement after Euler confirms real Recall@5%):
+**Spatial post-processing** (implemented, running):
 ```
 final_score(pixel) = model_score(pixel) + α × max(model_score(8-neighbours))
 ```
-For each pixel, add a fraction of the highest-scoring neighbour's score. Pulls in ordinary pixels adjacent to high-scoring core pixels — captures the contiguous area nature of PA designation. α is a tunable parameter (try 0.1, 0.3, 0.5, 1.0). Implement in `scripts/regions/south_america/6_evaluation/` as a post-processing step on scored parquets. Evaluate Recall@5% before vs after on the full SA test set.
+Script: `scripts/regions/south_america/6_evaluation/spatial_postprocess_stage2.py`
+Alpha sweep: [0.0, 0.1, 0.3, 0.5, 1.0, 2.0]. Pick the alpha where Recall@5% peaks without Lift@1% collapsing.
 
 **Mini-sample state**: currently 49 features (58 cols including metadata) after `pruned30` experiment. To restore to 88 cols for future local experiments: re-inject the 30 dropped features from their source TIFs. For now, Euler uses the full SA splits (all features) independently.
 
