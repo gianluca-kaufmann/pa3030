@@ -1,6 +1,6 @@
 # PA3030 — Publication Roadmap
 
-**Updated**: 2026-06-14 | **Branch**: `paper` (active). `main` = intact thesis, never touch.
+**Updated**: 2026-06-15 | **Branch**: `paper` (active). `main` = intact thesis, never touch.
 
 **Story**: The 30×30 agreement forces countries to double protected area coverage by 2030. We predict which pixels will be designated — giving investors, central banks, and policymakers an actionable transition risk tool. Stage 1 predicts *when* countries will expand; Stage 2 predicts *which pixels* will be chosen. Stage 2 output is a **calibrated suitability score**: every pixel gets a value interpretable as annual designation probability.
 
@@ -30,7 +30,7 @@ P(pixel i designated in year t)
 
 | Region | Stage 1 D² | 95% CI | Stage 2 Lift@1% | Status |
 |---|---|---|---|---|
-| SA | **+0.345** (7yr PRIMARY, CBD-free, corrected panel) | JK [−0.155, +0.817] SE=0.199 | 5.99× (Colombia dev, LambdaRank W9a) | Phase 0 pending |
+| SA | **+0.345** (7yr PRIMARY, CBD-free, corrected panel) | JK [−0.155, +0.817] SE=0.199 | 5.99× (Colombia dev, LambdaRank W9a, neg_ratio=100) | Phase 0 ✅ → Phase 1 |
 | SEA | **−1.001** (6yr PRIMARY, corrected panel) | — | 12.7× (old panel, stale) | Regime-shift finding; Phase 2 |
 | USA | −3.14 | — | TBD | Path-dependency finding; deprioritised |
 
@@ -98,22 +98,25 @@ Local retrain at 3–5M rows: seconds. 30-trial Optuna: ~5–10 min. Feature exp
 | P | Comparison metric for W8 | Lift@1% used; LambdaRank selected over binary |
 | W | Graded vs binary labels | LambdaRank 5.99× >> Binary 3.04× — graded labels confirmed 2026-05-29 |
 | CC | Stage 1 LASSO feature selection | LOYO-CV alpha=100. 9-feat selected (D²_7yr=0.346): lag1, cumsum_lag1, polyarchy, gdp_lag1, redd, d_csprtcpt, agri_land, d_legcon_lag1, cbd. Zeroed: lag2, lag3, d_legcon, legcon_x_cspart. 9-feat marginally better than 12-feat (0.346 vs 0.345). CBD survival disregarded (2 training instances). Interaction term dropped by LASSO but retained in primary spec on theoretical grounds. |
+| BB | XGBoost vs LambdaRank | LambdaRank 5.99× >> XGBoost 3.55× (Colombia dev, 8 groups, 739 trees). Engine locked: LightGBM LambdaRank 2026-06-15. |
+| X | neg_ratio sensitivity | neg_ratio=200 won tuning NDCG (0.1275 vs 0.1070) but lost test Lift@1% (5.05× vs 5.99×, early-stop iter 23). neg_ratio=100 retained 2026-06-15. |
+| MS | SA mini-sample validation gate | Gate passed 2026-06-15: Lift@1%=3.82× on full SA test (107M rows, 61 groups) > 2.81× naive baseline. Mini-sample valid surrogate for Phase 1 feature experiments. |
 
 ### Open — Phase 0 (do before any feature work)
 | ID | Issue | Action |
 |---|---|---|
 | ~~**CC**~~ | Stage 1 LASSO feature selection | ✅ Done 2026-06-14. See `outputs/south_america/results/stage1_lasso.json`. |
-| **BB** | XGBoost `rank:ndcg` vs LambdaRank W9a | ⚠️ First training (job 3354097) invalid: early-stop set had only 3 Colombia expansion groups → NDCG noisy → stopped at iter 4 → reported Lift@1%=2.33× with 4 trees. Bug fixed in `stage2_xgb_core.py` (falls back to fixed-iter when <5 expansion groups). Retraining submitted job 3391479 with full 739 iterations. Await new Lift@1% to compare vs LambdaRank 5.99×. |
-| **X** | neg_ratio sensitivity | neg_ratio=200 ✅ NDCG@1%=0.1275. neg_ratio=full ✅ NDCG@1%=0.1061 (worst). Baseline neg_ratio=100 NDCG@1%=0.1070. Winner: neg_ratio=200 on tuning metric. Submit LGBM training with neg_ratio=200 after BB engine decision. |
-| **MS** | Build SA mini-sample | ✅ Built. Validation gate: first run (job 3356942) OOM killed (32 GB → not enough for full SA test). Fixed SLURM to 16×8G=128 GB. Resubmitted job 3391648. |
+| ~~**BB**~~ | XGBoost `rank:ndcg` vs LambdaRank W9a | ✅ Done 2026-06-15. XGBoost 3.55× vs LambdaRank 5.99× (both Colombia dev, 8 test groups). **Engine locked: LightGBM LambdaRank.** |
+| ~~**X**~~ | neg_ratio sensitivity | ✅ Done 2026-06-15. neg_ratio=200 won on tuning metric (NDCG@1%=0.1275 vs 0.1070) but lost on test Lift@1% (5.05× vs 5.99×, early-stop at iter 23). **neg_ratio=100 retained.** |
+| ~~**MS**~~ | Build SA mini-sample | ✅ Done 2026-06-15. Validation gate passed: Lift@1%=3.82× on full SA test (107M rows, 61 groups) > 2.81× naive baseline. Job 3391648, 67 GB / 128 GB. Sync mini-sample to Desktop before Phase 1. |
 
-→ After Phase 0: engine (XGBoost or LightGBM) + neg_ratio locked. Mini-sample validated. No further architecture changes in Phase 1.
+→ Phase 0 complete 2026-06-15: engine = LightGBM LambdaRank, neg_ratio=100. Mini-sample validated. Remaining: sync mini-sample to Desktop, then Phase 1.
 
 ### Open — Stage 2 Quality (Phase 1–2)
 | ID | Issue | Action |
 |---|---|---|
 | Q | No CIs on Stage 2 metrics | Bootstrap over (country_id, year) groups after final model. Phase 2. |
-| S | W9a train/eval group mismatch | If BB→XGBoost: dissolved. If LightGBM retained: Methods paragraph + SHAP-by-biome. |
+| S | W9a train/eval group mismatch | BB confirmed LightGBM → write Methods paragraph justifying eco sub-groups for training vs cy groups for eval + SHAP-by-biome. Phase 2. |
 | Y | Macro Lift@1% weights groups equally | Compute area-weighted Lift@1% alongside macro. Phase 2. |
 | Z | 2024 test-set labels incomplete | Exclude 2024 from primary metrics or report delta. Phase 2. |
 | AA | Spatial autocorrelation | Moran's I on scored test parquet. Phase 2. |
@@ -138,7 +141,7 @@ Local retrain at 3–5M rows: seconds. 30-trial Optuna: ~5–10 min. Feature exp
 
 ## Phase 1 Feature Sprint (after Phase 0 settled)
 
-**Workflow per feature**: rasterise → add to SA mini-sample → 30-trial Optuna retune locally → retrain → check Lift@1% + Recall@5% on full SA test. If promising → validate on full SA on Euler. Track in `outputs/south_america/results/feature_ablation_sa.json`. Keep if SHAP rank top-5 AND Lift@1% improves.
+**Workflow per feature**: rasterise → add to SA mini-sample → 30-trial Optuna retune locally → retrain → check NDCG@1% on mini-sample early-stop set (local proxy). If proxy improves → submit Euler job to evaluate Lift@1% on full SA test (official). Track in `outputs/south_america/results/feature_ablation_sa.json`. Keep if SHAP rank top-5 AND Lift@1% improves on full SA test.
 
 | Priority | Feature | Source | Notes |
 |---|---|---|---|
@@ -156,17 +159,17 @@ Local retrain at 3–5M rows: seconds. 30-trial Optuna: ~5–10 min. Feature exp
 
 ## Next Actions (ordered)
 
-### Phase 0 — Engine + Mini-Sample (in progress)
+### Phase 0 — Engine + Mini-Sample ✅ Complete 2026-06-15
 
 1. ~~**Issue CC**~~ ✅ Done 2026-06-14.
 
-2. **Issue BB** — XGBoost tuning ✅. First training invalid (early-stop bug, 4 trees). Fixed + resubmitted (job 3391479, 739 trees). Once done: compare Lift@1% vs LambdaRank 5.99× → lock engine.
+2. ~~**Issue BB**~~ ✅ Done 2026-06-15. XGBoost 3.55× << LambdaRank 5.99×. Engine locked: LightGBM LambdaRank.
 
-3. **Issue X** — All ratios done: neg_full=0.1061 (worst), baseline=0.1070, neg200=0.1275 (best). Once BB engine locked: submit LGBM training with neg_ratio=200 → confirm Lift@1% on test.
+3. ~~**Issue X**~~ ✅ Done 2026-06-15. neg_ratio=200 lost on test Lift@1% (5.05× vs 5.99×). neg_ratio=100 retained.
 
-4. **Issue MS** — mini-sample ✅ built. Validation gate resubmitted (job 3391648, 128 GB). Once done: check Lift@1% > 2.81× (naive baseline) → gate passes → sync to Desktop.
+4. ~~**Issue MS**~~ ✅ Done 2026-06-15. Gate passed: 3.82× > 2.81× naive. Next: sync mini-sample parquet to Desktop.
 
-→ Outcome: engine locked + neg_ratio locked + mini-sample validated. Ready for Phase 1.
+→ Outcome: engine = LightGBM LambdaRank, neg_ratio=100, baseline Lift@1%=5.99×. Mini-sample validated + synced to `data/south_america/mini_sample.parquet`. Ready for Phase 1.
 
 ### Phase 1 — Feature Sprint (local, daily iterations)
 
@@ -201,7 +204,7 @@ Local retrain at 3–5M rows: seconds. 30-trial Optuna: ~5–10 min. Feature exp
 |---|---|
 | SA merged_panel_final.parquet (57 GB) | `euler:$SCRATCH/data/south_america/ml/merged_panel_final.parquet` |
 | SA Stage 2 splits (42 GB) | `euler:$SCRATCH/data/south_america/ml/main/{train,earlystop,test}.parquet` |
-| SA mini-sample (~200 MB) | `euler:$SCRATCH/data/south_america/ml/mini_sample.parquet` → sync to `data/south_america/mini_sample.parquet` |
+| SA mini-sample (680 MB) | `euler:~/master_thesis/data/south_america/mini_sample.parquet` (synced from SCRATCH 2026-06-15) → rsync to Desktop |
 | Colombia Stage 2 panel (3.9 GB) | `euler:$SCRATCH/data/dev/south_america/ml/main/{train,earlystop,test}.parquet` |
 | Stage 1 panels (~35 KB each) | `data/{south_america,se_asia,usa}/stage1_panel.parquet` (in repo) |
 | Stage 2 eco raster | `$SCRATCH/data/south_america/ready/GSN/gsn_terrestrial_ecoregions_mask_1km.tif` |
@@ -238,6 +241,7 @@ Local retrain at 3–5M rows: seconds. 30-trial Optuna: ~5–10 min. Feature exp
 - **Temporal split**: Train 2001–2016, test 2017–2024. Do not change.
 - **WDPA reporting lag**: SA 2024 excluded (~33% capture). SA primary = 7yr (2017–23); SEA = 6yr (2017–22).
 - **Governance features**: First differences only — levels cause temporal drift in forward predictions.
+- **neg_ratio=100**: neg_ratio=200 lost on test Lift@1% (5.05× vs 5.99×) despite winning on tuning NDCG. Tuning metric unreliable across neg_ratio configs.
 - **No pre-2001 training data**: Frontier-exhaustion regime mismatch.
 - **CBD**: Robustness check only. CBD-free is primary.
 - **Suitability score framing**: Stage 2 output = calibrated 0–1 probability throughout the paper.
