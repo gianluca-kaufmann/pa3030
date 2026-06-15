@@ -85,8 +85,8 @@ Model dominated by coarse landscape signals. `dist_wdpa` (#14) is already annual
 
 | Job | SLURM ID | Status | ETA | Output |
 |---|---|---|---|---|
-| Spatial post-processing | 3495807 | RUNNING | ~1h | `outputs/south_america/results/spatial_postprocess_alpha_sweep.json` |
-| Full SA retuning (20 trials) | 3496845 | PENDING (afterok:3495807) | ~8–12h (overnight) | `scripts/regions/south_america/5_training/model1_stage2_lgbm_best_params.json` |
+| Spatial post-processing | 3495807 | ✅ Done | — | `outputs/south_america/results/spatial_postprocess_alpha_sweep.json` |
+| Full SA retuning (20 trials) | 3496845 | 🔄 RUNNING (~1h50m elapsed) | ~8h remaining | `scripts/regions/south_america/5_training/model1_stage2_lgbm_best_params.json` |
 
 Monitor:
 ```bash
@@ -107,9 +107,9 @@ tail $SCRATCH/logs/model1_tune_stage2_3495808.out
 
 | Priority | Action | Status | Rationale |
 |---|---|---|---|
-| 1 | **Spatial post-processing** | 🔄 Running — job 3495807, ETA ~1–1.5h | Alpha sweep on existing model; read `spatial_postprocess_alpha_sweep.json` when done |
-| 2 | **Full SA retuning (20 trials)** | 🔄 Queued — job 3496845, ETA ~8–12h | 20 Optuna trials on full 42 GB SA splits; fixes hyperparameter mismatch |
-| 3 | **Retrain + apply spatial PP** | ⬜ After tuning | Retrain with new params → apply best alpha → record full SA metrics |
+| 1 | **Spatial post-processing** | ✅ Done — no effect | Recall@5% flat (14.8% at all alpha). Dead end at current model quality. See results below. |
+| 2 | **Full SA retuning (20 trials)** | 🔄 Running — job 3496845, ~8h remaining | 20 Optuna trials on full 42 GB SA splits; fixes hyperparameter mismatch |
+| 3 | **Retrain with new params** | ⬜ After tuning | Submit `training_lgbm_stage2_phase1.slurm` with new best_params; record full SA Lift@1% + Recall@5% |
 | 4 | `is_kba`, `dist_kba_km` | ⏸ Blocked — awaiting BirdLife shapefile | Strongest intent signal (IUCN "should be protected" list) |
 | 5 | `in_indigenous_poly`, `dist_indigenous_poly_km` | ⏸ Blocked — awaiting RAISG download | Resguardo → national park pathway |
 | — | **Euler baseline gate** | ✅ Done 2026-06-15 | Full SA: Lift@1%=2.85×, Recall@5%=14.0%; proxy confirmed overoptimistic |
@@ -120,12 +120,14 @@ tail $SCRATCH/logs/model1_tune_stage2_3495808.out
 
 **KBA download**: https://www.keybiodiversityareas.org/kba-data/request → `data/shared/KBA/`
 
-**Spatial post-processing** (implemented, running):
+**Spatial post-processing** (done, no effect):
 ```
-final_score(pixel) = model_score(pixel) + α × max(model_score(8-neighbours))
+alpha=0.0  Lift@1%=3.33×  Recall@5%=14.8%   ← correct baseline (rank-normalized)
+alpha=0.1  Lift@1%=3.36×  Recall@5%=14.8%
+alpha=1.0  Lift@1%=3.43×  Recall@5%=14.6%   ← peak Lift, Recall drifts down
+alpha=2.0  Lift@1%=3.38×  Recall@5%=14.6%
 ```
-Script: `scripts/regions/south_america/6_evaluation/spatial_postprocess_stage2.py`
-Alpha sweep: [0.0, 0.1, 0.3, 0.5, 1.0, 2.0]. Pick the alpha where Recall@5% peaks without Lift@1% collapsing.
+Conclusion: neighbourhood propagation does nothing meaningful at current model quality. The model doesn't reliably score the core pixel of a designation event highly enough for the signal to propagate usefully. Drop this approach until the model itself improves substantially. Script kept at `scripts/regions/south_america/6_evaluation/spatial_postprocess_stage2.py` for future use.
 
 **Mini-sample state**: currently 49 features (58 cols including metadata) after `pruned30` experiment. To restore to 88 cols for future local experiments: re-inject the 30 dropped features from their source TIFs. For now, Euler uses the full SA splits (all features) independently.
 
