@@ -33,9 +33,17 @@ P(pixel i designated in year t)
 
 ---
 
-## Data Audit Findings (2026-06-16)
+## Guiding Principle
 
-Full analysis of SA mini-sample (4M rows, 2001–2013). These findings drive the Phase 1 strategy.
+**The publication bar (Lift@1%≥15×, Recall@5%≥90%) is achievable. We just haven't found the right approach yet.**
+
+Before tweaking hyperparameters or dropping features, always ask: *Is the fundamental framing correct?* When performance is far below bar, the problem is almost certainly foundational — a wrong objective, wrong grouping, wrong feature space, wrong temporal framing — not a learning rate away. Be bold and creative. Every analysis and proposed fix carries uncertainty; treat experiments as tests of hypotheses, not confirmations of conclusions.
+
+---
+
+## Data Audit Observations (2026-06-16)
+
+Exploratory analysis of SA mini-sample (4M rows, 2001–2013). These are observations to inform hypotheses, not settled conclusions.
 
 ### 1. Temporal Designation Collapse — The Core Problem
 
@@ -60,24 +68,23 @@ The default temporal weighting (min_weight=0.5, linear 2001→2013) barely addre
 
 **Critical implication**: No feature-based model can reliably predict the ~31% of expansion events driven by small, targeted designations. The publication bar of Recall@5% ≥ 90% requires either capturing institutional drivers (KBA, REDD+, indigenous poly) or accepting that small events set a hard floor. Current features are insufficient for small events; adding KBA + indigenous polygon features is the highest-priority structural intervention.
 
-### 3. Feature Redundancy and Noise
+### 3. Feature Redundancy (Hypothesis, Not Settled)
 
-**Near-zero discriminators** (dropped from model as of 2026-06-16, 79 → 67 features):
-| Feature(s) | Issue |
+**Marginally discriminating features** (dropped from model as of 2026-06-16, 79 → 67 features — *this needs validation, may be reversed*):
+| Feature(s) | Observation |
 |---|---|
-| `elevation_b2` + all smooths | slope — |z| ≈ 0 across all analyses |
-| `elevation_b1_smooth4` | r = 0.999 with raw b1; zero additional information |
-| `powerplants_b2` | |z| = 0.016, 0.73% null, no discriminative value |
-| `GSN_b1` + smooths | |z| < 0.20; biodiversity signal carried by GSN_b2/b3 |
-| `GSN_b5` + smooths | |z| < 0.03, near-constant values |
+| `elevation_b2` + all smooths | slope — |z| ≈ 0 in simple pos/neg comparison |
+| `elevation_b1_smooth4` | r = 0.999 with raw b1 in mini-sample |
+| `powerplants_b2` | |z| = 0.016, 0.73% null |
+| `GSN_b1` + smooths | |z| < 0.20 in mini-sample |
+| `GSN_b5` + smooths | |z| < 0.03 in mini-sample |
 
-**WorldClim collinearity** (19 bands, 14+ pairs with |r| > 0.9):
+**Caveat**: z-scores on marginal distributions don't tell us what a tree model does with feature interactions. The 12-feature prune is a hypothesis to test, not a proven improvement.
+
+**WorldClim collinearity** (19 bands, 14+ pairs with |r| > 0.9 in mini-sample):
 - b1 ↔ b2,b3,b16,b18,b19: r > 0.92
-- b4 ↔ b5,b8: r > 0.92
-- b6 ↔ b9: r = 0.993
-- b13 ↔ b14, b14 ↔ b17: r > 0.90
-
-Only ~7 independent dimensions in the 19-band space. Best discriminators: b14 (z=−0.89), b8 (z=0.87), b4 (z=0.85), b11 (z=0.67), b16 (z=0.74). **Reducing to 8 targeted bands is Phase 1B.**
+- b4 ↔ b5,b8: r > 0.92; b6 ↔ b9: r = 0.993
+19 static climate bands with ~7 independent dimensions. Whether this hurts the LambdaRank model is an open question — trees handle collinearity reasonably well. A targeted WorldClim reduction experiment is needed.
 
 **Top 10 discriminating features** (|z| from pos/neg pooled analysis):
 1. `landcover` (−1.04)
@@ -101,14 +108,18 @@ Only ~7 independent dimensions in the 19-band space. Best discriminators: b14 (z
 
 Even for small events, a perfect ranker could achieve Recall@5%=100% (positives fit within top 1% by count). The gap between current 14% and ceiling is purely model quality for large events, and partially unpredictability for small events.
 
-### 5. What Drives the Publication-Bar Gap (2.85× vs. 15×)
+### 5. Why Are We Far Below Bar? (Open Questions, Not Conclusions)
 
-In order of estimated impact:
-1. **Missing institutional features** — KBA, indigenous polygons, REDD+ hotspots. Small events (33% of test groups) are driven by these; current features can't see them. *~30–40% of the recall gap.*
-2. **Training distribution mismatch** — 96% of gradient signal from 2001–2009. Model learns "cheap remote land" pattern, not modern targeted designation. *~20–30% of the gap.*
-3. **Feature noise** — 12 near-zero features dilute splits; WorldClim collinearity wastes tree capacity. *~5–10% gain from pruning.*
-4. **Hyperparameter instability** — low truncation level (84 in failed retune) caused early stopping noise. *Fixed by reverting to baseline params.*
-5. **Earlystop sensitivity** — stopping at iter 149 may be premature; noisy NDCG@1% on small earlystop sets. *Longer patience (150) may help.*
+We are at 2.85× Lift@1% vs. bar of 15×. This is a 5× gap. The honest answer is: **we don't fully know why.** Candidates to investigate:
+
+1. **Is LambdaRank with within-group ranking the right objective?** We optimize ranking within (country, year) groups, but PA designation is a spatial polygon process — the model never sees that a pixel belongs to a contiguous block. Does NDCG@1% even correlate with the policy-relevant question?
+2. **Are eco sub-groups (W9a) helping or hurting?** They prevent the 9K sub-window problem but break the country-year group signal. We don't have a controlled ablation of this.
+3. **Is graded relevance (1–4 by cluster size) well-calibrated?** Large clusters dominate the gradient. If post-2010 designations are smaller, the model is trained to find a pattern that no longer exists in the test period.
+4. **Is the train/test temporal gap too large?** 4+ year gap (2013→2017) in a rapidly changing policy landscape. The model learned from one era and tests on another.
+5. **Missing institutional features** — KBA, indigenous polygons, REDD+ hotspots. May be essential for small events. But we don't know their actual impact until tested.
+6. **Are we ranking within the right scope?** We rank all unprotected pixels in a country-year. But maybe ranking within ecological zones or biomes is more predictive — the government didn't choose "best pixel in Brazil" but "best pixel in this ecoregion."
+
+These are foundational questions. Small tweaks (temporal weighting, 12-feature prune) will not move us from 2.85× to 15×. A step-change requires finding and fixing something structurally wrong.
 
 ---
 
@@ -139,6 +150,21 @@ In order of estimated impact:
 | Full SA retrain | ⬜ Queued (job 3561527) | Record Lift@1% + Recall@5% in `feature_ablation_sa.json` |
 
 Expected outcome: modestly better than 2.85× Lift@1% (feature pruning removes noise; temporal weighting focuses on recent years). If result is worse than baseline, YEAR_WEIGHT_MIN=0.5 (revert to default).
+
+---
+
+## Foundational Questions to Explore (Before/Alongside Feature Experiments)
+
+These aren't tweaks — they question whether the current architecture is the right one. Each needs at least a mini-sample experiment before committing Euler time.
+
+| Question | Why it matters | How to test |
+|---|---|---|
+| **Is NDCG@1% the right training signal?** | We optimize ndcg@90 on eco sub-groups during training. But eco sub-groups and country-year groups are very different. Maybe optimizing Recall@5% directly (a list-based loss) is better. | Try `lambdarank_truncation_level` spanning 1%–5% of median group size. |
+| **Should we drop eco sub-groups (W9a)?** | W9a was validated on proxy (22 groups). Its effect on full SA is unknown. The eco sub-groups limit the comparison scope to pixels in the same ecoregion — which may be wrong if the government's choice is country-wide. | Train without W9a and compare. |
+| **Is graded relevance hurting small-event learning?** | Large-block events (relevance 4) dominate gradients. Post-2010, events are smaller. The model may have learned to ignore relevance-1 events. | Try binary labels (0/1) on full SA. |
+| **Should we expand the ranking scope?** | Currently rank all unprotected pixels in a country-year. Maybe ranking within ecoregion globally (not just within expansion years) gives a better signal. | Change group definition from expansion-only to all country-years (including non-expansion). |
+| **Is the 2001–2013 training window wrong?** | 96% of positives from 2001–2009. Consider train 2001–2016 (adding back earlystop years) with earlystop on 2017–2019. Longer, more recent training. | Requires redefining splits — discuss before testing. |
+| **Is rank normalization hurting?** | We replace feature values with within-group percentile ranks. This removes absolute feature information. For features where the absolute value matters (e.g. "biodiversity score > X"), normalization destroys the signal. | Try without rank normalization on a mini-sample run. |
 
 ---
 
