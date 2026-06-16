@@ -467,7 +467,7 @@ def load_stage2_arrays(
     # 75 feature columns (~190 GB peak for SA at 203M rows with float32 features).
     # With separation: meta concat is ~4 GB; feature concat peaks at ~2×60 GB = 120 GB.
     meta_cols = ["country_id", "year", TARGET_COL]
-    if use_graded_relevance:
+    if use_graded_relevance or eco_raster is not None:
         meta_cols += ["row", "col"]
 
     meta_frames: list[pd.DataFrame] = []
@@ -533,8 +533,9 @@ def load_stage2_arrays(
     country_ids = data["country_id"].to_numpy(dtype=np.int32)
 
     # W9a eco grouping: look up eco_id per row BEFORE deleting data (needs row/col).
-    # Eco groups must only be used when use_graded_relevance=True (row/col available).
-    if eco_raster is not None and use_graded_relevance:
+    # row/col are included in meta_cols whenever eco_raster is not None (see above),
+    # so eco sub-groups work regardless of use_graded_relevance.
+    if eco_raster is not None:
         eco_ids_arr: Optional[np.ndarray] = ecoregion_ids_for_rows(data, eco_raster)
     else:
         eco_ids_arr = None
@@ -596,22 +597,37 @@ def compute_group_norm_weights(
     y: np.ndarray,
     cy_group_sizes: np.ndarray,
     mode: str = "inv_npos",
+    years: Optional[np.ndarray] = None,
+    temporal_decay: float = 0.2,
 ) -> np.ndarray:
     """Per-row weights so every expansion group contributes equal gradient signal.
 
-    mode="inv_npos"      weight = 1/n_pos  (strong equalisation)
-    mode="inv_sqrt_npos" weight = 1/sqrt(n_pos)  (gentler equalisation)
+    mode="inv_npos"               weight = 1/n_pos  (strong equalisation)
+    mode="inv_sqrt_npos"          weight = 1/sqrt(n_pos)  (gentler equalisation)
+    mode="inv_sqrt_npos_temporal" weight = (1/sqrt(n_pos)) * exp(-decay*(max_year-year))
+                                  Addresses BOTH gradient concentration sources: event
+                                  size AND age. Requires years array to be passed.
+                                  decay=0.2 → 2001 event gets ~16% of 2013 weight.
 
     Weights are normalised to mean=1 so LightGBM's learning-rate and
     regularisation stay calibrated. Groups with n_pos=0 get weight=1.
     """
     weights = np.ones(len(y), dtype=np.float32)
+    max_year: int = int(years.max()) if years is not None else 0
     start = 0
     for g_size in cy_group_sizes:
         end = start + int(g_size)
         n_pos = int((y[start:end] > 0).sum())
         if n_pos > 0:
-            w = 1.0 / n_pos if mode == "inv_npos" else 1.0 / np.sqrt(float(n_pos))
+            if mode == "inv_npos":
+                w = 1.0 / n_pos
+            elif mode == "inv_sqrt_npos_temporal":
+                size_w = 1.0 / np.sqrt(float(n_pos))
+                year_val = int(years[start]) if years is not None else max_year
+                temporal_w = np.exp(-temporal_decay * (max_year - year_val))
+                w = size_w * temporal_w
+            else:  # inv_sqrt_npos (default fallback)
+                w = 1.0 / np.sqrt(float(n_pos))
             weights[start:end] = w
         start = end
     weights /= weights.mean()
@@ -855,21 +871,45 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
         print("Loading ecoregion raster for W9a eco sub-groups...")
         eco_raster = load_ecoregion_raster(cfg.region)
 
-    print(f"Loading train pool (variant={cfg.variant}, neg_ratio={neg_ratio}, eco_groups={eco_raster is not None})...")
+    # H5: STAGE2_NORMALIZE_WITHIN_GROUPS=0 disables within-group percentile rank normalisation.
+    # Exposes absolute feature signals (globally high biodiversity, low population density)
+    # that rank normalisation destroys. Must be consistent across train / earlystop / test.
+    _normalize = os.environ.get("STAGE2_NORMALIZE_WITHIN_GROUPS", "1") != "0"
+    # H2: STAGE2_GRADED_RELEVANCE=0 switches labels from graded 1–4 to binary 0/1.
+    # Removes the cluster-size bias that amplifies gradient from large events.
+    _graded = os.environ.get("STAGE2_GRADED_RELEVANCE", "1") != "0"
+    # H9: STAGE2_TRAIN_YEAR_MIN restricts training to events from that year onward.
+    # E.g., STAGE2_TRAIN_YEAR_MIN=2010 drops 2001-2009 mega-events (98.6% of gradient)
+    # to train only on post-2010 events that are structurally similar to the test set.
+    _train_year_min = int(os.environ.get("STAGE2_TRAIN_YEAR_MIN", str(cfg.train_years[0])))
+    effective_train_years = (max(cfg.train_years[0], _train_year_min), cfg.train_years[1])
+    print(
+        f"Loading train pool (variant={cfg.variant}, neg_ratio={neg_ratio},"
+        f" eco_groups={eco_raster is not None},"
+        f" train_years={effective_train_years},"
+        f" normalize_within_groups={_normalize}, graded_relevance={_graded})..."
+    )
     arr_tr = load_stage2_arrays(
-        train_path, cfg.region, feature_cols, expansion_groups, cfg.train_years,
+        train_path, cfg.region, feature_cols, expansion_groups, effective_train_years,
         neg_ratio=neg_ratio,
         eco_raster=eco_raster,
+        normalize_within_groups=_normalize,
+        use_graded_relevance=_graded,
     )
     # Earlystop is evaluation-only — always use cy groups for NDCG callback.
     arr_es = load_stage2_arrays(
         earlystop_path, cfg.region, feature_cols, expansion_groups, cfg.earlystop_years,
         neg_ratio=neg_ratio,
+        normalize_within_groups=_normalize,
+        use_graded_relevance=_graded,
     )
 
     _gw_mode = os.environ.get("STAGE2_GROUP_WEIGHT_MODE", "year_weights")
-    if _gw_mode in ("inv_npos", "inv_sqrt_npos"):
-        sample_weights = compute_group_norm_weights(arr_tr.y, arr_tr.cy_group_sizes, _gw_mode)
+    _gw_norm_modes = ("inv_npos", "inv_sqrt_npos", "inv_sqrt_npos_temporal")
+    if _gw_mode in _gw_norm_modes:
+        sample_weights = compute_group_norm_weights(
+            arr_tr.y, arr_tr.cy_group_sizes, _gw_mode, years=arr_tr.years
+        )
         print(f"Group-norm weights: mode={_gw_mode}  mean={sample_weights.mean():.3f}  "
               f"min={sample_weights.min():.4f}  max={sample_weights.max():.1f}")
     else:
@@ -931,7 +971,9 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
     test_expansion = _expansion_groups_from_batches(test_path, cfg.region, cfg.test_years)
     print("Loading test set (no neg_ratio — full evaluation)...")
     arr_te = load_stage2_arrays(
-        test_path, cfg.region, feature_cols, test_expansion, cfg.test_years
+        test_path, cfg.region, feature_cols, test_expansion, cfg.test_years,
+        normalize_within_groups=_normalize,
+        use_graded_relevance=_graded,
     )
     scores = model.predict(arr_te.X, num_iteration=model.best_iteration or None).astype(np.float64)
     test_metrics = compute_stage2_metrics(arr_te.y.astype(np.float64), scores, arr_te.cy_group_sizes)

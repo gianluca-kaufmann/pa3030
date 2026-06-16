@@ -1,6 +1,6 @@
 # PA3030 — Publication Roadmap
 
-**Updated**: 2026-06-16 | **Branch**: `paper` (active). `main` = intact thesis, never touch.
+**Updated**: 2026-06-17 | **Branch**: `paper` (active). `main` = intact thesis, never touch.
 
 **Story**: The 30×30 agreement forces countries to double protected area coverage by 2030. We predict which pixels will be designated — giving investors, central banks, and policymakers a transition risk tool. Stage 1 predicts *when* countries expand; Stage 2 predicts *which pixels* are chosen. Stage 2 output = calibrated suitability score (annual designation probability per pixel).
 
@@ -139,13 +139,47 @@ With this weighting:
 
 **Rationale**: Rank normalisation removes absolute feature information. If a pixel's biodiversity score is "objectively high" (top 5% globally), that absolute signal is lost when replaced by its rank within a country-year group where most pixels happen to have low biodiversity. The model cannot learn "protect the most biodiverse land globally" — only "protect the most biodiverse land within this particular country-year group."
 
-**Risk**: Rank normalisation was introduced to handle cross-country scale differences. Without it, Brazil's feature distribution (large country, high variance) might overwhelm smaller countries. Test carefully.
+Top SHAP features (biodiversity GSN_b2, population GPW, distance dist_wdpa) are ALL globally comparable — the absolute values carry real signal that within-group normalisation destroys. This is the strongest argument for H5.
+
+**Risk**: Rank normalisation was introduced to handle cross-country scale differences. Without it, Brazil's feature distribution (large country, high variance) might overwhelm smaller countries. LambdaRank already compares within-group, so scale differences between countries should not matter as long as features are internally consistent.
+
+**Implementation**: `STAGE2_NORMALIZE_WITHIN_GROUPS=0` — coded 2026-06-17.
 
 ### H6: Metric–objective alignment
 
 **Idea**: We train on NDCG@1% (graded relevance, early stopping) but evaluate Recall@5% (binary, all designated pixels equal). These reward different things. Consider whether the early-stopping metric should be binary Recall@5% instead.
 
 **Challenge**: Implementing a custom early-stopping callback on Recall@5% (binary, within-group) is straightforward — it's the same `_TrueNdcg1PctEarlyStop` structure but calling `compute_stage2_metrics` and extracting `recall_at_5pct_within_groups`. Try this alongside H1.
+
+### H7: Restrict training to post-2010 events only
+
+**Idea**: Set `STAGE2_TRAIN_YEAR_MIN=2010` to drop all 2001–2009 training groups and train only on events from 2010–2013 (25 groups).
+
+**Rationale**: The gradient concentration analysis shows 2001–2009 = 98.6% of gradient. Even with H1b (inv_sqrt_npos), these ancient mega-events still dominate because their absolute pair count dwarfs recent small events. The test set (2017–2024) consists almost entirely of small, targeted post-2010 style events. Training exclusively on 2010–2013 events (same regime as test) may generalise far better, at the cost of fewer training groups.
+
+**Risk**: Only 25 training groups. Training may be less stable; possible overfitting to those 25 groups. Cannot be tested on mini-sample (only 1 year of post-2009 data in mini train). Must go directly to full SA.
+
+**Implementation**: `STAGE2_TRAIN_YEAR_MIN=2010` env var in `run_stage2_training()` — coded 2026-06-17. Full SA only.
+
+### H8: Combined size + temporal gradient weights
+
+**Idea**: `STAGE2_GROUP_WEIGHT_MODE=inv_sqrt_npos_temporal`. Weight = `(1/sqrt(n_pos)) × exp(-0.2 × (max_year - year))`. Addresses BOTH gradient concentration sources simultaneously: event size AND event age.
+
+**Rationale**: H1b (inv_sqrt_npos) only corrects for SIZE. But large ancient events are doubly damaging: large (monopolises gradient) AND old (most unlike test era). Multiplying by temporal decay further penalises 2001–2009 events while rewarding 2010–2013 events. Example: Brazil 2006 (n_pos=110K) gets ~2000× less weight than Peru 2012 (n_pos=13), compared to ~92× for pure H1b.
+
+**Risk**: More aggressive than H1b. Could destabilise training (similar risk to H1 inv_npos). Should test with H6 (Recall@5% earlystop) to buffer instability.
+
+**Implementation**: `mode="inv_sqrt_npos_temporal"` in `compute_group_norm_weights()` — coded 2026-06-17. Test on mini-sample first.
+
+### H9: Partial rank normalisation (absolute features only)
+
+**Idea**: Disable rank normalisation for features where absolute value is globally meaningful (biodiversity GSN_b2, population GPW, distance features), keep it for contextual features (climate, elevation, NDVI).
+
+**Rationale**: H5 (full no-norm) loses the benefit of rank normalisation for features where it helps. Partial normalisation captures the best of both: absolute global signals where they exist, relative within-group ranking where absolute values are country-specific.
+
+**Risk**: Requires defining the split manually. Test H5 (full no-norm) first — if H5 works, partial norm is refinement. If H5 fails, partial norm is the next experiment.
+
+**Implementation**: `STAGE2_ABS_FEATURES="GSN_b2,GPW,dist_wdpa,dist_indigenous"` env var; apply rank normalisation only to the complement. Not yet coded.
 
 ---
 
@@ -157,12 +191,15 @@ Run on mini-sample first. If proxy Recall@5% > 20% (current best) → promote to
 
 | Priority | Experiment | Status | Notes |
 |---|---|---|---|
-| 1 | H5: no rank normalisation | ⬜ Not started | `normalize_within_groups=False` — may expose absolute feature signals (biodiversity, distance) |
-| 2 | H2: binary labels (0/1 instead of 1–4) | ⬜ Not started | removes graded-relevance bias; test jointly with H6+H1b |
-| 3 | Retune hyperparams (≥100 trials) | ⬜ Not started | current params tuned for NDCG@1%+year_weights; retune for Recall@5%+inv_sqrt_npos |
-| 4 | KBA features | ⏸ Blocked — awaiting BirdLife shapefile | add dist_kba_km, is_kba |
-| 5 | Indigenous polygon features | ⏸ Blocked — awaiting RAISG download | add dist_raisg_km, is_indigenous_territory |
-| 6 | H4: extended training window (2001–2016) | ⏸ Needs pipeline change — discuss first | include 2014–2016 in train; use 2017–2019 as earlystop |
+| 1 | H5: no rank normalisation | 🔄 Running mini — job 3647627 | `STAGE2_NORMALIZE_WITHIN_GROUPS=0` |
+| 2 | H2: binary labels (0/1 instead of 1–4) | 🔄 Running mini — job 3647627 | `STAGE2_GRADED_RELEVANCE=0`; eco sub-groups still work (decoupled 2026-06-17) |
+| 3 | H5+H2 combined | 🔄 Running mini — job 3647627 | both off simultaneously |
+| 4 | H8: inv_sqrt_npos_temporal weights | ⬜ Not started | combined size+temporal — `STAGE2_GROUP_WEIGHT_MODE=inv_sqrt_npos_temporal` (coded) |
+| 5 | H7: train only 2010–2013 | ⬜ Not started — full SA only | `STAGE2_TRAIN_YEAR_MIN=2010`; cannot test on mini (only 1 post-2009 year) |
+| 6 | Retune hyperparams (≥100 trials) | ⬜ Not started | only after structure is locked |
+| 7 | KBA features | ⏸ Blocked — awaiting BirdLife shapefile | add dist_kba_km, is_kba |
+| 8 | Indigenous polygon features | ⏸ Blocked — awaiting RAISG download | add dist_raisg_km, is_indigenous_territory |
+| 9 | H4: extended training window (2001–2016) | ⏸ Needs pipeline change — discuss first | include 2014–2016 in train; use 2017–2019 as earlystop |
 
 **Closed experiments:**
 - H1 inv_npos: ✗ too aggressive, training collapses

@@ -45,6 +45,7 @@ from scripts.regions.shared.training.stage2_lgbm_core import (
     TARGET_COL,
     _expansion_groups_from_batches,
     _prepare_lgb_params,
+    compute_group_norm_weights,
     load_stage2_arrays,
     train_lambdarank,
 )
@@ -142,15 +143,24 @@ def main() -> None:
 
     neg_ratio = int(os.environ.get("STAGE2_NEG_RATIO", "100"))
 
+    # H5: STAGE2_NORMALIZE_WITHIN_GROUPS=0 disables within-group percentile rank normalisation.
+    # H2: STAGE2_GRADED_RELEVANCE=0 switches labels from graded 1–4 to binary 0/1.
+    _normalize = os.environ.get("STAGE2_NORMALIZE_WITHIN_GROUPS", "1") != "0"
+    _graded = os.environ.get("STAGE2_GRADED_RELEVANCE", "1") != "0"
+
+    print(f"normalize_within_groups={_normalize}  graded_relevance={_graded}")
+
     print("Loading train split...")
     arr_tr = load_stage2_arrays(
         train_path, "south_america", feature_cols, expansion_groups,
         TRAIN_YEARS, neg_ratio=neg_ratio, eco_raster=eco_raster,
+        normalize_within_groups=_normalize, use_graded_relevance=_graded,
     )
     print("Loading earlystop split (proxy val)...")
     arr_es = load_stage2_arrays(
         es_path, "south_america", feature_cols, expansion_groups,
         ES_YEARS, neg_ratio=None,   # no subsampling at eval time
+        normalize_within_groups=_normalize, use_graded_relevance=_graded,
     )
 
     num_threads = int(os.environ.get("OMP_NUM_THREADS", str(os.cpu_count() or 4)))
@@ -158,19 +168,29 @@ def main() -> None:
     num_boost_round = int(
         best_params.get("n_estimators", best_params.get("num_boost_round", 1000))
     )
-    year_weights = compute_year_weights(
-        arr_tr.years, min_year=TRAIN_YEARS[0], max_year=TRAIN_YEARS[1]
-    )
+    _gw_mode = os.environ.get("STAGE2_GROUP_WEIGHT_MODE", "year_weights")
+    _gw_norm_modes = ("inv_npos", "inv_sqrt_npos", "inv_sqrt_npos_temporal")
+    if _gw_mode in _gw_norm_modes:
+        sample_weights = compute_group_norm_weights(
+            arr_tr.y, arr_tr.cy_group_sizes, _gw_mode, years=arr_tr.years
+        )
+        print(f"Group-norm weights: mode={_gw_mode}  mean={sample_weights.mean():.3f}  "
+              f"min={sample_weights.min():.4f}  max={sample_weights.max():.1f}")
+    else:
+        sample_weights = compute_year_weights(
+            arr_tr.years, min_year=TRAIN_YEARS[0], max_year=TRAIN_YEARS[1]
+        )
 
     print(
         f"\nTraining LambdaRank  n_estimators={num_boost_round}"
         f"  eco_groups={eco_raster is not None}"
+        f"  weights={_gw_mode}"
     )
     t0 = time.time()
     model = train_lambdarank(
         arr_tr.X, arr_tr.y, arr_tr.train_group_sizes,
         arr_es.X, arr_es.y, arr_es.cy_group_sizes,
-        params, year_weights, num_boost_round,
+        params, sample_weights, num_boost_round,
     )
     elapsed = time.time() - t0
 
