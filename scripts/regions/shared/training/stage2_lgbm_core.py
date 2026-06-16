@@ -119,6 +119,12 @@ class _Stage2EarlyStop:
     def _score(self, pred: np.ndarray) -> float:
         if self.metric == "recall_at_5pct":
             return recall_at_k_within_groups(self.y_val, pred, self.group_val, 5.0)
+        if self.metric == "ndcg_x_recall":
+            # H10: product of NDCG@1% and Recall@5%. Maximised only when BOTH are high;
+            # breaks the Lift/Recall trade-off from pure single-metric stopping.
+            ndcg = ndcg_at_k_within_groups(self.y_val, pred, self.group_val, 1.0)
+            recall = recall_at_k_within_groups(self.y_val, pred, self.group_val, 5.0)
+            return ndcg * recall
         return ndcg_at_k_within_groups(self.y_val, pred, self.group_val, 1.0)
 
     def __call__(self, env: Any) -> None:

@@ -1,6 +1,6 @@
 # PA3030 — Publication Roadmap
 
-**Updated**: 2026-06-17 | **Branch**: `paper` (active). `main` = intact thesis, never touch.
+**Updated**: 2026-06-17 (H5 mini done) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
 
 **Story**: The 30×30 agreement forces countries to double protected area coverage by 2030. We predict which pixels will be designated — giving investors, central banks, and policymakers a transition risk tool. Stage 1 predicts *when* countries expand; Stage 2 predicts *which pixels* are chosen. Stage 2 output = calibrated suitability score (annual designation probability per pixel).
 
@@ -191,21 +191,42 @@ Run on mini-sample first. If proxy Recall@5% > 20% (current best) → promote to
 
 | Priority | Experiment | Status | Notes |
 |---|---|---|---|
-| 1 | H5: no rank normalisation | 🔄 Running mini — job 3647627 | `STAGE2_NORMALIZE_WITHIN_GROUPS=0` |
-| 2 | H2: binary labels (0/1 instead of 1–4) | 🔄 Running mini — job 3647627 | `STAGE2_GRADED_RELEVANCE=0`; eco sub-groups still work (decoupled 2026-06-17) |
-| 3 | H5+H2 combined | 🔄 Running mini — job 3647627 | both off simultaneously |
-| 4 | H8: inv_sqrt_npos_temporal weights | ⬜ Not started | combined size+temporal — `STAGE2_GROUP_WEIGHT_MODE=inv_sqrt_npos_temporal` (coded) |
-| 5 | H7: train only 2010–2013 | ⬜ Not started — full SA only | `STAGE2_TRAIN_YEAR_MIN=2010`; cannot test on mini (only 1 post-2009 year) |
-| 6 | Retune hyperparams (≥100 trials) | ⬜ Not started | only after structure is locked |
-| 7 | KBA features | ⏸ Blocked — awaiting BirdLife shapefile | add dist_kba_km, is_kba |
-| 8 | Indigenous polygon features | ⏸ Blocked — awaiting RAISG download | add dist_raisg_km, is_indigenous_territory |
-| 9 | H4: extended training window (2001–2016) | ⏸ Needs pipeline change — discuss first | include 2014–2016 in train; use 2017–2019 as earlystop |
+| 1 | H5 full SA | 🔄 Running — job 3655195 | `training_lgbm_stage2_h6_h1b_h5.slurm`; ~8h |
+| 2 | H10+H8 mini (4 runs) | 🔄 Queued — job 3655220, after 3655195 | `mini_h10_h8.slurm`; tests ndcg×recall stop + temporal weights |
+| 3 | H8: inv_sqrt_npos_temporal weights | ⬜ Not started | combined size+temporal — `STAGE2_GROUP_WEIGHT_MODE=inv_sqrt_npos_temporal` (coded) |
+| 4 | H7: train only 2010–2013 | ⬜ Not started — full SA only | `STAGE2_TRAIN_YEAR_MIN=2010`; cannot test on mini (only 1 post-2009 year) |
+| 5 | Retune hyperparams (≥100 trials) | ⬜ Not started | only after structure is locked |
+| 6 | KBA features | ⏸ Blocked — awaiting BirdLife shapefile | add dist_kba_km, is_kba |
+| 7 | Indigenous polygon features | ⏸ Blocked — awaiting RAISG download | add dist_raisg_km, is_indigenous_territory |
+| 8 | H4: extended training window (2001–2016) | ⏸ Needs pipeline change — discuss first | include 2014–2016 in train; use 2017–2019 as earlystop |
+
+**Decision rule for H5 full SA**: If full SA Recall@5% > 18.1% (H6+H1b) → lock H5 as new baseline. If full SA Lift@1% also drops, investigate combined-metric stopping (H10) next.
 
 **Closed experiments:**
 - H1 inv_npos: ✗ too aggressive, training collapses
 - H1b inv_sqrt_npos alone: ✗ NDCG@1% early stop fires at iter 8 — needs H6
 - H3 W9a off: ✗ hurts both metrics
 - H6+H1b+H3: ✗ W9a off degrades H6+H1b
+- H2 binary labels (on top of H6+H1b): ✗ no change — binary labels add nothing when H1b already corrects gradient bias; Recall=27.9%, Lift=12.86× = identical to H6+H1b
+- H5+H2: ✗ H2 adds nothing on top of H5; result identical to H5 alone
+
+---
+
+## Lift vs Recall Trade-off Diagnosis (2026-06-17)
+
+**Critical finding**: Every intervention so far improves one metric at the cost of the other.
+
+| Stopping metric | Proxy Lift@1% | Proxy Recall@5% | Direction |
+|---|---|---|---|
+| NDCG@1% (baseline, year_weights) | **20.32×** | 13.3% | high lift, low recall |
+| Recall@5% (H6+H1b) | 12.86× | 27.9% | lower lift, better recall |
+| Recall@5% (H6+H1b+H5) | 11.52× | **34.8%** | lowest lift, best recall |
+
+The publication bar requires BOTH ≥15× Lift AND ≥90% Recall simultaneously. Neither early stopping metric achieves this. Current experiments optimise ONE metric while degrading the other.
+
+**Root cause**: NDCG@1% stopping teaches the model to rank the best few pixels perfectly (high Lift) but ignores the bottom half of positives (low Recall). Recall@5% stopping teaches the model to find ALL positives in the top 5% (high Recall) but doesn't concentrate the best pixels in the very top 1% (lower Lift).
+
+**H10 hypothesis**: Early stopping on `ndcg_at_1pct × recall_at_5pct` (product). This combined metric is maximised only when BOTH are high. Training under this objective might avoid the trade-off by forcing the model to be simultaneously a good ranker AND a good retriever.
 
 ---
 
