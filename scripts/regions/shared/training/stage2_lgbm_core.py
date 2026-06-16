@@ -32,6 +32,7 @@ from scripts.regions.shared.country_raster import (
 from scripts.regions.shared.evaluation.stage2_metrics import (
     compute_stage2_metrics,
     ndcg_at_k_within_groups,
+    recall_at_k_within_groups,
 )
 from scripts.regions.shared.training.feature_guard import check_feature_denylist
 from scripts.regions.shared.training.utils import compute_year_weights, get_repo_root
@@ -80,17 +81,16 @@ BINARY_FIXED_PARAMS = {
 }
 
 
-class _TrueNdcg1PctEarlyStop:
-    """Custom early-stopping callback using true NDCG@1% on full validation groups.
+class _Stage2EarlyStop:
+    """Early stopping on Recall@5% or NDCG@1% over full (country_id, year) groups.
 
-    Replaces lgb's built-in stopping criteria for both LambdaRank (ndcg@90 on 9K
-    sub-windows — Issue N) and binary (average_precision). Both models now stop on
-    the same metric used for final evaluation, so best_iteration reflects the model
-    state with the highest real-world ranking quality.
+    Controlled by STAGE2_EARLY_STOP_METRIC env var:
+      "ndcg_at_1pct"   — original behaviour (default)
+      "recall_at_5pct" — directly optimises the publication bar metric; more stable
+                         because it aggregates over 5× more data points per group
 
-    Prediction is called at every iteration on the full unsplit X_val so that
-    NDCG@1% is computed over the complete (country_id, year) groups rather than
-    over the 9K sub-window fragments that LightGBM sees internally.
+    Prediction runs on the full unsplit X_val at every iteration so the metric
+    reflects true group boundaries, not 9K sub-window fragments.
     """
 
     order = 30  # run after lgb.log_evaluation (order=20)
@@ -102,6 +102,7 @@ class _TrueNdcg1PctEarlyStop:
         y_val: np.ndarray,
         group_val: np.ndarray,
         patience: int = 100,
+        metric: str = "ndcg_at_1pct",
         verbose: bool = True,
         log_interval: int = 50,
     ) -> None:
@@ -109,32 +110,42 @@ class _TrueNdcg1PctEarlyStop:
         self.y_val = y_val.astype(np.float64)
         self.group_val = group_val
         self.patience = patience
+        self.metric = metric
         self.verbose = verbose
         self.log_interval = log_interval
         self.best_score: float = 0.0
         self.best_iter: int = 0
 
+    def _score(self, pred: np.ndarray) -> float:
+        if self.metric == "recall_at_5pct":
+            return recall_at_k_within_groups(self.y_val, pred, self.group_val, 5.0)
+        return ndcg_at_k_within_groups(self.y_val, pred, self.group_val, 1.0)
+
     def __call__(self, env: Any) -> None:
         pred = env.model.predict(self.X_val)
-        score = ndcg_at_k_within_groups(self.y_val, pred, self.group_val, 1.0)
+        score = self._score(pred)
         if score > self.best_score:
             self.best_score = score
             self.best_iter = env.iteration
         if self.verbose and (env.iteration + 1) % self.log_interval == 0:
             print(
-                f"[{env.iteration + 1}]  true ndcg@1%: {score:.6f}"
+                f"[{env.iteration + 1}]  true {self.metric}: {score:.6f}"
                 f"  best: {self.best_score:.6f} @ iter {self.best_iter + 1}"
             )
         if env.iteration - self.best_iter >= self.patience:
             if self.verbose:
                 print(
-                    f"True NDCG@1% early stopping at iter {env.iteration + 1}."
+                    f"Early stopping ({self.metric}) at iter {env.iteration + 1}."
                     f" Best: iter {self.best_iter + 1} ({self.best_score:.6f})"
                 )
             raise _LgbEarlyStopException(
                 self.best_iter,
-                [("val", "ndcg@1%", self.best_score, True)],
+                [("val", self.metric, self.best_score, True)],
             )
+
+
+# Backward-compatible alias
+_TrueNdcg1PctEarlyStop = _Stage2EarlyStop
 
 
 def _split_large_groups(group_sizes: np.ndarray) -> np.ndarray:
@@ -581,6 +592,32 @@ def _compute_scale_pos_weight(y: np.ndarray) -> float:
     return float(n_neg) / float(max(n_pos, 1))
 
 
+def compute_group_norm_weights(
+    y: np.ndarray,
+    cy_group_sizes: np.ndarray,
+    mode: str = "inv_npos",
+) -> np.ndarray:
+    """Per-row weights so every expansion group contributes equal gradient signal.
+
+    mode="inv_npos"      weight = 1/n_pos  (strong equalisation)
+    mode="inv_sqrt_npos" weight = 1/sqrt(n_pos)  (gentler equalisation)
+
+    Weights are normalised to mean=1 so LightGBM's learning-rate and
+    regularisation stay calibrated. Groups with n_pos=0 get weight=1.
+    """
+    weights = np.ones(len(y), dtype=np.float32)
+    start = 0
+    for g_size in cy_group_sizes:
+        end = start + int(g_size)
+        n_pos = int((y[start:end] > 0).sum())
+        if n_pos > 0:
+            w = 1.0 / n_pos if mode == "inv_npos" else 1.0 / np.sqrt(float(n_pos))
+            weights[start:end] = w
+        start = end
+    weights /= weights.mean()
+    return weights
+
+
 def _scan_true_class_counts(
     panel_path: Path,
     region: str,
@@ -669,9 +706,10 @@ def train_lambdarank(
 ) -> lgb.Booster:
     train_set = lgb.Dataset(X_train, label=y_train, group=_split_large_groups(group_train), weight=weights)
     # val_set passed for ndcg@90 diagnostic logs (log_evaluation); stopping uses the
-    # custom callback below which monitors true NDCG@1% on full unsplit groups.
+    # custom callback below which monitors the chosen metric on full unsplit groups.
     val_set = lgb.Dataset(X_val, label=y_val, group=_split_large_groups(group_val), reference=train_set)
-    early_stop_cb = _TrueNdcg1PctEarlyStop(X_val, y_val, group_val, patience=patience)
+    es_metric = os.environ.get("STAGE2_EARLY_STOP_METRIC", "ndcg_at_1pct")
+    early_stop_cb = _Stage2EarlyStop(X_val, y_val, group_val, patience=patience, metric=es_metric)
     return lgb.train(
         params,
         train_set,
@@ -703,9 +741,10 @@ def train_binary_lgbm(
     y_va_bin = (y_val > 0).astype(np.int8)
     train_set = lgb.Dataset(X_train, label=y_tr_bin, weight=weights)
     # val_set passed for average_precision diagnostic logs; stopping uses the
-    # custom callback which monitors true NDCG@1% on full unsplit groups.
+    # custom callback which monitors the chosen metric on full unsplit groups.
     val_set = lgb.Dataset(X_val, label=y_va_bin, reference=train_set)
-    early_stop_cb = _TrueNdcg1PctEarlyStop(X_val, y_val, group_val, patience=patience)
+    es_metric = os.environ.get("STAGE2_EARLY_STOP_METRIC", "ndcg_at_1pct")
+    early_stop_cb = _Stage2EarlyStop(X_val, y_val, group_val, patience=patience, metric=es_metric)
     return lgb.train(
         params,
         train_set,
@@ -828,9 +867,15 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
         neg_ratio=neg_ratio,
     )
 
-    year_weights = compute_year_weights(
-        arr_tr.years, min_year=cfg.train_years[0], max_year=cfg.train_years[1]
-    )
+    _gw_mode = os.environ.get("STAGE2_GROUP_WEIGHT_MODE", "year_weights")
+    if _gw_mode in ("inv_npos", "inv_sqrt_npos"):
+        sample_weights = compute_group_norm_weights(arr_tr.y, arr_tr.cy_group_sizes, _gw_mode)
+        print(f"Group-norm weights: mode={_gw_mode}  mean={sample_weights.mean():.3f}  "
+              f"min={sample_weights.min():.4f}  max={sample_weights.max():.1f}")
+    else:
+        sample_weights = compute_year_weights(
+            arr_tr.years, min_year=cfg.train_years[0], max_year=cfg.train_years[1]
+        )
 
     lgb_params: Dict[str, Any] = {}
     binary_params: Dict[str, Any] = {}
@@ -857,7 +902,7 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
         )
         model = train_binary_lgbm(
             arr_tr.X, arr_tr.y, arr_es.X, arr_es.y, arr_es.cy_group_sizes,
-            binary_params, year_weights, num_boost_round,
+            binary_params, sample_weights, num_boost_round,
         )
     else:
         lgb_params = _prepare_lgb_params(best_params, num_threads)
@@ -869,7 +914,7 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
         model = train_lambdarank(
             arr_tr.X, arr_tr.y, arr_tr.train_group_sizes,
             arr_es.X, arr_es.y, arr_es.cy_group_sizes,
-            lgb_params, year_weights, num_boost_round,
+            lgb_params, sample_weights, num_boost_round,
         )
 
     del arr_tr, arr_es

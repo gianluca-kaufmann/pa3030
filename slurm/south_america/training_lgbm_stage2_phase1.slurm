@@ -31,8 +31,12 @@ export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
 export STAGE2_NEG_RATIO=100
 export STAGE2_ECO_GROUPS=1
+# H6: Recall@5% early stopping (set to "recall_at_5pct" to enable; default = "ndcg_at_1pct")
+export STAGE2_EARLY_STOP_METRIC=ndcg_at_1pct
+# H1b: group-normalised weights (set to "inv_sqrt_npos" or "inv_npos"; default = "year_weights")
+export STAGE2_GROUP_WEIGHT_MODE=year_weights
 
-echo "Phase 1 full SA training  neg_ratio=$STAGE2_NEG_RATIO  eco_groups=$STAGE2_ECO_GROUPS"
+echo "Phase 1 full SA training  neg_ratio=$STAGE2_NEG_RATIO  eco_groups=$STAGE2_ECO_GROUPS  es_metric=$STAGE2_EARLY_STOP_METRIC  group_weights=$STAGE2_GROUP_WEIGHT_MODE"
 
 srun --cpu-bind=cores --distribution=block:block python -u \
     scripts/regions/south_america/5_training/model1_LGBM_stage2
