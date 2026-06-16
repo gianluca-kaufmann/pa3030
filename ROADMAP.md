@@ -28,8 +28,8 @@ P(pixel i designated in year t)
 
 | Metric | Bar | Full SA best |
 |---|---|---|
-| Lift@1% | ≥ 15× | **2.85×** (baseline, 2026-06-15) |
-| Recall@5% | ≥ 90% | **14.0%** (baseline, 2026-06-15) |
+| Lift@1% | ≥ 15× | **3.73×** (H6+H1b, 2026-06-16) |
+| Recall@5% | ≥ 90% | **18.1%** (H6+H1b, 2026-06-16) |
 
 ---
 
@@ -47,11 +47,21 @@ Before tweaking hyperparameters or dropping features, ask: *Is the fundamental f
 
 | Experiment | Lift@1% | Recall@5% | best_iter | Verdict |
 |---|---|---|---|---|
-| Baseline (79 feat, truncation=741) | **2.85×** | **14.0%** | 149 | ✓ best result |
+| Baseline (79 feat, truncation=741) | 2.85× | 14.0% | 149 | previous best |
 | 20-trial retune → truncation=84 | 2.06× | 8.4% | 7 | ✗ catastrophic |
 | 67 feat + YEAR_WEIGHT_MIN=0.2 | 2.64× | 11.4% | 113 | ✗ both negative |
+| **H6+H1b (Recall@5% earlystop + inv_sqrt_npos)** | **3.73×** | **18.1%** | **89** | ✓ **new best — both improved** |
 
-Three runs, every change made things worse. The baseline with default params and all 79 features is still the best. **Feature pruning and temporal weighting are reverted.**
+H6+H1b is the first experiment to improve both metrics simultaneously. +31% Lift, +29% Recall vs baseline. This is the new locked baseline for future experiments.
+
+**What worked and why:**
+- **H6 (Recall@5% early stopping)**: Directly optimises the publication metric instead of NDCG@1%. More stable signal (aggregates over 5× more data points per group). Main driver.
+- **H1b (inv_sqrt_npos group weights)**: Down-weights large events (Brazil 2001–2009), gives small events more influence. Adds ~+1% Recall and improves Lift vs H6 alone.
+- **H3 (W9a off)**: Tested and rejected — hurts both metrics. Eco sub-groups stay.
+
+**What didn't work:**
+- H1 (inv_npos, 1/n_pos): Too aggressive, destabilises training, stops at iter 56
+- H1+H6 without H1b not tested directly (H6_only: Lift=8.85×, Recall=27% on proxy — H1b improved on this)
 
 ---
 
@@ -141,18 +151,24 @@ With this weighting:
 
 ## Experiment Queue
 
-Run on mini-sample first (fast iteration, ~10 min per run). If promising, promote to full SA Euler job.
+**Locked baseline**: H6+H1b (Recall@5% earlystop + inv_sqrt_npos). All future experiments build on this.
 
-| Priority | Experiment | Status | Mini-sample script |
+Run on mini-sample first. If proxy Recall@5% > 20% (current best) → promote to full SA.
+
+| Priority | Experiment | Status | Notes |
 |---|---|---|---|
-| 1 | H1: group-normalised weights (`1/n_pos`) | ⬜ Not started | `model1_phase1_local_train --feature-tag group_norm_weight` |
-| 2 | H1+H2: group-normalised + binary labels | ⬜ Not started | same + binary variant |
-| 3 | H3: W9a off | ⬜ Not started | `STAGE2_ECO_GROUPS=0` |
-| 4 | H6: Recall@5% early stopping | ⬜ Not started | modify `_TrueNdcg1PctEarlyStop` |
-| 5 | KBA features | ⏸ Blocked — awaiting BirdLife shapefile | `add_feature_to_mini_sample.py --tif ...` |
-| 6 | Indigenous polygon features | ⏸ Blocked — awaiting RAISG download | same |
-| 7 | H4: extended training window | ⏸ Needs pipeline change | discuss first |
-| 8 | H5: no rank normalisation | ⬜ Low priority | `normalize_within_groups=False` |
+| 1 | H5: no rank normalisation | ⬜ Not started | `normalize_within_groups=False` — may expose absolute feature signals (biodiversity, distance) |
+| 2 | H2: binary labels (0/1 instead of 1–4) | ⬜ Not started | removes graded-relevance bias; test jointly with H6+H1b |
+| 3 | Retune hyperparams (≥100 trials) | ⬜ Not started | current params tuned for NDCG@1%+year_weights; retune for Recall@5%+inv_sqrt_npos |
+| 4 | KBA features | ⏸ Blocked — awaiting BirdLife shapefile | add dist_kba_km, is_kba |
+| 5 | Indigenous polygon features | ⏸ Blocked — awaiting RAISG download | add dist_raisg_km, is_indigenous_territory |
+| 6 | H4: extended training window (2001–2016) | ⏸ Needs pipeline change — discuss first | include 2014–2016 in train; use 2017–2019 as earlystop |
+
+**Closed experiments:**
+- H1 inv_npos: ✗ too aggressive, training collapses
+- H1b inv_sqrt_npos alone: ✗ NDCG@1% early stop fires at iter 8 — needs H6
+- H3 W9a off: ✗ hurts both metrics
+- H6+H1b+H3: ✗ W9a off degrades H6+H1b
 
 ---
 
@@ -179,10 +195,13 @@ Run on mini-sample first (fast iteration, ~10 min per run). If promising, promot
 ## Settled Decisions
 
 - **Engine**: LightGBM LambdaRank, neg_ratio=100
+- **Early stopping**: Recall@5% within (country_id, year) groups (H6, locked 2026-06-16)
+- **Sample weights**: inv_sqrt_npos group-norm weights (H1b, locked 2026-06-16)
+- **Eco sub-groups**: W9a on (H3 tested and rejected)
 - **Primary metrics**: Lift@1% + Recall@5% within expansion groups
 - **Temporal split**: Train 2001–2013, early-stop 2014–2016, test 2017–2024 — *potentially revisit H4*
-- **Proxy abandoned**: all evaluation on full SA only (proxy 5× overoptimistic)
-- **Full SA retuning with < 100 trials is harmful**: 20-trial run found truncation=84 (catastrophic). Only retune after structure is locked.
+- **Proxy Recall@5% is directionally reliable**: proxy baseline 13.3% ≈ full SA 14.0%. Use proxy to screen experiments.
+- **Full SA retuning with < 100 trials is harmful**: Only retune after structure is locked.
 - **No ensembles, no sub-models** (supervisor directive)
 - **Governance features**: first differences only
 - **CBD**: robustness only; CBD-free is primary
