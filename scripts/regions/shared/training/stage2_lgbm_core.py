@@ -40,6 +40,7 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "200000"))
 TARGET_COL = "transition_01"
 GROUP_COLS = ("country_id", "year")
 STAGE2_EXCLUDE_COLS = frozenset({
+    # --- metadata / leakage ---
     "transition_01",
     "transition_01_win5",
     "WDPA_b1",
@@ -53,6 +54,24 @@ STAGE2_EXCLUDE_COLS = frozenset({
     "year",
     "country_id",
     "country_iso3",
+    # --- near-zero discriminators (data audit 2026-06-16, z-score analysis on SA mini-sample) ---
+    # elevation_b2 = slope — all smooths have |z|≈0 pos vs neg; r≥0.997 with b1 smooths
+    "elevation_b2",
+    "elevation_b2_smooth4",
+    "elevation_b2_smooth16",
+    "elevation_b2_smooth64",
+    # elevation_b1_smooth4 — r=0.999 with raw elevation_b1; zero addl information
+    "elevation_b1_smooth4",
+    # powerplants_b2 — |z|=0.016, 0.73% null, no discriminative value at this resolution
+    "powerplants_b2",
+    # GSN_b1 and smooths — |z|<0.20; biodiversity signal carried by GSN_b2/b3
+    "GSN_b1",
+    "GSN_b1_smooth16",
+    "GSN_b1_smooth64",
+    # GSN_b5 and smooths — |z|<0.03, near-constant values (biodiversity intactness sub-band)
+    "GSN_b5",
+    "GSN_b5_smooth16",
+    "GSN_b5_smooth64",
 })
 
 # LightGBM 4.6 hardcodes a 10 000-row per-query limit in C++.
@@ -828,8 +847,10 @@ def run_stage2_training(cfg: Stage2Config, cv_mode: str = "fold3") -> None:
         neg_ratio=neg_ratio,
     )
 
+    _year_w_min = float(os.environ.get("STAGE2_YEAR_WEIGHT_MIN", "0.5"))
     year_weights = compute_year_weights(
-        arr_tr.years, min_year=cfg.train_years[0], max_year=cfg.train_years[1]
+        arr_tr.years, min_year=cfg.train_years[0], max_year=cfg.train_years[1],
+        min_weight=_year_w_min,
     )
 
     lgb_params: Dict[str, Any] = {}

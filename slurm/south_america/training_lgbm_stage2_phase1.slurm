@@ -31,6 +31,9 @@ export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
 export STAGE2_NEG_RATIO=100
 export STAGE2_ECO_GROUPS=1
+# Down-weight early (high-designation) years relative to recent (low-rate) years.
+# 0.2 means 2001 gets 1/5th the weight of 2013 (vs default 1/2 at 0.5).
+export STAGE2_YEAR_WEIGHT_MIN=0.2
 
 echo "Phase 1 full SA training  neg_ratio=$STAGE2_NEG_RATIO  eco_groups=$STAGE2_ECO_GROUPS"
 
