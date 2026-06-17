@@ -1,0 +1,385 @@
+#!/usr/bin/env python3
+"""Stage 2 patch-level LambdaRank — Tier 3 architectural fix (H12).
+
+Changes the ranking unit from pixels to connected-component patches of
+unprotected land. Each patch is one row; a patch is positive if any pixel
+inside it was designated (transition_01 > 0).
+
+This eliminates the polygon-vs-pixel framing mismatch that capped Recall@5%
+near 20% regardless of training-side interventions (Tiers 1+2).
+
+Inherits the locked baseline settings:
+  H6:  Recall@5% early stopping  (STAGE2_EARLY_STOP_METRIC=recall_at_5pct)
+  H1b: inv_sqrt_npos group weights (STAGE2_GROUP_WEIGHT_MODE=inv_sqrt_npos)
+  H5:  rank normalisation OFF     (always disabled for patch-level data)
+  W9a: eco sub-groups OFF         (not applicable at patch level)
+
+Input:  patch_{train,earlystop,test}.parquet  (from build_patch_panel.py)
+Output: metrics JSON + scored parquet in outputs/south_america/results/ml_models/
+"""
+
+from __future__ import annotations
+
+import gc
+import json
+import os
+import pickle
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+_ROOT = Path(__file__).resolve().parents[4]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from scripts.regions.shared.evaluation.stage2_metrics import compute_stage2_metrics
+from scripts.regions.shared.training.stage2_lgbm_core import (
+    _Stage2EarlyStop,
+    _split_large_groups,
+    compute_group_norm_weights,
+)
+
+# Columns that are NOT features in the patch panel
+PATCH_EXCLUDE_COLS = frozenset({
+    "transition_01",
+    "transition_01_win5",
+    "country_id", "year",
+    "patch_n_pixels",  # diagnostic — use log_patch_size_km2 as feature instead
+})
+
+FIXED_PARAMS = {
+    "boosting_type": "gbdt",
+    "objective": "lambdarank",
+    "metric": "ndcg",
+    "verbose": -1,
+    "lambdarank_truncation_level": 100,
+    "eval_at": [10],  # k@1% of 1K-patch groups; diagnostic only
+}
+
+
+def _resolve_splits_dir() -> Path:
+    data_root = os.environ.get("STAGE2_DATA_ROOT")
+    if data_root:
+        for p in [Path(data_root) / "main", Path(data_root)]:
+            if p.exists():
+                return p
+    scratch = os.environ.get("SCRATCH")
+    if scratch:
+        return Path(scratch) / "data/south_america/ml/main"
+    raise RuntimeError("Set SCRATCH or STAGE2_DATA_ROOT to locate splits directory.")
+
+
+def _resolve_best_params() -> dict:
+    repo_root = _ROOT
+    candidates = [
+        repo_root / "scripts/regions/south_america/5_training/model1_stage2_lgbm_best_params.json",
+        repo_root / "scripts/regions/south_america/5_training/lgbm_best_params.json",
+    ]
+    scratch = os.environ.get("SCRATCH")
+    if scratch:
+        candidates.insert(
+            0,
+            Path(scratch) / "scripts/regions/south_america/5_training/model1_stage2_lgbm_best_params.json",
+        )
+    for p in candidates:
+        if p.exists():
+            with open(p) as f:
+                raw = json.load(f)
+            return raw.get("best_params", raw) if isinstance(raw, dict) else raw
+    # Fallback defaults
+    print("  No best_params JSON found — using defaults")
+    return {
+        "num_leaves": 127,
+        "learning_rate": 0.05,
+        "min_child_samples": 20,
+        "subsample": 0.8,
+        "colsample_bytree": 0.7,
+        "reg_alpha": 0.1,
+        "reg_lambda": 1.0,
+    }
+
+
+def _discover_years(panel_path: Path) -> list[int]:
+    df = pq.read_table(panel_path, columns=["year"]).to_pandas()
+    return sorted(df["year"].unique())
+
+
+def _build_expansion_groups(
+    panel_paths: list[Path],
+    year_ranges: list[tuple[int, int]],
+) -> set[tuple[int, int]]:
+    """Return (country_id, year) pairs with at least one positive patch."""
+    groups: set[tuple[int, int]] = set()
+    for path, (y_min, y_max) in zip(panel_paths, year_ranges):
+        pf = pq.ParquetFile(path)
+        for batch in pf.iter_batches(
+            columns=["country_id", "year", "transition_01"],
+            batch_size=500_000,
+        ):
+            df = batch.to_pandas()
+            df = df[(df["year"] >= y_min) & (df["year"] <= y_max)]
+            pos = df[df["transition_01"] > 0]
+            for cid, yr in zip(pos["country_id"], pos["year"]):
+                groups.add((int(cid), int(yr)))
+    return groups
+
+
+def _load_patch_arrays(
+    panel_path: Path,
+    feature_cols: list[str],
+    expansion_groups: set[tuple[int, int]],
+    year_range: Optional[tuple[int, int]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Load patch panel, filter to expansion groups, return (X, y, years, country_ids, group_sizes).
+
+    Labels are binary: y=1 if transition_01 > 0 (any pixel in patch designated).
+    """
+    meta_frames: list[pd.DataFrame] = []
+    feat_arrays: list[np.ndarray] = []
+
+    essential = list(dict.fromkeys(
+        feature_cols + ["transition_01", "year", "country_id"]
+    ))
+    schema_names = set(pq.ParquetFile(panel_path).schema_arrow.names)
+    essential = [c for c in essential if c in schema_names]
+    actual_feature_cols = [c for c in feature_cols if c in schema_names]
+
+    pf = pq.ParquetFile(panel_path)
+    for batch in pf.iter_batches(columns=essential, batch_size=500_000):
+        df = batch.to_pandas()
+        if year_range:
+            df = df[(df["year"] >= year_range[0]) & (df["year"] <= year_range[1])]
+        if df.empty:
+            continue
+        keys = list(zip(df["country_id"].astype(int), df["year"].astype(int)))
+        mask = np.array([k in expansion_groups for k in keys], dtype=bool)
+        df = df[mask]
+        if df.empty:
+            continue
+        meta_frames.append(df[["country_id", "year", "transition_01"]].copy())
+        feat_arrays.append(df[actual_feature_cols].to_numpy(dtype=np.float32))
+        del df
+
+    if not meta_frames:
+        raise ValueError(f"No patch data after expansion filter: {panel_path}")
+
+    meta = pd.concat(meta_frames, ignore_index=True)
+    del meta_frames
+    gc.collect()
+
+    order = np.lexsort((meta["year"].to_numpy(), meta["country_id"].to_numpy()))
+    meta = meta.iloc[order].reset_index(drop=True)
+
+    X_cat = np.concatenate(feat_arrays, axis=0)
+    del feat_arrays
+    gc.collect()
+    X = X_cat[order]
+    del X_cat, order
+    gc.collect()
+
+    y = (meta["transition_01"].to_numpy() > 0).astype(np.int8)
+    years = meta["year"].to_numpy(dtype=np.int32)
+    country_ids = meta["country_id"].to_numpy(dtype=np.int32)
+    group_sizes = (
+        meta.groupby(["country_id", "year"], sort=False)
+        .size()
+        .to_numpy(dtype=np.int32)
+    )
+
+    return X, y, years, country_ids, group_sizes
+
+
+def main() -> None:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    splits_dir = _resolve_splits_dir()
+
+    train_path = splits_dir / "patch_train.parquet"
+    earlystop_path = splits_dir / "patch_earlystop.parquet"
+    test_path = splits_dir / "patch_test.parquet"
+
+    for p in (train_path, earlystop_path, test_path):
+        if not p.exists():
+            raise FileNotFoundError(
+                f"Patch panel not found: {p}\n"
+                "Run build_patch_panel.py first."
+            )
+
+    repo_root = _ROOT
+    out_dir = repo_root / "outputs/south_america/results/ml_models"
+    model_dir = repo_root / "data/south_america/ml/models"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    # Discover feature columns from schema
+    schema = pq.ParquetFile(train_path).schema_arrow
+    feature_cols = [
+        name for name, field in zip(schema.names, schema)
+        if name not in PATCH_EXCLUDE_COLS
+        and (pa.types.is_integer(field.type) or pa.types.is_floating(field.type))
+    ]
+    print(f"Patch feature columns: {len(feature_cols)}")
+    print(f"  First 10: {feature_cols[:10]}")
+
+    # Temporal split boundaries (same as pixel-level baseline)
+    TRAIN_YEARS = (2001, 2013)
+    EARLYSTOP_YEARS = (2014, 2016)
+    TEST_YEARS = (2017, 2024)
+
+    print("Building expansion group index...")
+    t0 = time.time()
+    expansion_groups = _build_expansion_groups(
+        [train_path, earlystop_path],
+        [TRAIN_YEARS, EARLYSTOP_YEARS],
+    )
+    print(f"  {len(expansion_groups):,} expansion (country, year) groups ({time.time()-t0:.1f}s)")
+
+    best_params = _resolve_best_params()
+    num_threads = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 4))
+    num_boost_round = int(best_params.get("n_estimators", best_params.get("num_boost_round", 2000)))
+
+    print(f"Loading patch train ({TRAIN_YEARS})...")
+    t0 = time.time()
+    X_tr, y_tr, years_tr, cids_tr, groups_tr = _load_patch_arrays(
+        train_path, feature_cols, expansion_groups, TRAIN_YEARS
+    )
+    print(f"  {len(y_tr):,} patches  ({(y_tr>0).sum()} positive)  [{time.time()-t0:.1f}s]")
+
+    print(f"Loading patch earlystop ({EARLYSTOP_YEARS})...")
+    t0 = time.time()
+    X_es, y_es, years_es, cids_es, groups_es = _load_patch_arrays(
+        earlystop_path, feature_cols, expansion_groups, EARLYSTOP_YEARS
+    )
+    print(f"  {len(y_es):,} patches  ({(y_es>0).sum()} positive)  [{time.time()-t0:.1f}s]")
+
+    # H1b: inv_sqrt_npos group-norm weights
+    gw_mode = os.environ.get("STAGE2_GROUP_WEIGHT_MODE", "inv_sqrt_npos")
+    _gw_norm_modes = ("inv_npos", "inv_sqrt_npos", "inv_sqrt_npos_temporal")
+    if gw_mode in _gw_norm_modes:
+        sample_weights = compute_group_norm_weights(y_tr, groups_tr, gw_mode)
+        print(
+            f"Group-norm weights: mode={gw_mode}  mean={sample_weights.mean():.3f}"
+            f"  min={sample_weights.min():.4f}  max={sample_weights.max():.1f}"
+        )
+    else:
+        sample_weights = None
+        print("No sample weights (uniform)")
+
+    # Build LightGBM params
+    params = {**FIXED_PARAMS}
+    for key in ("num_leaves", "max_depth", "learning_rate", "min_child_samples",
+                "subsample", "colsample_bytree", "colsample_bynode",
+                "reg_alpha", "reg_lambda", "min_split_gain", "path_smooth"):
+        if key in best_params:
+            params[key] = best_params[key]
+    for key in ("scale_pos_weight", "is_unbalance", "n_estimators", "num_boost_round", "n_jobs"):
+        params.pop(key, None)
+    params["num_threads"] = num_threads
+    params["random_state"] = best_params.get("random_state", 42)
+
+    # H6: Recall@5% early stopping (directly optimises the publication bar metric)
+    es_metric = os.environ.get("STAGE2_EARLY_STOP_METRIC", "recall_at_5pct")
+
+    print(
+        f"\nFitting patch LambdaRank:"
+        f"  train={len(y_tr):,} patches / earlystop={len(y_es):,} patches"
+        f"  early_stop={es_metric}"
+        f"  n_boost_rounds={num_boost_round}"
+    )
+
+    train_set = lgb.Dataset(X_tr, label=y_tr, group=_split_large_groups(groups_tr), weight=sample_weights)
+    val_set = lgb.Dataset(X_es, label=y_es, group=_split_large_groups(groups_es), reference=train_set)
+    early_stop_cb = _Stage2EarlyStop(X_es, y_es, groups_es, patience=100, metric=es_metric)
+
+    model = lgb.train(
+        params,
+        train_set,
+        num_boost_round=num_boost_round,
+        valid_sets=[val_set],
+        valid_names=["earlystop"],
+        callbacks=[lgb.log_evaluation(50), early_stop_cb],
+    )
+
+    del X_tr, y_tr, X_es, y_es
+    gc.collect()
+
+    tag = "model1_lgbm_stage2_patch"
+    model_path = model_dir / f"{tag}_{timestamp}.pkl"
+    with open(model_path, "wb") as f:
+        pickle.dump({"model": model, "feature_cols": feature_cols}, f)
+    print(f"\nModel saved: {model_path}")
+    print(f"Best iteration: {model.best_iteration or 'N/A (max rounds)'}")
+
+    # Evaluate on test patches
+    test_expansion = _build_expansion_groups([test_path], [TEST_YEARS])
+    print(f"\nLoading patch test ({TEST_YEARS})...")
+    t0 = time.time()
+    X_te, y_te, years_te, cids_te, groups_te = _load_patch_arrays(
+        test_path, feature_cols, test_expansion, TEST_YEARS
+    )
+    print(f"  {len(y_te):,} patches  ({(y_te>0).sum()} positive)  [{time.time()-t0:.1f}s]")
+
+    scores = model.predict(X_te, num_iteration=model.best_iteration or None).astype(np.float64)
+    test_metrics = compute_stage2_metrics(y_te.astype(np.float64), scores, groups_te)
+
+    print(f"\n{'='*50}")
+    print(f"PATCH-LEVEL TEST RESULTS")
+    print(f"{'='*50}")
+    print(f"  Lift@1%:    {test_metrics['lift_at_1pct_within_groups']:.2f}×")
+    print(f"  Recall@5%:  {test_metrics['recall_at_5pct_within_groups']*100:.1f}%")
+    print(f"  NDCG@1%:    {test_metrics['ndcg_at_1pct']:.4f}")
+    print(f"  n_groups:   {test_metrics['n_groups']}")
+    print(f"  n_patches:  {test_metrics['n_samples']:,}")
+    print(f"{'='*50}")
+
+    scored_df = pd.DataFrame({
+        "y_true": y_te,
+        "y_pred_score": scores,
+        "year": years_te,
+        "country_id": cids_te,
+    })
+    scored_path = out_dir / f"{tag}_scored_{timestamp}.parquet"
+    pq.write_table(
+        pa.Table.from_pandas(scored_df, preserve_index=False),
+        scored_path,
+    )
+
+    metrics = {
+        "metadata": {
+            "timestamp": timestamp,
+            "model": "LightGBM_LambdaRank_Patch",
+            "task": "stage2_patch_selection",
+            "tier": "Tier3_H12",
+            "ranking_unit": "connected_component_patch",
+            "n_features": len(feature_cols),
+            "features": feature_cols,
+            "group_cols": ["country_id", "year"],
+            "group_weight_mode": gw_mode,
+            "early_stop_metric": es_metric,
+            "best_iteration": model.best_iteration,
+        },
+        "temporal_split": {
+            "train_years": list(TRAIN_YEARS),
+            "earlystop_years": list(EARLYSTOP_YEARS),
+            "test_years": list(TEST_YEARS),
+        },
+        "test_performance": test_metrics,
+        "model_parameters": params,
+        "n_expansion_groups_train_pool": len(expansion_groups),
+    }
+    metrics_path = out_dir / f"{tag}_metrics_{timestamp}.json"
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+    print(f"Metrics: {metrics_path}")
+    print(f"Scored:  {scored_path}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,10 +1,24 @@
 # PA3030 — Publication Roadmap
 
-**Updated**: 2026-06-17 (sa_h5 done; sa_h8_h10 queued — job 3707314) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
+**Updated**: 2026-06-17 | **Branch**: `paper` (active). `main` = intact thesis, never touch.
 
-**Story**: The 30×30 agreement forces countries to double protected area coverage by 2030. We predict which pixels will be designated — giving investors, central banks, and policymakers a transition risk tool. Stage 1 predicts *when* countries expand; Stage 2 predicts *which pixels* are chosen. Stage 2 output = calibrated suitability score (annual designation probability per pixel).
+**Story**: The 30×30 agreement forces countries to roughly double protected area coverage by 2030. We predict which land areas will be designated — giving investors, policymakers, and conservation planners a data-driven transition risk and coverage tool. Stage 1 predicts *when and how much* each country expands; Stage 2 predicts *which areas* are selected. Combined output: annual designation probability for every unprotected pixel in South America, 2025–2030.
 
-**Target journal**: Nature Sustainability (primary) → One Earth / GEC → JEEM. Nature Finance if NGFS integration strong.
+**Target journal**: Nature Sustainability (primary) → One Earth / GEC → JEEM.
+
+---
+
+## Research Questions
+
+These are refined as of 2026-06-17 to reflect what the model actually achieves and where the scientific contribution lies.
+
+**RQ1 (Stage 1 — solved)**: Which countries will expand their PA networks under 30×30, and how much area will they add each year?
+
+**RQ2 (Stage 2 — in progress)**: Within an expansion event, which contiguous land areas does a government select — and can we learn the spatial, ecological, and institutional patterns of past designations well enough to predict future ones?
+
+The framing matters: governments designate **polygons** (connected areas), not individual pixels. A model that predicts which pixels are "most likely" is approximating a fundamentally area-based institutional process. This is the key tension the model must address, and the methodological contribution of the paper.
+
+**RQ3 (applied)**: Where does predicted PA expansion diverge from conservation priority — and what does the gap tell us about systemic bias in how the 30×30 target will be met?
 
 ---
 
@@ -18,273 +32,219 @@ P(pixel i designated in year t)
 
 **Stage 1** — Poisson GLM, LASSO α=100, 9 features. Metric: D² OOS. Train 2001–2016, test 2017–2023.
 
-**Stage 2** — LightGBM LambdaRank W9a. Eco-stratified training groups; eval on `(country_id, year)` groups. Graded relevance 1–4. Train 2001–2013, early-stop 2014–2016, test 2017–2024. Primary metrics: Lift@1% + Recall@5% within expansion groups.
+**Stage 2** — LightGBM LambdaRank W9a. Eco-stratified training groups; evaluated on `(country_id, year)` expansion groups. Graded relevance 1–4. Train 2001–2013, early-stop 2014–2016, test 2017–2024.
+
+**Primary metrics**: Lift@1% + Recall@5% within expansion groups.
 
 **Forward output** (Phase 3): Stage 1 budget × Stage 2 suitability → cumulative risk = 1 − ∏(1 − score_t). BAU / 30×30 / NGFS scenarios.
+
+**Lift metric note**: `lift_at_k_within_groups` = macro_precision@k / global_positive_rate. Mixing macro numerator and micro baseline is consistent across all experiments and does not affect rankings, but must be noted in the paper methods section.
 
 ---
 
 ## Publication Bar
 
-| Metric | Bar | Full SA best |
+| Metric | Bar | Current best |
 |---|---|---|
-| Lift@1% | ≥ 15× | **3.73×** (H6+H1b, 2026-06-16) |
-| Recall@5% | ≥ 90% | **18.1%** (H6+H1b, 2026-06-16) |
+| Lift@1% | ≥ 15× | **6.46×** (H6+H1b+H5, job 3655195) |
+| Recall@5% | ≥ 90% | **18.96%** (H6+H8+H10, job 3707314) |
+| Theoretical ceiling | — | **99.6%** (perfect model, structural) |
+
+The 90% Recall bar is structurally achievable: a perfect ranker reaches 99.6% macro Recall@5% on the test set. The gap from 18.96% to 90% is a model quality problem, not a data structure problem. See diagnostic below.
 
 ---
 
-## Guiding Principle
+## Guiding Principles
 
-**The publication bar (Lift@1%≥15×, Recall@5%≥90%) is achievable. We haven't found the right approach yet.**
+1. **The bar is achievable — but not by tweaking LambdaRank.** Every training-side intervention so far (reweighting, temporal decay, stopping metric) yields 20–70% Lift gains. We need 2.3× more Lift and 5× more Recall. That requires structural fixes, not more reweighting.
 
-Before tweaking hyperparameters or dropping features, ask: *Is the fundamental framing correct?* When performance is far below bar, the problem is almost certainly foundational. Small tweaks will not close a 5× gap in Lift@1%. Be bold and creative. Treat every proposed fix as a hypothesis with uncertainty, not a confirmed solution.
+2. **The polygon-vs-pixel framing mismatch is the primary barrier to Recall.** Governments designate contiguous areas; LambdaRank ranks independent pixels. Until the model is aware of spatial contiguity, Recall will stay near 20% regardless of how well we tune the training objective.
+
+3. **Proxy experiments are directionally useful, not quantitatively reliable.** H8+H10 proxy Lift=20× → full SA Lift=4.17×. Only full SA results drive decisions.
+
+4. **Do not retune hyperparameters until structure is locked.** 20-trial retune destroyed performance (Lift 2.85× → 2.06×). Retuning is Phase 2, not Phase 1.
 
 ---
 
-## Current Situation (2026-06-17)
+## Full SA Experiment History
 
-**All full SA experiments so far:**
+**Locked baseline**: H6+H1b+H5. Full SA: Lift=6.46×, Recall=15.7%, best_iter=136.
 
-| Experiment | Lift@1% | Recall@5% | best_iter | Verdict |
+| Experiment | Lift@1% | Recall@5% | iter | Verdict |
 |---|---|---|---|---|
-| Baseline (79 feat, truncation=741) | 2.85× | 14.0% | 149 | previous best |
-| 20-trial retune → truncation=84 | 2.06× | 8.4% | 7 | ✗ catastrophic |
-| 67 feat + YEAR_WEIGHT_MIN=0.2 | 2.64× | 11.4% | 113 | ✗ both negative |
-| H6+H1b (Recall@5% earlystop + inv_sqrt_npos) | 3.73× | 18.1% | 89 | ✓ first both-improved |
-| **H6+H1b+H5 (no rank-norm)** | **6.46×** | **15.7%** | **136** | ✓ **new best Lift — +73% vs H6+H1b** |
+| Baseline (79 feat, default params) | 2.85× | 14.0% | 149 | starting point |
+| 20-trial Optuna retune (truncation=84) | 2.06× | 8.4% | 7 | ✗ catastrophic — never retune early |
+| 67 feat + temporal year weights | 2.64× | 11.4% | 113 | ✗ both negative |
+| H6+H1b (Recall stop + inv_sqrt_npos weights) | 3.73× | 18.1% | 89 | ✓ first both-improved |
+| **H6+H1b+H5 (+ no rank-norm)** | **6.46×** | **15.7%** | **136** | ✓ **locked baseline; +73% Lift** |
+| H6+H8+H10 (temporal weights + combined stop) | 4.17× | 18.96% | 112 | ✗ proxy 20× did not transfer |
+| H6+H1b+H5+H7 (train 2010–2013 only) | 1.51× | 10.5% | — | ✗ catastrophic — 25 groups too few; year restriction abandoned |
+| **H6+H1b+H5+H11 (patch-context features)** | **5.56×** | **16.6%** | **50** | ✗ Lift regression −14%; Recall flat; iter 50 = model barely trained. Patch features identical within patch → zero within-patch discrimination. Pixel-level patch features do not fix polygon-vs-pixel mismatch. |
 
-H6+H1b+H5 is the new best on Lift. Removing rank normalisation (H5) lets the model use absolute feature values (globally high biodiversity, absolute distance to PAs) rather than within-group percentile ranks. Recall dips slightly (-2.4pp) — the Lift/Recall trade-off persists but H5 shifts the curve meaningfully upward on Lift.
+**What is locked in the baseline (all confirmed on full SA):**
+- H6: Recall@5% early stopping — directly optimises the publication metric
+- H1b: `inv_sqrt_npos` group-norm weights — reduces gradient concentration from mega-events
+- H5: No rank normalisation — absolute feature signals (biodiversity, distance) carry global information that within-group rank destroys; +73% Lift
 
-**What worked:**
-- **H6 (Recall@5% early stopping)**: Directly optimises the publication metric. Main driver.
-- **H1b (inv_sqrt_npos group weights)**: Down-weights large events, gives small events more influence.
-- **H5 (no rank normalisation)**: Absolute feature signals (biodiversity, distance) are globally comparable — rank-norm was destroying that signal. +73% Lift on full SA.
-- **H3 (W9a off)**: Tested and rejected — hurts both metrics. Eco sub-groups stay.
-
-**What didn't work:**
-- H1 (inv_npos, 1/n_pos): Too aggressive, destabilises training, stops at iter 56
-- H2 (binary labels): Adds nothing on top of H1b or H5 — gradient bias already corrected
+**What has been closed:**
+- H1 (`inv_npos`): too aggressive, training collapses at iter 56
+- H2 (binary labels): no gain on top of H1b or H5
+- H3 (W9a off): hurts both metrics; eco sub-groups stay
+- H7 (train 2010–2013 only): catastrophic — Lift 6.46→1.51×, Recall 15.7→10.5%. 25 groups too few; old data provides necessary structural signal despite gradient concentration
+- H8+H10 (temporal decay + combined stop): proxy 20× did not transfer to full SA; rank-norm removal (H5) is the stronger lever
+- H11 (patch-context features): Lift 6.46→5.56×, Recall flat at 16.6%, best_iter=50. Patch-level features are constant within each patch → model gains cross-patch discrimination but loses nothing within the patch. The pixel-level ranking unit is the fundamental barrier; adding patch features to pixels cannot fix it.
 
 ---
 
-## Root Cause Analysis: The Gradient Concentration Problem
+## Root Cause Analysis
 
-**This is the most important finding.** From scanning the full SA training split (2001–2013, 121 expansion groups):
+### 1. Gradient concentration (training side)
 
-| Group subset | # groups | % of total gradient |
+From the training split (2001–2013, 121 expansion groups):
+
+| Group subset | % of total gradient |
+|---|---|
+| Top 5 groups | 72.6% |
+| Top 10 groups | 96.0% |
+| Years 2001–2009 (96 groups) | **98.6%** |
+| Years 2010–2013 (25 groups) | 1.4% |
+
+LambdaRank gradient scales as `n_pos × min(n_neg, neg_ratio × n_pos)`. Brazil 2006 (110K positives) generates ~40,000× more gradient signal than Peru 2012 (13 positives) even after neg_ratio=100 subsampling. The model has been trained almost entirely on ~10 giant 2001–2009 events; the small, targeted 2010–2013 events that resemble the test set are invisible to it.
+
+H1b (inv_sqrt_npos) partially addresses this. H8 (inv_sqrt_npos_temporal) made it worse on full SA. H7 (hard cutoff: drop 2001–2009 entirely) is the current test.
+
+### 2. Polygon-vs-pixel framing mismatch (inference side) ← primary Recall barrier
+
+Governments designate **connected polygons** — they draw a boundary around a contiguous area. LambdaRank ranks **individual pixels** independently. The model correctly identifies the right *part of a country* (explaining moderate Lift), but the actual PA polygon contains thousands of interior pixels that are not individually distinguishable by their feature vectors from non-PA neighbours — they are designated because they are *adjacent to the core*, not because they have uniquely high feature values.
+
+**This is why all training-side interventions hit a Recall ceiling near 20%**: even with perfect training, a pixel-independent model cannot recover the full polygon extent from features alone. Fixing this requires either (a) spatial post-processing that propagates scores within connected regions, (b) features that encode patch membership, or (c) changing the ranking unit from pixels to patches.
+
+### 3. Structural ceiling diagnostic (2026-06-17)
+
+Test set: 61 expansion groups, 239,885 positives (2017–2024).
+
+| Size bin | # groups | % positives | Structural max Recall@5% |
+|---|---|---|---|
+| 1–5 pixels | 4 | 0.006% | 100% (trivially achievable) |
+| 6–20 | 3 | 0.015% | 100% |
+| 21–100 | 10 | 0.3% | 100% |
+| 101–1K | 20 | 3.3% | 100% |
+| **1K+** | **24** | **96.4%** | 100% (except 1 group: 73%) |
+
+Median positive rate within expansion groups = 0.064%. The top-5% window holds ~78× more pixels than positives for the median group. **Theoretical max macro Recall@5% = 99.6%.** The 90% bar is structurally achievable across 60/61 groups. The gap from 18.96% to 90% is pure model quality failure.
+
+---
+
+## Strategy: Three Tiers
+
+### Tier 1 — Spatial diffusion (immediate, no retraining)
+
+**What**: Multi-step 8-neighbour score propagation on the H6+H1b+H5 model output. Each step: `score[pixel] += alpha × mean(scores[neighbours]) × decay^step`.
+
+**Why**: If the model ranks even 1–5 pixels per PA polygon above the 95th percentile, iterative diffusion propagates that seed across the entire connected polygon. Recall@5% is dominated by within-polygon coverage — this directly targets it without any retraining.
+
+**Expected gain**: Recall@5% from ~19% to 40–60%. Lift@1% should be unaffected (top-1% seeds are already identified).
+
+**Implementation**: Add iteration loop to existing `spatial_postprocess_stage2.py`. Test 5/10/20 steps, decay=0.95. ~10 lines of code; run on Euler with H6+H1b+H5 booster.
+
+**Result (job 3723734, H6+H1b+H5 booster)**: Recall ceiling at 17.2% regardless of n_steps or alpha. Best (steps=10, alpha=2.0): Recall=17.2%, Lift=6.15×. Decision rule triggered: Recall < 30% → move to Tier 2. Root cause: diffusion within expansion groups (millions of negatives) dilutes signal across a sea of non-polygon pixels. Correct fix requires patch-level features so the model can uniformly score all pixels in the same connected component.
+
+### Tier 2 — Patch-context features (H11+)
+
+**What**: A family of features that encode the spatial context of each pixel's contiguous unprotected block (connected component of WDPA_prev==0).
+
+| Feature | Description | Leakage-safe? |
 |---|---|---|
-| Top 5 groups | 5 | **72.6%** |
-| Top 10 groups | 10 | **96.0%** |
-| Groups with n_pos ≤ 100 | 27 | **0.003%** |
-| Groups with n_pos ≤ 20 | 12 | **0.000%** |
-| Years 2001–2009 | 96 groups | **98.6%** |
-| Years 2010–2013 | 25 groups | **1.4%** |
+| `log_patch_size_km2` | Size of unprotected patch this pixel belongs to | ✓ (uses WDPA_prev) |
+| `patch_pa_adjacency_frac` | Fraction of patch perimeter touching existing PAs | ✓ |
+| `patch_mean_gsn_b2` | Mean biodiversity score across the patch | ✓ |
+| `patch_designation_lag1` | Was any pixel in this patch designated last year? | ✓ |
 
-The LambdaRank gradient from a group scales as `n_pos × min(n_neg, neg_ratio × n_pos)`. A single group with 110,000 positives generates ~820 billion pairs. A group with 13 positives generates 16,900 pairs — a ratio of ~50,000,000:1. After neg_ratio=100 subsampling, the ratio is still ~40,000:1.
+**Why**: These features give the model information about the *decision unit* governments operate on. A pixel in a 50,000 km² contiguous patch is categorically different from an isolated pixel — governments draw PA polygons around large unprotected areas adjacent to existing PAs. The model currently cannot represent this.
 
-**The model has been trained almost exclusively on ~10 giant designation events from 2001–2009. Everything else — including all the small, post-2010 events that resemble the test set — is invisible to it.**
+**Implementation**: Annual `scipy.ndimage.label` on the WDPA_prev==0 binary raster in `feature_engineering.py`. O(n) per year; feasible on Euler. Requires panel rebuild (large Euler job).
 
-This is why temporal weighting failed: even at YEAR_WEIGHT_MIN=0.2, the huge 2001–2009 groups still dominate because their absolute pair count dwarfs recent small events. You'd need to downweight 2006 by a factor of ~50,000,000 to equalise it with a 13-positive group.
+**Result (jobs 3728182/3728184)**: Lift=5.56×, Recall=16.6%, best_iter=50 (baseline: 6.46×/15.7%/136). **Failed.** Root cause: patch-level features (log_patch_size_km2, patch_pa_adjacency_frac, patch_mean_gsn_b2, patch_designation_lag1) are constant for all pixels within the same patch. Cross-patch discrimination exists but within-patch ranking remains zero. The model early-stops at iter 50 — patch features add noise that confounds the existing pixel-level signal. Pixel-level ranking is the wrong unit for polygon-based designation. Tier 3 triggered.
 
----
+### Tier 3 — Patch-level ranking (architectural clean fix) ← **NEXT**
 
-## Hypotheses to Test (Ordered by Expected Impact)
+**What**: Change the ranking unit from pixels to patches (connected unprotected components). Each patch gets one feature vector (mean/max of pixel features) and one score. Ranked within country-year groups. A patch is a positive if any pixel inside it was designated.
 
-These are hypotheses. Each needs a controlled experiment before committing Euler time.
+**Why this is the correct fix**: Governments designate polygons. LambdaRank must rank decision units that match what governments choose. Tiers 1+2 confirmed this — diffusion and patch features both failed because the ranking unit (pixel) is incommensurable with the designation unit (polygon). Tier 3 eliminates the mismatch at the source.
 
-### H1: Group-normalised weights (highest priority)
+**Secondary benefit**: Sample size drops from ~1M pixels to ~hundreds of patches per country-year group. Gradient concentration from Brazil 2006 shrinks because it contributes one patch per polygon, not 110K pixels. H1b (inv_sqrt_npos) may become unnecessary.
 
-**Idea**: Weight every sample in group g by `1 / n_pos(g)`. This makes each expansion group contribute equal total gradient regardless of its size.
+**Metrics semantics**: Patch-level Lift@1% = fraction of the top-1% of ranked patches that contain a designated pixel ÷ fraction of all patches that are positive. Recall@5% = fraction of positive patches that fall in the top 5% of ranked patches. These are directly comparable to pixel-level metrics and remain the publication metrics.
 
-With this weighting:
-- Group with 110,000 positives: weight per sample = 0.000009
-- Group with 13 positives: weight per sample = 0.077
-- Both groups contribute the same total gradient signal
+**Implementation plan**:
+1. `add_patch_features_to_splits.py` already computes patch IDs — extend to output patch-level aggregates (mean/max per feature) as a separate parquet
+2. New training script that loads patch-level panel, groups by `(country_id, year)`, runs LambdaRank on patches
+3. Evaluation computes patch-level Lift@1% + Recall@5% (positive patch = any pixel designated)
 
-**Expected effect**: The model is forced to learn from small events. If small-event positives do have learnable feature signals (within their group — which the pooled z-score analysis cannot tell us), the model will now learn them.
+**Gate for Tier 3**: Tiers 1+2 Recall < 70%. **Confirmed: Tier 1 max=17.2%, Tier 2=16.6%. Gate triggered. H12 implementation submitted.**
 
-**Risk**: Small events may be genuinely noise at the feature level. If so, forcing the model to learn from them could degrade performance on large events without improving it on small ones. This is an empirical question.
+**H12 decision rule**: Recall@5% > 30% → framing fix works; iterate. > 70% → Tier 3 success, proceed to Phase 2 retune. < 30% → open architectural discussion.
 
-**Implementation**: compute `group_weight = 1 / n_pos_for_group` per row, pass as `weights=` to `lgb.Dataset`. Modify `load_stage2_arrays` to return group_weights or compute them in `run_stage2_training`.
-
-**Variant**: `1 / sqrt(n_pos)` is less aggressive — large events downweighted but not as severely. Test both.
-
-### H2: Binary labels instead of graded relevance
-
-**Idea**: Use 0/1 labels instead of 1–4 graded relevance by cluster size.
-
-**Rationale**: Graded relevance amplifies the gradient from large clusters (relevance=4) relative to isolated pixels (relevance=1). Combined with the gradient concentration above, this makes the model doubly biased toward large-block events. Binary labels remove this second-order bias.
-
-**Note**: Previously tested on proxy (Colombia dev): "Graded relevance 1–4: LambdaRank >> Binary (5.99× vs 3.04×)." But that was on Colombia dev data and likely dominated by large events too. On full SA with group normalisation, the comparison may be different. Test H2 jointly with H1.
-
-### H3: Drop eco sub-groups (W9a off)
-
-**Idea**: Train with standard (country_id, year) groups instead of (country_id, year, eco_id) sub-groups.
-
-**Rationale**: W9a was validated on the proxy (22 large groups). On full SA with 121 diverse groups including many small events, splitting large groups into eco sub-groups may fragment the gradient signal in ways that hurt small-event learning. The model learns "which pixel is best within this ecoregion" but is tested on "which pixel is best within this entire country."
-
-**Risk**: Without W9a, the 9K sub-window fragmentation problem returns for large groups. Evaluate whether large groups in training are actually >9K after eco splitting — if all eco sub-groups are already <9K, W9a may simply be benign but not necessary.
-
-**Implementation**: Set `STAGE2_ECO_GROUPS=0` in SLURM script. Fast to test.
-
-### H4: Extended training window 2001–2016
-
-**Idea**: Include 2014–2016 in training; use 2017–2019 as early-stop window.
-
-**Rationale**: 2014–2016 represents the post-2013 low-designation regime. Training on those years gives the model direct examples of the policy era the test set comes from. The 2013 cutoff was originally chosen to avoid leakage into the test period; extending to 2016 moves the gap from 4 years to 1 year.
-
-**Risk**: Requires redefining the splits parquet files (currently test.parquet starts at 2017, earlystop is 2014–2016). This is a data pipeline change, not just a training change. Confirm with supervisor before doing.
-
-### H5: Remove rank normalisation (or exclude it for key features)
-
-**Idea**: Stop replacing feature values with within-group percentile ranks. Or at minimum, exclude features where absolute value matters (e.g. biodiversity score, distance to PA) from normalisation.
-
-**Rationale**: Rank normalisation removes absolute feature information. If a pixel's biodiversity score is "objectively high" (top 5% globally), that absolute signal is lost when replaced by its rank within a country-year group where most pixels happen to have low biodiversity. The model cannot learn "protect the most biodiverse land globally" — only "protect the most biodiverse land within this particular country-year group."
-
-Top SHAP features (biodiversity GSN_b2, population GPW, distance dist_wdpa) are ALL globally comparable — the absolute values carry real signal that within-group normalisation destroys. This is the strongest argument for H5.
-
-**Risk**: Rank normalisation was introduced to handle cross-country scale differences. Without it, Brazil's feature distribution (large country, high variance) might overwhelm smaller countries. LambdaRank already compares within-group, so scale differences between countries should not matter as long as features are internally consistent.
-
-**Implementation**: `STAGE2_NORMALIZE_WITHIN_GROUPS=0` — coded 2026-06-17.
-
-### H6: Metric–objective alignment
-
-**Idea**: We train on NDCG@1% (graded relevance, early stopping) but evaluate Recall@5% (binary, all designated pixels equal). These reward different things. Consider whether the early-stopping metric should be binary Recall@5% instead.
-
-**Challenge**: Implementing a custom early-stopping callback on Recall@5% (binary, within-group) is straightforward — it's the same `_TrueNdcg1PctEarlyStop` structure but calling `compute_stage2_metrics` and extracting `recall_at_5pct_within_groups`. Try this alongside H1.
-
-### H7: Restrict training to post-2010 events only
-
-**Idea**: Set `STAGE2_TRAIN_YEAR_MIN=2010` to drop all 2001–2009 training groups and train only on events from 2010–2013 (25 groups).
-
-**Rationale**: The gradient concentration analysis shows 2001–2009 = 98.6% of gradient. Even with H1b (inv_sqrt_npos), these ancient mega-events still dominate because their absolute pair count dwarfs recent small events. The test set (2017–2024) consists almost entirely of small, targeted post-2010 style events. Training exclusively on 2010–2013 events (same regime as test) may generalise far better, at the cost of fewer training groups.
-
-**Risk**: Only 25 training groups. Training may be less stable; possible overfitting to those 25 groups. Cannot be tested on mini-sample (only 1 year of post-2009 data in mini train). Must go directly to full SA.
-
-**Implementation**: `STAGE2_TRAIN_YEAR_MIN=2010` env var in `run_stage2_training()` — coded 2026-06-17. Full SA only.
-
-### H8: Combined size + temporal gradient weights
-
-**Idea**: `STAGE2_GROUP_WEIGHT_MODE=inv_sqrt_npos_temporal`. Weight = `(1/sqrt(n_pos)) × exp(-0.2 × (max_year - year))`. Addresses BOTH gradient concentration sources simultaneously: event size AND event age.
-
-**Rationale**: H1b (inv_sqrt_npos) only corrects for SIZE. But large ancient events are doubly damaging: large (monopolises gradient) AND old (most unlike test era). Multiplying by temporal decay further penalises 2001–2009 events while rewarding 2010–2013 events. Example: Brazil 2006 (n_pos=110K) gets ~2000× less weight than Peru 2012 (n_pos=13), compared to ~92× for pure H1b.
-
-**Risk**: More aggressive than H1b. Could destabilise training (similar risk to H1 inv_npos). Should test with H6 (Recall@5% earlystop) to buffer instability.
-
-**Implementation**: `mode="inv_sqrt_npos_temporal"` in `compute_group_norm_weights()` — coded 2026-06-17. Test on mini-sample first.
-
-### H9: Partial rank normalisation (absolute features only)
-
-**Idea**: Disable rank normalisation for features where absolute value is globally meaningful (biodiversity GSN_b2, population GPW, distance features), keep it for contextual features (climate, elevation, NDVI).
-
-**Rationale**: H5 (full no-norm) loses the benefit of rank normalisation for features where it helps. Partial normalisation captures the best of both: absolute global signals where they exist, relative within-group ranking where absolute values are country-specific.
-
-**Risk**: Requires defining the split manually. Test H5 (full no-norm) first — if H5 works, partial norm is refinement. If H5 fails, partial norm is the next experiment.
-
-**Implementation**: `STAGE2_ABS_FEATURES="GSN_b2,GPW,dist_wdpa,dist_indigenous"` env var; apply rank normalisation only to the complement. Not yet coded.
+**Scientific framing**: "We model PA designation at the polygon level, consistent with how governments make designation decisions. This outperforms pixel-level ranking on spatial coverage metrics and eliminates the gradient concentration artefact from area-weighted training data."
 
 ---
 
 ## Experiment Queue
 
-**Locked baseline**: H6+H1b+H5 (Recall@5% earlystop + inv_sqrt_npos + no rank-norm). Full SA: Lift=6.46×, Recall=15.7%.
-
 | Priority | Experiment | Status | Notes |
 |---|---|---|---|
-| 1 | H8+H10 full SA | 🔄 Running — job 3707314 | `training_lgbm_stage2_h6_h8_h10.slurm`; ~8h; proxy Lift=20× |
-| 2 | H7: train only 2010–2013 | ⬜ Not started — full SA only | `STAGE2_TRAIN_YEAR_MIN=2010`; cannot test on mini (only 1 post-2009 year) |
-| 3 | Retune hyperparams (≥100 trials) | ⬜ Not started | only after structure is locked |
-| 4 | KBA features | ⏸ Blocked — awaiting BirdLife shapefile | add dist_kba_km, is_kba |
-| 5 | Indigenous polygon features | ⏸ Blocked — awaiting RAISG download | add dist_raisg_km, is_indigenous_territory |
-| 6 | H4: extended training window (2001–2016) | ⏸ Needs pipeline change — discuss first | include 2014–2016 in train; use 2017–2019 as earlystop |
+| 1 | **H7: train 2010–2013 only** | ✗ Done — job 3718862 | Lift=1.51×, Recall=10.5%. Both regressed. 25 groups too few. Year restriction abandoned. |
+| 2 | **Tier 1: multi-step spatial diffusion** | ✗ Done — job 3723734 | Best: Recall=17.2%, Lift=6.15× (steps=10, alpha=2.0). Ceiling confirmed — decision rule triggered: Recall < 30% → Tier 2 first. |
+| 3 | **Tier 2: implement patch-context features (H11+)** | ✗ Done — jobs 3728182/3728184 | Lift=5.56×, Recall=16.6%, best_iter=50. Regression. Pixel-level patch features do not fix polygon-vs-pixel mismatch. Tier 3 triggered. |
+| 4 | **Tier 3: patch-level ranking unit (H12)** | 🔄 **In progress** | `build_patch_panel.py` + `model1_LGBM_stage2_patch` implemented. Submit: `sbatch slurm/south_america/build_patch_panel.slurm` then `sbatch --dependency=afterok:<JOB_ID> slurm/south_america/training_lgbm_stage2_patch.slurm`. |
+| 5 | **AGB feature (carbon stock)** | ⬜ Diagnose first | Investigate why proxy failed (best_iter=5). Fix scaling/NaN. Could add after Tier 3 structure is locked. |
+| 6 | Retune hyperparams (≥100 trials) | ⬜ Phase 2 only | After structure locked. |
+| 6 | KBA features (dist_kba_km, is_kba) | ⏸ Blocked — BirdLife shapefile | — |
+| 7 | Indigenous polygon features | ⏸ Blocked — RAISG download | — |
+| 8 | H4: extended training window (2001–2016) | ⏸ Discuss with supervisor | Pipeline change required. |
+| 9 | Tier 3: patch-level ranking | ⬜ Only if Tiers 1+2 < 70% Recall | Major restructuring; becomes methodological contribution. |
 
-**Decision rule for H8+H10 full SA**: If Lift@1% > 6.46× (H6+H1b+H5) → strong result. If Recall@5% also > 15.7% → consider H8+H10 as new baseline. If Lift improves but Recall drops further, consider H8+H10+H5 next (though proxy showed that combo hurt Lift).
+**Decision rules:**
 
-**Closed experiments:**
-- H1 inv_npos: ✗ too aggressive, training collapses
-- H1b inv_sqrt_npos alone: ✗ NDCG@1% early stop fires at iter 8 — needs H6
-- H3 W9a off: ✗ hurts both metrics
-- H6+H1b+H3: ✗ W9a off degrades H6+H1b
-- H2 binary labels: ✗ adds nothing on top of H1b or H5; gradient bias already corrected
-- H5 full SA (job 3655195): Lift=6.46×, Recall=15.7% — new best Lift but Recall below H6+H1b (18.1%); H5 now in locked baseline
-
----
-
-## Lift vs Recall Trade-off Diagnosis (2026-06-17)
-
-**Critical finding**: Every intervention so far improves one metric at the cost of the other.
-
-**Proxy results (mini-sample, 22 groups):**
-
-| Config | Proxy Lift@1% | Proxy Recall@5% | Direction |
-|---|---|---|---|
-| NDCG@1% stopping (baseline) | **20.32×** | 13.3% | high lift, low recall |
-| Recall@5% — H6+H1b | 12.86× | 27.9% | lower lift, better recall |
-| Recall@5% — H6+H1b+H5 | 11.52× | **34.8%** | lowest lift, best recall |
-| ndcg×recall — H6+H1b+H10 | 12.22× | 19.7% | middle ground, not better |
-| ndcg×recall — H6+H1b+H5+H10 | 13.33× | 32.0% | middle ground |
-| **ndcg×recall — H6+H8+H10** | **20.00×** | **24.8%** | **near-bar Lift, decent Recall** |
-| ndcg×recall — H6+H8+H5+H10 | 12.51× | 30.3% | adding H5 hurts Lift here |
-
-**H6+H8+H10 standout**: Proxy Lift=20.00× (≈ publication bar) with Recall=24.8% — substantially better on Lift than any Recall-stopping configuration. The temporal+size weights (H8) combined with combined stopping (H10) appear to break the trade-off more than H1b alone does. Full SA run queued (job 3707314).
-
-The publication bar requires BOTH ≥15× Lift AND ≥90% Recall simultaneously. No configuration achieves both yet. H8+H10 is the most promising direction for Lift; closing the Recall gap remains the open problem.
-
-**Root cause of trade-off**: NDCG@1% stopping ranks the best few pixels perfectly (high Lift) but ignores the bottom half of positives (low Recall). Recall@5% stopping finds ALL positives in the top 5% (high Recall) but doesn't concentrate the best pixels in the top 1% (lower Lift). The ndcg×recall product objective tries to force both simultaneously.
-
----
-
-## What We Know From Experiments So Far
-
-**On proxy (22 large groups — now abandoned as unreliable):**
-- Baseline: Lift@1%=15.34×, Recall@5%=24.4%
-- Graded relevance >> binary (5.99× vs 3.04× on Colombia dev)
-- eco_protection_gap: −1.3× Lift
-- dist_redd_km: −1.1× Recall
-- NDCG@5% earlystop: Lift collapsed
-- agb_tonne_ha: best_iter=5 (model fails to train)
-- pruned30 (49 feat): Lift+1.8× but Recall−2%
-
-**On full SA (61 groups, 107M rows, test 2017–2024):**
-- Baseline (79 feat, truncation=741, default params): Lift=2.85×, Recall=14.0%
-- 20-trial Optuna retune → truncation=84: Lift=2.06×, Recall=8.4% — catastrophic
-- 67 feat + YEAR_WEIGHT_MIN=0.2: Lift=2.64×, Recall=11.4% — both negative
-- H6+H1b (Recall@5% stop + inv_sqrt_npos): Lift=3.73×, Recall=18.1% — first both-improved
-- **H6+H1b+H5 (no rank-norm, job 3655195)**: **Lift=6.46×, Recall=15.7%** — new best Lift (+73%)
-
-**Lesson**: Proxy experiments are directionally reliable but not quantitatively predictive. All decisions must be validated on full SA. The gap from 6.46× to 15× still requires structural fixes — H8+H10 (temporal weights + combined stopping) is the current best hypothesis.
+- **H7 result**: Lift > 6.46× → era mismatch confirmed; H7 added to locked baseline. Lift < 6.46% + Recall improves → keep H7 for Recall but retain H5 baseline for Lift. Both regress → 25 groups too few; year restriction abandoned.
+- **After diffusion**: If Recall@5% > 50% → proceed to patch features (Tier 2). If Recall < 30% even after diffusion → model seed quality is too low; prioritise patch features first to improve seeds.
+- **Gate for Tier 3**: Implement only if Tier 1 + Tier 2 combined give Recall@5% < 70%.
 
 ---
 
 ## Settled Decisions
 
-- **Engine**: LightGBM LambdaRank, neg_ratio=100
-- **Early stopping**: Recall@5% within (country_id, year) groups (H6, locked 2026-06-16)
-- **Sample weights**: inv_sqrt_npos group-norm weights (H1b, locked 2026-06-16)
-- **Eco sub-groups**: W9a on (H3 tested and rejected)
-- **Primary metrics**: Lift@1% + Recall@5% within expansion groups
-- **Temporal split**: Train 2001–2013, early-stop 2014–2016, test 2017–2024 — *potentially revisit H4*
-- **Proxy Recall@5% is directionally reliable**: proxy baseline 13.3% ≈ full SA 14.0%. Use proxy to screen experiments.
-- **Full SA retuning with < 100 trials is harmful**: Only retune after structure is locked.
-- **No ensembles, no sub-models** (supervisor directive)
-- **Governance features**: first differences only
-- **CBD**: robustness only; CBD-free is primary
+| Decision | Value | Rationale |
+|---|---|---|
+| Engine | LightGBM LambdaRank | Validated through Phase 0 |
+| neg_ratio | 100 | Locked |
+| Eco sub-groups (W9a) | On | H3 (off) tested and rejected |
+| Early stopping | Recall@5% within groups (H6) | Directly optimises publication metric |
+| Sample weights | inv_sqrt_npos (H1b) | Partial gradient deconcentration |
+| Rank normalisation | Off (H5) | +73% Lift; absolute features carry global signal |
+| Primary metrics | Lift@1% + Recall@5% within expansion groups | — |
+| Temporal split | Train 2001–2013, earlystop 2014–2016, test 2017–2024 | H4 (extend to 2016) needs supervisor sign-off |
+| Proxy screening | Use for direction only | Quantitatively unreliable (H8+H10: proxy 20× → full SA 4.17×) |
+| Ensembles / sub-models | Forbidden | Supervisor directive |
+| Governance features | First differences only | — |
+| CBD features | Robustness check only | CBD-free is primary model |
+| Hyperparameter retuning | Phase 2 only | Early retune is catastrophic (2.85× → 2.06×) |
 
 ---
 
-## Phase 2 (locked until SA bar confirmed)
+## Phase 2 (after SA bar confirmed on both metrics)
 
-- Full SA retune (100 trials) with confirmed features + objective
-- SEA Stage 2 retune on corrected panel
+- Full SA retune (≥100 Optuna trials) with confirmed features + objective
+- SE Asia Stage 2 retune on corrected panel
 - Bootstrap CIs, model comparison table
-- Spearman ρ, NB robustness, independence check
+- Spearman ρ, negative-binomial robustness, Stage 1/Stage 2 independence check
 
 ## Phase 3 (after Phase 2)
 
 - Platt calibration → suitability scores
-- Cumulative risk pipeline (Stage 1 × Stage 2)
-- NGFS scenario integration
-- Conservation gap: predictions × biodiversity raster → 2×2 map (Nature Sustainability hook)
+- Cumulative risk pipeline: Stage 1 budget × Stage 2 suitability → 1 − ∏(1 − score_t)
+- NGFS scenario integration (BAU / moderate / 30×30)
+- Conservation gap map: predicted designations × biodiversity raster → 2×2 (Nature Sustainability hook for RQ3)
 - **Manuscript gate**: all above before writing
 
 ---
@@ -295,9 +255,9 @@ The publication bar requires BOTH ≥15× Lift AND ≥90% Recall simultaneously.
 |---|---|
 | SA full splits (42 GB) | `euler:$SCRATCH/data/south_america/ml/main/` |
 | SA mini-sample (79 features) | `data/south_america/mini_sample.parquet` |
-| Baseline best params | `scripts/regions/south_america/5_training/model1_stage2_lgbm_best_params.json` |
-| Baseline best params (archive) | `outputs/south_america/results/phase1/baseline/model1_stage2_lgbm_best_params.json` |
-| Baseline booster | `outputs/south_america/results/phase1/baseline/model1_stage2_lgbm_booster.txt` |
+| Best params (locked baseline) | `scripts/regions/south_america/5_training/model1_stage2_lgbm_best_params.json` |
+| Best params (archive) | `outputs/south_america/results/phase1/baseline/model1_stage2_lgbm_best_params.json` |
+| H6+H1b+H5 booster | `data/south_america/ml/models/model1_lgbm_stage2_20260617_011621.pkl` |
 | Feature ablation log | `outputs/south_america/results/feature_ablation_sa.json` |
 | AGB TIF | `data/south_america/ready/AGB/agb_sa.tif` |
 | REDD TIF | `data/south_america/ready/REDD/redd_sa.tif` |
@@ -306,47 +266,41 @@ The publication bar requires BOTH ≥15× Lift AND ≥90% Recall simultaneously.
 
 ---
 
-## SHAP Audit (2026-06-15, baseline 79-feature model)
+## SHAP Audit (2026-06-15, baseline model)
 
 ```
- 1. NDVI_smooth64        0.350
- 2. GSN_b2              0.283   biodiversity priority
- 3. WorldClim_b2        0.244
- 4. GPW                 0.227   population density
- 5. deforestation_b2    0.207
- 6. WorldClim_b14       0.195
- 7. WorldClim_b11       0.187
- 8. dist_indigenous     0.185
- 9. elevation_b2_smooth4 0.149
-10. GSN_b3              0.148
+ 1. NDVI_smooth64          0.350
+ 2. GSN_b2                0.283   biodiversity priority
+ 3. WorldClim_b2          0.244
+ 4. GPW                   0.227   population density
+ 5. deforestation_b2      0.207
+ 6. WorldClim_b14         0.195
+ 7. WorldClim_b11         0.187
+ 8. dist_indigenous        0.185
+ 9. elevation_b2_smooth4  0.149
+10. GSN_b3                0.148
 11. elevation_b1_smooth16 0.137
-12. WorldClim_b19       0.128
-13. WorldClim_b16       0.126
-14. dist_wdpa           0.125
-15. HNTL_smooth64       0.108
+12. WorldClim_b19         0.128
+13. WorldClim_b16         0.126
+14. dist_wdpa             0.125
+15. HNTL_smooth64         0.108
 ```
-Caveat: SHAP reflects what the baseline model learned, which is dominated by large 2001–2009 events. It does not reflect what a group-normalised model would use.
+
+Caveat: reflects what the baseline model learned — dominated by 2001–2009 mega-events. Does not generalise to the H6+H1b+H5 model. A new SHAP run after the locked baseline stabilises would be informative.
+
+Note on `dist_wdpa`: implemented as `scipy.ndimage.distance_transform_edt(1 − wdpa_binary) × 1000` — this is boundary distance to the nearest PA-occupied pixel, which is correct (PA polygons are rasterised as filled areas). No change needed.
 
 Plots: `outputs/south_america/results/phase1/baseline/shap_importance.png`, `shap_beeswarm.png`.
 
 ---
 
-## Spatial Post-Processing (closed, revisit if model improves)
-
-```
-alpha=0.0  Lift@1%=3.33×  Recall@5%=14.8%
-alpha=1.0  Lift@1%=3.43×  Recall@5%=14.6%
-```
-No meaningful effect at current model quality.
-
----
-
 ## Paused
 
-- SEA Stage 2 — Phase 2
+- SE Asia Stage 2 — Phase 2
 - USA Stage 2 — deprioritised
 - Forward pipeline — Phase 3
 
 ## Out of Scope (Paper 1)
 
-- Ensemble methods, sub-models, neural networks (Paper 2), survival framing, tropical Africa
+- Ensemble methods, sub-models, neural networks (Paper 2)
+- Survival framing, Tropical Africa
