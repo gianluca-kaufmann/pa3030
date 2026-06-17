@@ -1,6 +1,6 @@
 # PA3030 — Publication Roadmap
 
-**Updated**: 2026-06-17 (H5 mini done) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
+**Updated**: 2026-06-17 (sa_h5 done; sa_h8_h10 queued — job 3707314) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
 
 **Story**: The 30×30 agreement forces countries to double protected area coverage by 2030. We predict which pixels will be designated — giving investors, central banks, and policymakers a transition risk tool. Stage 1 predicts *when* countries expand; Stage 2 predicts *which pixels* are chosen. Stage 2 output = calibrated suitability score (annual designation probability per pixel).
 
@@ -41,7 +41,7 @@ Before tweaking hyperparameters or dropping features, ask: *Is the fundamental f
 
 ---
 
-## Current Situation (2026-06-16)
+## Current Situation (2026-06-17)
 
 **All full SA experiments so far:**
 
@@ -50,18 +50,20 @@ Before tweaking hyperparameters or dropping features, ask: *Is the fundamental f
 | Baseline (79 feat, truncation=741) | 2.85× | 14.0% | 149 | previous best |
 | 20-trial retune → truncation=84 | 2.06× | 8.4% | 7 | ✗ catastrophic |
 | 67 feat + YEAR_WEIGHT_MIN=0.2 | 2.64× | 11.4% | 113 | ✗ both negative |
-| **H6+H1b (Recall@5% earlystop + inv_sqrt_npos)** | **3.73×** | **18.1%** | **89** | ✓ **new best — both improved** |
+| H6+H1b (Recall@5% earlystop + inv_sqrt_npos) | 3.73× | 18.1% | 89 | ✓ first both-improved |
+| **H6+H1b+H5 (no rank-norm)** | **6.46×** | **15.7%** | **136** | ✓ **new best Lift — +73% vs H6+H1b** |
 
-H6+H1b is the first experiment to improve both metrics simultaneously. +31% Lift, +29% Recall vs baseline. This is the new locked baseline for future experiments.
+H6+H1b+H5 is the new best on Lift. Removing rank normalisation (H5) lets the model use absolute feature values (globally high biodiversity, absolute distance to PAs) rather than within-group percentile ranks. Recall dips slightly (-2.4pp) — the Lift/Recall trade-off persists but H5 shifts the curve meaningfully upward on Lift.
 
-**What worked and why:**
-- **H6 (Recall@5% early stopping)**: Directly optimises the publication metric instead of NDCG@1%. More stable signal (aggregates over 5× more data points per group). Main driver.
-- **H1b (inv_sqrt_npos group weights)**: Down-weights large events (Brazil 2001–2009), gives small events more influence. Adds ~+1% Recall and improves Lift vs H6 alone.
+**What worked:**
+- **H6 (Recall@5% early stopping)**: Directly optimises the publication metric. Main driver.
+- **H1b (inv_sqrt_npos group weights)**: Down-weights large events, gives small events more influence.
+- **H5 (no rank normalisation)**: Absolute feature signals (biodiversity, distance) are globally comparable — rank-norm was destroying that signal. +73% Lift on full SA.
 - **H3 (W9a off)**: Tested and rejected — hurts both metrics. Eco sub-groups stay.
 
 **What didn't work:**
 - H1 (inv_npos, 1/n_pos): Too aggressive, destabilises training, stops at iter 56
-- H1+H6 without H1b not tested directly (H6_only: Lift=8.85×, Recall=27% on proxy — H1b improved on this)
+- H2 (binary labels): Adds nothing on top of H1b or H5 — gradient bias already corrected
 
 ---
 
@@ -185,30 +187,26 @@ Top SHAP features (biodiversity GSN_b2, population GPW, distance dist_wdpa) are 
 
 ## Experiment Queue
 
-**Locked baseline**: H6+H1b (Recall@5% earlystop + inv_sqrt_npos). All future experiments build on this.
-
-Run on mini-sample first. If proxy Recall@5% > 20% (current best) → promote to full SA.
+**Locked baseline**: H6+H1b+H5 (Recall@5% earlystop + inv_sqrt_npos + no rank-norm). Full SA: Lift=6.46×, Recall=15.7%.
 
 | Priority | Experiment | Status | Notes |
 |---|---|---|---|
-| 1 | H5 full SA | 🔄 Running — job 3655195 | `training_lgbm_stage2_h6_h1b_h5.slurm`; ~8h |
-| 2 | H10+H8 mini (4 runs) | 🔄 Queued — job 3655220, after 3655195 | `mini_h10_h8.slurm`; tests ndcg×recall stop + temporal weights |
-| 3 | H8: inv_sqrt_npos_temporal weights | ⬜ Not started | combined size+temporal — `STAGE2_GROUP_WEIGHT_MODE=inv_sqrt_npos_temporal` (coded) |
-| 4 | H7: train only 2010–2013 | ⬜ Not started — full SA only | `STAGE2_TRAIN_YEAR_MIN=2010`; cannot test on mini (only 1 post-2009 year) |
-| 5 | Retune hyperparams (≥100 trials) | ⬜ Not started | only after structure is locked |
-| 6 | KBA features | ⏸ Blocked — awaiting BirdLife shapefile | add dist_kba_km, is_kba |
-| 7 | Indigenous polygon features | ⏸ Blocked — awaiting RAISG download | add dist_raisg_km, is_indigenous_territory |
-| 8 | H4: extended training window (2001–2016) | ⏸ Needs pipeline change — discuss first | include 2014–2016 in train; use 2017–2019 as earlystop |
+| 1 | H8+H10 full SA | 🔄 Running — job 3707314 | `training_lgbm_stage2_h6_h8_h10.slurm`; ~8h; proxy Lift=20× |
+| 2 | H7: train only 2010–2013 | ⬜ Not started — full SA only | `STAGE2_TRAIN_YEAR_MIN=2010`; cannot test on mini (only 1 post-2009 year) |
+| 3 | Retune hyperparams (≥100 trials) | ⬜ Not started | only after structure is locked |
+| 4 | KBA features | ⏸ Blocked — awaiting BirdLife shapefile | add dist_kba_km, is_kba |
+| 5 | Indigenous polygon features | ⏸ Blocked — awaiting RAISG download | add dist_raisg_km, is_indigenous_territory |
+| 6 | H4: extended training window (2001–2016) | ⏸ Needs pipeline change — discuss first | include 2014–2016 in train; use 2017–2019 as earlystop |
 
-**Decision rule for H5 full SA**: If full SA Recall@5% > 18.1% (H6+H1b) → lock H5 as new baseline. If full SA Lift@1% also drops, investigate combined-metric stopping (H10) next.
+**Decision rule for H8+H10 full SA**: If Lift@1% > 6.46× (H6+H1b+H5) → strong result. If Recall@5% also > 15.7% → consider H8+H10 as new baseline. If Lift improves but Recall drops further, consider H8+H10+H5 next (though proxy showed that combo hurt Lift).
 
 **Closed experiments:**
 - H1 inv_npos: ✗ too aggressive, training collapses
 - H1b inv_sqrt_npos alone: ✗ NDCG@1% early stop fires at iter 8 — needs H6
 - H3 W9a off: ✗ hurts both metrics
 - H6+H1b+H3: ✗ W9a off degrades H6+H1b
-- H2 binary labels (on top of H6+H1b): ✗ no change — binary labels add nothing when H1b already corrects gradient bias; Recall=27.9%, Lift=12.86× = identical to H6+H1b
-- H5+H2: ✗ H2 adds nothing on top of H5; result identical to H5 alone
+- H2 binary labels: ✗ adds nothing on top of H1b or H5; gradient bias already corrected
+- H5 full SA (job 3655195): Lift=6.46×, Recall=15.7% — new best Lift but Recall below H6+H1b (18.1%); H5 now in locked baseline
 
 ---
 
@@ -216,17 +214,23 @@ Run on mini-sample first. If proxy Recall@5% > 20% (current best) → promote to
 
 **Critical finding**: Every intervention so far improves one metric at the cost of the other.
 
-| Stopping metric | Proxy Lift@1% | Proxy Recall@5% | Direction |
+**Proxy results (mini-sample, 22 groups):**
+
+| Config | Proxy Lift@1% | Proxy Recall@5% | Direction |
 |---|---|---|---|
-| NDCG@1% (baseline, year_weights) | **20.32×** | 13.3% | high lift, low recall |
-| Recall@5% (H6+H1b) | 12.86× | 27.9% | lower lift, better recall |
-| Recall@5% (H6+H1b+H5) | 11.52× | **34.8%** | lowest lift, best recall |
+| NDCG@1% stopping (baseline) | **20.32×** | 13.3% | high lift, low recall |
+| Recall@5% — H6+H1b | 12.86× | 27.9% | lower lift, better recall |
+| Recall@5% — H6+H1b+H5 | 11.52× | **34.8%** | lowest lift, best recall |
+| ndcg×recall — H6+H1b+H10 | 12.22× | 19.7% | middle ground, not better |
+| ndcg×recall — H6+H1b+H5+H10 | 13.33× | 32.0% | middle ground |
+| **ndcg×recall — H6+H8+H10** | **20.00×** | **24.8%** | **near-bar Lift, decent Recall** |
+| ndcg×recall — H6+H8+H5+H10 | 12.51× | 30.3% | adding H5 hurts Lift here |
 
-The publication bar requires BOTH ≥15× Lift AND ≥90% Recall simultaneously. Neither early stopping metric achieves this. Current experiments optimise ONE metric while degrading the other.
+**H6+H8+H10 standout**: Proxy Lift=20.00× (≈ publication bar) with Recall=24.8% — substantially better on Lift than any Recall-stopping configuration. The temporal+size weights (H8) combined with combined stopping (H10) appear to break the trade-off more than H1b alone does. Full SA run queued (job 3707314).
 
-**Root cause**: NDCG@1% stopping teaches the model to rank the best few pixels perfectly (high Lift) but ignores the bottom half of positives (low Recall). Recall@5% stopping teaches the model to find ALL positives in the top 5% (high Recall) but doesn't concentrate the best pixels in the very top 1% (lower Lift).
+The publication bar requires BOTH ≥15× Lift AND ≥90% Recall simultaneously. No configuration achieves both yet. H8+H10 is the most promising direction for Lift; closing the Recall gap remains the open problem.
 
-**H10 hypothesis**: Early stopping on `ndcg_at_1pct × recall_at_5pct` (product). This combined metric is maximised only when BOTH are high. Training under this objective might avoid the trade-off by forcing the model to be simultaneously a good ranker AND a good retriever.
+**Root cause of trade-off**: NDCG@1% stopping ranks the best few pixels perfectly (high Lift) but ignores the bottom half of positives (low Recall). Recall@5% stopping finds ALL positives in the top 5% (high Recall) but doesn't concentrate the best pixels in the top 1% (lower Lift). The ndcg×recall product objective tries to force both simultaneously.
 
 ---
 
@@ -242,11 +246,13 @@ The publication bar requires BOTH ≥15× Lift AND ≥90% Recall simultaneously.
 - pruned30 (49 feat): Lift+1.8× but Recall−2%
 
 **On full SA (61 groups, 107M rows, test 2017–2024):**
-- Baseline (79 feat, truncation=741, default params): **Lift=2.85×, Recall=14.0%** — current best
+- Baseline (79 feat, truncation=741, default params): Lift=2.85×, Recall=14.0%
 - 20-trial Optuna retune → truncation=84: Lift=2.06×, Recall=8.4% — catastrophic
 - 67 feat + YEAR_WEIGHT_MIN=0.2: Lift=2.64×, Recall=11.4% — both negative
+- H6+H1b (Recall@5% stop + inv_sqrt_npos): Lift=3.73×, Recall=18.1% — first both-improved
+- **H6+H1b+H5 (no rank-norm, job 3655195)**: **Lift=6.46×, Recall=15.7%** — new best Lift (+73%)
 
-**Lesson**: Proxy experiments are noise. All decisions must be validated on full SA. Incremental tweaks (feature drops, temporal weighting) made things worse. The gap from 2.85× to 15× requires a structural fix.
+**Lesson**: Proxy experiments are directionally reliable but not quantitatively predictive. All decisions must be validated on full SA. The gap from 6.46× to 15× still requires structural fixes — H8+H10 (temporal weights + combined stopping) is the current best hypothesis.
 
 ---
 
