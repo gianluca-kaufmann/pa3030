@@ -8,6 +8,11 @@ a (country_id, year) group.
 A patch is positive if any pixel inside it was designated (transition_01 > 0).
 Feature aggregation: min for dist_* columns, mean for everything else.
 
+Additional patch-level features computed here (not in pixel splits):
+  Shape:       log_patch_perimeter_km, patch_compactness (4πA/P²)
+  Heterog.:    patch_std_gsn_b2, patch_max_gsn_b2, patch_max_ndvi,
+               patch_std_ndvi, patch_std_elevation, patch_max_deforestation_b1
+
 Output: patch_train.parquet, patch_earlystop.parquet, patch_test.parquet
 in the same directory as the input splits.
 
@@ -54,6 +59,17 @@ EXCLUDE_COLS = frozenset({
 
 PA_ADJACENCY_DIST_M = 1500.0
 
+# Optional extra aggregations: (output_col, source_pixel_col, agg_fn)
+# Only added when the source pixel column is present in the split.
+_EXTRA_AGGS = [
+    ("patch_std_gsn_b2",         "GSN_b2",          "std"),
+    ("patch_max_gsn_b2",         "GSN_b2",          "max"),
+    ("patch_max_ndvi",           "NDVI",            "max"),
+    ("patch_std_ndvi",           "NDVI",            "std"),
+    ("patch_std_elevation",      "elevation_b1",    "std"),
+    ("patch_max_deforestation",  "deforestation_b1","max"),
+]
+
 
 def _resolve_splits_dir() -> Path:
     data_root = os.environ.get("STAGE2_DATA_ROOT")
@@ -65,6 +81,22 @@ def _resolve_splits_dir() -> Path:
     if scratch:
         return Path(scratch) / "data/south_america/ml/main"
     raise RuntimeError("Set SCRATCH or STAGE2_DATA_ROOT to locate splits directory.")
+
+
+def _compute_perimeter_per_label(labeled: np.ndarray, n_labels: int) -> np.ndarray:
+    """Count 4-connected boundary edges per CC label (labels 1..n_labels).
+
+    Returns an int64 array of length n_labels where index i gives the perimeter
+    (in pixel-edge units) of CC label i+1.
+    """
+    padded = np.pad(labeled, pad_width=1, mode="constant", constant_values=0)
+    perim = np.zeros(n_labels + 1, dtype=np.int64)
+    for dr, dc in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+        shifted = np.roll(padded, (dr, dc), axis=(0, 1))
+        # Pixels where label differs from their 4-neighbour (includes border with 0)
+        mask = (padded != shifted) & (padded > 0)
+        perim += np.bincount(padded[mask].ravel(), minlength=n_labels + 1)
+    return perim[1:]  # shape (n_labels,), 0-indexed: index i → label i+1
 
 
 def _aggregate_year(df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
@@ -90,8 +122,12 @@ def _aggregate_year(df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
     grid = np.zeros((h, w), dtype=np.bool_)
     grid[r_idx, c_idx] = True
 
-    labeled, _ = scipy_label(grid, structure=_STRUCT8)
+    labeled, n_labels = scipy_label(grid, structure=_STRUCT8)
     patch_ids = labeled[r_idx, c_idx].astype(np.int32)  # 1..n_labels
+
+    # Compute perimeter per CC before freeing the labeled grid
+    perim_per_label = _compute_perimeter_per_label(labeled, n_labels)
+
     del grid, labeled
     gc.collect()
 
@@ -111,8 +147,14 @@ def _aggregate_year(df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
         agg_fn = "min" if col.startswith("dist_") else "mean"
         agg[col] = (col, agg_fn)
 
+    # Extra within-patch aggregations (std, max of key ecological columns)
+    cols_in_df = set(df.columns)
+    for out_col, src_col, agg_fn in _EXTRA_AGGS:
+        if out_col not in agg and src_col in cols_in_df:
+            agg[out_col] = (src_col, agg_fn)
+
     # If patch_pa_adjacency_frac not in feature_cols (splits without H11), compute it here.
-    if "patch_pa_adjacency_frac" not in feature_cols and "dist_wdpa" in df.columns:
+    if "patch_pa_adjacency_frac" not in feature_cols and "dist_wdpa" in cols_in_df:
         df["_pa_adj"] = (df["dist_wdpa"] <= PA_ADJACENCY_DIST_M).astype(np.float32)
         agg["patch_pa_adjacency_frac"] = ("_pa_adj", "mean")
 
@@ -123,10 +165,18 @@ def _aggregate_year(df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
     )
 
     # Recompute log_patch_size_km2 from the actual CC pixel count
-    patch_df["log_patch_size_km2"] = np.log(
-        np.maximum(patch_df["_n_pixels"].to_numpy(), 1)
-    ).astype(np.float32)
+    n_pix = patch_df["_n_pixels"].to_numpy(np.float32)
+    patch_df["log_patch_size_km2"] = np.log(np.maximum(n_pix, 1)).astype(np.float32)
     patch_df["patch_n_pixels"] = patch_df["_n_pixels"].astype(np.int32)
+
+    # Shape features — join perimeter by _patch_id (1-indexed)
+    patch_label_idx = patch_df["_patch_id"].to_numpy(np.int32) - 1  # 0-indexed
+    perim = np.maximum(perim_per_label[patch_label_idx].astype(np.float32), 1.0)
+    patch_df["log_patch_perimeter_km"] = np.log(perim).astype(np.float32)
+    # Isoperimetric quotient: 4π × area / perimeter² (circle → 1, elongated → 0)
+    patch_df["patch_compactness"] = (
+        (4.0 * np.pi * n_pix) / (perim ** 2)
+    ).astype(np.float32)
 
     patch_df.drop(columns=["_patch_id", "_n_pixels"], inplace=True)
 
@@ -134,6 +184,11 @@ def _aggregate_year(df: pd.DataFrame, feature_cols: list[str]) -> pd.DataFrame:
     cast_cols = [c for c in feature_cols if c in patch_df.columns and c != "log_patch_size_km2"]
     for col in cast_cols:
         patch_df[col] = patch_df[col].astype(np.float32)
+    # Cast extra aggregation output columns
+    extra_out_cols = [out_col for out_col, _, _ in _EXTRA_AGGS if out_col in patch_df.columns]
+    for col in extra_out_cols + ["log_patch_perimeter_km", "patch_compactness"]:
+        if col in patch_df.columns:
+            patch_df[col] = patch_df[col].astype(np.float32)
 
     return patch_df
 
