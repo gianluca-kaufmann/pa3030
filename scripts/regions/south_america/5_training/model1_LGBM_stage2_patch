@@ -220,11 +220,18 @@ def main() -> None:
 
     # Discover feature columns from schema
     schema = pq.ParquetFile(train_path).schema_arrow
+    # Optional: exclude additional columns via env var (comma-separated)
+    extra_exclude = frozenset(
+        c.strip() for c in os.environ.get("STAGE2_FEATURE_EXCLUDE", "").split(",") if c.strip()
+    )
     feature_cols = [
         name for name, field in zip(schema.names, schema)
         if name not in PATCH_EXCLUDE_COLS
+        and name not in extra_exclude
         and (pa.types.is_integer(field.type) or pa.types.is_floating(field.type))
     ]
+    if extra_exclude:
+        print(f"Extra excluded features: {sorted(extra_exclude)}")
     print(f"Patch feature columns: {len(feature_cols)}")
     print(f"  First 10: {feature_cols[:10]}")
 
@@ -310,7 +317,8 @@ def main() -> None:
     del X_tr, y_tr, X_es, y_es
     gc.collect()
 
-    tag = "model1_lgbm_stage2_patch"
+    run_tag = os.environ.get("STAGE2_RUN_TAG", "")
+    tag = f"model1_lgbm_stage2_patch{'_' + run_tag if run_tag else ''}"
     model_path = model_dir / f"{tag}_{timestamp}.pkl"
     with open(model_path, "wb") as f:
         pickle.dump({"model": model, "feature_cols": feature_cols}, f)
@@ -358,6 +366,8 @@ def main() -> None:
             "task": "stage2_patch_selection",
             "tier": "Tier3_H12",
             "ranking_unit": "connected_component_patch",
+            "run_tag": run_tag or None,
+            "feature_exclude": sorted(extra_exclude) if extra_exclude else [],
             "n_features": len(feature_cols),
             "features": feature_cols,
             "group_cols": ["country_id", "year"],
