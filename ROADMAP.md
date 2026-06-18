@@ -6,11 +6,12 @@
 > - ✅ Stage 1 Poisson GLM: complete, D²=0.345
 > - ✅ Stage 2 temporal model (H6+H1b+H5): locked at Lift@1%=6.46×, Recall@5%=15.7%
 > - ✅ P1.3 per-country breakdown: done — Brazil=1.69×, SUR=28.55×, ARG=9.31× (see Experiment History)
-> - ✅ P1.1 within-group run complete (job 3808266): ~93–96% Recall — **diagnosed as geometric artifact, NOT a paper result** (see Stage 2 design section)
-> - 🔄 Job 3809087: 10km grid diagnostic, pending after 3808266
-> - 🔄 Job 3818806: baselines comparison, pending after 3809696
-> - 🔄 Job 3818794: temporal stability per-year, independent (Priority)
-> - **NEXT ACTION**: implement cross-event training script → run on Colombia → submit to Euler
+> - ✅ P1.1 within-group: diagnosed geometric artifact, cancelled (was job 3808266)
+> - ✅ CE.1 cross-event script implemented: `5_training/model1_LGBM_stage2_cross_event.py`
+> - 🔄 CE.1 Colombia pilot: running locally — **result pending**
+> - 🔄 Job 3840332: baselines comparison, queued (resubmitted standalone)
+> - 🔄 Job 3818794: temporal stability per-year, **now running** (freed by job cancellation)
+> - **NEXT ACTION**: wait for Colombia pilot result → if Recall@5% ≥ 60%, `sbatch slurm/south_america/training_lgbm_stage2_cross_event.slurm`
 
 ---
 
@@ -108,13 +109,13 @@ Brazil's Bolsonaro-era events (2019–2022) are ~3–4 of the 30 test events (10
 |---|---|---|
 | Stage 1 Poisson GLM | ✅ Complete | D²=0.345 (SA 7yr OOS) |
 | Stage 2 temporal model (H6+H1b+H5) | ✅ Working | Lift@1%=6.46×, Recall@5%=15.7%, iter=136 |
-| Stage 2 cross-event model | ❌ Not yet built | **Next action** |
+| Stage 2 cross-event model | 🔄 Colombia pilot running | `5_training/model1_LGBM_stage2_cross_event.py` |
 | Per-country breakdown (temporal model) | ✅ Done | SUR=28.55×, ARG=9.31×, BRA=1.69× (see history) |
 | Within-group pixel split (P1.1) | ✅ Done — **abandoned** | 93–96% Recall — geometric artifact |
 | Patch CC approach (H12) | ❌ Abandoned | Mega-blob artifact confirmed |
-| 10km grid diagnostic | 🔄 Job 3809087 pending | Group size viability unknown |
+| 10km grid diagnostic | ❌ Cancelled (out of scope) | CE.1/CE.2 is primary path |
 | Temporal stability per-year | 🔄 Job 3818794 running | Will show 2019–2022 collapse detail |
-| Baselines (random, dist_wdpa, GSN_b2) | 🔄 Job 3818806 pending | Required for paper |
+| Baselines (random, dist_wdpa, GSN_b2) | 🔄 Job 3840332 queued | Required for paper |
 | AGB / carbon feature | ❌ Not added | TIF: `data/south_america/ready/AGB/agb_sa.tif` |
 | REDD feature | ❌ Not added | TIF: `data/south_america/ready/REDD/redd_sa.tif` |
 | SHAP analysis | ❌ Not run | Needs final model |
@@ -269,7 +270,7 @@ Do not begin until:
 
 | Priority | Task | Status | Blocks |
 |---|---|---|---|
-| **1** | Cross-event script — Colombia pilot (CE.1) | ⬜ **NEXT ACTION** | Everything |
+| **1** | Cross-event script — Colombia pilot (CE.1) | 🔄 **Running locally** | Everything |
 | **2** | Cross-event full SA on Euler (CE.2) | ⬜ After CE.1 ≥60% on Colombia | Paper model |
 | **3** | Add AGB+REDD; retrain cross-event (CE.3) | ⬜ After CE.2 | SHAP, narrative |
 | **4** | KBA download + rasterise (P3.1) | ⬜ Start any time (independent) | RQ3 |
