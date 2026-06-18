@@ -19,5 +19,6 @@ source "$VENV_DIR/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
 echo "Running Issue C: SA Stage 2 year/country breakdown..."
-python -u scripts/regions/south_america/6_evaluation/stage2_year_country_breakdown.py
+srun --cpu-bind=cores --distribution=block:block python -u \
+    scripts/regions/south_america/6_evaluation/stage2_year_country_breakdown.py
 echo "Done."

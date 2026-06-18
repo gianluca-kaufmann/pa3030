@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+"""P1.1 — Within-group 80/20 pixel split experiment.
+
+Answers: "Is the spatial logic of designation learnable at all?"
+
+Setup:
+  - Load test expansion groups (2017-2024) with ALL pixels (no neg_ratio)
+  - For each (country_id, year) group, assign 80% of pixels to train and 20% to val
+  - Apply neg_ratio=100 to the 80% train portion (memory control)
+  - Also load temporal train (2001-2013, neg_ratio=100) as additional signal
+  - Train H6+H1b+H5 settings, early-stop on the 20% val (all pixels)
+  - Report Recall@5% on the 20% val set
+
+Expected: ~94.5% Recall@5% (confirmed on Colombia scale).
+
+The gap between this and the temporal result (16-19%) measures temporal
+non-stationarity: the model has strong feature signal but past events do
+not perfectly predict future events. Both numbers belong in the paper.
+"""
+
+from __future__ import annotations
+
+import gc
+import json
+import os
+import pickle
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+_ROOT = Path(__file__).resolve().parents[4]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from scripts.regions.shared.evaluation.stage2_metrics import (
+    compute_stage2_metrics,
+    recall_at_k_within_groups,
+)
+from scripts.regions.shared.training.stage2_lgbm_core import (
+    STAGE2_EXCLUDE_COLS,
+    Stage2Arrays,
+    Stage2Config,
+    _Stage2EarlyStop,
+    _prepare_lgb_params,
+    _split_large_groups,
+    compute_group_norm_weights,
+    load_stage2_arrays,
+    resolve_best_params_json,
+    resolve_parquet_file,
+    _expansion_groups_from_batches,
+    _apply_graded_relevance,
+    _rank_normalize_within_groups,
+    _shuffle_within_groups,
+    BATCH_SIZE,
+    TARGET_COL,
+)
+from scripts.regions.shared.training.feature_guard import check_feature_denylist
+from scripts.regions.shared.training.utils import get_repo_root
+from scripts.regions.shared.country_raster import load_country_raster, country_ids_for_rows
+from lightgbm.callback import EarlyStopException as _LgbEarlyStopException
+
+
+def _load_all_pixels_for_expansion_groups(
+    panel_path: Path,
+    region: str,
+    feature_cols: List[str],
+    expansion_groups: set[tuple[int, int]],
+    year_range: Optional[Tuple[int, int]],
+    use_graded_relevance: bool = True,
+) -> Stage2Arrays:
+    """Load ALL pixels (no neg_ratio) for given expansion groups."""
+    schema_names = pq.ParquetFile(panel_path).schema_arrow.names
+    has_country = "country_id" in schema_names
+    raster = None if has_country else load_country_raster(region)
+
+    meta_cols = ["country_id", "year", TARGET_COL]
+    if use_graded_relevance:
+        meta_cols += ["row", "col"]
+
+    essential = feature_cols + [TARGET_COL, "year", "WDPA_prev", "row", "col"]
+    if has_country:
+        essential.append("country_id")
+    essential = list(dict.fromkeys(essential))
+
+    meta_frames: list[pd.DataFrame] = []
+    feat_arrays: list[np.ndarray] = []
+
+    pf = pq.ParquetFile(panel_path)
+    for batch in pf.iter_batches(columns=essential, batch_size=BATCH_SIZE):
+        df = batch.to_pandas()
+        if df.empty:
+            continue
+        df = df[df[TARGET_COL].notna() & (df["WDPA_prev"] == 0)]
+        if year_range is not None:
+            df = df[(df["year"] >= year_range[0]) & (df["year"] <= year_range[1])]
+        if df.empty:
+            continue
+        if not has_country:
+            df["country_id"] = country_ids_for_rows(df, raster)
+        keys = list(zip(df["country_id"].astype(int), df["year"].astype(int)))
+        df = df[np.array([k in expansion_groups for k in keys], dtype=bool)]
+        if df.empty:
+            continue
+        meta_frames.append(df[meta_cols].copy())
+        feat_arrays.append(df[feature_cols].to_numpy(dtype=np.float32))
+        del df
+
+    if not feat_arrays:
+        raise ValueError(f"No Stage 2 samples found: {panel_path}")
+
+    data = pd.concat(meta_frames, ignore_index=True)
+    del meta_frames
+    gc.collect()
+
+    order = np.lexsort((data["year"].to_numpy(), data["country_id"].to_numpy()))
+    data = data.iloc[order].reset_index(drop=True)
+
+    X_unsorted = np.concatenate(feat_arrays, axis=0)
+    del feat_arrays
+    gc.collect()
+    X = X_unsorted[order]
+    del X_unsorted, order
+    gc.collect()
+
+    cy_group_sizes = data.groupby(["country_id", "year"], sort=False).size().to_numpy(dtype=np.int32)
+
+    if use_graded_relevance:
+        y = _apply_graded_relevance(data, cy_group_sizes, TARGET_COL)
+    else:
+        y = (data[TARGET_COL] > 0).astype(np.int8).to_numpy()
+
+    years = data["year"].to_numpy(dtype=np.int32)
+    country_ids = data["country_id"].to_numpy(dtype=np.int32)
+    del data
+    gc.collect()
+
+    return Stage2Arrays(
+        X=X, y=y, years=years, country_ids=country_ids,
+        cy_group_sizes=cy_group_sizes, train_group_sizes=cy_group_sizes,
+    )
+
+
+def _within_group_pixel_split(
+    arr: Stage2Arrays,
+    train_ratio: float = 0.8,
+    rng_seed: int = 42,
+) -> Tuple[Stage2Arrays, Stage2Arrays]:
+    """Split pixels within each (country_id, year) group into train/val.
+
+    Groups are kept contiguous in both outputs. The split is deterministic
+    given rng_seed.
+    """
+    rng = np.random.default_rng(rng_seed)
+    X, y = arr.X, arr.y
+    years, cids = arr.years, arr.country_ids
+    group_sizes = arr.cy_group_sizes
+
+    tr_X, tr_y, tr_yr, tr_cid, tr_gs = [], [], [], [], []
+    va_X, va_y, va_yr, va_cid, va_gs = [], [], [], [], []
+
+    offset = 0
+    for gsize in group_sizes:
+        n = int(gsize)
+        perm = rng.permutation(n)
+        n_tr = int(n * train_ratio)
+        tr_idx = perm[:n_tr]
+        va_idx = perm[n_tr:]
+        sl = slice(offset, offset + n)
+
+        yr_g = int(years[offset])
+        cid_g = int(cids[offset])
+
+        tr_X.append(X[sl][tr_idx])
+        tr_y.append(y[sl][tr_idx])
+        tr_yr.append(np.full(n_tr, yr_g, dtype=np.int32))
+        tr_cid.append(np.full(n_tr, cid_g, dtype=np.int32))
+        tr_gs.append(n_tr)
+
+        n_va = n - n_tr
+        va_X.append(X[sl][va_idx])
+        va_y.append(y[sl][va_idx])
+        va_yr.append(np.full(n_va, yr_g, dtype=np.int32))
+        va_cid.append(np.full(n_va, cid_g, dtype=np.int32))
+        va_gs.append(n_va)
+
+        offset += n
+
+    tr_gsizes = np.array(tr_gs, dtype=np.int32)
+    va_gsizes = np.array(va_gs, dtype=np.int32)
+
+    arr_tr = Stage2Arrays(
+        X=np.concatenate(tr_X), y=np.concatenate(tr_y),
+        years=np.concatenate(tr_yr), country_ids=np.concatenate(tr_cid),
+        cy_group_sizes=tr_gsizes, train_group_sizes=tr_gsizes,
+    )
+    arr_va = Stage2Arrays(
+        X=np.concatenate(va_X), y=np.concatenate(va_y),
+        years=np.concatenate(va_yr), country_ids=np.concatenate(va_cid),
+        cy_group_sizes=va_gsizes, train_group_sizes=va_gsizes,
+    )
+    return arr_tr, arr_va
+
+
+def _apply_neg_ratio_to_arrays(
+    arr: Stage2Arrays,
+    neg_ratio: int,
+    rng: np.random.Generator,
+) -> Stage2Arrays:
+    """Subsample negatives within each group to keep neg_ratio × n_pos."""
+    X, y = arr.X, arr.y
+    years, cids = arr.years, arr.country_ids
+    group_sizes = arr.cy_group_sizes
+
+    kept_X, kept_y, kept_yr, kept_cid, new_gs = [], [], [], [], []
+    offset = 0
+    for gsize in group_sizes:
+        n = int(gsize)
+        sl = slice(offset, offset + n)
+        y_g = y[sl]
+        pos_mask = y_g > 0
+        pos_idx = np.where(pos_mask)[0]
+        neg_idx = np.where(~pos_mask)[0]
+        n_pos = len(pos_idx)
+        if n_pos == 0:
+            # Keep up to neg_ratio negatives even without positives (small groups)
+            keep = neg_idx[:neg_ratio] if len(neg_idx) > neg_ratio else neg_idx
+        else:
+            n_keep_neg = min(len(neg_idx), n_pos * neg_ratio)
+            neg_sampled = rng.choice(neg_idx, size=n_keep_neg, replace=False) if n_keep_neg < len(neg_idx) else neg_idx
+            keep = np.sort(np.concatenate([pos_idx, neg_sampled]))
+
+        kept_X.append(X[sl][keep])
+        kept_y.append(y[sl][keep])
+        kept_yr.append(years[sl][keep])
+        kept_cid.append(cids[sl][keep])
+        new_gs.append(len(keep))
+        offset += n
+
+    new_gsizes = np.array(new_gs, dtype=np.int32)
+    return Stage2Arrays(
+        X=np.concatenate(kept_X) if kept_X else np.empty((0, X.shape[1]), dtype=X.dtype),
+        y=np.concatenate(kept_y) if kept_y else np.array([], dtype=y.dtype),
+        years=np.concatenate(kept_yr) if kept_yr else np.array([], dtype=np.int32),
+        country_ids=np.concatenate(kept_cid) if kept_cid else np.array([], dtype=np.int32),
+        cy_group_sizes=new_gsizes,
+        train_group_sizes=new_gsizes,
+    )
+
+
+def _merge_train_arrays(
+    arr_temporal: Stage2Arrays,
+    arr_within: Stage2Arrays,
+) -> Stage2Arrays:
+    """Merge temporal train and within-group train arrays, re-sorted by (country_id, year)."""
+    X = np.concatenate([arr_temporal.X, arr_within.X], axis=0)
+    y = np.concatenate([arr_temporal.y, arr_within.y])
+    years = np.concatenate([arr_temporal.years, arr_within.years])
+    cids = np.concatenate([arr_temporal.country_ids, arr_within.country_ids])
+
+    order = np.lexsort((years, cids))
+    X = X[order]
+    y = y[order]
+    years = years[order]
+    cids = cids[order]
+    del order
+    gc.collect()
+
+    key = cids.astype(np.int64) * 100_000 + years.astype(np.int64)
+    changes = np.concatenate([[True], key[1:] != key[:-1], [True]])
+    group_sizes = np.diff(np.where(changes)[0]).astype(np.int32)
+
+    return Stage2Arrays(
+        X=X, y=y, years=years, country_ids=cids,
+        cy_group_sizes=group_sizes, train_group_sizes=group_sizes,
+    )
+
+
+def run_within_group_experiment() -> None:
+    """Train Stage 2 LambdaRank with within-group 80/20 pixel split and evaluate."""
+    repo_root = get_repo_root()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    region = "south_america"
+
+    out_dir = repo_root / f"outputs/{region}/results/ml_models"
+    model_dir = repo_root / f"data/{region}/ml/models"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg = Stage2Config(region=region, model_prefix="model1", variant="within_group")
+
+    train_path = resolve_parquet_file(region, "train.parquet")
+    test_path = resolve_parquet_file(region, "test.parquet")
+
+    schema = pq.ParquetFile(train_path).schema_arrow
+    numeric_cols = [
+        n for n, f in zip(schema.names, schema)
+        if pa.types.is_integer(f.type) or pa.types.is_floating(f.type)
+    ]
+    feature_cols = [c for c in numeric_cols if c not in STAGE2_EXCLUDE_COLS]
+    check_feature_denylist(feature_cols, context=f"{region}/lgbm/stage2/within_group")
+
+    # Load best params (same as locked H6+H1b+H5 model)
+    params_path = resolve_best_params_json(cfg)
+    if params_path:
+        with open(params_path) as f:
+            raw = json.load(f)
+        best_params = raw.get("best_params", raw) if isinstance(raw, dict) else raw
+    else:
+        best_params = {
+            "num_leaves": 127, "max_depth": -1, "learning_rate": 0.05,
+            "min_child_samples": 50, "subsample": 0.8, "colsample_bytree": 0.7,
+            "reg_alpha": 0.1, "reg_lambda": 1.0,
+        }
+        print("  Using default hyperparameters (no best_params JSON found)")
+
+    num_threads = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 4))
+    num_boost_round = int(best_params.get("n_estimators", best_params.get("num_boost_round", 2000)))
+    neg_ratio = int(os.environ.get("STAGE2_NEG_RATIO", "100"))
+    _normalize = os.environ.get("STAGE2_NORMALIZE_WITHIN_GROUPS", "1") != "0"
+    _graded = os.environ.get("STAGE2_GRADED_RELEVANCE", "1") != "0"
+    rng_split = np.random.default_rng(42)
+    rng_neg = np.random.default_rng(123)
+
+    # --- Step 1: discover all expansion groups from test period ---
+    print("Finding test expansion groups (2017-2024)...")
+    t0 = time.time()
+    test_expansion = _expansion_groups_from_batches(test_path, region, (2017, 2024))
+    print(f"  {len(test_expansion):,} expansion groups ({time.time()-t0:.1f}s)")
+
+    # --- Step 2: load test.parquet with ALL pixels (no neg_ratio) ---
+    print(f"Loading test pixels (all, no neg_ratio) for {len(test_expansion)} groups...")
+    t0 = time.time()
+    arr_test_full = _load_all_pixels_for_expansion_groups(
+        test_path, region, feature_cols, test_expansion, (2017, 2024),
+        use_graded_relevance=_graded,
+    )
+    print(f"  {len(arr_test_full.y):,} rows, {int((arr_test_full.y > 0).sum()):,} positives ({time.time()-t0:.1f}s)")
+
+    if _normalize:
+        print("Rank-normalising within groups...")
+        arr_test_full.X = _rank_normalize_within_groups(arr_test_full.X, arr_test_full.cy_group_sizes)
+
+    # --- Step 3: within-group 80/20 split ---
+    print("Splitting 80/20 within groups...")
+    t0 = time.time()
+    arr_tr_within_full, arr_va = _within_group_pixel_split(arr_test_full, train_ratio=0.8, rng_seed=42)
+    del arr_test_full
+    gc.collect()
+    print(f"  Train portion: {len(arr_tr_within_full.y):,} rows ({time.time()-t0:.1f}s)")
+    print(f"  Val portion:   {len(arr_va.y):,} rows, {int((arr_va.y > 0).sum()):,} positives")
+
+    # --- Step 4: apply neg_ratio=100 to train portion ---
+    print(f"Applying neg_ratio={neg_ratio} to train portion...")
+    t0 = time.time()
+    arr_tr_within = _apply_neg_ratio_to_arrays(arr_tr_within_full, neg_ratio, rng_neg)
+    del arr_tr_within_full
+    gc.collect()
+    print(f"  Subsampled: {len(arr_tr_within.y):,} rows ({time.time()-t0:.1f}s)")
+
+    # --- Step 5: shuffle within groups (training only) ---
+    _shuffle_within_groups(
+        arr_tr_within.X, arr_tr_within.y, arr_tr_within.cy_group_sizes,
+        np.random.default_rng(42 + 1337),
+    )
+
+    # --- Step 6: load temporal train (2001-2013) with neg_ratio=100 ---
+    print("Finding temporal train expansion groups (2001-2013)...")
+    t0 = time.time()
+    train_expansion = _expansion_groups_from_batches(train_path, region, (2001, 2013))
+    print(f"  {len(train_expansion):,} groups ({time.time()-t0:.1f}s)")
+
+    print(f"Loading temporal train (neg_ratio={neg_ratio})...")
+    t0 = time.time()
+    arr_tr_temporal = load_stage2_arrays(
+        train_path, region, feature_cols, train_expansion, (2001, 2013),
+        neg_ratio=neg_ratio, rng_seed=42,
+        normalize_within_groups=_normalize,
+        use_graded_relevance=_graded,
+    )
+    print(f"  {len(arr_tr_temporal.y):,} rows ({time.time()-t0:.1f}s)")
+
+    # --- Step 7: merge temporal train + within-group 80% ---
+    print("Merging temporal train + within-group train portion...")
+    t0 = time.time()
+    arr_train = _merge_train_arrays(arr_tr_temporal, arr_tr_within)
+    del arr_tr_temporal, arr_tr_within
+    gc.collect()
+    print(
+        f"  Combined: {len(arr_train.y):,} rows, {len(arr_train.cy_group_sizes):,} groups ({time.time()-t0:.1f}s)"
+    )
+
+    # --- Step 8: sample weights (H1b: inv_sqrt_npos) ---
+    _gw_mode = os.environ.get("STAGE2_GROUP_WEIGHT_MODE", "inv_sqrt_npos")
+    sample_weights = compute_group_norm_weights(arr_train.y, arr_train.cy_group_sizes, _gw_mode)
+    print(f"Sample weights: mode={_gw_mode}  mean={sample_weights.mean():.3f}")
+
+    # --- Step 9: train LambdaRank (H5: no rank norm; H6: Recall@5% early stopping) ---
+    lgb_params = _prepare_lgb_params(best_params, num_threads)
+    train_set = lgb.Dataset(
+        arr_train.X, label=arr_train.y,
+        group=_split_large_groups(arr_train.train_group_sizes),
+        weight=sample_weights,
+    )
+    val_set = lgb.Dataset(
+        arr_va.X, label=arr_va.y,
+        group=_split_large_groups(arr_va.cy_group_sizes),
+        reference=train_set,
+    )
+    es_metric = os.environ.get("STAGE2_EARLY_STOP_METRIC", "recall_at_5pct")
+    early_stop_cb = _Stage2EarlyStop(
+        arr_va.X, arr_va.y.astype(np.float64), arr_va.cy_group_sizes,
+        patience=100, metric=es_metric,
+    )
+
+    print(
+        f"Fitting LambdaRank: {len(arr_train.y):,} train rows, {len(arr_va.y):,} val rows "
+        f"| {len(arr_train.cy_group_sizes):,} train groups, {len(arr_va.cy_group_sizes):,} val groups"
+    )
+    model = lgb.train(
+        lgb_params,
+        train_set,
+        num_boost_round=num_boost_round,
+        valid_sets=[val_set],
+        valid_names=["val"],
+        callbacks=[lgb.log_evaluation(50), early_stop_cb],
+    )
+
+    del arr_train, train_set, val_set
+    gc.collect()
+
+    # --- Step 10: evaluate on val set (20% of each group) ---
+    scores = model.predict(arr_va.X, num_iteration=model.best_iteration or None).astype(np.float64)
+    test_metrics = compute_stage2_metrics(
+        arr_va.y.astype(np.float64), scores, arr_va.cy_group_sizes
+    )
+
+    recall5 = test_metrics["recall_at_5pct_within_groups"]
+    lift1 = test_metrics["lift_at_1pct_within_groups"]
+    print(f"\n=== Within-group 80/20 Evaluation (20% held-out pixels) ===")
+    print(f"  Recall@5%:  {recall5:.4f}  ({recall5*100:.1f}%)")
+    print(f"  Lift@1%:    {lift1:.4f}x")
+    print(f"  n_groups:   {test_metrics['n_groups']}")
+    print(f"  n_samples:  {test_metrics['n_samples']:,}")
+
+    # Save model
+    tag = "model1_lgbm_stage2_within_group"
+    model_path = model_dir / f"{tag}_{timestamp}.pkl"
+    with open(model_path, "wb") as f:
+        pickle.dump({"model": model, "feature_cols": feature_cols, "config": cfg}, f)
+    print(f"Model saved: {model_path}")
+
+    # Save metrics
+    result = {
+        "metadata": {
+            "timestamp": timestamp,
+            "experiment": "within_group_80_20_pixel_split",
+            "description": (
+                "Within-group spatial characterization: for each (country_id, year) expansion "
+                "group, 80% of pixels used for training, 20% held out for evaluation. "
+                "Measures learnability of spatial designation logic within events (upper bound). "
+                "Gap to temporal result quantifies temporal non-stationarity."
+            ),
+            "region": region,
+            "train_years": "2001-2013 (temporal) + 80% pixels of 2017-2024 expansion groups",
+            "val_set": "20% pixels of 2017-2024 expansion groups (all pixels, no neg_ratio)",
+            "n_features": len(feature_cols),
+            "normalize_within_groups": _normalize,
+            "graded_relevance": _graded,
+            "neg_ratio_train": neg_ratio,
+            "group_weight_mode": _gw_mode,
+            "early_stop_metric": es_metric,
+        },
+        "val_performance": test_metrics,
+    }
+    metrics_path = out_dir / f"{tag}_metrics_{timestamp}.json"
+    with open(metrics_path, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"Metrics saved: {metrics_path}")
+    print(f"\nRecord in ROADMAP.md experiment table:")
+    print(f"  Within-group 80/20 random split | — | {recall5*100:.1f}% | {model.best_iteration} | ⬜ → ✅ CONFIRMED")
+
+
+if __name__ == "__main__":
+    run_within_group_experiment()
