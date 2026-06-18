@@ -1,6 +1,6 @@
 # PA3030 — Publication Roadmap
 
-**Updated**: 2026-06-18 (session 2) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
+**Updated**: 2026-06-18 (session 3) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
 
 > **Current state (2026-06-18)**:
 > - ✅ Stage 1 Poisson GLM: complete, D²=0.345
@@ -111,7 +111,7 @@ Brazil's Bolsonaro-era events (2019–2022) are ~3–4 of the 30 test events (10
 | Stage 2 cross-event (CE.2) | ✅ Done — gate FAILED | macro R@5%=23.8%, weighted=41.6%, 28 events; root cause: heterogeneous events; redesign in progress |
 | CE.3a spatial coherence diagnostic | ⬜ Next (local, ~1h) | Quantify clustering per event; verify ecological vs political split |
 | CE.3b redesigned cross-event run | ⬜ After CE.3a | Fixes 2+4: event normalization, stratified split, patience=200; gate ≥50% |
-| CE.4 AGB+REDD features | ⬜ Blocked on data | Raw tiles not downloaded; see Data Pipeline section |
+| CE.4 AGB+REDD features | ⬜ Blocked on rasterise step | Raw data on Euler; run rasterise scripts, then rebuild splits |
 | Per-country breakdown (temporal model) | ✅ Done | SUR=28.55×, ARG=9.31×, BRA=1.69×; excl. outliers: 10.89× |
 | Within-group pixel split (P1.1) | ❌ Abandoned | Geometric artifact (93–96% guaranteed by cluster geometry) |
 | Patch CC approach (H12) | ❌ Abandoned | Mega-blob artifact confirmed |
@@ -461,10 +461,10 @@ Do not begin until:
 | CE.2 cross-event models | `data/south_america/ml/models/model1_lgbm_stage2_cross_event_*.pkl` | ✅ 3 files (2 × Colombia, 1 × SA) |
 | USA pixel splits | `euler:$SCRATCH/data/usa/ml/main/{train,earlystop,test}.parquet` | ✅ Ready |
 | SE Asia pixel splits | `euler:$SCRATCH/data/se_asia/ml/main/{train,earlystop,test}.parquet` | ✅ Ready |
-| AGB raw tiles | `data/shared/ESA_CCI_Biomass/` | ✅ **29 tiles, 1.7 GB locally** — needs rsync to Euler before `agb_rasterise.py` |
-| AGB TIF (processed) | `data/south_america/ready/AGB/agb_sa.tif` | ❌ **Does not exist** — run `agb_rasterise.py` after rsync to Euler |
-| REDD raw data | `data/REDD/` | ✅ **ID-RECCO V5.0_20231201.zip locally (1.4 MB)** — needs rsync to Euler before `redd_rasterise.py` |
-| REDD TIF (processed) | `data/south_america/ready/REDD/redd_sa.tif` | ❌ **Does not exist** — run `redd_rasterise.py` after rsync to Euler |
+| AGB raw tiles | `data/shared/ESA_CCI_Biomass/` | ✅ **29 tiles, 1.7 GB on Euler** — ESA CCI Biomass fv7.0 (2010); ready to rasterise |
+| AGB TIF (processed) | `data/south_america/ready/AGB/agb_sa.tif` | ⬜ Run `agb_rasterise.py` (next step for CE.4) |
+| REDD raw data | `data/REDD/ID-RECCO V5.0_20231201.zip` | ✅ **1.4 MB zip on Euler** — ready to rasterise |
+| REDD TIF (processed) | `data/south_america/ready/REDD/redd_sa.tif` | ⬜ Run `redd_rasterise.py` (next step for CE.4) |
 | Colombia dev panel | `euler:$SCRATCH/data/dev/south_america/ml/main/` | ✅ Ready (79 features) |
 | Forward scored (existing) | `euler:$SCRATCH/outputs/south_america/forward_scored_2024.parquet` | ✅ Exists |
 | MapBiomas Brazil | Google Drive | ⚠️ Verify format/coverage before committing |
