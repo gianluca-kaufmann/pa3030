@@ -114,7 +114,7 @@ Brazil's Bolsonaro-era events (2019–2022) are ~3–4 of the 30 test events (10
 | Within-group pixel split (P1.1) | ✅ Done — **abandoned** | 93–96% Recall — geometric artifact |
 | Patch CC approach (H12) | ❌ Abandoned | Mega-blob artifact confirmed |
 | 10km grid diagnostic | ❌ Cancelled (out of scope) | CE.1/CE.2 is primary path |
-| Temporal stability per-year | 🔄 Job 3818794 running | Will show 2019–2022 collapse detail |
+| Temporal stability per-year | ✅ Done (job 3818794) | 2017=7.81×, 2018=11.59×, **2019=0.99×**, **2020=0.50×**, 2021=1.74×, 2022=1.89×, **2023=6.77×**, **2024=9.02×** — Bolsonaro collapse confirmed |
 | Baselines (random, dist_wdpa, GSN_b2) | 🔄 Job 3840332 queued | Required for paper |
 | AGB / carbon feature | ❌ Not added | TIF: `data/south_america/ready/AGB/agb_sa.tif` |
 | REDD feature | ❌ Not added | TIF: `data/south_america/ready/REDD/redd_sa.tif` |
