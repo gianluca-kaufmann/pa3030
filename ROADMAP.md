@@ -1,18 +1,16 @@
 # PA3030 — Publication Roadmap
 
-**Updated**: 2026-06-18 | **Branch**: `paper` (active). `main` = intact thesis, never touch.
+**Updated**: 2026-06-18 (session 2) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
 
 > **Current state (2026-06-18)**:
 > - ✅ Stage 1 Poisson GLM: complete, D²=0.345
-> - ✅ Stage 2 temporal model (H6+H1b+H5): locked at Lift@1%=6.46×, Recall@5%=15.7%
-> - ✅ P1.3 per-country breakdown: done — Brazil=1.69×, SUR=28.55×, ARG=9.31×
-> - ✅ P1.1 within-group: geometric artifact, cancelled
-> - ✅ Temporal stability: done — 2017=7.81×, 2018=11.59×, 2019=0.99×, 2020=0.50×, 2021=1.74×, 2022=1.89×, 2023=6.77×, 2024=9.02×
-> - ✅ Baselines: done — random=1.0×, naive(dist_wdpa)=2.81×, full model=6.54×
-> - ✅ CE.1 cross-event script implemented: `5_training/model1_LGBM_stage2_cross_event.py`
-> - 🔄 Job 3841212: CE.1 Colombia pilot running on Euler (4h wall, result pending)
-> - 🔄 Job 3841647: CE.2 full SA cross-event queued on Euler (12h wall, pending)
-> - **NEXT ACTION**: check results of 3841212 and 3841647 → record in Experiment History below
+> - ✅ Stage 2 temporal model (H6+H1b+H5): 79 features, Lift@1%=6.46×, Recall@5%=15.7%
+> - ✅ P1.3 per-country breakdown: BRA=1.69×, SUR=28.55×, ARG=9.31×; excl. BRA+CHL+BOL+VEN → 10.89× weighted
+> - ✅ Temporal stability: 2017=7.81×, 2018=11.59×, 2019=0.99×, 2020=0.50×, 2021=1.74×, 2022=1.89×, 2023=6.77×, 2024=9.02×
+> - ✅ Baselines: random=1.0×, naive(dist_wdpa)=2.81×, full model=6.54×
+> - ✅ CE.2 full SA cross-event: macro R@5%=23.8%, weighted R@5%=41.6% (28 test events) — gate FAILED
+> - **Root cause identified**: events are heterogeneous — ecological campaigns R@5%=49–93%, political/legal designations R@5%=0–12%. Average mixes both. Goal remains high performance; fix the training design, not the bar.
+> - **NEXT ACTION (in order)**: CE.3a spatial coherence diagnostic (local) → CE.3b redesigned Euler run (Fixes 2+4) → CE.4 AGB+REDD (blocked on data download)
 
 ---
 
@@ -110,19 +108,19 @@ Brazil's Bolsonaro-era events (2019–2022) are ~3–4 of the 30 test events (10
 |---|---|---|
 | Stage 1 Poisson GLM | ✅ Complete | D²=0.345 (SA 7yr OOS) |
 | Stage 2 temporal model (H6+H1b+H5) | ✅ Working | Lift@1%=6.46×, Recall@5%=15.7%, iter=136 |
-| Stage 2 cross-event model | 🔄 Colombia job 3841212, SA job 3841647 | results pending |
-| Per-country breakdown (temporal model) | ✅ Done | SUR=28.55×, ARG=9.31×, BRA=1.69× (see history) |
-| Within-group pixel split (P1.1) | ✅ Done — **abandoned** | 93–96% Recall — geometric artifact |
+| Stage 2 cross-event (CE.2) | ✅ Done — gate FAILED | macro R@5%=23.8%, weighted=41.6%, 28 events; root cause: heterogeneous events; redesign in progress |
+| CE.3a spatial coherence diagnostic | ⬜ Next (local, ~1h) | Quantify clustering per event; verify ecological vs political split |
+| CE.3b redesigned cross-event run | ⬜ After CE.3a | Fixes 2+4: event normalization, stratified split, patience=200; gate ≥50% |
+| CE.4 AGB+REDD features | ⬜ Blocked on data | Raw tiles not downloaded; see Data Pipeline section |
+| Per-country breakdown (temporal model) | ✅ Done | SUR=28.55×, ARG=9.31×, BRA=1.69×; excl. outliers: 10.89× |
+| Within-group pixel split (P1.1) | ❌ Abandoned | Geometric artifact (93–96% guaranteed by cluster geometry) |
 | Patch CC approach (H12) | ❌ Abandoned | Mega-blob artifact confirmed |
-| 10km grid diagnostic | ❌ Cancelled (out of scope) | CE.1/CE.2 is primary path |
-| Temporal stability per-year | ✅ Done (job 3818794) | 2017=7.81×, 2018=11.59×, **2019=0.99×**, **2020=0.50×**, 2021=1.74×, 2022=1.89×, **2023=6.77×**, **2024=9.02×** — Bolsonaro collapse confirmed |
-| Baselines (random, dist_wdpa, GSN_b2) | ✅ Done (job 3840332) | random=1.0×, naive=2.81×, full=6.54× |
-| AGB / carbon feature | ❌ Not added | TIF: `data/south_america/ready/AGB/agb_sa.tif` |
-| REDD feature | ❌ Not added | TIF: `data/south_america/ready/REDD/redd_sa.tif` |
-| SHAP analysis | ❌ Not run | Needs final model |
+| Temporal stability per-year | ✅ Done | 2017=7.81×, 2018=11.59×, 2019=0.99×, 2020=0.50×, 2021=1.74×, 2022=1.89×, 2023=6.77×, 2024=9.02× |
+| Baselines | ✅ Done | random=1.0×, naive=2.81×, full=6.54× |
+| SHAP analysis | ❌ Not run | Needs final model (after CE.3b/CE.4) |
 | KBA download + rasterise | ❌ Not done | Required for RQ3 |
 | Representation gap (RQ3) | ❌ Not quantified | THE paper finding |
-| Bootstrap CIs | ❌ Script written | Run after final model |
+| Bootstrap CIs | ❌ Not run | After final model |
 | Cross-regional transfer (USA, SE Asia) | ❌ Not run | Phase 5 |
 
 ---
@@ -148,31 +146,88 @@ The same spatial logic transfers to USA and SE Asia — universal pattern of gov
 
 ## Implementation Phases
 
-### Phase 1 — Cross-event Stage 2 model (IMMEDIATE PRIORITY)
+### Phase 1 — Cross-event Stage 2 model (IN PROGRESS — redesign based on CE.2 failure)
 
-**CE.1 — Write and run cross-event training script** ← DO THIS NOW
-- File: `scripts/regions/south_america/5_training/model1_LGBM_stage2_cross_event.py`
-- Enumerate all ~222 SA expansion events from train+test parquets
-- Filter: ≥200 positive pixels (~150 events remain)
-- Random 80/20 event split (seed=42): ~120 train events, ~30 test events
-- Load train events (neg_ratio=100), load test events (all pixels)
-- Train with H6+H1b+H5 settings; early-stop on 10% of train events held aside
-- Evaluate: Recall@5% and Lift@1% per test event, macro-average
-- **Run on Colombia first** (hours, not days) to confirm direction before full SA Euler run
-- Decision gate: if Colombia Recall@5% ≥ 60% → submit to Euler immediately
-- Output: `outputs/south_america/results/ml_models/model1_lgbm_stage2_cross_event_metrics_*.json`
+**CE.1 / CE.2 — Done but gate failed.** See Experiment History for full results and per-event breakdown.
 
-**CE.2 — Full SA cross-event run on Euler**
-- SLURM: `slurm/south_america/training_lgbm_stage2_cross_event.slurm`
-- Same spec as within-group SLURM (128GB, 16 CPUs, 12h)
-- If Recall@5% ≥ 65%: this is the paper model → proceed to CE.3
-- If Recall@5% < 50%: re-examine event filter threshold and feature set before proceeding
+---
 
-**CE.3 — Add AGB + REDD features to splits; retrain cross-event model**
-- TIFs exist: `data/south_america/ready/AGB/agb_sa.tif` and `redd_sa.tif`
-- Add `AGB_mean`, `AGB_max`, `REDD_value` to split construction script
-- Retrain cross-event model with new features
-- Check metric improvement + SHAP top features (does AGB enter top 10?)
+#### Root cause of CE.2 failure
+
+CE.2 macro Recall@5%=23.8%. This is the macro average across two structurally different event types:
+
+1. **Ecological campaigns** (large, spatially coherent, cost-minimisation logic): Recall@5%=49–93%. These events are what the model is designed to predict, and it does so well. Examples: Brazil 2009 (52.9%), Suriname 2015 (59.1%), Argentina 2023 (92.8%).
+2. **Political/legal designations** (court-ordered indigenous territories, scattered reclassifications, economic-crisis-driven designations): Recall@5%=0–12%. No landscape feature can predict which specific parcels are affected by a legal ruling or political deal. These events structurally resist prediction.
+
+The macro average mixes both types indiscriminately. The model is correct on class 1; class 2 is inherently unpredictable.
+
+**Three additional design flaws in CE.2 that suppressed performance:**
+1. **Training gradient imbalance (Fix 2)**: The current `inv_sqrt_npos` weights reduce gradient per-pixel within large events, but Brazil's 100K+ pixel events still contribute ~50× more total gradient signal than Colombia's 1K-pixel events. The model becomes biased toward "what Amazon pixels look like" and underfits smaller countries.
+2. **Early stopping failure (Fix 4)**: The model stopped at iteration 66 (vs 136 for the temporal model). This happened because the validation set contained too many class-2 events — no amount of training would improve recall on politically-driven events, so the early-stopping metric stalled and training terminated prematurely.
+3. **Unlucky random event split (Fix 4)**: Random seed=42 placed all of Argentina's early-2000s events (crisis years 2001-2005) in the test set. These are anomalous years (Argentine economic collapse, Dec 2001). A stratified split prevents this.
+
+---
+
+#### The four fixes
+
+**Fix 1 — Spatial coherence filter (CE.3a diagnostic first, then applied in CE.3b)**
+
+Ecological campaigns are spatially clustered (one big contiguous park). Political designations are geographically scattered (10 isolated parcels across the country for 10 different legal reasons). Measure this per event using pixel coordinates already in the parquet: coherence = fraction of positive pixels within 5 km of another positive pixel.
+
+**Important**: do NOT rely on min_positive_pixels alone as the filter. A 200-pixel designation of a coherent wetland is legitimate and predictable. A 10,000-pixel event of scattered parcels is not. Use coherence as the primary filter; min_positive_pixels stays at 200 (do not raise arbitrarily).
+
+**Fix 2 — Event-level gradient normalization (code change in cross_event training script)**
+
+Change weighting so each EVENT contributes equally to model training, regardless of pixel count. Currently:
+- `inv_sqrt_npos` per pixel → Brazil 155K-pixel event contributes ~333 total gradient units; Colombia 1K-pixel event contributes ~22 units (15× imbalance even after weighting)
+
+New formula: `weight_i = 1 / n_pos_in_group` (normalise each group's total gradient to 1.0). Combined with inv_sqrt_npos: `weight_i = 1 / (n_pos_in_group × sqrt(n_pos_in_group))`. Every event, regardless of size, contributes equal total signal to the model.
+
+This is a change in `compute_group_norm_weights()` in `scripts/regions/shared/training/stage2_lgbm_core.py`. Add a new mode `"event_norm"` (or `"inv_npos"`) alongside the existing `"inv_sqrt_npos"`.
+
+**Fix 3 — AGB + REDD features (CE.4 — blocked on data download, separate from CE.3b)**
+
+AGB (above-ground biomass) and REDD (proximity to carbon-market projects) are key missing features. They capture the carbon-market incentive mechanism that drives Amazon designation. High-carbon forests earn international payments under REDD+, making them preferential targets for PA designation.
+
+**Critical facts:**
+- Both features are **static** (not annually dynamic). AGB is an ESA CCI Biomass 2010 snapshot. REDD is a distance-to-project metric from the ID-RECCO V5.0 database (2023 snapshot). This is intentional — we want the structural signal (is this pixel in a carbon-rich forest?) not year-by-year biomass fluctuations.
+- **Neither is downloaded or in the current model.** Confirmed: raw ESA CCI tiles missing (`data/shared/ESA_CCI_Biomass/` empty); REDD directory empty. The current SA splits use 79 features (temporal model) or 83 features (CE.2 — 4 unidentified extra columns, definitely NOT AGB/REDD).
+- Fix 3 requires: (a) download raw data, (b) run rasterise scripts, (c) rebuild SA splits on Euler (42 GB rebuild job), (d) retrain.
+- This is a significant pipeline step — **CE.4 is the correct home for this**, running after CE.3b establishes the training design.
+
+**Fix 4 — Stratified event split + longer early-stop patience (code change)**
+
+- **Stratified split**: instead of random shuffle, group events by country, then sample 80/20 within each country. This prevents unlucky seeds from putting all of one country's anomalous years in the test set.
+- **Coherence-filtered validation set**: restrict the early-stopping validation set to high-coherence events only. The model can learn from political events in training (they provide some signal) but should not be stopped early because it fails on inherently unpredictable validation events.
+- **Patience=200** (was 100): the model gave up at iteration 66. More patience lets it find deeper signal in the ecological events.
+
+---
+
+#### Implementation plan
+
+**CE.3a — Spatial coherence diagnostic** ← IMMEDIATE (local, ~1h, no Euler needed)
+- Script: `scripts/regions/south_america/6_evaluation/stage2_event_coherence.py` (new)
+- Input: scored test parquet from CE.2 (`model1_lgbm_stage2_cross_event_20260618_170012.pkl`) + train/test parquets for positive pixel coordinates
+- For each of the 139 SA events: load positive pixel (row, col) coordinates; compute coherence = fraction within 5 km (5 pixels) of another positive; record (country_id, year, n_pos, coherence, recall_at_5pct_from_CE2)
+- Output: `outputs/south_america/results/ml_models/stage2_event_coherence_diagnostic.json`
+- Decision: find the coherence threshold above which events have median Recall@5% ≥ 30%; use that as the filter for CE.3b
+
+**CE.3b — Redesigned cross-event run on Euler** ← AFTER CE.3a
+- Implement Fix 2 (event normalization) in `stage2_lgbm_core.py`
+- Implement Fix 4 (stratified split, coherence-filtered validation, patience=200) in `model1_LGBM_stage2_cross_event.py`
+- Apply Fix 1 coherence filter (threshold from CE.3a); keep min_positive_pixels=200
+- SLURM: update `slurm/south_america/training_lgbm_stage2_cross_event.slurm`
+- Decision gate: macro Recall@5% on coherent-event test set ≥ 50% → proceed to CE.4
+- Decision gate: if < 40% → investigate WDPA designation_type filter (separate diagnostic)
+
+**CE.4 — Add AGB + REDD; retrain** ← AFTER CE.3b passes; blocked on data
+- Download ESA CCI Biomass v4.0 tiles from CEDA (requires free registration)
+- Download ID-RECCO V5.0 from reddprojectsdatabase.org (zip may be available locally — recheck)
+- Run: `scripts/regions/south_america/2_preprocessing/agb_rasterise.py`
+- Run: `scripts/regions/south_america/2_preprocessing/redd_rasterise.py`
+- Rebuild SA splits on Euler to inject AGB + REDD columns (42 GB rebuild)
+- Retrain with CE.3b settings; check AGB/REDD importance in SHAP
+- Decision gate: AGB or REDD enters top-10 SHAP features → confirmed as mechanism for paper
 
 ---
 
@@ -271,26 +326,56 @@ Do not begin until:
 
 | Priority | Task | Status | Blocks |
 |---|---|---|---|
-| **1** | Cross-event script — Colombia pilot (CE.1) | 🔄 Job 3841212 running | Everything |
-| **2** | Cross-event full SA on Euler (CE.2) | 🔄 Job 3841647 queued | Paper model |
-| **3** | Add AGB+REDD; retrain cross-event (CE.3) | ⬜ After CE.2 | SHAP, narrative |
-| **4** | KBA download + rasterise (P3.1) | ⬜ Start any time (independent) | RQ3 |
-| **5** | SHAP global beeswarm (P2.1) | ⬜ After CE.3 | Core paper story |
-| **6** | Temporal SHAP pre/post-Paris (P2.2) | ⬜ After P2.1 | Bold finding B |
-| **7** | Country-level SHAP (P2.3) | ⬜ After P2.1 | Paper nuance |
-| **8** | Score vs biodiversity priority (P3.2) | ⬜ After P2.1 + P3.1 | RQ3 figure |
-| **9** | Forward projection KBA headline (P3.3) | ⬜ After P3.2 | Headline number |
-| **10** | Country scorecard (P3.4) | ⬜ After Stage 1 + P3.3 | Bold finding C |
-| **11** | Bootstrap CIs (P4.1) | ⬜ After CE.2 | Statistical rigor |
-| **12** | Temporal stability per-year (P4.2) | ✅ Done (job 3818794) | Bolsonaro collapse confirmed (see Current State) |
-| **13** | Cross-regional transfer (P4.3) | ⬜ After CE.3 | Claim 5 |
-| **14** | Baselines comparison (P1.4) | ✅ Done | random=1.0×, naive=2.81×, full=6.54× |
-| **15** | Forward maps + KBA overlay (P5.2–P5.4) | ⬜ After CE.3 | Figure 3 |
-| **16** | Paper writing (Phase 6) | ⬜ After all above | — |
+| **Priority** | **Task** | **Status** | **Blocks** |
+| 1 | CE.3a Spatial coherence diagnostic (local, ~1h) | ⬜ IMMEDIATE | CE.3b threshold |
+| 2 | CE.3b Redesigned CE run (Fix 1+2+4: coherence filter, event norm, stratified split, patience=200) | ⬜ After CE.3a | Paper model |
+| 3 | CE.4 AGB+REDD: download → rasterise → split rebuild → retrain | ⬜ After CE.3b passes; **blocked on data download** | Features + SHAP |
+| 4 | KBA download + rasterise (P3.1) | ⬜ Start any time — no model dependency | RQ3 |
+| 5 | SHAP global beeswarm (P2.1) | ⬜ After CE.4 | Paper mechanism story |
+| 6 | Temporal SHAP pre/post-Paris (P2.2) | ⬜ After P2.1 | Carbon-market finding |
+| 7 | Country-level SHAP (P2.3) | ⬜ After P2.1 | Brazil vs Andean nuance |
+| 8 | Score vs biodiversity priority (P3.2) | ⬜ After P2.1 + P3.1 | RQ3 figure |
+| 9 | Forward projection KBA headline (P3.3) | ⬜ After P3.2 | Headline number |
+| 10 | Country scorecard (P3.4) | ⬜ After Stage 1 + P3.3 | Policy finding |
+| 11 | Bootstrap CIs (P4.1) | ⬜ After CE.3b | Statistical rigour |
+| 12 | Temporal stability per-year (P4.2) | ✅ Done | Bolsonaro collapse documented |
+| 13 | Cross-regional transfer SA→USA→SEA (P4.3) | ⬜ After CE.4 | Claim 5 |
+| 14 | Baselines (P1.4) | ✅ Done | random=1.0×, naive=2.81×, full=6.54× |
+| 15 | Forward maps + KBA overlay (P5.2–P5.4) | ⬜ After CE.4 | Figure 3 |
+| 16 | Paper writing (Phase 6) | ⬜ After all above | — |
 
 ---
 
 ## Full Experiment History
+
+### Stage 2 cross-event experiments (2026-06-18)
+
+| Experiment | macro R@5% | weighted R@5% | macro Lift@1% | n_test_events | Verdict |
+|---|---|---|---|---|---|
+| CE.1 Colombia pilot (country_id=5 only, min_pos=200) | 16.8% | 11.8% | 5.26× | 4 | ❌ gate FAILED (<60%); within-Colombia cross-time only |
+| CE.2 Full SA (13 countries, min_pos=200, 83 feat) | 23.8% | 41.6% | 6.05× | 28 | ❌ gate FAILED (<65%); macro vs weighted gap is large |
+
+**Per-event pattern (CE.2 full SA test events)**:
+
+| Event | n_pos | Recall@5% | Lift@1% | Note |
+|---|---|---|---|---|
+| (1, 2023) | 320 | 92.8% | 49.1× | Best — tiny but geographically coherent |
+| (10, 2015) | 17581 | 59.1% | 21.7× | Excellent large event |
+| (3, 2009) | 155630 | 52.9% | 13.8× | Strong Brazil event |
+| (3, 2005) | 111429 | 49.4% | 8.9× | Good Brazil |
+| (6, 2019) | 297 | 48.8% | 17.2× | Small but coherent |
+| (6, 2002) | 300 | 46.7% | 0.67× | OK recall, weak lift |
+| (5, 2009) | 14079 | 32.5% | 8.3× | Decent Colombia |
+| (3, 2024) | 866 | 23.2% | 6.7× | Moderate |
+| (1, 2005) | 6050 | 17.5% | 12.1× | OK recall, high lift |
+| (1, 2003) | 10349 | 17.2% | 3.6× | Moderate |
+| Many country 1 and 2 events | varies | 2–6% | 0–0.1× | Near-zero: model fails |
+
+**Structural diagnosis**: Macro recall (23.8%) is dragged down by small-count or geographically-scattered events (many near-zero). Weighted recall (41.6%) reflects that large, ecologically-coherent events (Brazil mass designations, Argentina large parks) perform well. The gap reveals **event heterogeneity**: cost-minimisation logic predicts large coherent campaigns; it cannot explain small politically-idiosyncratic designations.
+
+**Key question for next step**: Is raising min_positive_pixels (e.g., ≥5,000) the right filter, or should weighted recall replace macro as the headline metric?
+
+---
 
 ### Stage 2 pixel-level experiments (full SA unless noted)
 
@@ -354,29 +439,50 @@ Do not begin until:
 | Early stopping | Recall@5% within groups (H6) | Directly optimises target metric |
 | Sample weights | inv_sqrt_npos (H1b) | Gradient deconcentration across groups |
 | Rank normalisation | Off (H5) | Absolute features carry cross-country signal |
-| Hyperparameter retuning | Only after feature set locked | Early retune catastrophic (2.85× → 2.06×) |
+| Hyperparameter retuning | Only after AGB+REDD features locked (post CE.4) | Early retune catastrophic (2.85× → 2.06×) |
 | Ensembles | Forbidden | Supervisor directive |
 | Patch CC approach | Abandoned | Mega-blob artifact, structurally degenerate |
 | Paper framing | Representation gap is the finding; prediction model is the tool | Core strategic decision |
 | Naive baselines | Must be documented | Required for any top journal |
+| min_positive_pixels | Stay at 200; do NOT raise as primary filter | Small coherent events are scientifically valid; use coherence filter instead |
+| Sample weighting | Change to event-level norm (Fix 2) after CE.3b validation | inv_sqrt_npos alone creates 50× gradient imbalance between large/small events |
+| Event split | Stratified by country (Fix 4) | Random seed=42 placed Argentina crisis years entirely in test set |
+| AGB / REDD features | Static features (2010 AGB snapshot, 2023 REDD database) — intentional | Annual dynamics not needed; structural signal is what drives designation |
 
 ---
 
 ## Data Paths
 
-| Dataset | Location |
-|---|---|
-| SA pixel splits (42 GB) | `euler:$SCRATCH/data/south_america/ml/main/{train,earlystop,test}.parquet` |
-| SA merged panel (57 GB) | `euler:$SCRATCH/data/south_america/ml/merged_panel_final.parquet` |
-| Temporal model (H6+H1b+H5) | `data/south_america/ml/models/model1_lgbm_stage2_20260617_011621.pkl` |
-| USA pixel splits | `euler:$SCRATCH/data/usa/ml/main/{train,earlystop,test}.parquet` |
-| SE Asia pixel splits | `euler:$SCRATCH/data/se_asia/ml/main/{train,earlystop,test}.parquet` |
-| AGB TIF | `data/south_america/ready/AGB/agb_sa.tif` |
-| REDD TIF | `data/south_america/ready/REDD/redd_sa.tif` |
-| Colombia dev panel | `euler:$SCRATCH/data/dev/south_america/ml/main/` |
-| Feature ablation log | `outputs/south_america/results/feature_ablation_sa.json` |
-| Forward scored (existing) | `euler:$SCRATCH/outputs/south_america/forward_scored_2024.parquet` |
-| MapBiomas Brazil | Google Drive (verify format/coverage before committing) |
+| Dataset | Location | Status |
+|---|---|---|
+| SA pixel splits (42 GB) | `euler:$SCRATCH/data/south_america/ml/main/{train,earlystop,test}.parquet` | ✅ Ready (79 confirmed features; 4 unidentified extra in CE.2 run — investigate) |
+| SA merged panel (57 GB) | `euler:$SCRATCH/data/south_america/ml/merged_panel_final.parquet` | ✅ Ready |
+| Temporal model (H6+H1b+H5) | `data/south_america/ml/models/model1_lgbm_stage2_20260617_011621.pkl` | ✅ Locked baseline |
+| CE.2 cross-event models | `data/south_america/ml/models/model1_lgbm_stage2_cross_event_*.pkl` | ✅ 3 files (2 × Colombia, 1 × SA) |
+| USA pixel splits | `euler:$SCRATCH/data/usa/ml/main/{train,earlystop,test}.parquet` | ✅ Ready |
+| SE Asia pixel splits | `euler:$SCRATCH/data/se_asia/ml/main/{train,earlystop,test}.parquet` | ✅ Ready |
+| AGB raw tiles | `data/shared/ESA_CCI_Biomass/` | ❌ **Not downloaded** — ESA CCI Biomass v4.0 (2010), CEDA registration required |
+| AGB TIF (processed) | `data/south_america/ready/AGB/agb_sa.tif` | ❌ **Does not exist** — run `agb_rasterise.py` after download |
+| REDD raw data | `data/REDD/` | ❌ **Not downloaded** (or empty) — ID-RECCO V5.0 from reddprojectsdatabase.org |
+| REDD TIF (processed) | `data/south_america/ready/REDD/redd_sa.tif` | ❌ **Does not exist** — run `redd_rasterise.py` after download |
+| Colombia dev panel | `euler:$SCRATCH/data/dev/south_america/ml/main/` | ✅ Ready (79 features) |
+| Forward scored (existing) | `euler:$SCRATCH/outputs/south_america/forward_scored_2024.parquet` | ✅ Exists |
+| MapBiomas Brazil | Google Drive | ⚠️ Verify format/coverage before committing |
+
+### AGB and REDD: what they are and why they're blocked
+
+**AGB (Above-Ground Biomass)** — ESA CCI Biomass v4.0, 2010 vintage. Static single-year snapshot. Forest biomass changes slowly, so the 2010 snapshot captures the structural signal without temporal leakage. This is intentional: we want "is this pixel in a carbon-rich forest?" not year-by-year flux. Feature column: `agb_tonne_ha`.
+
+**REDD** — ID-RECCO V5.0 database of REDD+ project centroids. Produces `dist_redd_km` = distance to nearest REDD+ project. Static (database snapshot, 2023). Captures carbon-market geography: pixels near REDD+ projects face higher designation pressure from international financing.
+
+**Why these matter for the model**: Carbon market incentives (REDD+, Paris Agreement NDCs) are a primary driver of Amazon PA designation. The model currently cannot distinguish a carbon-rich forest (high REDD+ value) from a grassland at the same location — these features close that gap. Expected effect: significant improvement on Brazil/Peru/Bolivia events (Amazon-heavy), possibly entering top-5 SHAP features.
+
+**Pipeline steps required before CE.4**:
+1. Download ESA CCI Biomass tiles → `data/shared/ESA_CCI_Biomass/`
+2. Download ID-RECCO V5.0 zip → `data/REDD/`
+3. Run `scripts/regions/south_america/2_preprocessing/agb_rasterise.py`
+4. Run `scripts/regions/south_america/2_preprocessing/redd_rasterise.py`
+5. Rebuild SA splits on Euler: inject AGB and REDD columns into train/earlystop/test.parquet (42 GB rebuild job, ~4h on Euler)
 
 **CRS note**: All rasterise scripts must use `gdf.to_crs(epsg=3857)` and `CRS.from_epsg(3857)`. Backbone CRS is LOCAL_CS; `crs.to_epsg()` returns None.
 
@@ -384,10 +490,11 @@ Do not begin until:
 
 ## Out of Scope
 
-- Hyperparameter tuning — only after AGB + final feature set validated
+- Hyperparameter tuning — only after AGB + REDD features locked and CE.4 validated
 - SE Asia Stage 2 full training — zero-shot transfer only (Phase 4)
 - Neural networks, ensembles — Paper 2
 - Tropical Africa — Paper 2
-- 10km grid rebuild — viable only if CE.1/CE.2 disappoints; run P4.1 diagnostic first
-- MapBiomas Brazil — deferred; cross-event model may resolve Brazil performance
-- Rolling spatial PA profile feature (P4.2 old numbering) — low priority vs RQ3
+- 10km grid rebuild — viable only if CE.3b + CE.4 both disappoint; last resort
+- MapBiomas Brazil — deferred; cross-event model with AGB/REDD may resolve Brazil performance
+- Rolling spatial PA profile feature — low priority vs RQ3
+- Raising min_positive_pixels as a primary filter — a 200-pixel designation can be scientifically significant; use spatial coherence filter instead
