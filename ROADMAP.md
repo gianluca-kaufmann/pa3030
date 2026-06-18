@@ -5,13 +5,14 @@
 > **Current state (2026-06-18)**:
 > - ✅ Stage 1 Poisson GLM: complete, D²=0.345
 > - ✅ Stage 2 temporal model (H6+H1b+H5): locked at Lift@1%=6.46×, Recall@5%=15.7%
-> - ✅ P1.3 per-country breakdown: done — Brazil=1.69×, SUR=28.55×, ARG=9.31× (see Experiment History)
-> - ✅ P1.1 within-group: diagnosed geometric artifact, cancelled (was job 3808266)
+> - ✅ P1.3 per-country breakdown: done — Brazil=1.69×, SUR=28.55×, ARG=9.31×
+> - ✅ P1.1 within-group: geometric artifact, cancelled
+> - ✅ Temporal stability: done — 2017=7.81×, 2018=11.59×, 2019=0.99×, 2020=0.50×, 2021=1.74×, 2022=1.89×, 2023=6.77×, 2024=9.02×
+> - ✅ Baselines: done — random=1.0×, naive(dist_wdpa)=2.81×, full model=6.54×
 > - ✅ CE.1 cross-event script implemented: `5_training/model1_LGBM_stage2_cross_event.py`
-> - 🔄 CE.1 Colombia pilot: running locally — **result pending**
-> - 🔄 Job 3840332: baselines comparison, queued (resubmitted standalone)
-> - 🔄 Job 3818794: temporal stability per-year, **now running** (freed by job cancellation)
-> - **NEXT ACTION**: wait for Colombia pilot result → if Recall@5% ≥ 60%, `sbatch slurm/south_america/training_lgbm_stage2_cross_event.slurm`
+> - 🔄 Job 3841212: CE.1 Colombia pilot running on Euler (4h wall, result pending)
+> - 🔄 Job 3841647: CE.2 full SA cross-event queued on Euler (12h wall, pending)
+> - **NEXT ACTION**: check results of 3841212 and 3841647 → record in Experiment History below
 
 ---
 
@@ -109,13 +110,13 @@ Brazil's Bolsonaro-era events (2019–2022) are ~3–4 of the 30 test events (10
 |---|---|---|
 | Stage 1 Poisson GLM | ✅ Complete | D²=0.345 (SA 7yr OOS) |
 | Stage 2 temporal model (H6+H1b+H5) | ✅ Working | Lift@1%=6.46×, Recall@5%=15.7%, iter=136 |
-| Stage 2 cross-event model | 🔄 Colombia pilot running | `5_training/model1_LGBM_stage2_cross_event.py` |
+| Stage 2 cross-event model | 🔄 Colombia job 3841212, SA job 3841647 | results pending |
 | Per-country breakdown (temporal model) | ✅ Done | SUR=28.55×, ARG=9.31×, BRA=1.69× (see history) |
 | Within-group pixel split (P1.1) | ✅ Done — **abandoned** | 93–96% Recall — geometric artifact |
 | Patch CC approach (H12) | ❌ Abandoned | Mega-blob artifact confirmed |
 | 10km grid diagnostic | ❌ Cancelled (out of scope) | CE.1/CE.2 is primary path |
 | Temporal stability per-year | ✅ Done (job 3818794) | 2017=7.81×, 2018=11.59×, **2019=0.99×**, **2020=0.50×**, 2021=1.74×, 2022=1.89×, **2023=6.77×**, **2024=9.02×** — Bolsonaro collapse confirmed |
-| Baselines (random, dist_wdpa, GSN_b2) | 🔄 Job 3840332 queued | Required for paper |
+| Baselines (random, dist_wdpa, GSN_b2) | ✅ Done (job 3840332) | random=1.0×, naive=2.81×, full=6.54× |
 | AGB / carbon feature | ❌ Not added | TIF: `data/south_america/ready/AGB/agb_sa.tif` |
 | REDD feature | ❌ Not added | TIF: `data/south_america/ready/REDD/redd_sa.tif` |
 | SHAP analysis | ❌ Not run | Needs final model |
@@ -270,8 +271,8 @@ Do not begin until:
 
 | Priority | Task | Status | Blocks |
 |---|---|---|---|
-| **1** | Cross-event script — Colombia pilot (CE.1) | 🔄 **Running locally** | Everything |
-| **2** | Cross-event full SA on Euler (CE.2) | ⬜ After CE.1 ≥60% on Colombia | Paper model |
+| **1** | Cross-event script — Colombia pilot (CE.1) | 🔄 Job 3841212 running | Everything |
+| **2** | Cross-event full SA on Euler (CE.2) | 🔄 Job 3841647 queued | Paper model |
 | **3** | Add AGB+REDD; retrain cross-event (CE.3) | ⬜ After CE.2 | SHAP, narrative |
 | **4** | KBA download + rasterise (P3.1) | ⬜ Start any time (independent) | RQ3 |
 | **5** | SHAP global beeswarm (P2.1) | ⬜ After CE.3 | Core paper story |
@@ -281,9 +282,9 @@ Do not begin until:
 | **9** | Forward projection KBA headline (P3.3) | ⬜ After P3.2 | Headline number |
 | **10** | Country scorecard (P3.4) | ⬜ After Stage 1 + P3.3 | Bold finding C |
 | **11** | Bootstrap CIs (P4.1) | ⬜ After CE.2 | Statistical rigor |
-| **12** | Temporal stability per-year (P4.2) | 🔄 Job 3818794 running | Robustness supplement |
+| **12** | Temporal stability per-year (P4.2) | ✅ Done (job 3818794) | Bolsonaro collapse confirmed (see Current State) |
 | **13** | Cross-regional transfer (P4.3) | ⬜ After CE.3 | Claim 5 |
-| **14** | Baselines comparison (P1.4) | 🔄 Job 3818806 pending | Paper table |
+| **14** | Baselines comparison (P1.4) | ✅ Done | random=1.0×, naive=2.81×, full=6.54× |
 | **15** | Forward maps + KBA overlay (P5.2–P5.4) | ⬜ After CE.3 | Figure 3 |
 | **16** | Paper writing (Phase 6) | ⬜ After all above | — |
 
