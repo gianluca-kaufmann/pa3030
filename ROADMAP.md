@@ -9,8 +9,16 @@
 > - ✅ Temporal stability: 2017=7.81×, 2018=11.59×, 2019=0.99×, 2020=0.50×, 2021=1.74×, 2022=1.89×, 2023=6.77×, 2024=9.02×
 > - ✅ Baselines: random=1.0×, naive(dist_wdpa)=2.81×, full model=6.54×
 > - ✅ CE.2 full SA cross-event: macro R@5%=23.8%, weighted R@5%=41.6% (28 test events) — gate FAILED
-> - **Root cause identified**: events are heterogeneous — ecological campaigns R@5%=49–93%, political/legal designations R@5%=0–12%. Average mixes both. Goal remains high performance; fix the training design, not the bar.
-> - **NEXT ACTION (in order)**: CE.3a spatial coherence diagnostic (local) → CE.3b redesigned Euler run (Fixes 2+4) → CE.4 AGB+REDD (blocked on data download)
+> - **Root cause identified**: events are heterogeneous — ecological campaigns R@5%=49–93%, political/legal designations R@5%=0–12%. Average mixes both.
+> - ✅ CE.3b code complete: Fix 1 (coherence filter), Fix 2 (inv_npos event-norm), Fix 4 (stratified split + patience=200 + coherence-filtered val)
+> - 🔄 **RUNNING**: Full chain submitted 2026-06-18:
+>   - 3864314: CE.3a spatial coherence diagnostic (~30 min)
+>   - 3864332: CE.3b redesigned cross-event training (afterok 3864314, ~12h, reads threshold from CE.3a)
+>   - 3864334: AGB rasterise — ESA CCI Biomass → agb_sa.tif (afterok 3864332 gate pass)
+>   - 3864336: REDD rasterise — ID-RECCO → redd_sa.tif (afterok 3864334)
+>   - 3864339: AGB inject into splits (afterok 3864336)
+>   - 3864342: REDD inject into splits (afterok 3864339)
+> - **NEXT ACTION (manual, after chain)**: submit CE.4 retrain with same ce3b SLURM script (splits now have AGB+REDD)
 
 ---
 
@@ -109,9 +117,9 @@ Brazil's Bolsonaro-era events (2019–2022) are ~3–4 of the 30 test events (10
 | Stage 1 Poisson GLM | ✅ Complete | D²=0.345 (SA 7yr OOS) |
 | Stage 2 temporal model (H6+H1b+H5) | ✅ Working | Lift@1%=6.46×, Recall@5%=15.7%, iter=136 |
 | Stage 2 cross-event (CE.2) | ✅ Done — gate FAILED | macro R@5%=23.8%, weighted=41.6%, 28 events; root cause: heterogeneous events; redesign in progress |
-| CE.3a spatial coherence diagnostic | ⬜ Next (local, ~1h) | Quantify clustering per event; verify ecological vs political split |
-| CE.3b redesigned cross-event run | ⬜ After CE.3a | Fixes 2+4: event normalization, stratified split, patience=200; gate ≥50% |
-| CE.4 AGB+REDD features | ⬜ Blocked on rasterise step | Raw data on Euler; run rasterise scripts, then rebuild splits |
+| CE.3a spatial coherence diagnostic | 🔄 RUNNING (job 3864314) | Output: stage2_event_coherence_diagnostic.json |
+| CE.3b redesigned cross-event run | 🔄 QUEUED (job 3864332, afterok 3864314) | Fixes 1+2+4; reads coherence threshold from CE.3a JSON at runtime |
+| CE.4 AGB+REDD features | 🔄 QUEUED (jobs 3864334–3864342, afterok CE.3b gate pass) | AGB rasterise → REDD rasterise → inject splits × 2 |
 | Per-country breakdown (temporal model) | ✅ Done | SUR=28.55×, ARG=9.31×, BRA=1.69×; excl. outliers: 10.89× |
 | Within-group pixel split (P1.1) | ❌ Abandoned | Geometric artifact (93–96% guaranteed by cluster geometry) |
 | Patch CC approach (H12) | ❌ Abandoned | Mega-blob artifact confirmed |

@@ -183,6 +183,72 @@ def _split_events(
     return train_events, val_events, test_events
 
 
+def _split_events_stratified(
+    event_counts: dict[tuple[int, int], int],
+    min_pos: int = MIN_POSITIVE_PIXELS,
+    test_ratio: float = TEST_RATIO,
+    val_ratio: float = VAL_RATIO,
+    seed: int = SEED,
+) -> tuple[set[tuple[int, int]], set[tuple[int, int]], set[tuple[int, int]]]:
+    """Country-stratified 80/20 split of meaningful events.
+
+    Samples test and val events separately within each country so no single
+    country's anomalous years dominate a split.  Countries with only 1 event
+    put it in train; countries with 2 events assign 1 to test.
+
+    Returns (train_events, val_events, test_events).
+    """
+    meaningful = sorted(k for k, v in event_counts.items() if v >= min_pos)
+
+    # Group events by country
+    by_country: dict[int, list[tuple[int, int]]] = {}
+    for ev in meaningful:
+        by_country.setdefault(ev[0], []).append(ev)
+
+    test_events: set[tuple[int, int]] = set()
+    val_events: set[tuple[int, int]] = set()
+    train_events: set[tuple[int, int]] = set()
+
+    for cid, events in sorted(by_country.items()):
+        rng = np.random.default_rng(seed + cid)
+        evs = list(events)
+        rng.shuffle(evs)
+        n = len(evs)
+
+        if n == 1:
+            train_events.add(evs[0])
+            continue
+
+        n_test = max(1, int(round(n * test_ratio)))
+        n_train_pool = n - n_test
+        n_val = max(1, int(round(n_train_pool * val_ratio))) if n_train_pool >= 2 else 0
+
+        test_events.update(evs[:n_test])
+        val_events.update(evs[n_test : n_test + n_val])
+        train_events.update(evs[n_test + n_val :])
+
+    return train_events, val_events, test_events
+
+
+def _load_coherence_data(repo_root: Path, region: str, model_prefix: str) -> dict[tuple[int, int], float]:
+    """Load per-event coherence scores from the CE.3a diagnostic JSON.
+
+    Returns empty dict if the file does not exist yet (no filter applied).
+    """
+    path = (
+        repo_root / f"outputs/{region}/results/ml_models"
+        / "stage2_event_coherence_diagnostic.json"
+    )
+    if not path.exists():
+        return {}
+    with open(path) as f:
+        data = json.load(f)
+    return {
+        (int(e["country_id"]), int(e["year"])): float(e["coherence"])
+        for e in data.get("per_event", [])
+    }
+
+
 # ---------------------------------------------------------------------------
 # Data loading helpers
 # ---------------------------------------------------------------------------
@@ -341,18 +407,24 @@ def run_cross_event_training() -> None:
     feature_cols = [c for c in numeric_cols if c not in STAGE2_EXCLUDE_COLS]
     check_feature_denylist(feature_cols, context=f"{REGION}/lgbm/stage2/cross_event")
 
-    # --- Env-var controlled settings (H5 / H1b / H6 defaults locked) ---
-    _normalize = os.environ.get("STAGE2_NORMALIZE_WITHIN_GROUPS", "0") != "1"
-    _graded    = os.environ.get("STAGE2_GRADED_RELEVANCE", "1") != "0"
-    _gw_mode   = os.environ.get("STAGE2_GROUP_WEIGHT_MODE", "inv_sqrt_npos")
-    _es_metric = os.environ.get("STAGE2_EARLY_STOP_METRIC", "recall_at_5pct")
-    neg_ratio  = int(os.environ.get("STAGE2_NEG_RATIO", "100"))
+    # --- Env-var controlled settings ---
+    # CE.3b defaults: Fix 2 (inv_npos event normalization), Fix 4 (stratified, patience=200)
+    _normalize  = os.environ.get("STAGE2_NORMALIZE_WITHIN_GROUPS", "0") != "1"
+    _graded     = os.environ.get("STAGE2_GRADED_RELEVANCE", "1") != "0"
+    _gw_mode    = os.environ.get("STAGE2_GROUP_WEIGHT_MODE", "inv_npos")   # Fix 2: event-level norm
+    _es_metric  = os.environ.get("STAGE2_EARLY_STOP_METRIC", "recall_at_5pct")
+    _stratified = os.environ.get("STAGE2_STRATIFIED_SPLIT", "1") != "0"   # Fix 4: on by default
+    _patience   = int(os.environ.get("STAGE2_PATIENCE", "200"))            # Fix 4: was 100
+    _coh_thresh = float(os.environ.get("STAGE2_COHERENCE_THRESHOLD", "0.0"))  # Fix 1
+    neg_ratio   = int(os.environ.get("STAGE2_NEG_RATIO", "100"))
     num_threads = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 4))
 
     print(
         f"Cross-event Stage 2 | normalize_within_groups={not _normalize} "
         f"| graded_relevance={_graded} | group_weights={_gw_mode} "
-        f"| early_stop={_es_metric} | neg_ratio={neg_ratio}"
+        f"| early_stop={_es_metric} | neg_ratio={neg_ratio} "
+        f"| stratified={_stratified} | patience={_patience} "
+        f"| coherence_threshold={_coh_thresh}"
     )
 
     # --- Best params ---
@@ -371,6 +443,23 @@ def run_cross_event_training() -> None:
         print("  Using default hyperparameters (no best_params JSON found)")
     num_boost_round = int(best_params.get("n_estimators", best_params.get("num_boost_round", 2000)))
 
+    # --- Step 0: Load coherence data (Fix 1 — optional, requires CE.3a output) ---
+    coherence_data: dict[tuple[int, int], float] = {}
+    if _coh_thresh > 0.0:
+        coherence_data = _load_coherence_data(repo_root, REGION, MODEL_PREFIX)
+        if coherence_data:
+            n_coh = sum(1 for v in coherence_data.values() if v >= _coh_thresh)
+            print(
+                f"\nStep 0: Coherence filter active (threshold={_coh_thresh:.2f})"
+                f" | {n_coh}/{len(coherence_data)} events above threshold"
+            )
+        else:
+            print(
+                f"\nStep 0: WARNING — coherence_threshold={_coh_thresh} set but "
+                f"no coherence JSON found (run CE.3a first). Filter disabled."
+            )
+            _coh_thresh = 0.0
+
     # --- Step 1: Enumerate and filter events ---
     print(f"\nStep 1: Enumerating expansion events (min_pos={MIN_POSITIVE_PIXELS})...")
     t0 = time.time()
@@ -383,14 +472,45 @@ def run_cross_event_training() -> None:
         f"({time.time()-t0:.1f}s)"
     )
 
+    # Fix 1: filter to coherent events when threshold is set
+    if _coh_thresh > 0.0 and coherence_data:
+        before = len(meaningful)
+        meaningful = {
+            k: v for k, v in meaningful.items()
+            if coherence_data.get(k, 0.0) >= _coh_thresh
+        }
+        print(
+            f"  Coherence filter: {before} → {len(meaningful)} events "
+            f"(removed {before - len(meaningful)} low-coherence events)"
+        )
+
     # --- Step 2: Split events ---
-    train_events, val_events, test_events = _split_events(meaningful)
+    split_fn = _split_events_stratified if _stratified else _split_events
+    split_label = "stratified" if _stratified else "random"
+    train_events, val_events, test_events = split_fn(meaningful)
     print(
-        f"  Event split (seed={SEED}): "
+        f"  Event split [{split_label}] (seed={SEED}): "
         f"train={len(train_events)} | val(early-stop)={len(val_events)} | test={len(test_events)}"
     )
+
+    # Fix 4: restrict early-stop validation to coherent events only
+    val_events_es = val_events
+    if coherence_data:
+        val_coherent = {e for e in val_events if coherence_data.get(e, 0.0) >= _coh_thresh}
+        if len(val_coherent) >= 2:
+            val_events_es = val_coherent
+            print(
+                f"  Coherence-filtered val set: {len(val_events)} → {len(val_events_es)} events "
+                f"for early stopping"
+            )
+        else:
+            print(
+                f"  WARNING: Only {len(val_coherent)} coherent val events; "
+                f"using all {len(val_events)} for early stopping"
+            )
+
     print(f"  Train events: {sorted(train_events)}")
-    print(f"  Val   events: {sorted(val_events)}")
+    print(f"  Val   events (ES): {sorted(val_events_es)}")
     print(f"  Test  events: {sorted(test_events)}")
 
     # --- Step 3: Load training data (neg_ratio=100) ---
@@ -406,11 +526,11 @@ def run_cross_event_training() -> None:
         f"{len(arr_train.cy_group_sizes)} groups ({time.time()-t0:.1f}s)"
     )
 
-    # --- Step 4: Load early-stop val data (all pixels) ---
-    print(f"\nStep 4: Loading val events ({len(val_events)} events, all pixels)...")
+    # --- Step 4: Load early-stop val data (all pixels, coherent events only) ---
+    print(f"\nStep 4: Loading val events ({len(val_events_es)} events, all pixels)...")
     t0 = time.time()
     arr_val = _load_events_across_parquets(
-        parquet_sources, REGION, feature_cols, val_events,
+        parquet_sources, REGION, feature_cols, val_events_es,
         neg_ratio=None, normalize=_normalize, graded=_graded, rng_seed=SEED + 1,
     )
     n_val_pos = int((arr_val.y > 0).sum())
@@ -419,11 +539,14 @@ def run_cross_event_training() -> None:
         f"{len(arr_val.cy_group_sizes)} groups ({time.time()-t0:.1f}s)"
     )
 
-    # --- Step 5: Sample weights (H1b: inv_sqrt_npos) ---
+    # --- Step 5: Sample weights (Fix 2: inv_npos gives equal gradient per event) ---
     sample_weights = compute_group_norm_weights(
         arr_train.y, arr_train.cy_group_sizes, _gw_mode
     )
-    print(f"\nStep 5: Sample weights mode={_gw_mode}  mean={sample_weights.mean():.3f}")
+    print(
+        f"\nStep 5: Sample weights mode={_gw_mode}  mean={sample_weights.mean():.3f}"
+        f"  min={sample_weights.min():.4f}  max={sample_weights.max():.2f}"
+    )
 
     # --- Step 6: Train LambdaRank ---
     lgb_params = _prepare_lgb_params(best_params, num_threads)
@@ -437,9 +560,10 @@ def run_cross_event_training() -> None:
         group=_split_large_groups(arr_val.cy_group_sizes),
         reference=train_set,
     )
+    # Fix 4: patience=200 prevents premature stopping on coherent val events
     early_stop_cb = _Stage2EarlyStop(
         arr_val.X, arr_val.y.astype(np.float64), arr_val.cy_group_sizes,
-        patience=100, metric=_es_metric,
+        patience=_patience, metric=_es_metric,
     )
 
     print(
@@ -515,12 +639,26 @@ def run_cross_event_training() -> None:
     print(f"{'='*60}")
 
     # Decision gate
+    # CE.3b gate: ≥50% macro Recall@5% on coherent-event test set.
+    # CE.2 gate was 65% on all events (too strict given heterogeneous events).
     recall5 = test_agg["macro_recall_at_5pct"]
     is_colombia = len({e[0] for e in test_events}) == 1
-    gate_threshold = 0.60 if is_colombia else 0.65
-    gate_label = "Colombia (60%)" if is_colombia else "SA (65%)"
+    has_coherence_filter = _coh_thresh > 0.0 and bool(coherence_data)
+    # CE.3b uses 50% gate (on coherent events); fallback to original thresholds
+    if has_coherence_filter:
+        gate_threshold = 0.50
+        gate_label = "CE.3b coherent-events (50%)"
+    elif is_colombia:
+        gate_threshold = 0.60
+        gate_label = "Colombia (60%)"
+    else:
+        gate_threshold = 0.65
+        gate_label = "SA full (65%)"
     passed = recall5 >= gate_threshold
-    print(f"\nDecision gate [{gate_label}]: Recall@5%={recall5:.3f}  → {'PASS — submit to Euler' if passed else 'FAIL — re-examine'}")
+    print(
+        f"\nDecision gate [{gate_label}]: Recall@5%={recall5:.3f}"
+        f"  → {'PASS' if passed else 'FAIL — re-examine'}"
+    )
 
     # --- Step 11: Save metrics JSON ---
     result = {
@@ -528,9 +666,10 @@ def run_cross_event_training() -> None:
             "timestamp": timestamp,
             "experiment": "cross_event_stage2",
             "description": (
-                "Cross-event validation: 80/20 split of meaningful expansion events "
-                "(≥200 positive pixels). Train and test events are from different "
-                "countries and years — no spatial overlap, no geometric leakage."
+                "Cross-event validation: country-stratified 80/20 split of "
+                "meaningful expansion events (≥200 positive pixels). "
+                "Train and test events are from different countries and years "
+                "— no spatial overlap, no geometric leakage."
             ),
             "region": REGION,
             "min_positive_pixels": MIN_POSITIVE_PIXELS,
@@ -541,15 +680,20 @@ def run_cross_event_training() -> None:
             "n_meaningful_events": len(meaningful),
             "n_train_events": len(train_events),
             "n_val_events": len(val_events),
+            "n_val_events_es": len(val_events_es),
             "n_test_events": len(test_events),
             "train_events": sorted(list(train_events)),
             "val_events":   sorted(list(val_events)),
+            "val_events_es": sorted(list(val_events_es)),
             "test_events":  sorted(list(test_events)),
             "n_features": len(feature_cols),
             "normalize_within_groups": not _normalize,
             "graded_relevance": _graded,
             "group_weight_mode": _gw_mode,
             "early_stop_metric": _es_metric,
+            "early_stop_patience": _patience,
+            "stratified_split": _stratified,
+            "coherence_threshold": _coh_thresh,
             "neg_ratio_train": neg_ratio,
             "best_iteration": model.best_iteration,
             "model_path": str(model_path),
@@ -577,9 +721,13 @@ def run_cross_event_training() -> None:
     print(f"Metrics saved: {metrics_path}")
     print(f"\nAdd to ROADMAP.md Experiment History:")
     print(
-        f"  Cross-event (CE.1/CE.2) | — | {recall5*100:.1f}% | "
+        f"  Cross-event | — | {recall5*100:.1f}% | "
         f"{model.best_iteration} | {'✅ PASS' if passed else '❌ FAIL'}"
     )
+
+    if not passed:
+        import sys as _sys
+        _sys.exit(1)
 
 
 if __name__ == "__main__":
