@@ -191,8 +191,8 @@ AGB (above-ground biomass) and REDD (proximity to carbon-market projects) are ke
 
 **Critical facts:**
 - Both features are **static** (not annually dynamic). AGB is an ESA CCI Biomass 2010 snapshot. REDD is a distance-to-project metric from the ID-RECCO V5.0 database (2023 snapshot). This is intentional — we want the structural signal (is this pixel in a carbon-rich forest?) not year-by-year biomass fluctuations.
-- **Neither is downloaded or in the current model.** Confirmed: raw ESA CCI tiles missing (`data/shared/ESA_CCI_Biomass/` empty); REDD directory empty. The current SA splits use 79 features (temporal model) or 83 features (CE.2 — 4 unidentified extra columns, definitely NOT AGB/REDD).
-- Fix 3 requires: (a) download raw data, (b) run rasterise scripts, (c) rebuild SA splits on Euler (42 GB rebuild job), (d) retrain.
+- **Both raw datasets are present locally but NOT yet on Euler.** AGB: 29 tiles (1.7 GB) at `data/shared/ESA_CCI_Biomass/`. REDD: `ID-RECCO V5.0_20231201.zip` at `data/REDD/`. The current SA splits use 79 features (temporal model) or 83 features (CE.2 — 4 unidentified extra columns, definitely NOT AGB/REDD).
+- Fix 3 requires: (a) rsync raw data to Euler, (b) run rasterise scripts on Euler, (c) rebuild SA splits on Euler (42 GB rebuild job), (d) retrain.
 - This is a significant pipeline step — **CE.4 is the correct home for this**, running after CE.3b establishes the training design.
 
 **Fix 4 — Stratified event split + longer early-stop patience (code change)**
@@ -461,10 +461,10 @@ Do not begin until:
 | CE.2 cross-event models | `data/south_america/ml/models/model1_lgbm_stage2_cross_event_*.pkl` | ✅ 3 files (2 × Colombia, 1 × SA) |
 | USA pixel splits | `euler:$SCRATCH/data/usa/ml/main/{train,earlystop,test}.parquet` | ✅ Ready |
 | SE Asia pixel splits | `euler:$SCRATCH/data/se_asia/ml/main/{train,earlystop,test}.parquet` | ✅ Ready |
-| AGB raw tiles | `data/shared/ESA_CCI_Biomass/` | ❌ **Not downloaded** — ESA CCI Biomass v4.0 (2010), CEDA registration required |
-| AGB TIF (processed) | `data/south_america/ready/AGB/agb_sa.tif` | ❌ **Does not exist** — run `agb_rasterise.py` after download |
-| REDD raw data | `data/REDD/` | ❌ **Not downloaded** (or empty) — ID-RECCO V5.0 from reddprojectsdatabase.org |
-| REDD TIF (processed) | `data/south_america/ready/REDD/redd_sa.tif` | ❌ **Does not exist** — run `redd_rasterise.py` after download |
+| AGB raw tiles | `data/shared/ESA_CCI_Biomass/` | ✅ **29 tiles, 1.7 GB locally** — needs rsync to Euler before `agb_rasterise.py` |
+| AGB TIF (processed) | `data/south_america/ready/AGB/agb_sa.tif` | ❌ **Does not exist** — run `agb_rasterise.py` after rsync to Euler |
+| REDD raw data | `data/REDD/` | ✅ **ID-RECCO V5.0_20231201.zip locally (1.4 MB)** — needs rsync to Euler before `redd_rasterise.py` |
+| REDD TIF (processed) | `data/south_america/ready/REDD/redd_sa.tif` | ❌ **Does not exist** — run `redd_rasterise.py` after rsync to Euler |
 | Colombia dev panel | `euler:$SCRATCH/data/dev/south_america/ml/main/` | ✅ Ready (79 features) |
 | Forward scored (existing) | `euler:$SCRATCH/outputs/south_america/forward_scored_2024.parquet` | ✅ Exists |
 | MapBiomas Brazil | Google Drive | ⚠️ Verify format/coverage before committing |
