@@ -19,7 +19,11 @@ source "$VENV_DIR/bin/activate"
 export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
 echo "Building Stage 1 country-year panel (SA)..."
-python -u scripts/regions/south_america/5_training/stage1_data_builder.py
+srun --cpu-bind=cores python -u scripts/regions/south_america/5_training/stage1_data_builder.py
+STATUS=$?; [ $STATUS -ne 0 ] && exit $STATUS
+
 echo "Panel done. Running Stage 1 Poisson expansion model (SA)..."
-python -u scripts/regions/south_america/5_training/model1_expansion.py
+srun --cpu-bind=cores python -u scripts/regions/south_america/5_training/model1_expansion.py
+STATUS=$?; [ $STATUS -ne 0 ] && exit $STATUS
+
 echo "Stage 1 SA done."

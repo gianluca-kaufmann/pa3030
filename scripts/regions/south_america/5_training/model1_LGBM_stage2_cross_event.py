@@ -509,6 +509,23 @@ def run_cross_event_training() -> None:
                 f"using all {len(val_events)} for early stopping"
             )
 
+    # E11: filter early-stop val to large events only (prevents political micro-events
+    # from stalling early-stop metric at iter 51-66 via noisy near-zero recall).
+    _es_min_pos = int(os.environ.get("STAGE2_ES_MIN_POS", "0"))
+    if _es_min_pos > 0:
+        val_large = {e for e in val_events_es if event_counts.get(e, 0) >= _es_min_pos}
+        if len(val_large) >= 2:
+            val_events_es = val_large
+            print(
+                f"  E11: large-event val filter (n_pos>={_es_min_pos}): "
+                f"{len(val_events)} → {len(val_events_es)} events for early stopping"
+            )
+        else:
+            print(
+                f"  E11: WARNING — only {len(val_large)} events with n_pos>={_es_min_pos}; "
+                f"keeping all {len(val_events_es)} for early stopping"
+            )
+
     print(f"  Train events: {sorted(train_events)}")
     print(f"  Val   events (ES): {sorted(val_events_es)}")
     print(f"  Test  events: {sorted(test_events)}")
@@ -692,6 +709,7 @@ def run_cross_event_training() -> None:
             "group_weight_mode": _gw_mode,
             "early_stop_metric": _es_metric,
             "early_stop_patience": _patience,
+            "es_min_pos": _es_min_pos,
             "stratified_split": _stratified,
             "coherence_threshold": _coh_thresh,
             "neg_ratio_train": neg_ratio,

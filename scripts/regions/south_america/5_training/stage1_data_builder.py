@@ -11,6 +11,7 @@ Output:
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -50,7 +51,13 @@ WDPA_CSV_PATHS = [
 PRE2001_YEAR_RANGE = (1990, 2000)  # change to (1996, 2000) to restrict to WGI coverage
 
 REGION = "south_america"
-OUT_PATH = _ROOT / "data" / "south_america" / "stage1_panel.parquet"
+# Write to scratch if available (home is quota-constrained); fall back to repo root.
+_scratch = os.environ.get("SCRATCH", "")
+OUT_PATH = (
+    Path(_scratch) / "data/south_america/stage1_panel.parquet"
+    if _scratch
+    else _ROOT / "data" / "south_america" / "stage1_panel.parquet"
+)
 
 # ISO3 -> country_id mapping from policy preprocessing (must match raster codes)
 ISO3_TO_ID = {

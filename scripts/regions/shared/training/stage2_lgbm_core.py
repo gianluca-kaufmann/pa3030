@@ -429,6 +429,48 @@ def _shuffle_within_groups(
         offset += n
 
 
+def _cap_cy_groups(
+    X: np.ndarray, y: np.ndarray, years: np.ndarray, country_ids: np.ndarray,
+    cy_group_sizes: np.ndarray, max_size: int, rng_seed: int,
+) -> tuple:
+    """Cap each (country_id, year) group at max_size pixels.
+
+    Subsamples negatives only; all positives are always kept. Applied during
+    training (E12) to prevent large Brazil events from dominating gradients.
+    Data must be pre-sorted by (country_id, year).
+    """
+    rng = np.random.default_rng(rng_seed)
+    keep = np.ones(len(y), dtype=bool)
+    offset = 0
+    n_capped = 0
+    for gsize in cy_group_sizes:
+        n = int(gsize)
+        if n > max_size:
+            y_g = y[offset : offset + n]
+            pos_idx = np.where(y_g > 0)[0]
+            neg_idx = np.where(y_g == 0)[0]
+            n_neg_keep = max(0, max_size - len(pos_idx))
+            if n_neg_keep < len(neg_idx):
+                drop = rng.choice(neg_idx, size=len(neg_idx) - n_neg_keep, replace=False)
+                keep[offset + drop] = False
+                n_capped += 1
+        offset += n
+
+    if n_capped == 0:
+        return X, y, years, country_ids, cy_group_sizes, cy_group_sizes
+
+    X = X[keep]
+    y = y[keep]
+    years = years[keep]
+    country_ids = country_ids[keep]
+    key = country_ids.astype(np.int64) * 100_000 + years.astype(np.int64)
+    changes = np.concatenate([[True], key[1:] != key[:-1], [True]])
+    new_sizes = np.diff(np.where(changes)[0]).astype(np.int32)
+    print(f"  E12: capped {n_capped} groups at {max_size} pixels; "
+          f"{int(keep.sum()):,} / {len(keep):,} rows kept")
+    return X, y, years, country_ids, new_sizes, new_sizes
+
+
 def load_stage2_arrays(
     panel_path: Path,
     region: str,
@@ -580,6 +622,15 @@ def load_stage2_arrays(
         )
         changes = np.concatenate([[True], key[1:] != key[:-1], [True]])
         train_group_sizes = np.diff(np.where(changes)[0]).astype(np.int32)
+
+    # E12: cap training groups at STAGE2_MAX_GROUP_SIZE to prevent large events
+    # (e.g., Brazil 2009, 155K pixels) from dominating the gradient signal.
+    # Only active during training (neg_ratio is not None) and without eco sub-grouping.
+    _max_group = int(os.environ.get("STAGE2_MAX_GROUP_SIZE", "0"))
+    if _max_group > 0 and neg_ratio is not None and eco_ids_arr is None:
+        X, y, years, country_ids, cy_group_sizes, train_group_sizes = _cap_cy_groups(
+            X, y, years, country_ids, cy_group_sizes, _max_group, rng_seed + 999
+        )
 
     return Stage2Arrays(
         X=X,

@@ -50,7 +50,14 @@ _compute_governance_diffs = _mod._compute_governance_diffs
 _make_decay_weights   = _mod._make_decay_weights
 _merge_vdem_extra     = _mod._merge_vdem_extra
 
-PANEL_PATH = _ROOT / "data" / "south_america" / "stage1_panel.parquet"
+import os as _os
+_scratch = _os.environ.get("SCRATCH", "")
+_panel_scratch = Path(_scratch) / "data/south_america/stage1_panel.parquet" if _scratch else None
+PANEL_PATH = (
+    _panel_scratch
+    if _panel_scratch and _panel_scratch.exists()
+    else _ROOT / "data" / "south_america" / "stage1_panel.parquet"
+)
 OUT_PATH   = _ROOT / "outputs" / "south_america" / "results" / "stage1_nb_overdispersion.json"
 
 TEST_START       = 2017

@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=e1_gap
 #SBATCH --partition=normal.4h
-#SBATCH --time=03:00:00
+#SBATCH --time=04:00:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem-per-cpu=6G
+#SBATCH --cpus-per-task=16
+#SBATCH --mem-per-cpu=8G
 #SBATCH --output=/cluster/scratch/%u/logs/e1_gap_%j.out
 #SBATCH --error=/cluster/scratch/%u/logs/e1_gap_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis

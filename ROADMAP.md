@@ -1,12 +1,16 @@
 # PA3030 — Publication Roadmap
 
-**Updated**: 2026-06-19 (session 5 — strategic reframe) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
+**Updated**: 2026-06-19 (session 6 — B0 applied; CE.4 + A1 + A3 queued) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
 
 > **Current state (2026-06-19 — STRATEGIC REFRAME)**:
 > - ✅ Stage 1 Poisson GLM: D²=0.345 — improvable; NB + country FE to be tried (E6)
 > - ✅ Stage 2 temporal model (H6+H1b+H5): Lift@1%=6.46× — demonstrates cost-minimisation pattern; sufficient for Track A
 > - ✅ Cross-event validation: macro R@5% stuck at 18–24% across 3 experiments — pixel-level ranking has structural ceiling
-> - 🔄 Euler: CE.3b-sqrt diagnostic (job 3917581) + AGB/REDD inject chain (3953698→3953709→3953712, 3953702) running + E1 gap (3953707)
+> - ✅ AGB + REDD inject chain complete (3957103→3957105→3957107, 2026-06-19); SA splits now have 94 columns
+> - ✅ CE.3b-sqrt (3917581) complete — macro R@5%=18.8% (exit 1 = gate fail, not crash)
+> - ✅ B0 applied: E11 (val min-pos filter) + E12 (group size cap) in code + CE.4 SLURM
+> - 🔄 e1_gap RUNNING (3981693, 128G); eco_gap_inject PENDING (3981696); CE.4 PENDING (3981700, dep); stage1+NB PENDING (3981878→3981887)
+> - ❌ A2 KBA: blocked — user must download KBA shapefile from keybiodiversityareas.org/kba-data/request
 > - **STRATEGIC PIVOT — two parallel tracks**:
 >   - **Track A (Gap finding)**: use existing temporal model + GSN_b2 to quantify the biodiversity-cost gap. This IS the Nature finding and can be computed today (E1).
 >   - **Track B (Watershed model)**: rebuild mini-sample at HydroSHEDS L7 catchment level; rank catchments instead of pixels; structural Recall fix expected >70% (E3).
@@ -59,6 +63,34 @@ Change the Stage 2 ranking unit from 1km pixels to **HydroSHEDS level 7 catchmen
 
 Pixel-level CE experiments (CE.3b-sqrt, CE.4) continue on Euler in parallel — if they unexpectedly break through, great. But Track B is now the primary path to high Recall.
 
+**Track B extension — two-level hierarchical model (Paper 2 / post-Track B):** If single-level catchment ranking works but leaves further headroom, the natural next step is a two-stage spatial selector within Stage 2: Stage 2a ranks catchments to identify the target region; Stage 2b ranks pixels within the top-K catchments using the pixel-level features. Stage 2a handles the political/institutional targeting decision (which watershed); Stage 2b handles the boundary-drawing logic (which specific pixels). This cleanly separates the two decisions the current pixel model conflates. Prerequisite: Track B (E3) must first confirm catchment-level Recall ≥ 70%. Do not implement before then.
+
+### Custom Recall@5% training loss (refinement after Track B)
+
+**The problem:** LambdaRank optimises NDCG — a smooth proxy that rewards putting positive pixels near the very top with a logarithmic discount. Recall@5% is a hard threshold metric: every positive pixel inside the top 5% counts equally, and every positive pixel outside counts as a miss, regardless of how far outside it is. These objectives are not the same. A model that's excellent at NDCG might push a few positives to rank 1–5 while leaving others just outside the 5% boundary, missing them entirely.
+
+**The fix:** Replace the NDCG training objective with a smooth differentiable approximation of Recall@5%. Concretely: for each positive pixel in a group, compute a soft indicator of whether it falls in the top 5% using a sigmoid over the score gap to the 5th-percentile threshold. The loss penalises any positive pixel not confidently in the top 5%, equally and directly. LightGBM supports custom gradient/hessian functions — this would be implemented as a custom objective passed to `lgb.train()`.
+
+**Expected impact:** Modest — H6 early stopping on Recall@5% already partially aligns training with evaluation. The custom loss would close the remaining gap. Estimated improvement: 2–5 percentage points on top of whatever Track B achieves.
+
+**Implementation effort:** ~1 week. Requires deriving gradient and hessian of the smooth Recall approximation and validating numerical stability. Do not implement before Track B confirms the catchment unit works.
+
+**Status:** Not started. Post-Track B refinement only.
+
+### Track C — Survival model (contingency if Track B stalls)
+
+If watershed-level Recall@5% also fails to break 50% after E3, the correct next move is **not more feature engineering** — it is a fundamentally different model class: a **Cox Proportional Hazards survival model**. Instead of ranking pixels within an annual expansion event, we ask: *when will this pixel be protected?* Each unprotected pixel enters the model at t=2000 (or first available year) and exits either when protected (event) or at end of observation (right-censored). Key advantages for our structural problem:
+
+- **Baseline hazard absorbs the mid-2010s structural break**: time-varying baseline h₀(t) captures the drop in designation rates without poisoning the feature coefficients. Features explain *who gets chosen*, not *how many get chosen per year*.
+- **Right-censoring is native**: pixels never protected are treated as right-censored, not as "definitive negatives" — statistically correct for a process still unfolding.
+- **No event-grouping needed**: removes the need for country-year expansion groups entirely; partial likelihood handles the rare-event structure.
+
+Implementation: `lifelines.CoxTimeVaryingFitter` or `scikit-survival`. Features would be the same spatial predictors + annual time-varying covariates (NDVI, NTL, deforestation rate). Status: **Not started — activate only if E3 Track B Recall ≤ 50%.**
+
+### Heckman framing (paper positioning, not an architecture change)
+
+Gemini independently validated that our two-stage architecture maps directly onto the **Heckman Selection Model** from econometrics (Heckman, 1979): Stage 1 is the selection equation (which countries expand, and when); Stage 2 is the outcome equation (conditional on expansion, which land is chosen). This framing should appear explicitly in the Methods section — it grounds the two-stage design in a decades-old econometric tradition and strengthens the paper against reviewer questions about why we don't just train a single joint model.
+
 ### Revised success criteria
 
 | Track | Success looks like | Nature-ready? |
@@ -66,6 +98,7 @@ Pixel-level CE experiments (CE.3b-sqrt, CE.4) continue on Euler in parallel — 
 | Track A only | Strong negative score–biodiversity correlation; KBA headline number quantified | One Earth / GEC range |
 | Track A + Track B | Gap finding + watershed Recall@5% ≥ 70% + SHAP mechanism + cross-regional transfer | Nature Sustainability range |
 | Track A + B + Stage 1 improved | All above + D² lifted via NB/country-FE + CBD pledge features | Nature Sustainability strong |
+| Track A + B fails → Track C | Cox PH survival model replaces Stage 2; same gap finding still valid | Nature Sustainability if survival model Recall competitive |
 
 ---
 
@@ -149,8 +182,8 @@ Brazil's Bolsonaro-era events (2019–2022) are ~3–4 of the 30 test events (10
 | CE.3a spatial coherence diagnostic | ✅ Done | All 139 events coherence=1.0; threshold=0.0; Fix 1 is a no-op |
 | CE.3b redesigned cross-event run | ✅ Done — gate FAILED | macro R@5%=18.0%, weighted=26.5%, 29 events, iter=122; WORSE than CE.2 — Fix 2 (inv_npos) suspected |
 | CE.3b regression diagnostic (ce3b_sqrt) | ✅ Done — gate FAILED | macro R@5%=18.8%, val=35.3%, iter=51; inv_sqrt_npos confirmed better than inv_npos (val +3.5pp); BUT test still 18.8% vs CE.2 23.8% — stratified split is harder test set |
-| CE.4 AGB+REDD features | 🔄 RUNNING chain | redd_rasterise ✅ done; agb_rasterise 🔄 PENDING (3957103, was OOM at 16G → now 64G); agb_inject (3957105) → redd_inject (3957107) queued |
-| E1 gap analysis (Track A) | 🔄 RUNNING (3953707) | Scoring 300M+ rows with temporal model; GSN_b2 gap; ~30-60 min remaining |
+| CE.4 AGB+REDD features | ✅ Inject chain COMPLETE | 3957103 agb_rasterise ✅; 3957105 agb_inject ✅; 3957107 redd_inject ✅ — SA splits updated 2026-06-19 ~16:24 |
+| E1 gap analysis (Track A) | ❌ OOM — resubmit | 3953707 killed at 48G; stage2_gap_analysis.slurm fixed to 128G (16×8G) |
 | Per-country breakdown (temporal model) | ✅ Done | SUR=28.55×, ARG=9.31×, BRA=1.69×; excl. outliers: 10.89× |
 | Within-group pixel split (P1.1) | ❌ Abandoned | Geometric artifact (93–96% guaranteed by cluster geometry) |
 | Patch CC approach (H12) | ❌ Abandoned | Mega-blob artifact confirmed |
@@ -183,222 +216,182 @@ The same spatial logic transfers to USA and SE Asia — universal pattern of gov
 
 ---
 
-## Implementation Phases
+## Sequential Execution Plan
 
-### Phase 1 — Cross-event Stage 2 model (IN PROGRESS — redesign based on CE.2 failure)
-
-**CE.1 / CE.2 — Done but gate failed.** See Experiment History for full results and per-event breakdown.
+**Two parallel streams. Within each stream, one change at a time — so the impact of every decision is attributable. The streams converge at paper writing.**
 
 ---
 
-#### Root cause of CE.2 failure
+### Stream A — Nature Finding
 
-CE.2 macro Recall@5%=23.8%. This is the macro average across two structurally different event types:
+Independent of model Recall. Can start at any time. Does not block or wait for Stream B.
 
-1. **Ecological campaigns** (large, spatially coherent, cost-minimisation logic): Recall@5%=49–93%. These events are what the model is designed to predict, and it does so well. Examples: Brazil 2009 (52.9%), Suriname 2015 (59.1%), Argentina 2023 (92.8%).
-2. **Political/legal designations** (court-ordered indigenous territories, scattered reclassifications, economic-crisis-driven designations): Recall@5%=0–12%. No landscape feature can predict which specific parcels are affected by a legal ruling or political deal. These events structurally resist prediction.
+| Step | Action | What we learn | Status |
+|---|---|---|---|
+| **A1** | E1: Score full SA test pixels with temporal model; bin by score quantile; compute mean GSN_b2 per bin; Spearman r + plot | Does cost-minimisation systematically miss biodiversity? Confirms THE Nature finding | 🔄 QUEUED (job 3981693, 128G) |
+| **A2** | E7: Download IUCN KBA shapefile (keybiodiversityareas.org); rasterise to SA backbone; compute % of top-5% predicted pixels overlapping KBAs vs. random baseline | Headline number: "BAU 30×30 covers X% of KBAs vs Y% by chance" | ❌ BLOCKED — user must download KBA shapefile and place at `data/shared/KBA/KBA_poly.shp`; then run `kba_rasterise.py` |
+| **A3** | E6: Fit Stage 1 Negative Binomial GLM + country fixed effects; test overdispersion (Pearson χ²/df); compare D² | Does NB handle overdispersion? Does D² improve? | 🔄 QUEUED (jobs 3981878 → 3981887) |
+| **A4** | E8: Add to Stage 1 — CBD 30×30 pledge indicator (binary) + continuous national coverage gap (30% − current PA fraction); compare D² vs A3 | Does political commitment improve expansion prediction above cost baseline? | ⬜ 2 days; after A3 |
+| **A5** | P3.3–P3.4: BAU forward projections 2025–2030 with KBA overlay; country scorecard (on-track vs off-track × protects KBAs vs misses KBAs) | Paper-ready figures; country-level policy headline | ⬜ After A1+A2+final Stage 2 model |
 
-The macro average mixes both types indiscriminately. The model is correct on class 1; class 2 is inherently unpredictable.
-
-**Three additional design flaws in CE.2 that suppressed performance:**
-1. **Training gradient imbalance (Fix 2)**: The current `inv_sqrt_npos` weights reduce gradient per-pixel within large events, but Brazil's 100K+ pixel events still contribute ~50× more total gradient signal than Colombia's 1K-pixel events. The model becomes biased toward "what Amazon pixels look like" and underfits smaller countries.
-2. **Early stopping failure (Fix 4)**: The model stopped at iteration 66 (vs 136 for the temporal model). This happened because the validation set contained too many class-2 events — no amount of training would improve recall on politically-driven events, so the early-stopping metric stalled and training terminated prematurely.
-3. **Unlucky random event split (Fix 4)**: Random seed=42 placed all of Argentina's early-2000s events (crisis years 2001-2005) in the test set. These are anomalous years (Argentine economic collapse, Dec 2001). A stratified split prevents this.
-
----
-
-#### The four fixes
-
-**Fix 1 — Spatial coherence filter (CE.3a diagnostic first, then applied in CE.3b)**
-
-Ecological campaigns are spatially clustered (one big contiguous park). Political designations are geographically scattered (10 isolated parcels across the country for 10 different legal reasons). Measure this per event using pixel coordinates already in the parquet: coherence = fraction of positive pixels within 5 km of another positive pixel.
-
-**Important**: do NOT rely on min_positive_pixels alone as the filter. A 200-pixel designation of a coherent wetland is legitimate and predictable. A 10,000-pixel event of scattered parcels is not. Use coherence as the primary filter; min_positive_pixels stays at 200 (do not raise arbitrarily).
-
-**Fix 2 — Event-level gradient normalization (code change in cross_event training script)**
-
-Change weighting so each EVENT contributes equally to model training, regardless of pixel count. Currently:
-- `inv_sqrt_npos` per pixel → Brazil 155K-pixel event contributes ~333 total gradient units; Colombia 1K-pixel event contributes ~22 units (15× imbalance even after weighting)
-
-New formula: `weight_i = 1 / n_pos_in_group` (normalise each group's total gradient to 1.0). Combined with inv_sqrt_npos: `weight_i = 1 / (n_pos_in_group × sqrt(n_pos_in_group))`. Every event, regardless of size, contributes equal total signal to the model.
-
-This is a change in `compute_group_norm_weights()` in `scripts/regions/shared/training/stage2_lgbm_core.py`. Add a new mode `"event_norm"` (or `"inv_npos"`) alongside the existing `"inv_sqrt_npos"`.
-
-**Fix 3 — AGB + REDD features (CE.4 — blocked on data download, separate from CE.3b)**
-
-AGB (above-ground biomass) and REDD (proximity to carbon-market projects) are key missing features. They capture the carbon-market incentive mechanism that drives Amazon designation. High-carbon forests earn international payments under REDD+, making them preferential targets for PA designation.
-
-**Critical facts:**
-- Both features are **static** (not annually dynamic). AGB is an ESA CCI Biomass 2010 snapshot. REDD is a distance-to-project metric from the ID-RECCO V5.0 database (2023 snapshot). This is intentional — we want the structural signal (is this pixel in a carbon-rich forest?) not year-by-year biomass fluctuations.
-- **Both raw datasets are present locally but NOT yet on Euler.** AGB: 29 tiles (1.7 GB) at `data/shared/ESA_CCI_Biomass/`. REDD: `ID-RECCO V5.0_20231201.zip` at `data/REDD/`. The current SA splits use 79 features (temporal model) or 83 features (CE.2 — 4 unidentified extra columns, definitely NOT AGB/REDD).
-- Fix 3 requires: (a) rsync raw data to Euler, (b) run rasterise scripts on Euler, (c) rebuild SA splits on Euler (42 GB rebuild job), (d) retrain.
-- This is a significant pipeline step — **CE.4 is the correct home for this**, running after CE.3b establishes the training design.
-
-**Fix 4 — Stratified event split + longer early-stop patience (code change)**
-
-- **Stratified split**: instead of random shuffle, group events by country, then sample 80/20 within each country. This prevents unlucky seeds from putting all of one country's anomalous years in the test set.
-- **Coherence-filtered validation set**: restrict the early-stopping validation set to high-coherence events only. The model can learn from political events in training (they provide some signal) but should not be stopped early because it fails on inherently unpredictable validation events.
-- **Patience=200** (was 100): the model gave up at iteration 66. More patience lets it find deeper signal in the ecological events.
+**Gate**: A1 must confirm negative score–biodiversity correlation before A5 is worth running. A2, A3, A4 are fully independent of each other.
 
 ---
 
-#### Implementation plan
+### Stream B — Stage 2 Model (strictly sequential)
 
-**CE.3a — Spatial coherence diagnostic** ← IMMEDIATE (local, ~1h, no Euler needed)
-- Script: `scripts/regions/south_america/6_evaluation/stage2_event_coherence.py` (new)
-- Input: scored test parquet from CE.2 (`model1_lgbm_stage2_cross_event_20260618_170012.pkl`) + train/test parquets for positive pixel coordinates
-- For each of the 139 SA events: load positive pixel (row, col) coordinates; compute coherence = fraction within 5 km (5 pixels) of another positive; record (country_id, year, n_pos, coherence, recall_at_5pct_from_CE2)
-- Output: `outputs/south_america/results/ml_models/stage2_event_coherence_diagnostic.json`
-- Decision: find the coherence threshold above which events have median Recall@5% ≥ 30%; use that as the filter for CE.3b
-
-**CE.3b — Done (gate FAILED; regression diagnostic running as ce3b_sqrt job 3917581)**
-- Fix 2 (inv_npos) caused regression: 18.0% vs CE.2 23.8%. Diagnostic uses inv_sqrt_npos.
-- Fix 1 (coherence filter) is a no-op: all 139 events coherence=1.0 at 1 km / 5 km radius.
-- Fix 4 (stratified split, patience=200) confirmed correct — keep in all future runs.
-- **Country-level analysis**: cid=3 (Brazil) 38.5%, cid=6 61.2% — model works where cost-minimisation applies. cid=1,2,4,7,8,9,10,12,13 all ~5–9%. This is a structural finding, not a model failure.
-- **Gate revised**: lower from 65% → 50%. The original 65% assumed all test events are ecologically predictable; ~8/12 countries score low for political-economy reasons that features cannot encode.
-- **CE.4 SLURM script ready**: `slurm/south_america/training_lgbm_stage2_ce4.slurm` — submit after inject chain + ce3b_sqrt result confirmed.
-
-**CE.4 — Add AGB + REDD; retrain** ← AGB/REDD inject chain running (jobs 3953698→3953709→3953712 + 3953702); script ready
-- ✅ AGB raw tiles: `data/shared/ESA_CCI_Biomass/` (on Euler)
-- ✅ REDD raw data: `data/REDD/` (on Euler)
-- ✅ backbone.tif synced to `data/south_america/ready/backbone/backbone.tif`
-- 🔄 agb_rasterise (3953698) + redd_rasterise (3953702) running; agb_inject (3953709) → redd_inject (3953712) queued
-- SLURM: `slurm/south_america/training_lgbm_stage2_ce4.slurm` — ready to submit after inject chain
-- Retrain uses inv_sqrt_npos + stratified + patience=200 (confirmed by ce3b_sqrt diagnostic)
-- Decision gate: macro Recall@5% ≥ 50% (revised from 65%; ~8/12 test countries score low for political-economy reasons)
-- Decision gate: if AGB or REDD enters top-10 SHAP → confirmed as mechanism for paper
-- Decision gate: AGB or REDD enters top-10 SHAP features → confirmed as mechanism for paper
+**One change at a time. Record the result before starting the next step.**
 
 ---
 
-### Phase 2 — SHAP analysis (after CE.3)
+#### B0 — Training infrastructure fixes (~1 day, code only, no Euler run) ✅ DONE (2026-06-19)
 
-**P2.1 — Global SHAP beeswarm**
-- Run on all test events from cross-event model
-- Expected top features: dist_wdpa, dist_road, GPW, AGB, HNTL
-- Confirms cost-minimisation mechanism
+Applied before CE.4. Two code changes in effect:
 
-**P2.2 — Temporal SHAP: pre vs post Paris Agreement (2015)**
-- Split events into pre-2015 vs post-2015
-- Did AGB/carbon features increase in importance after Paris?
-- If yes: direct evidence of carbon market influence on spatial designation logic
-
-**P2.3 — Country-level SHAP: Brazil vs Andean countries**
-- Separate SHAP for BRA, BOL, COL, PER, ARG
-- Does carbon logic dominate Amazonian countries but not Andean?
+- **E11** ✅ — filter early-stop val set to events with `n_pos ≥ 5000` only. `STAGE2_ES_MIN_POS=5000` env var in CE.4 SLURM. Implemented in `model1_LGBM_stage2_cross_event.py`.
+- **E12** ✅ — cap training groups at 50,000 pixels; subsample negatives only. `STAGE2_MAX_GROUP_SIZE=50000` env var in CE.4 SLURM. `_cap_cy_groups()` helper added to `stage2_lgbm_core.py`.
 
 ---
 
-### Phase 3 — Representation gap (THE Nature hook)
+#### B1 — CE.4: AGB + REDD + eco_protection_gap (Euler, ~1 week)
 
-**P3.1 — KBA download + rasterise** *(start any time — no model dependency)*
-- Download IUCN KBA shapefile (BirdLife/IUCN, free: keybiodiversityareas.org)
-- Rasterise to 1 km grid matching SA backbone
-- Complement: existing GSN_b2 bands as biodiversity priority proxy
+*Best pixel-level attempt. Combines all pending feature additions with the B0 infrastructure fixes.*
 
-**P3.2 — Score vs biodiversity priority**
-- Bin all unprotected pixels into score quantiles (top 5%, 5–10%, etc.)
-- Per bin: mean KBA overlap and mean GSN_b2
-- Expected: high model score = low biodiversity value (the gap)
+Pre-submission checklist:
+- ✅ AGB inject complete (job 3957105, 2026-06-19)
+- ✅ REDD inject complete (job 3957107, 2026-06-19)
+- ✅ eco_protection_gap inject submitted (job 3981696, 2026-06-19)
+- ✅ policy_b1-4 confirmed present in train.parquet schema (94 total cols)
+- ✅ B0 code changes applied (E11 STAGE2_ES_MIN_POS=5000 + E12 STAGE2_MAX_GROUP_SIZE=50000)
+- ✅ CE.4 submitted with dependency (job 3981700, 2026-06-19)
 
-**P3.3 — Forward projection KBA headline numbers**
-- BAU forward predictions 2025–2030 from final cross-event model
-- Among predicted-protected pixels: what % overlap KBAs?
-- Paper headline: "Under BAU, 30×30 will cover X% of KBAs vs Y% by chance"
+What changes vs. CE.3b-sqrt (18.8%): AGB (carbon stocks), dist_redd (carbon-market geography), eco_protection_gap (30×30 political urgency per biome-country) + E11 (cleaner early-stop signal) + E12 (balanced group gradients).
 
-**P3.4 — Country feasibility scorecard**
-- Stage 1 extrapolation: which SA countries hit 30% coverage by 2030?
-- Overlay: do their trajectories protect KBAs?
-- 4-quadrant matrix: {on-track/off-track} × {protects KBAs/misses KBAs}
+**What we learn**: isolated combined impact of all feature additions and training infrastructure fixes on the pixel-level cross-event model. This is our definitive pixel ceiling.
 
----
-
-### Phase 4 — Robustness and cross-regional validation
-
-**P4.1 — Bootstrap confidence intervals**
-- 1000 bootstrap resamples of test events (cross-event model)
-- 95% CIs on Lift@1%, Recall@5%, and all baseline comparisons
-
-**P4.2 — Temporal stability: per-year performance**
-- Report Recall@5% per year 2017–2024 (temporal model, for robustness)
-- Shows 2019–2022 collapse — documents concept drift, not model failure
-- Job 3818794 already running
-
-**P4.3 — Cross-regional transfer: SA model → USA → SE Asia**
-- Zero-shot: score USA and SE Asia test splits with SA-trained cross-event model
-- Transfer = universal spatial logic; failure = governance-specific behaviour
+Decision gates:
+- macro Recall@5% ≥ 50% → pixel model viable; continue to B2
+- macro Recall@5% < 50% → pixel ceiling confirmed; skip B2–B3, go to B4
+- AGB or REDD in top-10 SHAP → carbon mechanism confirmed for paper regardless of Recall
 
 ---
 
-### Phase 5 — Forward maps and integration
+#### B2 — E5: Political event scoping (~2 days, local) [only if B1 ≥ 30%]
 
-**P5.1** — Calibrate final cross-event model (Platt scaling)
-**P5.2** — Stage 1 × Stage 2 → cumulative pixel risk 2025–2030: `1 − ∏(1 − p_t)`
-**P5.3** — Three scenarios: BAU / moderate / 30×30 target met by 2030
-**P5.4** — Continental risk map + KBA overlay (Figure 3 in paper)
-**P5.5** — Per-country coverage table: km² predicted protected vs gap to 30%
+Using CE.4 model: relabel events as "ecological" (n_pos ≥ 5000, not BRA 2019–2022) vs. "political". Train on ecological only, evaluate on ecological only. Record Recall separately for both groups.
 
----
+**What we learn**: the THEORETICAL CEILING of the pixel model on events it CAN predict. Separates "unfixable" (politically-driven) from "architectural" (pixel vs. catchment) failure.
 
-### Phase 6 — Paper writing
-
-Do not begin until:
-- [ ] Cross-event Recall@5% ≥ 65% confirmed on full SA (CE.2)
-- [ ] AGB feature added and validated (CE.3)
-- [ ] SHAP complete with temporal SHAP finding (P2.1–P2.3)
-- [ ] KBA headline number confirmed (P3.3)
-- [ ] Country scorecard produced (P3.4)
-- [ ] Baselines documented (job 3818806)
-- [ ] Bootstrap CIs computed (P4.1)
-- [ ] Cross-regional transfer result in hand (P4.3)
-- [ ] Forward maps produced (P5.4)
-
-**Target structure (Nature Sustainability, ~3500 words main text)**:
-1. **Introduction** (600w): 30×30 urgency, prediction-vs-prescription gap, cost-minimisation argument
-2. **Results** (1800w): Stage 1 → Stage 2 (cross-event primary + temporal robustness) → SHAP → representation gap + scorecard → forward projections
-3. **Discussion** (600w): designation as political economy, representation gap implications, limitations
-4. **Methods** (500w): data, Stage 1, Stage 2 (cross-event design + temporal robustness explicitly described)
-5. **Extended Data** (~8 figures): per-country metrics, temporal stability (per-year), temporal SHAP pre/post-Paris, USA/SE Asia zero-shot, country-level SHAP, forward scenarios, country scorecard
+Decision gates:
+- Ecological-only Recall ≥ 65% → pixel model works for its valid scientific scope; Track B adds headroom
+- Ecological-only Recall < 50% → even predictable events are hard at pixel level; Track B is essential
 
 ---
 
-## Experiment Queue
+#### B3 — E9 + E10: New features (local, ~2 days) [add one at a time]
 
-### Local experiments (mini-sample — run now, bold new directions)
+After B1 establishes the CE.4 baseline:
+1. Add **E9 (dist_border_km)** alone: distance to nearest country border; retrain on mini-sample; record Recall delta
+2. Add **E10 (TRI)** on top: Terrain Ruggedness Index from existing DEM; retrain; record Recall delta
 
-| # | Experiment | Time | What changes | Expected outcome |
-|---|---|---|---|---|
-| **E1** | **Gap analysis** — score mini-sample test pixels with current temporal model; bin by score quintile; compute mean GSN_b2 per bin; Spearman correlation + plot. **No model changes needed.** | 1–2h | Evaluation script only | Negative correlation = THE Nature finding confirmed immediately |
-| **E2** | **Large-event filter** — rerun cross-event eval on events ≥5,000 positive pixels only. Based on CE.2 per-event breakdown, ecological campaigns achieve 49–93% per-event Recall. | 1 day | Filter in eval script | Macro Recall@5% expected ~60–70%; defensible scope ("predicts large ecological campaigns") |
-| **E3** | **Watershed model** — download HydroSHEDS L7 SA catchments; aggregate mini-sample pixel features (mean) to catchment level; rebuild mini-splits grouped by (country_id, year, catchment); run LambdaRank; compute pixel-level Recall@5% from top-5% catchment predictions | 2–3 days | Rebuild mini-sample entirely at catchment resolution | Structural fix — Recall@5% expected >70% because PA polygons fit into 1–5 catchments |
-| **E4** | **Recent-PA expansion front** — add `dist_recent_pa_km`: distance to PA boundaries added 2010–present only (not all-time dist_wdpa which includes 1960s PAs). Gives model spatial momentum — where the network has been growing. | 2 days | New feature from WDPA shapefile (already have it) | Better spatial targeting; may substantially improve temporal holdout |
-| **E5** | **Political event classifier + scoping** — label each expansion event "ecological" (size ≥5K pixels, not Bolsonaro-era BRA 2019–2022) vs. "political"; train Stage 2 on ecological events only; evaluate only on ecological events. Report both explicitly. | 2 days | Event-level labels + training/eval filter | Headline Recall jumps; scientific scope is honest and defensible |
-| **E6** | **Stage 1 — Negative Binomial + country fixed effects** — test overdispersion (Pearson χ²/df); fit NB GLM; add country dummies; compare D² | 1 day | Change Stage 1 GLM family + predictors | D² likely improves substantially; NB handles count overdispersion |
-| **E7** | **KBA gap headline** — download IUCN KBA shapefile (free from keybiodiversityareas.org); rasterise to SA backbone; add `kba_overlap` to mini-sample as evaluation-only feature (NOT model input); compute: of top-5% predicted pixels, what % overlap KBAs vs. of all unprotected pixels? | 1–2 days | New raster + gap eval script | RQ3 headline number: "BAU 30×30 covers X% of KBAs vs Y% by chance" |
-| **E8** | **Stage 1 feature expansion** — add: country CBD 30×30 pledge indicator (binary), deforestation rate acceleration (Δ Hansen GFC rate 2015–2020 vs 2010–2015), governance quality index (WGI). Test whether pledges predict expansion above cost-minimisation baseline. | 2 days | New Stage 1 features from public data | Higher D²; CBD pledge as causal mechanism for Nature narrative |
+**Why one at a time**: two features added together cannot be individually attributed. Each isolated run gives us the marginal value of each feature and informs SHAP interpretation.
 
-**Critical path: E1 → E7 → E3**. E1 takes 2 hours and may already deliver the Nature finding. E7 sharpens it. E3 fixes Recall if Track B is needed.
+If either shows positive Recall delta on mini-sample → inject into Euler splits and include in CE.W (B5).
 
-### Euler (running / queued — continue in parallel)
+---
 
-| Job | Description | Status |
+#### B4 — E3: Watershed proof-of-concept (local, 2–3 days)
+
+Rebuild the mini-sample at HydroSHEDS L7 catchment level:
+1. Download HydroSHEDS L7 SA catchment shapefile
+2. For each catchment: aggregate pixel features (mean elevation, mean dist_wdpa, mean AGB, etc.)
+3. Rebuild mini-splits grouped by `(country_id, year, catchment_id)`
+4. Train LambdaRank on catchments with B0 infrastructure
+5. Evaluation: take top-5% catchments → recall all pixels inside → compute pixel-level Recall@5%
+
+**What we learn**: does changing the ranking unit from pixel to catchment fundamentally fix Recall? PA polygons fit into 1–5 catchments; top-5% budget = ~250 catchments vs. 500M pixels. Structurally expected > 70%.
+
+Decision gates:
+- Recall ≥ 70% → Track B validated; scale to full SA (B5)
+- Recall 50–70% → partial fix; investigate which events still fail; add features then scale
+- Recall < 50% → catchment unit also insufficient; activate Track C (Cox PH survival model)
+
+---
+
+#### B5 — CE.W: Full SA watershed model (Euler, ~1 week) [after B4 ≥ 50%]
+
+Scale B4 to the full 42GB SA splits:
+- Aggregate pixel features to HydroSHEDS L7 level (new Euler splits at catchment resolution)
+- Train LambdaRank with B0 infrastructure + best features from B1 + those that gained in B3
+- This is the model that goes in the paper
+
+**What we learn**: real-scale performance across all 222 SA expansion events with full continental training data. Group size imbalance is naturally reduced at catchment level.
+
+---
+
+#### B6 — Refinements (local, after B5) [time permitting]
+
+After model structure and features are fully settled, in this order:
+1. **E4 (dist_recent_pa)**: distance to PAs added 2010-present only, capturing spatial momentum of the expanding network; retrain; record delta
+2. **Custom Recall@5% loss**: replace NDCG objective with smooth sigmoid approximation of Recall@5%; expected 2–5pp improvement; ~1 week implementation effort
+
+Do each in isolation. These are polish, not structural fixes. Skip if time does not allow.
+
+---
+
+### Convergence — Final analysis and paper
+
+Do not begin until both streams are complete.
+
+| Step | Action | Prerequisite |
 |---|---|---|
-| 3917581 | CE.3b-sqrt diagnostic | ✅ Done — 18.8% macro R@5% |
-| 3953702 | REDD rasterise | ✅ Done — redd_sa.tif saved |
-| **3953707** | **E1 gap analysis** (8×6G) | **🔄 Running** (~30-60 min remaining) |
-| 3957103→3957105→3957107 | AGB rasterise (4×16G) → agb_inject → redd_inject | 🔄 Queued (OOM fix: was 16G→64G) |
-| CE.4 | AGB+REDD cross-event retrain (`training_lgbm_stage2_ce4.slurm`) | ⬜ Submit after inject chain + ce3b_sqrt |
-| CE.W | Watershed cross-event full SA (submit after E3 proves concept) | ⬜ After E3 |
-| SHAP | Global beeswarm + pre/post-Paris temporal SHAP | ⬜ After final model |
-| E7/P3.3 | KBA gap headline + forward projection numbers | ⬜ After E7 + final model |
-| P3.4 | Country scorecard (Stage 1 + gap) | ⬜ After E7/P3.3 |
-| P4.1 | Bootstrap CIs | ⬜ After final model |
-| P4.3 | Cross-regional transfer SA→USA→SE Asia | ⬜ After E3/CE.W |
-| P5 | Forward maps + KBA overlay (Figure 3) | ⬜ After E7/P3.3 |
-| Phase 6 | Paper writing | ⬜ After Track A gap confirmed + Track B Recall ≥ 70% |
+| **C1** | SHAP: global beeswarm + temporal (pre/post-Paris 2015) + per-country (BRA vs Andean) on final model | B5 done |
+| **C2** | Bootstrap CIs: 1000 resamples of test events; 95% CIs on Lift@1% and Recall@5% | B5 done |
+| **C3** | Cross-regional transfer: zero-shot SA watershed model → USA and SE Asia test splits | B5 done |
+| **C4** | Calibration: Platt scaling on final watershed model | B5 done |
+| **C5** | Forward maps: Stage 1 × Stage 2 → cumulative pixel risk 2025–2030; BAU / moderate / 30×30 scenarios; Figure 3 + KBA overlay | C4 + A2 done |
+| **C6** | Paper writing | All above + A1–A4 done |
 
-**Mini-sample status**: existing mini_splits/main/ (train 528MB + earlystop 153MB, no test.parquet, no HydroSHEDS features) is **not usable for E1–E8 as-is**. E1 uses full SA Euler parquets (unblocked). E3 (watershed model) requires a full mini-sample rebuild with HydroSHEDS L7 catchment features — this is the prerequisite for all Track B local experiments.
+**Paper writing gate** — do not begin until all boxes checked:
+- [ ] A1: gap confirmed (negative Spearman r between model score and GSN_b2)
+- [ ] A2: KBA headline number quantified
+- [ ] A3+A4: Stage 1 D² finalised with best GLM specification
+- [ ] B5 (or B2 if pixel scope is the paper claim): final Recall number
+- [ ] C1: SHAP mechanism confirmed (cost-minimisation drivers named)
+- [ ] C2: Bootstrap CIs in hand
+- [ ] C3: Cross-regional transfer result (transfer = universal claim; failure = regional finding)
+- [ ] C5: Forward maps and country scorecard produced
+
+**Paper structure (Nature Sustainability, ~3500 words)**:
+1. **Introduction** (600w): 30×30 urgency, prediction-vs-prescription gap, cost-minimisation argument
+2. **Results** (1800w): Stage 1 → Stage 2 cross-event → SHAP mechanism → representation gap + KBA headline → forward projections + country scorecard
+3. **Discussion** (600w): designation as political economy, representation gap implications, concept drift as finding, limitations
+4. **Methods** (500w): data; Stage 1 as Heckman selection equation; Stage 2 as Heckman outcome equation with cross-event validation design; temporal robustness supplement
+5. **Extended Data** (~8 figures): per-country metrics, temporal stability per-year, temporal SHAP pre/post-Paris, USA/SE Asia zero-shot, country-level SHAP, forward scenarios, country scorecard
+
+---
+
+### Euler job tracker
+
+| Job / Step | Description | Status |
+|---|---|---|
+| 3957103→3957105→3957107 | AGB rasterise → agb_inject → redd_inject | ✅ All COMPLETED (2026-06-19 ~16:24) |
+| B0 E11+E12 | Apply code changes: ES min-pos filter + group size cap | ✅ Applied (2026-06-19) |
+| 3981693 | A1: E1 gap analysis (re-run at 128G) | 🔄 QUEUED |
+| 3981696 | eco_protection_gap inject | 🔄 QUEUED |
+| 3981700 | B1 CE.4 training (after 3981696) | 🔄 QUEUED (dependency) |
+| 3981878 | A3: stage1 panel rebuild + Poisson GLM | 🔄 QUEUED |
+| 3981887 | A3: stage1_nb_overdispersion E6 (after 3981878) | 🔄 QUEUED (dependency) |
+| A2 KBA | Download KBA shapefile → kba_rasterise.py | ❌ BLOCKED — needs user to download from keybiodiversityareas.org |
+| A4 CBD features | Add CBD pledge + coverage gap to Stage 1 | ⬜ After A3 results |
+| B2 | Ecological scope filter on CE.4 model | ⬜ After B1 result |
+| B3 | E9 (dist_border) + E10 (TRI) features | ⬜ After B1 baseline |
+| B4 (E3) | Watershed proof-of-concept on mini-sample | ⬜ Local; after B1 result known |
+| B5 (CE.W) | Full SA watershed model | ⬜ Euler; after B4 ≥ 50% |
+| C1 | SHAP (global + temporal + country) | ⬜ After B5 |
+| C2 | Bootstrap CIs | ⬜ After B5 |
+| C3 | Cross-regional transfer SA→USA→SE Asia | ⬜ After B5 |
+| C5 | Forward maps + Figure 3 | ⬜ After C4 + A2 |
 
 ---
 
@@ -506,6 +499,11 @@ Do not begin until:
 | Sample weighting | **inv_sqrt_npos confirmed** (Fix 2 inv_npos tested in CE.3b → 18.0%, WORSE than CE.2 23.8%; ce3b_sqrt diagnostic running to confirm) | inv_npos over-amplifies noisy small events; inv_sqrt_npos remains the correct setting |
 | Event split | Stratified by country (Fix 4) | Random seed=42 placed Argentina crisis years entirely in test set |
 | AGB / REDD features | Static features (2010 AGB snapshot, 2023 REDD database) — intentional | Annual dynamics not needed; structural signal is what drives designation |
+| Policy features (WGI, V-Dem, DPI) | Already in panel as `policy_b1-4`; do NOT re-add | Confirmed present in merge pipeline; DPI executive ideology, V-Dem LDI, WGI GE + RL |
+| `dist_indigenous` | Already in feature set (STATIC_DISTANCE_MAPPING) | Distance to indigenous territory computed at merge time |
+| `deforestation` neighbourhood signal | Already available as `deforestation_b1_smooth16/smooth64` | Smooth versions capture ~16km and ~64km neighbourhood deforestation pressure |
+| Early-stop iter count (CE.3b-sqrt: 51; CE.2: 66) | Val set contaminated by political events → metric stalls early; Fix 4b (large-event-only val set) addresses this | Fixed iteration count (500 rounds, lr=0.02) is viable alternative; test in E11 |
+| Group size cap threshold | Not yet determined — test MAX_GROUP_SIZE=50,000 in E12 | inv_npos (CE.3b) over-amplified noisy small groups and made things worse; cap is a safer approach than full normalisation |
 
 ---
 
@@ -520,9 +518,9 @@ Do not begin until:
 | USA pixel splits | `euler:$SCRATCH/data/usa/ml/main/{train,earlystop,test}.parquet` | ✅ Ready |
 | SE Asia pixel splits | `euler:$SCRATCH/data/se_asia/ml/main/{train,earlystop,test}.parquet` | ✅ Ready |
 | AGB raw tiles | `data/shared/ESA_CCI_Biomass/` | ✅ **29 tiles, 1.7 GB on Euler** — ESA CCI Biomass fv7.0 (2010); ready to rasterise |
-| AGB TIF (processed) | `data/south_america/ready/AGB/agb_sa.tif` | ⬜ Run `agb_rasterise.py` (next step for CE.4) |
-| REDD raw data | `data/REDD/ID-RECCO V5.0_20231201.zip` | ✅ **1.4 MB zip on Euler** — ready to rasterise |
-| REDD TIF (processed) | `data/south_america/ready/REDD/redd_sa.tif` | ⬜ Run `redd_rasterise.py` (next step for CE.4) |
+| AGB TIF (processed) | `data/south_america/ready/AGB/agb_sa.tif` | ✅ Done (2026-06-19) — injected into all SA splits |
+| REDD raw data | `data/REDD/ID-RECCO V5.0_20231201.zip` | ✅ Done — rasterised 2026-06-19 |
+| REDD TIF (processed) | `data/south_america/ready/REDD/redd_sa.tif` | ✅ Done (2026-06-19) — injected into all SA splits |
 | Colombia dev panel | `euler:$SCRATCH/data/dev/south_america/ml/main/` | ✅ Ready (79 features) |
 | Forward scored (existing) | `euler:$SCRATCH/outputs/south_america/forward_scored_2024.parquet` | ✅ Exists |
 | MapBiomas Brazil | Google Drive | ⚠️ Verify format/coverage before committing |
@@ -556,3 +554,10 @@ Do not begin until:
 - MapBiomas Brazil — deferred; cross-event model with AGB/REDD may resolve Brazil performance
 - Rolling spatial PA profile feature — low priority vs RQ3
 - Raising min_positive_pixels as a primary filter — a 200-pixel designation can be scientifically significant; use spatial coherence filter instead
+- **MaxEnt / one-class modeling** — designed for presence-only data; we have full panel data; LambdaRank with inv_sqrt_npos is the correct choice
+- **Spatial Autoregressive (SAR) model** — the spatial contagion signal is already captured via dist_wdpa; a formal SAR specification adds complexity without clear benefit given our ranking objective
+- **Cox PH survival model (Track C)** — kept as a contingency if Track B watershed Recall ≤ 50%; not on the critical path now
+- **Political regime feature (re-adding WGI/V-Dem)** — already in panel as `policy_b1-4`; confirmed present
+- **Indigenous territory distance feature** — already in feature set as `dist_indigenous`
+- **Neighbourhood deforestation pressure ring** — already approximated by `deforestation_b1_smooth16/smooth64`
+- **Oil/gas concession distance** — already in feature set as `dist_oil_gas`; mining concessions could add marginal signal but data availability for SA is poor

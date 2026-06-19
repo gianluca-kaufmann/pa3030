@@ -41,13 +41,17 @@ export STAGE2_GRADED_RELEVANCE=1
 export STAGE2_EARLY_STOP_METRIC=recall_at_5pct
 export STAGE2_NEG_RATIO=100
 
-# --- CE.4 settings (Fix 2 reverted; Fix 4 kept) ---
+# --- CE.4 settings (Fix 2 reverted; Fix 4 kept; B0 infrastructure applied) ---
 export STAGE2_GROUP_WEIGHT_MODE=inv_sqrt_npos   # reverted from inv_npos (ce3b_sqrt confirmed)
 export STAGE2_STRATIFIED_SPLIT=1                # Fix 4: country-stratified split
 export STAGE2_PATIENCE=200                      # Fix 4: longer patience
 
 # Fix 1: coherence=0.0 (no-op — CE.3a found all 139 events have coherence=1.0)
 export STAGE2_COHERENCE_THRESHOLD=0.0
+
+# B0 infrastructure fixes
+export STAGE2_ES_MIN_POS=5000        # E11: early-stop val restricted to large events (≥5k pos)
+export STAGE2_MAX_GROUP_SIZE=50000   # E12: cap training groups at 50k pixels (subsample neg)
 
 echo "CE.4: cross-event Stage 2 with AGB + REDD features"
 echo "  weights=$STAGE2_GROUP_WEIGHT_MODE  patience=$STAGE2_PATIENCE"
