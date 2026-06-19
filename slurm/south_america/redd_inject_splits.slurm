@@ -4,7 +4,7 @@
 #SBATCH --time=06:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem-per-cpu=32G
+#SBATCH --mem-per-cpu=8G
 #SBATCH --output=/cluster/scratch/%u/logs/redd_inject_%j.out
 #SBATCH --error=/cluster/scratch/%u/logs/redd_inject_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
@@ -37,8 +37,7 @@ srun --cpu-bind=cores python -u \
     --tif "$REDD_TIF" \
     --cols dist_redd_km \
     --inplace
+STATUS=$?
 
-echo "Done. dist_redd_km injected into all three splits."
-echo "Splits now have AGB + REDD features. Manually submit CE.4 retrain:"
-echo "  sbatch slurm/south_america/training_lgbm_stage2_ce3b.slurm"
-echo "  (same script, same settings — uses the enriched splits automatically)"
+echo "Done: $(date)  exit=$STATUS"
+exit $STATUS

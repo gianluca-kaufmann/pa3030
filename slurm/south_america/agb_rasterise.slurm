@@ -4,7 +4,7 @@
 #SBATCH --time=1:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem-per-cpu=32G
+#SBATCH --mem-per-cpu=4G
 #SBATCH --output=/cluster/scratch/%u/logs/agb_rasterise_%j.out
 #SBATCH --error=/cluster/scratch/%u/logs/agb_rasterise_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
@@ -26,5 +26,7 @@ echo "CE.4 step 1: AGB rasterise"
 
 srun --cpu-bind=cores python -u \
     scripts/regions/south_america/2_preprocessing/agb_rasterise.py
+STATUS=$?
 
-echo "Done. Check data/south_america/ready/AGB/agb_sa.tif"
+echo "Done: $(date)  exit=$STATUS"
+exit $STATUS

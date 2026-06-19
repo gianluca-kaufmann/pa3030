@@ -4,7 +4,7 @@
 #SBATCH --time=0:30:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem-per-cpu=8G
+#SBATCH --mem-per-cpu=2G
 #SBATCH --output=/cluster/scratch/%u/logs/redd_rasterise_%j.out
 #SBATCH --error=/cluster/scratch/%u/logs/redd_rasterise_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
@@ -26,5 +26,7 @@ echo "CE.4 step 2: REDD rasterise"
 
 srun --cpu-bind=cores python -u \
     scripts/regions/south_america/2_preprocessing/redd_rasterise.py
+STATUS=$?
 
-echo "Done. Check data/south_america/ready/REDD/redd_sa.tif"
+echo "Done: $(date)  exit=$STATUS"
+exit $STATUS

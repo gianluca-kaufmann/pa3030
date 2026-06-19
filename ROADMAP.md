@@ -6,7 +6,7 @@
 > - ✅ Stage 1 Poisson GLM: D²=0.345 — improvable; NB + country FE to be tried (E6)
 > - ✅ Stage 2 temporal model (H6+H1b+H5): Lift@1%=6.46× — demonstrates cost-minimisation pattern; sufficient for Track A
 > - ✅ Cross-event validation: macro R@5% stuck at 18–24% across 3 experiments — pixel-level ranking has structural ceiling
-> - 🔄 Euler: CE.3b-sqrt diagnostic (job 3917581) + AGB/REDD inject chain (3917605→3917615→3917625, 3917608) running
+> - 🔄 Euler: CE.3b-sqrt diagnostic (job 3917581) + AGB/REDD inject chain (3953698→3953709→3953712, 3953702) running + E1 gap (3953707)
 > - **STRATEGIC PIVOT — two parallel tracks**:
 >   - **Track A (Gap finding)**: use existing temporal model + GSN_b2 to quantify the biodiversity-cost gap. This IS the Nature finding and can be computed today (E1).
 >   - **Track B (Watershed model)**: rebuild mini-sample at HydroSHEDS L7 catchment level; rank catchments instead of pixels; structural Recall fix expected >70% (E3).
@@ -149,7 +149,7 @@ Brazil's Bolsonaro-era events (2019–2022) are ~3–4 of the 30 test events (10
 | CE.3a spatial coherence diagnostic | ✅ Done | All 139 events coherence=1.0; threshold=0.0; Fix 1 is a no-op |
 | CE.3b redesigned cross-event run | ✅ Done — gate FAILED | macro R@5%=18.0%, weighted=26.5%, 29 events, iter=122; WORSE than CE.2 — Fix 2 (inv_npos) suspected |
 | CE.3b regression diagnostic | 🔄 RUNNING (job 3917581) | inv_sqrt_npos + stratified + patience=200; if ≥ CE.2 → Fix 2 (inv_npos) caused regression |
-| CE.4 AGB+REDD features | 🔄 RUNNING chain | 3917605 agb_rasterise → 3917615 agb_inject → 3917625 redd_inject; 3917608 redd_rasterise (parallel with agb chain; afterok both for redd_inject) |
+| CE.4 AGB+REDD features | 🔄 RUNNING chain | 3953698 agb_rasterise → 3953709 agb_inject → 3953712 redd_inject; 3953702 redd_rasterise (parallel with agb chain; afterok both for redd_inject) |
 | Per-country breakdown (temporal model) | ✅ Done | SUR=28.55×, ARG=9.31×, BRA=1.69×; excl. outliers: 10.89× |
 | Within-group pixel split (P1.1) | ❌ Abandoned | Geometric artifact (93–96% guaranteed by cluster geometry) |
 | Patch CC approach (H12) | ❌ Abandoned | Mega-blob artifact confirmed |
@@ -258,11 +258,11 @@ AGB (above-ground biomass) and REDD (proximity to carbon-market projects) are ke
 - **Gate revised**: lower from 65% → 50%. The original 65% assumed all test events are ecologically predictable; ~8/12 countries score low for political-economy reasons that features cannot encode.
 - **CE.4 SLURM script ready**: `slurm/south_america/training_lgbm_stage2_ce4.slurm` — submit after inject chain + ce3b_sqrt result confirmed.
 
-**CE.4 — Add AGB + REDD; retrain** ← AGB/REDD inject chain running (jobs 3917605→3917615→3917625 + 3917608); script ready
+**CE.4 — Add AGB + REDD; retrain** ← AGB/REDD inject chain running (jobs 3953698→3953709→3953712 + 3953702); script ready
 - ✅ AGB raw tiles: `data/shared/ESA_CCI_Biomass/` (on Euler)
 - ✅ REDD raw data: `data/REDD/` (on Euler)
 - ✅ backbone.tif synced to `data/south_america/ready/backbone/backbone.tif`
-- 🔄 agb_rasterise (3917605) + redd_rasterise (3917608) running; agb_inject (3917615) → redd_inject (3917625) queued
+- 🔄 agb_rasterise (3953698) + redd_rasterise (3953702) running; agb_inject (3953709) → redd_inject (3953712) queued
 - SLURM: `slurm/south_america/training_lgbm_stage2_ce4.slurm` — ready to submit after inject chain
 - Retrain uses inv_sqrt_npos + stratified + patience=200 (confirmed by ce3b_sqrt diagnostic)
 - Decision gate: macro Recall@5% ≥ 50% (revised from 65%; ~8/12 test countries score low for political-economy reasons)
@@ -384,9 +384,9 @@ Do not begin until:
 | Job | Description | Status |
 |---|---|---|
 | 3917581 | CE.3b-sqrt diagnostic (inv_sqrt_npos + stratified + patience=200) | 🔄 Running (~1h left) |
-| 3917605→3917615 | AGB rasterise → inject | 🔄 Queued (QOSMaxMemoryPerUser — will start when quota clears) |
-| 3917608→3917625 | REDD rasterise → inject | 🔄 Queued (same QOS limit) |
-| **3950635** | **E1 gap analysis** — score full SA test (2017-2024) with temporal model; GSN_b2 gap | **🔄 Queued (Priority)** |
+| 3953698→3953709 | AGB rasterise (4×4G) → inject (4×8G) | 🔄 Queued |
+| 3953702→3953712 | REDD rasterise (4×2G) → inject (4×8G) | 🔄 Queued |
+| **3953707** | **E1 gap analysis** (8×6G) — score full SA test (2017-2024); GSN_b2 gap | **🔄 Queued** |
 | CE.4 | AGB+REDD cross-event retrain (`training_lgbm_stage2_ce4.slurm`) | ⬜ Submit after inject chain + ce3b_sqrt |
 | CE.W | Watershed cross-event full SA (submit after E3 proves concept) | ⬜ After E3 |
 | SHAP | Global beeswarm + pre/post-Paris temporal SHAP | ⬜ After final model |

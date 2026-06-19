@@ -4,7 +4,7 @@
 #SBATCH --time=06:00:00
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem-per-cpu=32G
+#SBATCH --mem-per-cpu=8G
 #SBATCH --output=/cluster/scratch/%u/logs/agb_inject_%j.out
 #SBATCH --error=/cluster/scratch/%u/logs/agb_inject_%j.err
 #SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
@@ -37,5 +37,7 @@ srun --cpu-bind=cores python -u \
     --tif "$AGB_TIF" \
     --cols agb_tonne_ha \
     --inplace
+STATUS=$?
 
-echo "Done. agb_tonne_ha injected into all three splits."
+echo "Done: $(date)  exit=$STATUS"
+exit $STATUS
