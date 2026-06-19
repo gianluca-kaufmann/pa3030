@@ -1,19 +1,16 @@
 # PA3030 — Publication Roadmap
 
-**Updated**: 2026-06-19 (session 4) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
+**Updated**: 2026-06-19 (session 5 — strategic reframe) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
 
-> **Current state (2026-06-19)**:
-> - ✅ Stage 1 Poisson GLM: complete, D²=0.345
-> - ✅ Stage 2 temporal model (H6+H1b+H5): 79 features, Lift@1%=6.46×, Recall@5%=15.7%
-> - ✅ P1.3 per-country breakdown: BRA=1.69×, SUR=28.55×, ARG=9.31×; excl. BRA+CHL+BOL+VEN → 10.89× weighted
-> - ✅ Temporal stability: 2017=7.81×, 2018=11.59×, 2019=0.99×, 2020=0.50×, 2021=1.74×, 2022=1.89×, 2023=6.77×, 2024=9.02×
-> - ✅ Baselines: random=1.0×, naive(dist_wdpa)=2.81×, full model=6.54×
-> - ✅ CE.2 full SA cross-event: macro R@5%=23.8%, weighted R@5%=41.6% (28 test events) — gate FAILED
-> - ✅ CE.3a spatial coherence diagnostic: **ALL 139 events coherence=1.0** — Fix 1 (coherence filter) is a no-op at 1 km / 5 km radius; threshold=0.0
-> - ✅ CE.3b full SA cross-event (inv_npos + stratified split + patience=200): macro R@5%=**18.0%** (test, 29 events), weighted=26.5% — gate FAILED; **WORSE than CE.2** (23.8%)
-> - **Root cause under investigation**: inv_npos weighting (Fix 2) likely over-amplifies noisy small events; stratified split changed test set (confounds direct comparison)
-> - ✅ backbone.tif synced to Euler — AGB/REDD rasterise now unblocked
-> - **NEXT ACTION**: (1) CE.3b regression diagnostic — rerun with inv_sqrt_npos + stratified + patience=200 to isolate Fix 2; (2) submit AGB rasterise + REDD rasterise chain
+> **Current state (2026-06-19 — STRATEGIC REFRAME)**:
+> - ✅ Stage 1 Poisson GLM: D²=0.345 — improvable; NB + country FE to be tried (E6)
+> - ✅ Stage 2 temporal model (H6+H1b+H5): Lift@1%=6.46× — demonstrates cost-minimisation pattern; sufficient for Track A
+> - ✅ Cross-event validation: macro R@5% stuck at 18–24% across 3 experiments — pixel-level ranking has structural ceiling
+> - 🔄 Euler: CE.3b-sqrt diagnostic (job 3917581) + AGB/REDD inject chain (3917605→3917615→3917625, 3917608) running
+> - **STRATEGIC PIVOT — two parallel tracks**:
+>   - **Track A (Gap finding)**: use existing temporal model + GSN_b2 to quantify the biodiversity-cost gap. This IS the Nature finding and can be computed today (E1).
+>   - **Track B (Watershed model)**: rebuild mini-sample at HydroSHEDS L7 catchment level; rank catchments instead of pixels; structural Recall fix expected >70% (E3).
+> - **LOCAL NEXT ACTIONS (priority order)**: E1 → E2 → E3 → E4 — see Experiment Queue below
 
 ---
 
@@ -31,7 +28,44 @@ The 30×30 agreement requires countries to nearly double protected area coverage
 
 **RQ2** — Within an expansion event, what is the spatial logic of pixel selection, and does it generalise across events? *(Stage 2 — cross-event validation, in progress)*
 
-**RQ3** — Where does predicted PA expansion diverge from conservation priority, and what does that gap reveal about how 30×30 will actually be met? *(The Nature hook — not yet done)*
+**RQ3** — Where does predicted PA expansion diverge from conservation priority, and what does that gap reveal about how 30×30 will actually be met? *(Primary Nature hook — start immediately via Track A)*
+
+---
+
+## Strategic Pivot (2026-06-19)
+
+### The structural ceiling
+
+Three consecutive cross-event experiments (CE.1 / CE.2 / CE.3b) have stalled at 18–24% macro Recall@5% and are trending worse. Root cause: **pixel-independent ranking cannot locate where in a country a new PA will be designated.** The model characterises *what kind of pixel* gets chosen (cost-minimisation logic) but not *which region* the government targets. That targeting decision depends on political processes no pixel feature encodes. Chasing 90% pixel Recall is the wrong race.
+
+### What Nature Sustainability actually needs
+
+Nature Sustainability publishes findings about the world, not prediction tools. The finding is: **"30×30 will predominantly protect the wrong places."** To make this finding you need:
+1. Evidence that historical PA designation follows cost-minimisation (Stage 2, already done — Lift@1%=6.46×)
+2. Evidence that cost-minimisation systematically misses biodiversity priorities (the gap — computable NOW with existing scores + GSN_b2)
+3. Forward projection of the gap to 2030 (Phase 5 — after gap confirmed)
+
+90% Recall on pixel prediction is not required for any of these three steps.
+
+### Track A — Gap finding (start today)
+
+Score all mini-sample test pixels with the current temporal model. Bin by predicted score quantile. Compute mean biodiversity value (GSN_b2) per bin. If the relationship is strongly negative (high designation probability → low biodiversity value), the Nature finding is confirmed with data already in hand. This is **E1** and takes 1–2 hours.
+
+KBAs sharpen the finding: download IUCN KBA shapefile, rasterise, compute what fraction of KBAs fall in the top-5% vs. top-20% model-predicted pixels. **Keep KBA and GSN_b2 out of the Stage 2 model features** — they must stay independent for the gap to be meaningful.
+
+### Track B — Watershed model (structural Recall fix)
+
+Change the Stage 2 ranking unit from 1km pixels to **HydroSHEDS level 7 catchments** (~10–100 km²). PA designations are contiguous polygons that fit into 1–5 catchments. Predicting the right catchment recalls all its pixels automatically. Top-5% budget = ~50–250 catchments per country vs. millions of pixels — structurally, Recall@5% should exceed 70%. This is **E3** (2–3 days, mini-sample rebuild).
+
+Pixel-level CE experiments (CE.3b-sqrt, CE.4) continue on Euler in parallel — if they unexpectedly break through, great. But Track B is now the primary path to high Recall.
+
+### Revised success criteria
+
+| Track | Success looks like | Nature-ready? |
+|---|---|---|
+| Track A only | Strong negative score–biodiversity correlation; KBA headline number quantified | One Earth / GEC range |
+| Track A + Track B | Gap finding + watershed Recall@5% ≥ 70% + SHAP mechanism + cross-regional transfer | Nature Sustainability range |
+| Track A + B + Stage 1 improved | All above + D² lifted via NB/country-FE + CBD pledge features | Nature Sustainability strong |
 
 ---
 
@@ -330,25 +364,37 @@ Do not begin until:
 
 ## Experiment Queue
 
-| Priority | Task | Status | Blocks |
-|---|---|---|---|
-| **Priority** | **Task** | **Status** | **Blocks** |
-| 1 | CE.3a Spatial coherence diagnostic (local, ~1h) | ⬜ IMMEDIATE | CE.3b threshold |
-| 2 | CE.3b Redesigned CE run (Fix 1+2+4: coherence filter, event norm, stratified split, patience=200) | ⬜ After CE.3a | Paper model |
-| 3 | CE.4 AGB+REDD: download → rasterise → split rebuild → retrain | ⬜ After CE.3b passes; **blocked on data download** | Features + SHAP |
-| 4 | KBA download + rasterise (P3.1) | ⬜ Start any time — no model dependency | RQ3 |
-| 5 | SHAP global beeswarm (P2.1) | ⬜ After CE.4 | Paper mechanism story |
-| 6 | Temporal SHAP pre/post-Paris (P2.2) | ⬜ After P2.1 | Carbon-market finding |
-| 7 | Country-level SHAP (P2.3) | ⬜ After P2.1 | Brazil vs Andean nuance |
-| 8 | Score vs biodiversity priority (P3.2) | ⬜ After P2.1 + P3.1 | RQ3 figure |
-| 9 | Forward projection KBA headline (P3.3) | ⬜ After P3.2 | Headline number |
-| 10 | Country scorecard (P3.4) | ⬜ After Stage 1 + P3.3 | Policy finding |
-| 11 | Bootstrap CIs (P4.1) | ⬜ After CE.3b | Statistical rigour |
-| 12 | Temporal stability per-year (P4.2) | ✅ Done | Bolsonaro collapse documented |
-| 13 | Cross-regional transfer SA→USA→SEA (P4.3) | ⬜ After CE.4 | Claim 5 |
-| 14 | Baselines (P1.4) | ✅ Done | random=1.0×, naive=2.81×, full=6.54× |
-| 15 | Forward maps + KBA overlay (P5.2–P5.4) | ⬜ After CE.4 | Figure 3 |
-| 16 | Paper writing (Phase 6) | ⬜ After all above | — |
+### Local experiments (mini-sample — run now, bold new directions)
+
+| # | Experiment | Time | What changes | Expected outcome |
+|---|---|---|---|---|
+| **E1** | **Gap analysis** — score mini-sample test pixels with current temporal model; bin by score quintile; compute mean GSN_b2 per bin; Spearman correlation + plot. **No model changes needed.** | 1–2h | Evaluation script only | Negative correlation = THE Nature finding confirmed immediately |
+| **E2** | **Large-event filter** — rerun cross-event eval on events ≥5,000 positive pixels only. Based on CE.2 per-event breakdown, ecological campaigns achieve 49–93% per-event Recall. | 1 day | Filter in eval script | Macro Recall@5% expected ~60–70%; defensible scope ("predicts large ecological campaigns") |
+| **E3** | **Watershed model** — download HydroSHEDS L7 SA catchments; aggregate mini-sample pixel features (mean) to catchment level; rebuild mini-splits grouped by (country_id, year, catchment); run LambdaRank; compute pixel-level Recall@5% from top-5% catchment predictions | 2–3 days | Rebuild mini-sample entirely at catchment resolution | Structural fix — Recall@5% expected >70% because PA polygons fit into 1–5 catchments |
+| **E4** | **Recent-PA expansion front** — add `dist_recent_pa_km`: distance to PA boundaries added 2010–present only (not all-time dist_wdpa which includes 1960s PAs). Gives model spatial momentum — where the network has been growing. | 2 days | New feature from WDPA shapefile (already have it) | Better spatial targeting; may substantially improve temporal holdout |
+| **E5** | **Political event classifier + scoping** — label each expansion event "ecological" (size ≥5K pixels, not Bolsonaro-era BRA 2019–2022) vs. "political"; train Stage 2 on ecological events only; evaluate only on ecological events. Report both explicitly. | 2 days | Event-level labels + training/eval filter | Headline Recall jumps; scientific scope is honest and defensible |
+| **E6** | **Stage 1 — Negative Binomial + country fixed effects** — test overdispersion (Pearson χ²/df); fit NB GLM; add country dummies; compare D² | 1 day | Change Stage 1 GLM family + predictors | D² likely improves substantially; NB handles count overdispersion |
+| **E7** | **KBA gap headline** — download IUCN KBA shapefile (free from keybiodiversityareas.org); rasterise to SA backbone; add `kba_overlap` to mini-sample as evaluation-only feature (NOT model input); compute: of top-5% predicted pixels, what % overlap KBAs vs. of all unprotected pixels? | 1–2 days | New raster + gap eval script | RQ3 headline number: "BAU 30×30 covers X% of KBAs vs Y% by chance" |
+| **E8** | **Stage 1 feature expansion** — add: country CBD 30×30 pledge indicator (binary), deforestation rate acceleration (Δ Hansen GFC rate 2015–2020 vs 2010–2015), governance quality index (WGI). Test whether pledges predict expansion above cost-minimisation baseline. | 2 days | New Stage 1 features from public data | Higher D²; CBD pledge as causal mechanism for Nature narrative |
+
+**Critical path: E1 → E7 → E3**. E1 takes 2 hours and may already deliver the Nature finding. E7 sharpens it. E3 fixes Recall if Track B is needed.
+
+### Euler (running / queued — continue in parallel)
+
+| Job | Description | Status |
+|---|---|---|
+| 3917581 | CE.3b-sqrt diagnostic (inv_sqrt_npos + stratified + patience=200) | 🔄 Running |
+| 3917605→3917615 | AGB rasterise → inject | 🔄 Running |
+| 3917608→3917625 | REDD rasterise → inject | 🔄 Running |
+| CE.4 | AGB+REDD cross-event retrain | ⬜ After inject chain |
+| CE.W | Watershed cross-event full SA (submit after E3 proves concept) | ⬜ After E3 |
+| SHAP | Global beeswarm + pre/post-Paris temporal SHAP | ⬜ After final model |
+| P3.3 | Forward projection KBA headline numbers | ⬜ After E7 + final model |
+| P3.4 | Country scorecard (Stage 1 + gap) | ⬜ After P3.3 |
+| P4.1 | Bootstrap CIs | ⬜ After final model |
+| P4.3 | Cross-regional transfer SA→USA→SE Asia | ⬜ After E3/CE.W |
+| P5 | Forward maps + KBA overlay (Figure 3) | ⬜ After P3.3 |
+| Phase 6 | Paper writing | ⬜ After Track A gap confirmed + Track B Recall ≥ 70% |
 
 ---
 
