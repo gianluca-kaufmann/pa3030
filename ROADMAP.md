@@ -148,8 +148,9 @@ Brazil's Bolsonaro-era events (2019–2022) are ~3–4 of the 30 test events (10
 | Stage 2 cross-event (CE.2) | ✅ Done — gate FAILED | macro R@5%=23.8%, weighted=41.6%, 28 events; root cause: heterogeneous events |
 | CE.3a spatial coherence diagnostic | ✅ Done | All 139 events coherence=1.0; threshold=0.0; Fix 1 is a no-op |
 | CE.3b redesigned cross-event run | ✅ Done — gate FAILED | macro R@5%=18.0%, weighted=26.5%, 29 events, iter=122; WORSE than CE.2 — Fix 2 (inv_npos) suspected |
-| CE.3b regression diagnostic | 🔄 RUNNING (job 3917581) | inv_sqrt_npos + stratified + patience=200; if ≥ CE.2 → Fix 2 (inv_npos) caused regression |
-| CE.4 AGB+REDD features | 🔄 RUNNING chain | 3953698 agb_rasterise → 3953709 agb_inject → 3953712 redd_inject; 3953702 redd_rasterise (parallel with agb chain; afterok both for redd_inject) |
+| CE.3b regression diagnostic (ce3b_sqrt) | ✅ Done — gate FAILED | macro R@5%=18.8%, val=35.3%, iter=51; inv_sqrt_npos confirmed better than inv_npos (val +3.5pp); BUT test still 18.8% vs CE.2 23.8% — stratified split is harder test set |
+| CE.4 AGB+REDD features | 🔄 RUNNING chain | redd_rasterise ✅ done; agb_rasterise 🔄 PENDING (3957103, was OOM at 16G → now 64G); agb_inject (3957105) → redd_inject (3957107) queued |
+| E1 gap analysis (Track A) | 🔄 RUNNING (3953707) | Scoring 300M+ rows with temporal model; GSN_b2 gap; ~30-60 min remaining |
 | Per-country breakdown (temporal model) | ✅ Done | SUR=28.55×, ARG=9.31×, BRA=1.69×; excl. outliers: 10.89× |
 | Within-group pixel split (P1.1) | ❌ Abandoned | Geometric artifact (93–96% guaranteed by cluster geometry) |
 | Patch CC approach (H12) | ❌ Abandoned | Mega-blob artifact confirmed |
@@ -383,10 +384,10 @@ Do not begin until:
 
 | Job | Description | Status |
 |---|---|---|
-| 3917581 | CE.3b-sqrt diagnostic (inv_sqrt_npos + stratified + patience=200) | 🔄 Running (~1h left) |
-| 3953698→3953709 | AGB rasterise (4×4G) → inject (4×8G) | 🔄 Queued |
-| 3953702→3953712 | REDD rasterise (4×2G) → inject (4×8G) | 🔄 Queued |
-| **3953707** | **E1 gap analysis** (8×6G) — score full SA test (2017-2024); GSN_b2 gap | **🔄 Queued** |
+| 3917581 | CE.3b-sqrt diagnostic | ✅ Done — 18.8% macro R@5% |
+| 3953702 | REDD rasterise | ✅ Done — redd_sa.tif saved |
+| **3953707** | **E1 gap analysis** (8×6G) | **🔄 Running** (~30-60 min remaining) |
+| 3957103→3957105→3957107 | AGB rasterise (4×16G) → agb_inject → redd_inject | 🔄 Queued (OOM fix: was 16G→64G) |
 | CE.4 | AGB+REDD cross-event retrain (`training_lgbm_stage2_ce4.slurm`) | ⬜ Submit after inject chain + ce3b_sqrt |
 | CE.W | Watershed cross-event full SA (submit after E3 proves concept) | ⬜ After E3 |
 | SHAP | Global beeswarm + pre/post-Paris temporal SHAP | ⬜ After final model |
@@ -410,7 +411,7 @@ Do not begin until:
 | CE.1 Colombia pilot (country_id=5 only, min_pos=200) | 16.8% | 11.8% | 5.26× | 4 | ❌ gate FAILED (<60%); within-Colombia cross-time only |
 | CE.2 Full SA (13 countries, min_pos=200, 83 feat) | 23.8% | 41.6% | 6.05× | 28 | ❌ gate FAILED (<65%); macro vs weighted gap is large |
 | CE.3b Full SA (inv_npos + stratified split + patience=200 + coherence_thr=0.0) | 18.0% | 26.5% | 4.80× | 29 | ❌ gate FAILED (<65%); **WORSE than CE.2** — Fix 2 (inv_npos) suspected; iter=122 |
-| CE.3b-sqrt diagnostic (inv_sqrt_npos + stratified + patience=200) — job 3917581 | 🔄 running | — | — | 29 | pending result; if ≥ 23.8% → Fix 2 was the regression cause |
+| CE.3b-sqrt diagnostic (inv_sqrt_npos + stratified + patience=200) | 18.8% | — | 6.01× | 29 | ❌ gate FAILED; inv_sqrt_npos confirmed best (val +3.5pp vs inv_npos); stratified split = harder test — explains CE.2→CE.3b regression |
 
 **Per-event pattern (CE.2 full SA test events)**:
 
