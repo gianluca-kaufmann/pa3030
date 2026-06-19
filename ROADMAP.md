@@ -383,18 +383,21 @@ Do not begin until:
 
 | Job | Description | Status |
 |---|---|---|
-| 3917581 | CE.3b-sqrt diagnostic (inv_sqrt_npos + stratified + patience=200) | 🔄 Running |
-| 3917605→3917615 | AGB rasterise → inject | 🔄 Running |
-| 3917608→3917625 | REDD rasterise → inject | 🔄 Running |
-| CE.4 | AGB+REDD cross-event retrain | ⬜ After inject chain |
+| 3917581 | CE.3b-sqrt diagnostic (inv_sqrt_npos + stratified + patience=200) | 🔄 Running (~1h left) |
+| 3917605→3917615 | AGB rasterise → inject | 🔄 Queued (QOSMaxMemoryPerUser — will start when quota clears) |
+| 3917608→3917625 | REDD rasterise → inject | 🔄 Queued (same QOS limit) |
+| **3950635** | **E1 gap analysis** — score full SA test (2017-2024) with temporal model; GSN_b2 gap | **🔄 Queued (Priority)** |
+| CE.4 | AGB+REDD cross-event retrain (`training_lgbm_stage2_ce4.slurm`) | ⬜ Submit after inject chain + ce3b_sqrt |
 | CE.W | Watershed cross-event full SA (submit after E3 proves concept) | ⬜ After E3 |
 | SHAP | Global beeswarm + pre/post-Paris temporal SHAP | ⬜ After final model |
-| P3.3 | Forward projection KBA headline numbers | ⬜ After E7 + final model |
-| P3.4 | Country scorecard (Stage 1 + gap) | ⬜ After P3.3 |
+| E7/P3.3 | KBA gap headline + forward projection numbers | ⬜ After E7 + final model |
+| P3.4 | Country scorecard (Stage 1 + gap) | ⬜ After E7/P3.3 |
 | P4.1 | Bootstrap CIs | ⬜ After final model |
 | P4.3 | Cross-regional transfer SA→USA→SE Asia | ⬜ After E3/CE.W |
-| P5 | Forward maps + KBA overlay (Figure 3) | ⬜ After P3.3 |
+| P5 | Forward maps + KBA overlay (Figure 3) | ⬜ After E7/P3.3 |
 | Phase 6 | Paper writing | ⬜ After Track A gap confirmed + Track B Recall ≥ 70% |
+
+**Mini-sample status**: existing mini_splits/main/ (train 528MB + earlystop 153MB, no test.parquet, no HydroSHEDS features) is **not usable for E1–E8 as-is**. E1 uses full SA Euler parquets (unblocked). E3 (watershed model) requires a full mini-sample rebuild with HydroSHEDS L7 catchment features — this is the prerequisite for all Track B local experiments.
 
 ---
 
@@ -499,7 +502,7 @@ Do not begin until:
 | Paper framing | Representation gap is the finding; prediction model is the tool | Core strategic decision |
 | Naive baselines | Must be documented | Required for any top journal |
 | min_positive_pixels | Stay at 200; do NOT raise as primary filter | Small coherent events are scientifically valid; use coherence filter instead |
-| Sample weighting | Change to event-level norm (Fix 2) after CE.3b validation | inv_sqrt_npos alone creates 50× gradient imbalance between large/small events |
+| Sample weighting | **inv_sqrt_npos confirmed** (Fix 2 inv_npos tested in CE.3b → 18.0%, WORSE than CE.2 23.8%; ce3b_sqrt diagnostic running to confirm) | inv_npos over-amplifies noisy small events; inv_sqrt_npos remains the correct setting |
 | Event split | Stratified by country (Fix 4) | Random seed=42 placed Argentina crisis years entirely in test set |
 | AGB / REDD features | Static features (2010 AGB snapshot, 2023 REDD database) — intentional | Annual dynamics not needed; structural signal is what drives designation |
 

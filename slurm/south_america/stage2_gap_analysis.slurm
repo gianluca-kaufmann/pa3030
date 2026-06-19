@@ -1,48 +1,51 @@
 #!/bin/bash
-#SBATCH --job-name=gap_analysis
-#SBATCH --output=logs/gap_analysis_%j.out
-#SBATCH --error=logs/gap_analysis_%j.err
-#SBATCH --time=04:00:00
-#SBATCH --mem=48G
+#SBATCH --job-name=e1_gap
+#SBATCH --partition=normal.4h
+#SBATCH --time=03:00:00
+#SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --partition=compute
+#SBATCH --mem-per-cpu=12G
+#SBATCH --output=/cluster/scratch/%u/logs/e1_gap_%j.out
+#SBATCH --error=/cluster/scratch/%u/logs/e1_gap_%j.err
+#SBATCH --chdir=/cluster/home/gikaufmann/master_thesis
 
-# E1 (Track A): Representation gap analysis
-# Scores the full SA test parquet with the locked temporal model and
-# quantifies the biodiversity-cost gap (score vs. GSN_b2).
+# E1 (Track A): Representation gap analysis.
+# Scores the full SA test parquet (2017-2024) with the locked temporal model
+# and quantifies the biodiversity-cost gap (GSN_b2 of designated vs. all pixels).
 #
-# Submit after CE.3b-sqrt and inject chain finish, or independently.
-# Model: temporal H6+H1b+H5 (Lift@1%=6.46x, iter=136)
+# Independent of CE.3b-sqrt / AGB-REDD chain — submit any time.
+# Model: temporal H6+H1b+H5 (Lift@1%=6.46×, iter=136)
+# Note: GSN_b2 is a model feature, so Part B (score vs GSN_b2) is partially
+#       circular. Part A (direct within-event comparison) is the clean result.
 
-set -euo pipefail
+mkdir -p "$SCRATCH/logs"
 
-REPO="$HOME/master_thesis"
+MODEL="$HOME/master_thesis/data/south_america/ml/models/model1_lgbm_stage2_20260617_011621.pkl"
 DATA="$SCRATCH/data/south_america/ml/main"
-MODEL="$REPO/data/south_america/ml/models/model1_lgbm_stage2_20260617_011621.pkl"
 
-cd "$REPO"
-source "$HOME/miniforge3/etc/profile.d/conda.sh"
-conda activate pa3030
-
-# Verify model file exists
 if [ ! -f "$MODEL" ]; then
-    echo "ERROR: model not found at $MODEL"
-    echo "Check path in ROADMAP.md — may be stored in outputs/south_america/results/ml_models/"
+    echo "ERROR: model not found at $MODEL" >&2
     exit 1
 fi
 
-mkdir -p logs
+module purge
+module load stack/2024-06 gcc/12.2.0 python_cuda/3.11.6 cuda/12.4.1 eth_proxy
 
-echo "=== E1 Gap Analysis ==="
-echo "Model:       $MODEL"
-echo "Test split:  $DATA/test.parquet"
-echo "Started:     $(date)"
+source "$HOME/venvs/master_thesis/bin/activate"
+export PYTHONPATH="$HOME/master_thesis${PYTHONPATH:+:$PYTHONPATH}"
 
-python scripts/regions/south_america/6_evaluation/stage2_gap_analysis.py \
+echo "=== E1 Gap Analysis (Track A) ==="
+echo "Model: $MODEL"
+echo "Test:  $DATA/test.parquet"
+echo "Start: $(date)"
+
+srun --cpu-bind=cores python -u \
+    scripts/regions/south_america/6_evaluation/stage2_gap_analysis.py \
     --model  "$MODEL" \
     --test   "$DATA/test.parquet" \
     --extra  "$DATA/earlystop.parquet" "$DATA/train.parquet" \
     --out    "outputs/south_america/results/gap_analysis/"
+STATUS=$?
 
-echo "Finished: $(date)"
-echo "Results: outputs/south_america/results/gap_analysis/gap_analysis_results.json"
+echo "Done: $(date)  exit=$STATUS"
+exit $STATUS
