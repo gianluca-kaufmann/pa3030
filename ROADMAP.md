@@ -1,6 +1,6 @@
 # PA3030 — Publication Roadmap
 
-**Updated**: 2026-06-19 (session 6 — B0 applied; CE.4 + A1 + A3 queued) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
+**Updated**: 2026-06-20 (session 7 — CE.4 running; A1 gap confirmed; eco_gap inject fix) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
 
 > **Current state (2026-06-19 — STRATEGIC REFRAME)**:
 > - ✅ Stage 1 Poisson GLM: D²=0.345 — improvable; NB + country FE to be tried (E6)
@@ -9,7 +9,10 @@
 > - ✅ AGB + REDD inject chain complete (3957103→3957105→3957107, 2026-06-19); SA splits now have 94 columns
 > - ✅ CE.3b-sqrt (3917581) complete — macro R@5%=18.8% (exit 1 = gate fail, not crash)
 > - ✅ B0 applied: E11 (val min-pos filter) + E12 (group size cap) in code + CE.4 SLURM
-> - 🔄 e1_gap RUNNING (3981693, 128G); eco_gap_inject PENDING (3981696); CE.4 PENDING (3981700, dep); stage1+NB PENDING (3981878→3981887)
+> - ✅ e1_gap (3981693) COMPLETED: 131/170 events (77.1%) gap confirmed; GSN ratio=0.284; Spearman r=-0.255
+> - ❌ eco_gap_inject (3981696) FAILED: annual WDPA TIFs missing from scratch (deleted due to quota); inject script now fails with clear RuntimeError; CE.4 runs with 94 features (AGB+REDD, no eco_protection_gap)
+> - 🔄 CE.4 RUNNING (3981700): val R@5%=0.315 @iter248, patience=200, stops ~iter448
+> - 🔄 stage1+NB PENDING (3981878→3981887, QOSMaxMemoryPerUser)
 > - ❌ A2 KBA: blocked — user must download KBA shapefile from keybiodiversityareas.org/kba-data/request
 > - **STRATEGIC PIVOT — two parallel tracks**:
 >   - **Track A (Gap finding)**: use existing temporal model + GSN_b2 to quantify the biodiversity-cost gap. This IS the Nature finding and can be computed today (E1).
@@ -182,8 +185,8 @@ Brazil's Bolsonaro-era events (2019–2022) are ~3–4 of the 30 test events (10
 | CE.3a spatial coherence diagnostic | ✅ Done | All 139 events coherence=1.0; threshold=0.0; Fix 1 is a no-op |
 | CE.3b redesigned cross-event run | ✅ Done — gate FAILED | macro R@5%=18.0%, weighted=26.5%, 29 events, iter=122; WORSE than CE.2 — Fix 2 (inv_npos) suspected |
 | CE.3b regression diagnostic (ce3b_sqrt) | ✅ Done — gate FAILED | macro R@5%=18.8%, val=35.3%, iter=51; inv_sqrt_npos confirmed better than inv_npos (val +3.5pp); BUT test still 18.8% vs CE.2 23.8% — stratified split is harder test set |
-| CE.4 AGB+REDD features | ✅ Inject chain COMPLETE | 3957103 agb_rasterise ✅; 3957105 agb_inject ✅; 3957107 redd_inject ✅ — SA splits updated 2026-06-19 ~16:24 |
-| E1 gap analysis (Track A) | ❌ OOM — resubmit | 3953707 killed at 48G; stage2_gap_analysis.slurm fixed to 128G (16×8G) |
+| CE.4 AGB+REDD features | 🔄 TRAINING (job 3981700) | AGB+REDD injected ✅; eco_protection_gap inject FAILED (WDPA TIFs missing); val R@5%=0.315 @iter248; stops ~iter448 |
+| E1 gap analysis (Track A) | ✅ Complete | 3981693: 131/170 events (77.1%) gap confirmed; GSN ratio=0.284; Spearman r=-0.255 |
 | Per-country breakdown (temporal model) | ✅ Done | SUR=28.55×, ARG=9.31×, BRA=1.69×; excl. outliers: 10.89× |
 | Within-group pixel split (P1.1) | ❌ Abandoned | Geometric artifact (93–96% guaranteed by cluster geometry) |
 | Patch CC approach (H12) | ❌ Abandoned | Mega-blob artifact confirmed |
@@ -228,9 +231,9 @@ Independent of model Recall. Can start at any time. Does not block or wait for S
 
 | Step | Action | What we learn | Status |
 |---|---|---|---|
-| **A1** | E1: Score full SA test pixels with temporal model; bin by score quantile; compute mean GSN_b2 per bin; Spearman r + plot | Does cost-minimisation systematically miss biodiversity? Confirms THE Nature finding | 🔄 QUEUED (job 3981693, 128G) |
+| **A1** | E1: Score full SA test pixels with temporal model; bin by score quantile; compute mean GSN_b2 per bin; Spearman r + plot | Does cost-minimisation systematically miss biodiversity? Confirms THE Nature finding | ✅ DONE — 131/170 events (77.1%) confirm gap; pooled GSN ratio=0.284; Spearman r(score,GSN_b2)=-0.255 p≈0; top-decile GSN_b2=0.130 vs bottom-decile=0.686 (ratio=0.189) |
 | **A2** | E7: Download IUCN KBA shapefile (keybiodiversityareas.org); rasterise to SA backbone; compute % of top-5% predicted pixels overlapping KBAs vs. random baseline | Headline number: "BAU 30×30 covers X% of KBAs vs Y% by chance" | ❌ BLOCKED — user must download KBA shapefile and place at `data/shared/KBA/KBA_poly.shp`; then run `kba_rasterise.py` |
-| **A3** | E6: Fit Stage 1 Negative Binomial GLM + country fixed effects; test overdispersion (Pearson χ²/df); compare D² | Does NB handle overdispersion? Does D² improve? | 🔄 QUEUED (jobs 3981878 → 3981887) |
+| **A3** | E6: Fit Stage 1 Negative Binomial GLM + country fixed effects; test overdispersion (Pearson χ²/df); compare D² | Does NB handle overdispersion? Does D² improve? | 🔄 PENDING (jobs 3981878 → 3981887, QOSMaxMemoryPerUser) |
 | **A4** | E8: Add to Stage 1 — CBD 30×30 pledge indicator (binary) + continuous national coverage gap (30% − current PA fraction); compare D² vs A3 | Does political commitment improve expansion prediction above cost baseline? | ⬜ 2 days; after A3 |
 | **A5** | P3.3–P3.4: BAU forward projections 2025–2030 with KBA overlay; country scorecard (on-track vs off-track × protects KBAs vs misses KBAs) | Paper-ready figures; country-level policy headline | ⬜ After A1+A2+final Stage 2 model |
 
@@ -260,12 +263,13 @@ Applied before CE.4. Two code changes in effect:
 Pre-submission checklist:
 - ✅ AGB inject complete (job 3957105, 2026-06-19)
 - ✅ REDD inject complete (job 3957107, 2026-06-19)
-- ✅ eco_protection_gap inject submitted (job 3981696, 2026-06-19)
+- ❌ eco_protection_gap inject FAILED (job 3981696): annual WDPA TIFs deleted from scratch; inject.py now raises clear RuntimeError; to add eco_protection_gap regenerate TIFs first (see regenerate_wdpa_annual_tifs.py plan)
 - ✅ policy_b1-4 confirmed present in train.parquet schema (94 total cols)
 - ✅ B0 code changes applied (E11 STAGE2_ES_MIN_POS=5000 + E12 STAGE2_MAX_GROUP_SIZE=50000)
 - ✅ CE.4 submitted with dependency (job 3981700, 2026-06-19)
+- 🔄 CE.4 RUNNING: val R@5%=0.315 @iter248; expected to stop ~iter448
 
-What changes vs. CE.3b-sqrt (18.8%): AGB (carbon stocks), dist_redd (carbon-market geography), eco_protection_gap (30×30 political urgency per biome-country) + E11 (cleaner early-stop signal) + E12 (balanced group gradients).
+What changes vs. CE.3b-sqrt (18.8%): AGB (carbon stocks), dist_redd (carbon-market geography) + E11 (cleaner early-stop signal) + E12 (balanced group gradients). NOTE: eco_protection_gap excluded due to inject failure.
 
 **What we learn**: isolated combined impact of all feature additions and training infrastructure fixes on the pixel-level cross-event model. This is our definitive pixel ceiling.
 
@@ -377,11 +381,11 @@ Do not begin until both streams are complete.
 |---|---|---|
 | 3957103→3957105→3957107 | AGB rasterise → agb_inject → redd_inject | ✅ All COMPLETED (2026-06-19 ~16:24) |
 | B0 E11+E12 | Apply code changes: ES min-pos filter + group size cap | ✅ Applied (2026-06-19) |
-| 3981693 | A1: E1 gap analysis (re-run at 128G) | 🔄 QUEUED |
-| 3981696 | eco_protection_gap inject | 🔄 QUEUED |
-| 3981700 | B1 CE.4 training (after 3981696) | 🔄 QUEUED (dependency) |
-| 3981878 | A3: stage1 panel rebuild + Poisson GLM | 🔄 QUEUED |
-| 3981887 | A3: stage1_nb_overdispersion E6 (after 3981878) | 🔄 QUEUED (dependency) |
+| 3981693 | A1: E1 gap analysis (128G) | ✅ COMPLETED — gap confirmed (131/170, r=-0.255) |
+| 3981696 | eco_protection_gap inject | ❌ FAILED — WDPA TIFs missing; script now raises clear error |
+| 3981700 | B1 CE.4 training | 🔄 RUNNING — val R@5%=0.315 @iter248, patience=200 |
+| 3981878 | A3: stage1 panel rebuild + Poisson GLM | 🔄 PENDING (QOSMaxMemoryPerUser) |
+| 3981887 | A3: stage1_nb_overdispersion E6 (after 3981878) | 🔄 PENDING (Dependency on 3981878) |
 | A2 KBA | Download KBA shapefile → kba_rasterise.py | ❌ BLOCKED — needs user to download from keybiodiversityareas.org |
 | A4 CBD features | Add CBD pledge + coverage gap to Stage 1 | ⬜ After A3 results |
 | B2 | Ecological scope filter on CE.4 model | ⬜ After B1 result |
