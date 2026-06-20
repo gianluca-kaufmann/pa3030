@@ -190,17 +190,9 @@ def _split_events_stratified(
     val_ratio: float = VAL_RATIO,
     seed: int = SEED,
 ) -> tuple[set[tuple[int, int]], set[tuple[int, int]], set[tuple[int, int]]]:
-    """Country-stratified 80/20 split of meaningful events.
-
-    Samples test and val events separately within each country so no single
-    country's anomalous years dominate a split.  Countries with only 1 event
-    put it in train; countries with 2 events assign 1 to test.
-
-    Returns (train_events, val_events, test_events).
-    """
+    """Country-stratified 80/20 split of meaningful events (legacy — use v2)."""
     meaningful = sorted(k for k, v in event_counts.items() if v >= min_pos)
 
-    # Group events by country
     by_country: dict[int, list[tuple[int, int]]] = {}
     for ev in meaningful:
         by_country.setdefault(ev[0], []).append(ev)
@@ -227,6 +219,73 @@ def _split_events_stratified(
         val_events.update(evs[n_test : n_test + n_val])
         train_events.update(evs[n_test + n_val :])
 
+    return train_events, val_events, test_events
+
+
+def _split_events_stratified_v2(
+    event_counts: dict[tuple[int, int], int],
+    min_pos: int = MIN_POSITIVE_PIXELS,
+    test_ratio: float = TEST_RATIO,
+    val_ratio: float = VAL_RATIO,
+    es_anchor_pos: int = 2000,
+    es_n_anchor: int = 2,
+    seed: int = SEED,
+) -> tuple[set[tuple[int, int]], set[tuple[int, int]], set[tuple[int, int]]]:
+    """Country-stratified split with guaranteed large-event anchors in the val set.
+
+    The event-size distribution is highly skewed: a random 10% val sample often
+    draws only tiny events, giving Recall@5% near zero regardless of model quality.
+    This function forces at least es_n_anchor events with n_pos >= es_anchor_pos
+    into the val (early-stop) set before filling remaining slots via country
+    stratification. Large events provide reliable stopping signal; small events
+    remain in train/test for full evaluation.
+
+    Step 1 — country-stratified test split (identical to v1).
+    Step 2 — within train pool: force anchors into val, then fill remainder.
+    """
+    meaningful = sorted(k for k, v in event_counts.items() if v >= min_pos)
+
+    # Step 1: country-stratified test split
+    by_country: dict[int, list[tuple[int, int]]] = {}
+    for ev in meaningful:
+        by_country.setdefault(ev[0], []).append(ev)
+
+    test_events: set[tuple[int, int]] = set()
+    train_pool: list[tuple[int, int]] = []
+
+    for cid, events in sorted(by_country.items()):
+        rng = np.random.default_rng(seed + cid)
+        evs = list(events)
+        rng.shuffle(evs)
+        n = len(evs)
+        n_test = max(1, int(round(n * test_ratio))) if n >= 2 else 0
+        test_events.update(evs[:n_test])
+        train_pool.extend(evs[n_test:])
+
+    # Step 2: within train pool, guarantee anchor events in val
+    rng_pool = np.random.default_rng(seed + 9999)
+    pool_anchors    = [e for e in train_pool if event_counts[e] >= es_anchor_pos]
+    pool_small      = [e for e in train_pool if event_counts[e] <  es_anchor_pos]
+    rng_pool.shuffle(pool_anchors)
+    rng_pool.shuffle(pool_small)
+
+    n_anchor_to_val  = min(es_n_anchor, len(pool_anchors))
+    forced_val       = set(pool_anchors[:n_anchor_to_val])
+    remaining_anchors = pool_anchors[n_anchor_to_val:]
+
+    n_val_total    = max(1, int(round(len(train_pool) * val_ratio)))
+    n_val_extra    = max(0, n_val_total - len(forced_val))
+    extra_val      = set(pool_small[:n_val_extra])
+
+    val_events    = forced_val | extra_val
+    train_events  = set(remaining_anchors) | set(pool_small[n_val_extra:])
+
+    n_anchors_placed = len(forced_val)
+    print(
+        f"  [v2 split] anchor_pos>={es_anchor_pos}: "
+        f"{len(pool_anchors)} in train pool → {n_anchors_placed} forced into val "
+        f"(target={es_n_anchor})"
+    )
     return train_events, val_events, test_events
 
 
@@ -409,15 +468,17 @@ def run_cross_event_training() -> None:
 
     # --- Env-var controlled settings ---
     # CE.3b defaults: Fix 2 (inv_npos event normalization), Fix 4 (stratified, patience=200)
-    _normalize  = os.environ.get("STAGE2_NORMALIZE_WITHIN_GROUPS", "0") != "1"
-    _graded     = os.environ.get("STAGE2_GRADED_RELEVANCE", "1") != "0"
-    _gw_mode    = os.environ.get("STAGE2_GROUP_WEIGHT_MODE", "inv_npos")   # Fix 2: event-level norm
-    _es_metric  = os.environ.get("STAGE2_EARLY_STOP_METRIC", "recall_at_5pct")
-    _stratified = os.environ.get("STAGE2_STRATIFIED_SPLIT", "1") != "0"   # Fix 4: on by default
-    _patience   = int(os.environ.get("STAGE2_PATIENCE", "200"))            # Fix 4: was 100
-    _coh_thresh = float(os.environ.get("STAGE2_COHERENCE_THRESHOLD", "0.0"))  # Fix 1
-    neg_ratio   = int(os.environ.get("STAGE2_NEG_RATIO", "100"))
-    num_threads = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 4))
+    _normalize    = os.environ.get("STAGE2_NORMALIZE_WITHIN_GROUPS", "0") != "1"
+    _graded       = os.environ.get("STAGE2_GRADED_RELEVANCE", "1") != "0"
+    _gw_mode      = os.environ.get("STAGE2_GROUP_WEIGHT_MODE", "inv_npos")
+    _es_metric    = os.environ.get("STAGE2_EARLY_STOP_METRIC", "recall_at_5pct")
+    _stratified   = os.environ.get("STAGE2_STRATIFIED_SPLIT", "1") != "0"
+    _patience     = int(os.environ.get("STAGE2_PATIENCE", "200"))
+    _coh_thresh   = float(os.environ.get("STAGE2_COHERENCE_THRESHOLD", "0.0"))
+    _anchor_pos   = int(os.environ.get("STAGE2_ES_ANCHOR_POS", "2000"))   # min n_pos to be a val anchor
+    _n_anchor     = int(os.environ.get("STAGE2_ES_N_ANCHOR", "2"))        # anchors guaranteed in val
+    neg_ratio     = int(os.environ.get("STAGE2_NEG_RATIO", "100"))
+    num_threads   = int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 4))
 
     print(
         f"Cross-event Stage 2 | normalize_within_groups={not _normalize} "
@@ -485,9 +546,17 @@ def run_cross_event_training() -> None:
         )
 
     # --- Step 2: Split events ---
-    split_fn = _split_events_stratified if _stratified else _split_events
-    split_label = "stratified" if _stratified else "random"
-    train_events, val_events, test_events = split_fn(meaningful)
+    if _stratified:
+        train_events, val_events, test_events = _split_events_stratified_v2(
+            meaningful,
+            es_anchor_pos=_anchor_pos,
+            es_n_anchor=_n_anchor,
+            seed=SEED,
+        )
+        split_label = f"stratified-v2 (anchor>={_anchor_pos}, n={_n_anchor})"
+    else:
+        train_events, val_events, test_events = _split_events(meaningful)
+        split_label = "random"
     print(
         f"  Event split [{split_label}] (seed={SEED}): "
         f"train={len(train_events)} | val(early-stop)={len(val_events)} | test={len(test_events)}"
@@ -509,22 +578,10 @@ def run_cross_event_training() -> None:
                 f"using all {len(val_events)} for early stopping"
             )
 
-    # E11: filter early-stop val to large events only (prevents political micro-events
-    # from stalling early-stop metric at iter 51-66 via noisy near-zero recall).
-    _es_min_pos = int(os.environ.get("STAGE2_ES_MIN_POS", "0"))
-    if _es_min_pos > 0:
-        val_large = {e for e in val_events_es if event_counts.get(e, 0) >= _es_min_pos}
-        if len(val_large) >= 2:
-            val_events_es = val_large
-            print(
-                f"  E11: large-event val filter (n_pos>={_es_min_pos}): "
-                f"{len(val_events)} → {len(val_events_es)} events for early stopping"
-            )
-        else:
-            print(
-                f"  E11: WARNING — only {len(val_large)} events with n_pos>={_es_min_pos}; "
-                f"keeping all {len(val_events_es)} for early stopping"
-            )
+    # E11 (STAGE2_ES_MIN_POS) is superseded by the anchor guarantee in
+    # _split_events_stratified_v2. Large events are now forced into val at split
+    # time rather than filtered post-hoc. STAGE2_ES_MIN_POS is ignored.
+    _es_min_pos = 0  # kept for JSON metadata only
 
     print(f"  Train events: {sorted(train_events)}")
     print(f"  Val   events (ES): {sorted(val_events_es)}")
@@ -709,7 +766,8 @@ def run_cross_event_training() -> None:
             "group_weight_mode": _gw_mode,
             "early_stop_metric": _es_metric,
             "early_stop_patience": _patience,
-            "es_min_pos": _es_min_pos,
+            "es_anchor_pos": _anchor_pos,
+            "es_n_anchor": _n_anchor,
             "stratified_split": _stratified,
             "coherence_threshold": _coh_thresh,
             "neg_ratio_train": neg_ratio,

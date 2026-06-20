@@ -25,6 +25,7 @@ from pathlib import Path
 import geopandas as gpd
 import numpy as np
 import rasterio
+from pyproj import Transformer
 from rasterio.features import rasterize
 from scipy.ndimage import distance_transform_edt
 from shapely.geometry import box
@@ -46,9 +47,11 @@ SA_ISO3 = {
 
 def _find_kba_shapefile() -> Path:
     for pattern in ("KBA_poly*.shp", "kba_poly*.shp", "KBA*.shp", "kba*.shp"):
-        matches = sorted(KBA_DIR.glob(pattern))
+        matches = sorted(KBA_DIR.rglob(pattern))
         if matches:
-            return matches[0]
+            # prefer polygon files over point files
+            pol = [m for m in matches if "POL" in m.name or "poly" in m.name.lower()]
+            return pol[0] if pol else matches[0]
     raise FileNotFoundError(
         f"No KBA shapefile found in {KBA_DIR}.\n"
         "Download 'KBA Digital Boundaries' from:\n"
@@ -75,9 +78,16 @@ def main() -> None:
     bbox_geom = box(bounds.left, bounds.bottom, bounds.right, bounds.top)
     print(f"SA grid: {shape[0]} × {shape[1]} pixels  CRS: {crs}")
 
+    # Backbone CRS is LOCAL_CS (3857 metres); KBA file is WGS84 degrees.
+    # Convert bbox to WGS84 for the spatial pre-filter on read.
+    _t = Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True)
+    lon_min, lat_min = _t.transform(bounds.left, bounds.bottom)
+    lon_max, lat_max = _t.transform(bounds.right, bounds.top)
+    bbox_wgs84 = box(lon_min, lat_min, lon_max, lat_max)
+
     # Spatial filter to SA bounding box (fast path on global file)
     try:
-        gdf = gpd.read_file(shp_path, bbox=bbox_geom)
+        gdf = gpd.read_file(shp_path, bbox=bbox_wgs84)
     except Exception:
         gdf = gpd.read_file(shp_path)
 

@@ -1,6 +1,6 @@
 # PA3030 — Publication Roadmap
 
-**Updated**: 2026-06-20 (session 8 — CE.4 FAILED 15.4%; pixel ceiling confirmed; mini_sample_v2 built; move to B4 watershed; Stage 1 blocked on country_iso3.tif) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
+**Updated**: 2026-06-20 (session 9 — A2 kba_sa.tif rasterised + synced to Euler; A3 country_iso3.tif synced to Euler, stage1.slurm ready to submit; move to B4 watershed) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
 
 > **Current state (2026-06-19 — STRATEGIC REFRAME)**:
 > - ✅ Stage 1 Poisson GLM: D²=0.345 — improvable; NB + country FE to be tried (E6)
@@ -12,13 +12,13 @@
 > - ✅ e1_gap (3981693) COMPLETED: 131/170 events (77.1%) gap confirmed; GSN ratio=0.284; Spearman r=-0.255
 > - ❌ eco_gap_inject (3981696) FAILED: annual WDPA TIFs missing from scratch (deleted due to quota); inject script now fails with clear RuntimeError; CE.4 runs with 94 features (AGB+REDD, no eco_protection_gap)
 > - ❌ CE.4 (3981700) FAILED gate: macro R@5%=15.4%, weighted=21.5%, Lift@1%=3.28×, 29 events, 85 features — WORSE than CE.2 23.8%; **pixel ceiling confirmed < 50% → skip B2–B3, go to B4**
-> - ❌ stage1_sa (3981878) FAILED: country_iso3.tif deleted from scratch (policy dir empty); user must upload country_iso3.tif + country_iso3_mapping.json to `$SCRATCH/data/south_america/ready/policy/`
-> - ❌ stage1_nb (3981887) CANCELLED: dependency on 3981878 failed
-> - ❌ A2 KBA: blocked — user must download KBA shapefile from keybiodiversityareas.org/kba-data/request
+> - ❌ stage1_sa (3981878) FAILED: country_iso3.tif deleted from scratch — now fixed: files synced to `$SCRATCH/data/shared/`; submit stage1.slurm to rerun
+> - ❌ stage1_nb (3981887) CANCELLED: dependency on 3981878 failed — resubmit after stage1.slurm succeeds
+> - ✅ A2 KBA: kba_sa.tif rasterised (1,768 SA polygons, 15.1% land pixels) + synced to `$SCRATCH/data/south_america/ready/KBA/kba_sa.tif`
 > - **STRATEGIC PIVOT — two parallel tracks**:
->   - **Track A (Gap finding)**: A1 confirmed. A3 blocked on country_iso3.tif upload.
+>   - **Track A (Gap finding)**: A1 confirmed. A2 done. A3 ready to submit.
 >   - **Track B (Watershed model)**: CE.4 gate FAILED → **B4 is now the primary path**; start locally.
-> - **NEXT ACTIONS**: (1) upload country_iso3.tif to unblock A3; (2) start B4 watershed PoC locally; (3) user downloads KBA shapefile for A2
+> - **NEXT ACTIONS**: (1) submit A3 on Euler: `JOB=$(sbatch --parsable slurm/south_america/stage1.slurm) && sbatch --dependency=afterok:$JOB slurm/south_america/stage1_nb_overdispersion.slurm`; (2) start B4 watershed PoC locally
 
 ---
 
@@ -194,7 +194,7 @@ Brazil's Bolsonaro-era events (2019–2022) are ~3–4 of the 30 test events (10
 | Temporal stability per-year | ✅ Done | 2017=7.81×, 2018=11.59×, 2019=0.99×, 2020=0.50×, 2021=1.74×, 2022=1.89×, 2023=6.77×, 2024=9.02× |
 | Baselines | ✅ Done | random=1.0×, naive=2.81×, full=6.54× |
 | SHAP analysis | ❌ Not run | Needs final model (after CE.3b/CE.4) |
-| KBA download + rasterise | ❌ Not done | Required for RQ3 |
+| KBA download + rasterise | ✅ Done | kba_sa.tif: 1,768 polygons, 15.1% land pixels; synced to Euler |
 | Representation gap (RQ3) | ❌ Not quantified | THE paper finding |
 | Bootstrap CIs | ❌ Not run | After final model |
 | Cross-regional transfer (USA, SE Asia) | ❌ Not run | Phase 5 |
@@ -233,8 +233,8 @@ Independent of model Recall. Can start at any time. Does not block or wait for S
 | Step | Action | What we learn | Status |
 |---|---|---|---|
 | **A1** | E1: Score full SA test pixels with temporal model; bin by score quantile; compute mean GSN_b2 per bin; Spearman r + plot | Does cost-minimisation systematically miss biodiversity? Confirms THE Nature finding | ✅ DONE — 131/170 events (77.1%) confirm gap; pooled GSN ratio=0.284; Spearman r(score,GSN_b2)=-0.255 p≈0; top-decile GSN_b2=0.130 vs bottom-decile=0.686 (ratio=0.189) |
-| **A2** | E7: Download IUCN KBA shapefile (keybiodiversityareas.org); rasterise to SA backbone; compute % of top-5% predicted pixels overlapping KBAs vs. random baseline | Headline number: "BAU 30×30 covers X% of KBAs vs Y% by chance" | ❌ BLOCKED — user must download KBA shapefile and place at `data/shared/KBA/KBA_poly.shp`; then run `kba_rasterise.py` |
-| **A3** | E6: Fit Stage 1 Negative Binomial GLM + country fixed effects; test overdispersion (Pearson χ²/df); compare D² | Does NB handle overdispersion? Does D² improve? | ❌ BLOCKED — country_iso3.tif deleted from scratch; upload to `$SCRATCH/data/south_america/ready/policy/` then resubmit stage1.slurm → stage1_nb_overdispersion.slurm |
+| **A2** | E7: Download IUCN KBA shapefile (keybiodiversityareas.org); rasterise to SA backbone; compute % of top-5% predicted pixels overlapping KBAs vs. random baseline | Headline number: "BAU 30×30 covers X% of KBAs vs Y% by chance" | ✅ kba_sa.tif rasterised (1,768 SA polygons, 15.1% land pixels, max dist=438 km); synced to `$SCRATCH/data/south_america/ready/KBA/kba_sa.tif`; next: run KBA inject + gap analysis |
+| **A3** | E6: Fit Stage 1 Negative Binomial GLM + country fixed effects; test overdispersion (Pearson χ²/df); compare D² | Does NB handle overdispersion? Does D² improve? | ⬜ READY — country_iso3.tif + mapping.json at `$SCRATCH/data/shared/`; submit: `JOB=$(sbatch --parsable slurm/south_america/stage1.slurm) && sbatch --dependency=afterok:$JOB slurm/south_america/stage1_nb_overdispersion.slurm` |
 | **A4** | E8: Add to Stage 1 — CBD 30×30 pledge indicator (binary) + continuous national coverage gap (30% − current PA fraction); compare D² vs A3 | Does political commitment improve expansion prediction above cost baseline? | ⬜ 2 days; after A3 |
 | **A5** | P3.3–P3.4: BAU forward projections 2025–2030 with KBA overlay; country scorecard (on-track vs off-track × protects KBAs vs misses KBAs) | Paper-ready figures; country-level policy headline | ⬜ After A1+A2+final Stage 2 model |
 
@@ -252,7 +252,7 @@ Independent of model Recall. Can start at any time. Does not block or wait for S
 
 Applied before CE.4. Two code changes in effect:
 
-- **E11** ✅ — filter early-stop val set to events with `n_pos ≥ 5000` only. `STAGE2_ES_MIN_POS=5000` env var in CE.4 SLURM. Implemented in `model1_LGBM_stage2_cross_event.py`.
+- **E11** ~~✅~~ **SUPERSEDED (2026-06-20)** — post-hoc val filter (`STAGE2_ES_MIN_POS=5000`) replaced by `_split_events_stratified_v2` anchor guarantee. E11 is now a no-op in the cross-event script; `STAGE2_ES_MIN_POS` is ignored.
 - **E12** ✅ — cap training groups at 50,000 pixels; subsample negatives only. `STAGE2_MAX_GROUP_SIZE=50000` env var in CE.4 SLURM. `_cap_cy_groups()` helper added to `stage2_lgbm_core.py`.
 
 ---
@@ -307,7 +307,7 @@ If either shows positive Recall delta on mini-sample → inject into Euler split
 
 ---
 
-#### B4 — E3: Watershed proof-of-concept (local, 2–3 days)
+#### B4 — E3: Watershed proof-of-concept (local, 2–3 days) — uses anchor val split
 
 Rebuild the mini-sample at HydroSHEDS L7 catchment level:
 1. Download HydroSHEDS L7 SA catchment shapefile
@@ -389,8 +389,8 @@ Do not begin until both streams are complete.
 | 3981700 | B1 CE.4 training | ❌ gate FAIL — macro R@5%=15.4% weighted=21.5% Lift@1%=3.28× 29 events; pixel ceiling confirmed |
 | 3981878 | A3: stage1 panel rebuild + Poisson GLM | ❌ FAILED — country_iso3.tif missing from scratch (policy dir empty) |
 | 3981887 | A3: stage1_nb_overdispersion E6 | ❌ CANCELLED (dependency 3981878 failed) |
-| A3 resubmit | Upload country_iso3.tif → resubmit stage1.slurm → stage1_nb.slurm | ⬜ Blocked on user upload |
-| A2 KBA | Download KBA shapefile → kba_rasterise.py | ❌ BLOCKED — needs user to download from keybiodiversityareas.org |
+| A3 resubmit | Upload country_iso3.tif → resubmit stage1.slurm → stage1_nb.slurm | ⬜ READY — files at `$SCRATCH/data/shared/`; submit chain above |
+| A2 KBA | kba_rasterise.py | ✅ DONE — kba_sa.tif at `$SCRATCH/data/south_america/ready/KBA/kba_sa.tif` |
 | A4 CBD features | Add CBD pledge + coverage gap to Stage 1 | ⬜ After A3 results |
 | B2 | Ecological scope filter on CE.4 model | ⬜ Skipped (B1 < 30%) |
 | B3 | E9 (dist_border) + E10 (TRI) features | ⬜ Skipped (B1 < 50%) |
@@ -507,6 +507,7 @@ Do not begin until both streams are complete.
 | Naive baselines | Must be documented | Required for any top journal |
 | min_positive_pixels | Stay at 200; do NOT raise as primary filter | Small coherent events are scientifically valid; use coherence filter instead |
 | Sample weighting | **inv_sqrt_npos confirmed** (Fix 2 inv_npos tested in CE.3b → 18.0%, WORSE than CE.2 23.8%; ce3b_sqrt diagnostic running to confirm) | inv_npos over-amplifies noisy small events; inv_sqrt_npos remains the correct setting |
+| Early-stop val split | **`_split_events_stratified_v2`** (2026-06-20, session 8): guarantees ≥2 anchor events with n_pos ≥ `STAGE2_ES_ANCHOR_POS` (default 2000) in val set before filling remaining slots via country stratification. Replaces E11 post-hoc filter. | Event-size distribution is highly skewed; a random 10% val draw often gets all tiny events → Recall@5% flatlines → early stopping fires blindly. Anchor guarantee ensures the stopping signal has resolution. Euler runs: set `STAGE2_ES_ANCHOR_POS=10000`. |
 | Event split | Stratified by country (Fix 4) | Random seed=42 placed Argentina crisis years entirely in test set |
 | AGB / REDD features | Static features (2010 AGB snapshot, 2023 REDD database) — intentional | Annual dynamics not needed; structural signal is what drives designation |
 | Policy features (WGI, V-Dem, DPI) | Already in panel as `policy_b1-4`; do NOT re-add | Confirmed present in merge pipeline; DPI executive ideology, V-Dem LDI, WGI GE + RL |
