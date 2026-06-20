@@ -1,6 +1,6 @@
 # PA3030 — Publication Roadmap
 
-**Updated**: 2026-06-20 (session 7 — CE.4 running; A1 gap confirmed; eco_gap inject fix) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
+**Updated**: 2026-06-20 (session 8 — CE.4 FAILED 15.4%; pixel ceiling confirmed; mini_sample_v2 built; move to B4 watershed; Stage 1 blocked on country_iso3.tif) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
 
 > **Current state (2026-06-19 — STRATEGIC REFRAME)**:
 > - ✅ Stage 1 Poisson GLM: D²=0.345 — improvable; NB + country FE to be tried (E6)
@@ -11,13 +11,14 @@
 > - ✅ B0 applied: E11 (val min-pos filter) + E12 (group size cap) in code + CE.4 SLURM
 > - ✅ e1_gap (3981693) COMPLETED: 131/170 events (77.1%) gap confirmed; GSN ratio=0.284; Spearman r=-0.255
 > - ❌ eco_gap_inject (3981696) FAILED: annual WDPA TIFs missing from scratch (deleted due to quota); inject script now fails with clear RuntimeError; CE.4 runs with 94 features (AGB+REDD, no eco_protection_gap)
-> - 🔄 CE.4 RUNNING (3981700): val R@5%=0.315 @iter248, patience=200, stops ~iter448
-> - 🔄 stage1+NB PENDING (3981878→3981887, QOSMaxMemoryPerUser)
+> - ❌ CE.4 (3981700) FAILED gate: macro R@5%=15.4%, weighted=21.5%, Lift@1%=3.28×, 29 events, 85 features — WORSE than CE.2 23.8%; **pixel ceiling confirmed < 50% → skip B2–B3, go to B4**
+> - ❌ stage1_sa (3981878) FAILED: country_iso3.tif deleted from scratch (policy dir empty); user must upload country_iso3.tif + country_iso3_mapping.json to `$SCRATCH/data/south_america/ready/policy/`
+> - ❌ stage1_nb (3981887) CANCELLED: dependency on 3981878 failed
 > - ❌ A2 KBA: blocked — user must download KBA shapefile from keybiodiversityareas.org/kba-data/request
 > - **STRATEGIC PIVOT — two parallel tracks**:
->   - **Track A (Gap finding)**: use existing temporal model + GSN_b2 to quantify the biodiversity-cost gap. This IS the Nature finding and can be computed today (E1).
->   - **Track B (Watershed model)**: rebuild mini-sample at HydroSHEDS L7 catchment level; rank catchments instead of pixels; structural Recall fix expected >70% (E3).
-> - **LOCAL NEXT ACTIONS (priority order)**: E1 → E2 → E3 → E4 — see Experiment Queue below
+>   - **Track A (Gap finding)**: A1 confirmed. A3 blocked on country_iso3.tif upload.
+>   - **Track B (Watershed model)**: CE.4 gate FAILED → **B4 is now the primary path**; start locally.
+> - **NEXT ACTIONS**: (1) upload country_iso3.tif to unblock A3; (2) start B4 watershed PoC locally; (3) user downloads KBA shapefile for A2
 
 ---
 
@@ -185,7 +186,7 @@ Brazil's Bolsonaro-era events (2019–2022) are ~3–4 of the 30 test events (10
 | CE.3a spatial coherence diagnostic | ✅ Done | All 139 events coherence=1.0; threshold=0.0; Fix 1 is a no-op |
 | CE.3b redesigned cross-event run | ✅ Done — gate FAILED | macro R@5%=18.0%, weighted=26.5%, 29 events, iter=122; WORSE than CE.2 — Fix 2 (inv_npos) suspected |
 | CE.3b regression diagnostic (ce3b_sqrt) | ✅ Done — gate FAILED | macro R@5%=18.8%, val=35.3%, iter=51; inv_sqrt_npos confirmed better than inv_npos (val +3.5pp); BUT test still 18.8% vs CE.2 23.8% — stratified split is harder test set |
-| CE.4 AGB+REDD features | 🔄 TRAINING (job 3981700) | AGB+REDD injected ✅; eco_protection_gap inject FAILED (WDPA TIFs missing); val R@5%=0.315 @iter248; stops ~iter448 |
+| CE.4 AGB+REDD features | ❌ FAILED gate (3981700) | macro R@5%=15.4% weighted=21.5% Lift@1%=3.28× 29 events 85 features; WORSE than CE.2 (23.8%); gate<50% → **pixel ceiling confirmed; skip B2–B3** |
 | E1 gap analysis (Track A) | ✅ Complete | 3981693: 131/170 events (77.1%) gap confirmed; GSN ratio=0.284; Spearman r=-0.255 |
 | Per-country breakdown (temporal model) | ✅ Done | SUR=28.55×, ARG=9.31×, BRA=1.69×; excl. outliers: 10.89× |
 | Within-group pixel split (P1.1) | ❌ Abandoned | Geometric artifact (93–96% guaranteed by cluster geometry) |
@@ -233,7 +234,7 @@ Independent of model Recall. Can start at any time. Does not block or wait for S
 |---|---|---|---|
 | **A1** | E1: Score full SA test pixels with temporal model; bin by score quantile; compute mean GSN_b2 per bin; Spearman r + plot | Does cost-minimisation systematically miss biodiversity? Confirms THE Nature finding | ✅ DONE — 131/170 events (77.1%) confirm gap; pooled GSN ratio=0.284; Spearman r(score,GSN_b2)=-0.255 p≈0; top-decile GSN_b2=0.130 vs bottom-decile=0.686 (ratio=0.189) |
 | **A2** | E7: Download IUCN KBA shapefile (keybiodiversityareas.org); rasterise to SA backbone; compute % of top-5% predicted pixels overlapping KBAs vs. random baseline | Headline number: "BAU 30×30 covers X% of KBAs vs Y% by chance" | ❌ BLOCKED — user must download KBA shapefile and place at `data/shared/KBA/KBA_poly.shp`; then run `kba_rasterise.py` |
-| **A3** | E6: Fit Stage 1 Negative Binomial GLM + country fixed effects; test overdispersion (Pearson χ²/df); compare D² | Does NB handle overdispersion? Does D² improve? | 🔄 PENDING (jobs 3981878 → 3981887, QOSMaxMemoryPerUser) |
+| **A3** | E6: Fit Stage 1 Negative Binomial GLM + country fixed effects; test overdispersion (Pearson χ²/df); compare D² | Does NB handle overdispersion? Does D² improve? | ❌ BLOCKED — country_iso3.tif deleted from scratch; upload to `$SCRATCH/data/south_america/ready/policy/` then resubmit stage1.slurm → stage1_nb_overdispersion.slurm |
 | **A4** | E8: Add to Stage 1 — CBD 30×30 pledge indicator (binary) + continuous national coverage gap (30% − current PA fraction); compare D² vs A3 | Does political commitment improve expansion prediction above cost baseline? | ⬜ 2 days; after A3 |
 | **A5** | P3.3–P3.4: BAU forward projections 2025–2030 with KBA overlay; country scorecard (on-track vs off-track × protects KBAs vs misses KBAs) | Paper-ready figures; country-level policy headline | ⬜ After A1+A2+final Stage 2 model |
 
@@ -267,7 +268,7 @@ Pre-submission checklist:
 - ✅ policy_b1-4 confirmed present in train.parquet schema (94 total cols)
 - ✅ B0 code changes applied (E11 STAGE2_ES_MIN_POS=5000 + E12 STAGE2_MAX_GROUP_SIZE=50000)
 - ✅ CE.4 submitted with dependency (job 3981700, 2026-06-19)
-- 🔄 CE.4 RUNNING: val R@5%=0.315 @iter248; expected to stop ~iter448
+- ❌ CE.4 COMPLETED with gate FAIL: macro R@5%=15.4%, weighted=21.5%, Lift@1%=3.28×, 29 events
 
 What changes vs. CE.3b-sqrt (18.8%): AGB (carbon stocks), dist_redd (carbon-market geography) + E11 (cleaner early-stop signal) + E12 (balanced group gradients). NOTE: eco_protection_gap excluded due to inject failure.
 
@@ -277,6 +278,8 @@ Decision gates:
 - macro Recall@5% ≥ 50% → pixel model viable; continue to B2
 - macro Recall@5% < 50% → pixel ceiling confirmed; skip B2–B3, go to B4
 - AGB or REDD in top-10 SHAP → carbon mechanism confirmed for paper regardless of Recall
+
+**OUTCOME (2026-06-20): macro R@5%=15.4% < 50% → pixel ceiling confirmed. Skip B2–B3. Go directly to B4.**
 
 ---
 
@@ -383,14 +386,16 @@ Do not begin until both streams are complete.
 | B0 E11+E12 | Apply code changes: ES min-pos filter + group size cap | ✅ Applied (2026-06-19) |
 | 3981693 | A1: E1 gap analysis (128G) | ✅ COMPLETED — gap confirmed (131/170, r=-0.255) |
 | 3981696 | eco_protection_gap inject | ❌ FAILED — WDPA TIFs missing; script now raises clear error |
-| 3981700 | B1 CE.4 training | 🔄 RUNNING — val R@5%=0.315 @iter248, patience=200 |
-| 3981878 | A3: stage1 panel rebuild + Poisson GLM | 🔄 PENDING (QOSMaxMemoryPerUser) |
-| 3981887 | A3: stage1_nb_overdispersion E6 (after 3981878) | 🔄 PENDING (Dependency on 3981878) |
+| 3981700 | B1 CE.4 training | ❌ gate FAIL — macro R@5%=15.4% weighted=21.5% Lift@1%=3.28× 29 events; pixel ceiling confirmed |
+| 3981878 | A3: stage1 panel rebuild + Poisson GLM | ❌ FAILED — country_iso3.tif missing from scratch (policy dir empty) |
+| 3981887 | A3: stage1_nb_overdispersion E6 | ❌ CANCELLED (dependency 3981878 failed) |
+| A3 resubmit | Upload country_iso3.tif → resubmit stage1.slurm → stage1_nb.slurm | ⬜ Blocked on user upload |
 | A2 KBA | Download KBA shapefile → kba_rasterise.py | ❌ BLOCKED — needs user to download from keybiodiversityareas.org |
 | A4 CBD features | Add CBD pledge + coverage gap to Stage 1 | ⬜ After A3 results |
-| B2 | Ecological scope filter on CE.4 model | ⬜ After B1 result |
-| B3 | E9 (dist_border) + E10 (TRI) features | ⬜ After B1 baseline |
-| B4 (E3) | Watershed proof-of-concept on mini-sample | ⬜ Local; after B1 result known |
+| B2 | Ecological scope filter on CE.4 model | ⬜ Skipped (B1 < 30%) |
+| B3 | E9 (dist_border) + E10 (TRI) features | ⬜ Skipped (B1 < 50%) |
+| 4044178 | mini_sample_v2 build (event-stratified, N_CAP=50k) | ✅ DONE — 15.4M rows, 50 meaningful events, 3.4GB at `$SCRATCH/data/south_america/ml/mini_sample_v2.parquet`; rsync to desktop then run `prepare_mini_splits_v2.py` |
+| B4 (E3) | Watershed proof-of-concept on desktop mini-sample | ⬜ Needs HydroSHEDS L7 SA download + new code; mini_sample_v2 ready as input |
 | B5 (CE.W) | Full SA watershed model | ⬜ Euler; after B4 ≥ 50% |
 | C1 | SHAP (global + temporal + country) | ⬜ After B5 |
 | C2 | Bootstrap CIs | ⬜ After B5 |
@@ -409,6 +414,7 @@ Do not begin until both streams are complete.
 | CE.2 Full SA (13 countries, min_pos=200, 83 feat) | 23.8% | 41.6% | 6.05× | 28 | ❌ gate FAILED (<65%); macro vs weighted gap is large |
 | CE.3b Full SA (inv_npos + stratified split + patience=200 + coherence_thr=0.0) | 18.0% | 26.5% | 4.80× | 29 | ❌ gate FAILED (<65%); **WORSE than CE.2** — Fix 2 (inv_npos) suspected; iter=122 |
 | CE.3b-sqrt diagnostic (inv_sqrt_npos + stratified + patience=200) | 18.8% | — | 6.01× | 29 | ❌ gate FAILED; inv_sqrt_npos confirmed best (val +3.5pp vs inv_npos); stratified split = harder test — explains CE.2→CE.3b regression |
+| **CE.4 AGB+REDD+B0 (inv_sqrt_npos + stratified + E11 + E12 + 85 feat)** | **15.4%** | **21.5%** | **3.28×** | **29** | ❌ gate FAILED (<50%); WORSE than CE.2 23.8%; AGB+REDD+B0 did not help; **pixel ceiling confirmed — go to B4** |
 
 **Per-event pattern (CE.2 full SA test events)**:
 
