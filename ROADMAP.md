@@ -1,24 +1,21 @@
 # PA3030 — Publication Roadmap
 
-**Updated**: 2026-06-20 (session 9 — A2 kba_sa.tif rasterised + synced to Euler; A3 country_iso3.tif synced to Euler, stage1.slurm ready to submit; move to B4 watershed) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
+**Updated**: 2026-06-20 (session 10 — Stage 1 D²=0.4257 confirmed; data audit complete; statsmodels + WGI blockers identified; wgi.csv fix script added) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
 
-> **Current state (2026-06-19 — STRATEGIC REFRAME)**:
-> - ✅ Stage 1 Poisson GLM: D²=0.345 — improvable; NB + country FE to be tried (E6)
+> **Current state (2026-06-20)**:
+> - ✅ Stage 1 Poisson GLM: **D²=0.4257** (7yr primary 2017–2023) — up from 0.345; WGI cols still null (wgi.csv wrong, fix pending)
 > - ✅ Stage 2 temporal model (H6+H1b+H5): Lift@1%=6.46× — demonstrates cost-minimisation pattern; sufficient for Track A
 > - ✅ Cross-event validation: macro R@5% stuck at 18–24% across 3 experiments — pixel-level ranking has structural ceiling
 > - ✅ AGB + REDD inject chain complete (3957103→3957105→3957107, 2026-06-19); SA splits now have 94 columns
-> - ✅ CE.3b-sqrt (3917581) complete — macro R@5%=18.8% (exit 1 = gate fail, not crash)
-> - ✅ B0 applied: E11 (val min-pos filter) + E12 (group size cap) in code + CE.4 SLURM
 > - ✅ e1_gap (3981693) COMPLETED: 131/170 events (77.1%) gap confirmed; GSN ratio=0.284; Spearman r=-0.255
-> - ❌ eco_gap_inject (3981696) FAILED: annual WDPA TIFs missing from scratch (deleted due to quota); inject script now fails with clear RuntimeError; CE.4 runs with 94 features (AGB+REDD, no eco_protection_gap)
-> - ❌ CE.4 (3981700) FAILED gate: macro R@5%=15.4%, weighted=21.5%, Lift@1%=3.28×, 29 events, 85 features — WORSE than CE.2 23.8%; **pixel ceiling confirmed < 50% → skip B2–B3, go to B4**
-> - ❌ stage1_sa (3981878) FAILED: country_iso3.tif deleted from scratch — now fixed: files synced to `$SCRATCH/data/shared/`; submit stage1.slurm to rerun
-> - ❌ stage1_nb (3981887) CANCELLED: dependency on 3981878 failed — resubmit after stage1.slurm succeeds
-> - ✅ A2 KBA: kba_sa.tif rasterised (1,768 SA polygons, 15.1% land pixels) + synced to `$SCRATCH/data/south_america/ready/KBA/kba_sa.tif`
-> - **STRATEGIC PIVOT — two parallel tracks**:
->   - **Track A (Gap finding)**: A1 confirmed. A2 done. A3 ready to submit.
->   - **Track B (Watershed model)**: CE.4 gate FAILED → **B4 is now the primary path**; start locally.
-> - **NEXT ACTIONS**: (1) submit A3 on Euler: `JOB=$(sbatch --parsable slurm/south_america/stage1.slurm) && sbatch --dependency=afterok:$JOB slurm/south_america/stage1_nb_overdispersion.slurm`; (2) start B4 watershed PoC locally
+> - ❌ CE.4 (3981700) FAILED gate: macro R@5%=15.4%, weighted=21.5%, Lift@1%=3.28×, 29 events; **pixel ceiling confirmed < 50% → skip B2–B3, go to B4**
+> - ✅ A2 KBA: kba_sa.tif rasterised (1,768 SA polygons, 15.1% land pixels) + synced to Euler
+> - ✅ Stage 1 data audit complete: all files correct EXCEPT wgi.csv (duplicate of vdem_v15.csv)
+> - ✅ model1_expansion.py: fixed null-iso3 crash (country_id=13 unmapped); _merge_vdem_extra now always casts iso3 to str
+> - ❌ A3 NB overdispersion (4074169): FAILED — `statsmodels` not installed in venv; install before resubmit
+> - ❌ A2 KBA gap (4074170): CANCELLED — needs A3 chain to complete first
+> - **BLOCKING**: (1) `wgi.csv` is wrong (duplicate of vdem_v15.csv) → run `scripts/regions/shared/data_prep/build_wgi.py` on Euler login node to fetch real World Bank WGI data; (2) `statsmodels` not in venv → `pip install statsmodels` in master_thesis venv on Euler
+> - **NEXT ACTIONS after blockers fixed**: resubmit `JOB=$(sbatch --parsable slurm/south_america/stage1.slurm) && JOB2=$(sbatch --parsable --dependency=afterok:$JOB slurm/south_america/stage1_nb_overdispersion.slurm) && sbatch --dependency=afterok:$JOB2 slurm/south_america/kba_gap_analysis.slurm`
 
 ---
 
@@ -114,7 +111,7 @@ P(pixel j designated in year t | country C expands)
   × S(pixel j | expansion in C, t)          ← Stage 2: LightGBM LambdaRank
 ```
 
-**Stage 1** — Poisson GLM, LASSO α=100, 9 features. Train 2001–2016, test 2017–2023. D²=0.345. Complete.
+**Stage 1** — Poisson GLM, LASSO α=100, 12 features. Train 2001–2016, test 2017–2023. D²=0.4257 (7yr primary). Complete. NB robustness pending (statsmodels install needed).
 
 **Stage 2** — LightGBM LambdaRank, grouped by `(country_id, year)`, ranking unit: pixels with `WDPA_prev==0`. Locked settings: H6 (Recall@5% early stop), H1b (inv_sqrt_npos weights), H5 (rank normalisation OFF).
 
@@ -180,7 +177,7 @@ Brazil's Bolsonaro-era events (2019–2022) are ~3–4 of the 30 test events (10
 
 | Item | Status | Numbers |
 |---|---|---|
-| Stage 1 Poisson GLM | ✅ Complete | D²=0.345 (SA 7yr OOS) |
+| Stage 1 Poisson GLM | ✅ Complete | D²=0.4257 (SA 7yr OOS 2017–2023); WGI cols null pending wgi.csv fix |
 | Stage 2 temporal model (H6+H1b+H5) | ✅ Working | Lift@1%=6.46×, Recall@5%=15.7%, iter=136 |
 | Stage 2 cross-event (CE.2) | ✅ Done — gate FAILED | macro R@5%=23.8%, weighted=41.6%, 28 events; root cause: heterogeneous events |
 | CE.3a spatial coherence diagnostic | ✅ Done | All 139 events coherence=1.0; threshold=0.0; Fix 1 is a no-op |
@@ -389,8 +386,9 @@ Do not begin until both streams are complete.
 | 3981700 | B1 CE.4 training | ❌ gate FAIL — macro R@5%=15.4% weighted=21.5% Lift@1%=3.28× 29 events; pixel ceiling confirmed |
 | 3981878 | A3: stage1 panel rebuild + Poisson GLM | ❌ FAILED — country_iso3.tif missing from scratch (policy dir empty) |
 | 3981887 | A3: stage1_nb_overdispersion E6 | ❌ CANCELLED (dependency 3981878 failed) |
-| A3 resubmit | Upload country_iso3.tif → resubmit stage1.slurm → stage1_nb.slurm | ⬜ RUNNING — 4072037 (stage1) → 4072038 (nb) |
-| A2 KBA gap | kba_gap_analysis.py on full test parquet | ⬜ QUEUED — 4072039 (afterok:4072038) |
+| A3 stage1 (4074168) | Poisson GLM COMPLETE: D²=0.4257 7yr, train=0.577, FE hurts (0.129), no-interact=0.455 | ✅ DONE |
+| A3 NB overdispersion (4074169) | FAILED: statsmodels not installed in venv | ❌ BLOCKED — pip install statsmodels, then resubmit |
+| A2 KBA gap (4074170) | CANCELLED — depends on A3 chain | ⬜ Resubmit after blockers fixed |
 | A2 KBA rasterise | kba_rasterise.py | ✅ DONE — kba_sa.tif at `$SCRATCH/data/south_america/ready/KBA/kba_sa.tif` |
 | A4 CBD features | Add CBD pledge + coverage gap to Stage 1 | ⬜ After A3 results |
 | B2 | Ecological scope filter on CE.4 model | ⬜ Skipped (B1 < 30%) |

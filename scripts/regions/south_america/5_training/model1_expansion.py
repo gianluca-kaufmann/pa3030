@@ -124,6 +124,7 @@ def _apply_log1p(X: np.ndarray, feat_cols: list[str]) -> np.ndarray:
 
 
 def _merge_vdem_extra(cy: pd.DataFrame) -> pd.DataFrame:
+    cy["iso3"] = cy["iso3"].astype(str)  # normalise before any early return
     needed = [c for c in VDEM_EXTRA + VDEM_LEVEL if c not in cy.columns]
     if not needed:
         return cy
@@ -423,6 +424,10 @@ def main() -> None:
             f"Stage 1 panel not found at {PANEL_PATH}. Run stage1_data_builder.py first."
         )
     cy = pd.read_parquet(PANEL_PATH)
+    n_null = cy["iso3"].isna().sum()
+    if n_null > 0:
+        print(f"  WARN: dropping {n_null} rows with unmapped country_id (no iso3)")
+        cy = cy.dropna(subset=["iso3"])
     cy = _merge_vdem_extra(cy)
     cy = _compute_governance_diffs(cy)
 
