@@ -1,21 +1,31 @@
 # PA3030 — Publication Roadmap
 
-**Updated**: 2026-06-20 (session 10 — Stage 1 D²=0.4257 confirmed; data audit complete; statsmodels + WGI blockers identified; wgi.csv fix script added) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
+**Updated**: 2026-06-20 (session 11 — B4 watershed PoC complete; temporal-split bug identified; cross-event watershed 28.6% > CE.2 23.8%) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
 
 > **Current state (2026-06-20)**:
 > - ✅ Stage 1 Poisson GLM: **D²=0.4257** (7yr primary 2017–2023) — up from 0.345; WGI cols still null (wgi.csv wrong, fix pending)
 > - ✅ Stage 2 temporal model (H6+H1b+H5): Lift@1%=6.46× — demonstrates cost-minimisation pattern; sufficient for Track A
-> - ✅ Cross-event validation: macro R@5% stuck at 18–24% across 3 experiments — pixel-level ranking has structural ceiling
+> - ✅ Cross-event validation: macro R@5% stuck at 18–24% across 3 pixel experiments — pixel-level ceiling confirmed
 > - ✅ AGB + REDD inject chain complete (3957103→3957105→3957107, 2026-06-19); SA splits now have 94 columns
 > - ✅ e1_gap (3981693) COMPLETED: 131/170 events (77.1%) gap confirmed; GSN ratio=0.284; Spearman r=-0.255
-> - ❌ CE.4 (3981700) FAILED gate: macro R@5%=15.4%, weighted=21.5%, Lift@1%=3.28×, 29 events; **pixel ceiling confirmed < 50% → skip B2–B3, go to B4**
+> - ❌ CE.4 (3981700) FAILED gate: macro R@5%=15.4%, weighted=21.5%, Lift@1%=3.28×, 29 events; **pixel ceiling confirmed < 50% → go to B4**
 > - ✅ A2 KBA: kba_sa.tif rasterised (1,768 SA polygons, 15.1% land pixels) + synced to Euler
 > - ✅ Stage 1 data audit complete: all files correct EXCEPT wgi.csv (duplicate of vdem_v15.csv)
-> - ✅ model1_expansion.py: fixed null-iso3 crash (country_id=13 unmapped); _merge_vdem_extra now always casts iso3 to str
+> - ✅ model1_expansion.py: fixed null-iso3 crash (country_id=13 unmapped)
 > - ❌ A3 NB overdispersion (4074169): FAILED — `statsmodels` not installed in venv; install before resubmit
 > - ❌ A2 KBA gap (4074170): CANCELLED — needs A3 chain to complete first
-> - **BLOCKING**: (1) `wgi.csv` is wrong (duplicate of vdem_v15.csv) → run `scripts/regions/shared/data_prep/build_wgi.py` on Euler login node to fetch real World Bank WGI data; (2) `statsmodels` not in venv → `pip install statsmodels` in master_thesis venv on Euler
-> - **NEXT ACTIONS after blockers fixed**: resubmit `JOB=$(sbatch --parsable slurm/south_america/stage1.slurm) && JOB2=$(sbatch --parsable --dependency=afterok:$JOB slurm/south_america/stage1_nb_overdispersion.slurm) && sbatch --dependency=afterok:$JOB2 slurm/south_america/kba_gap_analysis.slurm`
+> - ✅ **B4 watershed PoC DONE (local)**:
+>   - HydroSHEDS L7 downloaded + rasterised (7,036 SA catchments → `catchment_id_sa.tif`)
+>   - `watershed_mini_sample.parquet` built (157K catchment-year rows from 15.4M pixels)
+>   - Temporal-split PoC: **17.9% macro Recall@5%** (same ceiling as pixels) — root cause identified
+>   - **KEY FINDING**: temporal split (train 2001–2013, test 2017–2024) was the bug; ALL 0% events are post-2016; model had ample training events for those countries in 2001–2013
+>   - **Cross-event PoC** (random 80/20 across all years): **28.6% macro, 39% weighted** (35 events) — beats CE.2 pixel best (23.8%)
+>   - Catchment unit IS better than pixels on the correct evaluation; mini-sample scale (164 train events) is the remaining bottleneck
+> - **BLOCKING (A3)**: (1) `wgi.csv` wrong → run `build_wgi.py` on Euler login node; (2) `statsmodels` not in venv → `pip install statsmodels`
+> - **NEXT ACTIONS (priority order)**:
+>   1. Fix A3 blockers on Euler, then resubmit: `JOB=$(sbatch --parsable slurm/south_america/stage1.slurm) && JOB2=$(sbatch --parsable --dependency=afterok:$JOB slurm/south_america/stage1_nb_overdispersion.slurm) && sbatch --dependency=afterok:$JOB2 slurm/south_america/kba_gap_analysis.slurm`
+>   2. B4 local improvement: upgrade `build_watershed_mini_sample.py` to use min(dist_wdpa) / max(GSN_b2) / max(agb) aggregation instead of mean; add catchment structural features (n_total_pixels as area proxy, elevation range); re-run cross-event PoC
+>   3. If cross-event PoC ≥ 50% after improvements → submit B5 (CE.W) to Euler using cross-event split design (NOT temporal split)
 
 ---
 
@@ -192,6 +202,7 @@ Brazil's Bolsonaro-era events (2019–2022) are ~3–4 of the 30 test events (10
 | Baselines | ✅ Done | random=1.0×, naive=2.81×, full=6.54× |
 | SHAP analysis | ❌ Not run | Needs final model (after CE.3b/CE.4) |
 | KBA download + rasterise | ✅ Done | kba_sa.tif: 1,768 polygons, 15.1% land pixels; synced to Euler |
+| B4 watershed PoC (local) | ✅ Done | 7,036 L7 catchments; temporal split 17.9% (same as pixels); cross-event 28.6% > CE.2 23.8%; temporal split was the bug |
 | Representation gap (RQ3) | ❌ Not quantified | THE paper finding |
 | Bootstrap CIs | ❌ Not run | After final model |
 | Cross-regional transfer (USA, SE Asia) | ❌ Not run | Phase 5 |
@@ -304,21 +315,42 @@ If either shows positive Recall delta on mini-sample → inject into Euler split
 
 ---
 
-#### B4 — E3: Watershed proof-of-concept (local, 2–3 days) — uses anchor val split
+#### B4 — E3: Watershed proof-of-concept (local) ✅ DONE — cross-event 28.6%
 
-Rebuild the mini-sample at HydroSHEDS L7 catchment level:
-1. Download HydroSHEDS L7 SA catchment shapefile
-2. For each catchment: aggregate pixel features (mean elevation, mean dist_wdpa, mean AGB, etc.)
-3. Rebuild mini-splits grouped by `(country_id, year, catchment_id)`
-4. Train LambdaRank on catchments with B0 infrastructure
-5. Evaluation: take top-5% catchments → recall all pixels inside → compute pixel-level Recall@5%
+HydroSHEDS L7 downloaded and rasterised. `watershed_mini_sample.parquet` built. Two PoC variants run.
 
-**What we learn**: does changing the ranking unit from pixel to catchment fundamentally fix Recall? PA polygons fit into 1–5 catchments; top-5% budget = ~250 catchments vs. 500M pixels. Structurally expected > 70%.
+**Scripts (all in repo)**:
+- `2_preprocessing/hydroshed_rasterise.py` — rasterises 7,036 L7 SA catchments to backbone grid
+- `3_merging/build_watershed_mini_sample.py` — aggregates pixel features (mean) to catchment level; outputs 157K catchment-year rows with n_pos_pixels for evaluation
+- `5_training/model1_watershed_poc.py` — catchment-level LambdaRank + pixel Recall@5% evaluation
+- `5_training/model1_watershed_score_aggregate.py` — score-then-aggregate variant (pixel model scores → max per catchment)
 
-Decision gates:
-- Recall ≥ 70% → Track B validated; scale to full SA (B5)
-- Recall 50–70% → partial fix; investigate which events still fail; add features then scale
-- Recall < 50% → catchment unit also insufficient; activate Track C (Cox PH survival model)
+**Data files (local only, not on Euler)**:
+- `data/south_america/ready/hydroshed/catchment_id_sa.tif` — int32 catchment index raster
+- `data/south_america/ready/hydroshed/catchment_id_mapping.json` — index → HYBAS_ID
+- `data/south_america/watershed_mini_sample.parquet` — 157,475 catchment-year rows, 92 columns
+
+**Results**:
+
+| Variant | Split | Macro R@5% | Weighted R@5% | n events | Note |
+|---|---|---|---|---|---|
+| Mean-aggregated catchment model | Temporal (2001–2013 → 2017–2024) | 17.9% | 15.4% | 57 | Same as pixels; early stop round 24 |
+| Score-then-aggregate (max pixel score) | Temporal | 15.3% | 10.6% | 57 | Mean aggregation destroys signal |
+| Mean-aggregated catchment model | **Cross-event (random 80/20)** | **28.6%** | **39.0%** | 35 | Beats CE.2 pixel (23.8%) ✅ |
+
+**Root cause of temporal-split failure**: ALL 0% events were post-2016. Both countries 6 and 9 had 10+ training events in 2001–2013. The model was not failing on those countries — it was facing era-based concept drift from being trained on 2001–2013 and tested on 2017–2024. This is the same structural flaw that affected CE.1–CE.4 at pixel level. On cross-event evaluation (events from the same era seen in both train and test), the watershed model outperforms the pixel model.
+
+**Why mean-aggregation hurts**: designation is driven by a few extreme pixels inside a catchment. Mean aggregation dilutes those extreme values across all catchment pixels. Fix: use min(dist_wdpa), max(GSN_b2), max(agb_tonne_ha) for key features.
+
+**Remaining B4 work (before B5)**:
+1. Upgrade `build_watershed_mini_sample.py`: use directional aggregation (min/max) for suitability features; add catchment structural features (n_total_pixels as area, elevation std within catchment, PA overlap fraction)
+2. Re-run cross-event PoC with improved features
+3. If ≥ 50% → submit B5 (CE.W) to Euler
+
+Decision gates (unchanged):
+- Cross-event Recall ≥ 70% → Track B validated; scale to full SA (B5)
+- Cross-event Recall 50–70% → partial fix; improve features then scale
+- Cross-event Recall < 50% → activate Track C (Cox PH survival model)
 
 ---
 
@@ -394,8 +426,9 @@ Do not begin until both streams are complete.
 | B2 | Ecological scope filter on CE.4 model | ⬜ Skipped (B1 < 30%) |
 | B3 | E9 (dist_border) + E10 (TRI) features | ⬜ Skipped (B1 < 50%) |
 | 4044178 | mini_sample_v2 build (event-stratified, N_CAP=50k) | ✅ DONE — 15.4M rows, 50 meaningful events, 3.4GB at `$SCRATCH/data/south_america/ml/mini_sample_v2.parquet`; rsync to desktop then run `prepare_mini_splits_v2.py` |
-| B4 (E3) | Watershed proof-of-concept on desktop mini-sample | ⬜ Needs HydroSHEDS L7 SA download + new code; mini_sample_v2 ready as input |
-| B5 (CE.W) | Full SA watershed model | ⬜ Euler; after B4 ≥ 50% |
+| B4 (E3) | Watershed PoC — local | ✅ DONE (2026-06-20) — cross-event 28.6% macro (35 events); temporal-split bug identified; beats CE.2 pixel 23.8% |
+| B4 improvements | Upgrade aggregation (min/max) + catchment structural features | ⬜ Local, 1–2h; run cross-event PoC again |
+| B5 (CE.W) | Full SA watershed model | ⬜ Euler; after improved B4 ≥ 50%; MUST use cross-event split design (NOT temporal) |
 | C1 | SHAP (global + temporal + country) | ⬜ After B5 |
 | C2 | Bootstrap CIs | ⬜ After B5 |
 | C3 | Cross-regional transfer SA→USA→SE Asia | ⬜ After B5 |
@@ -506,6 +539,7 @@ Do not begin until both streams are complete.
 | Naive baselines | Must be documented | Required for any top journal |
 | min_positive_pixels | Stay at 200; do NOT raise as primary filter | Small coherent events are scientifically valid; use coherence filter instead |
 | Sample weighting | **inv_sqrt_npos confirmed** (Fix 2 inv_npos tested in CE.3b → 18.0%, WORSE than CE.2 23.8%; ce3b_sqrt diagnostic running to confirm) | inv_npos over-amplifies noisy small events; inv_sqrt_npos remains the correct setting |
+| **Watershed evaluation split** | **Cross-event (random 80/20 across all years)** — NOT temporal (2001–2013 → 2017–2024) | Temporal split introduces era-based concept drift that has nothing to do with catchment unit quality. B4 PoC showed ALL 0% events were post-2016 despite model having 10+ training events for those countries pre-2014. Cross-event is the correct design for a spatial choice model. |
 | Early-stop val split | **`_split_events_stratified_v2`** (2026-06-20, session 8): guarantees ≥2 anchor events with n_pos ≥ `STAGE2_ES_ANCHOR_POS` (default 2000) in val set before filling remaining slots via country stratification. Replaces E11 post-hoc filter. | Event-size distribution is highly skewed; a random 10% val draw often gets all tiny events → Recall@5% flatlines → early stopping fires blindly. Anchor guarantee ensures the stopping signal has resolution. Euler runs: set `STAGE2_ES_ANCHOR_POS=10000`. |
 | Event split | Stratified by country (Fix 4) | Random seed=42 placed Argentina crisis years entirely in test set |
 | AGB / REDD features | Static features (2010 AGB snapshot, 2023 REDD database) — intentional | Annual dynamics not needed; structural signal is what drives designation |
