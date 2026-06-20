@@ -389,8 +389,9 @@ Do not begin until both streams are complete.
 | 3981700 | B1 CE.4 training | ❌ gate FAIL — macro R@5%=15.4% weighted=21.5% Lift@1%=3.28× 29 events; pixel ceiling confirmed |
 | 3981878 | A3: stage1 panel rebuild + Poisson GLM | ❌ FAILED — country_iso3.tif missing from scratch (policy dir empty) |
 | 3981887 | A3: stage1_nb_overdispersion E6 | ❌ CANCELLED (dependency 3981878 failed) |
-| A3 resubmit | Upload country_iso3.tif → resubmit stage1.slurm → stage1_nb.slurm | ⬜ READY — files at `$SCRATCH/data/shared/`; submit chain above |
-| A2 KBA | kba_rasterise.py | ✅ DONE — kba_sa.tif at `$SCRATCH/data/south_america/ready/KBA/kba_sa.tif` |
+| A3 resubmit | Upload country_iso3.tif → resubmit stage1.slurm → stage1_nb.slurm | ⬜ RUNNING — 4072037 (stage1) → 4072038 (nb) |
+| A2 KBA gap | kba_gap_analysis.py on full test parquet | ⬜ QUEUED — 4072039 (afterok:4072038) |
+| A2 KBA rasterise | kba_rasterise.py | ✅ DONE — kba_sa.tif at `$SCRATCH/data/south_america/ready/KBA/kba_sa.tif` |
 | A4 CBD features | Add CBD pledge + coverage gap to Stage 1 | ⬜ After A3 results |
 | B2 | Ecological scope filter on CE.4 model | ⬜ Skipped (B1 < 30%) |
 | B3 | E9 (dist_border) + E10 (TRI) features | ⬜ Skipped (B1 < 50%) |
