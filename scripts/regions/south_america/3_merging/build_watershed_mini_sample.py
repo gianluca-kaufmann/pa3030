@@ -1,14 +1,23 @@
 """Aggregate pixel mini-sample to HydroSHEDS L7 catchment level.
 
 For each (country_id, year, catchment_id) group, computes:
-  - mean of all feature columns
+  - Directional aggregation of feature columns:
+      min  → distance features (dist_wdpa, dist_road, etc.)
+      max  → biodiversity / value features (GSN_b2, agb_tonne_ha, etc.)
+      mean → all other numeric features
+      std  → elevation_b1 (added as elev_std, a catchment structure signal)
   - transition_01: 1 if any pixel in the catchment was designated
   - n_pos_pixels:  count of designated pixels (for pixel-level Recall@5% evaluation)
-  - n_total_pixels: total unprotected pixels in this catchment-year
-  - WDPA_prev_frac: fraction of pixels already protected (should be ~0 in mini-sample)
+  - n_total_pixels: total unprotected pixels in this catchment-year (area proxy)
+  - WDPA_prev_frac: fraction of pixels already protected (PA overlap fraction)
+
+The directional aggregation fixes the mean-aggregation problem: designation is
+driven by a few extreme pixels inside a catchment. min(dist_wdpa) captures the
+closest pixel to existing PAs; max(GSN_b2) captures the most biodiverse pixel.
+Mean would dilute these structural signals across all catchment pixels.
 
 Input:
-  data/south_america/mini_sample_v2.parquet          (15.4M pixel rows)
+  data/south_america/mini_sample_v2.parquet          (pixel rows)
   data/south_america/ready/hydroshed/catchment_id_sa.tif
 
 Output:
@@ -32,7 +41,7 @@ PIXEL_PATH = PROJECT_ROOT / "data/south_america/mini_sample_v2.parquet"
 CATCHMENT_TIF = PROJECT_ROOT / "data/south_america/ready/hydroshed/catchment_id_sa.tif"
 OUT_PATH = PROJECT_ROOT / "data/south_america/watershed_mini_sample.parquet"
 
-# Columns excluded from feature averaging (identifiers, labels, leakage)
+# Columns excluded from feature aggregation (identifiers, labels, leakage)
 EXCLUDE_FROM_FEATURES = frozenset({
     "year", "x", "y", "row", "col", "country_id",
     "transition_01", "WDPA_prev",
@@ -40,13 +49,41 @@ EXCLUDE_FROM_FEATURES = frozenset({
     "country_iso3",
 })
 
+# Distance features: use min (the catchment is attractive if ANY pixel is close)
+MIN_FEATURES = frozenset({
+    "dist_indigenous",
+    "dist_oil_gas",
+    "dist_powerplant",
+    "dist_redd_km",
+    "dist_road",
+    "dist_wdpa",
+})
+
+# Biodiversity / value features: use max (conservation value if ANY pixel is high)
+MAX_FEATURES = frozenset({
+    "GSN_b1", "GSN_b1_smooth16", "GSN_b1_smooth64",
+    "GSN_b2", "GSN_b2_smooth16", "GSN_b2_smooth64",
+    "GSN_b3", "GSN_b3_smooth16", "GSN_b3_smooth64",
+    "GSN_b4", "GSN_b4_smooth16", "GSN_b4_smooth64",
+    "GSN_b5", "GSN_b5_smooth16", "GSN_b5_smooth64",
+    "agb_tonne_ha",
+    "NDVI", "NDVI_smooth16", "NDVI_smooth64", "NDVI_trend5",
+    "patch_mean_gsn_b2",       # highest-biodiversity patch in catchment
+    "patch_pa_adjacency_frac", # is any patch in catchment adjacent to a PA?
+    "patch_designation_lag1",  # was any patch designated last year?
+})
+
+# Elevation std: add as new structural feature elev_std (terrain ruggedness proxy)
+ELEV_COL = "elevation_b1"
+
 
 def main() -> None:
     for p in (PIXEL_PATH, CATCHMENT_TIF):
         if not p.exists():
-            sys.exit(f"Not found: {p}\n"
-                     "Run hydroshed_rasterise.py first." if "catchment" in p.name
-                     else f"Not found: {p}")
+            sys.exit(
+                f"Not found: {p}\n"
+                + ("Run hydroshed_rasterise.py first." if "catchment" in p.name else "")
+            )
 
     print("Loading catchment raster...")
     with rasterio.open(CATCHMENT_TIF) as src:
@@ -56,7 +93,6 @@ def main() -> None:
 
     print(f"Loading pixel mini-sample: {PIXEL_PATH}")
     df = pd.read_parquet(PIXEL_PATH)
-    # Drop any internal pyarrow fragment columns
     df = df[[c for c in df.columns if not c.startswith("__")]]
     print(f"  {len(df):,} rows  {len(df.columns)} columns")
 
@@ -79,10 +115,39 @@ def main() -> None:
     ]
     print(f"  Feature columns to aggregate: {len(feature_cols)}")
 
-    group_cols = ["country_id", "year", "catchment_id"]
-    print("Aggregating to catchment level (this may take ~1 min)...")
+    min_cols  = [c for c in feature_cols if c in MIN_FEATURES]
+    max_cols  = [c for c in feature_cols if c in MAX_FEATURES]
+    has_elev  = ELEV_COL in feature_cols
+    mean_cols = [
+        c for c in feature_cols
+        if c not in MIN_FEATURES and c not in MAX_FEATURES and c != ELEV_COL
+    ]
 
-    feat_agg = df.groupby(group_cols)[feature_cols].mean()
+    print(f"  Aggregation breakdown: mean={len(mean_cols)}  "
+          f"min={len(min_cols)}  max={len(max_cols)}  "
+          f"elev_std={'yes' if has_elev else 'no'}")
+
+    group_cols = ["country_id", "year", "catchment_id"]
+    print("Aggregating to catchment level (this may take ~2 min)...")
+
+    agg_parts: list[pd.DataFrame] = []
+
+    if mean_cols:
+        agg_parts.append(df.groupby(group_cols)[mean_cols].mean())
+
+    if min_cols:
+        agg_parts.append(df.groupby(group_cols)[min_cols].min())
+
+    if max_cols:
+        agg_parts.append(df.groupby(group_cols)[max_cols].max())
+
+    if has_elev:
+        # Keep mean(elevation) for compatibility + add std as structural feature
+        agg_parts.append(df.groupby(group_cols)[[ELEV_COL]].mean())
+        elev_std = df.groupby(group_cols)[ELEV_COL].std().rename("elev_std")
+        agg_parts.append(elev_std.to_frame())
+
+    feat_agg = pd.concat(agg_parts, axis=1)
 
     label_agg = df.groupby(group_cols).agg(
         n_pos_pixels=("transition_01", "sum"),
@@ -92,13 +157,14 @@ def main() -> None:
 
     result = feat_agg.join(label_agg).reset_index()
     result["transition_01"] = (result["n_pos_pixels"] > 0).astype(np.uint8)
-    result["n_pos_pixels"] = result["n_pos_pixels"].astype(np.int32)
+    result["n_pos_pixels"]   = result["n_pos_pixels"].astype(np.int32)
     result["n_total_pixels"] = result["n_total_pixels"].astype(np.int32)
 
-    n_rows = len(result)
+    n_rows   = len(result)
     n_events = result.groupby(["country_id", "year"]).ngroups
-    n_pos = int(result["transition_01"].sum())
+    n_pos    = int(result["transition_01"].sum())
     total_pos_px = int(result["n_pos_pixels"].sum())
+
     print(f"\nCatchment-year rows:    {n_rows:,}")
     print(f"(country, year) groups: {n_events}")
     print(f"Positive catchments:    {n_pos:,} ({100*n_pos/n_rows:.2f}%)")
@@ -106,12 +172,21 @@ def main() -> None:
     print(f"Mean catchment size:    {result['n_total_pixels'].mean():.1f} pixels")
     print(f"Mean pos pixels/event:  "
           f"{result[result['transition_01']==1]['n_pos_pixels'].mean():.1f}")
+    if has_elev:
+        print(f"elev_std NaN frac:      "
+              f"{result['elev_std'].isna().mean()*100:.1f}% "
+              f"(single-pixel catchments have undefined std)")
+        result["elev_std"] = result["elev_std"].fillna(0.0)
 
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     result.to_parquet(OUT_PATH, index=False, compression="snappy")
+
+    n_feat_out = len([c for c in result.columns
+                      if c not in set(group_cols) | {"transition_01", "n_pos_pixels",
+                                                     "n_total_pixels", "WDPA_prev_frac"}])
     print(f"\nSaved → {OUT_PATH}")
     print(f"Columns: {len(result.columns)}  "
-          f"(features={len(feature_cols)}, meta=country_id/year/catchment_id, "
+          f"(features≈{n_feat_out}, meta=country_id/year/catchment_id, "
           f"labels=transition_01/n_pos_pixels/n_total_pixels/WDPA_prev_frac)")
 
 
