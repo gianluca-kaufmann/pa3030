@@ -21,7 +21,9 @@
 > - **NEXT ACTIONS (priority order)**:
 >   1. Wait for 4112175→4112176 (A3) and 4112177 (KBA gap) to complete; check logs at `$SCRATCH/logs/`
 >   2. **B4 local re-run**: pull updated scripts → run `build_watershed_mini_sample.py` (rebuilt with directional agg) → run `model1_watershed_poc.py` (cross-event primary) → record new Recall@5%
->   3. If cross-event PoC ≥ 50% → submit B5 (CE.W) to Euler using cross-event split design (NOT temporal)
+>   3. **Upload catchment_id_sa.tif to Euler**: `rsync data/south_america/ready/hydroshed/catchment_id_sa.tif euler:$SCRATCH/data/south_america/ready/hydroshed/catchment_id_sa.tif`
+>   4. **Submit full SA watershed pipeline** (no PoC gate — full data supersedes mini-sample): `JOB=$(sbatch --parsable slurm/south_america/watershed_build.slurm) && sbatch --dependency=afterok:$JOB slurm/south_america/watershed_ce_w.slurm`
+>   5. Optionally: pull updated scripts locally → run `build_watershed_mini_sample.py` + `model1_watershed_poc.py` for quick cross-event sanity check
 
 ---
 
@@ -427,6 +429,7 @@ Do not begin until both streams are complete.
 | 4044178 | mini_sample_v2 build (event-stratified, N_CAP=50k) | ✅ DONE — 15.4M rows, 50 meaningful events, 3.4GB at `$SCRATCH/data/south_america/ml/mini_sample_v2.parquet` |
 | B4 (E3) | Watershed PoC — local | ✅ DONE (2026-06-20) — cross-event 28.6% macro (35 events); temporal-split bug identified; beats CE.2 pixel 23.8% |
 | **B4 improvements** | **Upgrade aggregation + cross-event split in scripts** | ✅ DONE (2026-06-21) — `build_watershed_mini_sample.py` uses directional agg (min/max/std); `model1_watershed_poc.py` has cross-event as default primary + --temporal flag; structural features n_total_pixels+WDPA_prev_frac+elev_std now used. Re-run locally after git pull. |
+| **B5 full SA pipeline** | **New: build_watershed_full_splits.py + watershed_build.slurm + watershed_ce_w.slurm** | ✅ SCRIPTS READY (2026-06-21) — full SA pixel splits → catchment level (directional agg) → LambdaRank CE.W. Blocked on: `catchment_id_sa.tif` must be rsynced to `$SCRATCH/data/south_america/ready/hydroshed/catchment_id_sa.tif`. Then submit: `JOB=$(sbatch --parsable slurm/south_america/watershed_build.slurm) && sbatch --dependency=afterok:$JOB slurm/south_america/watershed_ce_w.slurm` |
 | B5 (CE.W) | Full SA watershed model | ⬜ Euler; after improved B4 ≥ 50%; MUST use cross-event split design (NOT temporal) |
 | C1 | SHAP (global + temporal + country) | ⬜ After B5 |
 | C2 | Bootstrap CIs | ⬜ After B5 |

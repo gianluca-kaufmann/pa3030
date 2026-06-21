@@ -53,9 +53,18 @@ _ROOT = Path(__file__).resolve().parents[4]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-WATERSHED_PATH = _ROOT / "data/south_america/watershed_sample.parquet"
-MODEL_DIR      = _ROOT / "data/south_america/ml/models"
-OUT_DIR        = _ROOT / "outputs/south_america/results/ml_models"
+_SCRATCH = os.environ.get("SCRATCH", "")
+_WS_PATH_ENV = os.environ.get("WS_PARQUET", "")
+
+if _WS_PATH_ENV:
+    WATERSHED_PATH = Path(_WS_PATH_ENV)
+elif _SCRATCH:
+    WATERSHED_PATH = Path(_SCRATCH) / "data/south_america/ml/watershed/watershed_full_sa.parquet"
+else:
+    WATERSHED_PATH = _ROOT / "data/south_america/watershed_mini_sample.parquet"
+
+MODEL_DIR = _ROOT / "data/south_america/ml/models"
+OUT_DIR   = _ROOT / "outputs/south_america/results/ml_models"
 
 SEED            = int(os.environ.get("WS_SEED",              "42"))
 TEST_RATIO      = float(os.environ.get("WS_TEST_RATIO",      "0.20"))
@@ -64,13 +73,17 @@ MIN_POS_PIXELS  = int(os.environ.get("WS_MIN_POS_PIXELS",    "200"))
 NEG_RATIO       = int(os.environ.get("WS_NEG_RATIO",         "20"))
 NUM_BOOST_ROUND = int(os.environ.get("WS_NUM_BOOST_ROUND",   "1000"))
 
-# Columns that are NOT features (group keys, labels, counts)
+# Columns that are NOT features.
+# n_total_pixels and WDPA_prev_frac are intentionally allowed as features
+# (catchment area proxy and PA overlap fraction).
 NON_FEATURE = frozenset({
     "country_id", "year", "catchment_id",
-    "n_positive_pixels", "n_total_pixels", "catchment_is_positive",
+    "n_pos_pixels", "n_positive_pixels",   # both naming conventions
+    "catchment_is_positive",
     "transition_01", "transition_01_win5",
     "WDPA_b1", "WDPA_b2", "WDPA_prev", "WDPA",
-    "x_mean", "y_mean", "row_mean", "col_mean",  # coordinate averages
+    "x", "y", "row", "col",
+    "x_mean", "y_mean", "row_mean", "col_mean",
     "country_iso3", "country_iso3_mean",
 })
 
@@ -334,12 +347,24 @@ def main() -> None:
 
     print(f"Loading watershed sample: {WATERSHED_PATH}")
     df = pd.read_parquet(WATERSHED_PATH)
+
+    # Support both column naming conventions:
+    #   old builder: catchment_is_positive, n_positive_pixels
+    #   new builder: transition_01, n_pos_pixels
+    if "catchment_is_positive" not in df.columns and "transition_01" in df.columns:
+        df["catchment_is_positive"] = df["transition_01"]
+    if "n_positive_pixels" not in df.columns and "n_pos_pixels" in df.columns:
+        df["n_positive_pixels"] = df["n_pos_pixels"]
+
     print(f"  {len(df):,} catchment-events  |  "
           f"positive catchments: {int(df['catchment_is_positive'].sum()):,}  |  "
           f"events: {df.groupby(['country_id','year']).ngroups}")
 
     feature_cols = _get_feature_cols(df)
     print(f"  Feature columns: {len(feature_cols)}")
+    for sf in ("n_total_pixels", "WDPA_prev_frac", "elev_std"):
+        status = "✓" if sf in feature_cols else "✗"
+        print(f"    {status} {sf}")
 
     # ── Enumerate meaningful events ──
     ev_stats = df[df["catchment_is_positive"] == 1].groupby(["country_id", "year"])[
