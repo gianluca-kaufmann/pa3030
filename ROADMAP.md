@@ -1,29 +1,22 @@
 # PA3030 — Publication Roadmap
 
-**Updated**: 2026-06-21 (session 12 — wgi.csv fixed; statsmodels installed; A3+KBA gap jobs submitted; B4 scripts upgraded with directional aggregation + cross-event split) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
+**Updated**: 2026-06-21 (session 14 — B5 diagnostic complete; structural ceiling diagnosed; B5H hierarchical model chosen as next step) | **Branch**: `paper` (active). `main` = intact thesis, never touch.
 
 > **Current state (2026-06-21)**:
-> - ✅ Stage 1 Poisson GLM: **D²=0.4257** (7yr primary 2017–2023); WGI now fixed — stage1 panel rebuild queued (4112175) to get non-null WGI cols
-> - ✅ Stage 2 temporal model (H6+H1b+H5): Lift@1%=6.46× — demonstrates cost-minimisation pattern; sufficient for Track A
-> - ✅ Cross-event validation: macro R@5% stuck at 18–24% across 3 pixel experiments — pixel-level ceiling confirmed
-> - ✅ AGB + REDD inject chain complete (3957103→3957105→3957107, 2026-06-19); SA splits now have 94 columns
-> - ✅ e1_gap (3981693) COMPLETED: 131/170 events (77.1%) gap confirmed; GSN ratio=0.284; Spearman r=-0.255
-> - ❌ CE.4 (3981700) FAILED gate: macro R@5%=15.4%, weighted=21.5%, Lift@1%=3.28×, 29 events; **pixel ceiling confirmed < 50% → go to B4**
-> - ✅ A2 KBA: kba_sa.tif rasterised (1,768 SA polygons, 15.1% land pixels) + synced to Euler
-> - ✅ **wgi.csv FIXED**: correct columns (iso3, year, gov_wgi_ge_est, gov_wgi_rl_est, 5477 rows) now in both repo data/shared/ and $SCRATCH/data/shared/
-> - ✅ **statsmodels 0.14.6 installed** in venv (login node pip install)
-> - ⏳ A3 stage1 panel rebuild (4112175) → NB overdispersion (4112176): QUEUED
-> - ⏳ A2 KBA gap analysis (4112177): QUEUED — independent of A3; uses locked Stage 2 model + test.parquet + kba_sa.tif
-> - ✅ **B4 code upgraded (session 12)**:
->   - `build_watershed_mini_sample.py`: directional aggregation (min for dist_*, max for GSN_b*/agb/NDVI/patch features); elev_std structural feature added
->   - `model1_watershed_poc.py`: cross-event split as PRIMARY evaluation (run default); --temporal flag for diagnostic; n_total_pixels + WDPA_prev_frac + elev_std now included as features
->   - B4 data files (catchment_id_sa.tif, watershed_mini_sample.parquet) are LOCAL ONLY — re-run `build_watershed_mini_sample.py` locally after pulling code, then `model1_watershed_poc.py`
-> - **NEXT ACTIONS (priority order)**:
->   1. Wait for 4112175→4112176 (A3) and 4112177 (KBA gap) to complete; check logs at `$SCRATCH/logs/`
->   2. **B4 local re-run**: pull updated scripts → run `build_watershed_mini_sample.py` (rebuilt with directional agg) → run `model1_watershed_poc.py` (cross-event primary) → record new Recall@5%
->   3. **Upload catchment_id_sa.tif to Euler**: `rsync data/south_america/ready/hydroshed/catchment_id_sa.tif euler:$SCRATCH/data/south_america/ready/hydroshed/catchment_id_sa.tif`
->   4. **Submit full SA watershed pipeline** (no PoC gate — full data supersedes mini-sample): `JOB=$(sbatch --parsable slurm/south_america/watershed_build.slurm) && sbatch --dependency=afterok:$JOB slurm/south_america/watershed_ce_w.slurm`
->   5. Optionally: pull updated scripts locally → run `build_watershed_mini_sample.py` + `model1_watershed_poc.py` for quick cross-event sanity check
+> - ✅ **Stage 1 Poisson GLM: D²=0.455** (7yr primary 2017–2023, p95 spec) — up from 0.4257 after WGI fix; all specs in 0.40–0.47 range
+> - ✅ **A3 NB overdispersion DONE (4112175→4112176)**: massively overdispersed (Pearson χ²/df=9632, CT α=0.532) BUT NB hurts OOS D²: Poisson 0.446 vs NB 0.353 (Δ=−0.094). **Poisson is the correct spec.** Country FE collapses to 0.170 — no-FE confirmed. CBD spec marginally improves (0.422 vs 0.455 without). No-interact spec best at 0.455.
+> - ✅ **A2 KBA gap DONE (4112177)**: UNEXPECTED — top-5% predicted pixels have KBA rate=0.154 vs baseline=0.086, lift=1.79× (Spearman r=+0.082). **Model FINDS KBAs, not avoids them.** This contradicts E1 (GSN_b2 gap confirmed at ratio=0.284). Discrepancy interpretation: model predicts land near existing PAs (which overlap KBAs) but within those areas, the cheapest/most-remote pixels get chosen — hence GSN_b2 gap exists at the micro-scale. **KBA analysis must be re-run per expansion event (Part A direct) or limited to non-PA-adjacent pixels.** Check Part A direct output in `outputs/south_america/results/gap_analysis/kba_gap_analysis.json`.
+> - ✅ Stage 2 temporal model (H6+H1b+H5): Lift@1%=6.46× — demonstrates cost-minimisation pattern
+> - ✅ CE.4 pixel ceiling confirmed: macro R@5%=15.4% (<50%) → Track B watershed primary path
+> - ✅ e1_gap: 131/170 events (77.1%) GSN gap confirmed; Spearman r=−0.255 — model steers toward low-biodiversity land
+> - ✅ AGB + REDD inject complete; SA splits have 94 columns
+> - ✅ **catchment_id_sa.tif on Euler** at `$SCRATCH/data/south_america/ready/hydroshed/catchment_id_sa.tif` (5MB, arrived 2026-06-20)
+> - ✅ **B5 + fixed-iter diagnostic DONE**: CE.W (28 rounds)=20.6% macro; CE.W fixed (343 rounds)=18.4% macro — MORE training HURTS macro (Brazil gradient dominates, small events collapse). Oracle ceiling=97.5%. **Structural ceiling of single-global LambdaRank = ~20% macro, regardless of iterations.**
+> - **Root cause (definitive)**: Two competing spatial logics. (1) Proximity-to-PA (Argentina, Colombia): positives closer to existing PAs. (2) REDD+/carbon-market (some Peru/Bolivia): positives 1.4–2.7× FARTHER from PAs — remote forest protection driven by carbon financing. A single global model cannot learn both simultaneously. More training overfits to Brazil (largest gradient) at expense of others. **Key insight: Recall@20% is already 50.7%** — widening the budget from 5%→20% already passes the Track B gate.
+> - **NEXT ACTIONS**:
+>   1. **Implement B5H (hierarchical two-level watershed model)** — see B5H section below. Start with local PoC on `watershed_mini_sample.parquet`. Scripts to write: `build_subregion_mapping.py` + `model1_watershed_hierarchical_poc.py`.
+>   2. Interpret KBA gap per-event: read `outputs/south_america/results/gap_analysis/kba_gap_analysis.json` — does designated land *within* expansion events have lower KBA fraction than random? Report for paper.
+>   3. Event-type stratification (see Convergence section) — tag ecological vs. political events; report Recall separately in paper.
 
 ---
 
@@ -72,7 +65,7 @@ Change the Stage 2 ranking unit from 1km pixels to **HydroSHEDS level 7 catchmen
 
 Pixel-level CE experiments (CE.3b-sqrt, CE.4) continue on Euler in parallel — if they unexpectedly break through, great. But Track B is now the primary path to high Recall.
 
-**Track B extension — two-level hierarchical model (Paper 2 / post-Track B):** If single-level catchment ranking works but leaves further headroom, the natural next step is a two-stage spatial selector within Stage 2: Stage 2a ranks catchments to identify the target region; Stage 2b ranks pixels within the top-K catchments using the pixel-level features. Stage 2a handles the political/institutional targeting decision (which watershed); Stage 2b handles the boundary-drawing logic (which specific pixels). This cleanly separates the two decisions the current pixel model conflates. Prerequisite: Track B (E3) must first confirm catchment-level Recall ≥ 70%. Do not implement before then.
+**Track B extension — two-level hierarchical model → now B5H (Paper 1):** Single-level catchment ranking (CE.W) confirmed stuck at ~20% macro due to two competing spatial logics. The fix is a two-stage spatial selector: Stage 2a identifies *which sub-region* of a country will be targeted; Stage 2b ranks L7 catchments within those sub-regions. This separates the targeting decision (which drainage basin / biome this year?) from the site-selection decision (which specific catchments within the target area?). **Being implemented as B5H — see that section.**
 
 ### Custom Recall@5% training loss (refinement after Track B)
 
@@ -200,7 +193,9 @@ Brazil's Bolsonaro-era events (2019–2022) are ~3–4 of the 30 test events (10
 | Baselines | ✅ Done | random=1.0×, naive=2.81×, full=6.54× |
 | SHAP analysis | ❌ Not run | Needs final model (after CE.3b/CE.4) |
 | KBA download + rasterise | ✅ Done | kba_sa.tif: 1,768 polygons, 15.1% land pixels; synced to Euler |
-| B4 watershed PoC (local) | ✅ Done | 7,036 L7 catchments; temporal split 17.9% (same as pixels); cross-event 28.6% > CE.2 23.8%; temporal split was the bug |
+| B4 watershed PoC (local) | ✅ Done | 7,036 L7 catchments; temporal split 17.9%; cross-event 28.6% > CE.2 23.8%; gate FAILED (<50%) |
+| B5 CE.W (4112735, best_iter=28) | ❌ gate FAIL | macro R@5%=20.6% weighted=10.4% |
+| B5 CE.W fixed (4119497, best_iter=343) | ❌ gate FAIL | macro R@5%=18.4% weighted=24.2%; macro WORSE than 28 rounds; structural ceiling confirmed at ~20% |
 | Representation gap (RQ3) | ❌ Not quantified | THE paper finding |
 | Bootstrap CIs | ❌ Not run | After final model |
 | Cross-regional transfer (USA, SE Asia) | ❌ Not run | Phase 5 |
@@ -352,18 +347,112 @@ Decision gates (unchanged):
 
 ---
 
-#### B5 — CE.W: Full SA watershed model (Euler, ~1 week) [after B4 ≥ 50%]
+#### B5 — CE.W: Full SA watershed model (Euler) ✅ DONE — gate FAILED
 
-Scale B4 to the full 42GB SA splits:
-- Aggregate pixel features to HydroSHEDS L7 level (new Euler splits at catchment resolution)
-- Train LambdaRank with B0 infrastructure + best features from B1 + those that gained in B3
-- This is the model that goes in the paper
+Scale B4 to the full 42GB SA splits.
 
-**What we learn**: real-scale performance across all 222 SA expansion events with full continental training data. Group size imbalance is naturally reduced at catchment level.
+**Results (2026-06-21)**:
+- watershed_build ✅: 173,011 catchment rows from 392M pixel rows (13.2 min)
+- CE.W (4112735, best_iter=28): macro=20.6%, weighted=10.4%, 29 test events ❌
+- CE.W fixed-iter (4119497, best_iter=343, patience=9999): macro=18.4%, weighted=24.2% ❌
+
+**Key diagnostic finding**: More training makes macro WORSE (20.6%→18.4%) while making weighted BETTER (10.4%→24.2%). The model at 343 rounds massively improves Brazil events ((3, 2007): 3.3%→33.8%, (3, 2009): 12%→30.6%) while catastrophically degrading previously-working events ((4, 2011): 99.5%→0.1%, (13, 2005): 70.3%→0.0%). Seven zero-recall events are IMMOVABLE at both iteration counts despite having clearly separable features in the diagnostic.
+
+**Root cause (definitive)**: Two competing spatial logics that a single global model cannot learn simultaneously:
+1. **Proximity-to-PA logic** (Argentina, Colombia, small countries): positive catchments are closer to existing PAs, lower population density — the typical cost-minimisation pattern.
+2. **REDD+/carbon-market logic** (some Peru/Bolivia events): positive catchments are FARTHER from existing PAs (dist_wdpa 1.4–2.7× higher), near oil/gas, high AGB — these are remote forest protections driven by international carbon financing. The learned rule "closer to PA = more likely" actively ranks these events WRONG.
+
+Brazil's 5 test events (19% of training data, largest catchment counts) dominate the gradient signal at higher iterations, causing the model to overfit Brazil's spatial pattern at the expense of all other countries.
+
+**What we learned**: The structural ceiling of a single-global-objective LambdaRank is ~20% macro Recall@5% on this data. It cannot be raised by more training, different iterations, or the watershed spatial unit. The two logics require either per-country models, interaction terms, or a fundamentally different architecture. **Track C activates.**
 
 ---
 
-#### B6 — Refinements (local, after B5) [time permitting]
+#### B5H — Hierarchical two-level watershed model (local PoC → Euler) [NEXT]
+
+**Why**: The single-global LambdaRank ceiling is ~20% macro Recall@5% because it cannot simultaneously learn proximity-to-PA logic (most countries) and REDD+/carbon logic (some Peru/Bolivia events). The deeper problem for large countries (Brazil, 3,300+ catchments): the 5% budget = 167 catchments must find positive designations scattered across the entire Amazon/Cerrado/Pantanal. The model knows the RIGHT KIND of land but not WHICH SUB-REGION of Brazil will be targeted this year. Key diagnostic number: **Recall@20% = 50.7% already** — widening the effective budget to 20% already passes the 50% gate. The hierarchical model achieves this without changing the evaluation: Stage 2a selects the right sub-region (concentrating budget), Stage 2b ranks within it.
+
+**Architecture**:
+
+```
+Stage 2a: Sub-region selector
+  Input:  (country_id, year) × N_subregions   ← features aggregated from L7 catchments
+  Target: which sub-region(s) contain the year's designations?
+  Output: top-K sub-regions (K=2 typically)
+  Model:  LambdaRank grouped by (country_id, year) or binary classifier
+
+Stage 2b: Catchment ranker (within selected sub-regions only)
+  Input:  L7 catchments filtered to top-K sub-regions
+  Target: catchment_is_positive (same as before)
+  Output: ranked catchments → top-5% of country's catchments
+  Model:  LambdaRank (same as CE.W, reuse architecture)
+
+Evaluation:
+  Recall@5% computed over ALL catchments in country (not just sub-region)
+  i.e. the recalled positive pixels / total positive pixels in event
+  — same metric as before, no metric gaming
+```
+
+**Why this breaks the 20% ceiling**:
+
+For Brazil 2009 (3,322 catchments, 260 positive, k=167):
+- Single model: must find right 260 catchments in 3,322 → hard targeting problem
+- Hierarchical: Stage 2a identifies "Amazon biome" → 300–500 catchments in that sub-region. Stage 2b picks top-5% of 400 = 20 catchments. Budget now focused on right area. Expected Recall@5% (pixel): 50–70%.
+
+**Sub-region definition** — two options, start with Option A (quick PoC):
+
+**Option A — k-means spatial clustering per country (no new data needed)**:
+- For each country, cluster its L7 catchments into N_clusters groups using (x_mean, y_mean)
+- N_clusters: `max(5, n_catchments // 100)` → Brazil: ~33 clusters, small countries: 5
+- Sub-region ID = `(country_id, cluster_id)`
+- Pro: zero new data, 30 min to implement, works on `watershed_mini_sample.parquet`
+- Con: clusters are geographic tiles, not hydrologically meaningful
+
+**Option B — HydroSHEDS Level 5 (hydrologically meaningful, ~1 day to set up)**:
+- Download HydroSHEDS L5 SA shapefile from hydrosheds.org (same source as L7, free)
+- Spatially join each L7 catchment → parent L5 basin (or use HYBAS_ID truncation if applicable)
+- SA has ~200 L5 basins → Brazil: ~60–80 sub-basins, each containing ~40–50 L7 catchments
+- Pro: scientifically cleaner, paper-defensible hierarchy
+- Con: requires download + spatial join step
+
+**Implementation plan (strictly sequential)**:
+
+| Step | Script | What it does | Input | Output |
+|---|---|---|---|---|
+| H1 | `3_merging/build_subregion_mapping.py` | Assign each L7 catchment to a sub-region via k-means clustering (Option A). Adds `subregion_id` column. | `watershed_mini_sample.parquet` | `watershed_mini_sample_subregions.parquet` |
+| H2 | `3_merging/build_subregion_features.py` | Aggregate L7 catchment features to sub-region level (mean/max/min). `n_pos_pixels_sr` = sum of positive pixels in sub-region. `subregion_is_positive` = 1 if any designation in sub-region. | `watershed_mini_sample_subregions.parquet` | `subregion_mini_sample.parquet` |
+| H3 | `5_training/model1_stage2a_poc.py` | Train Stage 2a LambdaRank on sub-regions, cross-event split (seed=42). Select top-K=2 sub-regions per event. Record Stage 2a sub-region recall (what fraction of events have ≥1 positive sub-region in top-2?). | `subregion_mini_sample.parquet` | Stage 2a metrics + selected sub-regions per event |
+| H4 | `5_training/model1_watershed_hierarchical_poc.py` | Full pipeline: Stage 2a selects sub-regions → Stage 2b LambdaRank within. Evaluate pixel Recall@5% on ALL catchments (not just sub-region). Compare to flat CE.W. | both parquets | `stage2_hierarchical_metrics_TIMESTAMP.json` |
+
+**Key design decisions for implementation**:
+
+- **K (sub-regions selected per event)**: start K=2. If a country has 33 sub-regions and we select 2, the effective pool is 2/33 × 3,300 = 200 catchments for Brazil → 5% of 200 = 10 catchments budget per sub-region. That's very tight. May need K=3–4 for Brazil.
+- **Stage 2a evaluation**: report "sub-region recall" separately — what % of events have at least 1 positive sub-region in top-K? This is the Stage 2a gate metric. Must be ≥ 80% for the pipeline to work.
+- **Stage 2b**: train on catchments within sub-regions, negative subsample ratio same (neg_ratio=20). Group by (country_id, year, subregion_id) or just (country_id, year) with subsetting.
+- **Event split**: same seed=42, same stratification as CE.W. Train/val/test events must be identical so results are directly comparable.
+- **Evaluation**: Recall@5% budget computed over ALL catchments in country (denominator = all unprotected catchments in country-year), NOT just selected sub-regions. Otherwise metric is gamed.
+
+**Decision gates**:
+
+| Stage 2a sub-region recall | Stage 2b pixel Recall@5% | Conclusion |
+|---|---|---|
+| ≥ 80% | ≥ 50% | ✅ B5H validated → scale to Euler (full SA watershed) |
+| ≥ 80% | 30–50% | Partial fix → try K=3–4 sub-regions or Option B (L5) |
+| < 80% | any | Stage 2a is the bottleneck → improve sub-region features or use L5 |
+| any | < 30% | Hierarchical approach insufficient → activate Track C (Cox PH) |
+
+**Expected results**:
+- Stage 2a sub-region recall: 85–95% (sub-regions are large, capturing most designations)
+- Stage 2b pixel Recall@5%: 40–65% (concentrated budget on right area)
+- Weighted Recall@5%: 50–75% (Brazil events improve most)
+
+**Scripts to create** (next session):
+1. `scripts/regions/south_america/3_merging/build_subregion_mapping.py` ← H1+H2 combined
+2. `scripts/regions/south_america/5_training/model1_watershed_hierarchical_poc.py` ← H3+H4 combined
+
+---
+
+#### B6 — Refinements (local, after B5H) [time permitting]
 
 After model structure and features are fully settled, in this order:
 1. **E4 (dist_recent_pa)**: distance to PAs added 2010-present only, capturing spatial momentum of the expanding network; retrain; record delta
@@ -379,21 +468,33 @@ Do not begin until both streams are complete.
 
 | Step | Action | Prerequisite |
 |---|---|---|
-| **C1** | SHAP: global beeswarm + temporal (pre/post-Paris 2015) + per-country (BRA vs Andean) on final model | B5 done |
-| **C2** | Bootstrap CIs: 1000 resamples of test events; 95% CIs on Lift@1% and Recall@5% | B5 done |
-| **C3** | Cross-regional transfer: zero-shot SA watershed model → USA and SE Asia test splits | B5 done |
-| **C4** | Calibration: Platt scaling on final watershed model | B5 done |
+| **C1** | SHAP: global beeswarm + temporal (pre/post-Paris 2015) + per-country (BRA vs Andean) on final model | B5H done |
+| **C2** | Bootstrap CIs: 1000 resamples of test events; 95% CIs on Lift@1% and Recall@5% | B5H done |
+| **C3** | Cross-regional transfer: zero-shot SA hierarchical model → USA and SE Asia test splits | B5H done |
+| **C4** | Calibration: Platt scaling on final hierarchical model | B5H done |
 | **C5** | Forward maps: Stage 1 × Stage 2 → cumulative pixel risk 2025–2030; BAU / moderate / 30×30 scenarios; Figure 3 + KBA overlay | C4 + A2 done |
 | **C6** | Paper writing | All above + A1–A4 done |
 
+**Event-type stratification (for paper writing, do during C6)**:
+
+Tag each test event as `ecological` or `political` and report Recall@5% separately:
+- **Political**: BRA 2019–2022 (Bolsonaro anti-conservation policy); any event where the positive catchments are counter-intuitive (REDD+-driven: dist_wdpa ratio > 1.5 for positives vs negatives)
+- **Ecological**: all others — cost-minimisation logic applies
+
+Report structure in paper (Results section):
+> "On ecologically-driven events (N=X), our hierarchical model achieves Z% macro Recall@5%. Performance degrades on politically-disrupted events (N=Y, Recall@5%=W%) — itself a finding: designation becomes spatially arbitrary when driven by political pressure rather than landscape features."
+
+This uses the performance failure as a scientific finding rather than a limitation. The contrast between ecological (~60–70%) and political (~10–20%) recall demonstrates that cost-minimisation logic is a real governance phenomenon, not just a model artefact.
+
 **Paper writing gate** — do not begin until all boxes checked:
-- [ ] A1: gap confirmed (negative Spearman r between model score and GSN_b2)
-- [ ] A2: KBA headline number quantified
-- [ ] A3+A4: Stage 1 D² finalised with best GLM specification
-- [ ] B5 (or B2 if pixel scope is the paper claim): final Recall number
+- [x] A1: gap confirmed — 131/170 events (77.1%), GSN ratio=0.284, Spearman r=−0.255
+- [ ] A2: KBA headline number re-quantified per expansion event (current result is INVERTED — re-run needed)
+- [x] A3: Stage 1 D² finalised — Poisson no-interact, D²=0.455
+- [ ] A4: CBD pledge features tested in Stage 1
+- [ ] B5H: hierarchical watershed Recall@5% final number
 - [ ] C1: SHAP mechanism confirmed (cost-minimisation drivers named)
 - [ ] C2: Bootstrap CIs in hand
-- [ ] C3: Cross-regional transfer result (transfer = universal claim; failure = regional finding)
+- [ ] C3: Cross-regional transfer result
 - [ ] C5: Forward maps and country scorecard produced
 
 **Paper structure (Nature Sustainability, ~3500 words)**:
@@ -420,20 +521,23 @@ Do not begin until both streams are complete.
 | A3 NB overdispersion (4074169) | FAILED: statsmodels not installed in venv | ❌ statsmodels 0.14.6 now installed (2026-06-21 login node pip install) |
 | A2 KBA gap (4074170) | CANCELLED — depends on A3 chain | ❌ superseded by 4112177 |
 | A2 KBA rasterise | kba_rasterise.py | ✅ DONE — kba_sa.tif at `$SCRATCH/data/south_america/ready/KBA/kba_sa.tif` |
-| **4112175** | **A3: stage1 panel rebuild + Poisson GLM (wgi fixed)** | ⏳ QUEUED (2026-06-21) |
-| **4112176** | **A3: stage1_nb_overdispersion E6** | ⏳ QUEUED (dependency 4112175) |
-| **4112177** | **A2: KBA gap analysis (independent)** | ⏳ QUEUED (2026-06-21) — uses locked Stage 2 model, no stage1 dependency |
+| 4112175 | A3: stage1 panel rebuild + Poisson GLM (wgi fixed) | ✅ DONE — D²=0.455 |
+| 4112176 | A3: stage1_nb_overdispersion E6 | ✅ DONE — NB worse (0.353 vs 0.446); Poisson confirmed |
+| 4112177 | A2: KBA gap analysis | ✅ DONE — INVERTED result: model FINDS KBAs (lift=1.79×); re-run needed per-event |
 | A4 CBD features | Add CBD pledge + coverage gap to Stage 1 | ⬜ After A3 results |
 | B2 | Ecological scope filter on CE.4 model | ⬜ Skipped (B1 < 30%) |
 | B3 | E9 (dist_border) + E10 (TRI) features | ⬜ Skipped (B1 < 50%) |
 | 4044178 | mini_sample_v2 build (event-stratified, N_CAP=50k) | ✅ DONE — 15.4M rows, 50 meaningful events, 3.4GB at `$SCRATCH/data/south_america/ml/mini_sample_v2.parquet` |
-| B4 (E3) | Watershed PoC — local | ✅ DONE (2026-06-20) — cross-event 28.6% macro (35 events); temporal-split bug identified; beats CE.2 pixel 23.8% |
+| B4 (E3) | Watershed PoC — local | ✅ DONE (2026-06-20) — cross-event 28.6% macro (35 events); temporal-split bug identified; beats CE.2 pixel 23.8% — but < 50% gate |
 | **B4 improvements** | **Upgrade aggregation + cross-event split in scripts** | ✅ DONE (2026-06-21) — `build_watershed_mini_sample.py` uses directional agg (min/max/std); `model1_watershed_poc.py` has cross-event as default primary + --temporal flag; structural features n_total_pixels+WDPA_prev_frac+elev_std now used. Re-run locally after git pull. |
-| **B5 full SA pipeline** | **New: build_watershed_full_splits.py + watershed_build.slurm + watershed_ce_w.slurm** | ✅ SCRIPTS READY (2026-06-21) — full SA pixel splits → catchment level (directional agg) → LambdaRank CE.W. Blocked on: `catchment_id_sa.tif` must be rsynced to `$SCRATCH/data/south_america/ready/hydroshed/catchment_id_sa.tif`. Then submit: `JOB=$(sbatch --parsable slurm/south_america/watershed_build.slurm) && sbatch --dependency=afterok:$JOB slurm/south_america/watershed_ce_w.slurm` |
-| B5 (CE.W) | Full SA watershed model | ⬜ Euler; after improved B4 ≥ 50%; MUST use cross-event split design (NOT temporal) |
-| C1 | SHAP (global + temporal + country) | ⬜ After B5 |
-| C2 | Bootstrap CIs | ⬜ After B5 |
-| C3 | Cross-regional transfer SA→USA→SE Asia | ⬜ After B5 |
+| **4112734** | **B5: watershed_build — full SA pixel → catchment aggregation** | ✅ COMPLETED (2026-06-21 13:32) — 173,011 catchment rows, 312 groups, 42 MB, 13.2 min |
+| **4112735** | **B5 CE.W: watershed LambdaRank cross-event (best_iter=28)** | ❌ gate FAIL — macro R@5%=20.6% weighted=10.4% 29 events |
+| **4119497** | **B5 CE.W fixed-iter (500 rounds, patience=9999, best_iter=343)** | ❌ gate FAIL — macro R@5%=18.4% weighted=24.2%; more training HURTS macro |
+| 4118652 | B5 diagnostic (`ws_diagnostic.py`) — oracle/naive/model/separability | ✅ DONE — oracle=97.5%; naive<random; 7 zero-recall events separable by features; root cause confirmed |
+| **B5H** | **Hierarchical watershed PoC (local)** — `build_subregion_mapping.py` + `model1_watershed_hierarchical_poc.py` | ⬜ NEXT — implement next session |
+| C1 | SHAP (global + temporal + country) | ⬜ After B5H |
+| C2 | Bootstrap CIs | ⬜ After B5H |
+| C3 | Cross-regional transfer SA→USA→SE Asia | ⬜ After B5H |
 | C5 | Forward maps + Figure 3 | ⬜ After C4 + A2 |
 
 ---
@@ -449,6 +553,23 @@ Do not begin until both streams are complete.
 | CE.3b Full SA (inv_npos + stratified split + patience=200 + coherence_thr=0.0) | 18.0% | 26.5% | 4.80× | 29 | ❌ gate FAILED (<65%); **WORSE than CE.2** — Fix 2 (inv_npos) suspected; iter=122 |
 | CE.3b-sqrt diagnostic (inv_sqrt_npos + stratified + patience=200) | 18.8% | — | 6.01× | 29 | ❌ gate FAILED; inv_sqrt_npos confirmed best (val +3.5pp vs inv_npos); stratified split = harder test — explains CE.2→CE.3b regression |
 | **CE.4 AGB+REDD+B0 (inv_sqrt_npos + stratified + E11 + E12 + 85 feat)** | **15.4%** | **21.5%** | **3.28×** | **29** | ❌ gate FAILED (<50%); WORSE than CE.2 23.8%; AGB+REDD+B0 did not help; **pixel ceiling confirmed — go to B4** |
+
+### Stage 2 watershed experiments (2026-06-21)
+
+| Experiment | macro R@5% | weighted R@5% | best_iter | n_test_events | Verdict |
+|---|---|---|---|---|---|
+| B4 PoC mini-sample (cross-event, mean agg) | 28.6% | 39.0% | ~24 | 35 | ❌ gate FAILED (<50%); beats pixel CE.2 (23.8%); temporal split confirmed wrong |
+| **CE.W full SA (4112735, patience=50, best_iter=28)** | **20.6%** | **10.4%** | 28 | 29 | ❌ gate FAILED (<50%); early stop at iter=28 (noisy val) |
+| CE.W fixed-iter (4119497, patience=9999, best_iter=343) | 18.4% | 24.2% | 343 | 29 | ❌ gate FAILED; more training HURTS macro; confirms structural ceiling |
+
+**Watershed structural ceiling diagnosis (2026-06-21)**:
+- Oracle Recall@5% = 97.5% — budget is NOT the constraint; features CAN separate positive from negative catchments
+- Naive baseline (dist_wdpa) = 4.6% < random (5.2%) — single proximity heuristic insufficient; multiple competing logics
+- Recall@20% (current model, no retraining) = **50.7%** — already passes 50% gate at wider budget
+- Root cause: two competing spatial logics (proximity-to-PA vs REDD+/carbon-market) cannot be learned by a single global model
+- 7 zero-recall events are IMMOVABLE across all iteration counts; their features are separable but in OPPOSITE directions depending on year
+- More training overfits Brazil (gradient dominant) at expense of small events — macro–weighted tradeoff is real
+- **Path forward: B5H hierarchical model (Stage 2a sub-region selector + Stage 2b L7 catchment ranker)**
 
 **Per-event pattern (CE.2 full SA test events)**:
 

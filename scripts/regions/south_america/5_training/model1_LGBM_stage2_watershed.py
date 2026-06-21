@@ -72,6 +72,7 @@ VAL_RATIO       = float(os.environ.get("WS_VAL_RATIO",       "0.10"))
 MIN_POS_PIXELS  = int(os.environ.get("WS_MIN_POS_PIXELS",    "200"))
 NEG_RATIO       = int(os.environ.get("WS_NEG_RATIO",         "20"))
 NUM_BOOST_ROUND = int(os.environ.get("WS_NUM_BOOST_ROUND",   "1000"))
+ES_PATIENCE     = int(os.environ.get("WS_ES_PATIENCE",       "50"))
 
 # Columns that are NOT features.
 # n_total_pixels and WDPA_prev_frac are intentionally allowed as features
@@ -433,7 +434,7 @@ def main() -> None:
     train_set = lgb.Dataset(X_tr, label=y_tr, group=g_tr, weight=sample_weights)
     val_set   = lgb.Dataset(X_val, label=y_val, group=g_val, reference=train_set)
 
-    es_cb = _WatershedEarlyStop(X_val, val_df_indexed, patience=50)
+    es_cb = _WatershedEarlyStop(X_val, val_df_indexed, patience=ES_PATIENCE)
 
     print(f"\nTraining LambdaRank (watershed, {len(y_tr):,} catchments, "
           f"{len(g_tr)} groups, {len(feature_cols)} features)...")
