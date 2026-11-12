@@ -102,6 +102,10 @@ from scripts.regions.shared.results.results_core import (  # noqa: E402
 warnings.filterwarnings("ignore", category=UserWarning)
 
 from scripts.regions.shared.training.utils import WandbRunLogger  # noqa: E402
+from scripts.regions.shared.forward.scenario_allocation import (  # noqa: E402
+    add_scenario_selections,
+    national_allocation_table,
+)
 
 # ── Map style constants ───────────────────────────────────────────────────────
 MAP_DPI      = 300
@@ -794,6 +798,21 @@ def _load_country_iso3_lookup(
         return None, None
 
 
+def _attach_iso3(df: pd.DataFrame) -> pd.DataFrame:
+    """Add an iso_a3 column from the country_iso3.tif raster (None outside the region's countries)."""
+    iso_grid, iso_map = _load_country_iso3_lookup(repo_root=get_repo_root(), data_subdir=DATA_SUBDIR)
+    if iso_grid is None:
+        raise FileNotFoundError("country_iso3.tif and its mapping are required to allocate scenarios by country.")
+    row_arr = df["row"].values.astype(np.int64)
+    col_arr = df["col"].values.astype(np.int64)
+    h, w = iso_grid.shape
+    valid = (row_arr >= 0) & (row_arr < h) & (col_arr >= 0) & (col_arr < w)
+    ids = np.full(len(df), -1, dtype=np.int64)
+    ids[valid] = iso_grid[row_arr[valid], col_arr[valid]]
+    df["iso_a3"] = pd.Series(ids).map(iso_map).values
+    return df
+
+
 def resolve_backbone_path_for_plot(
     repo_root: Path, data_subdir: str, baseline: Dict[str, Any],
 ) -> Optional[Path]:
@@ -1025,58 +1044,6 @@ def _lonlat_bounds_to_proj_bounds(
 
 
 # ── Scenario thresholds ───────────────────────────────────────────────────────
-
-def compute_scenario_cutoffs(
-    df: pd.DataFrame,
-    km2_needed_moderate: float,
-    moderate_target_pct: float,
-    km2_needed_30: float,
-    bau_km2: Optional[float] = None,
-) -> Tuple[float, float, float, str]:
-    """Compute BAU / moderate / 30x30 probability cutoffs.
-
-    Returns (bau_cutoff, moderate_cutoff, full_30x30_cutoff) as probability
-    thresholds such that cumulative area of top-ranked pixels equals target.
-
-    BAU target: historical 5-year designation volume (bau_km2 from coverage baseline,
-      i.e. new km² protected 2019→2024). Falls back to top-0.5% proxy if not available.
-    Moderate target: midpoint between current coverage and 30% (region-adaptive).
-    """
-    print("\nComputing scenario cutoffs…")
-    df_sorted = df.sort_values(PROBA_COL, ascending=False).reset_index(drop=True)
-    cum_area = df_sorted["area_km2"].cumsum().values
-
-    def _cutoff(km2_target: float, label: str) -> float:
-        if km2_target <= 0:
-            print(f"  {label}: target already met (km2_needed={km2_target:.0f})")
-            return 1.0  # return max threshold (nothing to add)
-        idx = np.searchsorted(cum_area, km2_target, side="left")
-        idx = min(idx, len(df_sorted) - 1)
-        cutoff = float(df_sorted[PROBA_COL].iloc[idx])
-        n_pixels = idx + 1
-        actual_km2 = float(cum_area[idx])
-        print(f"  {label}: target {km2_target:,.0f} km² → "
-              f"top {n_pixels:,} pixels ({actual_km2:,.0f} km²), cutoff p={cutoff:.6f}")
-        return cutoff
-
-    # BAU: use historical 5-year designation volume (2019→2024) if available;
-    # otherwise fall back to top 0.5% of unprotected pixels as a proxy.
-    if bau_km2 is not None and bau_km2 > 0:
-        bau_cutoff = _cutoff(bau_km2, "BAU (historical 2019→2024 volume)")
-        bau_subtitle = f"Historical 2019→2024 designation volume ({bau_km2:,.0f} km²)"
-    else:
-        n_bau = max(1, int(len(df_sorted) * 0.005))
-        bau_cutoff = float(df_sorted[PROBA_COL].iloc[n_bau - 1])
-        bau_km2_actual = float(cum_area[n_bau - 1])
-        print(f"  BAU (top 0.5% proxy — WDPA_2019 not available): "
-              f"{n_bau:,} pixels ({bau_km2_actual:,.0f} km²), cutoff p={bau_cutoff:.6f}")
-        bau_subtitle = f"Top 0.5% highest-risk pixels (proxy — WDPA 2019 unavailable)"
-
-    moderate_cutoff = _cutoff(km2_needed_moderate, f"Moderate (→{moderate_target_pct:.1%})")
-    full_cutoff     = _cutoff(km2_needed_30,       "30x30 Full    (→30%)")
-
-    return bau_cutoff, moderate_cutoff, full_cutoff, bau_subtitle
-
 
 # ── Map: probability ──────────────────────────────────────────────────────────
 
@@ -1362,9 +1329,6 @@ def _create_scenario_map(
 def create_scenario_maps(
     df: pd.DataFrame,
     baseline: Dict,
-    bau_cutoff: float,
-    moderate_cutoff: float,
-    full_cutoff: float,
     output_dir: Path,
     repo_root: Path,
     region_label: str,
@@ -1379,7 +1343,6 @@ def create_scenario_maps(
 
     x_m = df["x"].values.astype(np.float64)
     y_m = df["y"].values.astype(np.float64)
-    proba = df[PROBA_COL].values
     area  = df["area_km2"].values
     total_km2 = baseline.get("total_land_km2") or baseline.get("total_sa_km2", 1.0)
     protected_2024_km2 = baseline["protected_2024_km2"]
@@ -1389,9 +1352,9 @@ def create_scenario_maps(
     # BAU selects top-~1% of pixels (sparse) → dilation helps dots show in print.
     # Moderate and 30×30 select many more pixels → no dilation (avoids solid blobs).
     scenarios = [
-        (proba >= bau_cutoff,      "bau",     SCENARIO_COLORS["bau"],     "risk_map_bau",       _BAU_DILATION_RADIUS),
-        (proba >= moderate_cutoff, "moderate", SCENARIO_COLORS["moderate"], "scenario_moderate", 0),
-        (proba >= full_cutoff,     "30x30",    SCENARIO_COLORS["30x30"],    "scenario_30x30",    0),
+        (df["bau_sel"].values,      "bau",     SCENARIO_COLORS["bau"],     "risk_map_bau",       _BAU_DILATION_RADIUS),
+        (df["moderate_sel"].values, "moderate", SCENARIO_COLORS["moderate"], "scenario_moderate", 0),
+        (df["full_sel"].values,     "30x30",    SCENARIO_COLORS["30x30"],    "scenario_30x30",    0),
     ]
 
     for mask, key, color, stem, dil_r in scenarios:
@@ -1422,8 +1385,6 @@ def create_scenario_maps(
 def create_country_breakdown(
     df: pd.DataFrame,
     baseline: Dict,
-    bau_cutoff: float,
-    full_cutoff: float,
     output_dir: Path,
     world_gdf: Optional[Any],
     iso_codes: List[str],
@@ -1459,8 +1420,8 @@ def create_country_breakdown(
                     "name": iso3,  # will be overwritten by baseline lookup if available
                     "area_km2": area,
                     "proba": proba,
-                    "bau_sel":  (proba >= bau_cutoff).astype(np.int8),
-                    "full_sel": (proba >= full_cutoff).astype(np.int8),
+                    "bau_sel":  df["bau_sel"].values.astype(np.int8),
+                    "full_sel": df["full_sel"].values.astype(np.int8),
                 }
             )
             joined = joined[joined["iso_a3"].isin(iso_codes)].copy()
@@ -1491,8 +1452,8 @@ def create_country_breakdown(
                 {
                     "area_km2": area,
                     "proba": proba,
-                    "bau_sel":  (proba >= bau_cutoff).astype(np.int8),
-                    "full_sel": (proba >= full_cutoff).astype(np.int8),
+                    "bau_sel":  df["bau_sel"].values.astype(np.int8),
+                    "full_sel": df["full_sel"].values.astype(np.int8),
                 },
                 geometry=gpd.points_from_xy(lon, lat),
                 crs="EPSG:4326",
@@ -1606,8 +1567,6 @@ def create_country_breakdown(
 
 def create_biome_breakdown(
     df: pd.DataFrame,
-    bau_cutoff: float,
-    full_cutoff: float,
     gsn_path: Optional[Path],
     output_dir: Path,
 ) -> pd.DataFrame:
@@ -1636,8 +1595,6 @@ def create_biome_breakdown(
 
         df2 = df.copy()
         df2["biome"]    = biome_arr
-        df2["bau_sel"]  = (df2[PROBA_COL] >= bau_cutoff).astype(int)
-        df2["full_sel"] = (df2[PROBA_COL] >= full_cutoff).astype(int)
 
         biome_rows = []
         for biome_id, grp in df2.groupby("biome"):
@@ -1667,8 +1624,6 @@ def create_biome_breakdown(
 
 def create_gap_analysis(
     df: pd.DataFrame,
-    bau_cutoff: float,
-    full_cutoff: float,
     output_dir: Path,
     baseline: Dict[str, Any],
     repo_root: Path,
@@ -1687,13 +1642,12 @@ def create_gap_analysis(
     if not has_gsn:
         print(f"  NOTE: '{GSN_BIODIVERSITY_COL}' column not found — using placeholder.")
 
-    proba = df[PROBA_COL].values
     area  = df["area_km2"].values
     xm = df["x"].values.astype(np.float64)
     ym = df["y"].values.astype(np.float64)
 
-    bau_mask  = proba >= bau_cutoff
-    full_mask = proba >= full_cutoff
+    bau_mask  = df["bau_sel"].values
+    full_mask = df["full_sel"].values
 
     if has_gsn:
         gsn_mask         = df[GSN_BIODIVERSITY_COL].values.astype(bool)
@@ -1908,8 +1862,6 @@ def _plot_exposure_barchart(
 def create_economic_exposure(
     df: pd.DataFrame,
     forward_dir: Path,
-    bau_cutoff: float,
-    full_cutoff: float,
     output_dir: Path,
     baseline: Dict[str, Any],
     repo_root: Path,
@@ -1968,7 +1920,7 @@ def create_economic_exposure(
     print(f"  Loading features: {load_cols} …")
     feat_df = pq.read_table(feat_path, columns=["row", "col"] + load_cols).to_pandas()
     coord_cols = [c for c in ["x", "y"] if c in df.columns]
-    merged = df[["row", "col", PROBA_COL, "area_km2"] + coord_cols].merge(
+    merged = df[["row", "col", PROBA_COL, "area_km2", "bau_sel"] + coord_cols].merge(
         feat_df, on=["row", "col"], how="left"
     )
     del feat_df
@@ -1976,7 +1928,7 @@ def create_economic_exposure(
     # ── Define zones ─────────────────────────────────────────────────────────
     top5_mask = merged[PROBA_COL] >= float(np.percentile(merged[PROBA_COL], 95))
     top1_mask = merged[PROBA_COL] >= float(np.percentile(merged[PROBA_COL], 99))
-    bau_mask  = merged[PROBA_COL] >= bau_cutoff
+    bau_mask  = merged["bau_sel"].values
 
     # p99 threshold value for headline number
     top1_threshold = float(np.percentile(merged[PROBA_COL], 99))
@@ -2448,7 +2400,6 @@ def _add_country_borders_to_ax(ax: Any, world_3857: Any, zoom_bounds: Tuple, zor
 def create_hotspot_maps(
     df: pd.DataFrame,
     hotspot_regions: List[Tuple],
-    bau_cutoff: float,
     output_dir: Path,
     baseline: Dict[str, Any],
     repo_root: Path,
@@ -2486,7 +2437,7 @@ def create_hotspot_maps(
     lon_all, lat_all = epsg3857_to_lonlat(xm_all, ym_all)
     proba = df[PROBA_COL].values.astype(np.float64)
     norm_p = _forward_norm_params(proba)
-    bau_mask = proba >= bau_cutoff
+    bau_mask = df["bau_sel"].values
 
     backbone_path = resolve_backbone_path_for_plot(repo_root, DATA_SUBDIR, baseline)
     world_3857 = _load_country_borders_3857(repo_root)
@@ -2715,8 +2666,6 @@ def create_forecast_confidence_summary(model_output_dir: Path) -> Dict[str, Any]
 
 def create_conservation_alignment_map(
     df: pd.DataFrame,
-    bau_cutoff: float,
-    full_cutoff: float,
     output_dir: Path,
     baseline: Dict[str, Any],
     repo_root: Path,
@@ -2724,8 +2673,6 @@ def create_conservation_alignment_map(
     """Create a single-map 'Conservation Alignment' visualisation (biodiversity)."""
     return _create_alignment_map(
         df=df,
-        bau_cutoff=bau_cutoff,
-        full_cutoff=full_cutoff,
         output_dir=output_dir,
         baseline=baseline,
         repo_root=repo_root,
@@ -2739,8 +2686,6 @@ def create_conservation_alignment_map(
 
 def create_climate_alignment_map(
     df: pd.DataFrame,
-    bau_cutoff: float,
-    full_cutoff: float,
     output_dir: Path,
     baseline: Dict[str, Any],
     repo_root: Path,
@@ -2748,8 +2693,6 @@ def create_climate_alignment_map(
     """Create a single-map 'Climate Alignment' visualisation (climate stabilisation areas)."""
     return _create_alignment_map(
         df=df,
-        bau_cutoff=bau_cutoff,
-        full_cutoff=full_cutoff,
         output_dir=output_dir,
         baseline=baseline,
         repo_root=repo_root,
@@ -2763,8 +2706,6 @@ def create_climate_alignment_map(
 
 def _create_alignment_map(
     df: pd.DataFrame,
-    bau_cutoff: float,
-    full_cutoff: float,
     output_dir: Path,
     baseline: Dict[str, Any],
     repo_root: Path,
@@ -2783,13 +2724,12 @@ def _create_alignment_map(
         print(f"  NOTE: '{priority_col}' not available — skipping alignment map")
         return {}
 
-    proba   = df[PROBA_COL].values
     area    = df["area_km2"].values
     xm      = df["x"].values.astype(np.float64)
     ym      = df["y"].values.astype(np.float64)
     priority = df[priority_col].values.astype(bool)
-    bau     = proba >= bau_cutoff
-    full    = proba >= full_cutoff
+    bau     = df["bau_sel"].values
+    full    = df["full_sel"].values
 
     # Alignment categories (30x30 scenario for maximum impact)
     sweet_spot   =  full & priority          # designated AND priority
@@ -2943,7 +2883,6 @@ def save_alignment_summary(
 
 def create_country_conservation_alignment(
     df: pd.DataFrame,
-    full_cutoff: float,
     output_dir: Path,
     world_gdf,
     iso_codes: List[str],
@@ -2963,10 +2902,9 @@ def create_country_conservation_alignment(
         print(f"  NOTE: '{GSN_BIODIVERSITY_COL}' not available — skipping country alignment")
         return pd.DataFrame()
 
-    proba = df[PROBA_COL].values
     area  = df["area_km2"].values
     gsn   = df[GSN_BIODIVERSITY_COL].values.astype(bool)
-    full  = proba >= full_cutoff
+    full  = df["full_sel"].values
 
     # Prefer raster-based ISO3 assignment (policy preprocessing output).
     iso_grid, iso_map = _load_country_iso3_lookup(repo_root=get_repo_root(), data_subdir=DATA_SUBDIR)
@@ -3252,18 +3190,22 @@ def main() -> None:
     print(f"  Baseline protected 2024 km²:   {baseline['protected_2024_km2']:,.0f}")
     print(f"  Baseline coverage 2024:        {baseline['coverage_pct_2024']:.2%}")
 
-    # ── Scenario cutoffs ──────────────────────────────────────────────────────
-    # Use adaptive moderate target (midpoint current→30%) from baseline.
-    # Fall back to the legacy 25% key if re-running against an old baseline JSON.
-    km2_moderate = baseline.get("km2_needed_for_moderate") or baseline.get("km2_needed_for_25pct", 0.0)
-    moderate_pct = baseline.get("moderate_target_pct", 0.25)
-    bau_cutoff, moderate_cutoff, full_cutoff, _bau_subtitle = compute_scenario_cutoffs(
-        df,
-        km2_moderate,
-        moderate_pct,
-        baseline["km2_needed_for_30pct"],
-        bau_km2=baseline.get("bau_km2"),
-    )
+    # ── Scenario selections ───────────────────────────────────────────────────
+    # Each allocation mode writes to its own subdirectory so both can coexist.
+    allocation = os.environ.get("PA3030_FORWARD_ALLOCATION", "national_quota").strip().lower()
+    cluster_boxes_dir = model_output_dir
+    model_output_dir = model_output_dir / allocation
+    model_output_dir.mkdir(parents=True, exist_ok=True)
+    if allocation == "national_quota":
+        df = _attach_iso3(df)
+    df = add_scenario_selections(df, baseline, allocation, PROBA_COL)
+    for key in ("bau", "moderate", "full"):
+        sel = df[f"{key}_sel"].values
+        print(f"  {allocation} {key}: {int(sel.sum()):,} pixels, {df.loc[sel, 'area_km2'].sum():,.0f} km²")
+    if allocation == "national_quota":
+        allocation_path = model_output_dir / "national_allocation.csv"
+        national_allocation_table(df, baseline).to_csv(allocation_path, index=False, encoding="utf-8-sig")
+        print(f"  Saved: {allocation_path}")
 
     # ── Maps ──────────────────────────────────────────────────────────────────
     create_probability_map(
@@ -3271,7 +3213,7 @@ def main() -> None:
     )
 
     scenario_info = create_scenario_maps(
-        df, baseline, bau_cutoff, moderate_cutoff, full_cutoff,
+        df, baseline,
         model_output_dir, repo_root, REGION_LABEL,
     )
     wb.log({"results/stage": "scenario_maps_done"})
@@ -3288,23 +3230,23 @@ def main() -> None:
 
     # ── Breakdowns ────────────────────────────────────────────────────────────
     country_df = create_country_breakdown(
-        df, baseline, bau_cutoff, full_cutoff,
+        df, baseline,
         model_output_dir, world_gdf, ISO_CODES,
     )
     biome_df = create_biome_breakdown(
-        df, bau_cutoff, full_cutoff, gsn_path, model_output_dir
+        df, gsn_path, model_output_dir
     )
     wb.log({"results/stage": "breakdowns_done"})
 
     # ── Gap analysis ──────────────────────────────────────────────────────────
     gap_metrics = create_gap_analysis(
-        df, bau_cutoff, full_cutoff, model_output_dir, baseline, repo_root,
+        df, model_output_dir, baseline, repo_root,
     )
     wb.log({"results/stage": "gap_analysis_done"})
 
     # ── Economic exposure ─────────────────────────────────────────────────────
     create_economic_exposure(
-        df, features_forward_dir, bau_cutoff, full_cutoff,
+        df, features_forward_dir,
         model_output_dir, baseline, repo_root,
     )
     wb.log({"results/stage": "economic_exposure_done"})
@@ -3319,7 +3261,7 @@ def main() -> None:
     # ── Hotspot zoom-ins ──────────────────────────────────────────────────────
     # Prefer cluster-derived bounding boxes (from clustering_analysis.py) if available.
     # Fall back to hardcoded HOTSPOT_REGIONS from config.
-    _cluster_boxes_path = model_output_dir / "cluster_hotspot_boxes.json"
+    _cluster_boxes_path = cluster_boxes_dir / "cluster_hotspot_boxes.json"
     _hotspot_regions_to_use = HOTSPOT_REGIONS
     if _cluster_boxes_path.exists():
         try:
@@ -3336,7 +3278,7 @@ def main() -> None:
         except Exception as _e:
             print(f"  WARNING: could not load cluster boxes: {_e} — using config hotspot regions")
     create_hotspot_maps(
-        df, _hotspot_regions_to_use, bau_cutoff,
+        df, _hotspot_regions_to_use,
         model_output_dir, baseline, repo_root, REGION_LABEL,
         max_regions=HOTSPOT_MAX_REGIONS,
         region_indices=HOTSPOT_REGION_INDICES,
@@ -3348,10 +3290,10 @@ def main() -> None:
 
     # ── Conservation / climate alignment maps & country scores ───────────────
     biodiversity_alignment_metrics = create_conservation_alignment_map(
-        df, bau_cutoff, full_cutoff, model_output_dir, baseline, repo_root,
+        df, model_output_dir, baseline, repo_root,
     )
     climate_alignment_metrics = create_climate_alignment_map(
-        df, bau_cutoff, full_cutoff, model_output_dir, baseline, repo_root,
+        df, model_output_dir, baseline, repo_root,
     )
     alignment_metrics = {
         "biodiversity": biodiversity_alignment_metrics,
@@ -3359,7 +3301,7 @@ def main() -> None:
     }
     save_alignment_summary(alignment_metrics, model_output_dir)
     country_alignment_df = create_country_conservation_alignment(
-        df, full_cutoff, model_output_dir, world_gdf, ISO_CODES, baseline,
+        df, model_output_dir, world_gdf, ISO_CODES, baseline,
     )
 
     # ── Summary JSON ──────────────────────────────────────────────────────────
@@ -3375,9 +3317,7 @@ def main() -> None:
         "results/coverage_pct_2024":       baseline.get("coverage_pct_2024"),
         "results/protected_2024_km2":      baseline.get("protected_2024_km2"),
         "results/km2_needed_for_30pct":    baseline.get("km2_needed_for_30pct"),
-        "results/bau_cutoff":              float(bau_cutoff),
-        "results/moderate_cutoff":         float(moderate_cutoff),
-        "results/full_cutoff":             float(full_cutoff),
+        "results/allocation":              allocation,
     }
     if isinstance(scenario_info, dict):
         for _sc, _sv in scenario_info.items():
