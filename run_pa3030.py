@@ -44,6 +44,8 @@ def run_stage(p, region, stage, model_type, allocation=None):
         os.environ['PA3030_ML_MODELS_DIR'] = os.path.join(p.ml_models_root, region, 'ml', 'models')
     if allocation:
         os.environ['PA3030_FORWARD_ALLOCATION'] = allocation
+    else:
+        os.environ.pop('PA3030_FORWARD_ALLOCATION', None)
     run_region_forward(region, stage=stage, model_type=model_type)
 
 
