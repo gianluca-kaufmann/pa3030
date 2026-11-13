@@ -73,7 +73,29 @@ conservation gaps and opportunities, Nature Communications 15:9007 (2024).
 - 14 land factors (`list_variables_terrestrial.csv`).
   - Environment: altitude, distance to ocean, island, precipitation, freshwater, NDVI, temperature.
   - Socioeconomic: local GDP, human footprint, conflict, HDI, NGO, accessibility, natural resources.
-- Sources, versions and reference years are in the paper's Supplementary Data 1, which is not in the package. Each `allowed_cutoff` stays open until that file is read.
+- Source: Supplementary Data 1, `41467_2024_53241_MOESM4_ESM.xlsx` (15,248 bytes, Springer static content, downloaded 2026-11-13 to `~/Files/PA/mouillot_pelagic_v1.0/supplementary/`).
+- Release dates for the freshwater and island sources were checked from Zenodo and Crossref metadata. Every other row repeats the sheet's period and database, and their release dates are not yet verified.
+
+| Factor | Database (as listed) | Reference period | Scale | Observable by April 2020? |
+|---|---|---|---|---|
+| Altitude | GEBCO-2019 grid | 2019 | 15 arc s | Yes, static |
+| Distance to ocean | GADM 3.6 | — | polygons | Yes, static |
+| Island | Mouillot et al. 2020 island database | — | polygons | Release 7 Sep 2020 (Crossref) is after the cutoff. Island status is physical, so content is unchanged |
+| Mean temperature | WorldClim 2 | 1970–2000 | 30 arc s | Yes |
+| Precipitation | WorldClim 2 | 1970–2000 | 30 arc s | Yes |
+| Freshwater | Copernicus Global Land Service land cover 100 m, collection 3, epoch 2015 (zenodo 3939038, V3.0.1) | 2015 | 100 m | **No.** V3.0.1 was published 8 Sep 2020 (Zenodo). It describes 2015, but this release postdates the cutoff |
+| NDVI | Copernicus Global Land Service long-term NDVI statistics | 1999–2017 | ~1 km | Yes by period, release unverified |
+| Local GDP | Kummu et al. (dryad dk1j0) | 2010–2015 | 5 arc min | Yes by period, release unverified |
+| Human footprint | SEDAC 2009 Human Footprint, 2018 release | 2009 | ~1 km | Yes |
+| Accessibility | Malaria Atlas Project travel time to cities | 2015 | ~1 km | Yes by period, release unverified |
+| Conflict | UCDP/PRIO Armed Conflict Dataset v19.1 (sum of conflict years) | 1946–2018 | country | Yes by period, release unverified |
+| HDI | UNDP Human Development Report 2019 | 2018 | country | Yes by period, release unverified |
+| NGO | Union of International Associations, count per country | 2019 | country | Yes by period, release unverified |
+| Natural resources | World Bank (no source link in the sheet) | 2019 | country | Yes by period, release unverified |
+
+- **April 2020 cutoff.** Every reference period ends by 2019. One input release postdates the cutoff: freshwater (V3.0.1, Sep 2020). The island database is also a later release, but island status does not change. So the frozen score is prospective for April 2020 except for the freshwater layer. Freshwater ranks 13th of 14 in mean permutation importance (0.029). The T1 protocol still needs a sensitivity run with freshwater dropped or replaced by a pre-2020 release.
+- **Earlier cutoffs (T2 rolling backtests).** HDI (2018), NGO (2019), natural resources (2019), conflict (to 2018), GEBCO 2019 and NDVI (to 2017) are fixed at their latest years. Any cutoff before 2018 would use later values, so backtests need re-dated versions of these factors. The frozen score cannot serve them.
+- **Country-level factors.** Conflict, HDI, NGO and natural resources take one value per country. In the stored permutation importances (`importance_permutation_terrestrial.Rdata`, mean over 10 folds), HDI ranks 1st (0.130), NGO 5th (0.101), natural resources 7th (0.100) and conflict 8th (0.094) of 14. Country-level values repeated across cells are not local evidence, so held-out-country tests carry the forecasting claim.
 
 ## R0 verdict
 
@@ -82,7 +104,7 @@ conservation gaps and opportunities, Nature Communications 15:9007 (2024).
 
 ## Open items before T1
 
-1. Get Supplementary Data 1 and record source, version and reference year for each of the 14 factors.
+1. Done 2026-11-13: predictor dates recorded (see Predictor dates). Still open: release dates for the rows marked unverified.
 2. Done 2026-11-13: the stored scores are not in-sample (see the in-sample check). Still open: which model and split produced each of the two scores. Ask the authors (Casajus or Loiseau, listed in `DESCRIPTION`) if this matters for the protocol.
 3. Count the unprotected 10 km land cells in April 2020 on the GADM 3.6 grid, to get the sampling fraction.
 4. Build the post-2020 event ledger from archived WDPA releases (April 2020 onward), separating new designations from late reporting, renaming and boundary changes.
