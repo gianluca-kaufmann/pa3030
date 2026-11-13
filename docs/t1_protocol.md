@@ -27,12 +27,19 @@ Did the 2020 social-environmental niche of strict protected areas (Mouillot et a
 ## Populations
 
 - Sample population: the stored background cells, which the paper defines as cells outside IUCN I to VI protection in April 2020.
-- Expansion population: the sample population minus cells overlapped at the cutoff by a qualifying protected area of any IUCN status (Designated, Inscribed or Established, PA_DEF 1). This removes about 8.6% of the sample (agreement check, release `202004`). The primary analysis uses the expansion population. The sample population is reported as a sensitivity analysis.
+- Expansion population: the sample population minus cells overlapped at the cutoff by a qualifying protected area of any IUCN status (Designated, Inscribed or Established, PA_DEF 1). This removed about 8.6% of the sample on raw release `202004`. The share is recomputed on the reconstructed baseline before scoring. The primary analysis uses the expansion population. The sample population is reported as a sensitivity analysis.
 - Exclusion counts by reason and by country are reported, along with how the excluded cells change the population.
 
 ## Cutoff, window and observation
 
-- Cutoff: April 2020, the paper's snapshot date. OPEN: the release that stands for it. Release `202003` recovers 196 of 198 cells that `202004` misses, but the 1,802 cells that matched on `202004` have not been rechecked on `202003`. That check and a per-country completeness check of `201907` to `202005` come first.
+- Cutoff: April 2020, the paper's snapshot date. The stored protection flags match April 2020 content: 186 Colombian protected cells are covered only by sites first present in Colombia's April 2020 update.
+- Cutoff baseline: a reconstructed April 2020 release, because the Earth Engine copies of WDPA omit whole countries in single releases. Sources by country:
+  - Russia from `202003` (absent from `202004` to `202006`, identical IDs and attributes on return in `202007`);
+  - Colombia, Ecuador and Mozambique from `202005` (truncated in `202004`. The May 2020 release notes report no change for them, `202005` and `202006` are identical for them, and no substituted record has STATUS_YR after 2019);
+  - every other country from `202004`, plus the 2 sites absent only from `202004`.
+- The reconstruction totals 227,326 polygons against the official April 2020 total of 227,321, and matches the stored category in 1,998 of 2,000 sampled protected cells. Unverified: identity with the official file, boundaries (compared by GIS_AREA only), Russia's April content, the 5 extra polygons, and whether May 2020 rather than April matches the stored flags.
+- The Earth Engine asset `202003` holds February 2020 content and does not stand for March.
+- No post-cutoff record enters the baseline as new protection. The `202005` substitutions supply only sites that the official April release reported.
 - Designation window: legal designation in calendar years 2021 to 2024.
 - Observation date: OPEN, at least 18 months after the window ends. The latest available release (`202611`) gives 23 months.
 - The first release in which a site appears is recorded separately from its legal designation year (STATUS_YR).
@@ -41,6 +48,7 @@ Did the 2020 social-environmental niche of strict protected areas (Mouillot et a
 
 - Built from historical releases with their own geometries. The current-only extraction (`scripts/regions/world/fetch_wdpa_global.py`) cannot serve as the event dataset unchanged.
 - Each release is checked for completeness by country. A country-release with failed or missing chunks is marked incomplete, never treated as complete.
+- Every release used is screened at site-ID level: a WDPA_PID absent from one release but present in the releases before and after marks that country-release as a transient omission. Count thresholds are not used, since they missed omissions of 3,157 German and 933 Swedish sites in `202003`.
 - Each candidate site is followed across releases by WDPAID, WDPA_PID, name, STATUS, STATUS_YR, IUCN_CAT and geometry. ID changes, multipart sites, reappearances, removals and degazettement are reconciled.
 - The union of earlier releases is used to detect prior records and omissions. It does not automatically count as protection at the cutoff.
 - Every candidate gets one class:
@@ -97,7 +105,8 @@ All baselines use only information available at the cutoff.
 6. The 10 largest events removed.
 7. Countries with any incomplete release in the window removed.
 8. Designation window 2021 to 2023.
-9. Freshwater dropped, by refitting the strict model on the stored training sample. This is a separate refitted benchmark and never replaces the frozen score.
+9. Russia, Colombia, Ecuador and Mozambique, the countries whose cutoff content is reconstructed, removed from the expansion population and the distance baseline.
+10. Freshwater dropped, by refitting the strict model on the stored training sample. This is a separate refitted benchmark and never replaces the frozen score.
 
 ## Interpretation
 
