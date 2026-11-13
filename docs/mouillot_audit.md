@@ -45,7 +45,7 @@ conservation gaps and opportunities, Nature Communications 15:9007 (2024).
 - So the 258,725 background cells are a uniform random sample of land cells unprotected in April 2020. A post-2020 designation test on them keeps the true event rate in expectation.
 - Caveats:
   - **Strict model only.** The stored score is the IUCN-I model. A test of the all-category model needs a refit from the stored training data, which is no longer the authors' exact model.
-  - **In-sample scores ruled out (check below).** The background cells were training negatives, but neither stored score behaves like an in-sample prediction.
+  - **Provenance unresolved (check below).** The background cells were training negatives. Neither stored score matches the in-sample predictions of the refit, but the check cannot say whether the authors' scores are in-sample or held-out.
   - **The two stored scores disagree.** `corr.rf.response` is not a monotone transform of `PredictedProtection` (different AUCs, Spearman 0.745 on background cells). The published maps use `corr.rf.response`, so it is the primary benchmark and `PredictedProtection` the sensitivity check. Which model and split produced each score is unresolved.
   - **Sampling fraction unknown.** The package does not give the total number of unprotected land cells, so it does not give the share the sample represents.
   - **No WDPA snapshot.** The April 2020 WDPA snapshot itself is not included, only each cell's protected flag and IUCN category.
@@ -66,7 +66,9 @@ conservation gaps and opportunities, Nature Communications 15:9007 (2024).
   - `corr.rf.response` vs refit: 0.853 (in-sample), 0.837 (out-of-bag).
   - `PredictedProtection` vs refit: 0.655 (in-sample), 0.637 (out-of-bag).
 - Both stored scores separate the classes worse than random out-of-bag predictions. In-sample predictions reach 0.999.
-- Interpretation, not proof: the stored scores look like held-out predictions. Held-out cells from 1,000 km spatial blocks would score below random out-of-bag predictions. What would overturn this: a stored score that equals in-sample predictions of a weaker forest (fewer or shallower trees). The package records no forest settings that could settle it.
+- Interpretation, not proof: the stored scores are consistent with held-out predictions, since cells held out in 1,000 km spatial blocks would score below random out-of-bag predictions. The check does not establish this. A less flexible forest (larger minimum node size, smaller `mtry`, fewer or shallower trees) predicted in-sample could also score below 0.98, and the package records no forest settings.
+- What would settle it: the authors' score-generation code, fold membership or out-of-bag records, or the authors' description of how each stored score was produced.
+- A post-April 2020 designation test is held out in time whatever the spatial split, because no post-2020 outcome entered the fit. If the scores were fitted on the background cells, every one of them was a training negative, which can lower their scores and change their ranking. The T1 protocol must state which case applies, or that it is unknown.
 
 ## Predictor dates
 
@@ -105,7 +107,7 @@ conservation gaps and opportunities, Nature Communications 15:9007 (2024).
 ## Open items before T1
 
 1. Done 2026-11-13: predictor dates recorded (see Predictor dates). Still open: release dates for the rows marked unverified.
-2. Done 2026-11-13: the stored scores are not in-sample (see the in-sample check). Still open: which model and split produced each of the two scores. Ask the authors (Casajus or Loiseau, listed in `DESCRIPTION`) if this matters for the protocol.
+2. Partly done 2026-11-13: neither stored score matches the in-sample predictions of the refit (see the in-sample check). Still open: which model and split produced each of the two scores. This needs the authors' code, fold records or a description from the authors (Casajus or Loiseau, listed in `DESCRIPTION`).
 3. Count the unprotected 10 km land cells in April 2020 on the GADM 3.6 grid, to get the sampling fraction.
 4. Build the post-2020 event ledger from archived WDPA releases (April 2020 onward), separating new designations from late reporting, renaming and boundary changes.
 5. Write the T1 protocol (cutoff, horizon, event definition, metric, baselines, go/no-go) before scoring any designation.
