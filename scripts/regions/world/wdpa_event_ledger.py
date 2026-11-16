@@ -7,7 +7,8 @@ geometries.
 2. Site-ID screen: a WDPA_PID absent from a run of releases but present before and after is a
    transient omission of those releases. Counts per country and release go to completeness.csv.
 3. Cutoff baseline: BASE_RELEASE, with each PATCH country taken from its patch release and the
-   transient omissions of BASE_RELEASE taken from the next release that holds them.
+   sites missing from BASE_RELEASE alone (present in the releases just before and after) taken
+   from the next release. Longer gaps are left out, so no later record enters the baseline.
 4. Ledger: every qualifying record present after the cutoff and absent from the baseline, plus
    baseline sites whose IUCN category or area changed, each in one of the protocol's five classes.
    Baseline sites missing from the observation release go to removals.csv.
@@ -191,10 +192,8 @@ def main():
 
     base_j = releases.index(BASE_RELEASE)
     base_attrs = release_attributes(BASE_RELEASE, countries)[0]
-    fill_pids = {}
-    for pid in pids[gaps[:, base_j] & ~np.isin(site_iso3, list(PATCH))]:
-        release = releases[base_j + 1 + int(np.argmax(presence[pid_codes[pid], base_j + 1:]))]
-        fill_pids.setdefault(release, []).append(pid)
+    only_base_missing = ~presence[:, base_j] & presence[:, base_j - 1] & presence[:, base_j + 1]
+    fill_pids = {releases[base_j + 1]: list(pids[only_base_missing & ~np.isin(site_iso3, list(PATCH))])}
     parts = [base_attrs[~base_attrs.ISO3.isin(list(PATCH))]]
     for iso3, release in PATCH.items():
         attrs = release_attributes(release, countries)[0]
