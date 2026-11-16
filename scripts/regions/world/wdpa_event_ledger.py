@@ -13,7 +13,7 @@ geometries.
    baseline sites whose IUCN category or area changed, each in one of the protocol's five classes.
    Baseline sites missing from the observation release go to removals.csv.
 5. Geometries of the ledger's polygon records, from the release in which each first appears
-   (changed baseline sites: the last release that holds them), simplified to SIMPLIFY_M, with the
+   as a qualifying polygon (changed baseline sites: the last release that holds them), simplified to SIMPLIFY_M, with the
    share of each covered by baseline protection.
 
 Release attributes are cached per release. Outputs go to DATA_DIR/wdpa_event_ledger.
@@ -136,14 +136,23 @@ def baseline_collection(countries, fill_pids):
     return fc
 
 
-def read_geometries(fc, pid_field, pids, baseline):
-    """Simplified geometry and baseline-overlap share of each listed site."""
+def read_geometries(fc, pid_field, pids, baseline, max_error=SIMPLIFY_M):
+    """Simplified geometry and baseline-overlap share of each listed site. A request over Earth Engine's
+    memory limit is halved, and a single site over it is computed at ten times the error margin."""
     def with_overlap(f):
-        geom = f.geometry().simplify(SIMPLIFY_M)
-        covered = baseline.filterBounds(geom).geometry().dissolve(SIMPLIFY_M)
-        share = geom.intersection(covered, SIMPLIFY_M).area(SIMPLIFY_M).divide(geom.area(SIMPLIFY_M))
-        return ee.Feature(geom, {"WDPA_PID": f.get(pid_field), "baseline_overlap": share})
-    return fc.filter(ee.Filter.inList(pid_field, pids)).map(with_overlap).getInfo()["features"]
+        geom = f.geometry().simplify(max_error)
+        covered = baseline.filterBounds(geom).geometry().dissolve(max_error)
+        share = geom.intersection(covered, max_error).area(max_error).divide(geom.area(max_error))
+        return ee.Feature(geom, {"WDPA_PID": f.get(pid_field), "baseline_overlap": share, "max_error_m": max_error})
+    try:
+        return fc.filter(ee.Filter.inList(pid_field, pids)).map(with_overlap).getInfo()["features"]
+    except ee.EEException as error:
+        if "memory limit" not in str(error) or max_error > SIMPLIFY_M:
+            raise
+        if len(pids) == 1:
+            return read_geometries(fc, pid_field, pids, baseline, 10 * SIMPLIFY_M)
+        half = len(pids) // 2
+        return read_geometries(fc, pid_field, pids[:half], baseline) + read_geometries(fc, pid_field, pids[half:], baseline)
 
 
 def main():
@@ -207,17 +216,18 @@ def main():
 
     base_qualifying = baseline[baseline.STATUS.isin(QUALIFYING)].drop_duplicates("WDPA_PID")
     after = list(range(base_j + 1, len(releases)))
-    latest, first_seen = {}, {}
+    latest, first_seen, first_polygon = {}, {}, {}
     for j in after[::-1]:
         attrs = release_attributes(releases[j], countries)[0]
         q = attrs[attrs.STATUS.isin(QUALIFYING)]
         latest.update({p: (releases[j], r) for p, r in zip(q.WDPA_PID, q.itertuples(index=False)) if p not in latest})
         first_seen.update(dict.fromkeys(attrs.WDPA_PID, releases[j]))
+        first_polygon.update(dict.fromkeys(q.WDPA_PID[q.kind == "polygons"], releases[j]))
     last = pd.DataFrame([r._asdict() | {"last_release": rel} for rel, r in latest.values()])
     last["first_release"] = last.WDPA_PID.map(first_seen)
     last["present_at_observation"] = last.last_release == releases[-1]
 
-    new = last[~last.WDPA_PID.isin(base_qualifying.WDPA_PID)].assign(change="new", geometry_release=lambda d: d.first_release)
+    new = last[~last.WDPA_PID.isin(base_qualifying.WDPA_PID)].assign(change="new", geometry_release=lambda d: d.WDPA_PID.map(first_polygon))
     new["prior_record"] = new.WDPA_PID.isin(qualifying_before["WDPA_PID"]) | new.WDPAID.isin(qualifying_before["WDPAID"])
     new["baseline_site"] = new.WDPAID.isin(base_qualifying.WDPAID)
     old = last.merge(base_qualifying[["WDPA_PID", "IUCN_CAT", "AREA"]], on="WDPA_PID", suffixes=("", "_baseline"))
