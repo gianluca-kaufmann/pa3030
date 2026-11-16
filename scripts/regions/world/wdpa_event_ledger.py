@@ -76,7 +76,7 @@ def release_attributes(release, countries):
     cache = CACHE_DIR / ("_".join(countries) if countries else "all")
     attrs_path, counts_path = cache / f"attrs_{release}.parquet", cache / f"counts_{release}.csv"
     if attrs_path.exists():
-        return pd.read_parquet(attrs_path), pd.read_csv(counts_path, keep_default_na=False)
+        return pd.read_parquet(attrs_path), pd.read_csv(counts_path, keep_default_na=False, dtype={"release": str})
     names = {f for kind in ["polygons", "points"] for f in source_fields(release, kind)[2:]}
     fill = ee.Dictionary({f: NULL_FILL.get(f, "") for f in names})
     frames, counts = [], []
