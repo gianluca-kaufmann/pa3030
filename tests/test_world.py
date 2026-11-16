@@ -8,6 +8,7 @@ from scripts.regions.world.leakage_guard import (
     assert_no_forbidden_columns,
 )
 from scripts.regions.world.vif_prune import iterative_prune
+from scripts.regions.world.wdpa_event_ledger import classify, transient_gaps
 
 
 def test_country_year_tables_are_tracked_inputs():
@@ -36,3 +37,21 @@ def test_vif_prune_drops_a_collinear_column():
     vifs, dropped = iterative_prune(X, threshold=10)
     assert len(dropped) == 1 and dropped[0][0] in {"a", "a_copy"}
     assert "b" in vifs
+
+
+def test_transient_gaps_need_presence_on_both_sides():
+    presence = np.array([[1, 0, 0, 1], [1, 1, 0, 0], [0, 0, 1, 1]], bool)
+    assert transient_gaps(presence).tolist() == [[False, True, True, False], [False] * 4, [False] * 4]
+
+
+def test_ledger_classes_follow_the_protocol():
+    rows = pd.DataFrame({
+        "STATUS_YR": [2022, 2022, 2022, 2022, 2020, 2015, 2025, 0, 2015],
+        "change": ["new"] * 8 + ["category_change"],
+        "prior_record": [False, True, False, False, False, False, False, False, True],
+        "baseline_site": [False, False, True, False, False, False, False, False, True],
+        "kind": ["polygons"] * 3 + ["points"] + ["polygons"] * 5,
+    })
+    out = classify(rows)
+    assert out.event_class.tolist() == [1, 4, 4, 5, 3, 2, 5, 5, 4]
+    assert out.reason.tolist()[-2:] == ["no_status_year", "category_change"]

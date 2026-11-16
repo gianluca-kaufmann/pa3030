@@ -1,0 +1,257 @@
+"""Event ledger for the T1 test (docs/t1_protocol.md): protected-area records that are new after the
+April 2020 cutoff, read from the archived Earth Engine WDPA releases with their own attributes and
+geometries.
+
+1. Site attributes of every release from FIRST_RELEASE to the observation release, polygons and
+   points, checked per country against the release's own ISO3 counts.
+2. Site-ID screen: a WDPA_PID absent from a run of releases but present before and after is a
+   transient omission of those releases. Counts per country and release go to completeness.csv.
+3. Cutoff baseline: BASE_RELEASE, with each PATCH country taken from its patch release and the
+   transient omissions of BASE_RELEASE taken from the next release that holds them.
+4. Ledger: every qualifying record present after the cutoff and absent from the baseline, plus
+   baseline sites whose IUCN category or area changed, each in one of the protocol's five classes.
+   Baseline sites missing from the observation release go to removals.csv.
+5. Geometries of the ledger's polygon records, from the release in which each first appears
+   (changed baseline sites: the last release that holds them), simplified to SIMPLIFY_M, with the
+   share of each covered by baseline protection.
+
+Release attributes are cached per release. Outputs go to DATA_DIR/wdpa_event_ledger.
+
+Usage:
+    python -m scripts.regions.world.wdpa_event_ledger --project <ee project> --observation 202611
+        [--countries CHE,COL]
+"""
+import argparse
+
+import ee
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+from shapely.geometry import shape
+
+from scripts.regions.world import paths
+
+FIRST_RELEASE = "201707"
+BASE_RELEASE = "202004"
+PATCH = {"RUS": "202003", "COL": "202005", "ECU": "202005", "MOZ": "202005"}
+CUTOFF_YEAR = 2020
+WINDOW = (2021, 2024)
+QUALIFYING = ["Designated", "Inscribed", "Established"]
+AREA_TOLERANCE = 0.01
+SIMPLIFY_M = 100
+
+FIELDS = ["WDPAID", "WDPA_PID", "ISO3", "NAME", "STATUS", "STATUS_YR", "IUCN_CAT", "DESIG_TYPE", "PA_DEF", "MARINE", "AREA"]
+NULL_FILL = {"STATUS_YR": 0, "GIS_AREA": -1, "REP_AREA": -1}
+NEW_SCHEMA_FROM = "202512"
+NEW_NAMES = {"WDPAID": "SITE_ID", "WDPA_PID": "SITE_PID", "PA_DEF": "SITE_TYPE", "MARINE": "REALM"}
+NEW_CODES = {"PA_DEF": {"PA": "1", "OECM": "0"}, "MARINE": {"Terrestrial": "0", "Coastal": "1", "Marine": "2"}}
+
+CACHE_DIR = paths.DATA_DIR / "wdpa_releases"
+OUT_DIR = paths.DATA_DIR / "wdpa_event_ledger"
+
+
+def source_fields(release, kind):
+    names = [NEW_NAMES.get(f, f) if release >= NEW_SCHEMA_FROM else f for f in FIELDS]
+    return [("GIS_AREA" if kind == "polygons" else "REP_AREA") if f == "AREA" else f for f in names]
+
+
+def collection(release, kind, countries):
+    fc = ee.FeatureCollection(f"WCMC/WDPA/{release}/{kind}")
+    return fc.filter(ee.Filter.inList("ISO3", countries)) if countries else fc
+
+
+def list_releases(observation):
+    """Monthly releases from FIRST_RELEASE to `observation` that hold a polygon layer."""
+    assets = ee.data.listAssets({"parent": "projects/earthengine-public/assets/WCMC/WDPA"})["assets"]
+    releases = sorted(a["id"].split("/")[-1] for a in assets if a["id"].split("/")[-1].isdigit())
+    releases = [r for r in releases if FIRST_RELEASE <= r <= observation]
+    return [r for r in releases if ee.data.getInfo(f"WCMC/WDPA/{r}/polygons") is not None]
+
+
+def release_attributes(release, countries):
+    """Attributes of one release in the old-schema names, and per-country row counts against the
+    release's ISO3 histogram. Cached."""
+    cache = CACHE_DIR / ("_".join(countries) if countries else "all")
+    attrs_path, counts_path = cache / f"attrs_{release}.parquet", cache / f"counts_{release}.csv"
+    if attrs_path.exists():
+        return pd.read_parquet(attrs_path), pd.read_csv(counts_path, keep_default_na=False)
+    names = {f for kind in ["polygons", "points"] for f in source_fields(release, kind)[2:]}
+    fill = ee.Dictionary({f: NULL_FILL.get(f, "") for f in names})
+    frames, counts = [], []
+    for kind in ["polygons", "points"]:
+        fc = collection(release, kind, countries)
+        fields = source_fields(release, kind)
+        # reduceColumns drops a row with any null field, so rows with nulls are read with NULL_FILL in their place.
+        complete = ee.Filter.notNull(fields)
+        filled = fc.filter(complete.Not()).map(lambda f: f.set(fill.combine(f.toDictionary(), True)))
+        rows = [r for part in [fc.filter(complete), filled]
+                for r in part.reduceColumns(ee.Reducer.toList(len(fields)), fields).get("list").getInfo()]
+        df = pd.DataFrame(rows, columns=FIELDS).assign(kind=kind)
+        if release >= NEW_SCHEMA_FROM:
+            df = df.replace(NEW_CODES)
+        frames.append(df)
+        expected = pd.Series(fc.aggregate_histogram("ISO3").getInfo(), name="n_expected")
+        counts.append(pd.concat([expected, df.ISO3.value_counts().rename("n_pulled")], axis=1)
+                      .fillna(0).astype(int).rename_axis("ISO3").reset_index().assign(kind=kind))
+    attrs = pd.concat(frames, ignore_index=True).astype({"WDPAID": "int64", "WDPA_PID": str, "STATUS_YR": "int64", "AREA": float})
+    attrs[["PA_DEF", "MARINE"]] = attrs[["PA_DEF", "MARINE"]].astype(str)
+    attrs["AREA"] = attrs.AREA.mask(attrs.AREA < 0)
+    counts = pd.concat(counts, ignore_index=True).assign(release=release)
+    cache.mkdir(parents=True, exist_ok=True)
+    attrs.to_parquet(attrs_path, index=False)
+    counts.to_csv(counts_path, index=False, encoding="utf-8-sig")
+    return attrs, counts
+
+
+def transient_gaps(presence):
+    """True where a site is absent but present in an earlier and a later release (columns ordered by release)."""
+    before = np.maximum.accumulate(presence, axis=1)
+    after = np.maximum.accumulate(presence[:, ::-1], axis=1)[:, ::-1]
+    return ~presence & before & after
+
+
+def classify(ledger):
+    """Protocol class and reason for each ledger row (see docs/t1_protocol.md, Event ledger)."""
+    yr = ledger.STATUS_YR
+    conditions = [ledger.change != "new", ledger.prior_record, ledger.baseline_site, ledger.kind == "points",
+                  yr.between(*WINDOW), yr == CUTOFF_YEAR, (yr > 0) & (yr < CUTOFF_YEAR), yr > WINDOW[1]]
+    classes = [4, 4, 4, 5, 1, 3, 2, 5]
+    reasons = [ledger.change, "prior_record", "new_parcel_of_baseline_site", "point_without_boundary",
+               "designated_in_window", "status_year_2020", "designated_before_cutoff", "designated_after_window"]
+    return ledger.assign(event_class=np.select(conditions, classes, default=5),
+                         reason=np.select(conditions, reasons, default="no_status_year"))
+
+
+def baseline_collection(countries, fill_pids):
+    """The cutoff baseline's qualifying polygons as an Earth Engine collection."""
+    def qualifying(release):
+        return collection(release, "polygons", countries).filter(ee.Filter.inList("STATUS", QUALIFYING))
+    fc = qualifying(BASE_RELEASE).filter(ee.Filter.inList("ISO3", list(PATCH)).Not())
+    for iso3, release in PATCH.items():
+        fc = fc.merge(qualifying(release).filter(ee.Filter.eq("ISO3", iso3)))
+    for release, pids in fill_pids.items():
+        fc = fc.merge(qualifying(release).filter(ee.Filter.inList("WDPA_PID", pids)))
+    return fc
+
+
+def read_geometries(fc, pid_field, pids, baseline):
+    """Simplified geometry and baseline-overlap share of each listed site."""
+    def with_overlap(f):
+        geom = f.geometry().simplify(SIMPLIFY_M)
+        covered = baseline.filterBounds(geom).geometry().dissolve(SIMPLIFY_M)
+        share = geom.intersection(covered, SIMPLIFY_M).area(SIMPLIFY_M).divide(geom.area(SIMPLIFY_M))
+        return ee.Feature(geom, {"WDPA_PID": f.get(pid_field), "baseline_overlap": share})
+    return fc.filter(ee.Filter.inList(pid_field, pids)).map(with_overlap).getInfo()["features"]
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--project", required=True, help="Earth Engine Cloud project id")
+    parser.add_argument("--observation", required=True, help="observation release, YYYYMM")
+    parser.add_argument("--countries", default=None, help="comma-separated ISO3 codes, for a test run")
+    parser.add_argument("--chunk", type=int, default=200, help="sites per geometry request")
+    args = parser.parse_args()
+    ee.Initialize(project=args.project)
+    countries = args.countries.split(",") if args.countries else None
+    out_dir = OUT_DIR / ("_".join(countries) if countries else "all")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    releases = list_releases(args.observation)
+    print(f"{len(releases)} releases with polygons, {releases[0]} to {releases[-1]}", flush=True)
+    pid_codes, pid_iso3, present, counts = {}, {}, [], []
+    qualifying_before = {"WDPA_PID": set(), "WDPAID": set()}
+    for release in releases:
+        attrs, release_counts = release_attributes(release, countries)
+        counts.append(release_counts)
+        present.append(np.array([pid_codes.setdefault(p, len(pid_codes)) for p in attrs.WDPA_PID.unique()]))
+        pid_iso3.update(zip(attrs.WDPA_PID, attrs.ISO3))
+        if release <= BASE_RELEASE:
+            q = attrs[attrs.STATUS.isin(QUALIFYING)]
+            qualifying_before["WDPA_PID"].update(q.WDPA_PID)
+            qualifying_before["WDPAID"].update(q.WDPAID)
+        print(release, len(attrs), flush=True)
+
+    pids = np.array(list(pid_codes))
+    presence = np.zeros((len(pids), len(releases)), bool)
+    for j, codes in enumerate(present):
+        presence[codes, j] = True
+    gaps = transient_gaps(presence)
+    site_iso3 = np.array([pid_iso3[p] for p in pids])
+    dropped = np.hstack([np.zeros((len(pids), 1), bool), ~presence[:, 1:] & presence[:, :-1]])
+    screen = pd.concat([pd.DataFrame({"n_transient": pd.Series(site_iso3[gaps[:, j]]).value_counts(),
+                                      "n_dropped": pd.Series(site_iso3[dropped[:, j]]).value_counts()}).assign(release=r)
+                        for j, r in enumerate(releases)]).fillna(0).astype({"n_transient": int, "n_dropped": int})
+    screen = screen.rename_axis("ISO3").reset_index()
+    completeness = pd.concat(counts).pivot_table(index=["release", "ISO3"], columns="kind", values=["n_expected", "n_pulled"], fill_value=0)
+    completeness.columns = [f"{a}_{b}" for a, b in completeness.columns]
+    completeness = completeness.reset_index().merge(screen, on=["release", "ISO3"], how="outer").fillna(0)
+    completeness.to_csv(out_dir / "completeness.csv", index=False, encoding="utf-8-sig")
+
+    base_j = releases.index(BASE_RELEASE)
+    base_attrs = release_attributes(BASE_RELEASE, countries)[0]
+    fill_pids = {}
+    for pid in pids[gaps[:, base_j] & ~np.isin(site_iso3, list(PATCH))]:
+        release = releases[base_j + 1 + int(np.argmax(presence[pid_codes[pid], base_j + 1:]))]
+        fill_pids.setdefault(release, []).append(pid)
+    parts = [base_attrs[~base_attrs.ISO3.isin(list(PATCH))]]
+    for iso3, release in PATCH.items():
+        attrs = release_attributes(release, countries)[0]
+        parts.append(attrs[attrs.ISO3 == iso3])
+    for release, fill in fill_pids.items():
+        attrs = release_attributes(release, countries)[0]
+        parts.append(attrs[attrs.WDPA_PID.isin(fill)])
+    baseline = pd.concat(parts, ignore_index=True)
+    baseline.to_parquet(out_dir / "cutoff_baseline.parquet", index=False)
+    print(f"baseline: {len(baseline)} records, {(baseline.kind == 'polygons').sum()} polygons", flush=True)
+
+    base_qualifying = baseline[baseline.STATUS.isin(QUALIFYING)].drop_duplicates("WDPA_PID")
+    after = list(range(base_j + 1, len(releases)))
+    latest, first_seen = {}, {}
+    for j in after[::-1]:
+        attrs = release_attributes(releases[j], countries)[0]
+        q = attrs[attrs.STATUS.isin(QUALIFYING)]
+        latest.update({p: (releases[j], r) for p, r in zip(q.WDPA_PID, q.itertuples(index=False)) if p not in latest})
+        first_seen.update(dict.fromkeys(attrs.WDPA_PID, releases[j]))
+    last = pd.DataFrame([r._asdict() | {"last_release": rel} for rel, r in latest.values()])
+    last["first_release"] = last.WDPA_PID.map(first_seen)
+    last["present_at_observation"] = last.last_release == releases[-1]
+
+    new = last[~last.WDPA_PID.isin(base_qualifying.WDPA_PID)].assign(change="new", geometry_release=lambda d: d.first_release)
+    new["prior_record"] = new.WDPA_PID.isin(qualifying_before["WDPA_PID"]) | new.WDPAID.isin(qualifying_before["WDPAID"])
+    new["baseline_site"] = new.WDPAID.isin(base_qualifying.WDPAID)
+    old = last.merge(base_qualifying[["WDPA_PID", "IUCN_CAT", "AREA"]], on="WDPA_PID", suffixes=("", "_baseline"))
+    old["change"] = np.select([old.IUCN_CAT != old.IUCN_CAT_baseline, old.AREA > old.AREA_baseline * (1 + AREA_TOLERANCE)],
+                              ["category_change", "area_increase"], default="")
+    old = old[old.change != ""].assign(prior_record=True, baseline_site=True, geometry_release=lambda d: d.last_release)
+    ledger = classify(pd.concat([new, old], ignore_index=True))
+    ledger.to_parquet(out_dir / "ledger.parquet", index=False)
+    print(ledger.groupby(["event_class", "reason"]).size().to_string(), flush=True)
+
+    obs = release_attributes(releases[-1], countries)[0]
+    removals = base_qualifying[~base_qualifying.WDPA_PID.isin(obs.WDPA_PID)].assign(
+        last_release=lambda d: d.WDPA_PID.map(lambda p: releases[int(np.flatnonzero(presence[pid_codes[p]])[-1])]))
+    removals.to_csv(out_dir / "removals.csv", index=False, encoding="utf-8-sig")
+
+    base_fc = baseline_collection(countries, fill_pids)
+    frames = []
+    for release, group in ledger[ledger.kind == "polygons"].groupby("geometry_release"):
+        cache = out_dir / f"geometries_{release}.parquet"
+        if not cache.exists():
+            fc = collection(release, "polygons", countries)
+            pid_field = source_fields(release, "polygons")[1]
+            todo = sorted(group.WDPA_PID.unique())
+            features = [f for lo in range(0, len(todo), args.chunk)
+                        for f in read_geometries(fc, pid_field, todo[lo:lo + args.chunk], base_fc)]
+            gpd.GeoDataFrame([f["properties"] for f in features], geometry=[shape(f["geometry"]) for f in features],
+                             crs="EPSG:4326").to_parquet(cache)
+            print(release, len(features), "of", len(todo), "geometries", flush=True)
+        frames.append(gpd.read_parquet(cache).assign(geometry_release=release))
+    geometries = pd.concat(frames, ignore_index=True)
+    events = gpd.GeoDataFrame(ledger.merge(geometries, on=["WDPA_PID", "geometry_release"], how="inner"), crs="EPSG:4326")
+    missing = ledger[(ledger.kind == "polygons") & ~ledger.WDPA_PID.isin(events.WDPA_PID)]
+    print(f"{len(events)} polygon events with geometry, {len(missing)} without", flush=True)
+    events.to_file(out_dir / "events.gpkg", driver="GPKG")
+
+
+if __name__ == "__main__":
+    main()

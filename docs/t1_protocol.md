@@ -46,7 +46,7 @@ Did the 2020 social-environmental niche of strict protected areas (Mouillot et a
 
 ## Event ledger
 
-- Built from historical releases with their own geometries. The current-only extraction (`scripts/regions/world/fetch_wdpa_global.py`) cannot serve as the event dataset unchanged.
+- Built from historical releases with their own geometries by `scripts/regions/world/wdpa_event_ledger.py`. The current-only extraction (`scripts/regions/world/fetch_wdpa_global.py`) cannot serve as the event dataset unchanged.
 - Each release is checked for completeness by country. A country-release with failed or missing chunks is marked incomplete, never treated as complete.
 - Every release used is screened at site-ID level: a WDPA_PID absent from one release but present in the releases before and after marks that country-release as a transient omission. Count thresholds are not used, since they missed omissions of 3,157 German and 933 Swedish sites in `202003`.
 - Each candidate site is followed across releases by WDPAID, WDPA_PID, name, STATUS, STATUS_YR, IUCN_CAT and geometry. ID changes, multipart sites, reappearances, removals and degazettement are reconciled.
