@@ -39,6 +39,7 @@ WINDOW = (2021, 2024)
 QUALIFYING = ["Designated", "Inscribed", "Established"]
 AREA_TOLERANCE = 0.01
 SIMPLIFY_M = 100
+REQUEST_DEADLINE_MS = 600_000
 
 FIELDS = ["WDPAID", "WDPA_PID", "ISO3", "NAME", "STATUS", "STATUS_YR", "IUCN_CAT", "DESIG_TYPE", "PA_DEF", "MARINE", "AREA"]
 NULL_FILL = {"STATUS_YR": 0, "GIS_AREA": -1, "REP_AREA": -1}
@@ -152,6 +153,7 @@ def main():
     parser.add_argument("--chunk", type=int, default=200, help="sites per geometry request")
     args = parser.parse_args()
     ee.Initialize(project=args.project)
+    ee.data.setDeadline(REQUEST_DEADLINE_MS)
     countries = args.countries.split(",") if args.countries else None
     out_dir = OUT_DIR / ("_".join(countries) if countries else "all")
     out_dir.mkdir(parents=True, exist_ok=True)
