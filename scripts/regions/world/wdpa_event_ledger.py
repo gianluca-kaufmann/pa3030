@@ -12,11 +12,12 @@ geometries.
 4. Ledger: every qualifying record present after the cutoff and absent from the baseline, plus
    baseline sites whose IUCN category or area changed, each in one of the protocol's five classes.
    Baseline sites missing from the observation release go to removals.csv.
-5. Geometries of the ledger's polygon records, from the release in which each first appears
-   as a qualifying polygon (changed baseline sites: the last release that holds them), simplified to SIMPLIFY_M, with the
-   share of each covered by baseline protection.
+5. Geometries (sites of 1 km2 or more simplified to SIMPLIFY_M): the baseline's qualifying polygons from their source
+   release, and each ledger polygon from the first release that holds it as a qualifying polygon
+   (changed baseline sites: the last release that holds them). For each ledger polygon, the share
+   of its area covered by baseline polygons, computed in Mollweide.
 
-Release attributes are cached per release. Outputs go to DATA_DIR/wdpa_event_ledger.
+Release attributes and geometries are cached per release. Outputs go to DATA_DIR/wdpa_event_ledger.
 
 Usage:
     python -m scripts.regions.world.wdpa_event_ledger --project <ee project> --observation 202611
@@ -28,6 +29,7 @@ import ee
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import shapely
 from shapely.geometry import shape
 
 from scripts.regions.world import paths
@@ -40,6 +42,8 @@ WINDOW = (2021, 2024)
 QUALIFYING = ["Designated", "Inscribed", "Established"]
 AREA_TOLERANCE = 0.01
 SIMPLIFY_M = 100
+SIMPLIFY_MIN_M2 = 1_000_000
+EQUAL_AREA_CRS = "ESRI:54009"
 REQUEST_DEADLINE_MS = 600_000
 
 FIELDS = ["WDPAID", "WDPA_PID", "ISO3", "NAME", "STATUS", "STATUS_YR", "IUCN_CAT", "DESIG_TYPE", "PA_DEF", "MARINE", "AREA"]
@@ -124,35 +128,30 @@ def classify(ledger):
                          reason=np.select(conditions, reasons, default="no_status_year"))
 
 
-def baseline_collection(countries, fill_pids):
-    """The cutoff baseline's qualifying polygons as an Earth Engine collection."""
-    def qualifying(release):
-        return collection(release, "polygons", countries).filter(ee.Filter.inList("STATUS", QUALIFYING))
-    fc = qualifying(BASE_RELEASE).filter(ee.Filter.inList("ISO3", list(PATCH)).Not())
-    for iso3, release in PATCH.items():
-        fc = fc.merge(qualifying(release).filter(ee.Filter.eq("ISO3", iso3)))
-    for release, pids in fill_pids.items():
-        fc = fc.merge(qualifying(release).filter(ee.Filter.inList("WDPA_PID", pids)))
-    return fc
+def read_geometries(release, pids, chunk):
+    """Geometries of the listed sites in one release. Sites of SIMPLIFY_MIN_M2 or more are simplified to
+    SIMPLIFY_M, smaller ones are kept as they are, since simplifying would collapse them."""
+    pid_field = source_fields(release, "polygons")[1]
+    fc = ee.FeatureCollection(f"WCMC/WDPA/{release}/polygons")
+
+    def simplified(f):
+        geom = ee.Geometry(ee.Algorithms.If(f.geometry().area(1).lt(SIMPLIFY_MIN_M2), f.geometry(), f.geometry().simplify(SIMPLIFY_M)))
+        return ee.Feature(geom, {"WDPA_PID": f.get(pid_field)})
+    features = []
+    for lo in range(0, len(pids), chunk):
+        features += fc.filter(ee.Filter.inList(pid_field, pids[lo:lo + chunk])).map(simplified).getInfo()["features"]
+    return gpd.GeoDataFrame({"WDPA_PID": [f["properties"]["WDPA_PID"] for f in features], "geometry_release": release},
+                            geometry=[shape(f["geometry"]) for f in features], crs="EPSG:4326")
 
 
-def read_geometries(fc, pid_field, pids, baseline, max_error=SIMPLIFY_M):
-    """Simplified geometry and baseline-overlap share of each listed site. A request over Earth Engine's
-    memory limit is halved, and a single site over it is computed at ten times the error margin."""
-    def with_overlap(f):
-        geom = f.geometry().simplify(max_error)
-        covered = baseline.filterBounds(geom).geometry().dissolve(max_error)
-        share = geom.intersection(covered, max_error).area(max_error).divide(geom.area(max_error))
-        return ee.Feature(geom, {"WDPA_PID": f.get(pid_field), "baseline_overlap": share, "max_error_m": max_error})
-    try:
-        return fc.filter(ee.Filter.inList(pid_field, pids)).map(with_overlap).getInfo()["features"]
-    except ee.EEException as error:
-        if "memory limit" not in str(error) or max_error > SIMPLIFY_M:
-            raise
-        if len(pids) == 1:
-            return read_geometries(fc, pid_field, pids, baseline, 10 * SIMPLIFY_M)
-        half = len(pids) // 2
-        return read_geometries(fc, pid_field, pids[:half], baseline) + read_geometries(fc, pid_field, pids[half:], baseline)
+def baseline_overlap(sites, baseline):
+    """Share of each site's area covered by the union of the baseline polygons, in EQUAL_AREA_CRS."""
+    sites = shapely.make_valid(sites.to_crs(EQUAL_AREA_CRS).geometry.reset_index(drop=True))
+    baseline = shapely.make_valid(baseline.to_crs(EQUAL_AREA_CRS).geometry.reset_index(drop=True))
+    pairs = gpd.sjoin(gpd.GeoDataFrame(geometry=sites), gpd.GeoDataFrame(geometry=baseline), predicate="intersects")
+    pieces = shapely.intersection(sites.values[pairs.index], baseline.values[pairs.index_right])
+    covered = gpd.GeoSeries(pieces, index=pairs.index).groupby(level=0).agg(lambda g: shapely.union_all(g.values).area)
+    return (covered.reindex(sites.index, fill_value=0) / sites.area).to_numpy()
 
 
 def main():
@@ -203,13 +202,13 @@ def main():
     base_attrs = release_attributes(BASE_RELEASE, countries)[0]
     only_base_missing = ~presence[:, base_j] & presence[:, base_j - 1] & presence[:, base_j + 1]
     fill_pids = {releases[base_j + 1]: list(pids[only_base_missing & ~np.isin(site_iso3, list(PATCH))])}
-    parts = [base_attrs[~base_attrs.ISO3.isin(list(PATCH))]]
+    parts = [base_attrs[~base_attrs.ISO3.isin(list(PATCH))].assign(source_release=BASE_RELEASE)]
     for iso3, release in PATCH.items():
         attrs = release_attributes(release, countries)[0]
-        parts.append(attrs[attrs.ISO3 == iso3])
+        parts.append(attrs[attrs.ISO3 == iso3].assign(source_release=release))
     for release, fill in fill_pids.items():
         attrs = release_attributes(release, countries)[0]
-        parts.append(attrs[attrs.WDPA_PID.isin(fill)])
+        parts.append(attrs[attrs.WDPA_PID.isin(fill)].assign(source_release=release))
     baseline = pd.concat(parts, ignore_index=True)
     baseline.to_parquet(out_dir / "cutoff_baseline.parquet", index=False)
     print(f"baseline: {len(baseline)} records, {(baseline.kind == 'polygons').sum()} polygons", flush=True)
@@ -243,26 +242,25 @@ def main():
         last_release=lambda d: d.WDPA_PID.map(lambda p: releases[int(np.flatnonzero(presence[pid_codes[p]])[-1])]))
     removals.to_csv(out_dir / "removals.csv", index=False, encoding="utf-8-sig")
 
-    base_fc = baseline_collection(countries, fill_pids)
+    base_polygons = base_qualifying[base_qualifying.kind == "polygons"].assign(geometry_release=lambda d: d.source_release)
+    ledger_polygons = ledger[ledger.kind == "polygons"]
+    needed = pd.concat([base_polygons, ledger_polygons])[["WDPA_PID", "geometry_release"]].drop_duplicates()
     frames = []
-    for release, group in ledger[ledger.kind == "polygons"].groupby("geometry_release"):
+    for release, group in needed.groupby("geometry_release"):
         cache = out_dir / f"geometries_{release}.parquet"
         if not cache.exists():
-            fc = collection(release, "polygons", countries)
-            pid_field = source_fields(release, "polygons")[1]
-            todo = sorted(group.WDPA_PID.unique())
-            features = [f for lo in range(0, len(todo), args.chunk)
-                        for f in read_geometries(fc, pid_field, todo[lo:lo + args.chunk], base_fc)]
-            gpd.GeoDataFrame([f["properties"] for f in features], geometry=[shape(f["geometry"]) for f in features],
-                             crs="EPSG:4326").to_parquet(cache)
-            print(release, len(features), "of", len(todo), "geometries", flush=True)
-        frames.append(gpd.read_parquet(cache).assign(geometry_release=release))
+            read_geometries(release, sorted(group.WDPA_PID), args.chunk).to_parquet(cache)
+        frames.append(gpd.read_parquet(cache))
+        print(release, len(frames[-1]), "of", len(group), "geometries", flush=True)
     geometries = pd.concat(frames, ignore_index=True)
-    events = gpd.GeoDataFrame(ledger.merge(geometries, on=["WDPA_PID", "geometry_release"], how="inner"), crs="EPSG:4326")
-    missing = ledger[(ledger.kind == "polygons") & ~ledger.WDPA_PID.isin(events.WDPA_PID)]
-    print(f"{len(events)} polygon events with geometry, {len(missing)} without", flush=True)
-    events.to_file(out_dir / "events.gpkg", driver="GPKG")
 
+    baseline_geometries = gpd.GeoDataFrame(base_polygons.merge(geometries, on=["WDPA_PID", "geometry_release"]), crs="EPSG:4326")
+    events = gpd.GeoDataFrame(ledger_polygons.merge(geometries, on=["WDPA_PID", "geometry_release"]), crs="EPSG:4326")
+    events["baseline_overlap"] = baseline_overlap(events, baseline_geometries)
+    print(f"{len(baseline_geometries)} of {len(base_polygons)} baseline polygons and {len(events)} of {len(ledger_polygons)} "
+          "ledger polygons with geometry", flush=True)
+    baseline_geometries.to_parquet(out_dir / "cutoff_baseline_polygons.parquet")
+    events.to_parquet(out_dir / "events.parquet")
 
 if __name__ == "__main__":
     main()
