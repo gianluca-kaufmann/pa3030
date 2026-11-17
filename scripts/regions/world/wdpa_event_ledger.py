@@ -24,6 +24,7 @@ Usage:
         [--countries CHE,COL]
 """
 import argparse
+import shutil
 
 import ee
 import geopandas as gpd
@@ -128,20 +129,24 @@ def classify(ledger):
                          reason=np.select(conditions, reasons, default="no_status_year"))
 
 
-def read_geometries(release, pids, chunk):
+def read_geometries(release, pids, chunk, part_dir):
     """Geometries of the listed sites in one release. Sites of SIMPLIFY_MIN_M2 or more are simplified to
-    SIMPLIFY_M, smaller ones are kept as they are, since simplifying would collapse them."""
+    SIMPLIFY_M, smaller ones are kept as they are, since simplifying would collapse them. Each request is
+    saved to part_dir, so an interrupted release resumes from the last saved request."""
     pid_field = source_fields(release, "polygons")[1]
     fc = ee.FeatureCollection(f"WCMC/WDPA/{release}/polygons")
 
     def simplified(f):
         geom = ee.Geometry(ee.Algorithms.If(f.geometry().area(1).lt(SIMPLIFY_MIN_M2), f.geometry(), f.geometry().simplify(SIMPLIFY_M)))
         return ee.Feature(geom, {"WDPA_PID": f.get(pid_field)})
-    features = []
+    part_dir.mkdir(exist_ok=True)
     for lo in range(0, len(pids), chunk):
-        features += fc.filter(ee.Filter.inList(pid_field, pids[lo:lo + chunk])).map(simplified).getInfo()["features"]
-    return gpd.GeoDataFrame({"WDPA_PID": [f["properties"]["WDPA_PID"] for f in features], "geometry_release": release},
-                            geometry=[shape(f["geometry"]) for f in features], crs="EPSG:4326")
+        part = part_dir / f"{lo:07d}_{chunk}.parquet"
+        if not part.exists():
+            features = fc.filter(ee.Filter.inList(pid_field, pids[lo:lo + chunk])).map(simplified).getInfo()["features"]
+            gpd.GeoDataFrame({"WDPA_PID": [f["properties"]["WDPA_PID"] for f in features], "geometry_release": release},
+                             geometry=[shape(f["geometry"]) for f in features], crs="EPSG:4326").to_parquet(part)
+    return pd.concat([gpd.read_parquet(part) for part in sorted(part_dir.glob(f"*_{chunk}.parquet"))], ignore_index=True)
 
 
 def baseline_overlap(sites, baseline):
@@ -159,7 +164,7 @@ def main():
     parser.add_argument("--project", required=True, help="Earth Engine Cloud project id")
     parser.add_argument("--observation", required=True, help="observation release, YYYYMM")
     parser.add_argument("--countries", default=None, help="comma-separated ISO3 codes, for a test run")
-    parser.add_argument("--chunk", type=int, default=200, help="sites per geometry request")
+    parser.add_argument("--chunk", type=int, default=1000, help="sites per geometry request")
     args = parser.parse_args()
     ee.Initialize(project=args.project)
     ee.data.setDeadline(REQUEST_DEADLINE_MS)
@@ -249,7 +254,9 @@ def main():
     for release, group in needed.groupby("geometry_release"):
         cache = out_dir / f"geometries_{release}.parquet"
         if not cache.exists():
-            read_geometries(release, sorted(group.WDPA_PID), args.chunk).to_parquet(cache)
+            part_dir = out_dir / f"geometries_{release}_parts"
+            read_geometries(release, sorted(group.WDPA_PID), args.chunk, part_dir).to_parquet(cache)
+            shutil.rmtree(part_dir)
         frames.append(gpd.read_parquet(cache))
         print(release, len(frames[-1]), "of", len(group), "geometries", flush=True)
     geometries = pd.concat(frames, ignore_index=True)
