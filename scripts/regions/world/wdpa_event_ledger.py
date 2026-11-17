@@ -14,8 +14,8 @@ geometries.
    Baseline sites missing from the observation release go to removals.csv.
 5. Geometries (sites of 1 km2 or more simplified to SIMPLIFY_M): the baseline's qualifying polygons from their source
    release, and each ledger polygon from the first release that holds it as a qualifying polygon
-   (changed baseline sites: the last release that holds them). For each ledger polygon, the share
-   of its area covered by baseline polygons, computed in Mollweide.
+   (changed baseline sites: the last release that holds them). For each ledger polygon, the baseline
+   polygon that covers most of it and the share of its area that polygon covers, in Mollweide.
 
 Release attributes and geometries are cached per release. Outputs go to DATA_DIR/wdpa_event_ledger.
 
@@ -150,19 +150,21 @@ def read_geometries(release, pids, chunk, part_dir):
     return pd.concat([gpd.read_parquet(part) for part in sorted(part_dir.glob(f"*_{chunk}.parquet"))], ignore_index=True)
 
 
-def baseline_overlap(sites, baseline):
-    """Share of each site's area covered by the union of the baseline polygons, in EQUAL_AREA_CRS,
-    computed OVERLAP_BATCH sites at a time to bound memory."""
+def largest_baseline_overlap(sites, baseline):
+    """For each site, the WDPA_PID of the baseline polygon covering most of it and the share of the site's
+    area it covers, in EQUAL_AREA_CRS. Computed OVERLAP_BATCH sites at a time to bound memory."""
     sites = shapely.make_valid(sites.to_crs(EQUAL_AREA_CRS).geometry.reset_index(drop=True))
-    baseline = gpd.GeoDataFrame(geometry=shapely.make_valid(baseline.to_crs(EQUAL_AREA_CRS).geometry.reset_index(drop=True)))
-    shares = []
+    baseline = gpd.GeoDataFrame({"WDPA_PID": baseline.WDPA_PID.to_numpy()},
+                                geometry=shapely.make_valid(baseline.to_crs(EQUAL_AREA_CRS).geometry.reset_index(drop=True)))
+    frames = []
     for lo in range(0, len(sites), OVERLAP_BATCH):
         part = sites.iloc[lo:lo + OVERLAP_BATCH]
         pairs = gpd.sjoin(gpd.GeoDataFrame(geometry=part), baseline, predicate="intersects")
-        pieces = shapely.intersection(part.loc[pairs.index].values, baseline.geometry.values[pairs.index_right])
-        covered = pd.Series(pieces, index=pairs.index, dtype=object).groupby(level=0).agg(lambda g: shapely.union_all(g.values).area)
-        shares.append((covered.reindex(part.index, fill_value=0.0).astype(float) / part.area).to_numpy())
-    return np.concatenate(shares)
+        pairs["share"] = shapely.area(shapely.intersection(part.loc[pairs.index].values, baseline.geometry.values[pairs.index_right])) / part.area.loc[pairs.index]
+        best = pairs.sort_values("share").groupby(level=0).tail(1)
+        frames.append(pd.DataFrame({"largest_baseline_pid": best.WDPA_PID, "largest_baseline_share": best.share}).reindex(part.index))
+        print(f"overlap {lo + len(part)} of {len(sites)}", flush=True)
+    return pd.concat(frames).fillna({"largest_baseline_share": 0.0})
 
 
 def main():
@@ -269,10 +271,11 @@ def main():
 
     baseline_geometries = gpd.GeoDataFrame(base_polygons.merge(geometries, on=["WDPA_PID", "geometry_release"]), crs="EPSG:4326")
     events = gpd.GeoDataFrame(ledger_polygons.merge(geometries, on=["WDPA_PID", "geometry_release"]), crs="EPSG:4326")
-    events["baseline_overlap"] = baseline_overlap(events, baseline_geometries)
     print(f"{len(baseline_geometries)} of {len(base_polygons)} baseline polygons and {len(events)} of {len(ledger_polygons)} "
           "ledger polygons with geometry", flush=True)
     baseline_geometries.to_parquet(out_dir / "cutoff_baseline_polygons.parquet")
+    overlap = largest_baseline_overlap(events, baseline_geometries)
+    events[overlap.columns] = overlap.to_numpy()
     events.to_parquet(out_dir / "events.parquet")
 
 if __name__ == "__main__":

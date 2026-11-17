@@ -11,8 +11,8 @@ from scripts.regions.world.leakage_guard import (
 )
 from scripts.regions.world.vif_prune import iterative_prune
 from scripts.regions.world.wdpa_event_ledger import (
-    baseline_overlap,
     classify,
+    largest_baseline_overlap,
     transient_gaps,
 )
 
@@ -63,10 +63,13 @@ def test_ledger_classes_follow_the_protocol():
     assert out.reason.tolist()[-2:] == ["no_status_year", "category_change"]
 
 
-def test_baseline_overlap_counts_shared_baseline_area_once(monkeypatch):
+def test_largest_baseline_overlap_picks_the_most_covering_polygon(monkeypatch):
     crs = "ESRI:54009"
     sites = gpd.GeoDataFrame(geometry=[box(0, 0, 10_000, 10_000), box(50_000, 0, 60_000, 10_000)], crs=crs)
-    baseline = gpd.GeoDataFrame(geometry=[box(-5_000, -5_000, 5_000, 15_000), box(0, -5_000, 5_000, 15_000)], crs=crs)
-    assert np.allclose(baseline_overlap(sites, baseline), [0.5, 0.0])
-    monkeypatch.setattr(wdpa_event_ledger, "OVERLAP_BATCH", 1)
-    assert np.allclose(baseline_overlap(sites, baseline), [0.5, 0.0])
+    baseline = gpd.GeoDataFrame({"WDPA_PID": ["a", "b"]},
+                                geometry=[box(-5_000, -5_000, 2_000, 15_000), box(0, -5_000, 5_000, 15_000)], crs=crs)
+    for batch in [20_000, 1]:
+        monkeypatch.setattr(wdpa_event_ledger, "OVERLAP_BATCH", batch)
+        out = largest_baseline_overlap(sites, baseline)
+        assert out.largest_baseline_pid.tolist()[0] == "b" and pd.isna(out.largest_baseline_pid.tolist()[1])
+        assert np.allclose(out.largest_baseline_share.astype(float), [0.5, 0.0])
