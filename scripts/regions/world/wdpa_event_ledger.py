@@ -150,21 +150,38 @@ def read_geometries(release, pids, chunk, part_dir):
     return pd.concat([gpd.read_parquet(part) for part in sorted(part_dir.glob(f"*_{chunk}.parquet"))], ignore_index=True)
 
 
+def polygon_parts(geoms):
+    """Single polygons of each geometry, with the position of the geometry each came from."""
+    parts, owner = shapely.get_parts(geoms, return_index=True)
+    parts, inner = shapely.get_parts(parts, return_index=True)
+    owner = owner[inner]
+    keep = shapely.get_type_id(parts) == 3
+    return parts[keep], owner[keep]
+
+
 def largest_baseline_overlap(sites, baseline):
     """For each site, the WDPA_PID of the baseline polygon covering most of it and the share of the site's
-    area it covers, in EQUAL_AREA_CRS. Computed OVERLAP_BATCH sites at a time to bound memory."""
-    sites = shapely.make_valid(sites.to_crs(EQUAL_AREA_CRS).geometry.reset_index(drop=True))
-    baseline = gpd.GeoDataFrame({"WDPA_PID": baseline.WDPA_PID.to_numpy()},
-                                geometry=shapely.make_valid(baseline.to_crs(EQUAL_AREA_CRS).geometry.reset_index(drop=True)))
+    area it covers, in EQUAL_AREA_CRS. Both sides are split into single polygons, since intersecting whole
+    collections makes GEOS union all their parts, and a baseline part lying inside a site part is counted
+    by its own area. Site parts are processed OVERLAP_BATCH at a time."""
+    site_parts, site_of = polygon_parts(shapely.make_valid(sites.to_crs(EQUAL_AREA_CRS).geometry.values))
+    base_parts, base_of = polygon_parts(shapely.make_valid(baseline.to_crs(EQUAL_AREA_CRS).geometry.values))
+    base_pid = baseline.WDPA_PID.to_numpy()[base_of]
+    tree = shapely.STRtree(base_parts)
+    shapely.prepare(site_parts)
     frames = []
-    for lo in range(0, len(sites), OVERLAP_BATCH):
-        part = sites.iloc[lo:lo + OVERLAP_BATCH]
-        pairs = gpd.sjoin(gpd.GeoDataFrame(geometry=part), baseline, predicate="intersects")
-        pairs["share"] = shapely.area(shapely.intersection(part.loc[pairs.index].values, baseline.geometry.values[pairs.index_right])) / part.area.loc[pairs.index]
-        best = pairs.sort_values("share").groupby(level=0).tail(1)
-        frames.append(pd.DataFrame({"largest_baseline_pid": best.WDPA_PID, "largest_baseline_share": best.share}).reindex(part.index))
-        print(f"overlap {lo + len(part)} of {len(sites)}", flush=True)
-    return pd.concat(frames).fillna({"largest_baseline_share": 0.0})
+    for lo in range(0, len(site_parts), OVERLAP_BATCH):
+        batch = site_parts[lo:lo + OVERLAP_BATCH]
+        i, j = tree.query(batch, predicate="intersects")
+        area = shapely.area(base_parts[j])
+        crossing = ~shapely.contains_properly(batch[i], base_parts[j])
+        area[crossing] = shapely.area(shapely.intersection(batch[i][crossing], base_parts[j][crossing]))
+        frames.append(pd.DataFrame({"site": site_of[lo + i], "pid": base_pid[j], "area": area}))
+        print(f"overlap {lo + len(batch)} of {len(site_parts)} site parts", flush=True)
+    covered = pd.concat(frames).groupby(["site", "pid"]).area.sum().sort_values().groupby(level="site").tail(1).reset_index(level="pid")
+    site_area = pd.Series(np.bincount(site_of, weights=shapely.area(site_parts), minlength=len(sites)))
+    return pd.DataFrame({"largest_baseline_pid": covered.pid.reindex(site_area.index),
+                         "largest_baseline_share": covered.area.reindex(site_area.index, fill_value=0.0) / site_area})
 
 
 def main():

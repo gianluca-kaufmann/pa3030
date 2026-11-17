@@ -65,11 +65,13 @@ def test_ledger_classes_follow_the_protocol():
 
 def test_largest_baseline_overlap_picks_the_most_covering_polygon(monkeypatch):
     crs = "ESRI:54009"
-    sites = gpd.GeoDataFrame(geometry=[box(0, 0, 10_000, 10_000), box(50_000, 0, 60_000, 10_000)], crs=crs)
-    baseline = gpd.GeoDataFrame({"WDPA_PID": ["a", "b"]},
-                                geometry=[box(-5_000, -5_000, 2_000, 15_000), box(0, -5_000, 5_000, 15_000)], crs=crs)
+    two_parts = box(0, 0, 10_000, 10_000).union(box(20_000, 0, 30_000, 10_000))
+    sites = gpd.GeoDataFrame(geometry=[box(0, 0, 10_000, 10_000), box(50_000, 0, 60_000, 10_000), two_parts], crs=crs)
+    baseline = gpd.GeoDataFrame({"WDPA_PID": ["a", "b", "c"]},
+                                geometry=[box(-5_000, -5_000, 2_000, 15_000), box(0, -5_000, 5_000, 15_000),
+                                          box(21_000, 1_000, 29_000, 9_000)], crs=crs)
     for batch in [20_000, 1]:
         monkeypatch.setattr(wdpa_event_ledger, "OVERLAP_BATCH", batch)
         out = largest_baseline_overlap(sites, baseline)
-        assert out.largest_baseline_pid.tolist()[0] == "b" and pd.isna(out.largest_baseline_pid.tolist()[1])
-        assert np.allclose(out.largest_baseline_share.astype(float), [0.5, 0.0])
+        assert out.largest_baseline_pid[0] == "b" and pd.isna(out.largest_baseline_pid[1]) and out.largest_baseline_pid[2] == "c"
+        assert np.allclose(out.largest_baseline_share, [0.5, 0.0, 64 / 200])
