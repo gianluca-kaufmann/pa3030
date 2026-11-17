@@ -4,13 +4,17 @@ import pandas as pd
 import pytest
 from shapely.geometry import box
 
-from scripts.regions.world import paths
+from scripts.regions.world import paths, wdpa_event_ledger
 from scripts.regions.world.leakage_guard import (
     assert_dynamic_state_is_prior_only,
     assert_no_forbidden_columns,
 )
 from scripts.regions.world.vif_prune import iterative_prune
-from scripts.regions.world.wdpa_event_ledger import baseline_overlap, classify, transient_gaps
+from scripts.regions.world.wdpa_event_ledger import (
+    baseline_overlap,
+    classify,
+    transient_gaps,
+)
 
 
 def test_country_year_tables_are_tracked_inputs():
@@ -59,8 +63,10 @@ def test_ledger_classes_follow_the_protocol():
     assert out.reason.tolist()[-2:] == ["no_status_year", "category_change"]
 
 
-def test_baseline_overlap_counts_shared_baseline_area_once():
+def test_baseline_overlap_counts_shared_baseline_area_once(monkeypatch):
     crs = "ESRI:54009"
     sites = gpd.GeoDataFrame(geometry=[box(0, 0, 10_000, 10_000), box(50_000, 0, 60_000, 10_000)], crs=crs)
     baseline = gpd.GeoDataFrame(geometry=[box(-5_000, -5_000, 5_000, 15_000), box(0, -5_000, 5_000, 15_000)], crs=crs)
+    assert np.allclose(baseline_overlap(sites, baseline), [0.5, 0.0])
+    monkeypatch.setattr(wdpa_event_ledger, "OVERLAP_BATCH", 1)
     assert np.allclose(baseline_overlap(sites, baseline), [0.5, 0.0])

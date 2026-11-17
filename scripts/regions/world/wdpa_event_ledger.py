@@ -45,6 +45,7 @@ AREA_TOLERANCE = 0.01
 SIMPLIFY_M = 100
 SIMPLIFY_MIN_M2 = 1_000_000
 EQUAL_AREA_CRS = "ESRI:54009"
+OVERLAP_BATCH = 20_000
 REQUEST_DEADLINE_MS = 600_000
 
 FIELDS = ["WDPAID", "WDPA_PID", "ISO3", "NAME", "STATUS", "STATUS_YR", "IUCN_CAT", "DESIG_TYPE", "PA_DEF", "MARINE", "AREA"]
@@ -150,13 +151,18 @@ def read_geometries(release, pids, chunk, part_dir):
 
 
 def baseline_overlap(sites, baseline):
-    """Share of each site's area covered by the union of the baseline polygons, in EQUAL_AREA_CRS."""
+    """Share of each site's area covered by the union of the baseline polygons, in EQUAL_AREA_CRS,
+    computed OVERLAP_BATCH sites at a time to bound memory."""
     sites = shapely.make_valid(sites.to_crs(EQUAL_AREA_CRS).geometry.reset_index(drop=True))
-    baseline = shapely.make_valid(baseline.to_crs(EQUAL_AREA_CRS).geometry.reset_index(drop=True))
-    pairs = gpd.sjoin(gpd.GeoDataFrame(geometry=sites), gpd.GeoDataFrame(geometry=baseline), predicate="intersects")
-    pieces = shapely.intersection(sites.values[pairs.index], baseline.values[pairs.index_right])
-    covered = gpd.GeoSeries(pieces, index=pairs.index).groupby(level=0).agg(lambda g: shapely.union_all(g.values).area)
-    return (covered.reindex(sites.index, fill_value=0) / sites.area).to_numpy()
+    baseline = gpd.GeoDataFrame(geometry=shapely.make_valid(baseline.to_crs(EQUAL_AREA_CRS).geometry.reset_index(drop=True)))
+    shares = []
+    for lo in range(0, len(sites), OVERLAP_BATCH):
+        part = sites.iloc[lo:lo + OVERLAP_BATCH]
+        pairs = gpd.sjoin(gpd.GeoDataFrame(geometry=part), baseline, predicate="intersects")
+        pieces = shapely.intersection(part.loc[pairs.index].values, baseline.geometry.values[pairs.index_right])
+        covered = pd.Series(pieces, index=pairs.index, dtype=object).groupby(level=0).agg(lambda g: shapely.union_all(g.values).area)
+        shares.append((covered.reindex(part.index, fill_value=0.0).astype(float) / part.area).to_numpy())
+    return np.concatenate(shares)
 
 
 def main():
