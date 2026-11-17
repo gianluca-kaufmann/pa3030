@@ -41,7 +41,7 @@ Did the 2020 social-environmental niche of strict protected areas (Mouillot et a
 - The Earth Engine asset `202003` holds February 2020 content and does not stand for March.
 - No post-cutoff record enters the baseline as new protection. The `202005` substitutions supply only sites that the official April release reported.
 - Designation window: legal designation in calendar years 2021 to 2024.
-- Observation date: OPEN, at least 18 months after the window ends. The latest available release (`202611`) gives 23 months.
+- Observation date: release `202610`, 22 months after the window ends (the minimum is 18). The later release `202611` is not used: it holds 4,651 Estonian, 14,646 German and 1,215 Polish records against 21,681, 23,609 and 3,217 in `202610`, the pattern of the 2020 truncations, and as the last release it cannot be screened for transient omissions.
 - The first release in which a site appears is recorded separately from its legal designation year (STATUS_YR).
 
 ## Event ledger
