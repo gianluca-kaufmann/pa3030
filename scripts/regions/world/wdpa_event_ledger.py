@@ -20,7 +20,7 @@ geometries.
 Release attributes and geometries are cached per release. Outputs go to DATA_DIR/wdpa_event_ledger.
 
 Usage:
-    python -m scripts.regions.world.wdpa_event_ledger --project <ee project> --observation 202611
+    python -m scripts.regions.world.wdpa_event_ledger --project <ee project> --observation 202610
         [--countries CHE,COL]
 """
 import argparse
@@ -277,10 +277,14 @@ def main():
     needed = pd.concat([base_polygons, ledger_polygons])[["WDPA_PID", "geometry_release"]].drop_duplicates()
     frames = []
     for release, group in needed.groupby("geometry_release"):
+        # The cache holds the sites an earlier run needed from this release, so missing sites are added to it.
         cache = out_dir / f"geometries_{release}.parquet"
-        if not cache.exists():
+        cached = gpd.read_parquet(cache) if cache.exists() else None
+        missing = sorted(set(group.WDPA_PID) - set(cached.WDPA_PID if cached is not None else []))
+        if missing:
             part_dir = out_dir / f"geometries_{release}_parts"
-            read_geometries(release, sorted(group.WDPA_PID), args.chunk, part_dir).to_parquet(cache)
+            fetched = read_geometries(release, missing, args.chunk, part_dir)
+            pd.concat([cached, fetched], ignore_index=True).to_parquet(cache)
             shutil.rmtree(part_dir)
         frames.append(gpd.read_parquet(cache))
         print(release, len(frames[-1]), "of", len(group), "geometries", flush=True)
