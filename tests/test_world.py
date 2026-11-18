@@ -2,7 +2,8 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import pytest
-from shapely.geometry import box
+import shapely
+from shapely.geometry import Polygon, box
 
 from scripts.regions.world import paths, wdpa_event_ledger
 from scripts.regions.world.leakage_guard import (
@@ -13,6 +14,7 @@ from scripts.regions.world.vif_prune import iterative_prune
 from scripts.regions.world.wdpa_event_ledger import (
     classify,
     largest_baseline_overlap,
+    split_antimeridian,
     transient_gaps,
 )
 
@@ -75,3 +77,17 @@ def test_largest_baseline_overlap_picks_the_most_covering_polygon(monkeypatch):
         out = largest_baseline_overlap(sites, baseline)
         assert out.largest_baseline_pid[0] == "b" and pd.isna(out.largest_baseline_pid[1]) and out.largest_baseline_pid[2] == "c"
         assert np.allclose(out.largest_baseline_share, [0.5, 0.0, 64 / 200])
+
+
+def test_split_antimeridian_keeps_a_crossing_polygon_near_180_degrees():
+    crossing = Polygon([(179, 0), (-179, 0), (-179, 1), (179, 1)])
+    split = split_antimeridian([crossing, box(10, 0, 11, 1)])[0]
+    assert shapely.area(split) == pytest.approx(2.0)
+    assert shapely.bounds(split)[0] == pytest.approx(-180) and shapely.bounds(split)[2] == pytest.approx(180)
+    assert not shapely.intersects(split, box(-170, 0, 170, 1))
+    past = split_antimeridian([box(178, 0, 182, 1)])[0]
+    assert shapely.area(past) == pytest.approx(4.0) and shapely.bounds(past)[2] <= 180
+    assert shapely.intersects(past, box(-180, 0, -179, 1))
+    sites = gpd.GeoDataFrame(geometry=[box(0, 0, 1, 1), box(179.5, 0.2, 179.9, 0.8)], crs="EPSG:4326")
+    out = largest_baseline_overlap(sites, gpd.GeoDataFrame({"WDPA_PID": ["x"]}, geometry=[crossing], crs="EPSG:4326"))
+    assert out.largest_baseline_share.tolist() == pytest.approx([0.0, 1.0])

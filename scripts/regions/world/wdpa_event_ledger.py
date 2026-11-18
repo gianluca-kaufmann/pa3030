@@ -150,6 +150,23 @@ def read_geometries(release, pids, chunk, part_dir):
     return pd.concat([gpd.read_parquet(part) for part in sorted(part_dir.glob(f"*_{chunk}.parquet"))], ignore_index=True)
 
 
+def split_antimeridian(geoms):
+    """Lon/lat geometries that cross 180 degrees, cut into pieces within -180 to 180. A crossing ring either
+    jumps from about 180 to about -180 (the geometry is then wider than 180 degrees) or runs past 180
+    (Papahanaumokuakea reaches 199). Projected as they are, both span the globe and cover land on other
+    continents. Other geometries are left unchanged."""
+    geoms = np.asarray(geoms, dtype=object).copy()
+    bounds = shapely.bounds(geoms)
+    wide = bounds[:, 2] - bounds[:, 0] > 180
+    for k in np.flatnonzero(wide | (bounds[:, 0] < -180) | (bounds[:, 2] > 180)):
+        g = geoms[k]
+        if wide[k]:
+            g = shapely.make_valid(shapely.transform(g, lambda c: np.where(c[:, :1] < 0, c + [360, 0], c)))
+        geoms[k] = shapely.union_all([shapely.transform(shapely.intersection(g, shapely.box(-180 - o, -90, 180 - o, 90)),
+                                                        lambda c, o=o: c + [o, 0]) for o in (-360, 0, 360)])
+    return geoms
+
+
 def polygon_parts(geoms):
     """Single polygons of each geometry, with the position of the geometry each came from."""
     parts, owner = shapely.get_parts(geoms, return_index=True)
@@ -159,13 +176,19 @@ def polygon_parts(geoms):
     return parts[keep], owner[keep]
 
 
+def equal_area(frame):
+    """Geometries of a lon/lat GeoDataFrame in EQUAL_AREA_CRS, split at the antimeridian first."""
+    split = gpd.GeoSeries(split_antimeridian(frame.to_crs("EPSG:4326").geometry.values), crs="EPSG:4326")
+    return split.to_crs(EQUAL_AREA_CRS).values
+
+
 def largest_baseline_overlap(sites, baseline):
     """For each site, the WDPA_PID of the baseline polygon covering most of it and the share of the site's
     area it covers, in EQUAL_AREA_CRS. Both sides are split into single polygons, since intersecting whole
     collections makes GEOS union all their parts, and a baseline part lying inside a site part is counted
     by its own area. Site parts are processed OVERLAP_BATCH at a time."""
-    site_parts, site_of = polygon_parts(shapely.make_valid(sites.to_crs(EQUAL_AREA_CRS).geometry.values))
-    base_parts, base_of = polygon_parts(shapely.make_valid(baseline.to_crs(EQUAL_AREA_CRS).geometry.values))
+    site_parts, site_of = polygon_parts(shapely.make_valid(equal_area(sites)))
+    base_parts, base_of = polygon_parts(shapely.make_valid(equal_area(baseline)))
     base_pid = baseline.WDPA_PID.to_numpy()[base_of]
     tree = shapely.STRtree(base_parts)
     shapely.prepare(site_parts)
