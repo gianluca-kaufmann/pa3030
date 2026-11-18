@@ -14,8 +14,11 @@ from scripts.regions.world.vif_prune import iterative_prune
 from scripts.regions.world.wdpa_event_ledger import (
     classify,
     largest_baseline_overlap,
+    parcel_lineage,
     split_antimeridian,
+    suffix_rank,
     transient_gaps,
+    union_baseline_share,
 )
 
 
@@ -91,3 +94,25 @@ def test_split_antimeridian_keeps_a_crossing_polygon_near_180_degrees():
     sites = gpd.GeoDataFrame(geometry=[box(0, 0, 1, 1), box(179.5, 0.2, 179.9, 0.8)], crs="EPSG:4326")
     out = largest_baseline_overlap(sites, gpd.GeoDataFrame({"WDPA_PID": ["x"]}, geometry=[crossing], crs="EPSG:4326"))
     assert out.largest_baseline_share.tolist() == pytest.approx([0.0, 1.0])
+
+
+def test_suffix_rank_maps_letters_and_digits_to_the_same_position():
+    assert [suffix_rank(p) for p in ["5_A", "5_B", "5_Z", "5_AA", "5_1", "5_27", "5"]] == [1, 2, 26, 27, 1, 27, None]
+
+
+def test_parcel_lineage_matches_renamed_parcels_one_to_one():
+    cols = ["WDPAID", "WDPA_PID", "kind", "IUCN_CAT", "AREA"]
+    vanished = pd.DataFrame([[1, "1_A", "polygons", "Ia", 10.0], [1, "1_B", "polygons", "Ia", 10.0],
+                             [2, "2_A", "polygons", "II", 5.0], [3, "3", "polygons", "IV", 7.0]], columns=cols)
+    appearing = pd.DataFrame([[1, "1_1", "polygons", "Ia", 10.0], [1, "1_2", "polygons", "Ia", 10.05],
+                              [2, "2_1", "polygons", "II", 9.0], [3, "33", "polygons", "IV", 7.0]], columns=cols)
+    out = parcel_lineage(vanished, appearing).sort_values("successor").reset_index(drop=True)
+    # Same-site twins resolve by suffix position, an area change beyond the tolerance stays unmatched.
+    assert out.to_dict("list") == {"successor": ["1_1", "1_2", "33"], "predecessor": ["1_A", "1_B", "3"]}
+
+
+def test_union_baseline_share_counts_overlapping_baselines_once():
+    crs = "ESRI:54009"
+    sites = gpd.GeoDataFrame(geometry=[box(0, 0, 10_000, 10_000), box(50_000, 0, 60_000, 10_000)], crs=crs)
+    baseline = gpd.GeoDataFrame(geometry=[box(0, 0, 6_000, 10_000), box(4_000, 0, 8_000, 10_000)], crs=crs)
+    assert union_baseline_share(sites, baseline).tolist() == pytest.approx([0.8, 0.0], abs=1e-6)
