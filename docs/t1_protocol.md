@@ -68,7 +68,7 @@ Did the 2020 social-environmental niche of strict protected areas (Mouillot et a
 - STATUS_YR above 2024: not an event in the window. Their cells stay negative, and a sensitivity removes them. STATUS_YR missing (0): class 5.
 - Point records among events (no boundary): class 5. The cell containing the point is removed. A sensitivity removes cells touched by a circle of the reported area. Both are approximations.
 - Source validation: 57 events in a stratified sample drawn before checking were compared with national records (`PA/audit/event_validation_results.csv`). The check is not extended to unsampled events, which are not described as legally verified. Two general rules follow from it and are applied to all events: International designations (for example Ramsar listings) are not new legal protection and become class 5, and the new-land rule above covers the upgrades found.
-- OPEN (D1): events established 2021 to 2024 that are absent from the observation release. Renamed parcels are reconciled by lineage, and the remaining absences are reported by type. Until this is decided, results are not computed.
+- D1: every event established 2021 to 2024 counts, whether or not it is present in the observation release. The question is where designation happened during the window. A survivor-only outcome would mix designation with later reporting changes. Renamed parcels are reconciled by lineage. Absences are reported by type (land still mapped under another ID, site present under another parcel, partly mapped, unresolved). Unresolved absences are bounded: once counted as positive, once removed.
 
 ## Cell labels
 
@@ -138,4 +138,4 @@ All baselines use only information available at the cutoff.
 
 ## Deviations
 
-None yet. Protocol status: PENDING until D1 and the species dataset are decided.
+None yet. Protocol status: PENDING until the species dataset is decided.
