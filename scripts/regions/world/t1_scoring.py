@@ -95,14 +95,16 @@ CHOICES = [
     "STATUS Designated, Inscribed or Established, STATUS_YR 2015 to 2019, terrestrial or coastal. Three forms: "
     "rate_area_reported, the sum of reported AREA (km2) over distinct parcels (WDPA_PID), polygons and points, which can "
     "overlap and so is not unique area; rate_sites, the number of distinct sites (WDPAID); rate_area_unique, the area "
-    "(km2) of the union of those polygons inside the country's sampled 10 km cells (points have no footprint and are "
-    "left out). A parcel listing several ISO3 counts for each in the reported and site forms. Each is divided by the "
+    "(km2, Mollweide) of the union of those polygons listing the country, whole polygons, not clipped to sampled cells, "
+    "since the background sample was drawn outside IUCN protected land and holds almost none of them (points have no "
+    "footprint and are left out). A parcel listing several ISO3 counts for each in the reported and site forms. Each is divided by the "
     "number of the country's cells in the variant's population (expansion population, or every cell in sensitivity 2), "
     "which is fixed at the cutoff and does not depend on any 2021 to 2024 label. The unit is per sampled at-risk 10 km "
     "cell: the stored cells are a sample of each country's land, so this is not a rate per country area.",
     "Correction dated 2026-11-19, made after the first results (commit 520be4f) and recorded as such: the first run divided "
     "by the variant's eligible cells, which depend on 2021 to 2024 removals, counted parcel rows as sites, and counted 9 "
-    "duplicated Chilean parcel rows (Kawesqar, II and IV) more than once. Those pooled rate results are superseded and "
+    "duplicated Chilean parcel rows (Kawesqar, II and IV) more than once. rate_area_unique is new. A first form clipped "
+    "to sampled cells was zero for every country (see above) and was replaced before any result was reported. Those pooled rate results are superseded and "
     "kept in their own output directory. No label rule, score or within-country baseline changed.",
     "Sample population: new land in a baseline-overlapping cell needs more than 1 m2 outside the baseline (numerical "
     "tolerance, not a tuned threshold). A point record in such a cell counts only if it lies outside the baseline.",
@@ -345,12 +347,15 @@ def historical_records(rec, cats):
     return r.assign(ISO3=r.ISO3.astype(str).str.split(";")).explode("ISO3")
 
 
-def unique_area_by_country(pieces, piece_cell, cell_country, n_countries):
-    """km2 per country of the union of polygon pieces already clipped to their cell, so overlaps count once."""
-    if len(pieces) == 0:
-        return np.zeros(n_countries)
-    per_cell = pd.Series(list(pieces)).groupby(np.asarray(piece_cell)).agg(lambda g: shapely.area(shapely.union_all(g.to_numpy())))
-    return np.bincount(cell_country[per_cell.index.to_numpy()], weights=per_cell.to_numpy() / 1e6, minlength=n_countries)
+def unique_area_by_country(geoms, iso3, country_names):
+    """km2 per country of the union of equal-area polygons listing it (ISO3 may hold several, separated by ';'), so
+    overlapping polygons count once."""
+    frame = pd.DataFrame({"geometry": list(shapely.make_valid(np.asarray(geoms, dtype=object))),
+                          "ISO3": pd.Series(iso3).astype(str).str.split(";").to_numpy()}).explode("ISO3")
+    if frame.empty:
+        return np.zeros(len(country_names))
+    area = frame.groupby("ISO3").geometry.agg(lambda g: shapely.area(shapely.union_all(g.to_numpy())) / 1e6)
+    return area.reindex(country_names, fill_value=0).to_numpy()
 
 
 def historical_rates(records, unique_km2, denominator, country_names):
@@ -590,9 +595,8 @@ def main():
                  & base.STATUS.isin(QUALIFYING)).to_numpy()
     hist = {}
     for outcome, cats in OUTCOMES.items():
-        keep_rows = (rate_poly & base.IUCN_CAT.isin(cats).to_numpy())[base_hits.owner.to_numpy()]
-        hist[outcome] = (historical_records(rec, cats),
-                         unique_area_by_country(clip[keep_rows], base_hits.cell.to_numpy()[keep_rows], country, len(country_names)))
+        keep = rate_poly & base.IUCN_CAT.isin(cats).to_numpy()
+        hist[outcome] = (historical_records(rec, cats), unique_area_by_country(base_geom[keep], base.ISO3.to_numpy()[keep], country_names))
     log(start, "historical rate numerators computed")
 
     rows, summary, boot, conc = [], [], [], []

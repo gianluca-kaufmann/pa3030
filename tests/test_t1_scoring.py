@@ -203,8 +203,7 @@ def test_rate_scores_depend_only_on_the_cutoff_population_not_on_labels():
 
 
 def test_unique_area_counts_overlapping_polygons_once():
-    cell = box(0, 0, 10_000, 10_000)
     a, b = box(0, 0, 6_000, 10_000), box(4_000, 0, 10_000, 10_000)  # 60 + 60 km2, overlap 20 km2
-    pieces = shapely.intersection(np.array([a, b, a]), cell)
-    km2 = unique_area_by_country(pieces, np.array([0, 0, 1]), np.array([0, 1]), 2)
-    assert km2 == pytest.approx([100.0, 60.0])
+    c = box(50_000, 0, 53_000, 10_000)  # 30 km2, listed in both countries
+    km2 = unique_area_by_country([a, b, a, c], ["AAA", "AAA", "BBB", "AAA;BBB"], np.array(["AAA", "BBB", "CCC"]))
+    assert km2 == pytest.approx([130.0, 90.0, 0.0])
