@@ -91,10 +91,19 @@ CHOICES = [
     "Baseline points are not used. Sensitivity 9 recomputes it without the four reconstructed countries' polygons.",
     "Environment and accessibility baseline: the mean of within-country average ranks of tt (higher first), hf "
     "(lower first) and Altitude (higher first).",
-    "Between-country baseline, pooled metrics only, two forms reported: rate_area, km2 of the outcome's categories "
-    "designated with STATUS_YR 2015 to 2019 (cutoff baseline records, terrestrial and coastal, polygons and points), "
-    "and rate_sites, the number of those sites, each divided by the country's eligible cells. A site listing several "
-    "ISO3 counts for each.",
+    "Between-country baseline, pooled metrics only, built from cutoff baseline records of the outcome's categories with "
+    "STATUS Designated, Inscribed or Established, STATUS_YR 2015 to 2019, terrestrial or coastal. Three forms: "
+    "rate_area_reported, the sum of reported AREA (km2) over distinct parcels (WDPA_PID), polygons and points, which can "
+    "overlap and so is not unique area; rate_sites, the number of distinct sites (WDPAID); rate_area_unique, the area "
+    "(km2) of the union of those polygons inside the country's sampled 10 km cells (points have no footprint and are "
+    "left out). A parcel listing several ISO3 counts for each in the reported and site forms. Each is divided by the "
+    "number of the country's cells in the variant's population (expansion population, or every cell in sensitivity 2), "
+    "which is fixed at the cutoff and does not depend on any 2021 to 2024 label. The unit is per sampled at-risk 10 km "
+    "cell: the stored cells are a sample of each country's land, so this is not a rate per country area.",
+    "Correction dated 2026-11-19, made after the first results (commit 520be4f) and recorded as such: the first run divided "
+    "by the variant's eligible cells, which depend on 2021 to 2024 removals, counted parcel rows as sites, and counted 9 "
+    "duplicated Chilean parcel rows (Kawesqar, II and IV) more than once. Those pooled rate results are superseded and "
+    "kept in their own output directory. No label rule, score or within-country baseline changed.",
     "Sample population: new land in a baseline-overlapping cell needs more than 1 m2 outside the baseline (numerical "
     "tolerance, not a tuned threshold). A point record in such a cell counts only if it lies outside the baseline.",
     "Site counts per country are distinct WDPAIDs of positive events touching the country's positive cells. Each "
@@ -329,6 +338,30 @@ class PooledRanking:
         return out
 
 
+def historical_records(rec, cats):
+    """Cutoff baseline records of the outcome's categories (already restricted to RATE_YEARS and qualifying status), one
+    row per distinct parcel and listed ISO3."""
+    r = rec[rec.IUCN_CAT.isin(cats)].drop_duplicates("WDPA_PID")
+    return r.assign(ISO3=r.ISO3.astype(str).str.split(";")).explode("ISO3")
+
+
+def unique_area_by_country(pieces, piece_cell, cell_country, n_countries):
+    """km2 per country of the union of polygon pieces already clipped to their cell, so overlaps count once."""
+    if len(pieces) == 0:
+        return np.zeros(n_countries)
+    per_cell = pd.Series(list(pieces)).groupby(np.asarray(piece_cell)).agg(lambda g: shapely.area(shapely.union_all(g.to_numpy())))
+    return np.bincount(cell_country[per_cell.index.to_numpy()], weights=per_cell.to_numpy() / 1e6, minlength=n_countries)
+
+
+def historical_rates(records, unique_km2, denominator, country_names):
+    """Per-country rate scores: reported area, distinct sites and unique area, each per population cell."""
+    reported = records.groupby("ISO3").AREA.sum().reindex(country_names, fill_value=0).to_numpy()
+    sites = records.groupby("ISO3").WDPAID.nunique().reindex(country_names, fill_value=0).to_numpy()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return {name: np.nan_to_num(v / denominator) for name, v in
+                [("rate_area_reported", reported), ("rate_sites", sites), ("rate_area_unique", np.asarray(unique_km2, float))]}
+
+
 def within_country_rank(country, values):
     return pd.Series(values).groupby(country).rank(method="average", pct=True).to_numpy()
 
@@ -361,9 +394,11 @@ def log(start, message):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--package", required=True, help="Mouillot et al. (2024) package data directory")
+    parser.add_argument("--out", default=str(OUT_DIR), help="output directory (inputs are always read from INPUT_DIR)")
     args = parser.parse_args()
+    out_dir = Path(args.out)
     start = time.time()
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     manifest = {"protocol": str(PROTOCOL_PATH), "protocol_sha256": check_protocol(), "code_commit": git_commit(),
                 "choices": CHOICES, "inputs": {}}
     log(start, "protocol hash verified")
@@ -376,7 +411,8 @@ def main():
     squares, centres = cell_squares(cells)
     tree = shapely.STRtree(squares)
 
-    base = gpd.read_parquet(LEDGER_DIR / "cutoff_baseline_polygons.parquet", columns=["ISO3", "IUCN_CAT", "geometry"])
+    base = gpd.read_parquet(LEDGER_DIR / "cutoff_baseline_polygons.parquet",
+                            columns=["ISO3", "IUCN_CAT", "STATUS", "STATUS_YR", "MARINE", "geometry"])
     base_geom = np.asarray(equal_area(base))
     base_hits, base_parts, base_owner = part_hits(tree, base_geom)
     excluded = np.zeros(n, bool)
@@ -445,7 +481,7 @@ def main():
     transient = sorted(w.ISO3.unique())
     status_yr = pd.to_numeric(ev.STATUS_YR, errors="coerce").fillna(0).to_numpy()
 
-    labels, notes, positive_masks = {}, {}, {}
+    labels, notes, positive_masks, populations = {}, {}, {}, {}
     for outcome, cats in OUTCOMES.items():
         pos_ev = positive_events(ev, cats)
         unc_ev = uncertain_events(ev, cats)
@@ -526,6 +562,10 @@ def main():
                                                drop_mask=pos_ev & ev.d1_unresolved.to_numpy()),
         }
         positive_masks[(outcome, "primary")] = pos_ev
+        populations[(outcome, "primary")] = expansion
+        for name in variants:
+            populations[(outcome, name)] = {"s02_sample_population": np.ones(n, bool), "s07_drop_transient_countries": expansion & drop_tr,
+                                            "s09_drop_reconstructed_countries": expansion & drop_rec}.get(name, expansion)
         for name, v in variants.items():
             labels[(outcome, name)] = v
             positive_masks[(outcome, name)] = alt_pos.get(name, pos_ev)
@@ -534,9 +574,9 @@ def main():
     label_table = cells[["ISO3", "long_key", "lat_key"]].copy()
     for (outcome, name), v in labels.items():
         label_table[f"{outcome}|{name}"] = v
-    label_table.to_parquet(OUT_DIR / "labels.parquet")
+    label_table.to_parquet(out_dir / "labels.parquet")
     pop = pd.DataFrame({"ISO3": cells.ISO3, "cells": 1, "excluded": excluded, "excluded_iucn": any_iucn})
-    pop.groupby("ISO3").sum().reset_index().to_csv(OUT_DIR / "population.csv", index=False, encoding="utf-8-sig")
+    pop.groupby("ISO3").sum().reset_index().to_csv(out_dir / "population.csv", index=False, encoding="utf-8-sig")
 
     # scores and baselines
     env = (within_country_rank(country, cells.tt.to_numpy()) + within_country_rank(country, -cells.hf.to_numpy())
@@ -546,7 +586,14 @@ def main():
     rec = pd.read_parquet(LEDGER_DIR / "cutoff_baseline.parquet", columns=["ISO3", "STATUS", "STATUS_YR", "IUCN_CAT", "MARINE", "AREA"])
     rec = rec[pd.to_numeric(rec.STATUS_YR, errors="coerce").between(*RATE_YEARS) & rec.MARINE.astype(str).isin(["0", "1"])
               & rec.STATUS.isin(QUALIFYING)]
-    rec = rec.assign(ISO3=rec.ISO3.astype(str).str.split(";")).explode("ISO3")
+    rate_poly = (pd.to_numeric(base.STATUS_YR, errors="coerce").between(*RATE_YEARS) & base.MARINE.astype(str).isin(["0", "1"])
+                 & base.STATUS.isin(QUALIFYING)).to_numpy()
+    hist = {}
+    for outcome, cats in OUTCOMES.items():
+        keep_rows = (rate_poly & base.IUCN_CAT.isin(cats).to_numpy())[base_hits.owner.to_numpy()]
+        hist[outcome] = (historical_records(rec, cats),
+                         unique_area_by_country(clip[keep_rows], base_hits.cell.to_numpy()[keep_rows], country, len(country_names)))
+    log(start, "historical rate numerators computed")
 
     rows, summary, boot, conc = [], [], [], []
     for (outcome, variant), lab_v in labels.items():
@@ -557,11 +604,8 @@ def main():
         if variant == "s09_drop_reconstructed_countries":
             scores["distance"] = -dist_no_rec
         n_elig_c = np.bincount(country[elig], minlength=len(country_names))
-        r = rec[rec.IUCN_CAT.isin(cats)]
-        area_c = r.groupby("ISO3").AREA.sum().reindex(country_names, fill_value=0).to_numpy()
-        sites_c = r.groupby("ISO3").size().reindex(country_names, fill_value=0).to_numpy()
-        with np.errstate(divide="ignore", invalid="ignore"):
-            pooled_extra = {"rate_area": np.nan_to_num(area_c / n_elig_c)[country], "rate_sites": np.nan_to_num(sites_c / n_elig_c)[country]}
+        n_pop_c = np.bincount(country[populations[(outcome, variant)]], minlength=len(country_names))
+        pooled_extra = {k: v[country] for k, v in historical_rates(*hist[outcome], n_pop_c, country_names).items()}
         pos_ev = positive_masks[(outcome, variant)]
         pos_cells = np.flatnonzero(lab_v == POSITIVE)
         hh = hits[hits.cell.isin(pos_cells) & pos_ev[hits.owner.to_numpy()]]
@@ -610,7 +654,7 @@ def main():
                                      "baseline": base_name, "metric": metric, "n_countries": int(sel.sum()),
                                      "difference": est, "ci_low": lo, "ci_high": hi})
         for model in MODELS:
-            for base_name in ["random", "distance", "environment", "rate_area", "rate_sites"]:
+            for base_name in ["random", "distance", "environment", *pooled_extra]:
                 for k, metric in enumerate(["ap", "recall5"]):
                     d = pooled_reps[model][:, k] - pooled_reps[base_name][:, k]
                     boot.append({"outcome": outcome, "variant": variant, "country_set": "pooled", "model": model,
@@ -626,14 +670,14 @@ def main():
                          "top10_share": notes[(outcome, "top10")].sum() / max(int(y[elig].sum()), 1)} if variant == "primary" else {})})
         log(start, f"{outcome} {variant}: metrics and bootstrap done")
 
-    pd.concat(rows).to_csv(OUT_DIR / "country_metrics.csv", index=False, encoding="utf-8-sig")
-    pd.DataFrame(summary).to_csv(OUT_DIR / "summary.csv", index=False, encoding="utf-8-sig")
-    pd.DataFrame(boot).to_csv(OUT_DIR / "bootstrap.csv", index=False, encoding="utf-8-sig")
-    pd.DataFrame(conc).to_csv(OUT_DIR / "concentration.csv", index=False, encoding="utf-8-sig")
+    pd.concat(rows).to_csv(out_dir / "country_metrics.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(summary).to_csv(out_dir / "summary.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(boot).to_csv(out_dir / "bootstrap.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(conc).to_csv(out_dir / "concentration.csv", index=False, encoding="utf-8-sig")
     manifest |= {"transient_countries": transient, "reconstructed_countries": RECONSTRUCTED, "n_boot": N_BOOT, "seed": SEED,
-                 "outputs": {p.name: sha256(p) for p in sorted(OUT_DIR.glob("*.*")) if p.name != "manifest.json"},
+                 "outputs": {p.name: sha256(p) for p in sorted(out_dir.glob("*.*")) if p.name != "manifest.json"},
                  "seconds": round(time.time() - start)}
-    (OUT_DIR / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
     log(start, "done")
 
 

@@ -16,6 +16,8 @@ from scripts.regions.world.t1_scoring import (
     cells_of,
     check_protocol,
     country_bootstrap,
+    historical_rates,
+    historical_records,
     join_on_keys,
     label,
     new_land_flags,
@@ -24,6 +26,7 @@ from scripts.regions.world.t1_scoring import (
     primary_points,
     ranking_metrics,
     uncertain_events,
+    unique_area_by_country,
 )
 
 STRICT, BROAD = OUTCOMES["IaIb"], OUTCOMES["I-VI"]
@@ -163,3 +166,45 @@ def test_bootstrap_resamples_countries_and_is_paired():
     assert lo >= diff.min() and hi <= diff.max()
     assert country_bootstrap(np.zeros(3), draws) == (0.0, 0.0, 0.0)
     assert np.array_equal(draws, bootstrap_draws(3, n_boot=200, seed=5))
+
+
+def rate_records():
+    return pd.DataFrame({"WDPAID": [1, 1, 1, 2, 3, 4], "WDPA_PID": ["1_A", "1_A", "1_B", "2", "3", "4"],
+                         "ISO3": ["AAA", "AAA", "AAA", "AAA;BBB", "BBB", "BBB"], "IUCN_CAT": ["Ia", "Ia", "II", "Ib", "Ia", "V"],
+                         "AREA": [10.0, 10.0, 5.0, 4.0, 2.0, 50.0]})
+
+
+def test_historical_records_count_parcels_once_and_sites_by_wdpaid():
+    names = np.array(["AAA", "BBB"])
+    strict = historical_records(rate_records(), ["Ia", "Ib"])
+    rates = historical_rates(strict, np.zeros(2), np.array([1, 1]), names)
+    assert rates["rate_area_reported"].tolist() == [14.0, 6.0]  # duplicated 1_A once, 2 listed in both countries
+    assert rates["rate_sites"].tolist() == [2.0, 2.0]
+    broad = historical_records(rate_records(), ["Ia", "Ib", "II", "V"])
+    rates = historical_rates(broad, np.zeros(2), np.array([1, 1]), names)
+    assert rates["rate_area_reported"].tolist() == [19.0, 56.0]
+    assert rates["rate_sites"].tolist() == [2.0, 3.0]  # site 1 has two parcels, counted once
+
+
+def test_rate_scores_depend_only_on_the_cutoff_population_not_on_labels():
+    names = np.array(["AAA", "BBB"])
+    country = np.array([0, 0, 0, 0, 1, 1])
+    population = np.array([True, True, True, False, True, True])
+    records = historical_records(rate_records(), ["Ia", "Ib"])
+    denominator = np.bincount(country[population], minlength=2)
+    first = historical_rates(records, np.array([3.0, 1.0]), denominator, names)
+    # any 2021-2024 labelling of the same population leaves the scores unchanged
+    for labels in [np.array([0, 1, 2, 3, 0, 2]), np.array([2, 2, 0, 3, 1, 1])]:
+        assert population.sum() == (labels != 3).sum()
+        again = historical_rates(records, np.array([3.0, 1.0]), denominator, names)
+        for k in first:
+            assert np.array_equal(first[k], again[k])
+    assert first["rate_area_unique"].tolist() == [1.0, 0.5]
+
+
+def test_unique_area_counts_overlapping_polygons_once():
+    cell = box(0, 0, 10_000, 10_000)
+    a, b = box(0, 0, 6_000, 10_000), box(4_000, 0, 10_000, 10_000)  # 60 + 60 km2, overlap 20 km2
+    pieces = shapely.intersection(np.array([a, b, a]), cell)
+    km2 = unique_area_by_country(pieces, np.array([0, 0, 1]), np.array([0, 1]), 2)
+    assert km2 == pytest.approx([100.0, 60.0])
