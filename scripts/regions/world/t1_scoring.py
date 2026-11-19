@@ -583,7 +583,7 @@ def main():
            + within_country_rank(country, cells.Altitude.to_numpy())) / 3
     within_scores = {m: cells[m].to_numpy(float) for m in MODELS}
     within_scores |= {"random": np.zeros(n), "distance": -dist, "environment": env}
-    rec = pd.read_parquet(LEDGER_DIR / "cutoff_baseline.parquet", columns=["ISO3", "STATUS", "STATUS_YR", "IUCN_CAT", "MARINE", "AREA"])
+    rec = pd.read_parquet(LEDGER_DIR / "cutoff_baseline.parquet", columns=["WDPAID", "WDPA_PID", "ISO3", "STATUS", "STATUS_YR", "IUCN_CAT", "MARINE", "AREA"])
     rec = rec[pd.to_numeric(rec.STATUS_YR, errors="coerce").between(*RATE_YEARS) & rec.MARINE.astype(str).isin(["0", "1"])
               & rec.STATUS.isin(QUALIFYING)]
     rate_poly = (pd.to_numeric(base.STATUS_YR, errors="coerce").between(*RATE_YEARS) & base.MARINE.astype(str).isin(["0", "1"])
