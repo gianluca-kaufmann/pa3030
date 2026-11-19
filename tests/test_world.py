@@ -12,13 +12,17 @@ from scripts.regions.world.leakage_guard import (
 )
 from scripts.regions.world.vif_prune import iterative_prune
 from scripts.regions.world.wdpa_event_ledger import (
+    category_timing,
     classify,
+    expansion_role,
     largest_baseline_overlap,
     parcel_lineage,
+    record_history,
     split_antimeridian,
     suffix_rank,
     transient_gaps,
     union_baseline_share,
+    window_footprints,
 )
 
 
@@ -116,3 +120,47 @@ def test_union_baseline_share_counts_overlapping_baselines_once():
     sites = gpd.GeoDataFrame(geometry=[box(0, 0, 10_000, 10_000), box(50_000, 0, 60_000, 10_000)], crs=crs)
     baseline = gpd.GeoDataFrame(geometry=[box(0, 0, 6_000, 10_000), box(4_000, 0, 8_000, 10_000)], crs=crs)
     assert union_baseline_share(sites, baseline).tolist() == pytest.approx([0.8, 0.0], abs=1e-6)
+
+
+def test_extension_land_counts_and_upgrade_land_does_not():
+    ledger = pd.DataFrame({"event_class": [1, 4, 4, 4, 4, 2], "STATUS_YR": [2022, 2022, 2022, 1990, 2022, 1990],
+                           "reason": ["designated_in_window", "new_parcel_of_baseline_site", "prior_record", "prior_record",
+                                      "area_increase", "designated_before_cutoff"]})
+    assert expansion_role(ledger).tolist() == ["new_site", "candidate_extension", "uncertain_extension", "undated_change",
+                                               "undated_change", "none"]
+    # A park protected before the cutoff, a 2022 extension parcel half outside it, and a 2022 stricter zone inside it.
+    crs = "ESRI:54009"
+    park = gpd.GeoDataFrame(geometry=[box(0, 0, 10_000, 10_000)], crs=crs)
+    records = gpd.GeoDataFrame(geometry=[box(5_000, 0, 15_000, 10_000), box(2_000, 2_000, 8_000, 8_000)], crs=crs)
+    new_land = 1 - union_baseline_share(records, park)
+    assert new_land.tolist() == pytest.approx([0.5, 0.0], abs=1e-6)
+
+
+def test_land_removed_before_the_window_end_stays_established():
+    first = [box(0, 0, 2, 1), box(0, 0, 1, 1)]
+    end = [box(0, 0, 1, 1), box(0, 0, 1, 1)]
+    union, removed = window_footprints(first, end, np.array([True, False]))
+    assert shapely.area(union[0]) == pytest.approx(2.0) and shapely.area(removed[0]) == pytest.approx(1.0)
+    assert shapely.area(union[1]) == pytest.approx(1.0) and removed[1] is None
+
+
+def test_category_timing_separates_window_records_from_retrospective_ones():
+    ledger = pd.DataFrame({"IUCN_CAT_geometry": ["Ia", "Ia", "Not Assigned", "Not Reported", None],
+                           "IUCN_CAT_assigned": ["Ia", "Ia", "Ib", None, None],
+                           "geometry_release": ["202408", "202512", "202211", "202211", None]})
+    out = category_timing(ledger)
+    # The second record was first reported in 2025: its category is known only after the window.
+    assert out.category_timing.tolist() == ["recorded_in_window", "recorded_after_window", "assigned_later",
+                                            "never_assigned", "never_assigned"]
+    assert out.IUCN_CAT_outcome.tolist()[:4] == ["Ia", "Ia", "Ib", "Not Reported"]
+
+
+def test_new_parcel_of_a_baseline_site_is_not_a_prior_record():
+    new = pd.DataFrame({"WDPA_PID": ["7_B", "7_A", "8", "9"], "WDPAID": [7, 7, 8, 9]})
+    before = {"WDPA_PID": {"7_A", "8"}, "WDPAID": {7, 8}}
+    out = record_history(new, before, baseline_wdpaids=[7])
+    # 7_B: new parcel of baseline site 7. 7_A: re-entered parcel. 8: dropped before the cutoff, re-entered. 9: new.
+    assert out.prior_record.tolist() == [False, True, True, False]
+    assert out.baseline_site.tolist() == [True, True, False, False]
+    ledger = pd.DataFrame({"change": "new", "kind": "polygons", "STATUS_YR": 2022, **out})
+    assert classify(ledger).reason.tolist() == ["new_parcel_of_baseline_site", "prior_record", "prior_record", "designated_in_window"]

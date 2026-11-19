@@ -1,6 +1,6 @@
 # T1 protocol: retrospective test of the Mouillot et al. (2024) protection niche
 
-Fixed before any designation outcome is scored. Items marked OPEN must be settled, and this file committed, before scoring. Any later change is listed under Deviations with its date and reason.
+Version 1.0, frozen 19 November 2026 before any designation outcome was scored. The commit holding this version and the file's sha256 are recorded with the freeze. Any later change is listed under Deviations with its date and reason, and a changed rule gives a new version.
 
 ## Question
 
@@ -26,7 +26,13 @@ Did the 2020 social-environmental niche of strict protected areas (Mouillot et a
 - New land is the part of an event outside the union of all cutoff baseline polygons. Extensions of earlier sites count for their new land. Designation of land already protected at the cutoff (upgrades, stricter zones, re-registration) is analysed separately and is never a positive.
 - Overlap with the baseline is diagnostic. High overlap does not prove an upgrade in law, and no overlap threshold is used or tuned.
 - Governance: governmental, private, NGO and Indigenous sites all count when the record is Designated, Inscribed or Established with a 2021 to 2024 year. A government-governance-only sensitivity is reported. It does not imply that other sites are invalid.
-- Category and boundary timing: an event's geometry, IUCN category and area come from the first release that holds it as a qualifying polygon, so all three share a date. Exception: a site first recorded as "Not Assigned" or "Not Reported" takes the first category assigned to it later, since that is a late assignment of the same site, not a legal change (2,123 class 1 I to VI records, 2,023 of them Finnish private reserves). The legal year is the latest STATUS_YR, since later releases correct years. A sensitivity uses the category at the observation release.
+- Footprint: a record's footprint at the window end comes from the last release up to `202412` holding it as a qualifying polygon. Where its first footprint differs, the established footprint is the union of the two: land protected during the window and removed or cut before its end still counts as established. The removed part is kept separately. Records first reported after `202412` have only later footprints, which may include later additions that cannot be separated. Land held only in releases between the first and the window-end footprint is not reconstructed. It is a stated limitation, not part of the established footprint.
+- Release timing is not legal timing. A release shows that a record or boundary was reported by that date. It does not show when the act took effect, so a change seen in a 2021 to 2024 release may rest on an earlier act, and an act of 2024 may first appear in 2025.
+- Category timing, from the release the footprint comes from:
+  - recorded in window: the category is recorded in a release up to `202412`. Primary.
+  - recorded after window: the record was first reported after `202412`, so its category is known only retrospectively, even with a 2021 to 2024 year. Primary, flagged, with a sensitivity removing these events. Leaving them out of the primary would favour countries that report quickly.
+  - assigned later: the record was "Not Assigned" or "Not Reported" and received a category only in a later release. A later assignment does not show that the category held during the window. These events are removed from the primary evaluation of the category they were later given, and bounded once as positive and once as negative.
+- The legal year is the latest STATUS_YR, since later releases correct years. A sensitivity uses the category at the observation release.
 
 ## Populations
 
@@ -34,7 +40,7 @@ Did the 2020 social-environmental niche of strict protected areas (Mouillot et a
 - Expansion population: the sample population minus cells overlapped at the cutoff by a qualifying protected area of any IUCN status (Designated, Inscribed or Established, PA_DEF 1). This removed about 8.6% of the sample on raw release `202004`. The share is recomputed on the reconstructed baseline before scoring. The primary analysis uses the expansion population. The sample population is reported as a sensitivity analysis.
 - On the reconstructed baseline, with polygons split at the antimeridian, the expansion population excludes 18,133 of 258,725 background cells (7.01%). Only 61 of them touch an IUCN I to VI polygon.
 - Exclusion counts by reason and by country are reported, along with how the excluded cells change the population.
-- Baseline point records (20,857) have no boundary and are not used for exclusion in the primary analysis, so earlier protection can be present in some eligible cells. Two sensitivities exclude cells containing a baseline point (1,814 eligible cells) and cells touched by a circle of the point's reported area around it (7,655 eligible cells). Neither footprint is the real boundary.
+- Baseline point records (20,857) have no boundary and are not used for exclusion in the primary analysis, so earlier protection can be present in some eligible cells. Two scenario sensitivities exclude cells containing a baseline point (1,814 eligible cells) and cells touched by a circle of the point's reported area around it (7,655 eligible cells). Neither footprint is the real boundary, so neither is an upper or lower bound on the true effect.
 
 ## Cutoff, window and observation
 
@@ -56,25 +62,30 @@ Did the 2020 social-environmental niche of strict protected areas (Mouillot et a
 - Each release is checked for completeness by country. A country-release with failed or missing chunks is marked incomplete, never treated as complete.
 - Every release used is screened at site-ID level: a WDPA_PID absent from one release but present in the releases before and after marks that country-release as a transient omission. Count thresholds are not used, since they missed omissions of 3,157 German and 933 Swedish sites in `202003`.
 - Each candidate site is followed across releases by WDPAID, WDPA_PID, name, STATUS, STATUS_YR, IUCN_CAT and geometry. ID changes, multipart sites, reappearances, removals and degazettement are reconciled.
-- Parcel lineage: a parcel record leaving the archive for good and a record of the same WDPAID first appearing in the next release, of the same kind and IUCN category and with areas within 1%, are one parcel renamed (release `202512` renamed suffixes _A, _B to _1, _2). Ties go to the same suffix position, and remaining ambiguous pairs stay separate. The successor takes the predecessor's ID. Pairs are listed with their release. Legitimate multipart sites keep one record per parcel.
+- Parcel lineage: a parcel record leaving the archive for good and a record of the same WDPAID first appearing in the next release, of the same kind and IUCN category and with areas within 1%, are one parcel renamed (release `202512` renamed suffixes _A, _B to _1, _2). Ties go to the same suffix position, and remaining ambiguous pairs stay separate. A pair is linked only if its polygons in the two releases share at least half of their union (intersection over union 0.5). Point records have no polygon and keep the attribute match. The successor takes the predecessor's ID. Pairs are listed with their release. Legitimate multipart sites keep one record per parcel.
 - The union of earlier releases is used to detect prior records and omissions. It does not automatically count as protection at the cutoff.
 - Every candidate gets one class:
-  1. Verified new designation: not recorded before the cutoff, STATUS_YR 2021 to 2024.
+  1. Candidate new designation: not recorded before the cutoff, STATUS_YR 2021 to 2024. Archive-derived, not legally verified.
   2. Late reporting: first seen after the cutoff, STATUS_YR before 2020.
   3. Ambiguous 2020 timing: STATUS_YR 2020.
   4. Change to an existing site: reappearance, ID change, category change or upgrade, boundary extension.
   5. Unresolved: missing or conflicting information.
-- Only class 1 sites are positive events in the primary analysis. Class 4 is analysed separately from new sites.
+- Expansion role of each record, all archive-derived:
+  - new site: class 1;
+  - candidate extension: a new parcel of a site protected before the cutoff, with its own STATUS_YR 2021 to 2024. Its new land is expansion on the same evidence as a new site;
+  - uncertain extension: a re-entered record of a site protected before the cutoff whose STATUS_YR now falls in 2021 to 2024. The year may be a correction or a re-registration;
+  - undated change: a category change or area increase of a baseline record. Its new land has no legal date.
+- New sites and candidate extensions are the positive events. The new land of uncertain extensions and undated changes has uncertain timing and is handled like class 3 and class 5. Upgrades of land protected at the cutoff are analysed separately.
 - STATUS_YR above 2024: not an event in the window. Their cells stay negative, and a sensitivity removes them. STATUS_YR missing (0): class 5.
 - Point records among events (no boundary): class 5. The cell containing the point is removed. A sensitivity removes cells touched by a circle of the reported area. Both are approximations.
 - Source validation: 57 events in a stratified sample drawn before checking were compared with national records (`PA/audit/event_validation_results.csv`). The check is not extended to unsampled events, which are not described as legally verified. Two general rules follow from it and are applied to all events: International designations (for example Ramsar listings) are not new legal protection and become class 5, and the new-land rule above covers the upgrades found.
-- D1: every event established 2021 to 2024 counts, whether or not it is present in the observation release. The question is where designation happened during the window. A survivor-only outcome would mix designation with later reporting changes. Renamed parcels are reconciled by lineage. Absences are reported by type (land still mapped under another ID, site present under another parcel, partly mapped, unresolved). Unresolved absences are bounded: once counted as positive, once removed.
+- D1: every event established 2021 to 2024 counts, whether or not it is present in the observation release, including land later removed or cut. The question is where designation happened during the window. A survivor-only outcome would mix designation with later reporting changes. Renamed parcels are reconciled by lineage. Absences are reported by type (land still mapped under another ID, site present under another parcel, partly mapped, unresolved). Unresolved absences are bounded: once counted as positive, once removed.
 
 ## Cell labels
 
-- A cell is positive if the new land of a class 1 event of the outcome's categories overlaps its 10 km square, the paper's own overlap rule. In the expansion population every eligible cell lies outside the baseline, so this equals any overlap.
-- Cells overlapped by a class 3 or class 5 site, and by no class 1 site, are removed from the primary evaluation and never labelled negative. Bounds: once treated as positive, once as negative.
-- Each positive cell is assigned to the class 1 event with the largest area in the cell.
+- A cell is positive if the new land of a positive event (new site or candidate extension) of the outcome's categories overlaps its 10 km square, the paper's own overlap rule. New land is the established footprint outside the union of cutoff baseline polygons. In the expansion population every eligible cell lies outside the baseline, so this equals any overlap.
+- Cells overlapped by the new land of a class 3 or class 5 site, an uncertain extension, an undated change, or an event whose category was assigned later, and by no positive event, are removed from the primary evaluation and never labelled negative. Bounds: once treated as positive, once as negative.
+- Each positive cell is assigned to the positive event with the largest area in the cell.
 
 ## Metrics
 
@@ -119,16 +130,15 @@ All baselines use only information available at the cutoff.
 8. Designation window 2021 to 2023.
 9. Russia, Colombia, Ecuador and Mozambique, the countries whose cutoff content is reconstructed, removed from the expansion population and the distance baseline.
 10. Government-governance events only.
-11. Category at the observation release in place of the category at the geometry release.
-12. Post-2024 events removed rather than negative. Cells containing or touched by baseline or event point records removed (two footprints).
-13. Freshwater dropped, by refitting the strict model on the stored training sample. This is a separate refitted benchmark and never replaces the frozen score.
+11. Category at the observation release in place of the category at the footprint release. Events whose category was recorded only after the window removed.
+12. Post-2024 events removed rather than negative. Cells containing or touched by baseline or event point records removed (two scenario footprints).
+13. Land removed or cut during the window not counted as established (window-end footprint only).
+14. Candidate extensions not counted as events (new sites only).
+15. Freshwater dropped, by refitting the strict model on the stored training sample. This is a separate refitted benchmark and never replaces the frozen score.
 
-## Biodiversity comparison (fixed before any biodiversity values are viewed)
+## Biodiversity comparison
 
-- After T1, the new land of class 1 events is compared with equal-area alternatives within the same country, drawn at random from that country's eligible cells (1,000 draws, area matched to the country's new land).
-- Ecosystem condition: GLOBIO 4 (web export, 2020) mean species abundance, all taxa, area-weighted over the land compared. The existing tiles of the bio macro NK project are reused read-only. No new download and no calibration from that project are used.
-- Species representation: a species-range measure chosen independently of the model's predictors. GSN, KBA and any other predictor of the strict model are not used as outcomes. OPEN: the species dataset, to be approved before any values are viewed.
-- MSA is modelled condition in 2020. It is not a causal protection benefit. Results are reported per country, with the same estimability rules, and pooled with equal country weight.
+Specified separately in `docs/biodiversity_comparison_protocol.md`, which is not part of this frozen T1 protocol.
 
 ## Interpretation
 
@@ -138,4 +148,4 @@ All baselines use only information available at the cutoff.
 
 ## Deviations
 
-None yet. Protocol status: PENDING until the species dataset is decided.
+None yet. Protocol status: FROZEN, version 1.0. The biodiversity comparison has its own protocol and does not hold this one open.
