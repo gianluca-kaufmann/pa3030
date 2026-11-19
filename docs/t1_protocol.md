@@ -1,6 +1,6 @@
 # T1 protocol: retrospective test of the Mouillot et al. (2024) protection niche
 
-Version 1.0, frozen 19 November 2026 before any designation outcome was scored. The commit holding this version and the file's sha256 are recorded with the freeze. Any later change is listed under Deviations with its date and reason, and a changed rule gives a new version.
+Version 1.1, frozen 19 November 2026 before any designation outcome was scored. The commit holding this version and the file's sha256 are recorded with the freeze. Any later change is listed under Deviations with its date and reason, and a changed rule gives a new version.
 
 ## Question
 
@@ -77,14 +77,14 @@ Did the 2020 social-environmental niche of strict protected areas (Mouillot et a
   - undated change: a category change or area increase of a baseline record. Its new land has no legal date.
 - New sites and candidate extensions are the positive events. The new land of uncertain extensions and undated changes has uncertain timing and is handled like class 3 and class 5. Upgrades of land protected at the cutoff are analysed separately.
 - STATUS_YR above 2024: not an event in the window. Their cells stay negative, and a sensitivity removes them. STATUS_YR missing (0): class 5.
-- Point records among events (no boundary): class 5. The cell containing the point is removed. A sensitivity removes cells touched by a circle of the reported area. Both are approximations.
+- Point records (no boundary): class 5. For each outcome, the cell containing a point record of the outcome's categories with STATUS_YR 2020 to 2024 or missing is removed. Point records dated before 2020 are late reports and, like baseline points, exclude no cell in the primary evaluation. Point records dated after 2024 leave their cells negative. A point has no geometry release, so its category timing is not checked, and the removal applies whatever the timing. A sensitivity removes cells touched by a circle of the reported area. Both are approximations.
 - Source validation: 57 events in a stratified sample drawn before checking were compared with national records (`PA/audit/event_validation_results.csv`). The check is not extended to unsampled events, which are not described as legally verified. Two general rules follow from it and are applied to all events: International designations (for example Ramsar listings) are not new legal protection and become class 5, and the new-land rule above covers the upgrades found.
 - D1: every event established 2021 to 2024 counts, whether or not it is present in the observation release, including land later removed or cut. The question is where designation happened during the window. A survivor-only outcome would mix designation with later reporting changes. Renamed parcels are reconciled by lineage. Absences are reported by type (land still mapped under another ID, site present under another parcel, partly mapped, unresolved). Unresolved absences are bounded: once counted as positive, once removed.
 
 ## Cell labels
 
 - A cell is positive if the new land of a positive event (new site or candidate extension) of the outcome's categories overlaps its 10 km square, the paper's own overlap rule. New land is the established footprint outside the union of cutoff baseline polygons. In the expansion population every eligible cell lies outside the baseline, so this equals any overlap.
-- Cells overlapped by the new land of a class 3 or class 5 site, an uncertain extension, an undated change, or an event whose category was assigned later, and by no positive event, are removed from the primary evaluation and never labelled negative. Bounds: once treated as positive, once as negative.
+- Eligible cells overlapped by the new land of a class 3 or class 5 site (International designations included, sites designated after 2024 excepted), an uncertain extension, an undated change, or an event whose category was assigned later, and by no positive event, are removed from the primary evaluation and never labelled negative. Cells outside the expansion population are not eligible and are never counted as removed. Bounds: once treated as positive, once as negative.
 - Each positive cell is assigned to the positive event with the largest area in the cell.
 
 ## Metrics
@@ -148,4 +148,6 @@ Specified separately in `docs/biodiversity_comparison_protocol.md`, which is not
 
 ## Deviations
 
-None yet. Protocol status: FROZEN, version 1.0. The biodiversity comparison has its own protocol and does not hold this one open.
+- 19 November 2026, version 1.1, before any score was examined. Clarifies which point records remove cells (year and outcome category), that International records remove cells as class 5, that sites designated after 2024 stay negative, and that only eligible cells are counted as removed. Prompted by a review of the label counts, which applied an all-category point mask built before parcel lineage, removed post-2024 sites, and left International records in neither mask. No rule on positive events changed.
+
+Protocol status: FROZEN, version 1.1. The biodiversity comparison has its own protocol and does not hold this one open.
